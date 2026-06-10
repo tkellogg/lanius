@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS events (
   correlation_id  TEXT,
   payload         TEXT,
   state           TEXT NOT NULL DEFAULT 'pending',
-                  -- pending | running | done | failed | waiting_on_human | expired
+                  -- pending | running | done | failed | waiting_on_human | expired | denied
   -- Which handler invocation emitted this event (from HARNESS_DISPATCH_ID).
   -- Scopes suspend/resume: an ask is matched to the dispatch that asked it.
   emitted_by_dispatch INTEGER,
@@ -65,6 +65,20 @@ CREATE TABLE IF NOT EXISTS throttles (
   rate_per_min        INTEGER,
   llm_tokens_per_hour INTEGER,
   coalesce            INTEGER NOT NULL DEFAULT 1  -- 0 = algedonic: never queue, never batch
+);
+
+-- Hook registrations (from [[hook]] in package manifests, crons-style).
+-- The chain for a point runs ordered by ord, id; first deny stops it.
+CREATE TABLE IF NOT EXISTS hooks (
+  id           INTEGER PRIMARY KEY,
+  skill        TEXT NOT NULL,
+  point        TEXT NOT NULL,            -- pre_tool_call | post_tool_call | pre_dispatch
+  run          TEXT NOT NULL,            -- path relative to the harness root
+  ord          INTEGER NOT NULL DEFAULT 50,
+  timeout_ms   INTEGER NOT NULL DEFAULT 500,
+  on_timeout   TEXT NOT NULL DEFAULT 'deny',  -- also covers spawn errors
+  match_filter TEXT NOT NULL DEFAULT '#',     -- MQTT filter on tool name / topic
+  UNIQUE(skill, point, run)
 );
 
 CREATE TABLE IF NOT EXISTS crons (

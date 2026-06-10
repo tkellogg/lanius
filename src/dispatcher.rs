@@ -1,5 +1,6 @@
 use crate::db;
 use crate::events::{self, EmitOpts};
+use crate::hooks;
 use crate::paths::Root;
 use crate::profile;
 use crate::skills;
@@ -362,6 +363,29 @@ fn dispatch_pending(root: &Root, conn: &Connection, running: &mut Vec<Running>) 
             continue; // stays pending; revisited next tick
         }
         let envelope = events::envelope(conn, id)?;
+        // Hook plane, pre_dispatch: may veto the event before any handler
+        // runs (allow/deny only — the envelope is ledger-backed, no rewrite).
+        let hook_ids = trace::Ids {
+            event_id: Some(id),
+            correlation_id: corr.clone(),
+            ..Default::default()
+        };
+        let gate = hooks::run_chain(
+            root,
+            conn,
+            "pre_dispatch",
+            &etype,
+            json!({ "point": "pre_dispatch", "event": envelope }),
+            &hook_ids,
+        )?;
+        if !gate.allow {
+            // The deny itself is already on the recorder (obs/hook/...).
+            conn.execute(
+                "UPDATE events SET state='denied', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
+                [id],
+            )?;
+            continue;
+        }
         conn.execute("UPDATE events SET state='running' WHERE id=?1", [id])?;
         for h in handlers {
             spawn_handler(root, conn, running, id, &envelope, h, None, corr.clone())?;

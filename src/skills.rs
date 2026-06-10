@@ -71,6 +71,40 @@ pub fn enable(root: &Root, conn: &Connection, name: &str) -> Result<()> {
             .with_context(|| format!("linking {}", link.display()))?;
         println!("wired {} -> {}", link.display(), target.display());
     }
+    for h in &m.hook {
+        if !manifest::HOOK_POINTS.contains(&h.point.as_str()) {
+            bail!("{name}: unknown hook point {:?} (valid: {:?})", h.point, manifest::HOOK_POINTS);
+        }
+        if h.on_timeout != "allow" && h.on_timeout != "deny" {
+            bail!("{name}: hook on_timeout must be \"allow\" or \"deny\", got {:?}", h.on_timeout);
+        }
+        if !crate::topic::valid_filter(&h.match_filter) {
+            bail!("{name}: hook 'match' is not a valid MQTT topic filter: {:?}", h.match_filter);
+        }
+        let script = dir.join(&h.run);
+        if !script.exists() {
+            bail!("{name}: hook script {} does not exist", script.display());
+        }
+        make_executable(&script)?;
+        // Stored root-relative so the root can move; resolved at run time.
+        let rel = PathBuf::from("skills").join(name).join(&h.run);
+        conn.execute(
+            "INSERT INTO hooks(skill, point, run, ord, timeout_ms, on_timeout, match_filter)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(skill, point, run) DO UPDATE SET
+               ord = ?4, timeout_ms = ?5, on_timeout = ?6, match_filter = ?7",
+            params![
+                name,
+                h.point,
+                rel.display().to_string(),
+                h.order,
+                h.timeout_ms as i64,
+                h.on_timeout,
+                h.match_filter
+            ],
+        )?;
+        println!("hook [{}] {} (match {}, timeout {}ms, on_timeout {})", h.point, rel.display(), h.match_filter, h.timeout_ms, h.on_timeout);
+    }
     for c in &m.cron {
         croner::Cron::from_str(&c.schedule)
             .map_err(|e| anyhow::anyhow!("{name}: bad cron schedule {:?}: {e}", c.schedule))?;
@@ -108,6 +142,7 @@ pub fn disable(root: &Root, conn: &Connection, name: &str) -> Result<()> {
         }
     }
     conn.execute("DELETE FROM crons WHERE skill = ?1", [name])?;
+    conn.execute("DELETE FROM hooks WHERE skill = ?1", [name])?;
     Ok(())
 }
 

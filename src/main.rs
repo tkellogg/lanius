@@ -3,6 +3,7 @@ mod dispatcher;
 mod dotenv;
 mod events;
 mod exec;
+mod hooks;
 mod human;
 mod initcmd;
 mod manifest;

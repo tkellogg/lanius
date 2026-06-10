@@ -11,6 +11,8 @@ pub struct Manifest {
     #[serde(default)]
     pub handler: Vec<HandlerDecl>,
     #[serde(default)]
+    pub hook: Vec<HookDecl>,
+    #[serde(default)]
     pub cron: Vec<CronDecl>,
     #[serde(default)]
     pub provider: Vec<ProviderDecl>,
@@ -24,6 +26,39 @@ pub struct HandlerDecl {
     pub run: String, // executable path relative to the skill dir
     #[serde(default = "default_order")]
     pub order: u32,
+}
+
+/// Blocking interception, git-hooks style: fork/exec with the subject JSON on
+/// stdin. Exit 0 = allow (nonempty JSON-object stdout = rewritten subject);
+/// nonzero = deny. `on_timeout` also covers spawn errors — fail-open vs
+/// fail-closed is a security decision and is declared, never defaulted
+/// silently (default is deny: a dead policy hook must not approve).
+#[derive(Debug, Deserialize)]
+pub struct HookDecl {
+    pub point: String, // pre_tool_call | post_tool_call | pre_dispatch
+    pub run: String,   // executable path relative to the skill dir
+    #[serde(default = "default_order")]
+    pub order: u32,
+    #[serde(default = "default_hook_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_on_timeout")]
+    pub on_timeout: String, // allow | deny
+    /// MQTT filter against the tool name (tool hooks) or event topic
+    /// (pre_dispatch). Default matches everything.
+    #[serde(default = "default_match_all", rename = "match")]
+    pub match_filter: String,
+}
+
+pub const HOOK_POINTS: &[&str] = &["pre_tool_call", "post_tool_call", "pre_dispatch"];
+
+fn default_hook_timeout_ms() -> u64 {
+    500
+}
+fn default_on_timeout() -> String {
+    "deny".into()
+}
+fn default_match_all() -> String {
+    "#".into()
 }
 
 #[derive(Debug, Deserialize)]

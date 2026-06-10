@@ -1,5 +1,6 @@
 use crate::db;
 use crate::events::{self, EmitOpts};
+use crate::hooks;
 use crate::paths::Root;
 use crate::profile;
 use crate::render;
@@ -203,21 +204,94 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
 
         let mut suspended_at: Option<usize> = None;
         for (i, call) in tool_calls.iter().enumerate() {
-            // The tool call goes to the trace BEFORE execution: a crash
-            // mid-tool must be visible as a call with no result.
+            // Hook plane, pre_tool_call: may rewrite args or veto. The
+            // transcript keeps the model's ORIGINAL call (it must replay as
+            // sent); rewritten args live in execution and the trace. A veto
+            // becomes an ordinary error result so the model can adapt.
+            let pre = hooks::run_chain(
+                root,
+                &conn,
+                "pre_tool_call",
+                &call.fn_name,
+                json!({ "point": "pre_tool_call", "session": session,
+                        "tool": call.fn_name, "args": call.fn_arguments }),
+                &ids,
+            )?;
+            let eff = ToolCall {
+                call_id: call.call_id.clone(),
+                fn_name: call.fn_name.clone(),
+                fn_arguments: pre
+                    .subject
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| call.fn_arguments.clone()),
+                thought_signatures: None,
+            };
+            // The (effective) tool call goes to the trace BEFORE execution: a
+            // crash mid-tool must be visible as a call with no result.
             trace::write(
                 root,
-                &obs_tool(&session, &call.fn_name, "call"),
+                &obs_tool(&session, &eff.fn_name, "call"),
                 &ids,
-                json!({ "call_id": call.call_id, "name": call.fn_name, "args": call.fn_arguments }),
+                json!({ "call_id": eff.call_id, "name": eff.fn_name, "args": eff.fn_arguments }),
             );
-            match run_tool(root, &conn, &session, event_id, in_handler, call, &mut self_emitted) {
+            if !pre.allow {
+                let result = json!({
+                    "error": format!("blocked by hook {}", pre.denied_by.as_deref().unwrap_or("?")),
+                    "reason": pre.reason,
+                })
+                .to_string();
+                trace::write(
+                    root,
+                    &obs_tool(&session, &eff.fn_name, "result"),
+                    &ids,
+                    json!({ "call_id": eff.call_id, "name": eff.fn_name, "denied": true, "result": trace::clip(&result, 2000) }),
+                );
+                store_msg(
+                    &conn,
+                    &session,
+                    event_id,
+                    &json!({
+                        "role": "tool",
+                        "tool_call_id": eff.call_id,
+                        "name": eff.fn_name,
+                        "content": result,
+                    }),
+                )?;
+                continue;
+            }
+            match run_tool(root, &conn, &session, event_id, in_handler, &eff, &mut self_emitted) {
                 ToolOutcome::Output(result) => {
+                    // Hook plane, post_tool_call: may scrub/rewrite the result
+                    // or veto it (the model then sees the denial, not the data).
+                    let post = hooks::run_chain(
+                        root,
+                        &conn,
+                        "post_tool_call",
+                        &eff.fn_name,
+                        json!({ "point": "post_tool_call", "session": session,
+                                "tool": eff.fn_name, "args": eff.fn_arguments,
+                                "result": result }),
+                        &ids,
+                    )?;
+                    let result = if !post.allow {
+                        json!({
+                            "error": format!("result blocked by hook {}", post.denied_by.as_deref().unwrap_or("?")),
+                            "reason": post.reason,
+                        })
+                        .to_string()
+                    } else {
+                        match post.subject.get("result") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(v) if !v.is_null() => v.to_string(),
+                            _ => result,
+                        }
+                    };
                     trace::write(
                         root,
-                        &obs_tool(&session, &call.fn_name, "result"),
+                        &obs_tool(&session, &eff.fn_name, "result"),
                         &ids,
-                        json!({ "call_id": call.call_id, "name": call.fn_name, "result": trace::clip(&result, 2000) }),
+                        json!({ "call_id": eff.call_id, "name": eff.fn_name, "result": trace::clip(&result, 2000) }),
                     );
                     store_msg(
                         &conn,
@@ -225,8 +299,8 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                         event_id,
                         &json!({
                             "role": "tool",
-                            "tool_call_id": call.call_id,
-                            "name": call.fn_name,
+                            "tool_call_id": eff.call_id,
+                            "name": eff.fn_name,
                             "content": result,
                         }),
                     )?;

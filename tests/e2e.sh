@@ -111,6 +111,33 @@ payload = { from = "ticker" }
 EOF
 elanus enable ticker >/dev/null || fail "enable ticker"
 
+# Hook plane: a guard package whose pre_dispatch hook vetoes work/test/denyme.
+mkdir -p "$TMP/skills/guard/scripts"
+cat > "$TMP/skills/guard/harness.toml" <<'EOF'
+[[handler]]
+on = "work/test/denyme"
+run = "scripts/h"
+order = 0
+
+[[hook]]
+point = "pre_dispatch"
+run = "scripts/gate"
+match = "work/test/denyme"
+timeout_ms = 2000
+EOF
+cat > "$TMP/skills/guard/scripts/h" <<'EOF'
+#!/bin/sh
+cat > "$HARNESS_ROOT/denied-ran.txt"
+EOF
+cat > "$TMP/skills/guard/scripts/gate" <<'EOF'
+#!/bin/sh
+cat >/dev/null
+echo "computer says no"
+exit 1
+EOF
+chmod +x "$TMP/skills/guard/scripts/h" "$TMP/skills/guard/scripts/gate"
+elanus enable guard >/dev/null || fail "enable guard"
+
 echo "== daemon =="
 elanus daemon --interval-ms 200 >"$TMP/daemon.log" 2>&1 &
 DAEMON_PID=$!
@@ -144,7 +171,14 @@ wait_for "event #$EV3 done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV3
 echo "== 4. cron fires =="
 wait_for "cron-emitted work/demo/echo handled" "grep -q '\"from\":\"ticker\"' '$TMP/echo.log'"
 
-echo "== 5. flight recorder =="
+echo "== 5. hook plane: pre_dispatch veto =="
+EV5=$(elanus emit work/test/denyme)
+wait_for "event #$EV5 denied" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV5\")\" = denied ]"
+[ ! -f "$TMP/denied-ran.txt" ] && ok "vetoed handler never ran" || fail "handler ran despite deny"
+grep -q '"kind":"obs/hook/pre_dispatch/deny"' "$TMP/trace.jsonl" && ok "hook deny on the recorder" || fail "no hook deny trace"
+grep -q 'computer says no' "$TMP/trace.jsonl" && ok "deny reason recorded" || fail "deny reason missing"
+
+echo "== 6. flight recorder =="
 for kind in obs/ledger/emit obs/dispatch/spawn obs/dispatch/exit obs/ledger/expire; do
   grep -q "\"kind\":\"$kind\"" "$TMP/trace.jsonl" && ok "trace has $kind" || fail "trace missing $kind"
 done
