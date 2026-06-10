@@ -6,3 +6,4 @@ trace.jsonl
 .DS_Store
 /tmp-root*
 .env
+HANDOFF.md
