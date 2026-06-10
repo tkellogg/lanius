@@ -5,7 +5,7 @@ use crate::profile;
 use crate::render;
 use crate::trace;
 use anyhow::{anyhow, bail, Context, Result};
-use genai::chat::{ChatMessage, ChatRequest, Tool, ToolCall, ToolResponse};
+use genai::chat::{ChatMessage, ChatRequest, ContentPart, MessageContent, Tool, ToolCall, ToolResponse};
 use genai::Client;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -76,6 +76,28 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
             }),
         )?;
         db::kv_del(&conn, &key)?;
+        // Close the loop in the event log: a CLI --resume is an answer too,
+        // otherwise the ask sits in the inbox forever. The daemon flow already
+        // has a human.answer (it triggered the resume) — dedupe on correlation.
+        if let Some(corr) = pend["correlation"].as_str() {
+            let already: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE type='human.answer' AND correlation_id=?1",
+                [corr],
+                |r| r.get(0),
+            )?;
+            if already == 0 {
+                events::emit(
+                    root,
+                    &conn,
+                    EmitOpts {
+                        payload: Some(json!({ "answer": ans, "via": "exec-resume" })),
+                        correlation: Some(corr.to_string()),
+                        cause: pend["ask_id"].as_i64(),
+                        ..EmitOpts::new("human.answer")
+                    },
+                )?;
+            }
+        }
     }
 
     // Crash repair BEFORE appending new input: any assistant tool call with no
@@ -396,28 +418,43 @@ fn build_request(conn: &Connection, session: &str, system: &str, tools: &[Tool])
         r
     };
     let mut msgs: Vec<ChatMessage> = Vec::new();
+    // Consecutive tool-result rows coalesce into ONE tool message: the
+    // Anthropic protocol wants every tool_use answered by tool_result blocks
+    // in the single next message, not a stack of messages.
+    let mut pending_tools: Vec<ToolResponse> = Vec::new();
+    fn flush_tools(msgs: &mut Vec<ChatMessage>, pending: &mut Vec<ToolResponse>) {
+        if !pending.is_empty() {
+            msgs.push(ChatMessage::from(std::mem::take(pending)));
+        }
+    }
     for raw in rows {
         let m: Value = serde_json::from_str(&raw)?;
         match m["role"].as_str().unwrap_or("") {
-            "user" => msgs.push(ChatMessage::user(m["text"].as_str().unwrap_or_default())),
+            "user" => {
+                flush_tools(&mut msgs, &mut pending_tools);
+                msgs.push(ChatMessage::user(m["text"].as_str().unwrap_or_default()));
+            }
             "assistant" => {
+                flush_tools(&mut msgs, &mut pending_tools);
                 let text = m["text"].as_str().unwrap_or_default();
                 if let Some(calls) = m["tool_calls"].as_array() {
-                    // Keep the assistant's interleaved commentary: replay text
-                    // first, then the tool calls.
+                    // One assistant message with text + tool_use parts —
+                    // splitting them into two messages breaks the protocol's
+                    // "tool_result immediately after tool_use" rule.
+                    let mut parts: Vec<ContentPart> = Vec::new();
                     if !text.is_empty() {
-                        msgs.push(ChatMessage::assistant(text));
+                        parts.push(ContentPart::Text(text.to_string()));
                     }
-                    let tcs: Vec<ToolCall> = calls
-                        .iter()
-                        .map(|c| ToolCall {
+                    for c in calls {
+                        parts.push(ContentPart::ToolCall(ToolCall {
                             call_id: c["call_id"].as_str().unwrap_or_default().to_string(),
                             fn_name: c["fn_name"].as_str().unwrap_or_default().to_string(),
                             fn_arguments: c["fn_arguments"].clone(),
                             thought_signatures: None,
-                        })
-                        .collect();
-                    msgs.push(ChatMessage::from(tcs));
+                        }));
+                    }
+                    let content: MessageContent = parts.into_iter().collect();
+                    msgs.push(ChatMessage::assistant(content));
                 } else if !text.is_empty() {
                     msgs.push(ChatMessage::assistant(text));
                 }
@@ -429,14 +466,15 @@ fn build_request(conn: &Connection, session: &str, system: &str, tools: &[Tool])
                     fn_arguments: Value::Null,
                     thought_signatures: None,
                 };
-                msgs.push(ChatMessage::from(ToolResponse::from_tool_call(
+                pending_tools.push(ToolResponse::from_tool_call(
                     &tc,
                     m["content"].as_str().unwrap_or_default(),
-                )));
+                ));
             }
             _ => {}
         }
     }
+    flush_tools(&mut msgs, &mut pending_tools);
     Ok(ChatRequest::new(msgs)
         .with_system(system)
         .with_tools(tools.to_vec()))
