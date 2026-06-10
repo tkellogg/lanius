@@ -15,6 +15,9 @@ impl Root {
     pub fn trace_file(&self) -> PathBuf {
         self.dir.join("trace.jsonl")
     }
+    pub fn recorder_file(&self) -> PathBuf {
+        self.dir.join("recorder.toml")
+    }
     pub fn skills(&self) -> PathBuf {
         self.dir.join("skills")
     }

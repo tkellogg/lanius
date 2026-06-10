@@ -27,12 +27,17 @@ pub fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// Append one line to trace.jsonl. Append-only, write-only: nothing in the
-/// system reads this file for control flow. Each line is a single write()
-/// on an O_APPEND fd so concurrent writers interleave at line granularity.
-/// Trace failures are deliberately swallowed: the flight recorder must never
-/// take the plane down.
+/// Publish a happening on its topic. `kind` is the topic; the recorder
+/// decides persistence (docs/bus.md). Sink::None is live-only — once the bus
+/// lands, such topics still fan out to in-process consumers; today they are
+/// simply not written. Append-only, write-only: nothing reads trace.jsonl for
+/// control flow. Each line is a single write() on an O_APPEND fd so concurrent
+/// writers interleave at line granularity. Failures are deliberately swallowed:
+/// the flight recorder must never take the plane down.
 pub fn write(root: &Root, kind: &str, ids: &Ids, payload: Value) {
+    if crate::recorder::get(root).sink_for(kind) == crate::recorder::Sink::None {
+        return;
+    }
     let mut line = json!({ "ts": now_iso(), "kind": kind, "payload": payload });
     let obj = line.as_object_mut().unwrap();
     if let Some(v) = ids.event_id {

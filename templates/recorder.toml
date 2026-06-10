@@ -1,0 +1,25 @@
+# elanus recorder — disk is a set of subscription patterns (docs/bus.md).
+# Every happening is published on a topic; these ordered rules decide what
+# persists to trace.jsonl. First match wins. Sinks: "trace" (append to the
+# flight recorder) or "none" (live-only, never touches disk). Editing this
+# file takes effect on the next daemon/exec start.
+#
+# The flight recorder is append-only and write-only: nothing reads it for
+# control flow. work/# events are sqlite-backed by the ledger regardless of
+# what is set here — that path is emit(), not the recorder.
+
+# Per-file fs deltas are high-volume (a build touches thousands); keep them
+# live-only. The per-call summary (obs/exec/<session>/fs/summary) still records.
+[[record]]
+match = "fs/#"
+sink  = "none"
+
+# Example: keep UI chatter off disk entirely.
+# [[record]]
+# match = "obs/ui/#"
+# sink  = "none"
+
+# Everything else is recorded.
+[[record]]
+match = "#"
+sink  = "trace"

@@ -52,6 +52,7 @@ echo "== init =="
 elanus init "$TMP" >/dev/null || fail "elanus init"
 [ -f "$TMP/harness.db" ] || fail "harness.db missing"
 [ -f "$TMP/trace.jsonl" ] || fail "trace.jsonl missing"
+[ -f "$TMP/recorder.toml" ] || fail "recorder.toml missing"
 [ -L "$TMP/handlers.d/work.demo.echo/00-echo-echo" ] || fail "echo handler not wired"
 
 echo "== test skills: asker (suspend/resume), asker2 (deadline default) =="

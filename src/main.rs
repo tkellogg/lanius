@@ -9,6 +9,7 @@ mod initcmd;
 mod manifest;
 mod paths;
 mod profile;
+mod recorder;
 mod render;
 mod sandbox;
 mod skills;
