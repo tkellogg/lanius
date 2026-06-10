@@ -392,6 +392,22 @@ handler stop re-pinging a human who already acked on another channel.
    the bus).
 5. **Packages**: `packages/` + `elanus.toml`, request/approval ledger,
    leases, supervised daemons + LWT; `handlers.d/` and `skills/` retire.
+   *Landed 2026-06-10 (commit 07720b3).* As-built notes, where reality
+   refined the design: (a) v1's per-package `[[handler]]` list collapsed to
+   one `[process]` per package — a package does one thing; its script
+   dispatches on the envelope's `type`. (b) Approval is all-or-nothing per
+   package for now; the `elanus approve` printout is the review surface;
+   per-capability decisions are a CLI growth, the ledger already stores
+   rows individually. (c) Manifest-edit semantics: unchanged (kind, value)
+   pairs carry over under the new hash (`decided_by = 'carried'`), the
+   delta re-enters pending, revoked values re-ask. (d) Actor identity =
+   per-spawn supervisor-minted tokens via env; `elanus bus pub|sub` picks
+   them up automatically, so script actors authenticate for free.
+   Anonymous loopback clients (the human) keep full access — open
+   question 7 stands for remotes. (e) The supervisor publishes retained
+   `obs/skill/<name>/status`; client LWT is honored too (ACL-checked,
+   fires on abnormal close only). (f) Leases landed per sandbox.md: tool
+   call surface, kernel borrow checker, cage narrowing.
 6. **Ingress bridge** (Discord first) — the first real daemon package.
 7. **Delivery receipts + escalation handler** — pure userland; can land any
    time after 4.

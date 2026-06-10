@@ -58,9 +58,13 @@ anyway. Side effect: write-attribution ambiguity between concurrent actors is
 recorded as a ledger row, released by the supervisor when the dispatch dies.
 No lock leaks; same recovery path as everything else.
 
-**[OPEN]** Acquisition surface: kernel tool call vs declaration in the work
-item payload. Lean tool call — it is a capability negotiation and belongs in
-the ledger with a `cause` attached.
+**[DECIDED 2026-06-10, built]** Acquisition surface: kernel tool call
+(`fs_lease`) — it is a capability negotiation and belongs in the ledger.
+As built: lease ⊆ grant is a canonicalized prefix check; conflict = prefix
+overlap in either direction against active leases of other holders; holder
+identity = enclosing dispatch (survives suspend/resume) else pid; release =
+dispatch end, dead-pid reap, or clean standalone-exec exit. Holding leases
+narrows the shell spawn cage to leases + harness root.
 
 ## The whole-agent grant
 
@@ -160,14 +164,17 @@ file" becomes a subscribe, not a query.
 
 ## Open questions
 
-1. Lease acquisition API (tool call vs work-item declaration; lean tool
-   call).
+1. ~~Lease acquisition API~~ — resolved: `fs_lease` tool call (see above).
 2. Whole-agent grant location (profile section vs own file; lean own file).
+   Still in profile `[sandbox]` as of step 5; package fs grants went to the
+   approval ledger, the agent's own grant has not hoisted yet.
 3. Exclusive **publish leases on topic prefixes** — `&mut ingress/discord/#`
-   for the discord adapter = source authenticity by construction. Lean yes,
-   lands with the bus.
-4. Zero-cage floor for packages (own dir read + scratch write + own status
-   topics?) and spawn policy for untrusted package roots.
+   for the discord adapter = source authenticity by construction. Lean yes;
+   the per-actor publish ACL (step 5) gives scoping but not exclusivity yet.
+4. Zero-cage floor for packages: as built (step 5) = scratch-dir writes +
+   approved fs_write, reads unrestricted (write-cage only), own
+   `obs/skill/<name>/#` publish floor. Read-scoping and spawn policy for
+   untrusted package roots remain open.
 5. Resource limits for daemon actors (supervision currently has restart
    backoff only).
 6. Default capture-exclusion set and where it is declared (grant vs lease vs
