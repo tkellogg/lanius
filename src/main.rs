@@ -10,6 +10,7 @@ mod manifest;
 mod paths;
 mod profile;
 mod render;
+mod sandbox;
 mod skills;
 mod topic;
 mod trace;

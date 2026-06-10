@@ -68,6 +68,21 @@ pub fn encode_segment(s: &str) -> String {
     out
 }
 
+/// Encode a canonical absolute path as a topic suffix: per-segment
+/// percent-encoding, '/' as the level separator, leading slash dropped
+/// (all paths are absolute, so it carries no information). The fs event
+/// topic is "fs/" + this.
+pub fn encode_path(p: &std::path::Path) -> String {
+    use std::path::Component;
+    let mut segs: Vec<String> = Vec::new();
+    for c in p.components() {
+        if let Component::Normal(s) = c {
+            segs.push(encode_segment(&s.to_string_lossy()));
+        }
+    }
+    segs.join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +139,17 @@ mod tests {
         assert!(!valid_name(""));
         // malformed filters match nothing
         assert!(!matches("a/#/b", "a/x/b"));
+    }
+
+    #[test]
+    fn path_encoding() {
+        use std::path::Path;
+        assert_eq!(encode_path(Path::new("/Users/tim/x.rs")), "Users/tim/x.rs");
+        assert_eq!(
+            encode_path(Path::new("/notes/#1 draft.md")),
+            "notes/%231 draft.md"
+        );
+        assert!(matches("fs/Users/tim/#", &format!("fs/{}", encode_path(Path::new("/Users/tim/a/b.txt")))));
     }
 
     #[test]

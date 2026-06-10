@@ -19,7 +19,12 @@ max_concurrent = 2
 llm_tokens_per_hour = 400000
 
 [sandbox]
-preset = "vm"   # MVP: the box is the boundary; real policy lands later
+# The whole-agent fs grant (docs/sandbox.md). fs_write prefixes (absolute or
+# root-relative) are the cage: the shell tool's whole process tree can only
+# write inside them, plus the harness root, system temp, and /dev. Empty or
+# absent = no cage (camera still records fs/ deltas of the root).
+# fs_write = ["workspace"]
+# capture_exclude = ["harness.db", "trace.jsonl", "run/", ".env", ".git/", "target/", "node_modules/"]
 
 [vars]
 # {{key}} substitutions available in blocks/*.md

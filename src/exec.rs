@@ -4,6 +4,7 @@ use crate::hooks;
 use crate::paths::Root;
 use crate::profile;
 use crate::render;
+use crate::sandbox;
 use crate::trace;
 use anyhow::{anyhow, bail, Context, Result};
 use genai::chat::{ChatMessage, ChatRequest, ContentPart, MessageContent, Tool, ToolCall, ToolResponse};
@@ -118,6 +119,9 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
     }
 
     let system = render::render(root, &conn, &opts.profile, &session)?;
+    // The cage is built once per exec from the profile's [sandbox] grant;
+    // every shell tool call spawns inside it and gets boundary-diffed.
+    let cage = sandbox::Cage::from_profile(root, &prof.sandbox);
     let client = build_client(&prof);
     let model = prof.model.model.clone();
     let tools = tool_defs();
@@ -260,7 +264,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 )?;
                 continue;
             }
-            match run_tool(root, &conn, &session, event_id, in_handler, &eff, &mut self_emitted) {
+            match run_tool(root, &conn, &cage, &session, event_id, in_handler, &eff, &mut self_emitted) {
                 ToolOutcome::Output(result) => {
                     // Hook plane, post_tool_call: may scrub/rewrite the result
                     // or veto it (the model then sees the denial, not the data).
@@ -613,9 +617,11 @@ fn tool_defs() -> Vec<Tool> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tool(
     root: &Root,
     conn: &Connection,
+    cage: &sandbox::Cage,
     session: &str,
     event_id: Option<i64>,
     in_handler: bool,
@@ -630,7 +636,14 @@ fn run_tool(
                 return err("shell: missing 'command'".into());
             };
             let timeout = args["timeout_secs"].as_u64().unwrap_or(120);
-            ToolOutcome::Output(run_shell(root, cmd, timeout))
+            // The camera: boundary diff of the writable roots around the
+            // call. cause attribution is structural — this tool call IS the
+            // bracket (docs/sandbox.md).
+            let before = sandbox::snapshot(cage);
+            let out = run_shell(root, cage, cmd, timeout);
+            let after = sandbox::snapshot(cage);
+            emit_fs_delta(root, session, &call.call_id, cage, &before, &after);
+            ToolOutcome::Output(out)
         }
         "emit_event" => {
             let Some(etype) = args["type"].as_str() else {
@@ -715,14 +728,50 @@ fn run_tool(
     }
 }
 
-fn run_shell(root: &Root, cmd: &str, timeout_secs: u64) -> String {
+/// One fs/ trace line per changed file plus a summary; exclusion is never
+/// silent (the summary names the active patterns).
+fn emit_fs_delta(
+    root: &Root,
+    session: &str,
+    call_id: &str,
+    cage: &sandbox::Cage,
+    before: &sandbox::Snapshot,
+    after: &sandbox::Snapshot,
+) {
+    let changes = sandbox::diff(before, after);
+    if changes.is_empty() && !after.capped {
+        return;
+    }
+    let mut ids = trace::Ids::from_env();
+    ids.session_id = Some(session.to_string());
+    for c in &changes {
+        trace::write(
+            root,
+            &format!("fs/{}", crate::topic::encode_path(&c.path)),
+            &ids,
+            json!({ "op": c.op, "size": c.size, "tool_call_id": call_id }),
+        );
+    }
+    trace::write(
+        root,
+        &obs(session, "fs/summary"),
+        &ids,
+        json!({
+            "changed": changes.len(),
+            "walk_capped": after.capped,
+            "excluded_patterns": cage.exclude,
+            "caged": cage.enforcing(),
+            "tool_call_id": call_id,
+        }),
+    );
+}
+
+fn run_shell(root: &Root, cage: &sandbox::Cage, cmd: &str, timeout_secs: u64) -> String {
     use std::os::unix::process::CommandExt as _;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
-    let mut c = Command::new("sh");
-    c.arg("-c")
-        .arg(cmd)
-        .current_dir(&root.dir)
+    let mut c = cage.shell_command(cmd);
+    c.current_dir(&root.dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

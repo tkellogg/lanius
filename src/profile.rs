@@ -16,7 +16,6 @@ pub struct Profile {
     #[serde(default)]
     pub throttle: BTreeMap<String, ThrottleDecl>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub sandbox: SandboxCfg,
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
@@ -67,13 +66,29 @@ impl Default for SkillsCfg {
     }
 }
 
+/// The whole-agent fs grant (docs/sandbox.md). `fs_write` prefixes are the
+/// cage: when nonempty, the shell tool's process tree can only write inside
+/// them (plus the harness root, system temp, and /dev — the harness must not
+/// cage itself out of its own ledger). Empty = no cage. The camera (boundary
+/// diff → fs/ events) runs either way, over root + fs_write.
+/// This lives in the profile until the grants ledger lands in migration
+/// step 5; it then hoists into the approval ledger with package grants.
 #[derive(Debug, Deserialize, Default)]
 pub struct SandboxCfg {
-    /// MVP: "vm" only — the box is the boundary. Parsed now so profiles can
-    /// declare intent; enforcement lands later.
     #[serde(default)]
-    #[allow(dead_code)]
-    pub preset: Option<String>,
+    pub fs_write: Vec<String>, // absolute, or relative to the harness root
+    /// Camera exclusions, prefix-matched against root-relative paths.
+    /// Exclusion is never silent: deltas carry the active patterns.
+    #[serde(default = "default_capture_exclude")]
+    pub capture_exclude: Vec<String>,
+}
+
+fn default_capture_exclude() -> Vec<String> {
+    // Kernel churn (db/wal/trace/run) would self-noise every diff.
+    ["harness.db", "trace.jsonl", "run/", ".env", ".git/", "target/", "node_modules/"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn default_model() -> String {
