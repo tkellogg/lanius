@@ -1,0 +1,28 @@
+#!/bin/sh
+# linemux: bridge $ELANUS_SCRATCH/inbox/*.line files onto the bus.
+# Crash-only: any bus failure exits nonzero; the supervisor restarts us
+# with backoff and publishes our retained liveness either way.
+set -u
+
+INBOX="$ELANUS_SCRATCH/inbox"
+mkdir -p "$INBOX"
+
+while true; do
+  for f in "$INBOX"/*.line; do
+    [ -e "$f" ] || continue
+    payload=$(python3 -c '
+import json, sys, datetime
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
+print(json.dumps({
+    "text": text,
+    "source": "linemux",
+    "received_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}))' "$f") || { rm -f "$f"; continue; }
+    # Ledger first (QoS 1: PUBACK means the kernel accepted it), then the
+    # observation copy. Only delete the file once the work item is in.
+    elanus bus pub work/linemux/triage "$payload" --qos 1 || exit 1
+    elanus bus pub ingress/linemux/message "$payload" --qos 0 || exit 1
+    rm -f "$f"
+  done
+  sleep 1
+done

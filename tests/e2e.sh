@@ -18,6 +18,7 @@ cleanup() {
   # Supervised actors are children of the daemon but survive a plain kill;
   # crash-only in production (their bus connection dies), explicit here.
   pkill -f "$TMP/packages/beacon" 2>/dev/null
+  pkill -f "$TMP/packages/linemux" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
@@ -292,6 +293,42 @@ elanus bus sub 'obs/test/beacon' --count 1 --timeout 10 | grep -q '"ping":true' 
 # The unapproved one was dropped with an obs echo, never delivered.
 wait_for "ACL denial echoed to obs/" "grep -q '\"kind\":\"obs/skill/beacon/denied\"' '$TMP/trace.jsonl'"
 grep -q '"value":"obs/test/evil"' "$TMP/trace.jsonl" && ok "denial names the topic" || fail "denial detail missing"
+
+echo "== 9. ingress bridge: linemux -> triage -> agent work =="
+cp -R "$REPO/packages/linemux" "$TMP/packages/"
+cp -R "$REPO/packages/triage-demo" "$TMP/packages/"
+elanus approve linemux >/dev/null || fail "approve linemux"
+elanus approve triage-demo >/dev/null || fail "approve triage-demo"
+wait_for "linemux alive (retained status)" "elanus bus sub 'obs/skill/linemux/status' --count 1 --timeout 2 | grep -q '\"state\":\"alive\"'"
+mkdir -p "$TMP/run/pkg-linemux/inbox"
+printf 'just a note\n' > "$TMP/run/pkg-linemux/inbox/a.line"
+printf 'agent: say hello\n' > "$TMP/run/pkg-linemux/inbox/b.line"
+# The variety ladder: the plain line is absorbed by the script rung...
+wait_for "triage absorbed the plain line" "grep -q 'just a note' '$TMP/triage.log'"
+# ...and only the agent-addressed line becomes expensive agent work.
+wait_for "agent line escalated to work/agent/exec" \
+  "[ \"\$(sql \"SELECT COUNT(*) FROM events WHERE type='work/agent/exec' AND payload LIKE '%say hello%'\")\" -ge 1 ]"
+grep -q '"kind":"ingress/linemux/message"' "$TMP/trace.jsonl" && ok "ingress observation recorded" || fail "no ingress observation"
+[ ! -e "$TMP/run/pkg-linemux/inbox/a.line" ] && ok "consumed line removed" || fail "inbox file not consumed"
+
+echo "== 10. delivery receipts + escalation =="
+# notify (stock) already surfaced the earlier asks; headless osascript
+# fails but the receipt must exist regardless — attempted delivery is data.
+wait_for "desktop sent-receipt on the ledger" \
+  "[ \"\$(sql \"SELECT COUNT(*) FROM events WHERE type='delivery/desktop/sent'\")\" -ge 1 ]"
+cp -R "$REPO/packages/escalation" "$TMP/packages/"
+# Shipped defaults are humane (30s sweep, 20s threshold); e2e tightens both.
+sed -i '' -e 's,\*/30,\*/2,' -e 's,after_secs = 20,after_secs = 2,' "$TMP/packages/escalation/elanus.toml"
+elanus approve escalation >/dev/null || fail "approve escalation"
+EVN=$(elanus emit human/ask --correlation nag-corr --payload '{"question":"will you ever answer?"}')
+wait_for "unanswered ask got nagged" \
+  "[ \"\$(sql \"SELECT COUNT(*) FROM events WHERE type='signal/attention' AND cause_id=$EVN\")\" -ge 1 ]"
+elanus emit delivery/desktop/acked --payload "{\"ask_id\":$EVN}" --cause "$EVN" >/dev/null
+sleep 3   # let any in-flight sweep land
+N1=$(sql "SELECT COUNT(*) FROM events WHERE type='signal/attention' AND cause_id=$EVN")
+sleep 5   # two more sweep cycles
+N2=$(sql "SELECT COUNT(*) FROM events WHERE type='signal/attention' AND cause_id=$EVN")
+[ "$N1" = "$N2" ] && ok "acked receipt stops the nagging (held at $N1)" || fail "nagged past ack: $N1 -> $N2"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

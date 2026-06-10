@@ -1,0 +1,11 @@
+# The variety ladder's middle rung, demonstrated: a zero-token script
+# absorbs routine ingress; only lines that ask for the agent become agent
+# work. "The agent runs as late as possible" (docs/bus.md).
+
+[request]
+subscribe = ["work/linemux/triage"]
+publish   = ["work/agent/exec"]
+
+[process]
+mode = "exec"
+run  = "scripts/triage"

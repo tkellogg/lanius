@@ -1,0 +1,11 @@
+# Local line-oriented ingress bridge: drop a *.line file into this actor's
+# scratch inbox and it becomes (a) a ledger-backed work/linemux/triage event
+# and (b) an ingress/linemux/message observation for dashboards. The
+# testable proof of the ingress pattern; packages/discord is the real one.
+
+[request]
+publish = ["work/linemux/triage", "ingress/linemux/#"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"

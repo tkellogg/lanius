@@ -1,0 +1,14 @@
+# Discord ingress bridge — UNTESTED SCAFFOLD (no token was available when
+# this was written; the structure is real, the gateway handling needs a live
+# pass). Requires: DISCORD_TOKEN in the daemon's environment, python3 with
+# the `websockets` package. Unconfigured, it parks (sleeps) rather than
+# crash-looping the supervisor.
+
+[request]
+subscribe = ["work/discord/send"]
+publish   = ["ingress/discord/#", "work/discord/triage", "delivery/discord/#"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+session_expiry_s = 30

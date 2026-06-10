@@ -1,0 +1,20 @@
+#!/bin/sh
+# Triage handler: log every line; escalate only "agent: ..." lines to the
+# expensive rung. Everything else is absorbed here, costing zero tokens.
+set -u
+
+EVENT=$(cat)
+text=$(printf '%s' "$EVENT" | python3 -c '
+import json, sys
+print(json.load(sys.stdin).get("payload", {}).get("text", ""))')
+
+printf '%s\n' "$text" >> "$HARNESS_ROOT/triage.log"
+
+case "$text" in
+  agent:*)
+    payload=$(python3 -c '
+import json, sys
+print(json.dumps({"prompt": sys.argv[1][len("agent:"):].strip()}))' "$text")
+    elanus emit work/agent/exec --payload "$payload" >/dev/null
+    ;;
+esac
