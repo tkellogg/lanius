@@ -512,6 +512,7 @@ dependencies = [
  "croner",
  "genai",
  "globset",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

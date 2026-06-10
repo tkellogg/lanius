@@ -111,6 +111,10 @@ enum Cmd {
 }
 
 fn main() {
+    // Die quietly on EPIPE like a normal Unix tool (`harness inbox | grep -q`).
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
         eprintln!("error: {e:#}");
