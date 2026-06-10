@@ -1,0 +1,40 @@
+#!/bin/sh
+# Sweep for unanswered asks and re-surface them, capped. An ask stops
+# nagging when: a human/answer shares its correlation, its deadline default
+# fired (state=expired), a delivery/+/acked receipt names it (someone saw
+# it on some channel), or the cap is reached. Nag state lives in the kv
+# table — survives daemon restarts, dies with the root, costs nothing.
+set -u
+
+EVENT=$(cat)
+AFTER=$(printf '%s' "$EVENT" | python3 -c '
+import json, sys
+print((json.load(sys.stdin).get("payload") or {}).get("after_secs", 20))')
+CAP=3
+DB="$HARNESS_DB"
+
+for ask_id in $(sqlite3 "$DB" "
+  SELECT e.id FROM events e
+   WHERE e.type = 'human/ask'
+     AND e.state NOT IN ('expired', 'denied')
+     AND e.correlation_id IS NOT NULL
+     AND e.created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || $AFTER || ' seconds')
+     AND NOT EXISTS (SELECT 1 FROM events a
+                     WHERE a.type = 'human/answer' AND a.correlation_id = e.correlation_id)
+     AND NOT EXISTS (SELECT 1 FROM events k
+                     WHERE k.type LIKE 'delivery/%/acked'
+                       AND json_extract(k.payload, '\$.ask_id') = e.id)
+"); do
+  n=$(sqlite3 "$DB" "SELECT COALESCE((SELECT value FROM kv WHERE key='escalation:nag:$ask_id'), 0)")
+  [ "$n" -ge "$CAP" ] && continue
+  n=$((n + 1))
+  question=$(sqlite3 "$DB" "SELECT COALESCE(json_extract(payload, '\$.question'), '') FROM events WHERE id=$ask_id")
+  payload=$(python3 -c '
+import json, sys
+print(json.dumps({"ask_id": int(sys.argv[1]), "question": sys.argv[2], "nag_count": int(sys.argv[3]),
+                  "reason": f"ask #{sys.argv[1]} still unanswered (nag {sys.argv[3]})"}))' \
+    "$ask_id" "$question" "$n")
+  elanus emit signal/attention --payload "$payload" --cause "$ask_id" >/dev/null
+  sqlite3 "$DB" "INSERT INTO kv(key, value) VALUES('escalation:nag:$ask_id', '$n')
+                 ON CONFLICT(key) DO UPDATE SET value='$n'"
+done

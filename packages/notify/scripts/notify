@@ -21,8 +21,24 @@ if etype == "human/ask":
     body += f'  — answer: elanus answer {event.get("id")} "..."'
 
 script = 'on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run'
+ok = False
 try:
-    subprocess.run(["osascript", "-e", script, title, body[:220]], check=False, timeout=10)
+    r = subprocess.run(["osascript", "-e", script, title, body[:220]], check=False, timeout=10)
+    ok = r.returncode == 0
 except Exception:
     pass
+
+# The receipt: "we attempted delivery on this channel, and it did/didn't
+# work". sent != acked — acked means a human demonstrably saw it, which the
+# desktop channel cannot know. Escalation logic keys off these.
+if etype == "human/ask":
+    receipt = json.dumps({"ask_id": event.get("id"), "channel": "desktop", "ok": ok})
+    try:
+        subprocess.run(
+            ["elanus", "emit", "delivery/desktop/sent", "--payload", receipt,
+             "--cause", str(event.get("id"))],
+            check=False, timeout=10,
+        )
+    except Exception:
+        pass
 print(body)
