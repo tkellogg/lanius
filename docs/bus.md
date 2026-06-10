@@ -119,9 +119,10 @@ moves to package manifests (see Packages below); `ls packages/` replaces
 **[DECIDED]** In-process bus; MQTT 5 listener as the boundary; privileged
 in-process consumers for ledger/recorder/hooks/exec.
 
-**[DECIDED — lean, spike before committing]** Build the micro-broker on
-**ntex-mqtt 8.x**. Research verdict (June 2026): it is the only option meeting
-every requirement *natively*:
+**[DECIDED — spike passed 2026-06-10, see spike/ntex/REPORT.md]** Build the
+micro-broker on **ntex-mqtt 8.x**. Research verdict (June 2026): it is the
+only option meeting every requirement *natively* — and the spike confirmed
+each claim live:
 
 - SUBSCRIBE user properties + subscription identifiers are surfaced directly
   to application code (`v5::codec::Subscribe { user_properties, .. }`), with
@@ -138,8 +139,22 @@ Costs, eyes open: ~1–2k LOC of broker logic (topic trie, retained store,
 shared groups, will-delay timers, session expiry), the ntex `System`-in-a-
 thread embedding dance, and single-maintainer framework risk.
 
-**[OPEN — fallback]** If the micro-broker spike runs heavy: embed **rmqtt
-0.21+** (very active, documented library mode, tokio-native). It has the right
+Spike results (2026-06-10, spike/ntex/): **both fallback triggers clear.**
+Embedding works — ntex on a dedicated `std::thread` creates its own
+current_thread runtime (`Handle::try_current()` → Err path in ntex-net),
+coexisting with the main tokio multi-thread runtime, 10/10 clean runs; the
+contract is *launch the System only from `std::thread::spawn`, never inside a
+tokio task*. `Subscribe::user_properties` + per-filter `confirm`/`fail(0x87)`
+confirmed; `send_at_least_once()` futures resolve on subscriber PUBACK
+(fan-out join = "all deliveries complete"). Owned broker logic ≈ **1k LOC**
+vs the 2k trigger. Loopback publish ~11 µs release, round trip < 10 ms —
+well inside the 500 ms hook budget. Residual: `!Send` internals
+(`Rc<MqttShared>`) pin broker logic to the ntex thread — cross-thread via
+channels, as designed; keep owned logic thin so rmqtt migration stays
+mechanical.
+
+**[DECIDED — fallback, not triggered]** If ntex sours later (maintainer risk):
+embed **rmqtt 0.21+** (very active, documented library mode, tokio-native). It has the right
 hook points (`ClientSubscribeCheckAcl`, `MessagePublish`, `MessageAcked`/
 `MessageDropped`, router introspection for fan-out sets) — but **drops
 SUBSCRIBE user properties before they reach hooks** (small localized patch, or
@@ -208,7 +223,9 @@ chain is where sandbox capability policy enforces when it lands — hooks are
 the enforcement point init.md promised ("injection checks before dispatch").
 
 **[OPEN]** Resident-hook transport: in-process trait object vs MQTT
-request/response round trip — measure the latency budget in the spike.
+request/response round trip. Spike measured the budget: loopback publish
+~11 µs (release), cross-thread round trip < 10 ms — MQTT round-trip is
+viable; the remaining question is taste, not feasibility.
 **[OPEN]** Whether the render-provider contract folds into pre-LLM-request
 hooks (a provider is arguably a hook that appends context).
 

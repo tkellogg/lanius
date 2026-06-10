@@ -1,0 +1,25 @@
+[package]
+name = "ntex-spike"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
+
+[dependencies]
+# ntex ecosystem — tokio backend
+ntex = { version = "3.9.6", features = ["tokio"] }
+ntex-mqtt = "8.1.0"
+
+# tokio for the main thread work
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+# rumqttc as the client in the round-trip demo
+rumqttc = "0.24"
+
+# utilities
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+bytes = "1"
