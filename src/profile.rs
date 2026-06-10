@@ -29,6 +29,15 @@ pub struct ModelCfg {
     pub model: String,
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
+    /// SDK-style base URL override for Anthropic-compatible providers
+    /// (e.g. "https://api.deepseek.com/anthropic"). Falls back to the
+    /// ANTHROPIC_BASE_URL env var when the model resolves to the Anthropic
+    /// adapter — same semantics as Anthropic's own SDK.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Env var holding the API key, when it isn't the adapter's default.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 impl Default for ModelCfg {
@@ -36,6 +45,8 @@ impl Default for ModelCfg {
         ModelCfg {
             model: default_model(),
             max_turns: default_max_turns(),
+            base_url: None,
+            api_key_env: None,
         }
     }
 }

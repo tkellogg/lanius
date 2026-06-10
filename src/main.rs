@@ -1,5 +1,6 @@
 mod db;
 mod dispatcher;
+mod dotenv;
 mod events;
 mod exec;
 mod human;
@@ -123,6 +124,9 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // Secrets fallback: cwd .env first (dev convenience), then the root's
+    // .env once resolved. Real environment always wins over both.
+    dotenv::load(std::path::Path::new(".env"));
     match cli.cmd {
         Cmd::Init { dir } => {
             return initcmd::init(dir.unwrap_or(std::env::current_dir()?));
@@ -130,6 +134,7 @@ fn run(cli: Cli) -> Result<()> {
         _ => {}
     }
     let root = paths::resolve(cli.root)?;
+    dotenv::load(&root.dir.join(".env"));
     match cli.cmd {
         Cmd::Init { .. } => unreachable!(),
         Cmd::Daemon { interval_ms } => dispatcher::run(&root, interval_ms)?,

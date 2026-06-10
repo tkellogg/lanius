@@ -95,7 +95,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
     }
 
     let system = render::render(root, &conn, &opts.profile, &session)?;
-    let client = Client::default();
+    let client = build_client(&prof);
     let model = prof.model.model.clone();
     let tools = tool_defs();
     let root_type = match event_id {
@@ -277,6 +277,51 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
 
 fn pending_ask_key(session: &str) -> String {
     format!("session:{session}:pending_ask")
+}
+
+/// Default client unless an endpoint/auth override is in play — then a
+/// ServiceTargetResolver rewrites the target. ANTHROPIC_BASE_URL (env) only
+/// applies when the model resolved to the Anthropic adapter, mirroring the
+/// Anthropic SDK; a profile's explicit base_url applies unconditionally.
+fn build_client(prof: &profile::Profile) -> Client {
+    use genai::adapter::AdapterKind;
+    use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
+    use genai::ServiceTarget;
+
+    let profile_url = prof.model.base_url.clone();
+    let env_url = std::env::var("ANTHROPIC_BASE_URL").ok().filter(|s| !s.is_empty());
+    let api_key_env = prof.model.api_key_env.clone();
+    if profile_url.is_none() && env_url.is_none() && api_key_env.is_none() {
+        return Client::default();
+    }
+    let resolver = ServiceTargetResolver::from_resolver_fn(
+        move |mut target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+            let adapter = target.model.adapter_kind;
+            let url = profile_url
+                .clone()
+                .or_else(|| (adapter == AdapterKind::Anthropic).then(|| env_url.clone()).flatten());
+            if let Some(url) = url {
+                target.endpoint = Endpoint::from_owned(normalize_base_url(&url, adapter));
+            }
+            if let Some(envk) = &api_key_env {
+                target.auth = AuthData::from_env(envk.clone());
+            }
+            Ok(target)
+        },
+    );
+    Client::builder().with_service_target_resolver(resolver).build()
+}
+
+/// genai appends e.g. "messages" directly to the endpoint, while SDK-style
+/// base URLs (ANTHROPIC_BASE_URL) expect "/v1/messages" appended. Normalize:
+/// trailing slash always; for the Anthropic adapter, a missing /v1/ is added.
+fn normalize_base_url(url: &str, adapter: genai::adapter::AdapterKind) -> String {
+    let trimmed = url.trim_end_matches('/');
+    if adapter == genai::adapter::AdapterKind::Anthropic && !trimmed.ends_with("/v1") {
+        format!("{trimmed}/v1/")
+    } else {
+        format!("{trimmed}/")
+    }
 }
 
 /// Synthesize results for tool calls that never got one (crash mid-tool, or a

@@ -4,6 +4,11 @@
 [model]
 model = "claude-sonnet-4-6"   # any genai target, e.g. "anthropic::claude-fable-5"
 max_turns = 24
+# Anthropic-compatible providers: force the adapter with the namespace form
+# and point base_url at the provider (or set ANTHROPIC_BASE_URL in .env):
+#   model = "anthropic::deepseek-chat"
+#   base_url = "https://api.deepseek.com/anthropic"
+#   api_key_env = "DEEPSEEK_API_KEY"   # if not ANTHROPIC_API_KEY
 
 [skills]
 include = ["*"]
