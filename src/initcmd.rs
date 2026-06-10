@@ -70,10 +70,10 @@ pub fn init(dir: PathBuf) -> Result<()> {
     println!();
     println!("next steps:");
     println!("  export HARNESS_ROOT={}", root.dir.display());
-    println!("  harness daemon &                     # the dispatcher");
-    println!("  harness exec --session hi \"hello\"    # chat (needs ANTHROPIC_API_KEY)");
-    println!("  harness emit agent.exec --payload '{{\"prompt\":\"check in with me\"}}'");
-    println!("  harness inbox / harness answer <id> \"...\"");
+    println!("  elanus daemon &                     # the dispatcher");
+    println!("  elanus exec --session hi \"hello\"    # chat (needs ANTHROPIC_API_KEY)");
+    println!("  elanus emit agent.exec --payload '{{\"prompt\":\"check in with me\"}}'");
+    println!("  elanus inbox / elanus answer <id> \"...\"");
     println!("  tail -f {}", root.trace_file().display());
     Ok(())
 }

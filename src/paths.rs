@@ -50,7 +50,7 @@ pub fn resolve(cli: Option<PathBuf>) -> Result<Root> {
             break;
         }
     }
-    bail!("no harness root found: run `harness init [dir]`, set HARNESS_ROOT, or pass -C <dir>")
+    bail!("no harness root found: run `elanus init [dir]`, set HARNESS_ROOT, or pass -C <dir>")
 }
 
 fn canon(p: PathBuf) -> Result<PathBuf> {

@@ -449,7 +449,7 @@ fn spawn_handler(
     let out_f = std::fs::File::create(&out_path)?;
     let err_f = std::fs::File::create(&err_path)?;
 
-    // Handlers call back into `harness`; make sure this binary wins on PATH.
+    // Handlers call back into `elanus`; make sure this binary wins on PATH.
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))

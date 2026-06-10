@@ -22,7 +22,7 @@ Then it's a handler.** The harness gets smaller by refusing to contain things.
 
 ## Non-goals
 
-- No workflow engine. A workflow is a script that calls `harness exec`. The OS is
+- No workflow engine. A workflow is a script that calls `elanus exec`. The OS is
   the workflow engine. RLM-style dynamic workflows live in userland as scripts that
   spawn child execs with restricted context views.
 - No personality. Self-mutating memory blocks are **punted, not designed for** — if
@@ -100,7 +100,7 @@ Kinds: `dispatch`, `handler.start`, `handler.exit`, `llm.request`, `llm.response
 Three writers cover everything: the dispatcher (dispatch, handler exits), the exec
 handler's tool loop (LLM requests/responses, tool calls/results — the loop is
 hand-rolled precisely so provenance capture like this is owned code, see Stack), and
-`harness trace` for arbitrary handlers.
+`elanus trace` for arbitrary handlers.
 
 **[OPEN]** Rotation/retention policy (daily files? size-based? never, until it
 hurts?).
@@ -148,7 +148,7 @@ registered — see Skill packages for registration):
 - A distinguished exit code (e.g. 75, à la EX_TEMPFAIL) = **suspended** —
   handler checkpointed itself and exited; resume happens via correlation_id
   (see Human Actor section).
-- Handlers emit new events via `harness emit`, which reads `HARNESS_EVENT_ID` from
+- Handlers emit new events via `elanus emit`, which reads `HARNESS_EVENT_ID` from
   env and threads `cause_id` automatically. Causality propagation must be
   zero-effort or it won't happen.
 
@@ -204,7 +204,7 @@ max_concurrent = 2
   have both (the Discord package: handlers for inbound messages *and* a SKILL.md
   telling the agent how to send them). Don't force ceremony either way.
 
-**Registration**: `harness enable <skill>` reads the manifest and materializes
+**Registration**: `elanus enable <skill>` reads the manifest and materializes
 `handlers.d/<event.type>/NN-name` symlinks, systemd-unit style. The manifest is the
 source of truth; `handlers.d/` is the compiled routing table. The dispatcher's logic
 stays "scan a directory," and debugging stays `ls`. **[OPEN]** Whether to keep the
@@ -220,14 +220,14 @@ render into context. One package, two facets, two activation scopes.
 
 **[DECIDED]** Two runtime verbs:
 
-- `harness emit <type> [--payload ...] [--priority ...] [--deadline ... --default ...]`
+- `elanus emit <type> [--payload ...] [--priority ...] [--deadline ... --default ...]`
   — universal entry point. Cron ticks, webhooks, CLI invocations, agent-spawned
   work, signals: all just emit.
-- `harness exec [--session ID] [--profile PATH] <prompt|->`
+- `elanus exec [--session ID] [--profile PATH] <prompt|->`
   — run an agent turn. **Chat is exec with a session ID** — one primitive, not two.
 
-Everything else is either sugar over emit (`harness ask`, `harness answer`) or
-plumbing, not semantics (`harness trace` appends a trace line; `harness enable`
+Everything else is either sugar over emit (`elanus ask`, `elanus answer`) or
+plumbing, not semantics (`elanus trace` appends a trace line; `elanus enable`
 materializes a package's registrations).
 
 ## Events: causality, workload typing, throttling
@@ -266,7 +266,7 @@ policy, not machinery**: the `signal.*` class in the throttle table is exempt fr
 coalescing, never queues behind other work, and punches through the human-proxy's
 digest batching.
 
-The agent is on both ends of the channel, via the same `harness emit`:
+The agent is on both ends of the channel, via the same `elanus emit`:
 
 - **Consuming**: signals wake or interrupt execs. Preemption of in-flight work is
   the one genuinely new behavior: a running exec checks for pending `signal.*`
@@ -327,7 +327,7 @@ Blocks exist only as a *render target*, never as a mutable store.
 **[OPEN]** Render-provider contract shape — lean: an executable declared in a
 package's manifest, invoked at render time with (profile, session, query hints) on
 stdin, returning block content on stdout. **[OPEN]** Whether assembly is a library
-linked into the exec handler or a standalone `harness render` the exec handler
+linked into the exec handler or a standalone `elanus render` the exec handler
 shells out to. Lean standalone — inspectable with `| less`, testable in isolation.
 
 ## Profiles
@@ -461,14 +461,14 @@ handler contract makes the kernel swappable; the schema is the real interface.
 ## Open questions (consolidated)
 
 1. Dispatcher wakeup: poll vs update_hook vs WAL watch. (Start: poll.)
-2. Context assembly: library vs `harness render` subprocess (lean: subprocess), and
+2. Context assembly: library vs `elanus render` subprocess (lean: subprocess), and
    the render-provider contract shape (lean: manifest-declared executable, stdin →
    stdout).
 3. Sandbox tech (bwrap / landlock / container) and scope (handlers vs execs only).
 4. Kernel language: Rust + genai vs Python first.
 5. Retry policy representation: per event type in throttles table vs separate table.
 6. Trace rotation/retention policy.
-7. Registration: keep materialized `handlers.d/` (via `harness enable`) vs
+7. Registration: keep materialized `handlers.d/` (via `elanus enable`) vs
    dispatcher reads manifests directly. (Lean: materialized — dumber dispatcher.)
 8. Signal taxonomy under `signal.*` and preemption granularity.
 9. How RLM-style context isolation maps: child execs with restricted profile/views.
@@ -477,23 +477,23 @@ handler contract makes the kernel swappable; the schema is the real interface.
 
 ## Suggested build order
 
-1. **Kernel skeleton**: events table + `trace.jsonl` + `harness emit`/`harness
+1. **Kernel skeleton**: events table + `trace.jsonl` + `elanus emit`/`harness
    trace` + dispatcher (poll, fork/exec, record) + handler execution contract.
    First producer: cron tick. First handler: echo. Prove causality threading via
    env *and* that the trace alone reconstructs the run.
-2. **Skill packaging**: `harness.toml` manifest + `harness enable` materialization.
+2. **Skill packaging**: `harness.toml` manifest + `elanus enable` materialization.
    The echo handler becomes the first package.
 3. **Throttles**: table + dispatcher enforcement + per-type concurrency. Verify
    agent-vs-human-initiated policies work via cause-chain root inspection.
 4. **Exec handler**: genai (or chosen layer) + hand-rolled tool loop + messages
-   table. `harness exec --session` = chat. Request metadata carries event
+   table. `elanus exec --session` = chat. Request metadata carries event
    type/causality; tool loop writes `llm.*` / `tool.call` / `tool.result` trace
    lines.
 5. **Human-proxy**: `human.ask`/`human.answer`, Discord adapter as a skill package
    (producer + consumer), deadline/default expiry, suspend-exit-code + resume via
    correlation_id. This is the riskiest novel machinery — do it before it
    calcifies around assumptions.
-6. **Context assembly**: render providers, computed registers, `harness render`,
+6. **Context assembly**: render providers, computed registers, `elanus render`,
    first profile directory.
 7. **Indexing packages** + KB-in-git flow (memory writes as commits).
 8. **Signals**: `signal.*` throttle class (no-coalesce), first measured-pain

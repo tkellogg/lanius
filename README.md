@@ -13,7 +13,7 @@ Design doc: [docs/init.md](docs/init.md).
 cargo build --release
 export PATH="$PWD/target/release:$PATH"
 
-harness init ~/agent          # scaffolds db, trace, default profile, stock skills
+elanus init ~/agent          # scaffolds db, trace, default profile, stock skills
 export HARNESS_ROOT=~/agent
 export ANTHROPIC_API_KEY=...  # any genai-supported provider works; see profile.toml
 ```
@@ -21,16 +21,16 @@ export ANTHROPIC_API_KEY=...  # any genai-supported provider works; see profile.
 ## Run
 
 ```sh
-harness daemon &                                  # the dispatcher (supervisor, not doer)
+elanus daemon &                                  # the dispatcher (supervisor, not doer)
 
-harness exec --session hi "hello"                 # chat = exec with a session id
-harness emit agent.exec --payload '{"prompt":"summarize echo.log"}'   # async agent turn
-harness emit demo.echo --payload '{"x":1}'        # any event; handlers.d decides who cares
+elanus exec --session hi "hello"                 # chat = exec with a session id
+elanus emit agent.exec --payload '{"prompt":"summarize echo.log"}'   # async agent turn
+elanus emit demo.echo --payload '{"x":1}'        # any event; handlers.d decides who cares
 
-harness inbox                                     # what's blocked on you?
-harness answer 42 "yes, ship it"                  # answers route by correlation_id
-harness events --limit 30                         # debug view of the log
-harness render | less                             # inspect assembled context
+elanus inbox                                     # what's blocked on you?
+elanus answer 42 "yes, ship it"                  # answers route by correlation_id
+elanus events --limit 30                         # debug view of the log
+elanus render | less                             # inspect assembled context
 tail -f $HARNESS_ROOT/trace.jsonl | jq .          # the flight recorder
 ```
 
@@ -38,7 +38,7 @@ tail -f $HARNESS_ROOT/trace.jsonl | jq .          # the flight recorder
 
 A cron tick wakes the agent → it works → hits a question → emits `human.ask`
 and exits 75 (checkpoint-and-exit; the transcript in sqlite *is* the process
-state) → notify pops a macOS notification → you `harness answer` → the
+state) → notify pops a macOS notification → you `elanus answer` → the
 dispatcher matches the correlation_id and re-invokes the handler with the
 answer → it finishes. If the deadline passes first, the declared default is
 applied and the assumption is logged as an ordinary event — auditable,
@@ -69,7 +69,7 @@ run = "scripts/context"    # contributes a context block at render time
 max_concurrent = 2
 ```
 
-`harness enable <name>` materializes the manifest into `handlers.d/` symlinks
+`elanus enable <name>` materializes the manifest into `handlers.d/` symlinks
 (systemd-enable style); the manifest is the source of truth, `handlers.d/` is
 the compiled routing table, and debugging is `ls`. `SKILL.md` (agent-facing
 instructions) and `harness.toml` (dispatcher-facing wiring) never mix.
@@ -87,7 +87,7 @@ failures — measured pain, not self-reported), `echo` (demo), `notes`
   `HARNESS_RESUME=1` on resume.
 - Exit 0 done; exit 75 suspended (emit a `human.ask` with a correlation_id
   first — that's the resume key); anything else failed.
-- Emit follow-up events with `harness emit`; `cause_id` threads automatically
+- Emit follow-up events with `elanus emit`; `cause_id` threads automatically
   from the environment.
 
 ## Trace log

@@ -17,7 +17,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "harness", version, about = "elanus: a minimal event-driven agent harness")]
+#[command(name = "elanus", version, about = "elanus: a minimal event-driven agent harness")]
 struct Cli {
     /// Harness root (default: $HARNESS_ROOT, or walk up from cwd to find harness.db)
     #[arg(short = 'C', long, global = true)]
@@ -111,7 +111,7 @@ enum Cmd {
 }
 
 fn main() {
-    // Die quietly on EPIPE like a normal Unix tool (`harness inbox | grep -q`).
+    // Die quietly on EPIPE like a normal Unix tool (`elanus inbox | grep -q`).
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }

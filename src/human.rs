@@ -42,7 +42,7 @@ pub fn inbox(conn: &Connection) -> Result<()> {
             println!("      deadline: {d} -> default: {def}");
         }
         println!("      asked: {created_at}  root cause: {root_type}");
-        println!("      answer with: harness answer {id} \"...\"");
+        println!("      answer with: elanus answer {id} \"...\"");
     }
     Ok(())
 }

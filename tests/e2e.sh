@@ -49,7 +49,7 @@ sql() {
 }
 
 echo "== init =="
-harness init "$TMP" >/dev/null || fail "harness init"
+elanus init "$TMP" >/dev/null || fail "elanus init"
 [ -f "$TMP/harness.db" ] || fail "harness.db missing"
 [ -f "$TMP/trace.jsonl" ] || fail "trace.jsonl missing"
 [ -L "$TMP/handlers.d/demo.echo/00-echo-echo" ] || fail "echo handler not wired"
@@ -71,7 +71,7 @@ case "$EVENT" in
     printf '%s' "$EVENT" > "$HARNESS_ROOT/answered.json"
     exit 0;;
   *)
-    harness emit human.ask --correlation "test-corr-1" --payload '{"question":"proceed with the thing?","options":["yes","no"]}' >/dev/null
+    elanus emit human.ask --correlation "test-corr-1" --payload '{"question":"proceed with the thing?","options":["yes","no"]}' >/dev/null
     exit 75;;
 esac
 EOF
@@ -92,14 +92,14 @@ case "$EVENT" in
     exit 0;;
   *)
     DL=$(date -u -v+2S +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u -d '+2 seconds' +"%Y-%m-%dT%H:%M:%S.000Z")
-    harness emit human.ask --correlation "test-corr-2" --deadline "$DL" --default-action '"go"' --payload '{"question":"expires soon"}' >/dev/null
+    elanus emit human.ask --correlation "test-corr-2" --deadline "$DL" --default-action '"go"' --payload '{"question":"expires soon"}' >/dev/null
     exit 75;;
 esac
 EOF
 chmod +x "$TMP/skills/asker2/scripts/run"
 
-harness enable asker >/dev/null || fail "enable asker"
-harness enable asker2 >/dev/null || fail "enable asker2"
+elanus enable asker >/dev/null || fail "enable asker"
+elanus enable asker2 >/dev/null || fail "enable asker2"
 
 # Seconds-resolution cron so the test doesn't wait a minute.
 mkdir -p "$TMP/skills/ticker"
@@ -109,32 +109,32 @@ schedule = "*/2 * * * * *"
 emit = "demo.echo"
 payload = { from = "ticker" }
 EOF
-harness enable ticker >/dev/null || fail "enable ticker"
+elanus enable ticker >/dev/null || fail "enable ticker"
 
 echo "== daemon =="
-harness daemon --interval-ms 200 >"$TMP/daemon.log" 2>&1 &
+elanus daemon --interval-ms 200 >"$TMP/daemon.log" 2>&1 &
 DAEMON_PID=$!
 sleep 1
 
 echo "== 1. emit -> dispatch -> handler =="
-EV1=$(harness emit demo.echo --payload '{"msg":"hello"}')
+EV1=$(elanus emit demo.echo --payload '{"msg":"hello"}')
 wait_for "echo handler ran" "grep -q '\"msg\":\"hello\"' '$TMP/echo.log'"
 wait_for "event #$EV1 done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV1\")\" = done ]"
 
 echo "== 2. suspend -> answer -> resume =="
-EV2=$(harness emit test.ask)
+EV2=$(elanus emit test.ask)
 wait_for "event #$EV2 waiting_on_human" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV2\")\" = waiting_on_human ]"
 ASK_ID=$(sql "SELECT id FROM events WHERE type='human.ask' AND correlation_id='test-corr-1'")
 [ -n "$ASK_ID" ] || fail "ask event not found"
 CAUSE=$(sql "SELECT cause_id FROM events WHERE id=$ASK_ID")
 [ "$CAUSE" = "$EV2" ] && ok "causality threaded (ask #$ASK_ID <- event #$EV2)" || fail "ask cause_id=$CAUSE, expected $EV2"
-harness inbox | grep -q "proceed with the thing" && ok "inbox shows the ask" || fail "inbox missing the ask"
-harness answer "$ASK_ID" "yes" >/dev/null || fail "harness answer"
+elanus inbox | grep -q "proceed with the thing" && ok "inbox shows the ask" || fail "inbox missing the ask"
+elanus answer "$ASK_ID" "yes" >/dev/null || fail "elanus answer"
 wait_for "handler resumed with answer" "grep -q '\"answer\":\"yes\"' '$TMP/answered.json'"
 wait_for "event #$EV2 done after resume" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV2\")\" = done ]"
 
 echo "== 3. deadline expiry -> default applied =="
-EV3=$(harness emit test.ask2)
+EV3=$(elanus emit test.ask2)
 wait_for "expired ask resumed with default" "grep -q '\"answer\":\"go\"' '$TMP/answered2.json'"
 grep -q '"assumed":true' "$TMP/answered2.json" && ok "assumption logged in answer" || fail "assumed flag missing"
 ASK2=$(sql "SELECT state FROM events WHERE type='human.ask' AND correlation_id='test-corr-2'")

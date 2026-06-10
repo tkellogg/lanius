@@ -18,7 +18,7 @@ options = payload.get("options")
 if options:
     body += "  [" + " | ".join(str(o) for o in options) + "]"
 if etype == "human.ask":
-    body += f'  — answer: harness answer {event.get("id")} "..."'
+    body += f'  — answer: elanus answer {event.get("id")} "..."'
 
 script = 'on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run'
 try:

@@ -29,7 +29,7 @@ enum ToolOutcome {
     Suspend,
 }
 
-/// `harness exec` — run an agent turn. Chat is exec with a session ID.
+/// `elanus exec` — run an agent turn. Chat is exec with a session ID.
 /// The tool loop is hand-rolled on purpose: termination policy, signal
 /// preemption, budget enforcement, and trace capture live here and are owned.
 pub fn run(root: &Root, opts: ExecOpts) -> Result<()> {
@@ -686,7 +686,7 @@ fn store_msg(conn: &Connection, session: &str, event_id: Option<i64>, msg: &Valu
     Ok(())
 }
 
-/// `harness handle-exec` — the two-line-script backend for exec-as-handler.
+/// `elanus handle-exec` — the two-line-script backend for exec-as-handler.
 /// Reads the event envelope from stdin per the handler contract.
 pub fn handle_exec(root: &Root) -> Result<()> {
     let mut body = String::new();
