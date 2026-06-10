@@ -9,6 +9,7 @@ use genai::chat::{ChatMessage, ChatRequest, Tool, ToolCall, ToolResponse};
 use genai::Client;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::Read as _;
 
 pub struct ExecOpts {
@@ -16,6 +17,16 @@ pub struct ExecOpts {
     pub profile: String,
     pub prompt: Option<String>,
     pub resume: Option<String>,
+}
+
+/// What a tool invocation produced. Model-caused errors (bad args, unknown
+/// tool) are Output too — they go back to the model as results so it can
+/// self-correct; aborting the exec would strand the stored tool-call message.
+enum ToolOutcome {
+    Output(String),
+    /// ask_human under the daemon: bookkeeping done, caller finishes the
+    /// batch with synthetic results and exits 75.
+    Suspend,
 }
 
 /// `harness exec` — run an agent turn. Chat is exec with a session ID.
@@ -65,10 +76,22 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
             }),
         )?;
         db::kv_del(&conn, &key)?;
-    } else if let Some(p) = &prompt {
-        store_msg(&conn, &session, event_id, &json!({ "role": "user", "text": p }))?;
-    } else {
-        bail!("nothing to do: provide a prompt, '-' for stdin, or --resume");
+    }
+
+    // Crash repair BEFORE appending new input: any assistant tool call with no
+    // recorded result (process died mid-tool, or an abandoned suspend) gets a
+    // synthetic "interrupted" result so the replayed transcript stays valid.
+    let repaired = repair_transcript(&conn, &session)?;
+    if repaired > 0 {
+        eprintln!("[exec] repaired {repaired} interrupted tool call(s) in session {session}");
+    }
+
+    if opts.resume.is_none() {
+        if let Some(p) = &prompt {
+            store_msg(&conn, &session, event_id, &json!({ "role": "user", "text": p }))?;
+        } else {
+            bail!("nothing to do: provide a prompt, '-' for stdin, or --resume");
+        }
     }
 
     let system = render::render(root, &conn, &opts.profile, &session)?;
@@ -84,13 +107,16 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
+    // Events emitted by this exec; excluded from signal preemption so an agent
+    // emitting signal.pain doesn't get its own scream echoed back (feedback loop).
+    let mut self_emitted: HashSet<i64> = HashSet::new();
 
     let mut turns = 0u32;
     loop {
         turns += 1;
         if turns > prof.model.max_turns {
             events::emit(
-                &conn_root(root),
+                root,
                 &conn,
                 EmitOpts {
                     payload: Some(json!({
@@ -153,7 +179,8 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
             return Ok(());
         }
 
-        for call in &tool_calls {
+        let mut suspended_at: Option<usize> = None;
+        for (i, call) in tool_calls.iter().enumerate() {
             // tool.call goes to the trace BEFORE execution: a crash mid-tool
             // must be visible as a call with no result.
             trace::write(
@@ -162,28 +189,64 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 &ids,
                 json!({ "call_id": call.call_id, "name": call.fn_name, "args": call.fn_arguments }),
             );
-            let result = run_tool(root, &conn, &session, event_id, in_handler, call)?;
-            trace::write(
-                root,
-                "tool.result",
-                &ids,
-                json!({ "call_id": call.call_id, "name": call.fn_name, "result": trace::clip(&result, 2000) }),
-            );
-            store_msg(
-                &conn,
-                &session,
-                event_id,
-                &json!({
-                    "role": "tool",
-                    "tool_call_id": call.call_id,
-                    "name": call.fn_name,
-                    "content": result,
-                }),
-            )?;
+            match run_tool(root, &conn, &session, event_id, in_handler, call, &mut self_emitted) {
+                ToolOutcome::Output(result) => {
+                    trace::write(
+                        root,
+                        "tool.result",
+                        &ids,
+                        json!({ "call_id": call.call_id, "name": call.fn_name, "result": trace::clip(&result, 2000) }),
+                    );
+                    store_msg(
+                        &conn,
+                        &session,
+                        event_id,
+                        &json!({
+                            "role": "tool",
+                            "tool_call_id": call.call_id,
+                            "name": call.fn_name,
+                            "content": result,
+                        }),
+                    )?;
+                }
+                ToolOutcome::Suspend => {
+                    suspended_at = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(i) = suspended_at {
+            // Sibling calls after the parked one get synthetic results NOW so
+            // the transcript replays cleanly on resume; only the ask itself
+            // stays open (its response arrives with the answer).
+            let interrupted =
+                json!({ "error": "interrupted: run suspended while waiting on the human" }).to_string();
+            for call in &tool_calls[i + 1..] {
+                trace::write(
+                    root,
+                    "tool.result",
+                    &ids,
+                    json!({ "call_id": call.call_id, "name": call.fn_name, "interrupted": true }),
+                );
+                store_msg(
+                    &conn,
+                    &session,
+                    event_id,
+                    &json!({
+                        "role": "tool",
+                        "tool_call_id": call.call_id,
+                        "name": call.fn_name,
+                        "content": interrupted,
+                    }),
+                )?;
+            }
+            // Checkpoint-and-exit, never block: the transcript in sqlite is
+            // the process state; 75 tells the dispatcher to park this chain.
+            std::process::exit(75);
         }
 
         // Algedonic preemption: between tool batches, new signal.* events
-        // interrupt the loop as injected context.
+        // (not our own) interrupt the loop as injected context.
         let sigs: Vec<(i64, String, Option<String>)> = {
             let mut stmt = conn.prepare(
                 "SELECT id, type, payload FROM events WHERE type LIKE 'signal.%' AND id > ?1 ORDER BY id",
@@ -193,8 +256,9 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             r
         };
+        signal_watermark = sigs.iter().map(|s| s.0).max().unwrap_or(signal_watermark);
+        let sigs: Vec<_> = sigs.into_iter().filter(|(id, _, _)| !self_emitted.contains(id)).collect();
         if !sigs.is_empty() {
-            signal_watermark = sigs.iter().map(|s| s.0).max().unwrap_or(signal_watermark);
             let note = sigs
                 .iter()
                 .map(|(id, t, p)| format!("[signal #{id}] {t} {}", p.as_deref().unwrap_or("{}")))
@@ -211,13 +275,69 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
     }
 }
 
-// events::emit takes &Root; tiny shim so call sites read naturally.
-fn conn_root(root: &Root) -> Root {
-    root.clone()
-}
-
 fn pending_ask_key(session: &str) -> String {
     format!("session:{session}:pending_ask")
+}
+
+/// Synthesize results for tool calls that never got one (crash mid-tool, or a
+/// suspend that was abandoned and re-prompted). Must run BEFORE new input is
+/// appended so the synthetic results sit adjacent to their tool-call message.
+fn repair_transcript(conn: &Connection, session: &str) -> Result<usize> {
+    let rows: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT content FROM messages WHERE session_id=?1 ORDER BY id ASC")?;
+        let r = stmt
+            .query_map([session], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+    let mut calls: Vec<(String, String)> = Vec::new(); // (call_id, name)
+    let mut responded: HashSet<String> = HashSet::new();
+    for raw in &rows {
+        let m: Value = serde_json::from_str(raw)?;
+        match m["role"].as_str().unwrap_or("") {
+            "assistant" => {
+                if let Some(tcs) = m["tool_calls"].as_array() {
+                    for c in tcs {
+                        calls.push((
+                            c["call_id"].as_str().unwrap_or_default().to_string(),
+                            c["fn_name"].as_str().unwrap_or_default().to_string(),
+                        ));
+                    }
+                }
+            }
+            "tool" => {
+                responded.insert(m["tool_call_id"].as_str().unwrap_or_default().to_string());
+            }
+            _ => {}
+        }
+    }
+    let dangling: Vec<_> = calls.into_iter().filter(|(id, _)| !responded.contains(id)).collect();
+    if dangling.is_empty() {
+        return Ok(0);
+    }
+    for (call_id, name) in &dangling {
+        store_msg(
+            conn,
+            session,
+            None,
+            &json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": name,
+                "content": json!({ "error": "interrupted before a result was recorded" }).to_string(),
+            }),
+        )?;
+    }
+    // If the repaired call was a parked ask, that suspend is now abandoned.
+    let key = pending_ask_key(session);
+    if let Some(pend) = db::kv_get(conn, &key)? {
+        let pend: Value = serde_json::from_str(&pend).unwrap_or(Value::Null);
+        if dangling.iter().any(|(id, _)| Some(id.as_str()) == pend["call_id"].as_str()) {
+            db::kv_del(conn, &key)?;
+        }
+    }
+    Ok(dangling.len())
 }
 
 /// Rebuild genai chat messages from the normalized transcript rows.
@@ -236,8 +356,13 @@ fn build_request(conn: &Connection, session: &str, system: &str, tools: &[Tool])
         match m["role"].as_str().unwrap_or("") {
             "user" => msgs.push(ChatMessage::user(m["text"].as_str().unwrap_or_default())),
             "assistant" => {
+                let text = m["text"].as_str().unwrap_or_default();
                 if let Some(calls) = m["tool_calls"].as_array() {
-                    // Replay as a tool-call message; the text part is audit-only.
+                    // Keep the assistant's interleaved commentary: replay text
+                    // first, then the tool calls.
+                    if !text.is_empty() {
+                        msgs.push(ChatMessage::assistant(text));
+                    }
                     let tcs: Vec<ToolCall> = calls
                         .iter()
                         .map(|c| ToolCall {
@@ -248,8 +373,8 @@ fn build_request(conn: &Connection, session: &str, system: &str, tools: &[Tool])
                         })
                         .collect();
                     msgs.push(ChatMessage::from(tcs));
-                } else {
-                    msgs.push(ChatMessage::assistant(m["text"].as_str().unwrap_or_default()));
+                } else if !text.is_empty() {
+                    msgs.push(ChatMessage::assistant(text));
                 }
             }
             "tool" => {
@@ -328,21 +453,23 @@ fn run_tool(
     event_id: Option<i64>,
     in_handler: bool,
     call: &ToolCall,
-) -> Result<String> {
+    self_emitted: &mut HashSet<i64>,
+) -> ToolOutcome {
     let args = &call.fn_arguments;
+    let err = |msg: String| ToolOutcome::Output(json!({ "error": msg }).to_string());
     match call.fn_name.as_str() {
         "shell" => {
-            let cmd = args["command"]
-                .as_str()
-                .ok_or_else(|| anyhow!("shell: missing command"))?;
+            let Some(cmd) = args["command"].as_str() else {
+                return err("shell: missing 'command'".into());
+            };
             let timeout = args["timeout_secs"].as_u64().unwrap_or(120);
-            Ok(run_shell(root, cmd, timeout))
+            ToolOutcome::Output(run_shell(root, cmd, timeout))
         }
         "emit_event" => {
-            let etype = args["type"]
-                .as_str()
-                .ok_or_else(|| anyhow!("emit_event: missing type"))?;
-            let id = events::emit(
+            let Some(etype) = args["type"].as_str() else {
+                return err("emit_event: missing 'type'".into());
+            };
+            match events::emit(
                 root,
                 conn,
                 EmitOpts {
@@ -351,13 +478,18 @@ fn run_tool(
                     cause: event_id,
                     ..EmitOpts::new(etype)
                 },
-            )?;
-            Ok(json!({ "emitted_event_id": id }).to_string())
+            ) {
+                Ok(id) => {
+                    self_emitted.insert(id);
+                    ToolOutcome::Output(json!({ "emitted_event_id": id }).to_string())
+                }
+                Err(e) => err(format!("emit failed: {e:#}")),
+            }
         }
         "ask_human" => {
-            let question = args["question"]
-                .as_str()
-                .ok_or_else(|| anyhow!("ask_human: missing question"))?;
+            let Some(question) = args["question"].as_str() else {
+                return err("ask_human: missing 'question'".into());
+            };
             let options: Vec<String> = args["options"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|o| o.as_str().map(String::from)).collect())
@@ -365,11 +497,10 @@ fn run_tool(
             if !in_handler {
                 // Interactive: short-circuit through the terminal.
                 if let Some(answer) = ask_tty(question, &options) {
-                    return Ok(json!({ "answer": answer }).to_string());
+                    return ToolOutcome::Output(json!({ "answer": answer }).to_string());
                 }
             }
-            // Daemon context: checkpoint-and-exit, never block. The transcript
-            // already in sqlite IS the process state.
+            // Daemon context: checkpoint-and-exit, never block.
             let corr = uuid::Uuid::new_v4().to_string();
             let deadline = args["deadline_minutes"].as_f64().map(|m| {
                 (chrono::Utc::now() + chrono::Duration::seconds((m * 60.0) as i64))
@@ -379,7 +510,7 @@ fn run_tool(
             if !options.is_empty() {
                 payload["options"] = json!(options);
             }
-            let ask_id = events::emit(
+            let ask_id = match events::emit(
                 root,
                 conn,
                 EmitOpts {
@@ -390,12 +521,17 @@ fn run_tool(
                     cause: event_id,
                     ..EmitOpts::new("human.ask")
                 },
-            )?;
-            db::kv_set(
+            ) {
+                Ok(id) => id,
+                Err(e) => return err(format!("ask emit failed: {e:#}")),
+            };
+            if let Err(e) = db::kv_set(
                 conn,
                 &pending_ask_key(session),
                 &json!({ "call_id": call.call_id, "correlation": corr, "ask_id": ask_id }).to_string(),
-            )?;
+            ) {
+                return err(format!("checkpoint failed: {e:#}"));
+            }
             let mut ids = trace::Ids::from_env();
             ids.session_id = Some(session.to_string());
             ids.correlation_id = Some(corr.clone());
@@ -406,17 +542,18 @@ fn run_tool(
                 json!({ "call_id": call.call_id, "name": "ask_human", "suspended": true, "ask_id": ask_id }),
             );
             eprintln!("suspending: waiting on human (ask #{ask_id}, correlation {corr})");
-            std::process::exit(75);
+            ToolOutcome::Suspend
         }
-        other => Ok(json!({ "error": format!("unknown tool: {other}") }).to_string()),
+        other => err(format!("unknown tool: {other}")),
     }
 }
 
 fn run_shell(root: &Root, cmd: &str, timeout_secs: u64) -> String {
+    use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
-    let spawned = Command::new("sh")
-        .arg("-c")
+    let mut c = Command::new("sh");
+    c.arg("-c")
         .arg(cmd)
         .current_dir(&root.dir)
         .stdin(Stdio::null())
@@ -424,40 +561,61 @@ fn run_shell(root: &Root, cmd: &str, timeout_secs: u64) -> String {
         .stderr(Stdio::piped())
         .env("HARNESS_ROOT", &root.dir)
         .env("HARNESS_DB", root.db())
-        .env("HARNESS_TRACE", root.trace_file())
-        .spawn();
-    let mut child = match spawned {
+        .env("HARNESS_TRACE", root.trace_file());
+    // Own process group so a timeout can kill the whole tree, not just sh.
+    c.process_group(0);
+    let mut child = match c.spawn() {
         Ok(c) => c,
         Err(e) => return json!({ "error": format!("spawn failed: {e}") }).to_string(),
     };
+    let pid = child.id() as i32;
+    // Drain pipes concurrently: a child writing more than the pipe buffer
+    // would otherwise block forever and look like a hang.
+    let out_h = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut b = String::new();
+            let _ = s.read_to_string(&mut b);
+            b
+        })
+    });
+    let err_h = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut b = String::new();
+            let _ = s.read_to_string(&mut b);
+            b
+        })
+    });
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut o) = child.stdout.take() {
-                    let _ = o.read_to_string(&mut stdout);
-                }
-                if let Some(mut e) = child.stderr.take() {
-                    let _ = e.read_to_string(&mut stderr);
-                }
-                return json!({
-                    "exit_code": status.code().unwrap_or(-1),
-                    "stdout": trace::clip(&stdout, 8000),
-                    "stderr": trace::clip(&stderr, 4000),
-                })
-                .to_string();
-            }
-            Ok(None) => {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) | Err(_) => {
                 if Instant::now() > deadline {
-                    let _ = child.kill();
-                    return json!({ "error": format!("timed out after {timeout_secs}s") }).to_string();
+                    unsafe {
+                        libc::killpg(pid, libc::SIGKILL);
+                    }
+                    let _ = child.wait(); // reap; no zombies
+                    break None;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return json!({ "error": format!("wait failed: {e}") }).to_string(),
         }
+    };
+    let stdout = out_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    let stderr = err_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    match status {
+        Some(s) => json!({
+            "exit_code": s.code().unwrap_or(-1),
+            "stdout": trace::clip(&stdout, 8000),
+            "stderr": trace::clip(&stderr, 4000),
+        })
+        .to_string(),
+        None => json!({
+            "error": format!("timed out after {timeout_secs}s (process group killed)"),
+            "stdout": trace::clip(&stdout, 8000),
+            "stderr": trace::clip(&stderr, 4000),
+        })
+        .to_string(),
     }
 }
 

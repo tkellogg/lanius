@@ -108,19 +108,26 @@ fn run_provider(root: &Root, script: &std::path::Path, profile_name: &str, sessi
             json!({ "profile": profile_name, "session": session }).to_string().as_bytes(),
         );
     }
-    // Providers run at prompt-render time; a hung one must not hang the exec.
+    // Drain stdout concurrently: a provider writing more than the pipe buffer
+    // would otherwise block forever. Providers run at prompt-render time; a
+    // hung one must not hang the exec.
+    let out_h = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut b = String::new();
+            let _ = s.read_to_string(&mut b);
+            b
+        })
+    });
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(_status) = child.try_wait()? {
-            let mut out = String::new();
-            use std::io::Read as _;
-            if let Some(mut stdout) = child.stdout.take() {
-                let _ = stdout.read_to_string(&mut out);
-            }
+        if child.try_wait()?.is_some() {
+            let out = out_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
             return Ok(trace::clip(&out, 16_000));
         }
         if Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait(); // reap; no zombies
             anyhow::bail!("provider timed out after 10s");
         }
         std::thread::sleep(Duration::from_millis(25));

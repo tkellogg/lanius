@@ -188,12 +188,13 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Skills => {
             let conn = open(&root)?;
             for s in skills::list(&root)? {
-                let enabled = skills::is_enabled(&root, &s.name);
                 let crons: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM crons WHERE skill=?1",
                     [&s.name],
                     |r| r.get(0),
                 )?;
+                // A package is enabled if anything of it is wired: handlers or crons.
+                let enabled = skills::is_enabled(&root, &s.name) || crons > 0;
                 let kind = match (&s.manifest, &s.meta) {
                     (Some(_), Some(_)) => "handlers+skill",
                     (Some(_), None) => "handlers",
@@ -232,7 +233,9 @@ fn run(cli: Cli) -> Result<()> {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for (id, t, state, cause, corr, payload, created) in rows.into_iter().rev() {
                 let cause = cause.map(|c| format!("<-{c}")).unwrap_or_default();
-                let corr = corr.map(|c| format!(" corr={}", &c[..c.len().min(8)])).unwrap_or_default();
+                let corr = corr
+                    .map(|c| format!(" corr={}", c.chars().take(8).collect::<String>()))
+                    .unwrap_or_default();
                 println!("#{id:<5} {created} {t:<20} {state:<16} {cause}{corr} {payload}");
             }
         }

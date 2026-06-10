@@ -34,9 +34,20 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
     merge_profile_throttles(root, &conn);
     std::fs::create_dir_all(root.run_dir())?;
     // Orphaned 'running' rows from a previous daemon are unrecoverable: the
-    // children died with that process. Mark them failed; replay is the cure.
+    // children died with that process. They get a distinct state — NOT
+    // 'failed' — so a successful replay isn't poisoned by stale rows when
+    // recompute_event_state aggregates, and NOT counted as failures by
+    // monitors. Replay is the cure.
     conn.execute(
-        "UPDATE dispatches SET state='failed', exit_code=-3, finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE state='running'",
+        "UPDATE dispatches SET state='orphaned', exit_code=-3, finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE state='running'",
+        [],
+    )?;
+    // Events with a surviving suspended dispatch are parked, not replayable:
+    // re-pending them would re-run the suspender from scratch (duplicate ask)
+    // while the old dispatch stays armed for resume — double execution.
+    conn.execute(
+        "UPDATE events SET state='waiting_on_human' WHERE state='running'
+         AND EXISTS (SELECT 1 FROM dispatches d WHERE d.event_id = events.id AND d.state='suspended')",
         [],
     )?;
     conn.execute("UPDATE events SET state='pending' WHERE state='running'", [])?;
@@ -185,16 +196,30 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
     let mut resume_correlation: Option<String> = None;
     if dstate == "suspended" {
         // The suspend contract: before exiting 75 the handler emitted a
-        // human.ask caused by this event. Its correlation_id is the resume key.
+        // human.ask. Match it by the emitting dispatch (HARNESS_DISPATCH_ID),
+        // so two handlers of the same event can each park on their own ask
+        // without cross-wiring; fall back to cause for emitters that lost env.
         resume_correlation = conn
             .query_row(
                 "SELECT correlation_id FROM events
-                 WHERE cause_id = ?1 AND type = 'human.ask' AND correlation_id IS NOT NULL
+                 WHERE emitted_by_dispatch = ?1 AND type = 'human.ask' AND correlation_id IS NOT NULL
                  ORDER BY id DESC LIMIT 1",
-                [r.event_id],
+                [r.dispatch_id],
                 |row| row.get(0),
             )
             .optional()?;
+        if resume_correlation.is_none() {
+            resume_correlation = conn
+                .query_row(
+                    "SELECT correlation_id FROM events
+                     WHERE cause_id = ?1 AND type = 'human.ask' AND correlation_id IS NOT NULL
+                       AND emitted_by_dispatch IS NULL
+                     ORDER BY id DESC LIMIT 1",
+                    [r.event_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+        }
         if resume_correlation.is_none() {
             // Suspended with nothing to wake it: that's a failure, loudly.
             dstate = "failed";
@@ -232,12 +257,14 @@ fn handler_name(_out: &PathBuf, conn: &Connection, dispatch_id: i64) -> String {
 }
 
 fn recompute_event_state(conn: &Connection, event_id: i64) -> Result<()> {
+    // 'orphaned' rows (pre-restart casualties) are excluded: a replay that
+    // succeeds must be able to reach 'done'.
     let (n_running, n_suspended, n_failed): (i64, i64, i64) = conn.query_row(
         "SELECT
            SUM(CASE WHEN state='running' THEN 1 ELSE 0 END),
            SUM(CASE WHEN state='suspended' THEN 1 ELSE 0 END),
            SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END)
-         FROM dispatches WHERE event_id=?1",
+         FROM dispatches WHERE event_id=?1 AND state != 'orphaned'",
         [event_id],
         |r| {
             Ok((
@@ -441,6 +468,7 @@ fn spawn_handler(
         .stdout(out_f)
         .stderr(err_f)
         .env("HARNESS_EVENT_ID", event_id.to_string())
+        .env("HARNESS_DISPATCH_ID", dispatch_id.to_string())
         .env("HARNESS_DB", root.db())
         .env("HARNESS_TRACE", root.trace_file())
         .env("HARNESS_ROOT", &root.dir)

@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS events (
   payload         TEXT,
   state           TEXT NOT NULL DEFAULT 'pending',
                   -- pending | running | done | failed | waiting_on_human | expired
+  -- Which handler invocation emitted this event (from HARNESS_DISPATCH_ID).
+  -- Scopes suspend/resume: an ask is matched to the dispatch that asked it.
+  emitted_by_dispatch INTEGER,
   priority        INTEGER NOT NULL DEFAULT 0,
   deadline        TEXT,
   default_action  TEXT,
@@ -91,6 +94,9 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 );
 "#,
     )?;
+    // Migration for databases created before the column existed; the error on
+    // a duplicate column is expected and ignored.
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN emitted_by_dispatch INTEGER", []);
     Ok(())
 }
 

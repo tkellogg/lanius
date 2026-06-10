@@ -37,17 +37,13 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
     if o.cause.is_none() {
         o.cause = std::env::var("HARNESS_EVENT_ID").ok().and_then(|v| v.parse().ok());
     }
-    if let Some(k) = &o.idempotency {
-        let existing: Option<i64> = conn
-            .query_row("SELECT id FROM events WHERE idempotency_key = ?1", [k], |r| r.get(0))
-            .optional()?;
-        if let Some(id) = existing {
-            return Ok(id); // at-least-once delivery + idempotency, not exactly-once
-        }
-    }
-    conn.execute(
-        "INSERT INTO events(type, cause_id, correlation_id, payload, priority, deadline, default_action, idempotency_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    let dispatch: Option<i64> = std::env::var("HARNESS_DISPATCH_ID").ok().and_then(|v| v.parse().ok());
+    // Atomic idempotency: ON CONFLICT DO NOTHING avoids the check-then-insert
+    // race where two concurrent emitters of the same key both pass a SELECT.
+    let inserted = conn.execute(
+        "INSERT INTO events(type, cause_id, correlation_id, payload, priority, deadline, default_action, idempotency_key, emitted_by_dispatch)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(idempotency_key) DO NOTHING",
         params![
             o.etype,
             o.cause,
@@ -57,8 +53,20 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
             o.deadline,
             o.default_action.as_ref().map(|v| v.to_string()),
             o.idempotency,
+            dispatch,
         ],
     )?;
+    if inserted == 0 {
+        // Only reachable with an idempotency key: return the existing event.
+        let key = o.idempotency.as_deref().unwrap_or_default();
+        let existing: Option<i64> = conn
+            .query_row("SELECT id FROM events WHERE idempotency_key = ?1", [key], |r| r.get(0))
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        anyhow::bail!("emit deduped but original event not found (key {key:?})");
+    }
     let id = conn.last_insert_rowid();
     trace::write(
         root,
