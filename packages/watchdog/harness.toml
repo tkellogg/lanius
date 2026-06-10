@@ -3,9 +3,9 @@
 
 [[cron]]
 schedule = "*/5 * * * *"
-emit = "watchdog.scan"
+emit = "work/watchdog/scan"
 
 [[handler]]
-on = "watchdog.scan"
+on = "work/watchdog/scan"
 run = "scripts/scan"
 order = 0

@@ -1,4 +1,4 @@
 [[handler]]
-on = "agent.exec"
+on = "work/agent/exec"
 run = "scripts/run"
 order = 0

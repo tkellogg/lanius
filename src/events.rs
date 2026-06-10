@@ -34,6 +34,9 @@ impl EmitOpts {
 /// caller doesn't pass one explicitly — causality propagation must be
 /// zero-effort or it won't happen.
 pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
+    if !crate::topic::valid_name(&o.etype) {
+        anyhow::bail!("invalid event type {:?}: must be a wildcard-free topic name", o.etype);
+    }
     if o.cause.is_none() {
         o.cause = std::env::var("HARNESS_EVENT_ID").ok().and_then(|v| v.parse().ok());
     }
@@ -70,7 +73,7 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
     let id = conn.last_insert_rowid();
     trace::write(
         root,
-        "emit",
+        "obs/ledger/emit",
         &trace::Ids {
             event_id: Some(id),
             cause_id: o.cause,

@@ -11,9 +11,9 @@ pub fn inbox(conn: &Connection) -> Result<()> {
     let rows: Vec<(i64, Option<String>, Option<String>, String, Option<String>)> = {
         let mut stmt = conn.prepare(
             "SELECT e.id, e.payload, e.deadline, e.created_at, e.default_action FROM events e
-             WHERE e.type='human.ask' AND e.state != 'expired' AND e.correlation_id IS NOT NULL
+             WHERE e.type='human/ask' AND e.state != 'expired' AND e.correlation_id IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM events a
-                               WHERE a.type='human.answer' AND a.correlation_id = e.correlation_id)
+                               WHERE a.type='human/answer' AND a.correlation_id = e.correlation_id)
              ORDER BY e.priority DESC, e.id ASC",
         )?;
         let r = stmt
@@ -50,16 +50,16 @@ pub fn inbox(conn: &Connection) -> Result<()> {
 pub fn answer(root: &Root, conn: &Connection, ask_id: i64, text: &str) -> Result<()> {
     let corr: Option<String> = conn
         .query_row(
-            "SELECT correlation_id FROM events WHERE id=?1 AND type='human.ask'",
+            "SELECT correlation_id FROM events WHERE id=?1 AND type='human/ask'",
             [ask_id],
             |r| r.get(0),
         )
-        .map_err(|_| anyhow::anyhow!("no human.ask event with id {ask_id}"))?;
+        .map_err(|_| anyhow::anyhow!("no human/ask event with id {ask_id}"))?;
     let Some(corr) = corr else {
         bail!("ask {ask_id} has no correlation_id; cannot route an answer to it")
     };
     let already: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM events WHERE type='human.answer' AND correlation_id=?1",
+        "SELECT COUNT(*) FROM events WHERE type='human/answer' AND correlation_id=?1",
         [&corr],
         |r| r.get(0),
     )?;
@@ -73,7 +73,7 @@ pub fn answer(root: &Root, conn: &Connection, ask_id: i64, text: &str) -> Result
             payload: Some(json!({ "answer": text })),
             correlation: Some(corr),
             cause: Some(ask_id),
-            ..EmitOpts::new("human.answer")
+            ..EmitOpts::new("human/answer")
         },
     )?;
     println!("answered ask #{ask_id} (answer event #{id})");
@@ -105,7 +105,7 @@ pub fn ask(
             correlation: Some(corr.clone()),
             deadline,
             default_action: default.map(|d| Value::String(d.to_string())),
-            ..EmitOpts::new("human.ask")
+            ..EmitOpts::new("human/ask")
         },
     )?;
     println!("ask #{id} (correlation {corr})");

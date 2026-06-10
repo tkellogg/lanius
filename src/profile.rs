@@ -1,7 +1,6 @@
 use crate::manifest::ThrottleDecl;
 use crate::paths::Root;
 use anyhow::{Context, Result};
-use globset::Glob;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -98,13 +97,9 @@ pub fn load(root: &Root, name: &str) -> Result<(Profile, PathBuf)> {
     Ok((p, dir))
 }
 
+/// Skill names are single-level topics; include/exclude use the same MQTT
+/// filter language as everything else ("#" = all).
 pub fn skill_visible(p: &Profile, skill: &str) -> bool {
-    let matches = |pats: &[String]| {
-        pats.iter().any(|pat| {
-            Glob::new(pat)
-                .map(|g| g.compile_matcher().is_match(skill))
-                .unwrap_or(false)
-        })
-    };
-    matches(&p.skills.include) && !matches(&p.skills.exclude)
+    let hit = |pats: &[String]| pats.iter().any(|pat| crate::topic::matches(pat, skill));
+    hit(&p.skills.include) && !hit(&p.skills.exclude)
 }

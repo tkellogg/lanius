@@ -1,6 +1,6 @@
 #!/bin/sh
 # End-to-end kernel test. No API key needed: exercises emit -> dispatch ->
-# handler, suspend (exit 75) -> human.answer -> resume, deadline expiry ->
+# handler, suspend (exit 75) -> human/answer -> resume, deadline expiry ->
 # default, and a seconds-resolution cron. Run from the repo root:
 #   sh tests/e2e.sh
 set -u
@@ -52,14 +52,14 @@ echo "== init =="
 elanus init "$TMP" >/dev/null || fail "elanus init"
 [ -f "$TMP/harness.db" ] || fail "harness.db missing"
 [ -f "$TMP/trace.jsonl" ] || fail "trace.jsonl missing"
-[ -L "$TMP/handlers.d/demo.echo/00-echo-echo" ] || fail "echo handler not wired"
+[ -L "$TMP/handlers.d/work.demo.echo/00-echo-echo" ] || fail "echo handler not wired"
 
 echo "== test skills: asker (suspend/resume), asker2 (deadline default) =="
 mkdir -p "$TMP/skills/asker/scripts" "$TMP/skills/asker2/scripts"
 
 cat > "$TMP/skills/asker/harness.toml" <<'EOF'
 [[handler]]
-on = "test.ask"
+on = "work/test/ask"
 run = "scripts/run"
 order = 0
 EOF
@@ -71,7 +71,7 @@ case "$EVENT" in
     printf '%s' "$EVENT" > "$HARNESS_ROOT/answered.json"
     exit 0;;
   *)
-    elanus emit human.ask --correlation "test-corr-1" --payload '{"question":"proceed with the thing?","options":["yes","no"]}' >/dev/null
+    elanus emit human/ask --correlation "test-corr-1" --payload '{"question":"proceed with the thing?","options":["yes","no"]}' >/dev/null
     exit 75;;
 esac
 EOF
@@ -79,7 +79,7 @@ chmod +x "$TMP/skills/asker/scripts/run"
 
 cat > "$TMP/skills/asker2/harness.toml" <<'EOF'
 [[handler]]
-on = "test.ask2"
+on = "work/test/ask2"
 run = "scripts/run"
 order = 0
 EOF
@@ -92,7 +92,7 @@ case "$EVENT" in
     exit 0;;
   *)
     DL=$(date -u -v+2S +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u -d '+2 seconds' +"%Y-%m-%dT%H:%M:%S.000Z")
-    elanus emit human.ask --correlation "test-corr-2" --deadline "$DL" --default-action '"go"' --payload '{"question":"expires soon"}' >/dev/null
+    elanus emit human/ask --correlation "test-corr-2" --deadline "$DL" --default-action '"go"' --payload '{"question":"expires soon"}' >/dev/null
     exit 75;;
 esac
 EOF
@@ -106,7 +106,7 @@ mkdir -p "$TMP/skills/ticker"
 cat > "$TMP/skills/ticker/harness.toml" <<'EOF'
 [[cron]]
 schedule = "*/2 * * * * *"
-emit = "demo.echo"
+emit = "work/demo/echo"
 payload = { from = "ticker" }
 EOF
 elanus enable ticker >/dev/null || fail "enable ticker"
@@ -117,14 +117,14 @@ DAEMON_PID=$!
 sleep 1
 
 echo "== 1. emit -> dispatch -> handler =="
-EV1=$(elanus emit demo.echo --payload '{"msg":"hello"}')
+EV1=$(elanus emit work/demo/echo --payload '{"msg":"hello"}')
 wait_for "echo handler ran" "grep -q '\"msg\":\"hello\"' '$TMP/echo.log'"
 wait_for "event #$EV1 done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV1\")\" = done ]"
 
 echo "== 2. suspend -> answer -> resume =="
-EV2=$(elanus emit test.ask)
+EV2=$(elanus emit work/test/ask)
 wait_for "event #$EV2 waiting_on_human" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV2\")\" = waiting_on_human ]"
-ASK_ID=$(sql "SELECT id FROM events WHERE type='human.ask' AND correlation_id='test-corr-1'")
+ASK_ID=$(sql "SELECT id FROM events WHERE type='human/ask' AND correlation_id='test-corr-1'")
 [ -n "$ASK_ID" ] || fail "ask event not found"
 CAUSE=$(sql "SELECT cause_id FROM events WHERE id=$ASK_ID")
 [ "$CAUSE" = "$EV2" ] && ok "causality threaded (ask #$ASK_ID <- event #$EV2)" || fail "ask cause_id=$CAUSE, expected $EV2"
@@ -134,18 +134,18 @@ wait_for "handler resumed with answer" "grep -q '\"answer\":\"yes\"' '$TMP/answe
 wait_for "event #$EV2 done after resume" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV2\")\" = done ]"
 
 echo "== 3. deadline expiry -> default applied =="
-EV3=$(elanus emit test.ask2)
+EV3=$(elanus emit work/test/ask2)
 wait_for "expired ask resumed with default" "grep -q '\"answer\":\"go\"' '$TMP/answered2.json'"
 grep -q '"assumed":true' "$TMP/answered2.json" && ok "assumption logged in answer" || fail "assumed flag missing"
-ASK2=$(sql "SELECT state FROM events WHERE type='human.ask' AND correlation_id='test-corr-2'")
+ASK2=$(sql "SELECT state FROM events WHERE type='human/ask' AND correlation_id='test-corr-2'")
 [ "$ASK2" = "expired" ] && ok "ask marked expired" || fail "ask2 state=$ASK2"
 wait_for "event #$EV3 done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV3\")\" = done ]"
 
 echo "== 4. cron fires =="
-wait_for "cron-emitted demo.echo handled" "grep -q '\"from\":\"ticker\"' '$TMP/echo.log'"
+wait_for "cron-emitted work/demo/echo handled" "grep -q '\"from\":\"ticker\"' '$TMP/echo.log'"
 
 echo "== 5. flight recorder =="
-for kind in emit dispatch handler.exit expire; do
+for kind in obs/ledger/emit obs/dispatch/spawn obs/dispatch/exit obs/ledger/expire; do
   grep -q "\"kind\":\"$kind\"" "$TMP/trace.jsonl" && ok "trace has $kind" || fail "trace missing $kind"
 done
 # tool truth: the suspended handler's exit code is on record

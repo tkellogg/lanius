@@ -1,4 +1,4 @@
 [[handler]]
-on = "demo.echo"
+on = "work/demo/echo"
 run = "scripts/echo"
 order = 0

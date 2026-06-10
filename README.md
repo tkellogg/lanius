@@ -24,8 +24,8 @@ export ANTHROPIC_API_KEY=...  # any genai-supported provider works; see profile.
 elanus daemon &                                  # the dispatcher (supervisor, not doer)
 
 elanus exec --session hi "hello"                 # chat = exec with a session id
-elanus emit agent.exec --payload '{"prompt":"summarize echo.log"}'   # async agent turn
-elanus emit demo.echo --payload '{"x":1}'        # any event; handlers.d decides who cares
+elanus emit work/agent/exec --payload '{"prompt":"summarize echo.log"}'   # async agent turn
+elanus emit work/demo/echo --payload '{"x":1}'        # any event; handlers.d decides who cares
 
 elanus inbox                                     # what's blocked on you?
 elanus answer 42 "yes, ship it"                  # answers route by correlation_id
@@ -36,7 +36,7 @@ tail -f $HARNESS_ROOT/trace.jsonl | jq .          # the flight recorder
 
 ## The milestone loop
 
-A cron tick wakes the agent → it works → hits a question → emits `human.ask`
+A cron tick wakes the agent → it works → hits a question → emits `human/ask`
 and exits 75 (checkpoint-and-exit; the transcript in sqlite *is* the process
 state) → notify pops a macOS notification → you `elanus answer` → the
 dispatcher matches the correlation_id and re-invokes the handler with the
@@ -54,7 +54,7 @@ sibling `harness.toml` manifest:
 
 ```toml
 [[handler]]
-on = "discord.message"     # event type, glob ok ("signal.*")
+on = "work/discord/message"     # topic filter, wildcards ok ("signal/#")
 run = "scripts/reply"      # any language; event JSON on stdin
 order = 0                  # cross-package ordering
 
@@ -65,7 +65,7 @@ emit = "feeds.check"
 [[provider]]
 run = "scripts/context"    # contributes a context block at render time
 
-[throttle."discord.*"]
+[throttle."work/discord/#"]
 max_concurrent = 2
 ```
 
@@ -74,8 +74,8 @@ max_concurrent = 2
 the compiled routing table, and debugging is `ls`. `SKILL.md` (agent-facing
 instructions) and `harness.toml` (dispatcher-facing wiring) never mix.
 
-Stock packages: `chat` (agent.exec → agent turn), `notify` (asks/signals →
-macOS notification), `watchdog` (cron monitor emitting `signal.pain` on
+Stock packages: `chat` (work/agent/exec → agent turn), `notify` (asks/signals →
+macOS notification), `watchdog` (cron monitor emitting `signal/pain` on
 failures — measured pain, not self-reported), `echo` (demo), `notes`
 (instructions-only skill).
 
@@ -85,7 +85,7 @@ failures — measured pain, not self-reported), `echo` (demo), `notes`
 - Env: `HARNESS_EVENT_ID`, `HARNESS_CAUSE_ID`, `HARNESS_CORRELATION_ID`,
   `HARNESS_DB`, `HARNESS_TRACE`, `HARNESS_ROOT`, `HARNESS_PROFILE`,
   `HARNESS_RESUME=1` on resume.
-- Exit 0 done; exit 75 suspended (emit a `human.ask` with a correlation_id
+- Exit 0 done; exit 75 suspended (emit a `human/ask` with a correlation_id
   first — that's the resume key); anything else failed.
 - Emit follow-up events with `elanus emit`; `cause_id` threads automatically
   from the environment.

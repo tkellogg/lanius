@@ -1,7 +1,6 @@
 use crate::manifest::{self, Manifest, SkillMeta, ThrottleDecl};
 use crate::paths::Root;
 use anyhow::{bail, Context, Result};
-use globset::Glob;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 
@@ -52,8 +51,14 @@ pub fn enable(root: &Root, conn: &Connection, name: &str) -> Result<()> {
         if !script.exists() {
             bail!("{name}: handler script {} does not exist", script.display());
         }
+        if !crate::topic::valid_filter(&h.on) {
+            bail!("{name}: 'on' is not a valid MQTT topic filter: {:?}", h.on);
+        }
         make_executable(&script)?;
-        let hdir = root.handlers().join(&h.on);
+        // Interim encoding until packages/ lands: '/' in the filter becomes
+        // '.' in the dirname so handlers.d stays flat. Dies in migration
+        // step 5 along with handlers.d itself.
+        let hdir = root.handlers().join(h.on.replace('/', "."));
         std::fs::create_dir_all(&hdir)?;
         let base = Path::new(&h.run)
             .file_name()
@@ -123,9 +128,10 @@ pub fn upsert_throttle(conn: &Connection, pat: &str, t: &ThrottleDecl) -> Result
     Ok(())
 }
 
-/// All handler executables registered for an event type: every handlers.d/
-/// subdirectory whose name (exact or glob) matches, entries sorted by basename
-/// so the NN- prefix gives cross-package ordering.
+/// All handler executables registered for an event topic: every handlers.d/
+/// subdirectory whose name (an MQTT filter, '.' standing for '/' — interim
+/// flat encoding) matches, entries sorted by basename so the NN- prefix gives
+/// cross-package ordering.
 pub fn matching_handlers(root: &Root, etype: &str) -> Result<Vec<PathBuf>> {
     let hd = root.handlers();
     let mut out: Vec<PathBuf> = Vec::new();
@@ -133,12 +139,8 @@ pub fn matching_handlers(root: &Root, etype: &str) -> Result<Vec<PathBuf>> {
         return Ok(out);
     }
     for tdir in std::fs::read_dir(&hd)?.filter_map(|e| e.ok()) {
-        let dirname = tdir.file_name().to_string_lossy().to_string();
-        let matched = dirname == etype
-            || Glob::new(&dirname)
-                .map(|g| g.compile_matcher().is_match(etype))
-                .unwrap_or(false);
-        if !matched || !tdir.path().is_dir() {
+        let filter = tdir.file_name().to_string_lossy().replace('.', "/");
+        if !crate::topic::matches(&filter, etype) || !tdir.path().is_dir() {
             continue;
         }
         for f in std::fs::read_dir(tdir.path())?.filter_map(|e| e.ok()) {

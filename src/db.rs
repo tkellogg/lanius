@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 
 CREATE TABLE IF NOT EXISTS throttles (
-  event_type          TEXT PRIMARY KEY,  -- glob ok, e.g. 'agent.*', 'signal.*'
+  event_type          TEXT PRIMARY KEY,  -- MQTT filter, e.g. 'work/agent/#', 'signal/#'
   max_concurrent      INTEGER,
   rate_per_min        INTEGER,
   llm_tokens_per_hour INTEGER,

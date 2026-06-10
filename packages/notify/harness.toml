@@ -2,11 +2,11 @@
 # Channel escalation / coalescing comes later; macOS notification is the MVP.
 
 [[handler]]
-on = "human.ask"
+on = "human/ask"
 run = "scripts/notify"
 order = 50
 
 [[handler]]
-on = "signal.*"
+on = "signal/#"
 run = "scripts/notify"
 order = 10

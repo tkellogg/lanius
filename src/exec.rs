@@ -78,10 +78,10 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         db::kv_del(&conn, &key)?;
         // Close the loop in the event log: a CLI --resume is an answer too,
         // otherwise the ask sits in the inbox forever. The daemon flow already
-        // has a human.answer (it triggered the resume) — dedupe on correlation.
+        // has a human/answer (it triggered the resume) — dedupe on correlation.
         if let Some(corr) = pend["correlation"].as_str() {
             let already: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM events WHERE type='human.answer' AND correlation_id=?1",
+                "SELECT COUNT(*) FROM events WHERE type='human/answer' AND correlation_id=?1",
                 [corr],
                 |r| r.get(0),
             )?;
@@ -93,7 +93,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                         payload: Some(json!({ "answer": ans, "via": "exec-resume" })),
                         correlation: Some(corr.to_string()),
                         cause: pend["ask_id"].as_i64(),
-                        ..EmitOpts::new("human.answer")
+                        ..EmitOpts::new("human/answer")
                     },
                 )?;
             }
@@ -125,12 +125,12 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         None => "cli".into(),
     };
     let mut signal_watermark: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(id), 0) FROM events WHERE type LIKE 'signal.%'",
+        "SELECT COALESCE(MAX(id), 0) FROM events WHERE type LIKE 'signal/%'",
         [],
         |r| r.get(0),
     )?;
     // Events emitted by this exec; excluded from signal preemption so an agent
-    // emitting signal.pain doesn't get its own scream echoed back (feedback loop).
+    // emitting signal/pain doesn't get its own scream echoed back (feedback loop).
     let mut self_emitted: HashSet<i64> = HashSet::new();
 
     let mut turns = 0u32;
@@ -146,7 +146,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                         "session": session, "turns": turns,
                     })),
                     cause: event_id,
-                    ..EmitOpts::new("signal.pain")
+                    ..EmitOpts::new("signal/pain")
                 },
             )?;
             bail!("max_turns ({}) reached for session {session}", prof.model.max_turns);
@@ -154,7 +154,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         check_token_budget(root, &conn, &root_type, event_id)?;
 
         let chat_req = build_request(&conn, &session, &system, &tools)?;
-        trace::write(root, "llm.request", &ids, json!({ "model": model, "turn": turns }));
+        trace::write(root, &obs(&session, "llm/request"), &ids, json!({ "model": model, "turn": turns }));
         let res = client
             .exec_chat(model.as_str(), chat_req, None)
             .await
@@ -170,7 +170,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         let tool_calls: Vec<ToolCall> = res.into_tool_calls();
         trace::write(
             root,
-            "llm.response",
+            &obs(&session, "llm/response"),
             &ids,
             json!({
                 "model": model,
@@ -203,11 +203,11 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
 
         let mut suspended_at: Option<usize> = None;
         for (i, call) in tool_calls.iter().enumerate() {
-            // tool.call goes to the trace BEFORE execution: a crash mid-tool
-            // must be visible as a call with no result.
+            // The tool call goes to the trace BEFORE execution: a crash
+            // mid-tool must be visible as a call with no result.
             trace::write(
                 root,
-                "tool.call",
+                &obs_tool(&session, &call.fn_name, "call"),
                 &ids,
                 json!({ "call_id": call.call_id, "name": call.fn_name, "args": call.fn_arguments }),
             );
@@ -215,7 +215,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 ToolOutcome::Output(result) => {
                     trace::write(
                         root,
-                        "tool.result",
+                        &obs_tool(&session, &call.fn_name, "result"),
                         &ids,
                         json!({ "call_id": call.call_id, "name": call.fn_name, "result": trace::clip(&result, 2000) }),
                     );
@@ -246,7 +246,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
             for call in &tool_calls[i + 1..] {
                 trace::write(
                     root,
-                    "tool.result",
+                    &obs_tool(&session, &call.fn_name, "result"),
                     &ids,
                     json!({ "call_id": call.call_id, "name": call.fn_name, "interrupted": true }),
                 );
@@ -267,11 +267,11 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
             std::process::exit(75);
         }
 
-        // Algedonic preemption: between tool batches, new signal.* events
+        // Algedonic preemption: between tool batches, new signal/# events
         // (not our own) interrupt the loop as injected context.
         let sigs: Vec<(i64, String, Option<String>)> = {
             let mut stmt = conn.prepare(
-                "SELECT id, type, payload FROM events WHERE type LIKE 'signal.%' AND id > ?1 ORDER BY id",
+                "SELECT id, type, payload FROM events WHERE type LIKE 'signal/%' AND id > ?1 ORDER BY id",
             )?;
             let r = stmt
                 .query_map([signal_watermark], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -286,7 +286,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 .map(|(id, t, p)| format!("[signal #{id}] {t} {}", p.as_deref().unwrap_or("{}")))
                 .collect::<Vec<_>>()
                 .join("\n");
-            trace::write(root, "signal", &ids, json!({ "injected": sigs.len() }));
+            trace::write(root, &obs(&session, "signal/injected"), &ids, json!({ "injected": sigs.len() }));
             store_msg(
                 &conn,
                 &session,
@@ -299,6 +299,16 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
 
 fn pending_ask_key(session: &str) -> String {
     format!("session:{session}:pending_ask")
+}
+
+/// Session-scoped observation topic: obs/exec/<session>/<rest>.
+fn obs(session: &str, rest: &str) -> String {
+    format!("obs/exec/{}/{rest}", crate::topic::encode_segment(session))
+}
+
+/// Tool-scoped observation topic: obs/exec/<session>/tool/<name>/<leaf>.
+fn obs_tool(session: &str, tool: &str, leaf: &str) -> String {
+    obs(session, &format!("tool/{}/{leaf}", crate::topic::encode_segment(tool)))
 }
 
 /// Default client unless an endpoint/auth override is in play — then a
@@ -498,12 +508,12 @@ fn tool_defs() -> Vec<Tool> {
         Tool::new("emit_event")
             .with_description(
                 "Emit an event onto the harness bus. Handlers subscribed to its type run asynchronously; \
-                 causality (cause_id) is threaded automatically. Use signal.* types for algedonic signals.",
+                 causality (cause_id) is threaded automatically. Use signal/ types for algedonic signals.",
             )
             .with_schema(json!({
                 "type": "object",
                 "properties": {
-                    "type": { "type": "string", "description": "event type, e.g. demo.echo or signal.pain" },
+                    "type": { "type": "string", "description": "event topic, e.g. work/demo/echo or signal/pain" },
                     "payload": { "type": "object" },
                     "priority": { "type": "integer" }
                 },
@@ -602,7 +612,7 @@ fn run_tool(
                     deadline,
                     default_action: args.get("default").filter(|d| !d.is_null()).cloned(),
                     cause: event_id,
-                    ..EmitOpts::new("human.ask")
+                    ..EmitOpts::new("human/ask")
                 },
             ) {
                 Ok(id) => id,
@@ -620,7 +630,7 @@ fn run_tool(
             ids.correlation_id = Some(corr.clone());
             trace::write(
                 root,
-                "tool.result",
+                &obs_tool(session, "ask_human", "result"),
                 &ids,
                 json!({ "call_id": call.call_id, "name": "ask_human", "suspended": true, "ask_id": ask_id }),
             );
@@ -733,7 +743,7 @@ fn check_token_budget(root: &Root, conn: &Connection, root_type: &str, event_id:
     };
     let limit = rows
         .iter()
-        .filter(|(pat, _)| crate::dispatcher::glob_match(pat, root_type))
+        .filter(|(pat, _)| crate::topic::matches(pat, root_type))
         .map(|(_, l)| *l)
         .min();
     let Some(limit) = limit else { return Ok(()) };
@@ -753,7 +763,7 @@ fn check_token_budget(root: &Root, conn: &Connection, root_type: &str, event_id:
                     "root_type": root_type, "used": used, "limit": limit,
                 })),
                 cause: event_id,
-                ..EmitOpts::new("signal.pain")
+                ..EmitOpts::new("signal/pain")
             },
         )?;
         bail!("llm token budget exhausted for {root_type}: {used}/{limit} in the last hour");
@@ -794,7 +804,7 @@ pub fn handle_exec(root: &Root) -> Result<()> {
         let prompt = payload["prompt"]
             .as_str()
             .or_else(|| payload["text"].as_str())
-            .ok_or_else(|| anyhow!("agent.exec payload needs a 'prompt' (or 'text') field"))?
+            .ok_or_else(|| anyhow!("work/agent/exec payload needs a 'prompt' (or 'text') field"))?
             .to_string();
         ExecOpts { session: Some(session), profile, prompt: Some(prompt), resume: None }
     };

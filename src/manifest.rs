@@ -20,7 +20,7 @@ pub struct Manifest {
 
 #[derive(Debug, Deserialize)]
 pub struct HandlerDecl {
-    pub on: String, // event type, glob ok ("signal.*")
+    pub on: String, // MQTT topic filter ("work/agent/exec", "signal/#")
     pub run: String, // executable path relative to the skill dir
     #[serde(default = "default_order")]
     pub order: u32,

@@ -11,10 +11,10 @@ max_turns = 24
 #   api_key_env = "DEEPSEEK_API_KEY"   # if not ANTHROPIC_API_KEY
 
 [skills]
-include = ["*"]
+include = ["#"]
 exclude = []
 
-[throttle."agent.*"]
+[throttle."work/agent/#"]
 max_concurrent = 2
 llm_tokens_per_hour = 400000
 

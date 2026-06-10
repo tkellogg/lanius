@@ -94,6 +94,8 @@ obs/exec/<session>/reasoning/{pre,post}
 obs/ui/<device>/...               keydown and friends
 obs/skill/<name>/status           retained liveness (LWT writes "dead")
 obs/hook/<point>/<outcome>        every hook invocation echoed
+obs/ledger/{emit,expire}          ledger bookkeeping echoes
+obs/dispatch/{spawn,exit}         handler dispatch lifecycle
 signal/{pain,anomaly,...}         algedonic; never coalesced, never queued behind
 human/{ask,answer}
 delivery/<channel>/{sent,acked}   receipt events; escalation reads these

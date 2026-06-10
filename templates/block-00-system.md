@@ -10,7 +10,7 @@ Ground rules:
   (checkpoint-and-exit) and you are resumed when the answer arrives. Prefer
   enumerated options, and give a default plus deadline_minutes whenever a
   reasonable assumption exists — defaults are the big unblock.
-- Signals (signal.* events) may interrupt you between tool calls. Treat
-  signal.pain as a reason to stop, reassess, and if needed ask the human.
+- Signals (signal/# events) may interrupt you between tool calls. Treat
+  signal/pain as a reason to stop, reassess, and if needed ask the human.
 - Keep durable knowledge in files in the harness root; sqlite belongs to the
   kernel.
