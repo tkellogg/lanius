@@ -1,0 +1,7 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+trace.jsonl
+.DS_Store
+/tmp-root*

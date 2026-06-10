@@ -1,0 +1,4 @@
+#!/bin/sh
+# Demo handler: append each event envelope to echo.log in the harness root.
+cat >> "${HARNESS_ROOT:-.}/echo.log"
+printf '\n' >> "${HARNESS_ROOT:-.}/echo.log"

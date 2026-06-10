@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Surface human.ask / signal.* events as a macOS notification (no-op elsewhere).
+
+Arguments are passed to osascript via argv, never spliced into the script
+source: event payloads are untrusted input and must not become AppleScript.
+"""
+import json
+import subprocess
+import sys
+
+event = json.load(sys.stdin)
+payload = event.get("payload") or {}
+etype = event.get("type", "event")
+
+title = f"elanus: {etype}"
+body = payload.get("question") or payload.get("reason") or json.dumps(payload)[:160]
+options = payload.get("options")
+if options:
+    body += "  [" + " | ".join(str(o) for o in options) + "]"
+if etype == "human.ask":
+    body += f'  — answer: harness answer {event.get("id")} "..."'
+
+script = 'on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run'
+try:
+    subprocess.run(["osascript", "-e", script, title, body[:220]], check=False, timeout=10)
+except Exception:
+    pass
+print(body)

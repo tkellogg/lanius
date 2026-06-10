@@ -1,0 +1,11 @@
+# Measured pain. The agent self-reporting trouble is nice; a monitor that
+# watches the actual event log is trustworthy — tools are the truth.
+
+[[cron]]
+schedule = "*/5 * * * *"
+emit = "watchdog.scan"
+
+[[handler]]
+on = "watchdog.scan"
+run = "scripts/scan"
+order = 0

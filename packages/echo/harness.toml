@@ -1,0 +1,4 @@
+[[handler]]
+on = "demo.echo"
+run = "scripts/echo"
+order = 0

@@ -1,0 +1,20 @@
+# elanus profile — one file is the whole identity: model, skill visibility,
+# throttles, sandbox policy, template vars.
+
+[model]
+model = "claude-sonnet-4-6"   # any genai target, e.g. "anthropic::claude-fable-5"
+max_turns = 24
+
+[skills]
+include = ["*"]
+exclude = []
+
+[throttle."agent.*"]
+max_concurrent = 2
+llm_tokens_per_hour = 400000
+
+[sandbox]
+preset = "vm"   # MVP: the box is the boundary; real policy lands later
+
+[vars]
+# {{key}} substitutions available in blocks/*.md
