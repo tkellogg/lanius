@@ -1,0 +1,17 @@
+# elanus bus — the MQTT 5 boundary interface (docs/bus.md).
+#
+# The listener is fan-out and ingress only: work, hooks, and the flight
+# recorder never depend on it ("the black box doesn't depend on the radio").
+# If it's down or disabled, external dashboards and ingress are lost —
+# nothing else changes.
+#
+# bind: where the daemon listens. Loopback by default. Binding wider
+# (e.g. "0.0.0.0:1883") is possible but DISCOURAGED until capability grants
+# land: there is no authentication yet, so anyone who can reach the port can
+# read every event and publish work. The daemon warns loudly if you do it.
+# Running several roots on one machine? Give each its own port.
+# Unix sockets are deliberately not offered — non-standard MQTT.
+#
+# Debugging surface: `elanus bus sub 'obs/#'` and `elanus bus pub <topic>`.
+enabled = true
+bind = "127.0.0.1:1883"

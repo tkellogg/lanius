@@ -167,6 +167,18 @@ Rust-side external skills use **rumqttc** (`subscribe_with_properties`,
 `set_manual_acks(true)` + `client.ack()`). Avoid paho-mqtt-rust: no manual
 ack, which breaks crash-only consumption.
 
+**[DECIDED 2026-06-10] Listener boundary**: TCP, loopback by default
+(`bind = "127.0.0.1:1883"` in root `bus.toml`), configurable. Binding beyond
+loopback is *possible but discouraged* until grants land — there is no
+authentication yet, and the daemon warns loudly. Unix sockets rejected:
+non-standard MQTT, and the client ecosystem (rumqttc included) doesn't
+reliably speak them. Local processes (exec, emit, handlers) mirror their
+happenings to the listener with a hand-rolled runtime-free QoS 0 publisher
+(`el-mirror` user property = "origin already recorded this, forward
+verbatim") — a client library on the flight path would drag an async runtime
+into trace::write. Identity/auth for non-local clients stays open (question
+7).
+
 **Degradation order** (the test for every design choice): MQTT listener down →
 external fan-out and ingress lost; work, hooks, recorder, exec unaffected.
 
@@ -370,7 +382,14 @@ handler stop re-pinging a human who already acked on another channel.
    grant only, no leases yet) + boundary diff → `fs/` events as trace lines.
    Pre-bus, independently valuable. See [sandbox.md](sandbox.md).
 4. **The bus**: ntex-mqtt spike → micro-broker (or rmqtt fallback); mirror
-   events + trace onto topics; recorder rules.
+   events + trace onto topics; recorder rules. *Landed 2026-06-10*: recorder
+   (src/recorder.rs), micro-broker on ntex-mqtt 8.x in the daemon
+   (src/broker.rs — subscription table, retained store, per-filter SUBACK,
+   QoS 0/1 fan-out, work/signal/human ingress → ledger), kernel publish path
+   + loopback mirror (src/bus.rs), `elanus bus pub|sub` debugging surface.
+   Still ahead within this step: resident hooks, $share groups, wills,
+   completion fan-in as control flow (arrives when work dispatch moves onto
+   the bus).
 5. **Packages**: `packages/` + `elanus.toml`, request/approval ledger,
    leases, supervised daemons + LWT; `handlers.d/` and `skills/` retire.
 6. **Ingress bridge** (Discord first) — the first real daemon package.

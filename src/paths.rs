@@ -18,6 +18,9 @@ impl Root {
     pub fn recorder_file(&self) -> PathBuf {
         self.dir.join("recorder.toml")
     }
+    pub fn bus_file(&self) -> PathBuf {
+        self.dir.join("bus.toml")
+    }
     pub fn skills(&self) -> PathBuf {
         self.dir.join("skills")
     }

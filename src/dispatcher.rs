@@ -29,6 +29,9 @@ struct Running {
 /// handlers, check throttles, fork/exec, record exits, write trace lines.
 /// It is a supervisor, not a doer.
 pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
+    // Before the first trace::write, or the publish path falls back to
+    // mirroring at a listener that doesn't exist yet.
+    crate::bus::init_daemon(root);
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
     merge_profile_throttles(root, &conn);

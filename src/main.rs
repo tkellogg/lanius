@@ -1,3 +1,6 @@
+mod broker;
+mod bus;
+mod buscli;
 mod db;
 mod dispatcher;
 mod dotenv;
@@ -112,6 +115,35 @@ enum Cmd {
     Events {
         #[arg(long, default_value_t = 20)]
         limit: i64,
+    },
+    /// The live bus: publish/subscribe via the daemon's MQTT listener
+    Bus {
+        #[command(subcommand)]
+        cmd: BusCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BusCmd {
+    /// Publish once; QoS 1 (default) waits for the broker to accept
+    Pub {
+        topic: String,
+        payload: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        qos: u8,
+        /// Retain: late subscribers get the last value (empty payload clears)
+        #[arg(long)]
+        retain: bool,
+    },
+    /// Subscribe and print one JSON line per message
+    Sub {
+        filter: String,
+        /// Exit successfully after this many messages
+        #[arg(long)]
+        count: Option<u64>,
+        /// Give up after this many seconds
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 }
 
@@ -229,6 +261,14 @@ fn run(cli: Cli) -> Result<()> {
             let conn = open(&root)?;
             human::ask(&root, &conn, &question, options.as_deref(), deadline_minutes, default.as_deref())?;
         }
+        Cmd::Bus { cmd } => match cmd {
+            BusCmd::Pub { topic, payload, qos, retain } => {
+                buscli::publish(&root, &topic, payload.as_deref(), qos, retain)?;
+            }
+            BusCmd::Sub { filter, count, timeout } => {
+                buscli::subscribe(&root, &filter, count, timeout)?;
+            }
+        },
         Cmd::Events { limit } => {
             let conn = open(&root)?;
             let mut stmt = conn.prepare(

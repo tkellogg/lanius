@@ -53,7 +53,11 @@ elanus init "$TMP" >/dev/null || fail "elanus init"
 [ -f "$TMP/harness.db" ] || fail "harness.db missing"
 [ -f "$TMP/trace.jsonl" ] || fail "trace.jsonl missing"
 [ -f "$TMP/recorder.toml" ] || fail "recorder.toml missing"
+[ -f "$TMP/bus.toml" ] || fail "bus.toml missing"
 [ -L "$TMP/handlers.d/work.demo.echo/00-echo-echo" ] || fail "echo handler not wired"
+# Per-run port so parallel runs and a real daemon on 1883 never collide.
+BUS_PORT=$((18000 + $$ % 2000))
+printf 'enabled = true\nbind = "127.0.0.1:%s"\n' "$BUS_PORT" > "$TMP/bus.toml"
 
 echo "== test skills: asker (suspend/resume), asker2 (deadline default) =="
 mkdir -p "$TMP/skills/asker/scripts" "$TMP/skills/asker2/scripts"
@@ -185,6 +189,26 @@ for kind in obs/ledger/emit obs/dispatch/spawn obs/dispatch/exit obs/ledger/expi
 done
 # tool truth: the suspended handler's exit code is on record
 grep -q '"exit_code":75' "$TMP/trace.jsonl" && ok "suspend (75) recorded" || fail "no exit 75 in trace"
+
+echo "== 7. bus: live stream + mqtt ingress =="
+grep -q "mqtt listener on 127.0.0.1:$BUS_PORT" "$TMP/daemon.log" && ok "listener bound" || fail "listener did not bind"
+# Live fan-out: a CLI process's happening reaches a subscriber via the
+# hand-rolled mirror -> broker -> rumqttc. Unique topic: cron noise immune.
+( elanus bus sub 'obs/e2e/#' --count 1 --timeout 10 > "$TMP/bus-sub.out" 2>&1; echo "$?" > "$TMP/bus-sub.code" ) &
+SUB_PID=$!
+sleep 1
+elanus trace obs/e2e/bus-live --payload '{"msg":"bus-live"}'
+wait "$SUB_PID"
+[ "$(cat "$TMP/bus-sub.code")" = 0 ] && ok "subscriber got obs/e2e/bus-live" || fail "bus sub failed: $(cat "$TMP/bus-sub.out")"
+grep -q '"msg":"bus-live"' "$TMP/bus-sub.out" && ok "live payload intact" || fail "live payload wrong"
+# Ingress: an external MQTT publish on work/# becomes a ledger event and runs.
+elanus bus pub work/demo/echo '{"msg":"via-mqtt"}' || fail "bus pub"
+wait_for "mqtt-published work ran" "grep -q '\"msg\":\"via-mqtt\"' '$TMP/echo.log'"
+EVM=$(sql "SELECT id FROM events WHERE payload LIKE '%via-mqtt%'")
+[ -n "$EVM" ] && wait_for "event #$EVM done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVM\")\" = done ]" || fail "mqtt publish not in ledger"
+# Retained: a late subscriber still gets the last value.
+elanus bus pub obs/skill/demo/status '{"alive":true}' --retain || fail "bus pub --retain"
+elanus bus sub 'obs/skill/+/status' --count 1 --timeout 5 | grep -q '"alive":true' && ok "retained replay to late subscriber" || fail "retained replay"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

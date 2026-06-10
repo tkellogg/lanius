@@ -35,9 +35,6 @@ pub fn now_iso() -> String {
 /// writers interleave at line granularity. Failures are deliberately swallowed:
 /// the flight recorder must never take the plane down.
 pub fn write(root: &Root, kind: &str, ids: &Ids, payload: Value) {
-    if crate::recorder::get(root).sink_for(kind) == crate::recorder::Sink::None {
-        return;
-    }
     let mut line = json!({ "ts": now_iso(), "kind": kind, "payload": payload });
     let obj = line.as_object_mut().unwrap();
     if let Some(v) = ids.event_id {
@@ -52,6 +49,19 @@ pub fn write(root: &Root, kind: &str, ids: &Ids, payload: Value) {
     if let Some(v) = &ids.session_id {
         obj.insert("session_id".into(), json!(v));
     }
+    let buf = line.to_string();
+    // Live first, disk second: the bus sees everything; the recorder only
+    // decides persistence. Both are best-effort and independent.
+    crate::bus::publish(root, kind, &buf);
+    if crate::recorder::get(root).sink_for(kind) == crate::recorder::Sink::None {
+        return;
+    }
+    append_line(root, &buf);
+}
+
+/// One O_APPEND write to trace.jsonl. Also the broker's path for recording
+/// inbound external events — same line format, same swallowed failures.
+pub fn append_line(root: &Root, line: &str) {
     let mut buf = line.to_string();
     buf.push('\n');
     let _ = std::fs::OpenOptions::new()

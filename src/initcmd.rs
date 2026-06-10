@@ -28,6 +28,7 @@ const PKG_FILES: &[PkgFile] = &[
 
 const PROFILE_TOML: &str = include_str!("../templates/profile.toml");
 const RECORDER_TOML: &str = include_str!("../templates/recorder.toml");
+const BUS_TOML: &str = include_str!("../templates/bus.toml");
 const BLOCK_SYSTEM: &str = include_str!("../templates/block-00-system.md");
 const BLOCK_CONTEXT: &str = include_str!("../templates/block-10-context.md");
 
@@ -39,6 +40,7 @@ pub fn init(dir: PathBuf) -> Result<()> {
     }
 
     write_if_missing(&root.recorder_file(), RECORDER_TOML, false)?;
+    write_if_missing(&root.bus_file(), BUS_TOML, false)?;
     write_if_missing(&root.profile_dir("default").join("profile.toml"), PROFILE_TOML, false)?;
     write_if_missing(&root.profile_dir("default").join("blocks/00-system.md"), BLOCK_SYSTEM, false)?;
     write_if_missing(&root.profile_dir("default").join("blocks/10-context.md"), BLOCK_CONTEXT, false)?;
