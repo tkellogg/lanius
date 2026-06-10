@@ -1,0 +1,11 @@
+# Minimal human-proxy: surface asks and algedonic signals to the human.
+# Channel escalation / coalescing comes later; macOS notification is the MVP.
+# One script, two subscriptions; it dispatches on the envelope's type.
+
+[request]
+subscribe = ["human/ask", "signal/#"]
+
+[process]
+mode = "exec"
+run  = "scripts/notify"
+order = 10

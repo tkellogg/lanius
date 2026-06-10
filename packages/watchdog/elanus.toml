@@ -1,11 +1,15 @@
 # Measured pain. The agent self-reporting trouble is nice; a monitor that
 # watches the actual event log is trustworthy — tools are the truth.
 
+[request]
+subscribe = ["work/watchdog/scan"]
+publish   = ["work/watchdog/scan", "signal/pain"]
+
+[process]
+mode = "exec"
+run  = "scripts/scan"
+order = 0
+
 [[cron]]
 schedule = "*/5 * * * *"
 emit = "work/watchdog/scan"
-
-[[handler]]
-on = "work/watchdog/scan"
-run = "scripts/scan"
-order = 0

@@ -1,4 +1,0 @@
-[[handler]]
-on = "work/demo/echo"
-run = "scripts/echo"
-order = 0

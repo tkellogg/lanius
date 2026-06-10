@@ -1,0 +1,9 @@
+# Demo handler: append the event payload to echo.log. Publishes nothing.
+
+[request]
+subscribe = ["work/demo/echo"]
+
+[process]
+mode = "exec"
+run  = "scripts/echo"
+order = 0

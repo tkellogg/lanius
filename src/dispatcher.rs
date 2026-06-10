@@ -1,18 +1,20 @@
 use crate::db;
 use crate::events::{self, EmitOpts};
 use crate::hooks;
+use crate::packages;
 use crate::paths::Root;
 use crate::profile;
-use crate::skills;
+use crate::sandbox;
 use crate::trace;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr as _;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One spawned handler process being supervised.
 struct Running {
@@ -24,6 +26,29 @@ struct Running {
     out_path: PathBuf,
     err_path: PathBuf,
 }
+
+/// One resident package actor (process.mode = "daemon"), crash-only:
+/// discovery boots it zero-caged, exits restart it with backoff, the
+/// supervisor publishes its retained liveness either way. (A self-connecting
+/// actor's own LWT also covers the crash case at the bus level.)
+struct Actor {
+    name: String,
+    child: Child,
+    started: Instant,
+}
+
+#[derive(Default)]
+struct Actors {
+    running: Vec<Actor>,
+    /// Consecutive failures per package; cleared by a healthy run.
+    strikes: HashMap<String, u32>,
+    backoff_until: HashMap<String, Instant>,
+}
+
+/// A run shorter than this counts as a failure for backoff purposes.
+const HEALTHY_RUN: Duration = Duration::from_secs(10);
+const BACKOFF_BASE: Duration = Duration::from_secs(2);
+const BACKOFF_CAP: Duration = Duration::from_secs(300);
 
 /// The dispatcher does *nothing* but: notice pending events, match type to
 /// handlers, check throttles, fork/exec, record exits, write trace lines.
@@ -54,26 +79,203 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
         [],
     )?;
     conn.execute("UPDATE events SET state='pending' WHERE state='running'", [])?;
+    // Stale leases from dead holders: release anything whose dispatch is no
+    // longer running and whose pid is gone. Crash-only, same as everything.
+    release_dead_leases(&conn)?;
+    // Register what's on the package path; requests only, never grants.
+    if let Err(e) = packages::sync(root, &conn) {
+        eprintln!("[daemon] package sync: {e:#}");
+    }
     eprintln!(
         "[daemon] root={} interval={}ms (let-it-crash; ctrl-c to stop)",
         root.dir.display(),
         interval_ms
     );
     let mut running: Vec<Running> = Vec::new();
+    let mut actors = Actors::default();
     loop {
-        if let Err(e) = tick(root, &conn, &mut running) {
+        if let Err(e) = tick(root, &conn, &mut running, &mut actors) {
             eprintln!("[daemon] tick error: {e:#}");
         }
         std::thread::sleep(Duration::from_millis(interval_ms));
     }
 }
 
-fn tick(root: &Root, conn: &Connection, running: &mut Vec<Running>) -> Result<()> {
+fn tick(root: &Root, conn: &Connection, running: &mut Vec<Running>, actors: &mut Actors) -> Result<()> {
     tick_crons(root, conn)?;
     expire_deadlines(root, conn)?;
     reap(root, conn, running)?;
     resume_suspended(root, conn, running)?;
     dispatch_pending(root, conn, running)?;
+    tick_actors(root, conn, actors)?;
+    release_dead_leases(conn)?;
+    Ok(())
+}
+
+/// Supervise resident package actors. Discovery boots them (zero cage:
+/// scratch dir + approved fs_write; capabilities attach live via the
+/// ledger); exits restart with exponential backoff unless restart="never".
+/// The supervisor publishes retained obs/skill/<name>/status — it is the
+/// one process that authoritatively knows spawn and exit.
+fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()> {
+    // Reap exits.
+    let mut i = 0;
+    while i < actors.running.len() {
+        match actors.running[i].child.try_wait() {
+            Ok(Some(status)) => {
+                let a = actors.running.swap_remove(i);
+                let healthy = a.started.elapsed() >= HEALTHY_RUN;
+                let strikes = if healthy {
+                    0
+                } else {
+                    *actors.strikes.get(&a.name).unwrap_or(&0) + 1
+                };
+                actors.strikes.insert(a.name.clone(), strikes);
+                let delay = BACKOFF_BASE
+                    .saturating_mul(2u32.saturating_pow(strikes.min(8)))
+                    .min(BACKOFF_CAP);
+                actors.backoff_until.insert(a.name.clone(), Instant::now() + delay);
+                crate::bus::register_actor(&a.name, None);
+                status_event(root, &a.name, "dead", json!({ "exit_code": status.code() }));
+            }
+            Ok(None) => i += 1,
+            Err(e) => {
+                eprintln!("[daemon] actor wait error: {e}");
+                i += 1;
+            }
+        }
+    }
+    // Boot what's discovered and not running.
+    for pkg in packages::discover(root)? {
+        let Some(lm) = &pkg.manifest else { continue };
+        let Some(proc_) = &lm.manifest.process else { continue };
+        if proc_.mode != "daemon" {
+            continue;
+        }
+        if actors.running.iter().any(|a| a.name == pkg.name) {
+            continue;
+        }
+        if proc_.restart == "never" && actors.strikes.contains_key(&pkg.name) {
+            continue; // ran once, died, stays down
+        }
+        if actors
+            .backoff_until
+            .get(&pkg.name)
+            .is_some_and(|t| Instant::now() < *t)
+        {
+            continue;
+        }
+        let script = pkg.dir.join(&proc_.run);
+        if !script.exists() {
+            continue;
+        }
+        let scratch = root.run_dir().join(format!("pkg-{}", pkg.name));
+        std::fs::create_dir_all(&scratch)?;
+        // Zero-cage floor: write scratch (+ approved durable fs_write).
+        // Daemon actors talk to the kernel over the bus, not the db — the
+        // ledger is deliberately outside their cage.
+        let mut write_roots = vec![scratch.clone()];
+        for w in packages::approved(conn, &pkg.name, "fs_write")? {
+            let p = PathBuf::from(&w);
+            let p = if p.is_absolute() { p } else { root.dir.join(p) };
+            if let Ok(c) = p.canonicalize() {
+                write_roots.push(c);
+            }
+        }
+        let cage = sandbox::Cage::from_roots(write_roots, Vec::new(), true);
+        let token = uuid::Uuid::new_v4().to_string();
+        crate::bus::register_actor(&pkg.name, Some(&token));
+        let bus_cfg = crate::bus::config(root);
+        let addr = crate::bus::connect_addr(&bus_cfg)
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let out = std::fs::File::create(scratch.join("stdout.log"))?;
+        let err = std::fs::File::create(scratch.join("stderr.log"))?;
+        let mut cmd = cage.command(&script);
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_default();
+        cmd.current_dir(&pkg.dir)
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .env("HARNESS_ROOT", &root.dir)
+            .env("ELANUS_PACKAGE", &pkg.name)
+            .env("ELANUS_SCRATCH", &scratch)
+            .env("ELANUS_BUS_ADDR", &addr)
+            .env("ELANUS_BUS_TOKEN", &token)
+            .env("ELANUS_SESSION_EXPIRY_S", proc_.session_expiry_s.to_string())
+            .env(
+                "PATH",
+                format!("{}:{}", exe_dir.display(), std::env::var("PATH").unwrap_or_default()),
+            );
+        match cmd.spawn() {
+            Ok(child) => {
+                status_event(root, &pkg.name, "alive", json!({ "pid": child.id() }));
+                actors.running.push(Actor { name: pkg.name.clone(), child, started: Instant::now() });
+            }
+            Err(e) => {
+                crate::bus::register_actor(&pkg.name, None);
+                actors.strikes.insert(pkg.name.clone(), actors.strikes.get(&pkg.name).unwrap_or(&0) + 1);
+                actors
+                    .backoff_until
+                    .insert(pkg.name.clone(), Instant::now() + BACKOFF_BASE);
+                status_event(root, &pkg.name, "dead", json!({ "spawn_error": e.to_string() }));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Retained liveness: late subscribers always see the last known state.
+fn status_event(root: &Root, name: &str, state: &str, mut extra: Value) {
+    let payload = match extra.as_object_mut() {
+        Some(o) => {
+            o.insert("state".into(), json!(state));
+            extra
+        }
+        None => json!({ "state": state }),
+    };
+    trace::write_opts(
+        root,
+        &format!("obs/skill/{}/status", crate::topic::encode_segment(name)),
+        &trace::Ids::default(),
+        payload,
+        true,
+    );
+}
+
+/// Leases die with their holders: a lease whose dispatch finished, or whose
+/// pid is gone, is released by the supervisor. No lock leaks, no manual
+/// unlock path to forget.
+fn release_dead_leases(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE leases SET released_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE released_at IS NULL
+           AND dispatch_id IS NOT NULL
+           AND dispatch_id IN (SELECT id FROM dispatches WHERE state NOT IN ('running','suspended'))",
+        [],
+    )?;
+    let stale: Vec<(i64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, pid FROM leases WHERE released_at IS NULL AND dispatch_id IS NULL AND pid IS NOT NULL",
+        )?;
+        let r = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+    for (id, pid) in stale {
+        // Signal 0: existence probe, no effect on the process.
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        if !alive {
+            conn.execute(
+                "UPDATE leases SET released_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+                [id],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -92,6 +294,14 @@ fn tick_crons(root: &Root, conn: &Connection) -> Result<()> {
         let Ok(cron) = croner::Cron::from_str(&schedule) else {
             continue;
         };
+        // A cron emit is a publish; the capability check happens at fire
+        // time so approvals attach and detach live.
+        let pkg: String = conn
+            .query_row("SELECT skill FROM crons WHERE id=?1", [id], |r| r.get(0))
+            .unwrap_or_default();
+        if !packages::may(conn, &pkg, "publish", &emit_type)? {
+            continue;
+        }
         match last_fired {
             None => {
                 // Arm on first sight; don't fire for the past.
@@ -353,7 +563,7 @@ fn dispatch_pending(root: &Root, conn: &Connection, running: &mut Vec<Running>) 
         r
     };
     for (id, etype, corr) in pending {
-        let handlers = skills::matching_handlers(root, &etype)?;
+        let handlers = packages::matching_exec_handlers(root, conn, &etype)?;
         if handlers.is_empty() {
             // No consumers: the event just lives in the log.
             conn.execute(
@@ -390,7 +600,7 @@ fn dispatch_pending(root: &Root, conn: &Connection, running: &mut Vec<Running>) 
             continue;
         }
         conn.execute("UPDATE events SET state='running' WHERE id=?1", [id])?;
-        for h in handlers {
+        for (_pkg, h) in handlers {
             spawn_handler(root, conn, running, id, &envelope, h, None, corr.clone())?;
         }
     }
@@ -564,7 +774,7 @@ fn merge_profile_throttles(root: &Root, conn: &Connection) {
         let name = e.file_name().to_string_lossy().to_string();
         if let Ok((prof, _)) = profile::load(root, &name) {
             for (pat, t) in &prof.throttle {
-                if let Err(err) = skills::upsert_throttle(conn, pat, t) {
+                if let Err(err) = packages::upsert_throttle(conn, pat, t) {
                     eprintln!("[daemon] throttle merge {pat}: {err:#}");
                 }
             }

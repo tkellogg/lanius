@@ -23,6 +23,12 @@ fn client(addr: SocketAddr, tag: &str) -> (AsyncClient, rumqttc::v5::EventLoop) 
         addr.port(),
     );
     opts.set_keep_alive(Duration::from_secs(10));
+    // Inside a supervised package actor, identity rides the environment the
+    // supervisor injected: the CLI authenticates as the actor and the
+    // broker scopes it to the package's grants.
+    if let (Ok(pkg), Ok(token)) = (std::env::var("ELANUS_PACKAGE"), std::env::var("ELANUS_BUS_TOKEN")) {
+        opts.set_credentials(pkg, token);
+    }
     AsyncClient::new(opts, 64)
 }
 

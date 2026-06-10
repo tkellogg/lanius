@@ -1,7 +1,7 @@
 use crate::db;
 use crate::manifest::ThrottleDecl;
+use crate::packages;
 use crate::paths::Root;
-use crate::skills;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -15,13 +15,13 @@ struct PkgFile {
 /// packages/ dir; init materializes copies into the harness root so the root
 /// is self-contained and the user can edit/fork them freely.
 const PKG_FILES: &[PkgFile] = &[
-    PkgFile { rel: "chat/harness.toml", content: include_str!("../packages/chat/harness.toml"), exec: false },
+    PkgFile { rel: "chat/elanus.toml", content: include_str!("../packages/chat/elanus.toml"), exec: false },
     PkgFile { rel: "chat/scripts/run", content: include_str!("../packages/chat/scripts/run"), exec: true },
-    PkgFile { rel: "echo/harness.toml", content: include_str!("../packages/echo/harness.toml"), exec: false },
+    PkgFile { rel: "echo/elanus.toml", content: include_str!("../packages/echo/elanus.toml"), exec: false },
     PkgFile { rel: "echo/scripts/echo", content: include_str!("../packages/echo/scripts/echo"), exec: true },
-    PkgFile { rel: "notify/harness.toml", content: include_str!("../packages/notify/harness.toml"), exec: false },
+    PkgFile { rel: "notify/elanus.toml", content: include_str!("../packages/notify/elanus.toml"), exec: false },
     PkgFile { rel: "notify/scripts/notify", content: include_str!("../packages/notify/scripts/notify"), exec: true },
-    PkgFile { rel: "watchdog/harness.toml", content: include_str!("../packages/watchdog/harness.toml"), exec: false },
+    PkgFile { rel: "watchdog/elanus.toml", content: include_str!("../packages/watchdog/elanus.toml"), exec: false },
     PkgFile { rel: "watchdog/scripts/scan", content: include_str!("../packages/watchdog/scripts/scan"), exec: true },
     PkgFile { rel: "notes/SKILL.md", content: include_str!("../packages/notes/SKILL.md"), exec: false },
 ];
@@ -35,7 +35,7 @@ const BLOCK_CONTEXT: &str = include_str!("../templates/block-10-context.md");
 pub fn init(dir: PathBuf) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let root = Root { dir: dir.canonicalize()? };
-    for d in [root.skills(), root.handlers(), root.run_dir(), root.profile_dir("default").join("blocks")] {
+    for d in [root.packages(), root.run_dir(), root.profile_dir("default").join("blocks")] {
         std::fs::create_dir_all(d)?;
     }
 
@@ -46,7 +46,7 @@ pub fn init(dir: PathBuf) -> Result<()> {
     write_if_missing(&root.profile_dir("default").join("blocks/10-context.md"), BLOCK_CONTEXT, false)?;
 
     for f in PKG_FILES {
-        let path = root.skills().join(f.rel);
+        let path = root.packages().join(f.rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -56,7 +56,7 @@ pub fn init(dir: PathBuf) -> Result<()> {
     let conn = db::open(&root)?;
     db::init_schema(&conn)?;
     // The algedonic class: never coalesced, never queued behind other work.
-    skills::upsert_throttle(
+    packages::upsert_throttle(
         &conn,
         "signal/#",
         &ThrottleDecl { coalesce: Some(false), ..Default::default() },
@@ -65,8 +65,12 @@ pub fn init(dir: PathBuf) -> Result<()> {
         std::fs::write(root.trace_file(), "")?;
     }
 
+    // Stock packages ship with the binary and init is a human gesture, so
+    // their requests are approved here with that provenance. Anything that
+    // lands on the package path later asks like everything else.
+    packages::sync(&root, &conn)?;
     for name in ["chat", "echo", "notify", "watchdog"] {
-        skills::enable(&root, &conn, name)?;
+        packages::decide(&root, &conn, name, true, "init")?;
     }
 
     println!();
@@ -78,6 +82,8 @@ pub fn init(dir: PathBuf) -> Result<()> {
     println!("  elanus exec --session hi \"hello\"    # chat (needs ANTHROPIC_API_KEY)");
     println!("  elanus emit work/agent/exec --payload '{{\"prompt\":\"check in with me\"}}'");
     println!("  elanus inbox / elanus answer <id> \"...\"");
+    println!("  elanus packages                     # what's installed, what's pending");
+    println!("  elanus bus sub 'obs/#'              # watch the live stream");
     println!("  tail -f {}", root.trace_file().display());
     Ok(())
 }

@@ -389,6 +389,127 @@ fn obs_tool(session: &str, tool: &str, leaf: &str) -> String {
     obs(session, &format!("tool/{}/{leaf}", crate::topic::encode_segment(tool)))
 }
 
+// ── Leases: &mut on subtrees, the kernel as borrow checker ─────────────────
+// (docs/sandbox.md). Lease lifetime = holder lifetime: the dispatcher
+// releases leases of finished dispatches and dead pids; a standalone exec
+// releases its own on clean exit. There is no unlock call to forget.
+
+/// Who holds leases acquired by this process: the enclosing dispatch when
+/// there is one (survives suspend/resume), else this pid.
+fn lease_holder() -> (Option<i64>, i64) {
+    let dispatch = std::env::var("HARNESS_DISPATCH_ID").ok().and_then(|v| v.parse().ok());
+    (dispatch, std::process::id() as i64)
+}
+
+fn same_holder(dispatch: Option<i64>, pid: i64, row_dispatch: Option<i64>, row_pid: Option<i64>) -> bool {
+    match (dispatch, row_dispatch) {
+        (Some(a), Some(b)) => a == b,
+        _ => row_pid == Some(pid),
+    }
+}
+
+fn acquire_lease(
+    root: &Root,
+    conn: &Connection,
+    cage: &sandbox::Cage,
+    session: &str,
+    path: &str,
+) -> anyhow::Result<String> {
+    let p = std::path::Path::new(path);
+    let p = if p.is_absolute() { p.to_path_buf() } else { root.dir.join(p) };
+    let canon = p
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("{} is not an existing directory: {e}", p.display()))?;
+    if !canon.is_dir() {
+        anyhow::bail!("{} is not a directory", canon.display());
+    }
+    // lease ⊆ grant: a decidable, boring prefix check (docs/sandbox.md).
+    if !cage.write_roots.iter().any(|r| canon.starts_with(r)) {
+        anyhow::bail!(
+            "{} is outside the granted write roots {:?}",
+            canon.display(),
+            cage.write_roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>()
+        );
+    }
+    let (dispatch, pid) = lease_holder();
+    // The borrow check: exclusive on a directory conflicts with any active
+    // lease above or below it, unless we already hold that lease.
+    let active: Vec<(String, Option<i64>, Option<i64>)> = {
+        let mut stmt =
+            conn.prepare("SELECT path, dispatch_id, pid FROM leases WHERE released_at IS NULL")?;
+        let r = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+    for (held_path, row_dispatch, row_pid) in &active {
+        if same_holder(dispatch, pid, *row_dispatch, *row_pid) {
+            continue;
+        }
+        let held = std::path::Path::new(held_path);
+        if canon.starts_with(held) || held.starts_with(&canon) {
+            anyhow::bail!(
+                "conflicts with an active lease on {held_path} held by another run; \
+                 wait for it to finish or lease a disjoint subtree"
+            );
+        }
+    }
+    conn.execute(
+        "INSERT INTO leases(path, session_id, dispatch_id, pid) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![canon.display().to_string(), session, dispatch, pid],
+    )?;
+    trace::write(
+        root,
+        &obs(session, "lease/acquire"),
+        &trace::Ids { session_id: Some(session.into()), ..Default::default() },
+        json!({ "path": canon.display().to_string(), "dispatch_id": dispatch, "pid": pid }),
+    );
+    Ok(canon.display().to_string())
+}
+
+/// Active leases held by this process's holder identity.
+fn held_leases(conn: &Connection) -> Vec<String> {
+    let (dispatch, pid) = lease_holder();
+    let Ok(mut stmt) =
+        conn.prepare("SELECT path, dispatch_id, pid FROM leases WHERE released_at IS NULL")
+    else {
+        return Vec::new();
+    };
+    let rows: Vec<(String, Option<i64>, Option<i64>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map(|m| m.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    rows.into_iter()
+        .filter(|(_, d, p)| same_holder(dispatch, pid, *d, *p))
+        .map(|(path, _, _)| path)
+        .collect()
+}
+
+/// When leases are held, the spawn cage is the lease write set (plus the
+/// harness root — the kernel must not cage itself out of its own ledger).
+fn narrowed_cage(root: &Root, conn: &Connection, base: &sandbox::Cage) -> Option<sandbox::Cage> {
+    let held = held_leases(conn);
+    if held.is_empty() {
+        return None;
+    }
+    let mut roots = vec![root.dir.clone()];
+    roots.extend(held.into_iter().map(std::path::PathBuf::from));
+    Some(sandbox::Cage::from_roots(roots, base.exclude.clone(), true))
+}
+
+/// Standalone (non-dispatched) exec: release own leases on clean exit.
+pub fn release_own_leases(conn: &Connection) {
+    let (dispatch, pid) = lease_holder();
+    if dispatch.is_some() {
+        return; // the dispatcher owns that lifecycle
+    }
+    let _ = conn.execute(
+        "UPDATE leases SET released_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE released_at IS NULL AND dispatch_id IS NULL AND pid = ?1",
+        [pid],
+    );
+}
+
 /// Default client unless an endpoint/auth override is in play — then a
 /// ServiceTargetResolver rewrites the target. ANTHROPIC_BASE_URL (env) only
 /// applies when the model resolved to the Anthropic adapter, mirroring the
@@ -597,6 +718,22 @@ fn tool_defs() -> Vec<Tool> {
                 },
                 "required": ["type"]
             })),
+        Tool::new("fs_lease")
+            .with_description(
+                "Acquire an exclusive write lease (&mut) on a directory subtree before mutating it. \
+                 The path must be an existing directory inside your granted write roots; the kernel is \
+                 the borrow checker and refuses overlapping leases held by concurrent runs. Once you \
+                 hold leases, shell commands can only write inside them (plus the harness root) — \
+                 lease exactly what you intend to change. Leases release automatically when this run \
+                 ends; there is no unlock to forget.",
+            )
+            .with_schema(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "directory to lease, absolute or relative to the harness root" }
+                },
+                "required": ["path"]
+            })),
         Tool::new("ask_human")
             .with_description(
                 "Ask the human a question. Interactively this waits for an answer; under the daemon it \
@@ -636,6 +773,12 @@ fn run_tool(
                 return err("shell: missing 'command'".into());
             };
             let timeout = args["timeout_secs"].as_u64().unwrap_or(120);
+            // Held leases narrow the cage: the spawn's write set becomes the
+            // leases (plus the harness root) instead of the whole grant —
+            // enforcement of exclusivity is the cage that exists anyway
+            // (docs/sandbox.md).
+            let narrowed = narrowed_cage(root, conn, cage);
+            let cage = narrowed.as_ref().unwrap_or(cage);
             // The camera: boundary diff of the writable roots around the
             // call. cause attribution is structural — this tool call IS the
             // bracket (docs/sandbox.md).
@@ -644,6 +787,17 @@ fn run_tool(
             let after = sandbox::snapshot(cage);
             emit_fs_delta(root, session, &call.call_id, cage, &before, &after);
             ToolOutcome::Output(out)
+        }
+        "fs_lease" => {
+            let Some(path) = args["path"].as_str() else {
+                return err("fs_lease: missing 'path'".into());
+            };
+            match acquire_lease(root, conn, cage, session, path) {
+                Ok(leased) => ToolOutcome::Output(
+                    json!({ "leased": leased, "held": held_leases(conn) }).to_string(),
+                ),
+                Err(e) => err(format!("fs_lease: {e:#}")),
+            }
         }
         "emit_event" => {
             let Some(etype) = args["type"].as_str() else {

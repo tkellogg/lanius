@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 /// profile.toml — one file, whole identity: skill visibility, throttles,
 /// sandbox policy, model selection, template vars.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct Profile {
     #[serde(default)]
     pub model: ModelCfg,
@@ -19,6 +20,31 @@ pub struct Profile {
     pub sandbox: SandboxCfg,
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
+    /// Ordered package search path; relative entries resolve against the
+    /// root. First hit wins by name (systemd unit load path semantics).
+    /// ELANUS_PACKAGE_PATH overrides.
+    #[serde(default = "default_package_path")]
+    pub package_path: Vec<String>,
+}
+
+fn default_package_path() -> Vec<String> {
+    vec!["packages".into()]
+}
+
+// Manual Default so a missing profile.toml behaves exactly like an empty
+// one: derive(Default) would zero the serde field defaults (empty
+// package_path = no discovery at all).
+impl Default for Profile {
+    fn default() -> Self {
+        Profile {
+            model: ModelCfg::default(),
+            skills: SkillsCfg::default(),
+            throttle: BTreeMap::new(),
+            sandbox: SandboxCfg::default(),
+            vars: BTreeMap::new(),
+            package_path: default_package_path(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

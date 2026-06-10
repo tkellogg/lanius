@@ -15,6 +15,9 @@ FAILS=0
 
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
+  # Supervised actors are children of the daemon but survive a plain kill;
+  # crash-only in production (their bus connection dies), explicit here.
+  pkill -f "$TMP/packages/beacon" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
@@ -54,21 +57,28 @@ elanus init "$TMP" >/dev/null || fail "elanus init"
 [ -f "$TMP/trace.jsonl" ] || fail "trace.jsonl missing"
 [ -f "$TMP/recorder.toml" ] || fail "recorder.toml missing"
 [ -f "$TMP/bus.toml" ] || fail "bus.toml missing"
-[ -L "$TMP/handlers.d/work.demo.echo/00-echo-echo" ] || fail "echo handler not wired"
+[ -f "$TMP/packages/echo/elanus.toml" ] || fail "echo package not materialized"
+[ -d "$TMP/skills" ] && fail "skills/ should not exist (retired in v2 step 5)"
+[ -d "$TMP/handlers.d" ] && fail "handlers.d/ should not exist (retired in v2 step 5)"
+elanus packages | grep -q "^echo .*granted=[1-9]" || fail "stock echo not approved by init"
 # Per-run port so parallel runs and a real daemon on 1883 never collide.
 BUS_PORT=$((18000 + $$ % 2000))
 printf 'enabled = true\nbind = "127.0.0.1:%s"\n' "$BUS_PORT" > "$TMP/bus.toml"
 
-echo "== test skills: asker (suspend/resume), asker2 (deadline default) =="
-mkdir -p "$TMP/skills/asker/scripts" "$TMP/skills/asker2/scripts"
+echo "== test packages: asker (suspend/resume), asker2 (deadline default) =="
+mkdir -p "$TMP/packages/asker/scripts" "$TMP/packages/asker2/scripts"
 
-cat > "$TMP/skills/asker/harness.toml" <<'EOF'
-[[handler]]
-on = "work/test/ask"
-run = "scripts/run"
+cat > "$TMP/packages/asker/elanus.toml" <<'EOF'
+[request]
+subscribe = ["work/test/ask"]
+publish   = ["human/ask"]
+
+[process]
+mode = "exec"
+run  = "scripts/run"
 order = 0
 EOF
-cat > "$TMP/skills/asker/scripts/run" <<'EOF'
+cat > "$TMP/packages/asker/scripts/run" <<'EOF'
 #!/bin/sh
 EVENT=$(cat)
 case "$EVENT" in
@@ -80,15 +90,19 @@ case "$EVENT" in
     exit 75;;
 esac
 EOF
-chmod +x "$TMP/skills/asker/scripts/run"
+chmod +x "$TMP/packages/asker/scripts/run"
 
-cat > "$TMP/skills/asker2/harness.toml" <<'EOF'
-[[handler]]
-on = "work/test/ask2"
-run = "scripts/run"
+cat > "$TMP/packages/asker2/elanus.toml" <<'EOF'
+[request]
+subscribe = ["work/test/ask2"]
+publish   = ["human/ask"]
+
+[process]
+mode = "exec"
+run  = "scripts/run"
 order = 0
 EOF
-cat > "$TMP/skills/asker2/scripts/run" <<'EOF'
+cat > "$TMP/packages/asker2/scripts/run" <<'EOF'
 #!/bin/sh
 EVENT=$(cat)
 case "$EVENT" in
@@ -101,27 +115,36 @@ case "$EVENT" in
     exit 75;;
 esac
 EOF
-chmod +x "$TMP/skills/asker2/scripts/run"
+chmod +x "$TMP/packages/asker2/scripts/run"
 
-elanus enable asker >/dev/null || fail "enable asker"
-elanus enable asker2 >/dev/null || fail "enable asker2"
+elanus approve asker >/dev/null || fail "approve asker"
+elanus approve asker2 >/dev/null || fail "approve asker2"
 
-# Seconds-resolution cron so the test doesn't wait a minute.
-mkdir -p "$TMP/skills/ticker"
-cat > "$TMP/skills/ticker/harness.toml" <<'EOF'
+# Seconds-resolution cron so the test doesn't wait a minute. The cron emit
+# is a publish: it needs the approved capability or it never fires.
+mkdir -p "$TMP/packages/ticker"
+cat > "$TMP/packages/ticker/elanus.toml" <<'EOF'
+[request]
+publish = ["work/demo/echo"]
+
 [[cron]]
 schedule = "*/2 * * * * *"
 emit = "work/demo/echo"
 payload = { from = "ticker" }
 EOF
-elanus enable ticker >/dev/null || fail "enable ticker"
+elanus approve ticker >/dev/null || fail "approve ticker"
 
 # Hook plane: a guard package whose pre_dispatch hook vetoes work/test/denyme.
-mkdir -p "$TMP/skills/guard/scripts"
-cat > "$TMP/skills/guard/harness.toml" <<'EOF'
-[[handler]]
-on = "work/test/denyme"
-run = "scripts/h"
+# The hook only exists because 'blocking = ["pre_dispatch"]' gets approved.
+mkdir -p "$TMP/packages/guard/scripts"
+cat > "$TMP/packages/guard/elanus.toml" <<'EOF'
+[request]
+subscribe = ["work/test/denyme"]
+blocking  = ["pre_dispatch"]
+
+[process]
+mode = "exec"
+run  = "scripts/h"
 order = 0
 
 [[hook]]
@@ -130,18 +153,35 @@ run = "scripts/gate"
 match = "work/test/denyme"
 timeout_ms = 2000
 EOF
-cat > "$TMP/skills/guard/scripts/h" <<'EOF'
+cat > "$TMP/packages/guard/scripts/h" <<'EOF'
 #!/bin/sh
 cat > "$HARNESS_ROOT/denied-ran.txt"
 EOF
-cat > "$TMP/skills/guard/scripts/gate" <<'EOF'
+cat > "$TMP/packages/guard/scripts/gate" <<'EOF'
 #!/bin/sh
 cat >/dev/null
 echo "computer says no"
 exit 1
 EOF
-chmod +x "$TMP/skills/guard/scripts/h" "$TMP/skills/guard/scripts/gate"
-elanus enable guard >/dev/null || fail "enable guard"
+chmod +x "$TMP/packages/guard/scripts/h" "$TMP/packages/guard/scripts/gate"
+elanus approve guard >/dev/null || fail "approve guard"
+
+# The phone-app property: discovery is not authority. 'gated' subscribes but
+# is never approved — its handler must not run until the human says so.
+mkdir -p "$TMP/packages/gated/scripts"
+cat > "$TMP/packages/gated/elanus.toml" <<'EOF'
+[request]
+subscribe = ["work/test/gated"]
+
+[process]
+mode = "exec"
+run  = "scripts/h"
+EOF
+cat > "$TMP/packages/gated/scripts/h" <<'EOF'
+#!/bin/sh
+cat > "$HARNESS_ROOT/gated-ran.txt"
+EOF
+chmod +x "$TMP/packages/gated/scripts/h"
 
 echo "== daemon =="
 elanus daemon --interval-ms 200 >"$TMP/daemon.log" 2>&1 &
@@ -183,6 +223,20 @@ wait_for "event #$EV5 denied" "[ \"\$(sql \"SELECT state FROM events WHERE id=$E
 grep -q '"kind":"obs/hook/pre_dispatch/deny"' "$TMP/trace.jsonl" && ok "hook deny on the recorder" || fail "no hook deny trace"
 grep -q 'computer says no' "$TMP/trace.jsonl" && ok "deny reason recorded" || fail "deny reason missing"
 
+echo "== 5b. grants: discovery is not authority =="
+EVG=$(elanus emit work/test/gated)
+wait_for "unapproved event #$EVG settled" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVG\")\" = done ]"
+[ ! -f "$TMP/gated-ran.txt" ] && ok "unapproved package never ran" || fail "unapproved package ran"
+elanus approve gated >/dev/null || fail "approve gated"
+EVG2=$(elanus emit work/test/gated)
+wait_for "approved package ran" "[ -f '$TMP/gated-ran.txt' ]"
+wait_for "event #$EVG2 done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVG2\")\" = done ]"
+# Manifest edit detaches: the changed request re-enters pending.
+printf '\n# edited\n' >> "$TMP/packages/gated/elanus.toml"
+rm -f "$TMP/gated-ran.txt"
+elanus packages >/dev/null  # re-sync picks up the new hash
+elanus packages | grep -q "^gated .*granted=[1-9]" && ok "unchanged value carried over manifest edit" || fail "carry-over broken"
+
 echo "== 6. flight recorder =="
 for kind in obs/ledger/emit obs/dispatch/spawn obs/dispatch/exit obs/ledger/expire; do
   grep -q "\"kind\":\"$kind\"" "$TMP/trace.jsonl" && ok "trace has $kind" || fail "trace missing $kind"
@@ -209,6 +263,35 @@ EVM=$(sql "SELECT id FROM events WHERE payload LIKE '%via-mqtt%'")
 # Retained: a late subscriber still gets the last value.
 elanus bus pub obs/skill/demo/status '{"alive":true}' --retain || fail "bus pub --retain"
 elanus bus sub 'obs/skill/+/status' --count 1 --timeout 5 | grep -q '"alive":true' && ok "retained replay to late subscriber" || fail "retained replay"
+
+echo "== 8. daemon actor: supervised, token-authed, ACL-scoped =="
+mkdir -p "$TMP/packages/beacon/scripts"
+cat > "$TMP/packages/beacon/elanus.toml" <<'EOF'
+[request]
+publish = ["obs/test/beacon"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+EOF
+cat > "$TMP/packages/beacon/scripts/main" <<'EOF'
+#!/bin/sh
+# Crash-only: when the bus dies, so do we; the supervisor restarts us.
+elanus bus pub obs/test/evil '{"sneaky":true}' --qos 0
+while true; do
+  elanus bus pub obs/test/beacon '{"ping":true}' --qos 1 || exit 1
+  sleep 1
+done
+EOF
+chmod +x "$TMP/packages/beacon/scripts/main"
+elanus approve beacon >/dev/null || fail "approve beacon"
+# The supervisor discovers, boots, and announces it (retained liveness).
+wait_for "beacon alive (retained status)" "elanus bus sub 'obs/skill/beacon/status' --count 1 --timeout 3 | grep -q '\"state\":\"alive\"'"
+# Its approved publish flows through its token-authenticated connection.
+elanus bus sub 'obs/test/beacon' --count 1 --timeout 10 | grep -q '"ping":true' && ok "actor publish delivered" || fail "actor publish lost"
+# The unapproved one was dropped with an obs echo, never delivered.
+wait_for "ACL denial echoed to obs/" "grep -q '\"kind\":\"obs/skill/beacon/denied\"' '$TMP/trace.jsonl'"
+grep -q '"value":"obs/test/evil"' "$TMP/trace.jsonl" && ok "denial names the topic" || fail "denial detail missing"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

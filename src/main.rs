@@ -10,12 +10,12 @@ mod hooks;
 mod human;
 mod initcmd;
 mod manifest;
+mod packages;
 mod paths;
 mod profile;
 mod recorder;
 mod render;
 mod sandbox;
-mod skills;
 mod topic;
 mod trace;
 
@@ -90,12 +90,12 @@ enum Cmd {
         #[arg(long, default_value = "render-preview")]
         session: String,
     },
-    /// Materialize a skill package's registrations into handlers.d/ + tables
-    Enable { name: String },
-    /// Remove a skill package's registrations
-    Disable { name: String },
-    /// List skill packages and their wiring
-    Skills,
+    /// List packages: what's discovered, what's requested, what's granted
+    Packages,
+    /// Approve a package's requested capabilities (prints each one)
+    Approve { name: String },
+    /// Revoke a package's approved capabilities
+    Revoke { name: String },
     /// What's blocked on you?
     Inbox,
     /// Answer an ask by event id
@@ -211,43 +211,69 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Cmd::Exec { prompt, session, profile, resume } => {
-            exec::run(&root, exec::ExecOpts { session, profile, prompt, resume })?;
+            let result = exec::run(&root, exec::ExecOpts { session, profile, prompt, resume });
+            if let Ok(conn) = open(&root) {
+                exec::release_own_leases(&conn);
+            }
+            result?;
         }
         Cmd::HandleExec => exec::handle_exec(&root)?,
         Cmd::Render { profile, session } => {
             let conn = open(&root)?;
             println!("{}", render::render(&root, &conn, &profile, &session)?);
         }
-        Cmd::Enable { name } => {
+        Cmd::Packages => {
             let conn = open(&root)?;
-            skills::enable(&root, &conn, &name)?;
-        }
-        Cmd::Disable { name } => {
-            let conn = open(&root)?;
-            skills::disable(&root, &conn, &name)?;
-        }
-        Cmd::Skills => {
-            let conn = open(&root)?;
-            for s in skills::list(&root)? {
-                let crons: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM crons WHERE skill=?1",
-                    [&s.name],
-                    |r| r.get(0),
-                )?;
-                // A package is enabled if anything of it is wired: handlers or crons.
-                let enabled = skills::is_enabled(&root, &s.name) || crons > 0;
-                let kind = match (&s.manifest, &s.meta) {
-                    (Some(_), Some(_)) => "handlers+skill",
-                    (Some(_), None) => "handlers",
+            packages::sync(&root, &conn)?;
+            for p in packages::discover(&root)? {
+                let (mode, hash) = match &p.manifest {
+                    Some(lm) => (
+                        lm.manifest
+                            .process
+                            .as_ref()
+                            .map(|pr| pr.mode.clone())
+                            .unwrap_or_else(|| "-".into()),
+                        lm.hash.clone(),
+                    ),
+                    None => ("-".into(), String::new()),
+                };
+                let counts: (i64, i64) = if hash.is_empty() {
+                    (0, 0)
+                } else {
+                    conn.query_row(
+                        "SELECT
+                           SUM(CASE WHEN state='requested' THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN state='approved' THEN 1 ELSE 0 END)
+                         FROM grants WHERE package=?1 AND manifest_hash=?2",
+                        rusqlite::params![p.name, hash],
+                        |r| {
+                            Ok((
+                                r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                            ))
+                        },
+                    )?
+                };
+                let kind = match (&p.manifest, &p.meta) {
+                    (Some(_), Some(_)) => "actor+skill",
+                    (Some(_), None) => "actor",
                     (None, Some(_)) => "skill",
                     (None, None) => "empty",
                 };
-                let desc = s.meta.as_ref().map(|m| m.description.clone()).unwrap_or_default();
+                let desc = p.meta.as_ref().map(|m| m.description.clone()).unwrap_or_default();
                 println!(
-                    "{:<12} {:<16} enabled={:<5} crons={} {}",
-                    s.name, kind, enabled, crons, desc
+                    "{:<12} {:<12} mode={:<7} pending={:<3} granted={:<3} {}",
+                    p.name, kind, mode, counts.0, counts.1, desc
                 );
             }
+        }
+        Cmd::Approve { name } => {
+            let conn = open(&root)?;
+            packages::decide(&root, &conn, &name, true, "cli")?;
+        }
+        Cmd::Revoke { name } => {
+            let conn = open(&root)?;
+            packages::decide(&root, &conn, &name, false, "cli")?;
         }
         Cmd::Inbox => {
             let conn = open(&root)?;

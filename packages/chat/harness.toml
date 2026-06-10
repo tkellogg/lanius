@@ -1,4 +1,0 @@
-[[handler]]
-on = "work/agent/exec"
-run = "scripts/run"
-order = 0

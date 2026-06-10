@@ -1,15 +1,25 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// harness.toml — the harness-facing manifest inside a skill package.
+/// elanus.toml — the manifest inside a package (docs/bus.md, Packages).
 /// SKILL.md stays pure per the agentskills.io spec; this sibling file carries
-/// everything the dispatcher needs.
+/// everything the harness needs. Ecosystem-facing, hence the tool-named file
+/// (Cargo.toml convention) — the settled exception to generic role names.
+///
+/// A manifest is a standing REQUEST, never a self-grant: anything that can
+/// write a directory onto the package path could otherwise grant itself
+/// subscribe = ["#"] and exfiltrate every session. Approval appends to the
+/// grants ledger pinned to the manifest hash; an edited manifest re-enters
+/// pending for the delta (browser-extension re-prompt semantics).
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     #[serde(default)]
-    pub handler: Vec<HandlerDecl>,
+    pub request: Request,
+    pub process: Option<ProcessDecl>,
     #[serde(default)]
     pub hook: Vec<HookDecl>,
     #[serde(default)]
@@ -20,12 +30,53 @@ pub struct Manifest {
     pub throttle: BTreeMap<String, ThrottleDecl>,
 }
 
+/// What the package asks to be allowed to do. Every field is a request the
+/// human approves into the grants ledger; none of it is effective on sight.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Request {
+    /// Topic filters delivered to the process (exec: fork per event;
+    /// daemon: MQTT subscription).
+    #[serde(default)]
+    pub subscribe: Vec<String>,
+    /// Topic filters it may publish into (cron emits are checked too).
+    #[serde(default)]
+    pub publish: Vec<String>,
+    /// Hook points it wants to block at; [[hook]] entries require this.
+    #[serde(default)]
+    pub blocking: Vec<String>,
+    /// Durable fs prefixes beyond its scratch dir (leases cover the
+    /// dynamic rest).
+    #[serde(default)]
+    pub fs_write: Vec<String>,
+}
+
+/// How events reach the package. v1's per-package [[handler]] list collapsed
+/// into one process: a package does one thing; its script dispatches on the
+/// envelope's `type` if it listens to several topics.
 #[derive(Debug, Deserialize)]
-pub struct HandlerDecl {
-    pub on: String, // MQTT topic filter ("work/agent/exec", "signal/#")
-    pub run: String, // executable path relative to the skill dir
+#[serde(deny_unknown_fields)]
+pub struct ProcessDecl {
+    /// "exec": fork/exec per delivered event, envelope on stdin (v1
+    /// handlers). "daemon": supervised resident process, crash-only.
+    pub mode: String,
+    pub run: String,
+    /// exec only: cross-package ordering of handlers for one event.
     #[serde(default = "default_order")]
     pub order: u32,
+    /// daemon only: "backoff" (default) or "never".
+    #[serde(default = "default_restart")]
+    pub restart: String,
+    /// daemon only: forwarded to its bus session when it connects.
+    #[serde(default = "default_session_expiry")]
+    pub session_expiry_s: u64,
+}
+
+fn default_restart() -> String {
+    "backoff".into()
+}
+fn default_session_expiry() -> u64 {
+    30
 }
 
 /// Blocking interception, git-hooks style: fork/exec with the subject JSON on
@@ -36,7 +87,7 @@ pub struct HandlerDecl {
 #[derive(Debug, Deserialize)]
 pub struct HookDecl {
     pub point: String, // pre_tool_call | post_tool_call | pre_dispatch
-    pub run: String,   // executable path relative to the skill dir
+    pub run: String,   // executable path relative to the package dir
     #[serde(default = "default_order")]
     pub order: u32,
     #[serde(default = "default_hook_timeout_ms")]
@@ -87,14 +138,32 @@ fn default_order() -> u32 {
     50
 }
 
-pub fn load(skill_dir: &Path) -> Result<Option<Manifest>> {
-    let f = skill_dir.join("harness.toml");
+/// A loaded manifest plus the hash grants pin to. The hash is over the raw
+/// file bytes: any edit — even whitespace — detaches approvals. Cheap, and
+/// the conservative direction for a security artifact.
+pub struct LoadedManifest {
+    pub manifest: Manifest,
+    pub hash: String,
+}
+
+pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
+    let f = pkg_dir.join("elanus.toml");
     if !f.exists() {
         return Ok(None);
     }
-    let s = std::fs::read_to_string(&f)?;
+    let raw = std::fs::read(&f)?;
+    let s = String::from_utf8_lossy(&raw);
     let m: Manifest = toml::from_str(&s).with_context(|| format!("parsing {}", f.display()))?;
-    Ok(Some(m))
+    if let Some(p) = &m.process {
+        if p.mode != "exec" && p.mode != "daemon" {
+            anyhow::bail!("{}: process.mode must be \"exec\" or \"daemon\", got {:?}", f.display(), p.mode);
+        }
+        if p.restart != "backoff" && p.restart != "never" {
+            anyhow::bail!("{}: process.restart must be \"backoff\" or \"never\", got {:?}", f.display(), p.restart);
+        }
+    }
+    let hash = format!("{:x}", Sha256::digest(&raw));
+    Ok(Some(LoadedManifest { manifest: m, hash }))
 }
 
 /// Minimal SKILL.md frontmatter reader: name + description. Deliberately not a
@@ -105,8 +174,8 @@ pub struct SkillMeta {
     pub description: String,
 }
 
-pub fn skill_md(skill_dir: &Path) -> Option<SkillMeta> {
-    let s = std::fs::read_to_string(skill_dir.join("SKILL.md")).ok()?;
+pub fn skill_md(pkg_dir: &Path) -> Option<SkillMeta> {
+    let s = std::fs::read_to_string(pkg_dir.join("SKILL.md")).ok()?;
     let mut lines = s.lines();
     if lines.next()?.trim() != "---" {
         return None;
@@ -132,4 +201,46 @@ pub fn skill_md(skill_dir: &Path) -> Option<SkillMeta> {
 
 pub fn toml_to_json(v: &toml::Value) -> serde_json::Value {
     serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v2_manifest_parses() {
+        let dir = std::env::temp_dir().join(format!("el-man-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("elanus.toml"),
+            r#"
+[request]
+subscribe = ["work/demo/echo"]
+publish   = ["obs/skill/echo/#"]
+
+[process]
+mode = "exec"
+run  = "scripts/echo"
+"#,
+        )
+        .unwrap();
+        let lm = load(&dir).unwrap().unwrap();
+        assert_eq!(lm.manifest.request.subscribe, vec!["work/demo/echo"]);
+        assert_eq!(lm.manifest.process.as_ref().unwrap().mode, "exec");
+        assert_eq!(lm.hash.len(), 64);
+        // Any byte change detaches: hash must move.
+        std::fs::write(dir.join("elanus.toml"), "[request]\nsubscribe = [\"#\"]\n").unwrap();
+        let lm2 = load(&dir).unwrap().unwrap();
+        assert_ne!(lm.hash, lm2.hash);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bad_mode_rejected() {
+        let dir = std::env::temp_dir().join(format!("el-man-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("elanus.toml"), "[process]\nmode = \"resident\"\nrun = \"x\"\n").unwrap();
+        assert!(load(&dir).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -91,6 +91,41 @@ CREATE TABLE IF NOT EXISTS crons (
   UNIQUE(skill, emit_type, schedule)
 );
 
+-- The grants ledger: capability requests and decisions, pinned to manifest
+-- hashes (docs/bus.md, Packages). Append-shaped: a revocation is a state
+-- flip with provenance, never a deletion — the ledger reads as a capability
+-- history. A package whose manifest changes gets fresh rows under the new
+-- hash; values approved under the old hash carry over (decided_by =
+-- 'carried'), the delta re-enters 'requested'.
+CREATE TABLE IF NOT EXISTS grants (
+  id            INTEGER PRIMARY KEY,
+  package       TEXT NOT NULL,
+  manifest_hash TEXT NOT NULL,
+  kind          TEXT NOT NULL,   -- subscribe | publish | blocking | fs_write
+  value         TEXT NOT NULL,   -- topic filter / hook point / path prefix
+  state         TEXT NOT NULL DEFAULT 'requested', -- requested | approved | revoked
+  requested_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  decided_at    TEXT,
+  decided_by    TEXT,            -- 'cli' | 'init' | 'carried'
+  UNIQUE(package, manifest_hash, kind, value)
+);
+CREATE INDEX IF NOT EXISTS idx_grants_pkg ON grants(package, state);
+
+-- Write leases: agent-acquired &mut on path prefixes, ⊆ the whole-agent
+-- grant (docs/sandbox.md). The kernel is the borrow checker: no overlapping
+-- active leases. Crash-only: released by the supervisor when the holder
+-- dies; never leaks.
+CREATE TABLE IF NOT EXISTS leases (
+  id          INTEGER PRIMARY KEY,
+  path        TEXT NOT NULL,     -- canonical absolute prefix
+  session_id  TEXT,
+  dispatch_id INTEGER,           -- set when held by a dispatched handler
+  pid         INTEGER,           -- liveness check for standalone exec
+  acquired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  released_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_leases_active ON leases(released_at) WHERE released_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS kv (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,

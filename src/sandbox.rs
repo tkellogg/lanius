@@ -43,6 +43,16 @@ impl Cage {
                 Err(e) => eprintln!("[sandbox] fs_write {w:?} ignored: {e}"),
             }
         }
+        // The whole-agent grant cage only enforces when fs_write is declared:
+        // an empty declaration means "no cage", v1 behavior preserved.
+        Cage::from_roots(roots, cfg.exclude_or_default(), !cfg.fs_write.is_empty())
+    }
+
+    /// A cage over an explicit write set — what leases and package actors
+    /// spawn under. `enforce` still requires a platform mechanism; without
+    /// one the cage is camera-scope only (warned, never silent).
+    pub fn from_roots(roots: Vec<PathBuf>, exclude: Vec<String>, enforce: bool) -> Cage {
+        let mut roots = roots;
         roots.sort();
         roots.dedup();
         // Drop roots nested inside another: one walk, one subpath rule.
@@ -52,14 +62,25 @@ impl Cage {
                 top.push(r);
             }
         }
-        let enforce = !cfg.fs_write.is_empty()
-            && cfg!(target_os = "macos")
-            && Path::new("/usr/bin/sandbox-exec").exists();
-        if !cfg.fs_write.is_empty() && !enforce {
-            eprintln!("[sandbox] fs_write declared but no enforcement mechanism on this platform; camera only");
+        let can_enforce =
+            enforce && cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists();
+        if enforce && !can_enforce {
+            eprintln!("[sandbox] enforcement requested but no mechanism on this platform; camera only");
         }
-        let sbpl = enforce.then(|| sbpl(&top));
-        Cage { write_roots: top, exclude: cfg.exclude_or_default(), sbpl }
+        let sbpl = can_enforce.then(|| sbpl(&top));
+        Cage { write_roots: top, exclude, sbpl }
+    }
+
+    /// Wrap an arbitrary program (a package actor's `run`) in the cage.
+    pub fn command(&self, program: &Path) -> std::process::Command {
+        match &self.sbpl {
+            Some(profile) => {
+                let mut c = std::process::Command::new("/usr/bin/sandbox-exec");
+                c.arg("-p").arg(profile).arg(program);
+                c
+            }
+            None => std::process::Command::new(program),
+        }
     }
 
     pub fn enforcing(&self) -> bool {

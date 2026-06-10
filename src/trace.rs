@@ -35,6 +35,12 @@ pub fn now_iso() -> String {
 /// writers interleave at line granularity. Failures are deliberately swallowed:
 /// the flight recorder must never take the plane down.
 pub fn write(root: &Root, kind: &str, ids: &Ids, payload: Value) {
+    write_opts(root, kind, ids, payload, false);
+}
+
+/// write() with the bus retain flag — kernel liveness topics
+/// (obs/skill/<name>/status) want late subscribers to see the last value.
+pub fn write_opts(root: &Root, kind: &str, ids: &Ids, payload: Value, retain: bool) {
     let mut line = json!({ "ts": now_iso(), "kind": kind, "payload": payload });
     let obj = line.as_object_mut().unwrap();
     if let Some(v) = ids.event_id {
@@ -52,7 +58,7 @@ pub fn write(root: &Root, kind: &str, ids: &Ids, payload: Value) {
     let buf = line.to_string();
     // Live first, disk second: the bus sees everything; the recorder only
     // decides persistence. Both are best-effort and independent.
-    crate::bus::publish(root, kind, &buf);
+    crate::bus::publish_with(root, kind, &buf, retain);
     if crate::recorder::get(root).sink_for(kind) == crate::recorder::Sink::None {
         return;
     }

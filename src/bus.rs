@@ -78,10 +78,24 @@ pub fn connect_addr(cfg: &BusConfig) -> Option<SocketAddr> {
 pub struct KernelPub {
     pub topic: String,
     pub line: String,
+    /// Retained: late subscribers get the last value (liveness topics).
+    pub retain: bool,
+}
+
+/// Kernel → broker-thread messages. Publishes share the channel with the
+/// few control messages the supervisor sends (actor identity registration).
+pub enum BusMsg {
+    Publish(KernelPub),
+    /// The supervisor minted a connection token for a package actor it is
+    /// about to spawn; the broker uses it to authenticate CONNECT and to
+    /// scope that session's ACL to the package's approved capabilities.
+    RegisterActor { name: String, token: String },
+    /// Actor exited; its token dies with it.
+    UnregisterActor { name: String },
 }
 
 enum Handle {
-    Local(tokio::sync::mpsc::UnboundedSender<KernelPub>),
+    Local(tokio::sync::mpsc::UnboundedSender<BusMsg>),
     Mirror(Mutex<Mirror>),
     Off,
 }
@@ -122,9 +136,14 @@ pub fn init_daemon(root: &Root) {
     }
 }
 
-/// Best-effort live publish. Never blocks meaningfully, never errors: the
-/// recorder (disk) has already made its own decision independently of this.
-pub fn publish(root: &Root, topic: &str, line: &str) {
+/// Best-effort live publish, with the retain flag (kernel liveness topics —
+/// late subscribers see the last value). Never blocks meaningfully, never
+/// errors: the recorder (disk) has already made its own decision
+/// independently of this. The mirror
+/// path is QoS 0 non-retained only; retained kernel publishes exist only in
+/// the daemon, which owns the broker — enforced here by simply dropping the
+/// flag on the mirror path.
+pub fn publish_with(root: &Root, topic: &str, line: &str, retain: bool) {
     let handle = HANDLE.get_or_init(|| {
         let cfg = config(root);
         if !cfg.enabled {
@@ -137,7 +156,11 @@ pub fn publish(root: &Root, topic: &str, line: &str) {
     });
     match handle {
         Handle::Local(tx) => {
-            let _ = tx.send(KernelPub { topic: topic.to_string(), line: line.to_string() });
+            let _ = tx.send(BusMsg::Publish(KernelPub {
+                topic: topic.to_string(),
+                line: line.to_string(),
+                retain,
+            }));
         }
         Handle::Mirror(m) => {
             if let Ok(mut mirror) = m.lock() {
@@ -145,6 +168,18 @@ pub fn publish(root: &Root, topic: &str, line: &str) {
             }
         }
         Handle::Off => {}
+    }
+}
+
+/// Supervisor-only: tell the broker about an actor's connection token.
+/// No-op outside the daemon.
+pub fn register_actor(name: &str, token: Option<&str>) {
+    if let Some(Handle::Local(tx)) = HANDLE.get() {
+        let msg = match token {
+            Some(t) => BusMsg::RegisterActor { name: name.to_string(), token: t.to_string() },
+            None => BusMsg::UnregisterActor { name: name.to_string() },
+        };
+        let _ = tx.send(msg);
     }
 }
 

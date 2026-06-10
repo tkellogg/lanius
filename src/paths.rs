@@ -21,11 +21,8 @@ impl Root {
     pub fn bus_file(&self) -> PathBuf {
         self.dir.join("bus.toml")
     }
-    pub fn skills(&self) -> PathBuf {
-        self.dir.join("skills")
-    }
-    pub fn handlers(&self) -> PathBuf {
-        self.dir.join("handlers.d")
+    pub fn packages(&self) -> PathBuf {
+        self.dir.join("packages")
     }
     pub fn profiles(&self) -> PathBuf {
         self.dir.join("profiles")

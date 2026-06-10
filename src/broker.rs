@@ -21,7 +21,7 @@
 //! capabilities once grants land (step 5). No auth: the loopback default is
 //! the boundary until then.
 
-use crate::bus::{BusConfig, KernelPub, MIRROR_PROP};
+use crate::bus::{BusConfig, BusMsg, MIRROR_PROP};
 use crate::events::{self, EmitOpts};
 use crate::paths::Root;
 use crate::recorder;
@@ -68,9 +68,23 @@ struct SubRec {
     qos: v5::QoS,
 }
 
+struct Will {
+    topic: String,
+    payload: String,
+    retain: bool,
+}
+
 struct SessionRec {
     sink: v5::MqttSink,
     subs: Vec<SubRec>,
+    /// Some(package) when CONNECT authenticated with a supervisor-minted
+    /// token: this session is that package actor, and its subscribe/publish
+    /// are scoped to the package's approved grants. None = anonymous local
+    /// client (the human at the keyboard) — full access until identity for
+    /// non-actor clients lands (docs/bus.md open question 7).
+    actor: Option<String>,
+    /// CONNECT last will, fired on abnormal close (crash-only liveness).
+    will: Option<Will>,
 }
 
 struct Broker {
@@ -80,6 +94,9 @@ struct Broker {
     conn: Option<rusqlite::Connection>,
     sessions: RefCell<HashMap<u64, SessionRec>>,
     retained: RefCell<HashMap<String, String>>,
+    /// Supervisor-minted actor tokens: package name → token. Registered
+    /// over the kernel channel just before each actor spawn.
+    actors: RefCell<HashMap<String, String>>,
     next_key: Cell<u64>,
 }
 
@@ -97,13 +114,52 @@ impl Broker {
             conn,
             sessions: RefCell::new(HashMap::new()),
             retained: RefCell::new(HashMap::new()),
+            actors: RefCell::new(HashMap::new()),
             next_key: Cell::new(1),
+        }
+    }
+
+    /// May this actor publish here? The zero-cage floor (its own status
+    /// subtree) is always allowed; everything else needs an approved
+    /// publish grant under the current manifest hash.
+    fn actor_may_publish(&self, pkg: &str, topic_name: &str) -> bool {
+        if topic::matches(&format!("obs/skill/{pkg}/#"), topic_name) {
+            return true;
+        }
+        let Some(conn) = self.conn.as_ref() else { return false };
+        crate::packages::may(conn, pkg, "publish", topic_name).unwrap_or(false)
+    }
+
+    fn actor_may_subscribe(&self, pkg: &str, filter: &str) -> bool {
+        let Some(conn) = self.conn.as_ref() else { return false };
+        crate::packages::approved(conn, pkg, "subscribe")
+            .map(|fs| fs.iter().any(|f| f == filter))
+            .unwrap_or(false)
+    }
+}
+
+/// Remove a session; fire its will unless the close was clean. The denied/
+/// dead echo goes to obs/ so the variety ladder can pick it up.
+fn drop_session(st: &Rc<Broker>, key: u64, clean: bool) {
+    let rec = st.sessions.borrow_mut().remove(&key);
+    if let Some(rec) = rec {
+        if !clean {
+            if let Some(w) = rec.will {
+                if w.retain {
+                    if w.payload.is_empty() {
+                        st.retained.borrow_mut().remove(&w.topic);
+                    } else {
+                        st.retained.borrow_mut().insert(w.topic.clone(), w.payload.clone());
+                    }
+                }
+                fan_out(st, &w.topic, &w.payload);
+            }
         }
     }
 }
 
 /// Start the broker thread; returns once the listener is bound (or not).
-pub fn spawn(root: Root, cfg: BusConfig, rx: UnboundedReceiver<KernelPub>) -> Result<()> {
+pub fn spawn(root: Root, cfg: BusConfig, rx: UnboundedReceiver<BusMsg>) -> Result<()> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
     std::thread::Builder::new()
         .name("elanus-bus".into())
@@ -117,12 +173,12 @@ pub fn spawn(root: Root, cfg: BusConfig, rx: UnboundedReceiver<KernelPub>) -> Re
 fn run_system(
     root: Root,
     cfg: BusConfig,
-    rx: UnboundedReceiver<KernelPub>,
+    rx: UnboundedReceiver<BusMsg>,
     ready_tx: std::sync::mpsc::Sender<Result<()>>,
 ) {
     // The bind factory must be callable per worker; the receiver moves into
     // whichever worker takes it first (we run exactly one).
-    let rx_cell: Arc<Mutex<Option<UnboundedReceiver<KernelPub>>>> = Arc::new(Mutex::new(Some(rx)));
+    let rx_cell: Arc<Mutex<Option<UnboundedReceiver<BusMsg>>>> = Arc::new(Mutex::new(Some(rx)));
     let bind = cfg.bind.clone();
     let sys = ntex::rt::System::new("elanus-bus", ntex::rt::DefaultRuntime);
     let run = sys.run(move || {
@@ -191,12 +247,50 @@ fn run_system(
 }
 
 async fn handshake(st: Rc<Broker>, h: v5::Handshake) -> Result<v5::HandshakeAck<BusSession>, ServerError> {
+    let pkt = h.packet();
+    // Identity: username+password = package + supervisor-minted token.
+    // Wrong credentials are refused; NO credentials is an anonymous local
+    // client with full access (interim — bus.md open question 7).
+    let actor = match (&pkt.username, &pkt.password) {
+        (Some(u), Some(p)) => {
+            let name = u.to_string();
+            let token_ok = st
+                .actors
+                .borrow()
+                .get(&name)
+                .is_some_and(|t| t.as_bytes() == p.as_ref());
+            if !token_ok {
+                eprintln!("[bus] CONNECT refused: bad token for actor {name:?}");
+                return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
+            }
+            Some(name)
+        }
+        _ => None,
+    };
+    let will = pkt.last_will.as_ref().map(|w| Will {
+        topic: w.topic.to_string(),
+        payload: String::from_utf8_lossy(&w.message).into_owned(),
+        retain: w.retain,
+    });
+    // An actor's will must also pass its publish ACL — a crash announcement
+    // is still a publish.
+    let will = match (&actor, will) {
+        (Some(pkg), Some(w)) => {
+            if topic::valid_name(&w.topic) && st.actor_may_publish(pkg, &w.topic) {
+                Some(w)
+            } else {
+                eprintln!("[bus] dropping unauthorized will for {pkg}: {}", w.topic);
+                None
+            }
+        }
+        (_, w) => w,
+    };
     let key = st.next_key.get();
     st.next_key.set(key + 1);
     let sink = h.sink();
     st.sessions
         .borrow_mut()
-        .insert(key, SessionRec { sink: sink.clone(), subs: Vec::new() });
+        .insert(key, SessionRec { sink: sink.clone(), subs: Vec::new(), actor, will });
     Ok(h.ack(BusSession { key, sink }))
 }
 
@@ -207,7 +301,9 @@ async fn control_msg(
 ) -> Result<Option<v5::codec::Encoded>, ServerError> {
     match control {
         Control::Stop(reason) => {
-            st.sessions.borrow_mut().remove(&session.key);
+            // Reaching Stop with the session still in the map means it never
+            // said a clean DISCONNECT: abnormal close, the will fires.
+            drop_session(&st, session.key, false);
             if let Reason::Error(_) = reason {
                 Ok(Some(
                     v5::codec::Packet::from(v5::codec::Disconnect {
@@ -231,6 +327,8 @@ async fn protocol_msg(
 ) -> Result<v5::ProtocolMessageAck, ServerError> {
     match msg {
         v5::ProtocolMessage::Subscribe(mut s) => {
+            let actor: Option<String> =
+                st.sessions.borrow().get(&session.key).and_then(|r| r.actor.clone());
             for mut sub in s.iter_mut() {
                 let filter = sub.topic().to_string();
                 if filter.starts_with("$share/") {
@@ -240,6 +338,20 @@ async fn protocol_msg(
                 if !topic::valid_filter(&filter) {
                     sub.fail(v5::codec::SubscribeAckReason::TopicFilterInvalid);
                     continue;
+                }
+                if let Some(pkg) = &actor {
+                    if !st.actor_may_subscribe(pkg, &filter) {
+                        // Per-filter 0x87; the echo lets the variety ladder
+                        // escalate (handler → human/ask → approval → retry).
+                        sub.fail(v5::codec::SubscribeAckReason::NotAuthorized);
+                        trace::write(
+                            &st.root,
+                            &format!("obs/skill/{pkg}/denied"),
+                            &trace::Ids::default(),
+                            json!({ "kind": "subscribe", "value": filter }),
+                        );
+                        continue;
+                    }
                 }
                 // We do QoS 0 and 1; grant min(requested, 1).
                 let granted = match sub.options().qos {
@@ -274,7 +386,11 @@ async fn protocol_msg(
             Ok(s.ack())
         }
         v5::ProtocolMessage::Disconnect(d) => {
-            st.sessions.borrow_mut().remove(&session.key);
+            // Clean goodbye: the will is discarded [MQTT-3.14], except the
+            // explicit "disconnect with will" reason (0x04).
+            let with_will = d.packet().reason_code
+                == v5::codec::DisconnectReasonCode::DisconnectWithWillMessage;
+            drop_session(&st, session.key, !with_will);
             Ok(d.ack())
         }
         v5::ProtocolMessage::Ping(p) => Ok(p.ack()),
@@ -284,7 +400,7 @@ async fn protocol_msg(
 
 async fn inbound(
     st: Rc<Broker>,
-    _session: Session<BusSession>,
+    session: Session<BusSession>,
     publish: Publish,
 ) -> Result<PublishAck, ServerError> {
     let topic = publish.publish_topic().to_string();
@@ -301,6 +417,21 @@ async fn inbound(
     if !topic::valid_name(&topic) {
         eprintln!("[bus] dropping inbound publish to invalid topic {topic:?}");
         return Ok(publish.ack());
+    }
+    // Actor sessions publish inside their approved filters (plus the status
+    // floor); a deny is a drop with an obs echo, never silent.
+    let actor: Option<String> =
+        st.sessions.borrow().get(&session.key).and_then(|r| r.actor.clone());
+    if let Some(pkg) = &actor {
+        if !st.actor_may_publish(pkg, &topic) {
+            trace::write(
+                &st.root,
+                &format!("obs/skill/{pkg}/denied"),
+                &trace::Ids::default(),
+                json!({ "kind": "publish", "value": topic }),
+            );
+            return Ok(publish.ack());
+        }
     }
     let text = String::from_utf8_lossy(&payload).into_owned();
 
@@ -350,10 +481,28 @@ async fn inbound(
     Ok(publish.ack())
 }
 
-/// Drain the kernel's publish channel onto connected subscribers.
-async fn pump(st: Rc<Broker>, mut rx: UnboundedReceiver<KernelPub>) {
-    while let Some(p) = rx.recv().await {
-        fan_out(&st, &p.topic, &p.line);
+/// Drain the kernel's channel: publishes onto connected subscribers,
+/// control messages into broker state.
+async fn pump(st: Rc<Broker>, mut rx: UnboundedReceiver<BusMsg>) {
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            BusMsg::Publish(p) => {
+                if p.retain {
+                    if p.line.is_empty() {
+                        st.retained.borrow_mut().remove(&p.topic);
+                    } else {
+                        st.retained.borrow_mut().insert(p.topic.clone(), p.line.clone());
+                    }
+                }
+                fan_out(&st, &p.topic, &p.line);
+            }
+            BusMsg::RegisterActor { name, token } => {
+                st.actors.borrow_mut().insert(name, token);
+            }
+            BusMsg::UnregisterActor { name } => {
+                st.actors.borrow_mut().remove(&name);
+            }
+        }
     }
 }
 

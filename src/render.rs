@@ -1,6 +1,6 @@
 use crate::paths::Root;
 use crate::profile;
-use crate::skills;
+use crate::packages;
 use crate::trace;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -31,14 +31,17 @@ pub fn render(root: &Root, _conn: &Connection, profile_name: &str, session: &str
         }
     }
 
-    // 2. Render providers: the read seam of the memory contract. Any enabled,
-    // visible package may contribute a block by declaring [[provider]].
-    for skill in skills::list(root)? {
+    // 2. Render providers: the read seam of the memory contract. Any
+    // discovered, visible package may contribute a block by declaring
+    // [[provider]]. (Providers run at render time in the kernel's context —
+    // hoisting them behind a grant is open in bus.md; today visibility is
+    // profile-scoped, same as v1.)
+    for skill in packages::discover(root)? {
         if !profile::skill_visible(&prof, &skill.name) {
             continue;
         }
-        let Some(m) = &skill.manifest else { continue };
-        let mut provs: Vec<_> = m.provider.iter().collect();
+        let Some(lm) = &skill.manifest else { continue };
+        let mut provs: Vec<_> = lm.manifest.provider.iter().collect();
         provs.sort_by_key(|p| p.order);
         for p in provs {
             let script = skill.dir.join(&p.run);
@@ -57,7 +60,7 @@ pub fn render(root: &Root, _conn: &Connection, profile_name: &str, session: &str
 
     // 3. Skills inventory: name + description only — progressive disclosure;
     // the agent reads SKILL.md on demand.
-    let visible: Vec<_> = skills::list(root)?
+    let visible: Vec<_> = packages::discover(root)?
         .into_iter()
         .filter(|s| s.meta.is_some() && profile::skill_visible(&prof, &s.name))
         .collect();
