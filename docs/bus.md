@@ -3,6 +3,8 @@
 > Status: design, agreed 2026-06-10. Supersedes the *architecture* of
 > [init.md](init.md); init.md remains the accurate record of v1, which is
 > implemented and live-tested on `main`. Nothing in this doc is built yet.
+> Companion: [sandbox.md](sandbox.md) — the cage/lease authority model, fs
+> events, packages-as-actors. Same status, agreed same day.
 > Same conventions: **[DECIDED]** is settled with rationale, **[OPEN]** needs a
 > decision. Spec citations are to MQTT 5.0 (OASIS Standard, 2019-03-07),
 > verified June 2026.
@@ -96,12 +98,19 @@ signal/{pain,anomaly,...}         algedonic; never coalesced, never queued behin
 human/{ask,answer}
 delivery/<channel>/{sent,acked}   receipt events; escalation reads these
 ingress/<source>/...              external arrivals, pre-triage
+fs/<path>                         file-change events from caged subprocesses;
+                                  topic = "fs" + canonical absolute path with
+                                  the leading "/" dropped — see sandbox.md
 ```
 
 Envelope unchanged from v1: `{ts, topic, cause, correlation, payload}`.
-Dots→slashes migration is mechanical. **[OPEN]** Whether `handlers.d/` survives
-as a materialized *view* generated from grants (for `ls`-ability) or dies; lean
-keep-as-view — debugging stays `ls` even when routing is dynamic.
+Dots→slashes migration is mechanical. **[DECIDED]** Path-derived topic
+segments percent-encode exactly `+`, `#`, `%` (as `%2B`, `%23`, `%25`):
+wildcards are legal in filenames but illegal in topic *names*
+[MQTT-4.7.1-1]. Filters are authored against the encoded form; nothing ever
+decodes for matching. **[DECIDED]** `handlers.d/` retires — registration
+moves to package manifests (see Packages below); `ls packages/` replaces
+`ls handlers.d/` as the debugging surface.
 
 ## The bus
 
@@ -223,36 +232,80 @@ sink  = "none"            # live-only, never touches disk
 trace.jsonl semantics unchanged from v1: append-only, write-only, nothing
 reads it for control flow, thinking excluded (transcripts hold it).
 
-## Grants: the manifest changes jobs
+## Packages: skills, clients, actors
 
-**[DECIDED]** `harness.toml` stops being routing config and becomes a
-**capability grant + supervision spec**. Routing goes dynamic (subscription IS
-registration); the *envelope* a skill may operate in stays a diff-reviewable
-artifact — preserving the open-strix security property. Without grants, any
-skill could SUBSCRIBE `#` and exfiltrate every session's observations.
+**[DECIDED]** `skills/` and `handlers.d/` are replaced by `packages/`. A
+package is a directory; its contents declare what it is:
+
+```
+packages/discord/
+  SKILL.md          # optional: it's a skill (agentskills.io, stays pure)
+  elanus.toml       # optional: it's a bus client — requests, supervision, hooks
+  scripts/...
+```
+
+**[DECIDED]** `harness.toml` → `elanus.toml`. This supersedes v1's "generic
+role names" rule for this one file: an ecosystem-facing manifest wants the
+tool-named convention (`Cargo.toml`, `package.json`) for grep-ability and
+uniqueness. `HARNESS_*` env vars and `harness.db` keep their role names.
+Cron, provider, and throttle declarations carry over unchanged; v1
+`[[handler]]` declarations become subscription requests with `mode = "exec"`.
+
+**[DECIDED]** Discovery via `package_path = [...]` in the profile
+(`ELANUS_PACKAGE_PATH` overrides), ordered, first-hit-wins name shadowing —
+systemd unit load path semantics (`/etc/systemd/system` > `/run` >
+`/usr/lib`, including override-by-shadowing).
+
+**[DECIDED]** **Discovery is not authority — packages are actors.** A
+discovered package boots into a zero cage: read its own dir, write its
+scratch, publish its own `obs/skill/<name>/status`; exact floor is [OPEN] in
+sandbox.md. Its manifest is a standing **request**, never a self-grant —
+otherwise anything that can write a directory onto the path grants itself
+`subscribe = ["#"]` and exfiltrates every session. Approval appends to the
+grant ledger, pinned to the manifest hash: a package that edits its manifest
+re-enters pending for the delta (browser-extension re-prompt semantics).
+Approved capabilities attach live; no restart. This is the phone-app model —
+install is one gesture *because* install grants nothing — and it is what
+makes the activation UX smoothable without sacrificing correctness. The
+open-strix property survives strengthened: third-party manifests are
+untrusted requests *by type*, and the approval ledger stays the
+diff-reviewable artifact.
 
 ```toml
-[grant]
+# packages/discord/elanus.toml — requests, not grants
+[request]
 subscribe = ["$share/discord/work/discord/#", "ingress/discord/#"]
 publish   = ["obs/skill/discord/#", "ingress/discord/#", "work/agent/exec", "signal/pain"]
-blocking  = []                  # may not register hooks; hook grants are explicit
+blocking  = []                  # hook capability is its own explicit request
+fs_write  = []                  # durable fs beyond scratch; leases cover the dynamic rest
 
 [process]
-mode             = "daemon"     # or "exec" (per-event fork/exec, v1 style)
+mode             = "daemon"     # or "exec" (per-event fork/exec, v1 handlers)
 run              = "scripts/main"
 restart          = "backoff"
 session_expiry_s = 30           # short: shared-group redelivery keys on session termination
 ```
 
-The bus enforces grants as per-connection ACLs (skill identity = client id,
-authenticated locally). Grant changes are commits; approval is reviewing the
-diff — same flow as sandbox policy. Both process modes coexist: daemons for
-adapters/indexers (warm state, websockets, ingress — the hole v1 hand-waved),
-exec for stateless scripts. SKILL.md stays pure agentskills.io, unchanged.
+Enforcement is locality-dependent; the request/grant language isn't
+(principle 1: interface unification). Local children get the OS cage plus
+per-connection ACL. Remote MQTT clients (phones, UIs, bridges) get
+protocol-side enforcement only: per-filter SUBACK 0x87 Not authorized
+(§3.9.3), PUBACK 0x87 on QoS 1 publish, silent-drop-plus-obs-event on QoS 0.
+A denied SUBSCRIBE echoes to `obs/` and can climb the variety ladder —
+handler → `human/ask` → approval appended → client retries. Authorization is
+just another event flow. **[OPEN]** Identity for non-local clients: local
+children authenticate by peer credentials; remotes need tokens.
+
+Both process modes coexist: daemons for adapters/indexers (warm state,
+websockets, ingress — the hole v1 hand-waved), exec for stateless scripts.
+SKILL.md stays pure agentskills.io, unchanged. Authority semantics — grants
+vs leases, the whole-agent grant, fs events — live in
+[sandbox.md](sandbox.md).
 
 ## Skill lifecycle: crash-only
 
-**[DECIDED]** Daemon skills connect with a retained will
+**[DECIDED]** Daemon packages boot into the zero cage (capabilities attach
+as approvals land; no restart) and connect with a retained will
 (`obs/skill/<name>/status` → `dead`), publish `alive` retained on connect.
 QoS 1 + manual acks + ack-after-processing; crash anytime. Crash → will fires
 → supervisor restarts with backoff → session resumes → unacked messages
@@ -287,29 +340,40 @@ handler stop re-pinging a human who already acked on another channel.
 
 ## Migration from v1
 
-1. **Topic grammar**: dots → paths; one filter language for handlers,
-   throttles, recorder. Mechanical.
+1. **Topic grammar**: dots → paths; one filter language (MQTT §4.7) for
+   handlers, throttles, recorder; percent-encoding rule; `fs/` family
+   reserved. Mechanical. Interim shim: `handlers.d/` dirnames keep dots,
+   converted at match time — the directory dies in step 5.
 2. **Hook plane, pre-bus**: `[[hook]]` exec-style in the exec loop and
    dispatcher (pre/post tool call first). Works without the bus; resident
    hooks arrive with it. Independently valuable as the sandbox seam.
-3. **The bus**: ntex-mqtt spike → micro-broker (or rmqtt fallback); mirror
+3. **Cage + camera**: sandbox spawn wrapper for agent tool execs (whole-agent
+   grant only, no leases yet) + boundary diff → `fs/` events as trace lines.
+   Pre-bus, independently valuable. See [sandbox.md](sandbox.md).
+4. **The bus**: ntex-mqtt spike → micro-broker (or rmqtt fallback); mirror
    events + trace onto topics; recorder rules.
-4. **Grants + supervised daemons + LWT**; `handlers.d/` becomes a generated
-   view or retires.
-5. **Ingress bridge** (Discord first) — the first real daemon skill.
-6. **Delivery receipts + escalation handler** — pure userland; can land any
-   time after 3.
+5. **Packages**: `packages/` + `elanus.toml`, request/approval ledger,
+   leases, supervised daemons + LWT; `handlers.d/` and `skills/` retire.
+6. **Ingress bridge** (Discord first) — the first real daemon package.
+7. **Delivery receipts + escalation handler** — pure userland; can land any
+   time after 4.
 
 ## Open questions (consolidated)
+
+Resolved since first draft: handlers.d (retired in favor of `packages/`);
+topic-filter-vs-filename encoding (percent-encode `+ # %`; interim dots shim).
 
 1. ntex spike: embedding ergonomics, latency of resident-hook round trip,
    LOC reality check. Fallback trigger to rmqtt is "broker logic > ~2k LOC or
    System embedding fights tokio."
 2. Shared-group (`$share`) vs per-skill queues for work topics.
 3. Render providers → pre-LLM-request hooks?
-4. `handlers.d/` as generated view: keep or retire?
-5. Recorder rotation/retention knobs per pattern.
-6. Poison policy parameters (N, backoff curve, park location).
-7. Topic-filter encoding anywhere a filesystem name is needed.
-8. Ledger schema changes for topic-shaped types (probably just rename
+4. Recorder rotation/retention knobs per pattern.
+5. Poison policy parameters (N, backoff curve, park location).
+6. Ledger schema changes for topic-shaped types (probably just rename
    `type` values; `emitted_by_dispatch` and correlation machinery carry over).
+7. Identity/auth for non-local MQTT clients (local children = peer creds;
+   remotes need tokens).
+8. Zero-cage floor and spawn policy for untrusted package roots (sandbox.md).
+9. Exclusive publish leases on topic prefixes for source authenticity
+   (sandbox.md).
