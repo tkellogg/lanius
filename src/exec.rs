@@ -204,6 +204,26 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         if tool_calls.is_empty() {
             let out = text.unwrap_or_default();
             println!("{out}");
+            // The mailbox model's last leg: a correlated, dispatched run is a
+            // conversation turn, and the reply is MAIL TO THE HUMAN — not just
+            // transcript + captured stdout. Same correlation = same thread
+            // (the TUI/CLI that composed the work sees the reply arrive).
+            // Uncorrelated or CLI-direct runs stay quiet: background work's
+            // results live in the transcript, not the human's inbox.
+            if in_handler && !out.is_empty() {
+                if let Some(corr) = ids.correlation_id.clone() {
+                    events::emit(
+                        root,
+                        &conn,
+                        EmitOpts {
+                            payload: Some(json!({ "text": out })),
+                            correlation: Some(corr),
+                            cause: event_id,
+                            ..EmitOpts::new(&crate::topic::human_mailbox(&prof.owner))
+                        },
+                    )?;
+                }
+            }
             return Ok(());
         }
 

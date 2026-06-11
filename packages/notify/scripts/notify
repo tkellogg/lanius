@@ -13,11 +13,13 @@ payload = event.get("payload") or {}
 etype = event.get("type", "event")
 
 title = f"elanus: {etype}"
-body = payload.get("question") or payload.get("reason") or json.dumps(payload)[:160]
+body = payload.get("question") or payload.get("text") or payload.get("reason") or json.dumps(payload)[:160]
 options = payload.get("options")
 if options:
     body += "  [" + " | ".join(str(o) for o in options) + "]"
-if etype == "in/human/owner":
+# The answer hint belongs on asks only; agent replies ({text}) are also
+# human mail and need no response.
+if etype == "in/human/owner" and payload.get("question"):
     body += f'  — answer: elanus answer {event.get("id")} "..."'
 
 script = 'on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run'

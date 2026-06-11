@@ -179,6 +179,11 @@ await waitFor('second ask pending', () => frame().includes('second ask?'));
 elanus('emit', 'in/agent/main', '--correlation', 'tui-corr-2', '--payload', '{"answer":"from-cli"}');
 await waitFor('CLI answer reflected', () => frame().includes('answered: from-cli'));
 
+// 4b. agent REPLIES are human mail too ({text}, not {question}) — they render
+// in the pane as un-answerable items and never open the editor.
+elanus('emit', 'in/human/owner', '--correlation', 'tui-conv-9', '--payload', '{"text":"here is your answer"}');
+await waitFor('agent reply rendered as mail', () => frame().includes('here is your answer'));
+
 // 5. compose path: publish new work, PUBACK = accepted indicator
 tui.stdin.write('\t'); // asks -> compose
 await waitFor('compose focused', () => frame().includes('prompt>'));

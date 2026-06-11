@@ -14,16 +14,14 @@ DAEMON_PID=""
 FAILS=0
 
 cleanup() {
-  [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
-  [ -n "${LLM_PID:-}" ] && kill "$LLM_PID" 2>/dev/null
-  # Supervised actors are children of the daemon but survive a plain kill;
+  # -9, unapologetically: these are throwaway test processes and the system
+  # is crash-only by design. A surviving daemon holds its port and poisons
+  # later runs (random bus-section failures) — that bit us repeatedly.
+  [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
+  [ -n "${LLM_PID:-}" ] && kill -9 "$LLM_PID" 2>/dev/null
+  # Supervised actors are children of the daemon but survive its death;
   # crash-only in production (their bus connection dies), explicit here.
-  pkill -f "$TMP/packages/beacon" 2>/dev/null
-  pkill -f "$TMP/packages/linemux" 2>/dev/null
-  pkill -f "$TMP/packages/worker" 2>/dev/null
-  pkill -f "$TMP/packages/resident-guard" 2>/dev/null
-  pkill -f "$TMP/packages/resident-mute" 2>/dev/null
-  pkill -f "$TMP/packages/resident-gate" 2>/dev/null
+  pkill -9 -f "$TMP/packages/" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
@@ -69,6 +67,10 @@ elanus init "$TMP" >/dev/null || fail "elanus init"
 elanus packages | grep -q "^echo .*granted=[1-9]" || fail "stock echo not approved by init"
 # Per-run port so parallel runs and a real daemon on 1883 never collide.
 BUS_PORT=$((18000 + $$ % 2000))
+# Evict any leaked daemon squatting on our port (a hard-killed prior run's
+# trap never fired) — otherwise our daemon's bind fails with a warning and
+# every bus section times out mysteriously.
+lsof -ti "tcp:$BUS_PORT" 2>/dev/null | xargs kill -9 2>/dev/null
 printf 'enabled = true\nbind = "127.0.0.1:%s"\n' "$BUS_PORT" > "$TMP/bus.toml"
 
 echo "== test packages: asker (suspend/resume), asker2 (deadline default) =="
@@ -570,6 +572,28 @@ ELAPSED=$(( $(date +%s) - START ))
 [ "$ELAPSED" -lt 30 ] && ok "tool call did not hang past the timeout (${ELAPSED}s)" || fail "tool call hung ${ELAPSED}s"
 grep '"kind":"obs/harness/hook/pre_tool_call/allow"' "$TMP/trace.jsonl" | grep '"hook":"resident:resident-mute"' | grep -q '"mode":"timeout"' \
   && ok "timeout outcome echoed with the declared default" || fail "timeout echo missing"
+
+echo "== 13. agent reply is mail to the human =="
+# The mailbox model's last leg: a dispatched, CORRELATED run's final text
+# becomes in/human/<owner> mail carrying the conversation's correlation —
+# that's how the composer (TUI/CLI) sees the reply. Drive handle-exec
+# directly, with the env the dispatcher would set.
+# cause_id is a real FK — anchor on an actual ledger row, as a dispatch would
+EV13=$(elanus emit obs/e2e/chat-anchor --correlation chat-corr-1)
+printf '{"id":%s,"correlation_id":"chat-corr-1","payload":{"prompt":"hi"}}' "$EV13" | \
+  HARNESS_EVENT_ID="$EV13" HARNESS_CORRELATION_ID=chat-corr-1 elanus handle-exec >/dev/null 2>&1
+REPLY=$(sql "SELECT json_extract(payload,'\$.text') FROM events WHERE type='in/human/owner' AND correlation_id='chat-corr-1'")
+[ "$REPLY" = "task complete" ] \
+  && ok "reply mailed to the human with the conversation correlation" \
+  || fail "reply mail missing/wrong: '$REPLY'"
+# An UNcorrelated run stays quiet: background work lives in the transcript,
+# never the human's inbox.
+NTEXT=$(sql "SELECT COUNT(*) FROM events WHERE type='in/human/owner' AND json_extract(payload,'\$.text') IS NOT NULL")
+EV13B=$(elanus emit obs/e2e/chat-anchor2)
+printf '{"id":%s,"payload":{"prompt":"hi"}}' "$EV13B" | \
+  HARNESS_EVENT_ID="$EV13B" elanus handle-exec >/dev/null 2>&1
+NTEXT2=$(sql "SELECT COUNT(*) FROM events WHERE type='in/human/owner' AND json_extract(payload,'\$.text') IS NOT NULL")
+[ "$NTEXT2" = "$NTEXT" ] && ok "uncorrelated run stays out of the inbox" || fail "uncorrelated run mailed the human"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

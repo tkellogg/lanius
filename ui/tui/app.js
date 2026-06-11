@@ -102,11 +102,25 @@ export default function App({ url, agent = 'main' }) {
         return next.length > STREAM_CAP ? next.slice(next.length - STREAM_CAP) : next;
       });
       if (topic.startsWith('in/human/')) {
-        // An ask. The wire envelope carries no deadline/default (ledger-only
-        // fields today — see README findings); show them if they ever appear.
+        // Human mail is two kinds: an ASK ({question}, wants an answer) or a
+        // REPLY ({text} — the agent's conversation turn, mail per the mailbox
+        // model). The wire envelope carries no deadline/default (ledger-only
+        // fields today); show them if they ever appear.
         const corr = env.correlation_id;
-        if (corr) {
-          const p = env.payload && typeof env.payload === 'object' ? env.payload : {};
+        const p = env.payload && typeof env.payload === 'object' ? env.payload : {};
+        if (!p.question && typeof p.text === 'string') {
+          setAsks((prev) =>
+            prev.concat({
+              k: `reply-${seq}`, // replies share corr with their compose; key must be unique
+              corr: corr ?? `reply-${seq}`,
+              question: p.text,
+              options: null,
+              deadline: null,
+              status: 'reply', // never answerable, never nagged
+              answer: null,
+            })
+          );
+        } else if (corr) {
           setAsks((prev) =>
             prev.some((a) => a.corr === corr)
               ? prev
@@ -130,7 +144,7 @@ export default function App({ url, agent = 'main' }) {
             env.payload && typeof env.payload === 'object' ? env.payload.answer : undefined;
           setAsks((prev) =>
             prev.map((a) =>
-              a.corr === corr && a.status !== 'answered'
+              a.corr === corr && a.status !== 'answered' && a.status !== 'reply'
                 ? { ...a, status: 'answered', answer: ans ?? a.answer }
                 : a
             )
@@ -170,10 +184,13 @@ export default function App({ url, agent = 'main' }) {
 
   const publishWork = (text) => {
     setComposeNote('sending…');
+    // Correlate the work so the conversation threads: the agent's reply
+    // comes back as in/human/# mail carrying this same correlation.
+    const conv = `tui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     clientRef.current?.publish(
       `in/agent/${agent}`,
       JSON.stringify({ prompt: text }),
-      { qos: 1 },
+      { qos: 1, properties: { userProperties: { 'el-correlation': conv } } },
       (err) => setComposeNote(err ? `rejected: ${err.message}` : 'accepted ✓ (PUBACK)')
     );
   };
@@ -268,7 +285,7 @@ export default function App({ url, agent = 'main' }) {
             h(
               Text,
               {
-                key: a.corr,
+                key: a.k ?? a.corr,
                 dimColor: a.status === 'answered',
                 color: pane === 'asks' && i === sel ? 'cyan' : undefined,
                 wrap: 'truncate-end',
