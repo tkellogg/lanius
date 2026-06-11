@@ -80,6 +80,13 @@ because it sees its own subscription table and its own acks.
 
 ## Topic grammar
 
+> **[SUPERSEDED IN DESIGN — 2026-06-11]** A v3 grammar is agreed in
+> [topics.md](topics.md): verb-first `{verb}/{category}/{noun}/{locators}`,
+> verbs = delivery contracts (`in`/`obs`/`signal`; `out` deliberately does
+> not exist — mailbox model), agent identity first-class, conversation IDs as
+> topic locators, rooms as nouns. Not yet implemented; the grammar below is
+> the accurate v2 as-built record until that migration lands.
+
 **[DECIDED]** One namespace, MQTT filter syntax (`+`, `#`) as the *single*
 pattern language — handler subscriptions, throttles, recorder rules, grants,
 hook points all use it. Replaces v1's dotted names + globset.
@@ -249,10 +256,20 @@ Every hook invocation and outcome echoes to `obs/hook/#`. The pre-tool-call
 chain is where sandbox capability policy enforces when it lands — hooks are
 the enforcement point init.md promised ("injection checks before dispatch").
 
-**[OPEN]** Resident-hook transport: in-process trait object vs MQTT
-request/response round trip. Spike measured the budget: loopback publish
-~11 µs (release), cross-thread round trip < 10 ms — MQTT round-trip is
-viable; the remaining question is taste, not feasibility.
+**[DECIDED 2026-06-11]** Resident-hook transport: **MQTT request/response
+round trip** (Response Topic + Correlation Data, §4.10), the canonical 5.0
+pattern — stable per-client response topic subscribed once at connect,
+per-request Correlation Data to demux (UUID-in-topic costs a subscription per
+request; opaque echoed bytes are free). The verdict is an ordinary publish
+whose payload carries `{decision: allow|deny, event: <rewritten>}`; PUBACKs
+are QoS plumbing and never carry the verdict. §4.10 is non-normative — the
+broker forwards the property without understanding it and nothing obliges a
+responder — so `timeout_ms` + `on_timeout` stay load-bearing, not paranoia.
+Explicitly rejected: an HTTP sidecar API (second listener, second auth story,
+second framing for a round trip MQTT already does) and direct-SQLite verdict
+channels (that's leg 3 of the containment gap — it would consecrate the
+hole). Spike numbers: ~11 µs loopback publish, < 10 ms round trip, vs the
+500 ms budget.
 **[OPEN]** Whether the render-provider contract folds into pre-LLM-request
 hooks (a provider is arguably a hook that appends context).
 
@@ -277,6 +294,21 @@ sink  = "none"            # live-only, never touches disk
 
 trace.jsonl semantics unchanged from v1: append-only, write-only, nothing
 reads it for control flow, thinking excluded (transcripts hold it).
+
+**[DECIDED 2026-06-11]** Flight recorder vs reconstruction views — split the
+concern. The in-process recorder is a **WAL**: each process records its own
+happenings synchronously in the write path, then mirrors to the broker
+best-effort (`el-mirror`). It stays in-process — it is ~250 LOC total, and
+the security posture depends on it ("the audit ledger bounds a package's
+blast radius" is only true if no package can sever the recorder by killing a
+connection). File order across processes was never the truth — trace.jsonl is
+multi-writer O_APPEND already; `ts` + `cause_id` + `correlation_id` are the
+ordering mechanism, the file is a crash-proof raw feed, not a timeline.
+**Reconstruction views** — per-agent traces, search indexes, conversation and
+room views, anything agents read to rebuild reality — are userland
+subscribers, never kernel. The multi-agent future means many *views*, not
+kernel growth; agents reconstructing reality read the ledger and transcripts
+(transactional, causal), not the trace.
 
 ## Packages: skills, clients, actors
 
@@ -490,7 +522,10 @@ handler stop re-pinging a human who already acked on another channel.
 ## Open questions (consolidated)
 
 Resolved since first draft: handlers.d (retired in favor of `packages/`);
-topic-filter-vs-filename encoding (percent-encode `+ # %`; interim dots shim).
+topic-filter-vs-filename encoding (percent-encode `+ # %`; interim dots shim);
+resident-hook transport (MQTT request/response — see Hook plane, 2026-06-11);
+topic grammar redesign agreed in [topics.md](topics.md) (2026-06-11 — its own
+[OPEN] list, each with a recommended default).
 
 1. ntex spike: embedding ergonomics, latency of resident-hook round trip,
    LOC reality check. Fallback trigger to rmqtt is "broker logic > ~2k LOC or
