@@ -99,6 +99,15 @@ MQTT Correlation Data is used by the resident-hook round trip (see bus.md
 hook plane) and never touches the envelope. The envelope pair is v1
 machinery, unchanged.
 
+**[DECIDED 2026-06-11, as-built]** External clients attach the *envelope*
+correlation to a publish via the **`el-correlation` user property** (the
+`el-*` namespace, like `el-mirror`); the broker materializes it into the
+ledger event's `correlation_id` on `in/#`/`signal/#` topics and echoes it on
+the announced line. This is how a pure MQTT client answers an ask such that
+the suspended asker actually resumes. `elanus bus pub --correlation` sets it.
+Correlation Data stays reserved for hooks — keeping the taxonomy above
+intact.
+
 **[DECIDED]** **Conversations get their own identity — as a topic locator,
 not by overloading `correlation_id`.** The dispatcher matches resumes by "the
 unanswered ask with this correlation" (flow-scoped); a conversation is a

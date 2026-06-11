@@ -1,0 +1,19 @@
+{
+  "name": "elanus-tui",
+  "version": "0.1.0",
+  "description": "elanus TUI — a pure MQTT 5 client on the loopback listener",
+  "type": "module",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "ink": "^7.0.5",
+    "mqtt": "^5.15.1",
+    "react": "^19.2.7"
+  },
+  "devDependencies": {
+    "ink-testing-library": "^4.0.0"
+  }
+}

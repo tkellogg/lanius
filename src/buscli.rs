@@ -46,7 +46,14 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 
 /// Publish once. QoS 1 (default) returns only after the broker's PUBACK —
 /// for in/# and signal/# topics that means "the ledger accepted it".
-pub fn publish(root: &Root, topic_name: &str, payload: Option<&str>, qos: u8, retain: bool) -> Result<()> {
+pub fn publish(
+    root: &Root,
+    topic_name: &str,
+    payload: Option<&str>,
+    qos: u8,
+    retain: bool,
+    correlation: Option<&str>,
+) -> Result<()> {
     if !topic::valid_name(topic_name) {
         bail!("invalid topic name {topic_name:?} (wildcards are for filters)");
     }
@@ -56,10 +63,24 @@ pub fn publish(root: &Root, topic_name: &str, payload: Option<&str>, qos: u8, re
         q => bail!("qos {q} unsupported (0 or 1)"),
     };
     let addr = addr(root)?;
+    let correlation = correlation.map(str::to_owned);
     runtime()?.block_on(async move {
         let (client, mut eventloop) = client(addr, "pub");
+        // Envelope correlation rides the el-correlation user property
+        // (topics.md ID taxonomy: MQTT Correlation Data stays reserved for
+        // the hook round trip).
+        let props = correlation.map(|c| rumqttc::v5::mqttbytes::v5::PublishProperties {
+            user_properties: vec![("el-correlation".to_string(), c)],
+            ..Default::default()
+        });
         client
-            .publish(topic_name, qos, retain, payload.unwrap_or("").as_bytes().to_vec())
+            .publish_with_properties(
+                topic_name,
+                qos,
+                retain,
+                payload.unwrap_or("").as_bytes().to_vec(),
+                props.unwrap_or_default(),
+            )
             .await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {

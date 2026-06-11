@@ -599,7 +599,7 @@ async fn inbound(
     publish: Publish,
 ) -> Result<PublishAck, ServerError> {
     let topic = publish.publish_topic().to_string();
-    let (retain, mirror, resp_to) = {
+    let (retain, mirror, resp_to, el_corr) = {
         let pkt = publish.packet();
         let mirror = pkt
             .properties
@@ -608,7 +608,18 @@ async fn inbound(
             .any(|(k, _)| k.as_str() == MIRROR_PROP);
         // Response Topic (§4.10): only meaningful on hook requests.
         let resp_to = pkt.properties.response_topic.as_ref().map(|t| t.to_string());
-        (pkt.retain, mirror, resp_to)
+        // el-correlation: how an external client attaches the ENVELOPE
+        // correlation (flow/trace id) to a publish. Deliberately a user
+        // property, not MQTT Correlation Data — the taxonomy in topics.md
+        // reserves Correlation Data for the hook round trip; this is the
+        // application-layer field, in the el-* namespace like el-mirror.
+        let el_corr = pkt
+            .properties
+            .user_properties
+            .iter()
+            .find(|(k, _)| k.as_str() == "el-correlation")
+            .map(|(_, v)| v.to_string());
+        (pkt.retain, mirror, resp_to, el_corr)
     };
     let payload = publish.read_all().await.unwrap_or_default();
     // A failure reason in the PUBACK is the honest answer for QoS 1: "I did
@@ -703,13 +714,15 @@ async fn inbound(
         };
         let mut opts = EmitOpts::new(&topic);
         opts.payload = Some(pv.clone());
+        opts.correlation = el_corr.clone();
         // This same function fans the materialized event out below, so the
         // row is born already-announced; the dispatcher's announce sweep
         // must not publish it a second time.
         opts.pre_announced = true;
         match events::emit(&st.root, conn, opts) {
             Ok(id) => json!({
-                "ts": trace::now_iso(), "kind": topic, "payload": pv, "event_id": id
+                "ts": trace::now_iso(), "kind": topic, "payload": pv, "event_id": id,
+                "correlation_id": el_corr
             })
             .to_string(),
             Err(e) => {

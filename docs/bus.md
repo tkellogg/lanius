@@ -186,6 +186,14 @@ verbatim") — a client library on the flight path would drag an async runtime
 into trace::write. Identity/auth for non-local clients stays open (question
 7).
 
+**[LANDED 2026-06-11]** The first UI exists and is the pure-client proof:
+`ui/tui/` (ink + mqtt.js) is an ordinary anonymous loopback MQTT 5 client —
+subscribes `obs/# in/# signal/#`, answers asks and composes agent work by
+publishing to the agent mailbox (correlation via the `el-correlation` user
+property, see topics.md), zero privileged access. Its smoke test drives a
+real daemon end to end (`npm test` in ui/tui; deliberately not part of
+tests/e2e.sh — the repo gate stays node-free).
+
 **Degradation order** (the test for every design choice): MQTT listener down →
 external fan-out and ingress lost; work, hooks, recorder, exec unaffected.
 

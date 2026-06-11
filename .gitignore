@@ -10,3 +10,4 @@ trace.jsonl
 HANDOFF.md
 __pycache__/
 *.pyc
+ui/tui/node_modules/

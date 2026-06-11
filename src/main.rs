@@ -135,6 +135,10 @@ enum BusCmd {
         /// Retain: late subscribers get the last value (empty payload clears)
         #[arg(long)]
         retain: bool,
+        /// Envelope correlation (flow id) — rides the el-correlation user
+        /// property; the broker materializes it on in/# and signal/# topics
+        #[arg(long)]
+        correlation: Option<String>,
     },
     /// Subscribe and print one JSON line per message
     Sub {
@@ -312,8 +316,8 @@ fn run(cli: Cli) -> Result<()> {
             human::ask(&root, &conn, &question, options.as_deref(), deadline_minutes, default.as_deref())?;
         }
         Cmd::Bus { cmd } => match cmd {
-            BusCmd::Pub { topic, payload, qos, retain } => {
-                buscli::publish(&root, &topic, payload.as_deref(), qos, retain)?;
+            BusCmd::Pub { topic, payload, qos, retain, correlation } => {
+                buscli::publish(&root, &topic, payload.as_deref(), qos, retain, correlation.as_deref())?;
             }
             BusCmd::Sub { filter, count, timeout, blocking, order, timeout_ms, on_timeout, phase, point } => {
                 let b = blocking.then_some(buscli::BlockingOpts {
