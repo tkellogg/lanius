@@ -412,11 +412,26 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
         // human/ask. Match it by the emitting dispatch (HARNESS_DISPATCH_ID),
         // so two handlers of the same event can each park on their own ask
         // without cross-wiring; fall back to cause for emitters that lost env.
+        //
+        // Crucially we match only an *unanswered* ask. On a resume the same
+        // dispatch_id is reused, so the dispatch's prior (already-answered)
+        // ask is still its newest by id; without this guard a handler that
+        // re-suspends WITHOUT emitting a fresh ask would re-park on that old
+        // correlation, whose answer already exists — resume_suspended would
+        // then respawn it every tick forever. Excluding answered asks turns
+        // that into the honest "nothing to wake it -> failed" below.
+        const UNANSWERED: &str =
+            "AND NOT EXISTS (SELECT 1 FROM events ans
+                             WHERE ans.type = 'human/answer'
+                               AND ans.correlation_id = events.correlation_id)";
         resume_correlation = conn
             .query_row(
-                "SELECT correlation_id FROM events
-                 WHERE emitted_by_dispatch = ?1 AND type = 'human/ask' AND correlation_id IS NOT NULL
-                 ORDER BY id DESC LIMIT 1",
+                &format!(
+                    "SELECT correlation_id FROM events
+                     WHERE emitted_by_dispatch = ?1 AND type = 'human/ask'
+                       AND correlation_id IS NOT NULL {UNANSWERED}
+                     ORDER BY id DESC LIMIT 1"
+                ),
                 [r.dispatch_id],
                 |row| row.get(0),
             )
@@ -424,17 +439,20 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
         if resume_correlation.is_none() {
             resume_correlation = conn
                 .query_row(
-                    "SELECT correlation_id FROM events
-                     WHERE cause_id = ?1 AND type = 'human/ask' AND correlation_id IS NOT NULL
-                       AND emitted_by_dispatch IS NULL
-                     ORDER BY id DESC LIMIT 1",
+                    &format!(
+                        "SELECT correlation_id FROM events
+                         WHERE cause_id = ?1 AND type = 'human/ask' AND correlation_id IS NOT NULL
+                           AND emitted_by_dispatch IS NULL {UNANSWERED}
+                         ORDER BY id DESC LIMIT 1"
+                    ),
                     [r.event_id],
                     |row| row.get(0),
                 )
                 .optional()?;
         }
         if resume_correlation.is_none() {
-            // Suspended with nothing to wake it: that's a failure, loudly.
+            // Suspended with no open ask to wake it: a failure, loudly —
+            // never a silent hot-loop on an already-answered correlation.
             dstate = "failed";
         }
     }

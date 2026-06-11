@@ -75,7 +75,11 @@ def outbound_loop():
             bus_pub("delivery/discord/sent", {"channel_id": channel, "ok": ok})
         except Exception as e:
             log(f"[discord] bad send event: {e}")
-    sys.exit(1)  # bus subscription died -> crash-only restart
+    # This runs in a daemon thread; sys.exit() would only unwind THIS thread
+    # and leave the half-dead process running. os._exit terminates the whole
+    # process so the supervisor's crash-only restart actually fires.
+    log("[discord] outbound bus subscription died -> exiting for restart")
+    os._exit(1)
 
 
 def main():

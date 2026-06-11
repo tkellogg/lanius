@@ -123,7 +123,13 @@ impl Broker {
     /// subtree) is always allowed; everything else needs an approved
     /// publish grant under the current manifest hash.
     fn actor_may_publish(&self, pkg: &str, topic_name: &str) -> bool {
-        if topic::matches(&format!("obs/skill/{pkg}/#"), topic_name) {
+        // Encode the name into the floor filter exactly as status_event()
+        // encodes it when publishing — otherwise a package literally named
+        // "+" would yield the floor `obs/skill/+/#`, a valid wildcard that
+        // matches every other package's status subtree. (Discovery also now
+        // rejects wildcard names, so this is belt-and-suspenders.)
+        let floor = format!("obs/skill/{}/#", crate::topic::encode_segment(pkg));
+        if topic::matches(&floor, topic_name) {
             return true;
         }
         let Some(conn) = self.conn.as_ref() else { return false };
@@ -414,12 +420,18 @@ async fn inbound(
         (pkt.retain, mirror)
     };
     let payload = publish.read_all().await.unwrap_or_default();
+    // A failure reason in the PUBACK is the honest answer for QoS 1: "I did
+    // not take ownership." The hand-rolled mirror is QoS 0 (no ack), so this
+    // only ever reaches a real client (rumqttc/`elanus bus pub`), which the
+    // CLI now treats as an error — the at-least-once handoff cannot lie.
+    use v5::codec::PublishAckReason as Nack;
+    let nack = |r: Nack| Ok(PublishAck::new(r));
     if !topic::valid_name(&topic) {
-        eprintln!("[bus] dropping inbound publish to invalid topic {topic:?}");
-        return Ok(publish.ack());
+        eprintln!("[bus] rejecting inbound publish to invalid topic {topic:?}");
+        return nack(Nack::TopicNameInvalid);
     }
     // Actor sessions publish inside their approved filters (plus the status
-    // floor); a deny is a drop with an obs echo, never silent.
+    // floor); a deny is a 0x87 NACK plus an obs echo, never a silent success.
     let actor: Option<String> =
         st.sessions.borrow().get(&session.key).and_then(|r| r.actor.clone());
     if let Some(pkg) = &actor {
@@ -430,44 +442,49 @@ async fn inbound(
                 &trace::Ids::default(),
                 json!({ "kind": "publish", "value": topic }),
             );
-            return Ok(publish.ack());
+            return nack(Nack::NotAuthorized);
         }
     }
     let text = String::from_utf8_lossy(&payload).into_owned();
+    let first = topic.split('/').next().unwrap_or("");
+    let is_ledger = matches!(first, "work" | "signal" | "human");
 
-    let out_line = if mirror {
-        // Our own process already recorded this; forward verbatim.
+    let out_line = if is_ledger {
+        // Ledger topics ALWAYS materialize, el-mirror or not: the mirror's
+        // "already recorded, forward verbatim" shortcut is for observations
+        // the kernel itself produced (obs/...), never a license for a client
+        // to inject un-ledgered, un-audited work/signal/human by setting one
+        // user property. The PUBACK below is the at-least-once handoff, so a
+        // failed emit must NACK, not silently succeed.
+        let pv: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        let Some(conn) = st.conn.as_ref() else {
+            eprintln!("[bus] no db, refusing inbound {topic}");
+            return nack(Nack::ImplementationSpecificError);
+        };
+        let mut opts = EmitOpts::new(&topic);
+        opts.payload = Some(pv.clone());
+        match events::emit(&st.root, conn, opts) {
+            Ok(id) => json!({
+                "ts": trace::now_iso(), "kind": topic, "payload": pv, "event_id": id
+            })
+            .to_string(),
+            Err(e) => {
+                eprintln!("[bus] inbound {topic} emit failed: {e:#}");
+                return nack(Nack::UnspecifiedError);
+            }
+        }
+    } else if mirror {
+        // Observation our own process already recorded; forward verbatim.
         text
     } else {
+        // Observation from an external client: standard envelope, the
+        // recorder decides disk, fan-out regardless.
         let pv: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        let first = topic.split('/').next().unwrap_or("");
-        if matches!(first, "work" | "signal" | "human") {
-            // Ledger topics: the PUBACK below is the at-least-once handoff.
-            let Some(conn) = st.conn.as_ref() else {
-                eprintln!("[bus] no db, dropping inbound {topic}");
-                return Ok(publish.ack());
-            };
-            let mut opts = EmitOpts::new(&topic);
-            opts.payload = Some(pv.clone());
-            match events::emit(&st.root, conn, opts) {
-                Ok(id) => json!({
-                    "ts": trace::now_iso(), "kind": topic, "payload": pv, "event_id": id
-                })
-                .to_string(),
-                Err(e) => {
-                    eprintln!("[bus] inbound {topic} emit failed: {e:#}");
-                    return Ok(publish.ack());
-                }
-            }
-        } else {
-            // Observation from an external client: standard envelope, the
-            // recorder decides disk, fan-out regardless.
-            let line = json!({ "ts": trace::now_iso(), "kind": topic, "payload": pv }).to_string();
-            if recorder::get(&st.root).sink_for(&topic) == recorder::Sink::Trace {
-                trace::append_line(&st.root, &line);
-            }
-            line
+        let line = json!({ "ts": trace::now_iso(), "kind": topic, "payload": pv }).to_string();
+        if recorder::get(&st.root).sink_for(&topic) == recorder::Sink::Trace {
+            trace::append_line(&st.root, &line);
         }
+        line
     };
 
     if retain {

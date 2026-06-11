@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS crons (
 CREATE TABLE IF NOT EXISTS grants (
   id            INTEGER PRIMARY KEY,
   package       TEXT NOT NULL,
-  manifest_hash TEXT NOT NULL,
+  manifest_hash TEXT NOT NULL,   -- full version identity (manifest + code)
+  code_hash     TEXT NOT NULL DEFAULT '', -- executables only; gates carry-over
   kind          TEXT NOT NULL,   -- subscribe | publish | blocking | fs_write
   value         TEXT NOT NULL,   -- topic filter / hook point / path prefix
   state         TEXT NOT NULL DEFAULT 'requested', -- requested | approved | revoked
@@ -143,9 +144,10 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 );
 "#,
     )?;
-    // Migration for databases created before the column existed; the error on
+    // Migrations for databases created before a column existed; the error on
     // a duplicate column is expected and ignored.
     let _ = conn.execute("ALTER TABLE events ADD COLUMN emitted_by_dispatch INTEGER", []);
+    let _ = conn.execute("ALTER TABLE grants ADD COLUMN code_hash TEXT NOT NULL DEFAULT ''", []);
     Ok(())
 }
 

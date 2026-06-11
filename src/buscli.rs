@@ -68,7 +68,21 @@ pub fn publish(root: &Root, topic_name: &str, payload: Option<&str>, qos: u8, re
                 .map_err(|_| anyhow::anyhow!("no broker response within 5s (daemon running?)"))?
                 .context("connection failed (daemon running?)")?;
             match ev {
-                Event::Incoming(Packet::PubAck(_)) => break,
+                Event::Incoming(Packet::PubAck(p)) => {
+                    // The reason code is the broker's real answer. A failure
+                    // (ACL deny, ledger emit failed, no db) must surface as a
+                    // nonzero exit so the caller — a crash-only ingress
+                    // bridge — does NOT delete its source line believing the
+                    // ledger took it. This is what makes "PUBACK = accepted"
+                    // true rather than aspirational.
+                    use rumqttc::v5::mqttbytes::v5::PubAckReason;
+                    if p.reason != PubAckReason::Success
+                        && p.reason != PubAckReason::NoMatchingSubscribers
+                    {
+                        bail!("broker rejected publish to {topic_name:?}: {:?}", p.reason);
+                    }
+                    break;
+                }
                 Event::Outgoing(rumqttc::Outgoing::Publish(_)) if qos == QoS::AtMostOnce => break,
                 _ => {}
             }

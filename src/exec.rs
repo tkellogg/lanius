@@ -432,32 +432,47 @@ fn acquire_lease(
         );
     }
     let (dispatch, pid) = lease_holder();
-    // The borrow check: exclusive on a directory conflicts with any active
-    // lease above or below it, unless we already hold that lease.
-    let active: Vec<(String, Option<i64>, Option<i64>)> = {
-        let mut stmt =
-            conn.prepare("SELECT path, dispatch_id, pid FROM leases WHERE released_at IS NULL")?;
-        let r = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        r
-    };
-    for (held_path, row_dispatch, row_pid) in &active {
-        if same_holder(dispatch, pid, *row_dispatch, *row_pid) {
-            continue;
+    // The borrow check must be atomic against other leasers: the overlap
+    // scan and the insert run inside one IMMEDIATE transaction so two
+    // concurrent processes cannot both pass the scan and then both insert
+    // overlapping leases (the check-then-act race). BEGIN IMMEDIATE takes
+    // the write lock up front; db::open set a 5s busy_timeout, so the loser
+    // waits rather than erroring. The kernel really is the borrow checker.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let outcome = (|| -> anyhow::Result<()> {
+        let active: Vec<(String, Option<i64>, Option<i64>)> = {
+            let mut stmt =
+                conn.prepare("SELECT path, dispatch_id, pid FROM leases WHERE released_at IS NULL")?;
+            let r = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            r
+        };
+        for (held_path, row_dispatch, row_pid) in &active {
+            if same_holder(dispatch, pid, *row_dispatch, *row_pid) {
+                continue;
+            }
+            let held = std::path::Path::new(held_path);
+            if canon.starts_with(held) || held.starts_with(&canon) {
+                anyhow::bail!(
+                    "conflicts with an active lease on {held_path} held by another run; \
+                     wait for it to finish or lease a disjoint subtree"
+                );
+            }
         }
-        let held = std::path::Path::new(held_path);
-        if canon.starts_with(held) || held.starts_with(&canon) {
-            anyhow::bail!(
-                "conflicts with an active lease on {held_path} held by another run; \
-                 wait for it to finish or lease a disjoint subtree"
-            );
+        conn.execute(
+            "INSERT INTO leases(path, session_id, dispatch_id, pid) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![canon.display().to_string(), session, dispatch, pid],
+        )?;
+        Ok(())
+    })();
+    match &outcome {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK");
         }
     }
-    conn.execute(
-        "INSERT INTO leases(path, session_id, dispatch_id, pid) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![canon.display().to_string(), session, dispatch, pid],
-    )?;
+    outcome?;
     trace::write(
         root,
         &obs(session, "lease/acquire"),
@@ -467,34 +482,37 @@ fn acquire_lease(
     Ok(canon.display().to_string())
 }
 
-/// Active leases held by this process's holder identity.
-fn held_leases(conn: &Connection) -> Vec<String> {
+/// Active leases held by this process's holder identity. Returns Err on a
+/// query failure rather than an empty Vec, so the caller does not mistake
+/// "couldn't read the table" for "holds nothing" and silently drop cage
+/// narrowing (a lease-exclusivity break).
+fn held_leases(conn: &Connection) -> anyhow::Result<Vec<String>> {
     let (dispatch, pid) = lease_holder();
-    let Ok(mut stmt) =
-        conn.prepare("SELECT path, dispatch_id, pid FROM leases WHERE released_at IS NULL")
-    else {
-        return Vec::new();
-    };
+    let mut stmt =
+        conn.prepare("SELECT path, dispatch_id, pid FROM leases WHERE released_at IS NULL")?;
     let rows: Vec<(String, Option<i64>, Option<i64>)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .map(|m| m.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-    rows.into_iter()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
         .filter(|(_, d, p)| same_holder(dispatch, pid, *d, *p))
         .map(|(path, _, _)| path)
-        .collect()
+        .collect())
 }
 
 /// When leases are held, the spawn cage is the lease write set (plus the
 /// harness root — the kernel must not cage itself out of its own ledger).
-fn narrowed_cage(root: &Root, conn: &Connection, base: &sandbox::Cage) -> Option<sandbox::Cage> {
-    let held = held_leases(conn);
+/// Ok(None) = no leases held, use the base grant cage. Err = the lease
+/// table could not be read; the caller fails the tool closed rather than
+/// run with the un-narrowed grant.
+fn narrowed_cage(root: &Root, conn: &Connection, base: &sandbox::Cage) -> anyhow::Result<Option<sandbox::Cage>> {
+    let held = held_leases(conn)?;
     if held.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut roots = vec![root.dir.clone()];
     roots.extend(held.into_iter().map(std::path::PathBuf::from));
-    Some(sandbox::Cage::from_roots(roots, base.exclude.clone(), true))
+    Ok(Some(sandbox::Cage::from_roots(roots, base.exclude.clone(), true)))
 }
 
 /// Standalone (non-dispatched) exec: release own leases on clean exit.
@@ -776,8 +794,12 @@ fn run_tool(
             // Held leases narrow the cage: the spawn's write set becomes the
             // leases (plus the harness root) instead of the whole grant —
             // enforcement of exclusivity is the cage that exists anyway
-            // (docs/sandbox.md).
-            let narrowed = narrowed_cage(root, conn, cage);
+            // (docs/sandbox.md). If the lease table can't be read we fail the
+            // tool closed rather than run with the un-narrowed grant.
+            let narrowed = match narrowed_cage(root, conn, cage) {
+                Ok(n) => n,
+                Err(e) => return err(format!("shell: cannot read active leases, refusing to run: {e:#}")),
+            };
             let cage = narrowed.as_ref().unwrap_or(cage);
             // The camera: boundary diff of the writable roots around the
             // call. cause attribution is structural — this tool call IS the
@@ -794,7 +816,7 @@ fn run_tool(
             };
             match acquire_lease(root, conn, cage, session, path) {
                 Ok(leased) => ToolOutcome::Output(
-                    json!({ "leased": leased, "held": held_leases(conn) }).to_string(),
+                    json!({ "leased": leased, "held": held_leases(conn).unwrap_or_default() }).to_string(),
                 ),
                 Err(e) => err(format!("fs_lease: {e:#}")),
             }

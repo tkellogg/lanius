@@ -7,9 +7,15 @@
 set -u
 
 EVENT=$(cat)
+# after_secs is interpolated into SQL below, so it must be a bare integer —
+# coerce it to one (default 20) and never trust the raw payload value.
 AFTER=$(printf '%s' "$EVENT" | python3 -c '
 import json, sys
-print((json.load(sys.stdin).get("payload") or {}).get("after_secs", 20))')
+try:
+    v = int((json.load(sys.stdin).get("payload") or {}).get("after_secs", 20))
+except (ValueError, TypeError):
+    v = 20
+print(max(0, v))')
 CAP=3
 DB="$HARNESS_DB"
 

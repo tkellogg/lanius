@@ -12,9 +12,16 @@ while true; do
     [ -e "$f" ] || continue
     payload=$(python3 -c '
 import json, sys, datetime
-text = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
+# Cap the read: a giant file must not become an oversized publish that the
+# broker rejects every restart, wedging the bridge in a retry loop.
+CAP = 64 * 1024
+with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
+    text = fh.read(CAP + 1)
+truncated = len(text) > CAP
+text = text[:CAP].strip()
 print(json.dumps({
     "text": text,
+    "truncated": truncated,
     "source": "linemux",
     "received_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
 }))' "$f") || { rm -f "$f"; continue; }

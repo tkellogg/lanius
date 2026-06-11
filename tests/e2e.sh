@@ -232,11 +232,20 @@ elanus approve gated >/dev/null || fail "approve gated"
 EVG2=$(elanus emit work/test/gated)
 wait_for "approved package ran" "[ -f '$TMP/gated-ran.txt' ]"
 wait_for "event #$EVG2 done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVG2\")\" = done ]"
-# Manifest edit detaches: the changed request re-enters pending.
+# Manifest-only edit: the code is unchanged, so unchanged requests carry.
 printf '\n# edited\n' >> "$TMP/packages/gated/elanus.toml"
 rm -f "$TMP/gated-ran.txt"
 elanus packages >/dev/null  # re-sync picks up the new hash
 elanus packages | grep -q "^gated .*granted=[1-9]" && ok "unchanged value carried over manifest edit" || fail "carry-over broken"
+# Script swap: a grant authorizes CODE, so editing the handler re-gates the
+# package even though its requests are byte-identical. The handler must not
+# run again until re-approved.
+printf '\necho swapped >> "$HARNESS_ROOT/gated-swapped.txt"\n' >> "$TMP/packages/gated/scripts/h"
+elanus packages >/dev/null  # re-sync sees the new code_hash
+elanus packages | grep -q "^gated .*granted=0" && ok "script edit re-gated the package" || fail "script edit did not re-gate"
+EVG3=$(elanus emit work/test/gated)
+wait_for "re-gated event #$EVG3 settled" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVG3\")\" = done ]"
+[ ! -f "$TMP/gated-swapped.txt" ] && ok "swapped code never ran (re-approval required)" || fail "swapped code ran without re-approval"
 
 echo "== 6. flight recorder =="
 for kind in obs/ledger/emit obs/dispatch/spawn obs/dispatch/exit obs/ledger/expire; do
