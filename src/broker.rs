@@ -15,11 +15,23 @@
 //! - everything else: wrapped in the standard envelope, recorder decides
 //!   disk, fan-out either way.
 //!
-//! Subscriptions: per-filter grant; `$share` and invalid filters are denied
-//! with the proper SUBACK reason. SUBSCRIBE user properties are accepted and
-//! ignored for now — blocking-subscription declarations only become honored
-//! capabilities once grants land (step 5). No auth: the loopback default is
-//! the boundary until then.
+//! Subscriptions: per-filter grant; invalid filters are denied with the
+//! proper SUBACK reason. `$share/<group>/<filter>` shared subscriptions
+//! (§4.8.2) are supported: one group member receives each matching message
+//! (round-robin), no retained replay, ACL checked against the inner filter.
+//! SUBSCRIBE user properties are accepted and ignored for now —
+//! blocking-subscription declarations only become honored capabilities once
+//! grants land (step 5). No auth: the loopback default is the boundary until
+//! then.
+//!
+//! Work plane on the bus: an in/# (or signal/#) event is announced under its
+//! own topic exactly once — by this broker when it arrived over the bus
+//! (inbound() materializes then fans out, inserting announced=1), or by the
+//! daemon's announce sweep (dispatcher::announce_ledger_events) for events
+//! the kernel minted itself. When an in/# delivery fans out to QoS 1
+//! subscribers, the broker joins their PUBACK futures and publishes
+//! obs/harness/delivery/complete when the last one lands — completion as
+//! control flow, never blocking the publisher's own PUBACK.
 
 use crate::bus::{BusConfig, BusMsg, MIRROR_PROP};
 use crate::events::{self, EmitOpts};
@@ -64,7 +76,13 @@ struct BusSession {
 }
 
 struct SubRec {
+    /// The filter exactly as subscribed — identity for re-subscribe and
+    /// UNSUBSCRIBE, including any `$share/<group>/` prefix.
     filter: String,
+    /// What actually matches topics: `filter` minus the share prefix.
+    inner: String,
+    /// Some(group) for `$share/<group>/<inner>` shared subscriptions.
+    group: Option<String>,
     qos: v5::QoS,
 }
 
@@ -97,6 +115,11 @@ struct Broker {
     /// Supervisor-minted actor tokens: package name → token. Registered
     /// over the kernel channel just before each actor spawn.
     actors: RefCell<HashMap<String, String>>,
+    /// Round-robin cursors for shared subscription groups, keyed by
+    /// "<group>\u{1}<inner filter>". Consumer choice is broker discretion
+    /// (§4.8.2); round-robin spreads load and is easy to reason about in
+    /// tests. No ordering guarantee across the group, per spec.
+    shared_rr: RefCell<HashMap<String, usize>>,
     next_key: Cell<u64>,
 }
 
@@ -115,6 +138,7 @@ impl Broker {
             sessions: RefCell::new(HashMap::new()),
             retained: RefCell::new(HashMap::new()),
             actors: RefCell::new(HashMap::new()),
+            shared_rr: RefCell::new(HashMap::new()),
             next_key: Cell::new(1),
         }
     }
@@ -337,16 +361,28 @@ async fn protocol_msg(
                 st.sessions.borrow().get(&session.key).and_then(|r| r.actor.clone());
             for mut sub in s.iter_mut() {
                 let filter = sub.topic().to_string();
-                if filter.starts_with("$share/") {
-                    sub.fail(v5::codec::SubscribeAckReason::SharedSubscriptionNotSupported);
-                    continue;
-                }
-                if !topic::valid_filter(&filter) {
+                // $share/<group>/<filter> (§4.8.2): competing consumers —
+                // one member of the group receives each matching message.
+                let (group, inner) = match parse_share(&filter) {
+                    Some(x) => x,
+                    None => {
+                        sub.fail(v5::codec::SubscribeAckReason::TopicFilterInvalid);
+                        continue;
+                    }
+                };
+                if !topic::valid_filter(&inner) {
                     sub.fail(v5::codec::SubscribeAckReason::TopicFilterInvalid);
                     continue;
                 }
                 if let Some(pkg) = &actor {
-                    if !st.actor_may_subscribe(pkg, &filter) {
+                    // The grant may be stored either as the full $share form
+                    // (a manifest that requested the shared subscription
+                    // verbatim) or as the inner filter (the capability is
+                    // "receive these topics"; the group is delivery
+                    // mechanics, not extra authority).
+                    let allowed = st.actor_may_subscribe(pkg, &filter)
+                        || (group.is_some() && st.actor_may_subscribe(pkg, &inner));
+                    if !allowed {
                         // Per-filter 0x87; the echo lets the variety ladder
                         // escalate (handler → ask → approval → retry).
                         sub.fail(v5::codec::SubscribeAckReason::NotAuthorized);
@@ -366,19 +402,27 @@ async fn protocol_msg(
                 };
                 if let Some(rec) = st.sessions.borrow_mut().get_mut(&session.key) {
                     rec.subs.retain(|x| x.filter != filter);
-                    rec.subs.push(SubRec { filter: filter.clone(), qos: granted });
+                    rec.subs.push(SubRec {
+                        filter: filter.clone(),
+                        inner: inner.clone(),
+                        group: group.clone(),
+                        qos: granted,
+                    });
                 }
                 sub.confirm(granted);
                 // Retained replay, QoS 0: last known value, best effort.
-                let matching: Vec<(String, String)> = st
-                    .retained
-                    .borrow()
-                    .iter()
-                    .filter(|(t, _)| topic::matches(&filter, t))
-                    .map(|(t, p)| (t.clone(), p.clone()))
-                    .collect();
-                for (t, p) in matching {
-                    let _ = session.sink.publish(t).send_at_most_once(p.into_bytes().into());
+                // Never for shared subscriptions [MQTT-3.3.1-10].
+                if group.is_none() {
+                    let matching: Vec<(String, String)> = st
+                        .retained
+                        .borrow()
+                        .iter()
+                        .filter(|(t, _)| topic::matches(&inner, t))
+                        .map(|(t, p)| (t.clone(), p.clone()))
+                        .collect();
+                    for (t, p) in matching {
+                        let _ = session.sink.publish(t).send_at_most_once(p.into_bytes().into());
+                    }
                 }
             }
             Ok(s.ack())
@@ -465,6 +509,10 @@ async fn inbound(
         };
         let mut opts = EmitOpts::new(&topic);
         opts.payload = Some(pv.clone());
+        // This same function fans the materialized event out below, so the
+        // row is born already-announced; the dispatcher's announce sweep
+        // must not publish it a second time.
+        opts.pre_announced = true;
         match events::emit(&st.root, conn, opts) {
             Ok(id) => json!({
                 "ts": trace::now_iso(), "kind": topic, "payload": pv, "event_id": id
@@ -525,11 +573,35 @@ async fn pump(st: Rc<Broker>, mut rx: UnboundedReceiver<BusMsg>) {
     }
 }
 
+/// Split a `$share/<group>/<filter>` subscription into (group, inner filter)
+/// per §4.8.2. Non-shared filters pass through as (None, filter). None =
+/// malformed share syntax (missing or wildcard group, empty inner filter).
+fn parse_share(filter: &str) -> Option<(Option<String>, String)> {
+    let Some(rest) = filter.strip_prefix("$share/") else {
+        return Some((None, filter.to_string()));
+    };
+    let (group, inner) = rest.split_once('/')?;
+    if group.is_empty() || group.contains('+') || group.contains('#') || inner.is_empty() {
+        return None;
+    }
+    Some((Some(group.to_string()), inner.to_string()))
+}
+
 /// Deliver to every session with a matching subscription, once per session at
-/// the strongest granted QoS. QoS 1 deliveries resolve on the subscriber's
-/// PUBACK; for now they complete in the background ("all deliveries done" as
-/// control flow arrives when work moves onto the bus). Dead sinks are pruned
+/// the strongest granted QoS. Shared subscriptions deliver to exactly one
+/// member per (group, filter), round-robin; a session holding both a normal
+/// and a shared matching subscription legitimately receives both copies.
+/// QoS 1 deliveries resolve on the subscriber's PUBACK; dead sinks are pruned
 /// on send failure — the safety net under Control::Stop cleanup.
+///
+/// Completion fan-in (docs/bus.md, "completion is kernel-owned"): for in/#
+/// deliveries the broker counts QoS 0 sends as complete immediately and joins
+/// the QoS 1 PUBACK futures; when the last lands it publishes
+/// obs/harness/delivery/complete {topic, event_id, subscribers}. Zero
+/// matching subscribers publishes nothing — "nobody was listening" is already
+/// visible in the ledger/dispatch records, and a completion event about no
+/// deliveries would be noise. This is observation/bookkeeping only: the
+/// publisher's PUBACK (= "ledger accepted") never waits on it.
 fn fan_out(st: &Rc<Broker>, topic_name: &str, line: &str) {
     let mut q0: Vec<v5::MqttSink> = Vec::new();
     let mut q1: Vec<(u64, v5::MqttSink)> = Vec::new();
@@ -538,7 +610,7 @@ fn fan_out(st: &Rc<Broker>, topic_name: &str, line: &str) {
         for (key, rec) in sessions.iter() {
             let mut best: Option<v5::QoS> = None;
             for sub in &rec.subs {
-                if topic::matches(&sub.filter, topic_name) {
+                if sub.group.is_none() && topic::matches(&sub.inner, topic_name) {
                     best = Some(match (best, sub.qos) {
                         (Some(v5::QoS::AtLeastOnce), _) | (_, v5::QoS::AtLeastOnce) => v5::QoS::AtLeastOnce,
                         _ => v5::QoS::AtMostOnce,
@@ -551,21 +623,121 @@ fn fan_out(st: &Rc<Broker>, topic_name: &str, line: &str) {
                 None => {}
             }
         }
+        // Shared groups: collect members per (group, inner), pick one each.
+        let mut groups: HashMap<(String, String), Vec<(u64, v5::MqttSink, v5::QoS)>> =
+            HashMap::new();
+        for (key, rec) in sessions.iter() {
+            for sub in &rec.subs {
+                if let Some(g) = &sub.group {
+                    if topic::matches(&sub.inner, topic_name) {
+                        groups
+                            .entry((g.clone(), sub.inner.clone()))
+                            .or_default()
+                            .push((*key, rec.sink.clone(), sub.qos));
+                    }
+                }
+            }
+        }
+        for ((g, inner), mut members) in groups {
+            // Stable order so the round-robin cursor means something.
+            members.sort_by_key(|m| m.0);
+            let mut rr = st.shared_rr.borrow_mut();
+            let cursor = rr.entry(format!("{g}\u{1}{inner}")).or_insert(0);
+            let (key, sink, qos) = members[*cursor % members.len()].clone();
+            *cursor = cursor.wrapping_add(1);
+            match qos {
+                v5::QoS::AtMostOnce => q0.push(sink),
+                _ => q1.push((key, sink)),
+            }
+        }
     }
+    let subscribers = q0.len() + q1.len();
+    let track = topic_name.starts_with("in/") && subscribers > 0;
     for sink in q0 {
         let _ = sink
             .publish(topic_name.to_string())
             .send_at_most_once(line.as_bytes().to_vec().into());
     }
+    if q1.is_empty() {
+        if track {
+            delivery_complete(st, topic_name, line, subscribers);
+        }
+        return;
+    }
+    // One countdown across the QoS 1 fan-out; each delivery still rides its
+    // own task so a slow subscriber never delays the others' sends.
+    let remaining = Rc::new(Cell::new(q1.len()));
     for (key, sink) in q1 {
         let fut = sink
             .publish(topic_name.to_string())
             .send_at_least_once(line.as_bytes().to_vec().into());
         let st = st.clone();
+        let remaining = remaining.clone();
+        let topic_name = topic_name.to_string();
+        let line = line.to_string();
         ntex::rt::spawn(async move {
             if fut.await.is_err() {
                 st.sessions.borrow_mut().remove(&key);
             }
+            // A failed/dead subscriber still "completes" its slot: the spec
+            // has no requeue, so waiting on a corpse would wedge fan-in.
+            remaining.set(remaining.get() - 1);
+            if remaining.get() == 0 && track {
+                delivery_complete(&st, &topic_name, &line, subscribers);
+            }
         });
+    }
+}
+
+/// All deliveries of an in/# event have completed (QoS 0 at send, QoS 1 at
+/// PUBACK): publish the kernel-owned completion observation the protocol
+/// itself cannot express. Recorded per recorder rules, fanned out like any
+/// other observation (an obs/ topic, so no recursion back through here).
+fn delivery_complete(st: &Rc<Broker>, topic_name: &str, line: &str, subscribers: usize) {
+    const COMPLETE_TOPIC: &str = "obs/harness/delivery/complete";
+    let event_id = serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("event_id").and_then(|x| x.as_i64()));
+    let out = json!({
+        "ts": trace::now_iso(),
+        "kind": COMPLETE_TOPIC,
+        "payload": { "topic": topic_name, "event_id": event_id, "subscribers": subscribers },
+    })
+    .to_string();
+    if recorder::get(&st.root).sink_for(COMPLETE_TOPIC) == recorder::Sink::Trace {
+        trace::append_line(&st.root, &out);
+    }
+    fan_out(st, COMPLETE_TOPIC, &out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_share;
+
+    #[test]
+    fn share_parsing() {
+        // Non-shared filters pass through.
+        assert_eq!(
+            parse_share("in/package/discord/send"),
+            Some((None, "in/package/discord/send".into()))
+        );
+        // §4.8.2 shape: $share/<group>/<filter>.
+        assert_eq!(
+            parse_share("$share/discord/in/package/discord/send"),
+            Some((Some("discord".into()), "in/package/discord/send".into()))
+        );
+        // Wildcards live in the inner filter, never the group.
+        assert_eq!(
+            parse_share("$share/g/in/package/discord/#"),
+            Some((Some("g".into()), "in/package/discord/#".into()))
+        );
+        assert_eq!(parse_share("$share/+/in/x"), None);
+        assert_eq!(parse_share("$share/#/in/x"), None);
+        // Malformed: missing group or filter.
+        assert_eq!(parse_share("$share/"), None);
+        assert_eq!(parse_share("$share/g"), None);
+        assert_eq!(parse_share("$share//in/x"), None);
+        // "$share/g/" has an empty inner filter.
+        assert_eq!(parse_share("$share/g/"), None);
     }
 }

@@ -28,9 +28,18 @@ CREATE TABLE IF NOT EXISTS events (
   deadline        TEXT,
   default_action  TEXT,
   idempotency_key TEXT UNIQUE,
+  -- Has this event been announced on the bus under its own topic?
+  -- 0 = the daemon's announce sweep still owes it a bus publish; 1 = done
+  -- (or it never needs one). Bus-origin events are inserted with 1 by the
+  -- broker — it fans out itself at inbound time — which is what makes
+  -- "announce exactly once" hold. DEFAULT 1 so rows inserted outside
+  -- events::emit (and pre-migration rows, see ALTER below) are never
+  -- blasted onto the bus retroactively; emit() always binds the value.
+  announced       INTEGER NOT NULL DEFAULT 1,
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   finished_at     TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_events_unannounced ON events(announced) WHERE announced = 0;
 CREATE INDEX IF NOT EXISTS idx_events_pending ON events(state, type, priority);
 CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id);
 
@@ -148,6 +157,9 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     // a duplicate column is expected and ignored.
     let _ = conn.execute("ALTER TABLE events ADD COLUMN emitted_by_dispatch INTEGER", []);
     let _ = conn.execute("ALTER TABLE grants ADD COLUMN code_hash TEXT NOT NULL DEFAULT ''", []);
+    // DEFAULT 1: pre-existing rows count as already announced — upgrading
+    // must not replay history onto the bus.
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN announced INTEGER NOT NULL DEFAULT 1", []);
     Ok(())
 }
 

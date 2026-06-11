@@ -13,6 +13,13 @@ pub struct EmitOpts {
     pub default_action: Option<Value>,
     pub idempotency: Option<String>,
     pub cause: Option<i64>,
+    /// True only when the caller has already announced (or is about to
+    /// announce, atomically with this insert) the event on the bus under its
+    /// own topic — today that is exactly the broker's inbound path, which
+    /// fans out the materialized event itself. Everything else leaves this
+    /// false and the daemon's announce sweep (dispatcher) publishes it.
+    /// This flag is what makes "announce exactly once" a row-level fact.
+    pub pre_announced: bool,
 }
 
 impl EmitOpts {
@@ -26,6 +33,7 @@ impl EmitOpts {
             default_action: None,
             idempotency: None,
             cause: None,
+            pre_announced: false,
         }
     }
 }
@@ -44,8 +52,8 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
     // Atomic idempotency: ON CONFLICT DO NOTHING avoids the check-then-insert
     // race where two concurrent emitters of the same key both pass a SELECT.
     let inserted = conn.execute(
-        "INSERT INTO events(type, cause_id, correlation_id, payload, priority, deadline, default_action, idempotency_key, emitted_by_dispatch)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO events(type, cause_id, correlation_id, payload, priority, deadline, default_action, idempotency_key, emitted_by_dispatch, announced)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(idempotency_key) DO NOTHING",
         params![
             o.etype,
@@ -57,6 +65,7 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
             o.default_action.as_ref().map(|v| v.to_string()),
             o.idempotency,
             dispatch,
+            o.pre_announced as i64,
         ],
     )?;
     if inserted == 0 {

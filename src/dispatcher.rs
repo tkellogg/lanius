@@ -104,11 +104,74 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
 fn tick(root: &Root, conn: &Connection, running: &mut Vec<Running>, actors: &mut Actors) -> Result<()> {
     tick_crons(root, conn)?;
     expire_deadlines(root, conn)?;
+    announce_ledger_events(root, conn)?;
     reap(root, conn, running)?;
     resume_suspended(root, conn, running)?;
     dispatch_pending(root, conn, running)?;
     tick_actors(root, conn, actors)?;
     release_dead_leases(conn)?;
+    Ok(())
+}
+
+/// Announce kernel-minted ledger events on the bus under their own topic —
+/// the work-plane-on-bus delivery piece (docs/bus.md "[KNOWN GAP — as built,
+/// step 5/6]"). The daemon is the single announcement authority for every
+/// emit that did NOT arrive over the bus: CLI `elanus emit`, cron, the
+/// dispatcher's own emits, exec handlers' emits — and events emitted while
+/// the daemon was down, which this sweep picks up on the next start.
+///
+/// Exactly-once is a row-level fact: events::emit inserts announced=0; the
+/// broker's inbound path inserts announced=1 because it fans the
+/// materialized event out itself at inbound time (a bus-origin event must
+/// never be announced twice). The kernel's announcements deliberately do NOT
+/// ride the el-mirror loopback path — the broker re-materializes in/# and
+/// signal/# mirrors into the ledger by design (the fc4fab1 security fix: the
+/// mirror marker is never a license to inject un-ledgered work), so the
+/// in-process channel (bus::publish_with in the daemon) is the only correct
+/// route. publish_with is fan-out only in pump(); it cannot re-enter emit().
+///
+/// Best-effort by design: listener down → daemon actors miss the live
+/// announcement, but the ledger row, exec dispatch, and recording are
+/// untouched (degradation order). The row is marked announced either way —
+/// the live stream is at-most-once; the ledger is the durable copy.
+fn announce_ledger_events(root: &Root, conn: &Connection) -> Result<()> {
+    let rows: Vec<(i64, String, Option<i64>, Option<String>, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, type, cause_id, correlation_id, payload FROM events
+             WHERE announced = 0 ORDER BY id LIMIT 500",
+        )?;
+        let r = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+    for (id, etype, cause, corr, payload) in rows {
+        // Only in/# and signal/# ride the bus under their own topic; other
+        // ledger-emitted types (e.g. obs/channel receipts via `elanus emit`)
+        // keep their obs/harness/ledger/emit echo only. Mark the row either
+        // way so the sweep moves on.
+        if etype.starts_with("in/") || etype.starts_with("signal/") {
+            let pv: Value = payload
+                .as_deref()
+                .map(|s| serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.into())))
+                .unwrap_or(Value::Null);
+            // Same line shape the broker fans out for bus-origin events, so
+            // a subscriber sees one format regardless of origin.
+            let mut line = json!({
+                "ts": trace::now_iso(), "kind": etype, "payload": pv, "event_id": id
+            });
+            if let Some(c) = cause {
+                line["cause_id"] = json!(c);
+            }
+            if let Some(c) = &corr {
+                line["correlation_id"] = json!(c);
+            }
+            crate::bus::publish_with(root, &etype, &line.to_string(), false);
+        }
+        conn.execute("UPDATE events SET announced = 1 WHERE id = ?1", [id])?;
+    }
     Ok(())
 }
 

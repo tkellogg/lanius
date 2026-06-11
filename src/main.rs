@@ -189,7 +189,6 @@ fn run(cli: Cli) -> Result<()> {
                 &root,
                 &conn,
                 events::EmitOpts {
-                    etype: r#type,
                     payload: parse_json_opt(payload.as_deref())?,
                     priority,
                     correlation,
@@ -197,6 +196,7 @@ fn run(cli: Cli) -> Result<()> {
                     default_action: parse_json_opt(default_action.as_deref())?,
                     idempotency,
                     cause,
+                    ..events::EmitOpts::new(&r#type)
                 },
             )?;
             println!("{id}");

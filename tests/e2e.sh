@@ -19,6 +19,7 @@ cleanup() {
   # crash-only in production (their bus connection dies), explicit here.
   pkill -f "$TMP/packages/beacon" 2>/dev/null
   pkill -f "$TMP/packages/linemux" 2>/dev/null
+  pkill -f "$TMP/packages/worker" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
@@ -341,6 +342,65 @@ N1=$(sql "SELECT COUNT(*) FROM events WHERE type='signal/attention' AND cause_id
 sleep 5   # two more sweep cycles
 N2=$(sql "SELECT COUNT(*) FROM events WHERE type='signal/attention' AND cause_id=$EVN")
 [ "$N1" = "$N2" ] && ok "acked receipt stops the nagging (held at $N1)" || fail "nagged past ack: $N1 -> $N2"
+
+echo "== 11. work plane on the bus =="
+# (a) A kernel-minted event (`elanus emit`, never near the listener) must be
+# announced under its own topic and reach a subscribed DAEMON ACTOR — before
+# this landed, kernel emits only reached exec handlers; daemon actors only
+# saw bus-origin publishes. The worker is a real supervised actor: token
+# CONNECT, subscribe ACL-checked against its approved filter.
+mkdir -p "$TMP/packages/worker/scripts"
+cat > "$TMP/packages/worker/elanus.toml" <<'EOF'
+[request]
+subscribe = ["in/package/e2e/work"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+EOF
+cat > "$TMP/packages/worker/scripts/main" <<'EOF'
+#!/bin/sh
+elanus bus sub 'in/package/e2e/work' --count 1 --timeout 60 > "$ELANUS_SCRATCH/got.json" 2>&1 || exit 1
+# Got it; park so the supervisor doesn't see a crash loop.
+while true; do sleep 5; done
+EOF
+chmod +x "$TMP/packages/worker/scripts/main"
+elanus approve worker >/dev/null || fail "approve worker"
+wait_for "worker alive (retained status)" "elanus bus sub 'obs/package/worker/status' --count 1 --timeout 3 | grep -q '\"state\":\"alive\"'"
+sleep 1  # alive is published at spawn; give the script a beat to SUBSCRIBE
+EVW=$(elanus emit in/package/e2e/work --payload '{"msg":"kernel-minted"}')
+wait_for "daemon actor received the kernel-minted event" "grep -q '\"msg\":\"kernel-minted\"' '$TMP/run/pkg-worker/got.json'"
+grep -q "\"event_id\":$EVW" "$TMP/run/pkg-worker/got.json" && ok "announcement carries the ledger event id" || fail "event_id missing from announcement"
+# (b) Completion fan-in: the worker's QoS 1 PUBACK resolves the delivery;
+# the kernel-owned completion observation lands on the recorder.
+wait_for "delivery completion observed in trace" \
+  "grep '\"kind\":\"obs/harness/delivery/complete\"' '$TMP/trace.jsonl' | grep -q '\"topic\":\"in/package/e2e/work\"'"
+grep '"kind":"obs/harness/delivery/complete"' "$TMP/trace.jsonl" | grep "in/package/e2e/work" | grep -q "\"event_id\":$EVW" \
+  && ok "completion names the event" || fail "completion missing event_id"
+# (c) Idempotence: a bus-origin in/# publish is announced exactly once (the
+# broker fans out at inbound; the dispatcher sweep must not repeat it).
+( elanus bus sub 'in/package/e2e/once' --timeout 6 > "$TMP/once.out" 2>&1 ) &
+ONCE_PID=$!
+sleep 1
+elanus bus pub in/package/e2e/once '{"n":1}' || fail "bus pub once"
+wait "$ONCE_PID"
+NONCE=$(grep -c '"n":1' "$TMP/once.out")
+[ "$NONCE" = 1 ] && ok "bus-origin event delivered exactly once" || fail "expected 1 delivery, saw $NONCE"
+# (d) $share shared subscriptions: two group members, two events — each
+# member receives exactly one (round-robin one-of-N delivery, §4.8.2).
+( elanus bus sub '$share/e2eg/in/package/e2e/shared' --count 1 --timeout 15 > "$TMP/share-a.out" 2>&1; echo "$?" > "$TMP/share-a.code" ) &
+SHA_PID=$!
+( elanus bus sub '$share/e2eg/in/package/e2e/shared' --count 1 --timeout 15 > "$TMP/share-b.out" 2>&1; echo "$?" > "$TMP/share-b.code" ) &
+SHB_PID=$!
+sleep 1
+elanus emit in/package/e2e/shared --payload '{"k":1}' >/dev/null
+elanus emit in/package/e2e/shared --payload '{"k":2}' >/dev/null
+wait "$SHA_PID" "$SHB_PID"
+[ "$(cat "$TMP/share-a.code")" = 0 ] && [ "$(cat "$TMP/share-b.code")" = 0 ] \
+  && ok "each \$share member got exactly one message" \
+  || fail "shared group delivery: a=$(cat "$TMP/share-a.out"), b=$(cat "$TMP/share-b.out")"
+cat "$TMP/share-a.out" "$TMP/share-b.out" | grep -q '"k":1' && cat "$TMP/share-a.out" "$TMP/share-b.out" | grep -q '"k":2' \
+  && ok "both events delivered across the group" || fail "an event was lost in the shared group"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

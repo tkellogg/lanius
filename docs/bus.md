@@ -219,20 +219,36 @@ NACK = drop, redelivery only on reconnect, no completion fan-in, no DLQ.
 "All deliveries complete" events are published by the kernel (from deferred-ack
 control flow on ntex, or dispatch bookkeeping) as ordinary observations.
 
-**[KNOWN GAP — as built, step 5/6].** Kernel-*originated* work events (created
-by `elanus emit`, cron, or the dispatcher → `events::emit`) are written to the
-ledger and dispatched to **exec-mode** handlers, but they are *not* announced
-on the bus: the kernel mirror carries `obs/ledger/emit`, not the `work/...`
-topic itself. So a **daemon actor** that SUBSCRIBEs `work/foo` only ever
-receives `work/foo` events that arrived *over the bus* (inbound publish →
-`inbound()` → fan-out), never ones the kernel minted internally. The discord
-scaffold's outbound path (`work/discord/send`) hits exactly this: a CLI/agent
-`emit work/discord/send` would dispatch to an exec handler but never reach the
-resident daemon. Closing it = the work-plane-on-bus delivery piece (announce
-ledger work to matching daemon subscribers, with the completion fan-in tracked
-kernel-side), deferred with `$share` work queues. Today: daemon actors react
-to bus-origin events; exec handlers react to ledger events; the two don't
-cross.
+**[GAP CLOSED — work-plane-on-bus, 2026-06-11].** Historically (steps 5/6),
+kernel-*originated* work events (created by `elanus emit`, cron, or the
+dispatcher → `events::emit`) were written to the ledger and dispatched to
+**exec-mode** handlers, but never announced on the bus under their own topic
+— a daemon actor SUBSCRIBEd to `in/package/discord/send` only ever saw
+bus-origin publishes. As built now:
+
+- **Announcement is exactly-once, decided at the row.** `events::emit`
+  inserts `announced=0`; the daemon's per-tick sweep
+  (`dispatcher::announce_ledger_events`) publishes every unannounced `in/#`
+  and `signal/#` event under its own topic via the in-process channel and
+  marks the row. The broker's inbound path inserts `announced=1` because it
+  fans the materialized event out itself — a bus-origin event is never
+  announced twice. The sweep also covers events emitted while the daemon was
+  down. The kernel deliberately does NOT ride the `el-mirror` loopback for
+  this: the broker re-ledgers `in/signal` mirrors by design (the mirror
+  marker is never a license to inject un-ledgered work), so the in-process
+  channel is the only correct route.
+- **Completion fan-in is control flow.** For an `in/#` delivery the broker
+  counts QoS 0 sends complete immediately and joins the QoS 1 PUBACK futures;
+  when the last lands it publishes `obs/harness/delivery/complete`
+  `{topic, event_id, subscribers}` (zero subscribers → no event). Bookkeeping
+  only: the publisher's PUBACK stays "the ledger accepted it."
+- **`$share/<group>/<filter>`** (§4.8.2) is supported: round-robin one-of-N
+  per group, no retained replay to shared subscriptions, ACL accepts a grant
+  on either the full `$share` form or the inner filter (the group is delivery
+  mechanics, not extra authority).
+
+Degradation order holds: listener down → daemon actors miss live
+announcements; the ledger row, exec dispatch, and recording are untouched.
 
 ### Hook plane
 
@@ -494,9 +510,9 @@ handler stop re-pinging a human who already acked on another channel.
    (src/broker.rs — subscription table, retained store, per-filter SUBACK,
    QoS 0/1 fan-out, work/signal/human ingress → ledger), kernel publish path
    + loopback mirror (src/bus.rs), `elanus bus pub|sub` debugging surface.
-   Still ahead within this step: resident hooks, $share groups, wills,
-   completion fan-in as control flow (arrives when work dispatch moves onto
-   the bus).
+   *2026-06-11*: $share groups and completion fan-in landed with
+   work-plane-on-bus (see the GAP CLOSED block under Work plane). Still
+   ahead within this step: resident hooks.
 5. **Packages**: `packages/` + `elanus.toml`, request/approval ledger,
    leases, supervised daemons + LWT; `handlers.d/` and `skills/` retire.
    *Landed 2026-06-10 (commit 07720b3).* As-built notes, where reality
