@@ -8,3 +8,5 @@ trace.jsonl
 /tmp-root*
 .env
 HANDOFF.md
+__pycache__/
+*.pyc
