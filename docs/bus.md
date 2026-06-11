@@ -212,6 +212,21 @@ NACK = drop, redelivery only on reconnect, no completion fan-in, no DLQ.
 "All deliveries complete" events are published by the kernel (from deferred-ack
 control flow on ntex, or dispatch bookkeeping) as ordinary observations.
 
+**[KNOWN GAP — as built, step 5/6].** Kernel-*originated* work events (created
+by `elanus emit`, cron, or the dispatcher → `events::emit`) are written to the
+ledger and dispatched to **exec-mode** handlers, but they are *not* announced
+on the bus: the kernel mirror carries `obs/ledger/emit`, not the `work/...`
+topic itself. So a **daemon actor** that SUBSCRIBEs `work/foo` only ever
+receives `work/foo` events that arrived *over the bus* (inbound publish →
+`inbound()` → fan-out), never ones the kernel minted internally. The discord
+scaffold's outbound path (`work/discord/send`) hits exactly this: a CLI/agent
+`emit work/discord/send` would dispatch to an exec handler but never reach the
+resident daemon. Closing it = the work-plane-on-bus delivery piece (announce
+ledger work to matching daemon subscribers, with the completion fan-in tracked
+kernel-side), deferred with `$share` work queues. Today: daemon actors react
+to bus-origin events; exec handlers react to ledger events; the two don't
+cross.
+
 ### Hook plane
 
 **[DECIDED]** Blocking interception at fixed points: `pre`/`post` tool call,
@@ -318,14 +333,54 @@ session_expiry_s = 30           # short: shared-group redelivery keys on session
 ```
 
 Enforcement is locality-dependent; the request/grant language isn't
-(principle 1: interface unification). Local children get the OS cage plus
-per-connection ACL. Remote MQTT clients (phones, UIs, bridges) get
-protocol-side enforcement only: per-filter SUBACK 0x87 Not authorized
+(principle 1: interface unification). Remote MQTT clients (phones, UIs,
+bridges) get protocol-side enforcement: per-filter SUBACK 0x87 Not authorized
 (§3.9.3), PUBACK 0x87 on QoS 1 publish, silent-drop-plus-obs-event on QoS 0.
 A denied SUBSCRIBE echoes to `obs/` and can climb the variety ladder —
 handler → `human/ask` → approval appended → client retries. Authorization is
-just another event flow. **[OPEN]** Identity for non-local clients: local
-children authenticate by peer credentials; remotes need tokens.
+just another event flow.
+
+**[KNOWN GAP — security review 2026-06-11, the containment boundary is not
+yet closed against a *malicious local package*; honest accounting here so the
+"local children get the cage plus ACL" line above is not read as more than it
+is].** What is actually enforced today:
+
+- **The OS cage bounds file *writes*** for daemon actors and the agent's
+  shell tool — to scratch + approved `fs_write` (+ leases). Reads are open,
+  network/loopback is open, and **exec-mode handlers are not caged at all and
+  receive `HARNESS_DB`** (they read/write the ledger directly — watchdog and
+  escalation are ledger-readers by design). So the cage is a write-fence on a
+  subset of spawn paths, not a sandbox.
+- **The bus ACL is authentication-gated, and authentication is presently
+  opt-out.** A session that presents a valid actor token is scoped to its
+  grants; a session that presents *no* credentials is treated as "the human"
+  with full access. A local package is also a local client: nothing stops its
+  script from connecting to the loopback broker without its token (the cage
+  permits loopback) and getting human authority — reading every session's
+  `obs/exec/...`, driving `work/agent/exec`, resolving `human/answer`. The
+  per-connection ACL contains a *cooperative* package, not a hostile one.
+
+Closing this needs the two pieces sandbox.md already defers: **fs_read
+scoping** (so a package cannot read a privileged-client cookie or other
+secrets) and **network-egress control** (so a package cannot reach the broker
+— or anything else — uninvited). A privileged-client token alone does not
+help while reads are open: the package reads the token. So the honest
+boundary today is: **the OS write-cage + the ledger are trustworthy against a
+package's *filesystem* mischief; the bus ACL is a correctness/teamwork
+boundary, not yet a security one against local code.** This is consistent
+with Tim's model (untrusted packages are the threat) only once those two
+deferred passes land; until then the mitigation is that packages are
+human-installed and the write-cage + audit ledger bound the blast radius.
+
+**[OPEN]** Identity model (supersedes the old "loopback = the human"
+assumption, which the review showed is unsound against local packages):
+should privileged local clients (the human CLI, the kernel mirror, exec
+processes) authenticate positively — e.g. a daemon-minted 0600 cookie — so
+that *unauthenticated* becomes deny rather than allow? It raises the bar
+(deliberate cookie read, auditable) but does not fully contain a package
+until fs_read scoping lands, and it trades away the "the CLI just works"
+simplicity Tim chose. Decision deferred to Tim; recorded rather than
+silently re-architected.
 
 Both process modes coexist: daemons for adapters/indexers (warm state,
 websockets, ingress — the hole v1 hand-waved), exec for stateless scripts.

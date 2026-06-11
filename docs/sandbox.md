@@ -95,6 +95,17 @@ egress — fs-write scoping without egress control is half a threat model: the
 camera sees staging, exfil is a network event. Both get their own design
 pass.
 
+**[Note — security review 2026-06-11].** These two deferred passes turned out
+to be load-bearing for *bus* security too, not just fs exfil. The
+per-connection bus ACL (bus.md, Packages) cannot contain a malicious local
+package while reads and loopback egress are open: the package's script can
+read any privileged-client token and/or simply connect to the loopback broker
+without credentials. So `fs_read` scoping + egress control are the
+prerequisites for the bus ACL to be a *security* boundary rather than a
+correctness one. Until they land, the enforced boundary against a hostile
+package is the OS write-cage + the audit ledger, and packages are assumed
+human-installed. See bus.md "Packages" → the KNOWN GAP block.
+
 ## The camera: fs events
 
 **[DECIDED]** Topic = `fs` + canonical absolute path, leading `/` dropped:
