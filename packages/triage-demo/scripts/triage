@@ -15,6 +15,6 @@ case "$text" in
     payload=$(python3 -c '
 import json, sys
 print(json.dumps({"prompt": sys.argv[1][len("agent:"):].strip()}))' "$text")
-    elanus emit work/agent/exec --payload "$payload" >/dev/null
+    elanus emit in/agent/main --payload "$payload" >/dev/null
     ;;
 esac

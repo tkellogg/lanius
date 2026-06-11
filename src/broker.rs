@@ -9,7 +9,7 @@
 //! The listener is fan-out and ingress only. Inbound routing:
 //! - `el-mirror` publishes (our own processes): forwarded verbatim — the
 //!   origin already recorded them;
-//! - `work/ signal/ human/`: materialized into the ledger via emit(); the
+//! - `in/ signal/`: materialized into the ledger via emit(); the
 //!   PUBACK means "the ledger accepted it" (at-least-once handoff), then the
 //!   event is announced to subscribers;
 //! - everything else: wrapped in the standard envelope, recorder decides
@@ -125,10 +125,10 @@ impl Broker {
     fn actor_may_publish(&self, pkg: &str, topic_name: &str) -> bool {
         // Encode the name into the floor filter exactly as status_event()
         // encodes it when publishing — otherwise a package literally named
-        // "+" would yield the floor `obs/skill/+/#`, a valid wildcard that
+        // "+" would yield the floor `obs/package/+/#`, a valid wildcard that
         // matches every other package's status subtree. (Discovery also now
         // rejects wildcard names, so this is belt-and-suspenders.)
-        let floor = format!("obs/skill/{}/#", crate::topic::encode_segment(pkg));
+        let floor = format!("obs/package/{}/#", crate::topic::encode_segment(pkg));
         if topic::matches(&floor, topic_name) {
             return true;
         }
@@ -348,11 +348,11 @@ async fn protocol_msg(
                 if let Some(pkg) = &actor {
                     if !st.actor_may_subscribe(pkg, &filter) {
                         // Per-filter 0x87; the echo lets the variety ladder
-                        // escalate (handler → human/ask → approval → retry).
+                        // escalate (handler → ask → approval → retry).
                         sub.fail(v5::codec::SubscribeAckReason::NotAuthorized);
                         trace::write(
                             &st.root,
-                            &format!("obs/skill/{pkg}/denied"),
+                            &format!("obs/package/{pkg}/denied"),
                             &trace::Ids::default(),
                             json!({ "kind": "subscribe", "value": filter }),
                         );
@@ -438,7 +438,7 @@ async fn inbound(
         if !st.actor_may_publish(pkg, &topic) {
             trace::write(
                 &st.root,
-                &format!("obs/skill/{pkg}/denied"),
+                &format!("obs/package/{pkg}/denied"),
                 &trace::Ids::default(),
                 json!({ "kind": "publish", "value": topic }),
             );
@@ -446,14 +446,16 @@ async fn inbound(
         }
     }
     let text = String::from_utf8_lossy(&payload).into_owned();
+    // The v3 routing rule (docs/topics.md): in/# and signal/# materialize to
+    // the ledger; obs/# (and everything else) fans out only.
     let first = topic.split('/').next().unwrap_or("");
-    let is_ledger = matches!(first, "work" | "signal" | "human");
+    let is_ledger = matches!(first, "in" | "signal");
 
     let out_line = if is_ledger {
         // Ledger topics ALWAYS materialize, el-mirror or not: the mirror's
         // "already recorded, forward verbatim" shortcut is for observations
         // the kernel itself produced (obs/...), never a license for a client
-        // to inject un-ledgered, un-audited work/signal/human by setting one
+        // to inject un-ledgered, un-audited in/signal events by setting one
         // user property. The PUBACK below is the at-least-once handoff, so a
         // failed emit must NACK, not silently succeed.
         let pv: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));

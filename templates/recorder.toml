@@ -5,13 +5,19 @@
 # file takes effect on the next daemon/exec start.
 #
 # The flight recorder is append-only and write-only: nothing reads it for
-# control flow. work/# events are sqlite-backed by the ledger regardless of
-# what is set here — that path is emit(), not the recorder.
+# control flow. in/# and signal/# events are sqlite-backed by the ledger
+# regardless of what is set here — that path is emit(), not the recorder.
 
 # Per-file fs deltas are high-volume (a build touches thousands); keep them
-# live-only. The per-call summary (obs/exec/<session>/fs/summary) still records.
+# live-only. The per-call summary (obs/agent/<name>/<session>/fs/summary)
+# still records — the explicit rule keeps it on disk even if the silencing
+# pattern widens.
 [[record]]
-match = "fs/#"
+match = "obs/agent/+/+/fs/summary"
+sink  = "trace"
+
+[[record]]
+match = "obs/fs/#"
 sink  = "none"
 
 # Example: keep UI chatter off disk entirely.

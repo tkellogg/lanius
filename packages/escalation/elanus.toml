@@ -1,11 +1,11 @@
 # The re-ping loop that makes deadline-or-default humane: an unanswered ask
 # gets re-surfaced (capped) until someone answers, the deadline default
-# fires, or a delivery/+/acked receipt shows a human already saw it on some
+# fires, or an obs/channel/+/acked receipt shows a human already saw it on some
 # channel. The sweep is a cron — zero resident cost.
 
 [request]
-subscribe = ["work/escalate/sweep"]
-publish   = ["work/escalate/sweep", "signal/attention"]
+subscribe = ["in/package/escalate/sweep"]
+publish   = ["in/package/escalate/sweep", "signal/attention"]
 
 [process]
 mode = "exec"
@@ -13,5 +13,5 @@ run  = "scripts/sweep"
 
 [[cron]]
 schedule = "*/30 * * * * *"
-emit = "work/escalate/sweep"
+emit = "in/package/escalate/sweep"
 payload = { after_secs = 20 }

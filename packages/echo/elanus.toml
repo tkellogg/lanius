@@ -1,7 +1,7 @@
 # Demo handler: append the event payload to echo.log. Publishes nothing.
 
 [request]
-subscribe = ["work/demo/echo"]
+subscribe = ["in/package/demo/echo"]
 
 [process]
 mode = "exec"

@@ -1,6 +1,6 @@
 #!/bin/sh
 # End-to-end kernel test. No API key needed: exercises emit -> dispatch ->
-# handler, suspend (exit 75) -> human/answer -> resume, deadline expiry ->
+# handler, suspend (exit 75) -> answer (in/agent/main) -> resume, deadline expiry ->
 # default, and a seconds-resolution cron. Run from the repo root:
 #   sh tests/e2e.sh
 set -u
@@ -71,8 +71,8 @@ mkdir -p "$TMP/packages/asker/scripts" "$TMP/packages/asker2/scripts"
 
 cat > "$TMP/packages/asker/elanus.toml" <<'EOF'
 [request]
-subscribe = ["work/test/ask"]
-publish   = ["human/ask"]
+subscribe = ["in/package/test/ask"]
+publish   = ["in/human/owner"]
 
 [process]
 mode = "exec"
@@ -87,7 +87,7 @@ case "$EVENT" in
     printf '%s' "$EVENT" > "$HARNESS_ROOT/answered.json"
     exit 0;;
   *)
-    elanus emit human/ask --correlation "test-corr-1" --payload '{"question":"proceed with the thing?","options":["yes","no"]}' >/dev/null
+    elanus emit in/human/owner --correlation "test-corr-1" --payload '{"question":"proceed with the thing?","options":["yes","no"]}' >/dev/null
     exit 75;;
 esac
 EOF
@@ -95,8 +95,8 @@ chmod +x "$TMP/packages/asker/scripts/run"
 
 cat > "$TMP/packages/asker2/elanus.toml" <<'EOF'
 [request]
-subscribe = ["work/test/ask2"]
-publish   = ["human/ask"]
+subscribe = ["in/package/test/ask2"]
+publish   = ["in/human/owner"]
 
 [process]
 mode = "exec"
@@ -112,7 +112,7 @@ case "$EVENT" in
     exit 0;;
   *)
     DL=$(date -u -v+2S +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u -d '+2 seconds' +"%Y-%m-%dT%H:%M:%S.000Z")
-    elanus emit human/ask --correlation "test-corr-2" --deadline "$DL" --default-action '"go"' --payload '{"question":"expires soon"}' >/dev/null
+    elanus emit in/human/owner --correlation "test-corr-2" --deadline "$DL" --default-action '"go"' --payload '{"question":"expires soon"}' >/dev/null
     exit 75;;
 esac
 EOF
@@ -126,21 +126,21 @@ elanus approve asker2 >/dev/null || fail "approve asker2"
 mkdir -p "$TMP/packages/ticker"
 cat > "$TMP/packages/ticker/elanus.toml" <<'EOF'
 [request]
-publish = ["work/demo/echo"]
+publish = ["in/package/demo/echo"]
 
 [[cron]]
 schedule = "*/2 * * * * *"
-emit = "work/demo/echo"
+emit = "in/package/demo/echo"
 payload = { from = "ticker" }
 EOF
 elanus approve ticker >/dev/null || fail "approve ticker"
 
-# Hook plane: a guard package whose pre_dispatch hook vetoes work/test/denyme.
+# Hook plane: a guard package whose pre_dispatch hook vetoes in/package/test/denyme.
 # The hook only exists because 'blocking = ["pre_dispatch"]' gets approved.
 mkdir -p "$TMP/packages/guard/scripts"
 cat > "$TMP/packages/guard/elanus.toml" <<'EOF'
 [request]
-subscribe = ["work/test/denyme"]
+subscribe = ["in/package/test/denyme"]
 blocking  = ["pre_dispatch"]
 
 [process]
@@ -151,7 +151,7 @@ order = 0
 [[hook]]
 point = "pre_dispatch"
 run = "scripts/gate"
-match = "work/test/denyme"
+match = "in/package/test/denyme"
 timeout_ms = 2000
 EOF
 cat > "$TMP/packages/guard/scripts/h" <<'EOF'
@@ -172,7 +172,7 @@ elanus approve guard >/dev/null || fail "approve guard"
 mkdir -p "$TMP/packages/gated/scripts"
 cat > "$TMP/packages/gated/elanus.toml" <<'EOF'
 [request]
-subscribe = ["work/test/gated"]
+subscribe = ["in/package/test/gated"]
 
 [process]
 mode = "exec"
@@ -190,14 +190,14 @@ DAEMON_PID=$!
 sleep 1
 
 echo "== 1. emit -> dispatch -> handler =="
-EV1=$(elanus emit work/demo/echo --payload '{"msg":"hello"}')
+EV1=$(elanus emit in/package/demo/echo --payload '{"msg":"hello"}')
 wait_for "echo handler ran" "grep -q '\"msg\":\"hello\"' '$TMP/echo.log'"
 wait_for "event #$EV1 done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV1\")\" = done ]"
 
 echo "== 2. suspend -> answer -> resume =="
-EV2=$(elanus emit work/test/ask)
+EV2=$(elanus emit in/package/test/ask)
 wait_for "event #$EV2 waiting_on_human" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV2\")\" = waiting_on_human ]"
-ASK_ID=$(sql "SELECT id FROM events WHERE type='human/ask' AND correlation_id='test-corr-1'")
+ASK_ID=$(sql "SELECT id FROM events WHERE type='in/human/owner' AND correlation_id='test-corr-1'")
 [ -n "$ASK_ID" ] || fail "ask event not found"
 CAUSE=$(sql "SELECT cause_id FROM events WHERE id=$ASK_ID")
 [ "$CAUSE" = "$EV2" ] && ok "causality threaded (ask #$ASK_ID <- event #$EV2)" || fail "ask cause_id=$CAUSE, expected $EV2"
@@ -207,29 +207,29 @@ wait_for "handler resumed with answer" "grep -q '\"answer\":\"yes\"' '$TMP/answe
 wait_for "event #$EV2 done after resume" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV2\")\" = done ]"
 
 echo "== 3. deadline expiry -> default applied =="
-EV3=$(elanus emit work/test/ask2)
+EV3=$(elanus emit in/package/test/ask2)
 wait_for "expired ask resumed with default" "grep -q '\"answer\":\"go\"' '$TMP/answered2.json'"
 grep -q '"assumed":true' "$TMP/answered2.json" && ok "assumption logged in answer" || fail "assumed flag missing"
-ASK2=$(sql "SELECT state FROM events WHERE type='human/ask' AND correlation_id='test-corr-2'")
+ASK2=$(sql "SELECT state FROM events WHERE type='in/human/owner' AND correlation_id='test-corr-2'")
 [ "$ASK2" = "expired" ] && ok "ask marked expired" || fail "ask2 state=$ASK2"
 wait_for "event #$EV3 done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV3\")\" = done ]"
 
 echo "== 4. cron fires =="
-wait_for "cron-emitted work/demo/echo handled" "grep -q '\"from\":\"ticker\"' '$TMP/echo.log'"
+wait_for "cron-emitted in/package/demo/echo handled" "grep -q '\"from\":\"ticker\"' '$TMP/echo.log'"
 
 echo "== 5. hook plane: pre_dispatch veto =="
-EV5=$(elanus emit work/test/denyme)
+EV5=$(elanus emit in/package/test/denyme)
 wait_for "event #$EV5 denied" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV5\")\" = denied ]"
 [ ! -f "$TMP/denied-ran.txt" ] && ok "vetoed handler never ran" || fail "handler ran despite deny"
-grep -q '"kind":"obs/hook/pre_dispatch/deny"' "$TMP/trace.jsonl" && ok "hook deny on the recorder" || fail "no hook deny trace"
+grep -q '"kind":"obs/harness/hook/pre_dispatch/deny"' "$TMP/trace.jsonl" && ok "hook deny on the recorder" || fail "no hook deny trace"
 grep -q 'computer says no' "$TMP/trace.jsonl" && ok "deny reason recorded" || fail "deny reason missing"
 
 echo "== 5b. grants: discovery is not authority =="
-EVG=$(elanus emit work/test/gated)
+EVG=$(elanus emit in/package/test/gated)
 wait_for "unapproved event #$EVG settled" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVG\")\" = done ]"
 [ ! -f "$TMP/gated-ran.txt" ] && ok "unapproved package never ran" || fail "unapproved package ran"
 elanus approve gated >/dev/null || fail "approve gated"
-EVG2=$(elanus emit work/test/gated)
+EVG2=$(elanus emit in/package/test/gated)
 wait_for "approved package ran" "[ -f '$TMP/gated-ran.txt' ]"
 wait_for "event #$EVG2 done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVG2\")\" = done ]"
 # Manifest-only edit: the code is unchanged, so unchanged requests carry.
@@ -243,12 +243,12 @@ elanus packages | grep -q "^gated .*granted=[1-9]" && ok "unchanged value carrie
 printf '\necho swapped >> "$HARNESS_ROOT/gated-swapped.txt"\n' >> "$TMP/packages/gated/scripts/h"
 elanus packages >/dev/null  # re-sync sees the new code_hash
 elanus packages | grep -q "^gated .*granted=0" && ok "script edit re-gated the package" || fail "script edit did not re-gate"
-EVG3=$(elanus emit work/test/gated)
+EVG3=$(elanus emit in/package/test/gated)
 wait_for "re-gated event #$EVG3 settled" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVG3\")\" = done ]"
 [ ! -f "$TMP/gated-swapped.txt" ] && ok "swapped code never ran (re-approval required)" || fail "swapped code ran without re-approval"
 
 echo "== 6. flight recorder =="
-for kind in obs/ledger/emit obs/dispatch/spawn obs/dispatch/exit obs/ledger/expire; do
+for kind in obs/harness/ledger/emit obs/harness/dispatch/spawn obs/harness/dispatch/exit obs/harness/ledger/expire; do
   grep -q "\"kind\":\"$kind\"" "$TMP/trace.jsonl" && ok "trace has $kind" || fail "trace missing $kind"
 done
 # tool truth: the suspended handler's exit code is on record
@@ -265,14 +265,14 @@ elanus trace obs/e2e/bus-live --payload '{"msg":"bus-live"}'
 wait "$SUB_PID"
 [ "$(cat "$TMP/bus-sub.code")" = 0 ] && ok "subscriber got obs/e2e/bus-live" || fail "bus sub failed: $(cat "$TMP/bus-sub.out")"
 grep -q '"msg":"bus-live"' "$TMP/bus-sub.out" && ok "live payload intact" || fail "live payload wrong"
-# Ingress: an external MQTT publish on work/# becomes a ledger event and runs.
-elanus bus pub work/demo/echo '{"msg":"via-mqtt"}' || fail "bus pub"
+# Ingress: an external MQTT publish on in/# becomes a ledger event and runs.
+elanus bus pub in/package/demo/echo '{"msg":"via-mqtt"}' || fail "bus pub"
 wait_for "mqtt-published work ran" "grep -q '\"msg\":\"via-mqtt\"' '$TMP/echo.log'"
 EVM=$(sql "SELECT id FROM events WHERE payload LIKE '%via-mqtt%'")
 [ -n "$EVM" ] && wait_for "event #$EVM done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVM\")\" = done ]" || fail "mqtt publish not in ledger"
 # Retained: a late subscriber still gets the last value.
-elanus bus pub obs/skill/demo/status '{"alive":true}' --retain || fail "bus pub --retain"
-elanus bus sub 'obs/skill/+/status' --count 1 --timeout 5 | grep -q '"alive":true' && ok "retained replay to late subscriber" || fail "retained replay"
+elanus bus pub obs/package/demo/status '{"alive":true}' --retain || fail "bus pub --retain"
+elanus bus sub 'obs/package/+/status' --count 1 --timeout 5 | grep -q '"alive":true' && ok "retained replay to late subscriber" || fail "retained replay"
 
 echo "== 8. daemon actor: supervised, token-authed, ACL-scoped =="
 mkdir -p "$TMP/packages/beacon/scripts"
@@ -296,11 +296,11 @@ EOF
 chmod +x "$TMP/packages/beacon/scripts/main"
 elanus approve beacon >/dev/null || fail "approve beacon"
 # The supervisor discovers, boots, and announces it (retained liveness).
-wait_for "beacon alive (retained status)" "elanus bus sub 'obs/skill/beacon/status' --count 1 --timeout 3 | grep -q '\"state\":\"alive\"'"
+wait_for "beacon alive (retained status)" "elanus bus sub 'obs/package/beacon/status' --count 1 --timeout 3 | grep -q '\"state\":\"alive\"'"
 # Its approved publish flows through its token-authenticated connection.
 elanus bus sub 'obs/test/beacon' --count 1 --timeout 10 | grep -q '"ping":true' && ok "actor publish delivered" || fail "actor publish lost"
 # The unapproved one was dropped with an obs echo, never delivered.
-wait_for "ACL denial echoed to obs/" "grep -q '\"kind\":\"obs/skill/beacon/denied\"' '$TMP/trace.jsonl'"
+wait_for "ACL denial echoed to obs/" "grep -q '\"kind\":\"obs/package/beacon/denied\"' '$TMP/trace.jsonl'"
 grep -q '"value":"obs/test/evil"' "$TMP/trace.jsonl" && ok "denial names the topic" || fail "denial detail missing"
 
 echo "== 9. ingress bridge: linemux -> triage -> agent work =="
@@ -308,31 +308,34 @@ cp -R "$REPO/packages/linemux" "$TMP/packages/"
 cp -R "$REPO/packages/triage-demo" "$TMP/packages/"
 elanus approve linemux >/dev/null || fail "approve linemux"
 elanus approve triage-demo >/dev/null || fail "approve triage-demo"
-wait_for "linemux alive (retained status)" "elanus bus sub 'obs/skill/linemux/status' --count 1 --timeout 2 | grep -q '\"state\":\"alive\"'"
+wait_for "linemux alive (retained status)" "elanus bus sub 'obs/package/linemux/status' --count 1 --timeout 2 | grep -q '\"state\":\"alive\"'"
 mkdir -p "$TMP/run/pkg-linemux/inbox"
 printf 'just a note\n' > "$TMP/run/pkg-linemux/inbox/a.line"
 printf 'agent: say hello\n' > "$TMP/run/pkg-linemux/inbox/b.line"
 # The variety ladder: the plain line is absorbed by the script rung...
 wait_for "triage absorbed the plain line" "grep -q 'just a note' '$TMP/triage.log'"
 # ...and only the agent-addressed line becomes expensive agent work.
-wait_for "agent line escalated to work/agent/exec" \
-  "[ \"\$(sql \"SELECT COUNT(*) FROM events WHERE type='work/agent/exec' AND payload LIKE '%say hello%'\")\" -ge 1 ]"
-grep -q '"kind":"ingress/linemux/message"' "$TMP/trace.jsonl" && ok "ingress observation recorded" || fail "no ingress observation"
+wait_for "agent line escalated to in/agent/main" \
+  "[ \"\$(sql \"SELECT COUNT(*) FROM events WHERE type='in/agent/main' AND payload LIKE '%say hello%'\")\" -ge 1 ]"
+# Twin-publish died (docs/topics.md decided item 3): the arrival is published
+# once, addressed; the ledger row is its record.
+wait_for "arrival on the ledger" \
+  "[ \"\$(sql \"SELECT COUNT(*) FROM events WHERE type='in/package/linemux/triage'\")\" -ge 2 ]"
 [ ! -e "$TMP/run/pkg-linemux/inbox/a.line" ] && ok "consumed line removed" || fail "inbox file not consumed"
 
 echo "== 10. delivery receipts + escalation =="
 # notify (stock) already surfaced the earlier asks; headless osascript
 # fails but the receipt must exist regardless — attempted delivery is data.
 wait_for "desktop sent-receipt on the ledger" \
-  "[ \"\$(sql \"SELECT COUNT(*) FROM events WHERE type='delivery/desktop/sent'\")\" -ge 1 ]"
+  "[ \"\$(sql \"SELECT COUNT(*) FROM events WHERE type='obs/channel/desktop/sent'\")\" -ge 1 ]"
 cp -R "$REPO/packages/escalation" "$TMP/packages/"
 # Shipped defaults are humane (30s sweep, 20s threshold); e2e tightens both.
 sed -i '' -e 's,\*/30,\*/2,' -e 's,after_secs = 20,after_secs = 2,' "$TMP/packages/escalation/elanus.toml"
 elanus approve escalation >/dev/null || fail "approve escalation"
-EVN=$(elanus emit human/ask --correlation nag-corr --payload '{"question":"will you ever answer?"}')
+EVN=$(elanus emit in/human/owner --correlation nag-corr --payload '{"question":"will you ever answer?"}')
 wait_for "unanswered ask got nagged" \
   "[ \"\$(sql \"SELECT COUNT(*) FROM events WHERE type='signal/attention' AND cause_id=$EVN\")\" -ge 1 ]"
-elanus emit delivery/desktop/acked --payload "{\"ask_id\":$EVN}" --cause "$EVN" >/dev/null
+elanus emit obs/channel/desktop/acked --payload "{\"ask_id\":$EVN}" --cause "$EVN" >/dev/null
 sleep 3   # let any in-flight sweep land
 N1=$(sql "SELECT COUNT(*) FROM events WHERE type='signal/attention' AND cause_id=$EVN")
 sleep 5   # two more sweep cycles

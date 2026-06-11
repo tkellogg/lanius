@@ -150,35 +150,34 @@ Leans, to be confirmed during migration; **[OPEN]** items called out below.
 | `fs/<path>` | `obs/fs/<path>` (percent-encoding rule [MQTT-4.7.1-1] carries verbatim) |
 | `signal/*` | unchanged |
 
-## Open questions (each with a recommended default)
+## Formerly-open questions — all eight leans adopted by Tim, 2026-06-11
 
-1. **Category set.** Lean: `agent, human, group, package, fs, harness,
+1. **[DECIDED]** Category set: `agent, human, group, package, fs, harness,
    channel` — small and closed-ish; adding a category is a design event, not
-   a convention. Sub-question: is `human` just an actor category distinction
-   worth keeping? Lean yes — ACL and escalation treat humans differently by
-   type, the grammar should too.
-2. **Locator conventions per category.** Lean: actor categories (agent,
-   human, group, package) have single-segment nouns; for `in/` the first
-   locator is the conversation ID; for `obs/` the first locator is the
-   session. `fs` nouns are the entire remainder.
-3. **Ingress mapping.** v2 flagged the tension: `ingress/#` routes as
-   observation, so bridges twin-publish a `work/#` copy. Lean: kill the twin
-   — an arrival is published once, addressed to its handler
-   (`in/package/<source>-triage` or per-manifest routing); observation of
-   arrivals comes from the delivery echo, not a second publish.
-4. **Delivery receipts shape.** Lean: `obs/channel/<chan>/{sent,acked}` as in
-   the table; escalation's filter becomes `obs/channel/+/acked`.
-5. **Room membership authority.** Lean: agent-minted rooms ride **leases**
+   a convention. `human` stays a distinct category — ACL and escalation treat
+   humans differently by type, the grammar should too.
+2. **[DECIDED]** Locator conventions: actor categories (agent, human, group,
+   package) have single-segment nouns; for `in/` the first locator is the
+   conversation ID; for `obs/` the first locator is the session. `fs` nouns
+   are the entire remainder.
+3. **[DECIDED]** Ingress: the twin-publish dies — an arrival is published
+   once, addressed to its handler (`in/package/...` per-manifest routing);
+   observation of arrivals comes from the delivery echo, not a second
+   publish. Resolves the v2 step-6 tension.
+4. **[DECIDED]** Delivery receipts: `obs/channel/<chan>/{sent,acked}`;
+   escalation's filter becomes `obs/channel/+/acked`.
+5. **[DECIDED]** Room membership: agent-minted rooms ride **leases**
    (dispatch-lifetime, crash-released — the borrow checker already exists);
    durable rooms (human participants) ride grants.
-6. **Default nouns for today's single-agent reality.** Lean: agent name from
-   profile, default `main`; human noun = profile owner.
-7. **Hook-verdict response topics.** Verdicts are sub-500ms ephemera and must
-   not be ledger-backed. Lean: bus mints response topics under
+6. **[DECIDED]** Default nouns: agent name from profile, default `main`;
+   human noun = profile owner.
+7. **[DECIDED]** Hook-verdict response topics: verdicts are sub-500ms
+   ephemera, never ledger-backed; the bus mints response topics under
    `obs/harness/hookresp/<id>`; the blocking grant includes publish right to
    that prefix.
-8. **Ledger `type` value renames** — carries bus.md open question 6
-   (mechanical; `emitted_by_dispatch` and correlation machinery carry over).
+8. **[DECIDED]** Ledger `type` value renames are mechanical (carries bus.md
+   open question 6; `emitted_by_dispatch` and correlation machinery carry
+   over).
 
 ## Migration
 

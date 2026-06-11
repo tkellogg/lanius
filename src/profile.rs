@@ -10,6 +10,14 @@ use std::path::PathBuf;
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Profile {
+    /// The agent noun (docs/topics.md decided item 6): this profile's agent
+    /// mailbox is in/agent/<agent> and its telemetry lands under
+    /// obs/agent/<agent>/<session>/...
+    #[serde(default = "default_agent")]
+    pub agent: String,
+    /// The human owner's noun: asks address in/human/<owner>.
+    #[serde(default = "default_owner")]
+    pub owner: String,
     #[serde(default)]
     pub model: ModelCfg,
     #[serde(default)]
@@ -31,12 +39,22 @@ fn default_package_path() -> Vec<String> {
     vec!["packages".into()]
 }
 
+fn default_agent() -> String {
+    "main".into()
+}
+
+fn default_owner() -> String {
+    "owner".into()
+}
+
 // Manual Default so a missing profile.toml behaves exactly like an empty
 // one: derive(Default) would zero the serde field defaults (empty
 // package_path = no discovery at all).
 impl Default for Profile {
     fn default() -> Self {
         Profile {
+            agent: default_agent(),
+            owner: default_owner(),
             model: ModelCfg::default(),
             skills: SkillsCfg::default(),
             throttle: BTreeMap::new(),
@@ -96,7 +114,7 @@ impl Default for SkillsCfg {
 /// cage: when nonempty, the shell tool's process tree can only write inside
 /// them (plus the harness root, system temp, and /dev — the harness must not
 /// cage itself out of its own ledger). Empty = no cage. The camera (boundary
-/// diff → fs/ events) runs either way, over root + fs_write.
+/// diff → obs/fs/ events) runs either way, over root + fs_write.
 /// This lives in the profile until the grants ledger lands in migration
 /// step 5; it then hoists into the approval ledger with package grants.
 #[derive(Debug, Deserialize, Default)]
@@ -136,6 +154,28 @@ pub fn load(root: &Root, name: &str) -> Result<(Profile, PathBuf)> {
     let s = std::fs::read_to_string(&f)?;
     let p: Profile = toml::from_str(&s).with_context(|| format!("parsing {}", f.display()))?;
     Ok((p, dir))
+}
+
+/// Mailbox topics derived from the "default" profile, cached per process.
+/// Ledger plumbing (dispatcher tick, CLI inbox/answer) needs the v3 nouns
+/// without threading a Profile through every call; a process serves one root,
+/// and changes pick up on restart — same semantics as the recorder.
+pub struct Mailboxes {
+    /// in/agent/<agent> — where answers (and other agent mail) go.
+    pub agent: String,
+    /// in/human/<owner> — where asks go.
+    pub human: String,
+}
+
+pub fn mailboxes(root: &Root) -> &'static Mailboxes {
+    static MAILBOXES: std::sync::OnceLock<Mailboxes> = std::sync::OnceLock::new();
+    MAILBOXES.get_or_init(|| {
+        let p = load(root, "default").map(|(p, _)| p).unwrap_or_default();
+        Mailboxes {
+            agent: crate::topic::agent_mailbox(&p.agent),
+            human: crate::topic::human_mailbox(&p.owner),
+        }
+    })
 }
 
 /// Skill names are single-level topics; include/exclude use the same MQTT

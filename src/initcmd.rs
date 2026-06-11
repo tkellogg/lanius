@@ -80,7 +80,7 @@ pub fn init(dir: PathBuf) -> Result<()> {
     println!("  export HARNESS_ROOT={}", root.dir.display());
     println!("  elanus daemon &                     # the dispatcher");
     println!("  elanus exec --session hi \"hello\"    # chat (needs ANTHROPIC_API_KEY)");
-    println!("  elanus emit work/agent/exec --payload '{{\"prompt\":\"check in with me\"}}'");
+    println!("  elanus emit in/agent/main --payload '{{\"prompt\":\"check in with me\"}}'");
     println!("  elanus inbox / elanus answer <id> \"...\"");
     println!("  elanus packages                     # what's installed, what's pending");
     println!("  elanus bus sub 'obs/#'              # watch the live stream");

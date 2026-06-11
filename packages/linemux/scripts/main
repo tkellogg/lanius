@@ -25,10 +25,9 @@ print(json.dumps({
     "source": "linemux",
     "received_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
 }))' "$f") || { rm -f "$f"; continue; }
-    # Ledger first (QoS 1: PUBACK means the kernel accepted it), then the
-    # observation copy. Only delete the file once the work item is in.
-    elanus bus pub work/linemux/triage "$payload" --qos 1 || exit 1
-    elanus bus pub ingress/linemux/message "$payload" --qos 0 || exit 1
+    # One addressed publish (QoS 1: PUBACK means the kernel accepted it).
+    # Only delete the file once the work item is in.
+    elanus bus pub in/package/linemux/triage "$payload" --qos 1 || exit 1
     rm -f "$f"
   done
   sleep 1

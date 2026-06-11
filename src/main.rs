@@ -52,7 +52,7 @@ enum Cmd {
         priority: i64,
         #[arg(long)]
         correlation: Option<String>,
-        /// ISO8601; for human/ask: when the default fires
+        /// ISO8601; for asks (in/human/<owner>): when the default fires
         #[arg(long)]
         deadline: Option<String>,
         #[arg(long)]
@@ -100,7 +100,7 @@ enum Cmd {
     Inbox,
     /// Answer an ask by event id
     Answer { ask_id: i64, text: String },
-    /// Sugar over emit: human/ask with correlation + deadline + default
+    /// Sugar over emit: an ask (in/human/<owner>) with correlation + deadline + default
     Ask {
         question: String,
         /// Comma-separated options
@@ -277,7 +277,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Inbox => {
             let conn = open(&root)?;
-            human::inbox(&conn)?;
+            human::inbox(&root, &conn)?;
         }
         Cmd::Answer { ask_id, text } => {
             let conn = open(&root)?;

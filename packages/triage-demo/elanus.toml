@@ -3,8 +3,8 @@
 # work. "The agent runs as late as possible" (docs/bus.md).
 
 [request]
-subscribe = ["work/linemux/triage"]
-publish   = ["work/agent/exec"]
+subscribe = ["in/package/linemux/triage"]
+publish   = ["in/agent/main"]
 
 [process]
 mode = "exec"

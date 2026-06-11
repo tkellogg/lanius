@@ -39,7 +39,7 @@ pub fn write(root: &Root, kind: &str, ids: &Ids, payload: Value) {
 }
 
 /// write() with the bus retain flag — kernel liveness topics
-/// (obs/skill/<name>/status) want late subscribers to see the last value.
+/// (obs/package/<name>/status) want late subscribers to see the last value.
 pub fn write_opts(root: &Root, kind: &str, ids: &Ids, payload: Value, retain: bool) {
     let mut line = json!({ "ts": now_iso(), "kind": kind, "payload": payload });
     let obj = line.as_object_mut().unwrap();

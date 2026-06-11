@@ -1,7 +1,7 @@
 #!/bin/sh
 # Sweep for unanswered asks and re-surface them, capped. An ask stops
-# nagging when: a human/answer shares its correlation, its deadline default
-# fired (state=expired), a delivery/+/acked receipt names it (someone saw
+# nagging when: an answer (in/agent/main) shares its correlation, its deadline
+# default fired (state=expired), an obs/channel/+/acked receipt names it (someone saw
 # it on some channel), or the cap is reached. Nag state lives in the kv
 # table — survives daemon restarts, dies with the root, costs nothing.
 set -u
@@ -21,14 +21,14 @@ DB="$HARNESS_DB"
 
 for ask_id in $(sqlite3 "$DB" "
   SELECT e.id FROM events e
-   WHERE e.type = 'human/ask'
+   WHERE e.type = 'in/human/owner'
      AND e.state NOT IN ('expired', 'denied')
      AND e.correlation_id IS NOT NULL
      AND e.created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || $AFTER || ' seconds')
      AND NOT EXISTS (SELECT 1 FROM events a
-                     WHERE a.type = 'human/answer' AND a.correlation_id = e.correlation_id)
+                     WHERE a.type = 'in/agent/main' AND a.correlation_id = e.correlation_id)
      AND NOT EXISTS (SELECT 1 FROM events k
-                     WHERE k.type LIKE 'delivery/%/acked'
+                     WHERE k.type LIKE 'obs/channel/%/acked'
                        AND json_extract(k.payload, '\$.ask_id') = e.id)
 "); do
   n=$(sqlite3 "$DB" "SELECT COALESCE((SELECT value FROM kv WHERE key='escalation:nag:$ask_id'), 0)")

@@ -1,10 +1,10 @@
-# The agent package: turns work/agent/exec into an elanus exec run.
+# The agent package: turns in/agent/main into an elanus exec run.
 # publish = ["#"] is deliberate and worth reading twice — the agent is the
 # variety machine; it can emit anything (asks, signals, new work). Approving
 # this package is approving that.
 
 [request]
-subscribe = ["work/agent/exec"]
+subscribe = ["in/agent/main"]
 publish   = ["#"]
 
 [process]

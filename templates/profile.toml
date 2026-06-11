@@ -1,6 +1,11 @@
 # elanus profile — one file is the whole identity: model, skill visibility,
 # throttles, sandbox policy, template vars.
 
+# Default nouns for the topic grammar (docs/topics.md): the agent's mailbox
+# is in/agent/<agent>; asks address the human as in/human/<owner>.
+agent = "main"
+owner = "owner"
+
 [model]
 model = "claude-sonnet-4-6"   # any genai target, e.g. "anthropic::claude-fable-5"
 max_turns = 24
@@ -14,7 +19,7 @@ max_turns = 24
 include = ["#"]
 exclude = []
 
-[throttle."work/agent/#"]
+[throttle."in/agent/#"]
 max_concurrent = 2
 llm_tokens_per_hour = 400000
 
@@ -22,7 +27,7 @@ llm_tokens_per_hour = 400000
 # The whole-agent fs grant (docs/sandbox.md). fs_write prefixes (absolute or
 # root-relative) are the cage: the shell tool's whole process tree can only
 # write inside them, plus the harness root, system temp, and /dev. Empty or
-# absent = no cage (camera still records fs/ deltas of the root).
+# absent = no cage (camera still records obs/fs/ deltas of the root).
 # fs_write = ["workspace"]
 # capture_exclude = ["harness.db", "trace.jsonl", "run/", ".env", ".git/", "target/", "node_modules/"]
 

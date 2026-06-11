@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Discord ingress bridge — UNTESTED SCAFFOLD (written without a live token).
 
-Inbound: gateway MESSAGE_CREATE -> `ingress/discord/message` (observation)
-plus `work/discord/triage` (ledger-backed, so triage handlers run).
-Outbound: subscribes `work/discord/send` {channel_id, content} -> REST post,
-then a `delivery/discord/sent` receipt.
+Inbound: gateway MESSAGE_CREATE -> `in/package/discord/triage` (ledger-backed,
+published once, addressed to the triage handler; observation of the arrival
+comes from the delivery echo).
+Outbound: subscribes `in/package/discord/send` {channel_id, content} -> REST
+post, then an `obs/channel/discord/sent` receipt.
 
 Bus access rides the `elanus bus` CLI as subprocesses — the CLI
 authenticates from the supervisor-injected env (ELANUS_PACKAGE /
@@ -55,11 +56,11 @@ def rest_post(path, body):
 
 
 def outbound_loop():
-    """work/discord/send -> REST post -> delivery receipt. Reads the
+    """in/package/discord/send -> REST post -> delivery receipt. Reads the
     `elanus bus sub` subprocess line-by-line; each line is
     {"topic":..., "payload": <envelope>}."""
     proc = subprocess.Popen(
-        ["elanus", "bus", "sub", "work/discord/send"],
+        ["elanus", "bus", "sub", "in/package/discord/send"],
         stdout=subprocess.PIPE, text=True,
     )
     for line in proc.stdout:
@@ -72,7 +73,7 @@ def outbound_loop():
             except Exception as e:
                 ok = False
                 log(f"[discord] send failed: {e}")
-            bus_pub("delivery/discord/sent", {"channel_id": channel, "ok": ok})
+            bus_pub("obs/channel/discord/sent", {"channel_id": channel, "ok": ok})
         except Exception as e:
             log(f"[discord] bad send event: {e}")
     # This runs in a daemon thread; sys.exit() would only unwind THIS thread
@@ -129,8 +130,7 @@ def main():
                 "text": d.get("content", ""),
                 "message_id": d.get("id"),
             }
-            bus_pub("ingress/discord/message", inbound, qos=0)
-            bus_pub("work/discord/triage", inbound, qos=1)
+            bus_pub("in/package/discord/triage", inbound, qos=1)
     sys.exit(1)  # gateway closed -> crash-only restart
 
 

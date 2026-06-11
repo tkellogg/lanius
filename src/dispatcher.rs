@@ -115,7 +115,7 @@ fn tick(root: &Root, conn: &Connection, running: &mut Vec<Running>, actors: &mut
 /// Supervise resident package actors. Discovery boots them (zero cage:
 /// scratch dir + approved fs_write; capabilities attach live via the
 /// ledger); exits restart with exponential backoff unless restart="never".
-/// The supervisor publishes retained obs/skill/<name>/status — it is the
+/// The supervisor publishes retained obs/package/<name>/status — it is the
 /// one process that authoritatively knows spawn and exit.
 fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()> {
     // Reap exits.
@@ -239,7 +239,7 @@ fn status_event(root: &Root, name: &str, state: &str, mut extra: Value) {
     };
     trace::write_opts(
         root,
-        &format!("obs/skill/{}/status", crate::topic::encode_segment(name)),
+        &format!("obs/package/{}/status", crate::topic::encode_segment(name)),
         &trace::Ids::default(),
         payload,
         true,
@@ -334,19 +334,21 @@ fn tick_crons(root: &Root, conn: &Connection) -> Result<()> {
 }
 
 /// Defaults are the big unblock: an expired ask executes its default and logs
-/// the assumption as an ordinary human/answer event — auditable, vetoable.
+/// the assumption as an ordinary answer event (mail to the agent) —
+/// auditable, vetoable.
 fn expire_deadlines(root: &Root, conn: &Connection) -> Result<()> {
+    let mb = profile::mailboxes(root);
     let rows: Vec<(i64, String, Option<String>)> = {
         let mut stmt = conn.prepare(
             "SELECT e.id, e.correlation_id, e.default_action FROM events e
-             WHERE e.type = 'human/ask' AND e.deadline IS NOT NULL
+             WHERE e.type = ?1 AND e.deadline IS NOT NULL
                AND e.state != 'expired' AND e.correlation_id IS NOT NULL
                AND e.deadline < strftime('%Y-%m-%dT%H:%M:%fZ','now')
                AND NOT EXISTS (SELECT 1 FROM events a
-                               WHERE a.type = 'human/answer' AND a.correlation_id = e.correlation_id)",
+                               WHERE a.type = ?2 AND a.correlation_id = e.correlation_id)",
         )?;
         let r = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map([&mb.human, &mb.agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         r
     };
@@ -362,7 +364,7 @@ fn expire_deadlines(root: &Root, conn: &Connection) -> Result<()> {
                 payload: Some(json!({ "answer": default, "assumed": true })),
                 correlation: Some(corr.clone()),
                 cause: Some(ask_id),
-                ..EmitOpts::new("human/answer")
+                ..EmitOpts::new(&mb.agent)
             },
         )?;
         conn.execute(
@@ -371,7 +373,7 @@ fn expire_deadlines(root: &Root, conn: &Connection) -> Result<()> {
         )?;
         trace::write(
             root,
-            "obs/ledger/expire",
+            "obs/harness/ledger/expire",
             &trace::Ids { event_id: Some(ask_id), correlation_id: Some(corr), ..Default::default() },
             json!({ "assumed_default": default }),
         );
@@ -408,10 +410,11 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
     };
     let mut resume_correlation: Option<String> = None;
     if dstate == "suspended" {
-        // The suspend contract: before exiting 75 the handler emitted a
-        // human/ask. Match it by the emitting dispatch (HARNESS_DISPATCH_ID),
-        // so two handlers of the same event can each park on their own ask
-        // without cross-wiring; fall back to cause for emitters that lost env.
+        // The suspend contract: before exiting 75 the handler emitted an ask
+        // (in/human/<owner>). Match it by the emitting dispatch
+        // (HARNESS_DISPATCH_ID), so two handlers of the same event can each
+        // park on their own ask without cross-wiring; fall back to cause for
+        // emitters that lost env.
         //
         // Crucially we match only an *unanswered* ask. On a resume the same
         // dispatch_id is reused, so the dispatch's prior (already-answered)
@@ -420,19 +423,20 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
         // correlation, whose answer already exists — resume_suspended would
         // then respawn it every tick forever. Excluding answered asks turns
         // that into the honest "nothing to wake it -> failed" below.
+        let mb = profile::mailboxes(root);
         const UNANSWERED: &str =
             "AND NOT EXISTS (SELECT 1 FROM events ans
-                             WHERE ans.type = 'human/answer'
+                             WHERE ans.type = ?3
                                AND ans.correlation_id = events.correlation_id)";
         resume_correlation = conn
             .query_row(
                 &format!(
                     "SELECT correlation_id FROM events
-                     WHERE emitted_by_dispatch = ?1 AND type = 'human/ask'
+                     WHERE emitted_by_dispatch = ?1 AND type = ?2
                        AND correlation_id IS NOT NULL {UNANSWERED}
                      ORDER BY id DESC LIMIT 1"
                 ),
-                [r.dispatch_id],
+                params![r.dispatch_id, mb.human, mb.agent],
                 |row| row.get(0),
             )
             .optional()?;
@@ -441,11 +445,11 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
                 .query_row(
                     &format!(
                         "SELECT correlation_id FROM events
-                         WHERE cause_id = ?1 AND type = 'human/ask' AND correlation_id IS NOT NULL
+                         WHERE cause_id = ?1 AND type = ?2 AND correlation_id IS NOT NULL
                            AND emitted_by_dispatch IS NULL {UNANSWERED}
                          ORDER BY id DESC LIMIT 1"
                     ),
-                    [r.event_id],
+                    params![r.event_id, mb.human, mb.agent],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -463,7 +467,7 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
     )?;
     trace::write(
         root,
-        "obs/dispatch/exit",
+        "obs/harness/dispatch/exit",
         &trace::Ids {
             event_id: Some(r.event_id),
             correlation_id: r.correlation.clone(),
@@ -525,23 +529,24 @@ fn recompute_event_state(conn: &Connection, event_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// A suspended handler whose resume correlation now has a human/answer gets
-/// re-invoked with the original event plus the answer. Only that causality
-/// chain parked; everything else kept flowing.
+/// A suspended handler whose resume correlation now has an answer (mail to
+/// the agent, in/agent/<noun>) gets re-invoked with the original event plus
+/// the answer. Only that causality chain parked; everything else kept flowing.
 fn resume_suspended(root: &Root, conn: &Connection, running: &mut Vec<Running>) -> Result<()> {
+    let mb = profile::mailboxes(root);
     let rows: Vec<(i64, i64, String, String, i64)> = {
         let mut stmt = conn.prepare(
             "SELECT d.id, d.event_id, d.handler, d.resume_correlation,
                     (SELECT a.id FROM events a
-                     WHERE a.type='human/answer' AND a.correlation_id = d.resume_correlation
+                     WHERE a.type=?1 AND a.correlation_id = d.resume_correlation
                      ORDER BY a.id LIMIT 1) AS answer_id
              FROM dispatches d
              WHERE d.state='suspended'
                AND EXISTS (SELECT 1 FROM events a
-                           WHERE a.type='human/answer' AND a.correlation_id = d.resume_correlation)",
+                           WHERE a.type=?1 AND a.correlation_id = d.resume_correlation)",
         )?;
         let r = stmt
-            .query_map([], |r| {
+            .query_map([&mb.agent], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -610,7 +615,7 @@ fn dispatch_pending(root: &Root, conn: &Connection, running: &mut Vec<Running>) 
             &hook_ids,
         )?;
         if !gate.allow {
-            // The deny itself is already on the recorder (obs/hook/...).
+            // The deny itself is already on the recorder (obs/harness/hook/...).
             conn.execute(
                 "UPDATE events SET state='denied', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
                 [id],
@@ -737,7 +742,7 @@ fn spawn_handler(
             }
             trace::write(
                 root,
-                "obs/dispatch/spawn",
+                "obs/harness/dispatch/spawn",
                 &trace::Ids {
                     event_id: Some(event_id),
                     cause_id: envelope["cause_id"].as_i64(),
@@ -769,7 +774,7 @@ fn spawn_handler(
             )?;
             trace::write(
                 root,
-                "obs/dispatch/exit",
+                "obs/harness/dispatch/exit",
                 &trace::Ids { event_id: Some(event_id), ..Default::default() },
                 json!({ "handler": handler.display().to_string(), "spawn_error": e.to_string(), "state": "failed" }),
             );

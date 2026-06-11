@@ -16,7 +16,7 @@ hook and observation planes (LSM hooks vs tracepoints, netfilter vs pcap):
   raceless, zero per-event cost. Seatbelt (macOS), Landlock + bubblewrap
   (Linux). It emits nothing; it is a static restriction on the action space —
   variety attenuation.
-- **The camera** — `fs/...` events on the observation plane. QoS 0, advisory,
+- **The camera** — `obs/fs/...` events on the observation plane. QoS 0, advisory,
   droppable; feeds handlers, recorder rules, dashboards.
 
 The dependency runs one way. Enforcement never depends on the event stream
@@ -108,9 +108,9 @@ human-installed. See bus.md "Packages" → the KNOWN GAP block.
 
 ## The camera: fs events
 
-**[DECIDED]** Topic = `fs` + canonical absolute path, leading `/` dropped:
-`fs/Users/tim/code/elanus/src/main.rs`. Per-file topics buy **spatial
-subscription** — `fs/Users/tim/code/elanus/#` is "watch this subtree": a
+**[DECIDED]** Topic = `obs/fs` + canonical absolute path, leading `/` dropped:
+`obs/fs/Users/tim/code/elanus/src/main.rs`. Per-file topics buy **spatial
+subscription** — `obs/fs/Users/tim/code/elanus/#` is "watch this subtree": a
 lease-holder watches its lease, an indexer watches the notes dir, nobody
 filters by session to find a place. Limits, eyes open: MQTT filters cannot
 express "*.rs at any depth" (`+` is single-level, `#` is tail-only) —
@@ -130,7 +130,7 @@ tool-call end (stat-walk: mtime/size/inode cache, content-hash on suspects;
 event per changed file:
 
 ```
-topic:   fs/<encoded canonical path>
+topic:   obs/fs/<encoded canonical path>
 cause:   <tool_use event id>            # attribution is structural, not inferred
 payload: { op: create|modify|unlink|rename, renamed_from?,
            agent, session, dispatch, bytes, digest }
@@ -151,7 +151,7 @@ later supplement *liveness*; the boundary diff remains the record).
 
 **[DECIDED]** Burst policy. `cargo build` touches thousands of files; the
 design must not pretend otherwise. In-process QoS 0 fan-out is cheap — the
-real costs are the stat-walk and disk. So: recorder default for `fs/#` is
+real costs are the stat-walk and disk. So: recorder default for `obs/fs/#` is
 `none` (persistence is opt-in per subtree); grants and leases carry
 capture-exclusion patterns (.gitignore-shaped: `target/`, `node_modules/`,
 `.git/`). Exclusion is never silent: each tool call's delta includes an

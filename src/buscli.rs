@@ -45,7 +45,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 /// Publish once. QoS 1 (default) returns only after the broker's PUBACK —
-/// for work/# topics that means "the ledger accepted it".
+/// for in/# and signal/# topics that means "the ledger accepted it".
 pub fn publish(root: &Root, topic_name: &str, payload: Option<&str>, qos: u8, retain: bool) -> Result<()> {
     if !topic::valid_name(topic_name) {
         bail!("invalid topic name {topic_name:?} (wildcards are for filters)");

@@ -73,7 +73,7 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
     let id = conn.last_insert_rowid();
     trace::write(
         root,
-        "obs/ledger/emit",
+        "obs/harness/ledger/emit",
         &trace::Ids {
             event_id: Some(id),
             cause_id: o.cause,

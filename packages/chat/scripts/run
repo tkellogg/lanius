@@ -1,4 +1,4 @@
 #!/bin/sh
-# work/agent/exec -> an agent turn. All event-JSON parsing lives in the binary;
+# in/agent/main -> an agent turn. All event-JSON parsing lives in the binary;
 # this script exists so the wiring stays visible in handlers.d/.
 exec elanus handle-exec

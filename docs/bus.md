@@ -84,8 +84,8 @@ because it sees its own subscription table and its own acks.
 > [topics.md](topics.md): verb-first `{verb}/{category}/{noun}/{locators}`,
 > verbs = delivery contracts (`in`/`obs`/`signal`; `out` deliberately does
 > not exist — mailbox model), agent identity first-class, conversation IDs as
-> topic locators, rooms as nouns. Not yet implemented; the grammar below is
-> the accurate v2 as-built record until that migration lands.
+> topic locators, rooms as nouns. **Migration landed 2026-06-11** — topics.md
+> is now the as-built grammar; the table below is the historical v2 record.
 
 **[DECIDED]** One namespace, MQTT filter syntax (`+`, `#`) as the *single*
 pattern language — handler subscriptions, throttles, recorder rules, grants,

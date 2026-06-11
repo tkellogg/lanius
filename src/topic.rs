@@ -71,7 +71,7 @@ pub fn encode_segment(s: &str) -> String {
 /// Encode a canonical absolute path as a topic suffix: per-segment
 /// percent-encoding, '/' as the level separator, leading slash dropped
 /// (all paths are absolute, so it carries no information). The fs event
-/// topic is "fs/" + this.
+/// topic is "obs/fs/" + this.
 pub fn encode_path(p: &std::path::Path) -> String {
     use std::path::Component;
     let mut segs: Vec<String> = Vec::new();
@@ -83,15 +83,25 @@ pub fn encode_path(p: &std::path::Path) -> String {
     segs.join("/")
 }
 
+/// The agent noun's mailbox topic (docs/topics.md): in/agent/<noun>.
+pub fn agent_mailbox(noun: &str) -> String {
+    format!("in/agent/{}", encode_segment(noun))
+}
+
+/// The human noun's mailbox topic: in/human/<noun>. Asks land here.
+pub fn human_mailbox(noun: &str) -> String {
+    format!("in/human/{}", encode_segment(noun))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn exact() {
-        assert!(matches("work/agent/exec", "work/agent/exec"));
-        assert!(!matches("work/agent/exec", "work/agent"));
-        assert!(!matches("work/agent", "work/agent/exec"));
+        assert!(matches("in/agent/main", "in/agent/main"));
+        assert!(!matches("in/agent/main", "in/agent"));
+        assert!(!matches("in/agent", "in/agent/main"));
     }
 
     #[test]
@@ -134,8 +144,8 @@ mod tests {
         assert!(!valid_filter("a/#/b")); // # not last
         assert!(!valid_filter("a#"));    // # not a whole level
         assert!(!valid_filter("a/b+"));  // + not a whole level
-        assert!(valid_name("work/agent/exec"));
-        assert!(!valid_name("work/+/exec"));
+        assert!(valid_name("in/agent/main"));
+        assert!(!valid_name("in/+/main"));
         assert!(!valid_name(""));
         // malformed filters match nothing
         assert!(!matches("a/#/b", "a/x/b"));
@@ -149,7 +159,7 @@ mod tests {
             encode_path(Path::new("/notes/#1 draft.md")),
             "notes/%231 draft.md"
         );
-        assert!(matches("fs/Users/tim/#", &format!("fs/{}", encode_path(Path::new("/Users/tim/a/b.txt")))));
+        assert!(matches("obs/fs/Users/tim/#", &format!("obs/fs/{}", encode_path(Path::new("/Users/tim/a/b.txt")))));
     }
 
     #[test]

@@ -80,11 +80,12 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         db::kv_del(&conn, &key)?;
         // Close the loop in the event log: a CLI --resume is an answer too,
         // otherwise the ask sits in the inbox forever. The daemon flow already
-        // has a human/answer (it triggered the resume) — dedupe on correlation.
+        // has an answer event (it triggered the resume) — dedupe on correlation.
         if let Some(corr) = pend["correlation"].as_str() {
+            let answer_mb = crate::topic::agent_mailbox(&prof.agent);
             let already: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM events WHERE type='human/answer' AND correlation_id=?1",
-                [corr],
+                "SELECT COUNT(*) FROM events WHERE type=?1 AND correlation_id=?2",
+                [answer_mb.as_str(), corr],
                 |r| r.get(0),
             )?;
             if already == 0 {
@@ -95,7 +96,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                         payload: Some(json!({ "answer": ans, "via": "exec-resume" })),
                         correlation: Some(corr.to_string()),
                         cause: pend["ask_id"].as_i64(),
-                        ..EmitOpts::new("human/answer")
+                        ..EmitOpts::new(&answer_mb)
                     },
                 )?;
             }
@@ -159,7 +160,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         check_token_budget(root, &conn, &root_type, event_id)?;
 
         let chat_req = build_request(&conn, &session, &system, &tools)?;
-        trace::write(root, &obs(&session, "llm/request"), &ids, json!({ "model": model, "turn": turns }));
+        trace::write(root, &obs(&prof.agent, &session, "llm/request"), &ids, json!({ "model": model, "turn": turns }));
         let res = client
             .exec_chat(model.as_str(), chat_req, None)
             .await
@@ -175,7 +176,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         let tool_calls: Vec<ToolCall> = res.into_tool_calls();
         trace::write(
             root,
-            &obs(&session, "llm/response"),
+            &obs(&prof.agent, &session, "llm/response"),
             &ids,
             json!({
                 "model": model,
@@ -235,7 +236,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
             // crash mid-tool must be visible as a call with no result.
             trace::write(
                 root,
-                &obs_tool(&session, &eff.fn_name, "call"),
+                &obs_tool(&prof.agent, &session, &eff.fn_name, "call"),
                 &ids,
                 json!({ "call_id": eff.call_id, "name": eff.fn_name, "args": eff.fn_arguments }),
             );
@@ -247,7 +248,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 .to_string();
                 trace::write(
                     root,
-                    &obs_tool(&session, &eff.fn_name, "result"),
+                    &obs_tool(&prof.agent, &session, &eff.fn_name, "result"),
                     &ids,
                     json!({ "call_id": eff.call_id, "name": eff.fn_name, "denied": true, "result": trace::clip(&result, 2000) }),
                 );
@@ -264,7 +265,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 )?;
                 continue;
             }
-            match run_tool(root, &conn, &cage, &session, event_id, in_handler, &eff, &mut self_emitted) {
+            match run_tool(root, &conn, &cage, &prof, &session, event_id, in_handler, &eff, &mut self_emitted) {
                 ToolOutcome::Output(result) => {
                     // Hook plane, post_tool_call: may scrub/rewrite the result
                     // or veto it (the model then sees the denial, not the data).
@@ -293,7 +294,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                     };
                     trace::write(
                         root,
-                        &obs_tool(&session, &eff.fn_name, "result"),
+                        &obs_tool(&prof.agent, &session, &eff.fn_name, "result"),
                         &ids,
                         json!({ "call_id": eff.call_id, "name": eff.fn_name, "result": trace::clip(&result, 2000) }),
                     );
@@ -324,7 +325,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
             for call in &tool_calls[i + 1..] {
                 trace::write(
                     root,
-                    &obs_tool(&session, &call.fn_name, "result"),
+                    &obs_tool(&prof.agent, &session, &call.fn_name, "result"),
                     &ids,
                     json!({ "call_id": call.call_id, "name": call.fn_name, "interrupted": true }),
                 );
@@ -364,7 +365,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 .map(|(id, t, p)| format!("[signal #{id}] {t} {}", p.as_deref().unwrap_or("{}")))
                 .collect::<Vec<_>>()
                 .join("\n");
-            trace::write(root, &obs(&session, "signal/injected"), &ids, json!({ "injected": sigs.len() }));
+            trace::write(root, &obs(&prof.agent, &session, "signal/injected"), &ids, json!({ "injected": sigs.len() }));
             store_msg(
                 &conn,
                 &session,
@@ -379,14 +380,18 @@ fn pending_ask_key(session: &str) -> String {
     format!("session:{session}:pending_ask")
 }
 
-/// Session-scoped observation topic: obs/exec/<session>/<rest>.
-fn obs(session: &str, rest: &str) -> String {
-    format!("obs/exec/{}/{rest}", crate::topic::encode_segment(session))
+/// Session-scoped observation topic: obs/agent/<agent>/<session>/<rest>.
+fn obs(agent: &str, session: &str, rest: &str) -> String {
+    format!(
+        "obs/agent/{}/{}/{rest}",
+        crate::topic::encode_segment(agent),
+        crate::topic::encode_segment(session)
+    )
 }
 
-/// Tool-scoped observation topic: obs/exec/<session>/tool/<name>/<leaf>.
-fn obs_tool(session: &str, tool: &str, leaf: &str) -> String {
-    obs(session, &format!("tool/{}/{leaf}", crate::topic::encode_segment(tool)))
+/// Tool-scoped observation topic: obs/agent/<agent>/<session>/tool/<name>/<leaf>.
+fn obs_tool(agent: &str, session: &str, tool: &str, leaf: &str) -> String {
+    obs(agent, session, &format!("tool/{}/{leaf}", crate::topic::encode_segment(tool)))
 }
 
 // ── Leases: &mut on subtrees, the kernel as borrow checker ─────────────────
@@ -412,6 +417,7 @@ fn acquire_lease(
     root: &Root,
     conn: &Connection,
     cage: &sandbox::Cage,
+    agent: &str,
     session: &str,
     path: &str,
 ) -> anyhow::Result<String> {
@@ -475,7 +481,7 @@ fn acquire_lease(
     outcome?;
     trace::write(
         root,
-        &obs(session, "lease/acquire"),
+        &obs(agent, session, "lease/acquire"),
         &trace::Ids { session_id: Some(session.into()), ..Default::default() },
         json!({ "path": canon.display().to_string(), "dispatch_id": dispatch, "pid": pid }),
     );
@@ -730,7 +736,7 @@ fn tool_defs() -> Vec<Tool> {
             .with_schema(json!({
                 "type": "object",
                 "properties": {
-                    "type": { "type": "string", "description": "event topic, e.g. work/demo/echo or signal/pain" },
+                    "type": { "type": "string", "description": "event topic, e.g. in/package/demo/echo or signal/pain" },
                     "payload": { "type": "object" },
                     "priority": { "type": "integer" }
                 },
@@ -777,6 +783,7 @@ fn run_tool(
     root: &Root,
     conn: &Connection,
     cage: &sandbox::Cage,
+    prof: &profile::Profile,
     session: &str,
     event_id: Option<i64>,
     in_handler: bool,
@@ -807,14 +814,14 @@ fn run_tool(
             let before = sandbox::snapshot(cage);
             let out = run_shell(root, cage, cmd, timeout);
             let after = sandbox::snapshot(cage);
-            emit_fs_delta(root, session, &call.call_id, cage, &before, &after);
+            emit_fs_delta(root, &prof.agent, session, &call.call_id, cage, &before, &after);
             ToolOutcome::Output(out)
         }
         "fs_lease" => {
             let Some(path) = args["path"].as_str() else {
                 return err("fs_lease: missing 'path'".into());
             };
-            match acquire_lease(root, conn, cage, session, path) {
+            match acquire_lease(root, conn, cage, &prof.agent, session, path) {
                 Ok(leased) => ToolOutcome::Output(
                     json!({ "leased": leased, "held": held_leases(conn).unwrap_or_default() }).to_string(),
                 ),
@@ -875,7 +882,8 @@ fn run_tool(
                     deadline,
                     default_action: args.get("default").filter(|d| !d.is_null()).cloned(),
                     cause: event_id,
-                    ..EmitOpts::new("human/ask")
+                    // The ask is mail to the owner (docs/topics.md decided 6).
+                    ..EmitOpts::new(&crate::topic::human_mailbox(&prof.owner))
                 },
             ) {
                 Ok(id) => id,
@@ -893,7 +901,7 @@ fn run_tool(
             ids.correlation_id = Some(corr.clone());
             trace::write(
                 root,
-                &obs_tool(session, "ask_human", "result"),
+                &obs_tool(&prof.agent, session, "ask_human", "result"),
                 &ids,
                 json!({ "call_id": call.call_id, "name": "ask_human", "suspended": true, "ask_id": ask_id }),
             );
@@ -904,10 +912,11 @@ fn run_tool(
     }
 }
 
-/// One fs/ trace line per changed file plus a summary; exclusion is never
+/// One obs/fs/ trace line per changed file plus a summary; exclusion is never
 /// silent (the summary names the active patterns).
 fn emit_fs_delta(
     root: &Root,
+    agent: &str,
     session: &str,
     call_id: &str,
     cage: &sandbox::Cage,
@@ -923,14 +932,14 @@ fn emit_fs_delta(
     for c in &changes {
         trace::write(
             root,
-            &format!("fs/{}", crate::topic::encode_path(&c.path)),
+            &format!("obs/fs/{}", crate::topic::encode_path(&c.path)),
             &ids,
             json!({ "op": c.op, "size": c.size, "tool_call_id": call_id }),
         );
     }
     trace::write(
         root,
-        &obs(session, "fs/summary"),
+        &obs(agent, session, "fs/summary"),
         &ids,
         json!({
             "changed": changes.len(),
@@ -1100,11 +1109,20 @@ pub fn handle_exec(root: &Root) -> Result<()> {
         };
         ExecOpts { session: Some(session), profile, prompt: None, resume: Some(ans) }
     } else {
-        let prompt = payload["prompt"]
-            .as_str()
-            .or_else(|| payload["text"].as_str())
-            .ok_or_else(|| anyhow!("work/agent/exec payload needs a 'prompt' (or 'text') field"))?
-            .to_string();
+        let prompt = payload["prompt"].as_str().or_else(|| payload["text"].as_str());
+        let Some(prompt) = prompt else {
+            if !payload["answer"].is_null() {
+                // An answer addressed to the agent mailbox (in/agent/<noun>)
+                // shares the mailbox topic with ordinary work since v3; the
+                // dispatcher's resume machinery already delivers it to the
+                // suspended session by correlation, so this fresh dispatch of
+                // the answer event itself is a no-op, not an error.
+                eprintln!("[handle-exec] answer event; resume is correlation-driven, nothing to do");
+                return Ok(());
+            }
+            bail!("agent mailbox (in/agent/<noun>) payload needs a 'prompt' (or 'text') field");
+        };
+        let prompt = prompt.to_string();
         ExecOpts { session: Some(session), profile, prompt: Some(prompt), resume: None }
     };
     run(root, opts)

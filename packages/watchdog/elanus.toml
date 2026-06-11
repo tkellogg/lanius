@@ -2,8 +2,8 @@
 # watches the actual event log is trustworthy — tools are the truth.
 
 [request]
-subscribe = ["work/watchdog/scan"]
-publish   = ["work/watchdog/scan", "signal/pain"]
+subscribe = ["in/package/watchdog/scan"]
+publish   = ["in/package/watchdog/scan", "signal/pain"]
 
 [process]
 mode = "exec"
@@ -12,4 +12,4 @@ order = 0
 
 [[cron]]
 schedule = "*/5 * * * *"
-emit = "work/watchdog/scan"
+emit = "in/package/watchdog/scan"

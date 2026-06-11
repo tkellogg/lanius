@@ -8,7 +8,7 @@
 //!
 //! Camera: boundary stat-diff of the writable roots around each tool call.
 //! The cage is what makes the camera complete: writes can only land inside
-//! the diffed roots. Events are trace lines today (topic `fs/<path>`), bus
+//! the diffed roots. Events are trace lines today (topic `obs/fs/<path>`), bus
 //! observations later.
 
 use crate::paths::Root;

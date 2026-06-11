@@ -6,7 +6,7 @@
 //! Failure semantics are the point of this plane: every registration declares
 //! `on_timeout` (which also covers spawn errors) because fail-open vs
 //! fail-closed is a security decision. Every invocation echoes to
-//! obs/hook/<point>/<outcome> on the flight recorder.
+//! obs/harness/hook/<point>/<outcome> on the flight recorder.
 
 use crate::paths::Root;
 use crate::trace;
@@ -74,7 +74,7 @@ pub fn run_chain(
         let (effect, detail, rewrite) = settle(&h, outcome);
         trace::write(
             root,
-            &format!("obs/hook/{point}/{}", if effect { "allow" } else { "deny" }),
+            &format!("obs/harness/hook/{point}/{}", if effect { "allow" } else { "deny" }),
             ids,
             json!({
                 "hook": format!("{}:{}", h.skill, h.run),

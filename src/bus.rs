@@ -28,7 +28,7 @@ pub const MIRROR_PROP: &str = "el-mirror";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
 /// After a failed connect or write, stay quiet this long before retrying —
-/// an fs/ flood against a dead daemon must not pay a connect per event.
+/// an obs/fs/ flood against a dead daemon must not pay a connect per event.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Deserialize)]

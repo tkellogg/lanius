@@ -5,8 +5,8 @@
 # crash-looping the supervisor.
 
 [request]
-subscribe = ["work/discord/send"]
-publish   = ["ingress/discord/#", "work/discord/triage", "delivery/discord/#"]
+subscribe = ["in/package/discord/send"]
+publish   = ["in/package/discord/triage", "obs/channel/discord/#"]
 
 [process]
 mode = "daemon"

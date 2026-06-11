@@ -9,7 +9,7 @@
 //!
 //! Sinks over the trace stream are `trace` (append to trace.jsonl) and `none`
 //! (live-only, never touches disk). The `ledger` sink is the emit() path —
-//! work/# is sqlite-backed by construction, not via this recorder — so it is
+//! in/# is sqlite-backed by construction, not via this recorder — so it is
 //! accepted as an alias for `trace` here and documented as such.
 
 use crate::paths::Root;
@@ -46,11 +46,12 @@ pub struct Recorder {
 
 impl Recorder {
     /// Built-in default when recorder.toml is absent or unparsable: per-file
-    /// fs/ deltas are live-only (high volume — cargo build touches thousands;
-    /// the obs/.../fs/summary still records), everything else hits trace.
+    /// obs/fs/ deltas are live-only (high volume — cargo build touches
+    /// thousands; the obs/agent/+/+/fs/summary still records), everything
+    /// else hits trace.
     fn default_rules() -> Vec<Rule> {
         vec![
-            Rule { filter: "fs/#".into(), sink: Sink::None },
+            Rule { filter: "obs/fs/#".into(), sink: Sink::None },
             Rule { filter: "#".into(), sink: Sink::Trace },
         ]
     }
@@ -126,9 +127,9 @@ mod tests {
 
     #[test]
     fn first_match_wins() {
-        let r = rec(&[("fs/#", Sink::None), ("#", Sink::Trace)]);
-        assert_eq!(r.sink_for("fs/Users/tim/x.rs"), Sink::None);
-        assert_eq!(r.sink_for("obs/exec/s1/llm/request"), Sink::Trace);
+        let r = rec(&[("obs/fs/#", Sink::None), ("#", Sink::Trace)]);
+        assert_eq!(r.sink_for("obs/fs/Users/tim/x.rs"), Sink::None);
+        assert_eq!(r.sink_for("obs/agent/main/s1/llm/request"), Sink::Trace);
         assert_eq!(r.sink_for("signal/pain"), Sink::Trace);
     }
 
@@ -140,20 +141,20 @@ mod tests {
             ("#", Sink::Trace),
         ]);
         assert_eq!(r.sink_for("obs/ui/laptop/keydown"), Sink::None);
-        assert_eq!(r.sink_for("obs/exec/s1/tool/shell/call"), Sink::Trace);
+        assert_eq!(r.sink_for("obs/agent/main/s1/tool/shell/call"), Sink::Trace);
     }
 
     #[test]
     fn unmatched_records() {
-        let r = rec(&[("work/#", Sink::None)]);
+        let r = rec(&[("in/#", Sink::None)]);
         assert_eq!(r.sink_for("something/else"), Sink::Trace);
     }
 
     #[test]
     fn default_silences_per_file_fs_keeps_summary() {
         let r = Recorder { rules: Recorder::default_rules() };
-        assert_eq!(r.sink_for("fs/Users/tim/code/x.rs"), Sink::None);
-        assert_eq!(r.sink_for("obs/exec/s1/fs/summary"), Sink::Trace);
+        assert_eq!(r.sink_for("obs/fs/Users/tim/code/x.rs"), Sink::None);
+        assert_eq!(r.sink_for("obs/agent/main/s1/fs/summary"), Sink::Trace);
         assert_eq!(r.sink_for("signal/pain"), Sink::Trace);
     }
 }
