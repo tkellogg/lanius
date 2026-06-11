@@ -39,7 +39,6 @@ CREATE TABLE IF NOT EXISTS events (
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   finished_at     TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_events_unannounced ON events(announced) WHERE announced = 0;
 CREATE INDEX IF NOT EXISTS idx_events_pending ON events(state, type, priority);
 CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id);
 
@@ -160,6 +159,12 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     // DEFAULT 1: pre-existing rows count as already announced — upgrading
     // must not replay history onto the bus.
     let _ = conn.execute("ALTER TABLE events ADD COLUMN announced INTEGER NOT NULL DEFAULT 1", []);
+    // Depends on the column above, so it lives after the migration, not in
+    // the batch (a pre-`announced` DB would fail the whole batch otherwise).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_unannounced ON events(announced) WHERE announced = 0",
+        [],
+    )?;
     Ok(())
 }
 
