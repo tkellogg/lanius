@@ -360,17 +360,37 @@ is].** What is actually enforced today:
   `obs/exec/...`, driving `work/agent/exec`, resolving `human/answer`. The
   per-connection ACL contains a *cooperative* package, not a hostile one.
 
-Closing this needs the two pieces sandbox.md already defers: **fs_read
-scoping** (so a package cannot read a privileged-client cookie or other
-secrets) and **network-egress control** (so a package cannot reach the broker
-— or anything else — uninvited). A privileged-client token alone does not
-help while reads are open: the package reads the token. So the honest
-boundary today is: **the OS write-cage + the ledger are trustworthy against a
-package's *filesystem* mischief; the bus ACL is a correctness/teamwork
-boundary, not yet a security one against local code.** This is consistent
-with Tim's model (untrusted packages are the threat) only once those two
-deferred passes land; until then the mitigation is that packages are
-human-installed and the write-cage + audit ledger bound the blast radius.
+The root cause is not "no auth" — auth exists and scopes a token-bearing
+session correctly. It is that **authority is decided by locality (local code
+is trusted) and a package is local code.** "Add authentication" is the fix
+that looks right and isn't sufficient, because the gap has three interlocking
+legs that must move roughly together; closing one alone closes nothing:
+
+1. **Bus authorization default** — unauthenticated must become *deny*, not
+   "the human." Necessary, but on its own a package just keeps using (or
+   re-reads) a credential.
+2. **fs_read scoping** — once unauthenticated = deny, the privileged path (the
+   human CLI, the kernel mirror) needs a credential, e.g. a 0600 cookie; with
+   reads open the package simply reads the cookie and presents it. So leg 1 is
+   load-bearing only *with* read scoping. (sandbox.md defers this.)
+3. **exec-handler containment** — this is a *separate door the bus does not
+   guard at all*: exec handlers run uncaged with `HARNESS_DB`, so a hostile
+   exec package never touches the bus — it opens the ledger directly, inserts
+   `work/agent/exec`, reads the transcripts table. Caging their writes and
+   removing the raw DB handle collides with watchdog/escalation being
+   ledger-readers by design, so it needs its own pass.
+
+(Network-egress control, also deferred in sandbox.md, is the cleaner cut for
+leg 1: a package with no egress grant cannot open the loopback bus connection
+at all.) So the honest boundary today: **the OS write-cage + the audit ledger
+bound a package's *filesystem* blast radius; the bus ACL and the ledger are a
+correctness/teamwork boundary, not yet a security one against hostile local
+code.** Consistent with Tim's untrusted-package threat model only once those
+passes land; until then the mitigation that makes punting safe is that
+**packages are human-installed** — the write-cage and the audit ledger bound
+what an installed-but-buggy or injection-compromised package can reach, but a
+*deliberately* malicious package is not contained. Do not present the bus ACL
+as a sandbox to a user installing third-party packages until legs 1–3 land.
 
 **[OPEN]** Identity model (supersedes the old "loopback = the human"
 assumption, which the review showed is unsound against local packages):
