@@ -213,6 +213,11 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
             // transcript keeps the model's ORIGINAL call (it must replay as
             // sent); rewritten args live in execution and the trace. A veto
             // becomes an ordinary error result so the model can adapt.
+            // Chain order: exec hooks first (local, stateless, no round
+            // trip), then resident hooks on the exec-rewritten subject; the
+            // first deny anywhere short-circuits — a denied call never pays
+            // the resident round trip. The resident consult is zero-cost
+            // when nothing is registered (kv gate, src/resident.rs).
             let pre = hooks::run_chain(
                 root,
                 &conn,
@@ -222,6 +227,11 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                         "tool": call.fn_name, "args": call.fn_arguments }),
                 &ids,
             )?;
+            let pre = if pre.allow {
+                crate::resident::consult(root, &conn, "pre_tool_call", &call.fn_name, pre.subject, &ids)
+            } else {
+                pre
+            };
             let eff = ToolCall {
                 call_id: call.call_id.clone(),
                 fn_name: call.fn_name.clone(),
@@ -269,6 +279,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 ToolOutcome::Output(result) => {
                     // Hook plane, post_tool_call: may scrub/rewrite the result
                     // or veto it (the model then sees the denial, not the data).
+                    // Same order as pre: exec chain, then resident chain.
                     let post = hooks::run_chain(
                         root,
                         &conn,
@@ -279,6 +290,11 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                                 "result": result }),
                         &ids,
                     )?;
+                    let post = if post.allow {
+                        crate::resident::consult(root, &conn, "post_tool_call", &eff.fn_name, post.subject, &ids)
+                    } else {
+                        post
+                    };
                     let result = if !post.allow {
                         json!({
                             "error": format!("result blocked by hook {}", post.denied_by.as_deref().unwrap_or("?")),

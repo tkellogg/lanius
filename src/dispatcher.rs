@@ -581,11 +581,18 @@ fn recompute_event_state(conn: &Connection, event_id: i64) -> Result<()> {
     } else {
         "done"
     };
+    // 'expired' is terminal and owned by the expiry sweep: an ask can carry
+    // dispatches of its own (e.g. notify), and a slow one finishing after the
+    // deadline must not clobber the expiry verdict with 'done'.
     if state == "running" || state == "waiting_on_human" {
-        conn.execute("UPDATE events SET state=?1 WHERE id=?2", params![state, event_id])?;
+        conn.execute(
+            "UPDATE events SET state=?1 WHERE id=?2 AND state != 'expired'",
+            params![state, event_id],
+        )?;
     } else {
         conn.execute(
-            "UPDATE events SET state=?1, finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
+            "UPDATE events SET state=?1, finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id=?2 AND state != 'expired'",
             params![state, event_id],
         )?;
     }
@@ -677,6 +684,17 @@ fn dispatch_pending(root: &Root, conn: &Connection, running: &mut Vec<Running>) 
             json!({ "point": "pre_dispatch", "event": envelope }),
             &hook_ids,
         )?;
+        // Resident hooks run after the exec chain (same order as the tool
+        // call points; the rationale lives in src/exec.rs). pre_dispatch is
+        // allow/deny only — the envelope is ledger-backed, rewrites are
+        // ignored downstream. The kv gate makes this free when nothing is
+        // registered; with the daemon consulting its own broker the round
+        // trip is loopback into the ntex thread, never a self-deadlock.
+        let gate = if gate.allow {
+            crate::resident::consult(root, conn, "pre_dispatch", &etype, gate.subject, &hook_ids)
+        } else {
+            gate
+        };
         if !gate.allow {
             // The deny itself is already on the recorder (obs/harness/hook/...).
             conn.execute(

@@ -286,6 +286,30 @@ second framing for a round trip MQTT already does) and direct-SQLite verdict
 channels (that's leg 3 of the containment gap — it would consecrate the
 hole). Spike numbers: ~11 µs loopback publish, < 10 ms round trip, vs the
 500 ms budget.
+
+**[LANDED 2026-06-11]** Resident hooks as built (src/broker.rs coordinator,
+src/resident.rs requester, `elanus bus sub --blocking` client). Refinements
+where implementation sharpened the design: (a) hook *requests* are a QoS 1
+publish to `obs/harness/hookreq/<point>/<matched>` — under `obs/`, not a
+reserved `in/` prefix, because in/# materializes to the ledger by the v3
+routing rule and hook round trips must never be ledger-backed (topics.md
+decided 7); a special-cased in/ prefix would break "delivery contract
+decidable at segment 1". (b) The subscription *filter* is authoritative for
+what a registration intercepts; the blocking grant vocabulary stays the
+exec-hook one (grant value = literal point name), so one manifest
+`blocking = ["pre_tool_call"]` line covers both registration styles, and the
+grant is re-checked per invocation (revocation detaches live, not at
+reconnect). (c) Chain order: exec hooks first (local, stateless, no round
+trip), then resident hooks on the exec-rewritten subject; first deny
+short-circuits. (d) Zero overhead when nothing is registered: the broker
+maintains a kv row (`resident_hooks_active`) of points with live
+registrations; exec/dispatcher do one indexed sqlite read per chain run and
+never touch the bus otherwise. Staleness: an attach mid-tool-call is seen at
+the next tool call; a daemon crash leaves the row stale-active until the
+next daemon start clears it (the consult then fails fast toward allow with a
+backoff). (e) Degradation order holds: coordinator unreachable or verdict
+lost → allow, loudly echoed — broker down means resident hooks don't exist,
+while the exec-hook chain and recording are untouched.
 **[OPEN]** Whether the render-provider contract folds into pre-LLM-request
 hooks (a provider is arguably a hook that appends context).
 
@@ -511,8 +535,9 @@ handler stop re-pinging a human who already acked on another channel.
    QoS 0/1 fan-out, work/signal/human ingress → ledger), kernel publish path
    + loopback mirror (src/bus.rs), `elanus bus pub|sub` debugging surface.
    *2026-06-11*: $share groups and completion fan-in landed with
-   work-plane-on-bus (see the GAP CLOSED block under Work plane). Still
-   ahead within this step: resident hooks.
+   work-plane-on-bus (see the GAP CLOSED block under Work plane); resident
+   hooks landed the same day (see the LANDED block under Hook plane) —
+   step 4 is complete.
 5. **Packages**: `packages/` + `elanus.toml`, request/approval ledger,
    leases, supervised daemons + LWT; `handlers.d/` and `skills/` retire.
    *Landed 2026-06-10 (commit 07720b3).* As-built notes, where reality

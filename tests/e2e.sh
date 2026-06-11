@@ -15,11 +15,15 @@ FAILS=0
 
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
+  [ -n "${LLM_PID:-}" ] && kill "$LLM_PID" 2>/dev/null
   # Supervised actors are children of the daemon but survive a plain kill;
   # crash-only in production (their bus connection dies), explicit here.
   pkill -f "$TMP/packages/beacon" 2>/dev/null
   pkill -f "$TMP/packages/linemux" 2>/dev/null
   pkill -f "$TMP/packages/worker" 2>/dev/null
+  pkill -f "$TMP/packages/resident-guard" 2>/dev/null
+  pkill -f "$TMP/packages/resident-mute" 2>/dev/null
+  pkill -f "$TMP/packages/resident-gate" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
@@ -401,6 +405,171 @@ wait "$SHA_PID" "$SHB_PID"
   || fail "shared group delivery: a=$(cat "$TMP/share-a.out"), b=$(cat "$TMP/share-b.out")"
 cat "$TMP/share-a.out" "$TMP/share-b.out" | grep -q '"k":1' && cat "$TMP/share-a.out" "$TMP/share-b.out" | grep -q '"k":2' \
   && ok "both events delivered across the group" || fail "an event was lost in the shared group"
+
+echo "== 12. resident hooks: live registration, broker-coordinated round trip =="
+# -- 12a. pre_dispatch: a token-authed actor with an approved blocking grant
+# registers via SUBSCRIBE user properties and vetoes an event before any
+# handler runs. The target is a real exec handler so the dispatcher actually
+# reaches the pre_dispatch gate.
+mkdir -p "$TMP/packages/rtarget/scripts"
+cat > "$TMP/packages/rtarget/elanus.toml" <<'EOF'
+[request]
+subscribe = ["in/package/test/rdeny"]
+
+[process]
+mode = "exec"
+run  = "scripts/h"
+EOF
+cat > "$TMP/packages/rtarget/scripts/h" <<'EOF'
+#!/bin/sh
+cat > "$HARNESS_ROOT/rtarget-ran.txt"
+EOF
+chmod +x "$TMP/packages/rtarget/scripts/h"
+elanus approve rtarget >/dev/null || fail "approve rtarget"
+
+mkdir -p "$TMP/packages/resident-gate/scripts"
+cat > "$TMP/packages/resident-gate/elanus.toml" <<'EOF'
+[request]
+blocking = ["pre_dispatch"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+EOF
+cat > "$TMP/packages/resident-gate/scripts/main" <<'EOF'
+#!/bin/sh
+# Shell-scriptable resident hook: one deny per registration, re-register.
+while true; do
+  printf 'deny:gate says no\n' | elanus bus sub 'obs/harness/hookreq/pre_dispatch/in/package/test/rdeny' \
+    --blocking --order 10 --timeout-ms 3000 --on-timeout deny --count 1 --timeout 600 \
+    >> "$ELANUS_SCRATCH/seen.jsonl" 2>> "$ELANUS_SCRATCH/err.log"
+done
+EOF
+chmod +x "$TMP/packages/resident-gate/scripts/main"
+elanus approve resident-gate >/dev/null || fail "approve resident-gate"
+wait_for "resident-gate registered (hookreg/attach)" \
+  "grep '\"kind\":\"obs/harness/hookreg/attach\"' '$TMP/trace.jsonl' | grep -q resident-gate"
+EVR=$(elanus emit in/package/test/rdeny)
+wait_for "event #$EVR denied by resident hook" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVR\")\" = denied ]"
+[ ! -f "$TMP/rtarget-ran.txt" ] && ok "vetoed handler never ran" || fail "handler ran despite resident deny"
+grep '"kind":"obs/harness/hook/pre_dispatch/deny"' "$TMP/trace.jsonl" | grep -q '"hook":"resident:resident-gate"' \
+  && ok "resident deny echoed to obs/harness/hook" || fail "resident pre_dispatch deny echo missing"
+grep -q 'gate says no' "$TMP/trace.jsonl" && ok "deny reason recorded" || fail "resident deny reason missing"
+grep -q '"point":"pre_dispatch"' "$TMP/run/pkg-resident-gate/seen.jsonl" \
+  && ok "hook client saw the event" || fail "hook client never saw the request"
+
+# -- 12b. pre_tool_call: the security seam. A fake Anthropic endpoint makes
+# `elanus exec` issue a real shell tool call with no API key: first request
+# returns a tool_use, any request carrying a tool_result returns text.
+cat > "$TMP/fake_llm.py" <<'EOF'
+import json, sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(n).decode()
+        if '"tool_result"' in body:
+            content = [{"type": "text", "text": "task complete"}]
+            stop = "end_turn"
+        else:
+            content = [{"type": "tool_use", "id": "tc1", "name": "shell",
+                        "input": {"command": "echo ran >> \"$HARNESS_ROOT/tool-ran.txt\""}}]
+            stop = "tool_use"
+        resp = json.dumps({"id": "msg_1", "type": "message", "role": "assistant",
+                           "model": "claude-3-5-haiku-latest", "content": content,
+                           "stop_reason": stop,
+                           "usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+    def log_message(self, *a): pass
+# Port 0: the OS picks a free one; the chosen port goes to the port file.
+srv = HTTPServer(("127.0.0.1", 0), H)
+with open(sys.argv[1], "w") as f:
+    f.write(str(srv.server_address[1]))
+srv.serve_forever()
+EOF
+python3 "$TMP/fake_llm.py" "$TMP/llm.port" &
+LLM_PID=$!
+wait_for "fake LLM bound" "[ -s '$TMP/llm.port' ]"
+LLM_PORT=$(cat "$TMP/llm.port")
+cat > "$TMP/profiles/default/profile.toml" <<EOF
+agent = "main"
+owner = "owner"
+
+[model]
+model = "claude-3-5-haiku-latest"
+max_turns = 6
+base_url = "http://127.0.0.1:$LLM_PORT"
+api_key_env = "FAKE_LLM_KEY"
+EOF
+export FAKE_LLM_KEY=dummy
+
+mkdir -p "$TMP/packages/resident-guard/scripts"
+cat > "$TMP/packages/resident-guard/elanus.toml" <<'EOF'
+[request]
+blocking = ["pre_tool_call"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+EOF
+cat > "$TMP/packages/resident-guard/scripts/main" <<'EOF'
+#!/bin/sh
+while true; do
+  printf 'deny:resident veto\n' | elanus bus sub 'obs/harness/hookreq/pre_tool_call/#' \
+    --blocking --timeout-ms 3000 --on-timeout deny --count 1 --timeout 600 \
+    >> "$ELANUS_SCRATCH/seen.jsonl" 2>> "$ELANUS_SCRATCH/err.log"
+done
+EOF
+chmod +x "$TMP/packages/resident-guard/scripts/main"
+elanus approve resident-guard >/dev/null || fail "approve resident-guard"
+wait_for "resident-guard registered (hookreg/attach)" \
+  "grep '\"kind\":\"obs/harness/hookreg/attach\"' '$TMP/trace.jsonl' | grep -q resident-guard"
+elanus exec "run the tool" --session rh1 > "$TMP/exec1.out" 2>&1 || fail "exec under resident deny: $(cat "$TMP/exec1.out")"
+[ ! -f "$TMP/tool-ran.txt" ] && ok "denied tool never executed" || fail "tool ran despite resident deny"
+grep -q '"tool":"shell"' "$TMP/run/pkg-resident-guard/seen.jsonl" \
+  && ok "hook saw the tool call" || fail "hook never saw the tool call"
+grep '"kind":"obs/harness/hook/pre_tool_call/deny"' "$TMP/trace.jsonl" | grep -q '"hook":"resident:resident-guard"' \
+  && ok "resident pre_tool_call deny echoed" || fail "resident pre_tool_call deny echo missing"
+grep '"kind":"obs/agent/main/rh1/tool/shell/result"' "$TMP/trace.jsonl" | grep -q '"denied":true' \
+  && ok "deny recorded on the tool result (transcript-visible)" || fail "deny not recorded on tool result"
+
+# -- 12c. dead hook client: revocation detaches live (grant re-checked per
+# invocation), and a registered-but-mute hook falls to its declared
+# on_timeout without wedging the tool call.
+elanus revoke resident-guard >/dev/null || fail "revoke resident-guard"
+pkill -f "$TMP/packages/resident-guard" 2>/dev/null
+mkdir -p "$TMP/packages/resident-mute/scripts"
+cat > "$TMP/packages/resident-mute/elanus.toml" <<'EOF'
+[request]
+blocking = ["pre_tool_call"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+EOF
+cat > "$TMP/packages/resident-mute/scripts/main" <<'EOF'
+#!/bin/sh
+# Registers, receives requests, never answers (stdin is EOF): the broker's
+# per-registration timeout + on_timeout=allow must decide.
+elanus bus sub 'obs/harness/hookreq/pre_tool_call/#' \
+  --blocking --timeout-ms 1500 --on-timeout allow --timeout 600 \
+  < /dev/null >> "$ELANUS_SCRATCH/seen.jsonl" 2>> "$ELANUS_SCRATCH/err.log"
+EOF
+chmod +x "$TMP/packages/resident-mute/scripts/main"
+elanus approve resident-mute >/dev/null || fail "approve resident-mute"
+wait_for "resident-mute registered (hookreg/attach)" \
+  "grep '\"kind\":\"obs/harness/hookreg/attach\"' '$TMP/trace.jsonl' | grep -q resident-mute"
+START=$(date +%s)
+elanus exec "run the tool" --session rh2 > "$TMP/exec2.out" 2>&1 || fail "exec under mute hook: $(cat "$TMP/exec2.out")"
+ELAPSED=$(( $(date +%s) - START ))
+[ -f "$TMP/tool-ran.txt" ] && ok "on_timeout=allow let the tool run" || fail "tool blocked by a hook that never answered"
+[ "$ELAPSED" -lt 30 ] && ok "tool call did not hang past the timeout (${ELAPSED}s)" || fail "tool call hung ${ELAPSED}s"
+grep '"kind":"obs/harness/hook/pre_tool_call/allow"' "$TMP/trace.jsonl" | grep '"hook":"resident:resident-mute"' | grep -q '"mode":"timeout"' \
+  && ok "timeout outcome echoed with the declared default" || fail "timeout echo missing"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

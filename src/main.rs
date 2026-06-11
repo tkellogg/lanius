@@ -15,6 +15,7 @@ mod paths;
 mod profile;
 mod recorder;
 mod render;
+mod resident;
 mod sandbox;
 mod topic;
 mod trace;
@@ -144,6 +145,29 @@ enum BusCmd {
         /// Give up after this many seconds
         #[arg(long)]
         timeout: Option<u64>,
+        /// Register as a resident blocking hook (filter must live under
+        /// obs/harness/hookreq/<point>/...; needs an approved blocking grant
+        /// and the actor token environment). Each request prints its JSON on
+        /// stdout; one stdin line answers it: allow | deny[:reason] | a JSON
+        /// object (rewritten subject).
+        #[arg(long)]
+        blocking: bool,
+        /// Chain position (lower runs earlier)
+        #[arg(long, default_value_t = 50)]
+        order: u32,
+        /// Broker-side wait per invocation before on-timeout applies
+        #[arg(long, default_value_t = 500)]
+        timeout_ms: u64,
+        /// allow|deny when this hook doesn't answer in time (fail-open vs
+        /// fail-closed is the registrant's security declaration)
+        #[arg(long, default_value = "deny")]
+        on_timeout: String,
+        /// Informational user property (the filter is authoritative)
+        #[arg(long)]
+        phase: Option<String>,
+        /// Informational user property (the filter is authoritative)
+        #[arg(long)]
+        point: Option<String>,
     },
 }
 
@@ -291,8 +315,15 @@ fn run(cli: Cli) -> Result<()> {
             BusCmd::Pub { topic, payload, qos, retain } => {
                 buscli::publish(&root, &topic, payload.as_deref(), qos, retain)?;
             }
-            BusCmd::Sub { filter, count, timeout } => {
-                buscli::subscribe(&root, &filter, count, timeout)?;
+            BusCmd::Sub { filter, count, timeout, blocking, order, timeout_ms, on_timeout, phase, point } => {
+                let b = blocking.then_some(buscli::BlockingOpts {
+                    order,
+                    timeout_ms,
+                    on_timeout,
+                    phase,
+                    point,
+                });
+                buscli::subscribe(&root, &filter, count, timeout, b)?;
             }
         },
         Cmd::Events { limit } => {

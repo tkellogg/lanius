@@ -19,10 +19,24 @@
 //! proper SUBACK reason. `$share/<group>/<filter>` shared subscriptions
 //! (§4.8.2) are supported: one group member receives each matching message
 //! (round-robin), no retained replay, ACL checked against the inner filter.
-//! SUBSCRIBE user properties are accepted and ignored for now —
-//! blocking-subscription declarations only become honored capabilities once
-//! grants land (step 5). No auth: the loopback default is the boundary until
-//! then.
+//!
+//! Resident hooks (docs/bus.md hook plane, [DECIDED 2026-06-11]): a SUBSCRIBE
+//! carrying user properties `mode=blocking, order, timeout_ms, on_timeout`
+//! on a filter under `obs/harness/hookreq/<point>/...` is a blocking-hook
+//! registration — honored ONLY for a token-authed session whose package has
+//! an approved `blocking` grant for that literal point. Everyone else gets
+//! plain observation semantics (props ignored, loudly). The broker is the
+//! chain coordinator: a hook REQUEST is a QoS 1 publish to
+//! `obs/harness/hookreq/<point>/<matched>` with Response Topic + Correlation
+//! Data (§4.10); the broker runs matching registrations in (order, seq)
+//! order — each via a per-invocation Response Topic under
+//! `obs/harness/hookresp/<id>` with a broker-side timeout — folds verdicts
+//! (first deny stops; allow+rewrite feeds the next), and publishes the final
+//! {decision, event, reason} to the requester's response topic. Requests live
+//! under obs/ (NOT in/) on purpose: in/# materializes to the ledger by the
+//! v3 routing rule, and hook round trips are sub-500ms ephemera that must
+//! never be ledger-backed (topics.md decided 7); special-casing a reserved
+//! in/ prefix would break "the delivery contract is decidable at segment 1".
 //!
 //! Work plane on the bus: an in/# (or signal/#) event is announced under its
 //! own topic exactly once — by this broker when it arrived over the bus
@@ -92,6 +106,25 @@ struct Will {
     retain: bool,
 }
 
+/// One resident blocking-hook registration (a grant-approved SUBSCRIBE with
+/// `mode=blocking` user properties). Lives and dies with the session —
+/// crash-only: a dead hook client deregisters by disconnecting, and an
+/// in-flight invocation falls to its broker-enforced timeout/default.
+#[derive(Clone)]
+struct BlockingReg {
+    /// Subscription filter, under obs/harness/hookreq/<point>/...
+    filter: String,
+    /// The literal hook point (segment 4 of the filter); grant-checked.
+    point: String,
+    order: u32,
+    timeout_ms: u64,
+    /// on_timeout=allow|deny — also covers send failures and malformed
+    /// verdicts. Fail-open vs fail-closed is the registrant's declaration.
+    allow_on_timeout: bool,
+    /// Registration sequence: stable tiebreak within equal `order`.
+    seq: u64,
+}
+
 struct SessionRec {
     sink: v5::MqttSink,
     subs: Vec<SubRec>,
@@ -103,6 +136,8 @@ struct SessionRec {
     actor: Option<String>,
     /// CONNECT last will, fired on abnormal close (crash-only liveness).
     will: Option<Will>,
+    /// Resident blocking-hook registrations held by this session.
+    blocking: Vec<BlockingReg>,
 }
 
 struct Broker {
@@ -120,6 +155,14 @@ struct Broker {
     /// (§4.8.2); round-robin spreads load and is easy to reason about in
     /// tests. No ordering guarantee across the group, per spec.
     shared_rr: RefCell<HashMap<String, usize>>,
+    /// In-flight hook invocations awaiting a verdict, keyed by the minted
+    /// response-topic id (obs/harness/hookresp/<id>). A verdict publish
+    /// completes the sender; a timeout removes the entry — a late verdict
+    /// after timeout is dropped on the floor, which is correct: the chain
+    /// already applied the declared default.
+    pending_verdicts: RefCell<HashMap<String, tokio::sync::oneshot::Sender<Value>>>,
+    /// Registration sequence counter (ordering tiebreak).
+    reg_seq: Cell<u64>,
     next_key: Cell<u64>,
 }
 
@@ -132,14 +175,44 @@ impl Broker {
                 None
             }
         };
-        Broker {
+        let b = Broker {
             root,
             conn,
             sessions: RefCell::new(HashMap::new()),
             retained: RefCell::new(HashMap::new()),
             actors: RefCell::new(HashMap::new()),
             shared_rr: RefCell::new(HashMap::new()),
+            pending_verdicts: RefCell::new(HashMap::new()),
+            reg_seq: Cell::new(1),
             next_key: Cell::new(1),
+        };
+        // A fresh broker has zero resident registrations by construction;
+        // clear any stale active-points row a crashed daemon left behind so
+        // exec's zero-overhead check doesn't chase ghosts.
+        b.refresh_hooks_kv();
+        b
+    }
+
+    /// Recompute the kv row exec/dispatcher read for the zero-overhead gate:
+    /// the comma-joined set of hook points with at least one live resident
+    /// registration. Updated on register/deregister/disconnect; cleared on
+    /// broker start. Staleness window (documented in src/resident.rs): a
+    /// registration that lands mid-tool-call is seen at the next tool call;
+    /// a daemon crash leaves the row stale until the next daemon start (the
+    /// consult path then fails fast toward allow — broker down means
+    /// resident hooks don't exist, per the degradation order).
+    fn refresh_hooks_kv(&self) {
+        let Some(conn) = self.conn.as_ref() else { return };
+        let mut points: Vec<String> = self
+            .sessions
+            .borrow()
+            .values()
+            .flat_map(|r| r.blocking.iter().map(|b| b.point.clone()))
+            .collect();
+        points.sort();
+        points.dedup();
+        if let Err(e) = crate::db::kv_set(conn, crate::resident::ACTIVE_KEY, &points.join(",")) {
+            eprintln!("[bus] resident-hooks kv update failed: {e:#}");
         }
     }
 
@@ -173,6 +246,21 @@ impl Broker {
 fn drop_session(st: &Rc<Broker>, key: u64, clean: bool) {
     let rec = st.sessions.borrow_mut().remove(&key);
     if let Some(rec) = rec {
+        // Registrations die with the session (crash-only): refresh the
+        // zero-overhead gate and leave an audit echo per detached hook. Any
+        // in-flight invocation against this session times out on its own.
+        if !rec.blocking.is_empty() {
+            st.refresh_hooks_kv();
+            for b in &rec.blocking {
+                trace::write(
+                    &st.root,
+                    "obs/harness/hookreg/detach",
+                    &trace::Ids::default(),
+                    json!({ "hook": format!("resident:{}", rec.actor.as_deref().unwrap_or("?")),
+                            "point": b.point, "filter": b.filter, "clean": clean }),
+                );
+            }
+        }
         if !clean {
             if let Some(w) = rec.will {
                 if w.retain {
@@ -318,9 +406,10 @@ async fn handshake(st: Rc<Broker>, h: v5::Handshake) -> Result<v5::HandshakeAck<
     let key = st.next_key.get();
     st.next_key.set(key + 1);
     let sink = h.sink();
-    st.sessions
-        .borrow_mut()
-        .insert(key, SessionRec { sink: sink.clone(), subs: Vec::new(), actor, will });
+    st.sessions.borrow_mut().insert(
+        key,
+        SessionRec { sink: sink.clone(), subs: Vec::new(), actor, will, blocking: Vec::new() },
+    );
     Ok(h.ack(BusSession { key, sink }))
 }
 
@@ -359,6 +448,15 @@ async fn protocol_msg(
         v5::ProtocolMessage::Subscribe(mut s) => {
             let actor: Option<String> =
                 st.sessions.borrow().get(&session.key).and_then(|r| r.actor.clone());
+            // SUBSCRIBE user properties (§3.8.2.1) are packet-level; they
+            // apply to every filter in the packet (the CLI sends one).
+            let props: HashMap<String, String> = s
+                .packet()
+                .user_properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let wants_blocking = props.get("mode").map(|m| m == "blocking").unwrap_or(false);
             for mut sub in s.iter_mut() {
                 let filter = sub.topic().to_string();
                 // $share/<group>/<filter> (§4.8.2): competing consumers —
@@ -373,6 +471,46 @@ async fn protocol_msg(
                 if !topic::valid_filter(&inner) {
                     sub.fail(v5::codec::SubscribeAckReason::TopicFilterInvalid);
                     continue;
+                }
+                // Blocking registration attempt. Blocking is a granted
+                // capability, never ambient: it requires a token-authed
+                // session AND an approved 'blocking' grant for the literal
+                // point in the filter. Anything short of that degrades to
+                // plain observation semantics (props ignored), echoed so the
+                // operator can see why their hook never fires.
+                if wants_blocking && group.is_none() {
+                    match try_register_blocking(&st, session.key, &actor, &filter, &props) {
+                        Ok(reg) => {
+                            let granted = match sub.options().qos {
+                                v5::QoS::AtMostOnce => v5::QoS::AtMostOnce,
+                                _ => v5::QoS::AtLeastOnce,
+                            };
+                            sub.confirm(granted);
+                            st.refresh_hooks_kv();
+                            trace::write(
+                                &st.root,
+                                "obs/harness/hookreg/attach",
+                                &trace::Ids::default(),
+                                json!({
+                                    "hook": format!("resident:{}", actor.as_deref().unwrap_or("?")),
+                                    "point": reg.point, "filter": reg.filter,
+                                    "order": reg.order, "timeout_ms": reg.timeout_ms,
+                                    "on_timeout": if reg.allow_on_timeout { "allow" } else { "deny" },
+                                }),
+                            );
+                            continue;
+                        }
+                        Err(why) => {
+                            trace::write(
+                                &st.root,
+                                "obs/harness/hookreg/ignored",
+                                &trace::Ids::default(),
+                                json!({ "filter": filter, "reason": why,
+                                        "actor": actor.as_deref() }),
+                            );
+                            // fall through: plain observation semantics
+                        }
+                    }
                 }
                 if let Some(pkg) = &actor {
                     // The grant may be stored either as the full $share form
@@ -428,10 +566,17 @@ async fn protocol_msg(
             Ok(s.ack())
         }
         v5::ProtocolMessage::Unsubscribe(s) => {
+            let mut dropped_blocking = false;
             if let Some(rec) = st.sessions.borrow_mut().get_mut(&session.key) {
                 for f in s.iter() {
                     rec.subs.retain(|x| x.filter != f.as_str());
+                    let before = rec.blocking.len();
+                    rec.blocking.retain(|b| b.filter != f.as_str());
+                    dropped_blocking |= rec.blocking.len() != before;
                 }
+            }
+            if dropped_blocking {
+                st.refresh_hooks_kv();
             }
             Ok(s.ack())
         }
@@ -454,14 +599,16 @@ async fn inbound(
     publish: Publish,
 ) -> Result<PublishAck, ServerError> {
     let topic = publish.publish_topic().to_string();
-    let (retain, mirror) = {
+    let (retain, mirror, resp_to) = {
         let pkt = publish.packet();
         let mirror = pkt
             .properties
             .user_properties
             .iter()
             .any(|(k, _)| k.as_str() == MIRROR_PROP);
-        (pkt.retain, mirror)
+        // Response Topic (§4.10): only meaningful on hook requests.
+        let resp_to = pkt.properties.response_topic.as_ref().map(|t| t.to_string());
+        (pkt.retain, mirror, resp_to)
     };
     let payload = publish.read_all().await.unwrap_or_default();
     // A failure reason in the PUBACK is the honest answer for QoS 1: "I did
@@ -474,10 +621,44 @@ async fn inbound(
         eprintln!("[bus] rejecting inbound publish to invalid topic {topic:?}");
         return nack(Nack::TopicNameInvalid);
     }
-    // Actor sessions publish inside their approved filters (plus the status
-    // floor); a deny is a 0x87 NACK plus an obs echo, never a silent success.
     let actor: Option<String> =
         st.sessions.borrow().get(&session.key).and_then(|r| r.actor.clone());
+    // Hook verdicts: point-to-point RPC plumbing, intercepted before generic
+    // routing — never fanned out, never written to disk (the
+    // obs/harness/hook/<point>/<outcome> echo is the recorded artifact).
+    // ACL (topics.md decided 7): the blocking grant includes publish right
+    // to this prefix — concretely, an actor session may publish here iff it
+    // holds a live blocking registration. Anonymous local clients pass as
+    // everywhere else.
+    if let Some(id) = topic.strip_prefix("obs/harness/hookresp/") {
+        if let Some(pkg) = &actor {
+            let registered = st
+                .sessions
+                .borrow()
+                .get(&session.key)
+                .map(|r| !r.blocking.is_empty())
+                .unwrap_or(false);
+            if !registered {
+                trace::write(
+                    &st.root,
+                    &format!("obs/package/{pkg}/denied"),
+                    &trace::Ids::default(),
+                    json!({ "kind": "publish", "value": topic }),
+                );
+                return nack(Nack::NotAuthorized);
+            }
+        }
+        if let Some(tx) = st.pending_verdicts.borrow_mut().remove(id) {
+            let v: Value = serde_json::from_str(&String::from_utf8_lossy(&payload))
+                .unwrap_or(Value::Null);
+            let _ = tx.send(v);
+        }
+        // No pending entry = a verdict after timeout; dropped, the chain
+        // already applied the registration's declared default.
+        return Ok(publish.ack());
+    }
+    // Actor sessions publish inside their approved filters (plus the status
+    // floor); a deny is a 0x87 NACK plus an obs echo, never a silent success.
     if let Some(pkg) = &actor {
         if !st.actor_may_publish(pkg, &topic) {
             trace::write(
@@ -490,6 +671,19 @@ async fn inbound(
         }
     }
     let text = String::from_utf8_lossy(&payload).into_owned();
+    // Hook requests: the broker is the chain coordinator. The PUBACK below
+    // means "request accepted"; the verdict rides the Response Topic. The
+    // raw request also fans out to any plain subscribers (observation
+    // semantics for non-blocking clients) but is never written to disk —
+    // requests are RPC, the hook echoes are the record. Note the actor ACL
+    // above already ran: a package cannot fire hook chains without an
+    // approved publish grant on this prefix (the kernel publishes
+    // anonymously and passes).
+    if topic.starts_with("obs/harness/hookreq/") {
+        handle_hook_request(&st, &topic, &text, resp_to);
+        fan_out(&st, &topic, &text);
+        return Ok(publish.ack());
+    }
     // The v3 routing rule (docs/topics.md): in/# and signal/# materialize to
     // the ledger; obs/# (and everything else) fans out only.
     let first = topic.split('/').next().unwrap_or("");
@@ -548,6 +742,173 @@ async fn inbound(
     Ok(publish.ack())
 }
 
+/// Run the resident-hook chain for one request and answer the requester.
+///
+/// Request topic: obs/harness/hookreq/<point>/<matched...>; payload
+/// {point, matched, subject, correlation}. Matching registrations (filter
+/// matches the request topic; grant re-checked at fire time so a revocation
+/// takes effect immediately, not at the next reconnect) run in (order, seq)
+/// order, each as its own §4.10 round trip: a direct publish to the
+/// registrant's session carrying a per-invocation Response Topic
+/// (obs/harness/hookresp/<id>) + Correlation Data, awaited under the
+/// registration's broker-enforced timeout — one dead hook can never stall
+/// the others, and a hook client killed mid-flight just falls to its
+/// declared on_timeout. First deny stops the chain; an allow verdict's
+/// `event` object rewrites the subject for the next hook. Every invocation
+/// echoes to obs/harness/hook/<point>/<outcome>, exactly like exec hooks.
+/// The final {decision, event, reason, denied_by, correlation} is published
+/// to the requester's Response Topic (correlation echoed in the payload —
+/// the requester's response topic is per-process and the correlation guards
+/// against stale verdicts from an earlier, abandoned consult).
+fn handle_hook_request(st: &Rc<Broker>, topic_name: &str, text: &str, resp_to: Option<String>) {
+    let req: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let point = topic_name.split('/').nth(3).unwrap_or("").to_string();
+    struct Inv {
+        sink: v5::MqttSink,
+        who: String,
+        timeout_ms: u64,
+        allow_on_timeout: bool,
+        order: u32,
+        seq: u64,
+    }
+    let mut invs: Vec<Inv> = Vec::new();
+    {
+        let sessions = st.sessions.borrow();
+        for rec in sessions.values() {
+            let Some(pkg) = &rec.actor else { continue };
+            for b in &rec.blocking {
+                if b.point != point || !topic::matches(&b.filter, topic_name) {
+                    continue;
+                }
+                // Live revocation: the grant is re-checked per invocation.
+                let granted = st
+                    .conn
+                    .as_ref()
+                    .map(|c| crate::packages::is_approved(c, pkg, "blocking", &point).unwrap_or(false))
+                    .unwrap_or(false);
+                if !granted {
+                    continue;
+                }
+                invs.push(Inv {
+                    sink: rec.sink.clone(),
+                    who: format!("resident:{pkg}"),
+                    timeout_ms: b.timeout_ms,
+                    allow_on_timeout: b.allow_on_timeout,
+                    order: b.order,
+                    seq: b.seq,
+                });
+            }
+        }
+    }
+    invs.sort_by_key(|i| (i.order, i.seq));
+    // Only answer requesters who minted their response topic in the
+    // reserved prefix — anything else is a misdirected publish, not an RPC.
+    let resp_to = resp_to
+        .filter(|t| topic::valid_name(t) && t.starts_with("obs/harness/hookresp/"));
+    let st = st.clone();
+    let topic_name = topic_name.to_string();
+    ntex::rt::spawn(async move {
+        let matched = req["matched"].as_str().unwrap_or("").to_string();
+        let correlation = req.get("correlation").cloned().unwrap_or(Value::Null);
+        let mut subject = req.get("subject").cloned().unwrap_or(Value::Null);
+        let ids = trace::Ids {
+            session_id: subject["session"].as_str().map(String::from),
+            ..Default::default()
+        };
+        let mut allow = true;
+        let mut denied_by: Option<String> = None;
+        let mut reason: Option<String> = None;
+        for inv in invs {
+            let id = format!("v{}", uuid::Uuid::new_v4().simple());
+            let hook_resp = format!("obs/harness/hookresp/{id}");
+            let (tx, rx) = tokio::sync::oneshot::channel::<Value>();
+            st.pending_verdicts.borrow_mut().insert(id.clone(), tx);
+            let out = json!({
+                "point": point, "matched": matched, "subject": subject,
+                "timeout_ms": inv.timeout_ms,
+            })
+            .to_string();
+            let started = std::time::Instant::now();
+            let sent = inv
+                .sink
+                .publish(topic_name.clone())
+                .properties(|p| {
+                    p.response_topic = Some(hook_resp.clone().into());
+                    p.correlation_data =
+                        Some(ntex::util::Bytes::from(id.clone().into_bytes()));
+                })
+                .send_at_most_once(out.into_bytes().into());
+            let verdict: Option<Value> = if sent.is_err() {
+                None
+            } else {
+                match ntex::time::timeout(
+                    std::time::Duration::from_millis(inv.timeout_ms.max(1)),
+                    rx,
+                )
+                .await
+                {
+                    Ok(Ok(v)) => Some(v),
+                    _ => None, // timeout, or the pending sender was dropped
+                }
+            };
+            st.pending_verdicts.borrow_mut().remove(&id);
+            let ms = started.elapsed().as_millis() as u64;
+            // Fold the verdict exactly like exec hooks' settle(): deny stops
+            // the chain; allow may rewrite; timeout/malformed/send-failure
+            // apply the registration's on_timeout declaration.
+            let (effect, detail) = match &verdict {
+                Some(v) if v["decision"] == "allow" => match v.get("event") {
+                    Some(ev) if ev.is_object() => {
+                        subject = ev.clone();
+                        (true, json!({ "mode": "rewrite" }))
+                    }
+                    _ => (true, json!({ "mode": "ok" })),
+                },
+                Some(v) if v["decision"] == "deny" => (
+                    false,
+                    json!({ "mode": "verdict",
+                            "reason": v["reason"].as_str().unwrap_or("denied by resident hook") }),
+                ),
+                Some(_) => (
+                    inv.allow_on_timeout,
+                    json!({ "mode": "malformed",
+                            "on_timeout": if inv.allow_on_timeout { "allow" } else { "deny" },
+                            "reason": "malformed verdict payload" }),
+                ),
+                None => (
+                    inv.allow_on_timeout,
+                    json!({ "mode": "timeout",
+                            "on_timeout": if inv.allow_on_timeout { "allow" } else { "deny" },
+                            "reason": format!("hook timed out after {}ms", inv.timeout_ms) }),
+                ),
+            };
+            trace::write(
+                &st.root,
+                &format!("obs/harness/hook/{point}/{}", if effect { "allow" } else { "deny" }),
+                &ids,
+                json!({ "hook": inv.who, "matched": matched, "ms": ms, "detail": detail }),
+            );
+            if !effect {
+                allow = false;
+                denied_by = Some(inv.who);
+                reason = detail["reason"].as_str().map(String::from);
+                break;
+            }
+        }
+        if let Some(rt) = resp_to {
+            let line = json!({
+                "decision": if allow { "allow" } else { "deny" },
+                "event": subject,
+                "denied_by": denied_by,
+                "reason": reason,
+                "correlation": correlation,
+            })
+            .to_string();
+            fan_out(&st, &rt, &line);
+        }
+    });
+}
+
 /// Drain the kernel's channel: publishes onto connected subscribers,
 /// control messages into broker state.
 async fn pump(st: Rc<Broker>, mut rx: UnboundedReceiver<BusMsg>) {
@@ -571,6 +932,59 @@ async fn pump(st: Rc<Broker>, mut rx: UnboundedReceiver<BusMsg>) {
             }
         }
     }
+}
+
+/// Validate and record a blocking-hook registration; Err(reason) means the
+/// subscription degrades to plain observation semantics. Defaults: order 50,
+/// timeout_ms 500, on_timeout deny (a dead policy hook must not silently
+/// approve). The filter's point segment must be a literal hook point — the
+/// grant vocabulary stays exactly the exec-hook one (blocking grant value =
+/// point name), so one manifest line covers both registration styles.
+fn try_register_blocking(
+    st: &Rc<Broker>,
+    key: u64,
+    actor: &Option<String>,
+    filter: &str,
+    props: &HashMap<String, String>,
+) -> Result<BlockingReg, String> {
+    let Some(pkg) = actor else {
+        return Err("blocking requires a token-authed session".into());
+    };
+    let segs: Vec<&str> = filter.split('/').collect();
+    if segs.len() < 4 || segs[0] != "obs" || segs[1] != "harness" || segs[2] != "hookreq" {
+        return Err("blocking filter must live under obs/harness/hookreq/<point>/...".into());
+    }
+    let point = segs[3].to_string();
+    if !crate::manifest::HOOK_POINTS.contains(&point.as_str()) {
+        return Err(format!("unknown or wildcard hook point {point:?} (must be literal)"));
+    }
+    let Some(conn) = st.conn.as_ref() else {
+        return Err("broker has no db; cannot check the blocking grant".into());
+    };
+    if !crate::packages::is_approved(conn, pkg, "blocking", &point).unwrap_or(false) {
+        return Err(format!("no approved blocking grant for point {point:?}"));
+    }
+    let on_timeout = props.get("on_timeout").map(|s| s.as_str()).unwrap_or("deny");
+    if on_timeout != "allow" && on_timeout != "deny" {
+        return Err("on_timeout must be allow|deny".into());
+    }
+    let seq = st.reg_seq.get();
+    st.reg_seq.set(seq + 1);
+    let reg = BlockingReg {
+        filter: filter.to_string(),
+        point,
+        order: props.get("order").and_then(|s| s.parse().ok()).unwrap_or(50),
+        timeout_ms: props.get("timeout_ms").and_then(|s| s.parse().ok()).unwrap_or(500),
+        allow_on_timeout: on_timeout == "allow",
+        seq,
+    };
+    let mut sessions = st.sessions.borrow_mut();
+    let Some(rec) = sessions.get_mut(&key) else {
+        return Err("session vanished mid-subscribe".into());
+    };
+    rec.blocking.retain(|b| b.filter != filter); // re-subscribe replaces
+    rec.blocking.push(reg.clone());
+    Ok(reg)
 }
 
 /// Split a `$share/<group>/<filter>` subscription into (group, inner filter)
