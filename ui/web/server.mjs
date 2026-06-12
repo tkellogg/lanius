@@ -11,8 +11,11 @@
 // <root>/run/pkg-history/http.json — discovery from harness state, never
 // retained bus messages (docs/security.md entry 11).
 //
-// AUTHORITY: read-and-converse only. No approve/revoke/kill endpoints —
-// admin stays in the CLI until the identity model lands (docs/bus.md §7).
+// AUTHORITY: read, converse, and STAGE. Admin endpoints compose pending
+// state (kit add --pending, profile file edits) but never commit grants —
+// approve/revoke stays in the CLI until the identity model lands
+// (HANDOFF phase 5; docs/security.md entries 4-5: staging is workflow,
+// not a boundary, and nothing here claims one).
 //
 //   node server.mjs --root /tmp/elanus-live [--port 7180] [--agent main]
 import fs from 'node:fs';
@@ -109,6 +112,69 @@ async function handleHistory(query, res) {
   }
 }
 
+// ---- admin: staging only ----------------------------------------------------
+// Privileged gestures shell out to the elanus CLI — one code path for every
+// human gesture, and this server adds no authority of its own. Kit installs
+// are ALWAYS staged (--pending); profile files are edited directly (the
+// same trust as the human's text editor — profiles are not ledger state).
+import { execFile } from 'node:child_process';
+const ELANUS_BIN = process.env.ELANUS_BIN || 'elanus';
+
+function cli(cliArgs) {
+  return new Promise((resolve) => {
+    execFile(ELANUS_BIN, cliArgs, { env: { ...process.env, ...(ROOT ? { HARNESS_ROOT: ROOT } : {}) }, timeout: 30000 },
+      (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr), error: err ? String(err.message ?? err) : undefined }));
+  });
+}
+
+function jsonLines(text) {
+  return text.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
+
+function sendJson(res, code, body) {
+  res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+}
+
+const PROFILE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+async function handleAdmin(url, req, res, body) {
+  if (url.pathname === '/api/admin/kits' && req.method === 'GET') {
+    const r = await cli(['kit', 'list', '--json']);
+    return sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, kits: jsonLines(r.stdout) } : { ok: false, error: r.stderr || r.error });
+  }
+  if (url.pathname === '/api/admin/kits/add' && req.method === 'POST') {
+    const { kit, copy } = body ?? {};
+    if (typeof kit !== 'string' || !kit.length) return sendJson(res, 400, { ok: false, error: 'need {kit}' });
+    // Staged, always: the UI composes; the CLI commits.
+    const args = ['kit', 'add', kit, '--pending'];
+    if (copy) args.push('--copy');
+    const r = await cli(args);
+    return sendJson(res, r.ok ? 200 : 500, { ok: r.ok, staged: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
+  }
+  if (url.pathname === '/api/admin/packages' && req.method === 'GET') {
+    const r = await cli(['packages', '--json']);
+    return sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, packages: jsonLines(r.stdout) } : { ok: false, error: r.stderr || r.error });
+  }
+  if (url.pathname === '/api/admin/profile' && (req.method === 'GET' || req.method === 'PUT')) {
+    if (!ROOT) return sendJson(res, 503, { ok: false, error: 'no --root; profile editing needs the harness root' });
+    const name = url.searchParams.get('name') ?? 'default';
+    if (!PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: 'bad profile name' });
+    const file = path.join(ROOT, 'profiles', name, 'profile.toml');
+    if (req.method === 'GET') {
+      try {
+        return sendJson(res, 200, { ok: true, name, toml: fs.readFileSync(file, 'utf8') });
+      } catch {
+        return sendJson(res, 404, { ok: false, error: `no profile.toml for ${name}` });
+      }
+    }
+    if (typeof body?.toml !== 'string') return sendJson(res, 400, { ok: false, error: 'need {toml}' });
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, body.toml);
+    return sendJson(res, 200, { ok: true, name });
+  }
+  sendJson(res, 404, { ok: false, error: 'unknown admin endpoint' });
+}
+
 function broadcast(obj) {
   const line = `data: ${JSON.stringify(obj)}\n\n`;
   for (const res of sseClients) res.write(line);
@@ -130,6 +196,22 @@ const server = http.createServer((req, res) => {
     for (const m of ring) res.write(`data: ${JSON.stringify(m)}\n\n`);
     sseClients.add(res);
     req.on('close', () => sseClients.delete(res));
+    return;
+  }
+  if (url.pathname.startsWith('/api/admin/')) {
+    if (req.method === 'GET') {
+      handleAdmin(url, req, res, null);
+    } else {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        let j = null;
+        if (body.length) {
+          try { j = JSON.parse(body); } catch { res.writeHead(400).end('bad json'); return; }
+        }
+        handleAdmin(url, req, res, j);
+      });
+    }
     return;
   }
   if (url.pathname === '/api/history' && req.method === 'POST') {

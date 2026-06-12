@@ -205,6 +205,38 @@ if (agentsResp) {
     : fail(`search DSL wrong: ${search.status} ${JSON.stringify(sj)}`);
 }
 
+// 8. admin = staging only (HANDOFF phase 5): the server composes pending
+// state via the CLI and edits profile files, but never commits a grant.
+const kitsResp = await (await fetch(`${BASE}/api/admin/kits`)).json();
+(kitsResp.ok && kitsResp.kits.some((k) => k.name === 'dev'))
+  ? ok('admin: kit list (dev kit resolvable)')
+  : fail(`admin kits wrong: ${JSON.stringify(kitsResp)}`);
+
+const add = await (await fetch(`${BASE}/api/admin/kits/add`, {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ kit: 'dev' }),
+})).json();
+add.ok && add.staged ? ok('admin: kit add stages') : fail(`kit add wrong: ${JSON.stringify(add)}`);
+sql(`SELECT COUNT(*) FROM grants WHERE package='git-protect' AND state='approved'`) === '0'
+  ? ok('admin: staging granted nothing')
+  : fail('admin kit add approved grants');
+
+const pkgs = await (await fetch(`${BASE}/api/admin/packages`)).json();
+const gp = (pkgs.packages ?? []).find((p) => p.name === 'git-protect');
+gp && gp.grants.some((g) => g.state === 'requested')
+  ? ok('admin: pending queue shows the staged requests')
+  : fail(`admin packages wrong: ${JSON.stringify(gp)}`);
+
+const prof0 = await (await fetch(`${BASE}/api/admin/profile?name=default`)).json();
+prof0.ok && /agent/.test(prof0.toml) ? ok('admin: profile read') : fail(`profile read wrong: ${JSON.stringify(prof0)}`);
+await fetch(`${BASE}/api/admin/profile?name=default`, {
+  method: 'PUT', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ toml: prof0.toml + '\n# edited-by-ui\n' }),
+});
+const prof1 = await (await fetch(`${BASE}/api/admin/profile?name=default`)).json();
+/edited-by-ui/.test(prof1.toml) ? ok('admin: profile write round-trips') : fail('profile write lost');
+const trav = await fetch(`${BASE}/api/admin/profile?name=../evil`);
+trav.status === 400 ? ok('admin: profile name traversal rejected') : fail(`traversal got ${trav.status}`);
+
 // -- teardown --
 server.kill('SIGKILL');
 daemon.kill('SIGKILL');

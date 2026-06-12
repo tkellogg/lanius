@@ -77,6 +77,7 @@ function renderNav() {
     if (sess.length > 12) box.appendChild(el('div', 'nav-hint', `+${sess.length - 12} more in sessions`));
   }
   $('.nav-signals').classList.toggle('on', sel.kind === 'signals');
+  $('.nav-setup').classList.toggle('on', sel.kind === 'setup');
 }
 
 // arrow keys walk the nav like a real instrument panel
@@ -89,12 +90,14 @@ $('#nav-list').addEventListener('keydown', (e) => {
   next?.focus();
 });
 $('.nav-signals').onclick = () => selectSignals();
+$('.nav-setup').onclick = () => selectSetup();
 
 // ---------- view switching ----------
 function show(view) {
   $('#view-converse').hidden = view !== 'converse';
   $('#view-sessions').hidden = view !== 'sessions';
   $('#view-rail').hidden = view !== 'rail';
+  $('#view-setup').hidden = view !== 'setup';
 }
 
 function selectSignals() {
@@ -107,6 +110,82 @@ function selectSignals() {
   renderRail();
   renderNav();
 }
+
+function selectSetup() {
+  sel = { kind: 'setup' };
+  $('#stage-title').textContent = 'setup';
+  $('#stage-note').textContent = 'stage here, commit in the terminal';
+  $('#agent-tabs').hidden = true;
+  show('setup');
+  renderNav();
+  loadSetup();
+}
+
+// ---------- setup (staging only — the CLI is the commit gesture) ----------
+async function adminGet(p) {
+  try { const r = await fetch(`/api/admin/${p}`); return await r.json(); } catch { return { ok: false }; }
+}
+
+async function loadSetup() {
+  const kitsBox = $('#setup-kits');
+  const pendBox = $('#setup-pending');
+  kitsBox.textContent = 'resolving…';
+  pendBox.textContent = 'reading the ledger…';
+
+  const [kits, pkgs, prof] = await Promise.all([
+    adminGet('kits'), adminGet('packages'), adminGet('profile?name=default'),
+  ]);
+
+  kitsBox.textContent = '';
+  for (const k of kits.kits ?? []) {
+    const row = el('div', 'setup-kit');
+    row.appendChild(el('span', 'setup-kit-name', k.name));
+    row.appendChild(el('span', 'dim-note', k.hook || ''));
+    const b = el('button', '', 'stage');
+    b.onclick = async () => {
+      b.disabled = true; b.textContent = 'staging…';
+      const r = await fetch('/api/admin/kits/add', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ kit: k.name }),
+      }).then((x) => x.json()).catch(() => ({ ok: false }));
+      b.textContent = r.ok ? 'staged' : 'failed';
+      if (r.ok) loadSetup();
+    };
+    row.appendChild(b);
+    kitsBox.appendChild(row);
+  }
+  if (!(kits.kits ?? []).length) kitsBox.appendChild(el('div', 'dim-note', 'no kits resolvable — set ELANUS_KIT_PATH where the server runs'));
+
+  pendBox.textContent = '';
+  let pendingAny = false;
+  for (const p of pkgs.packages ?? []) {
+    const reqs = (p.grants ?? []).filter((g) => g.state === 'requested');
+    if (!reqs.length) continue;
+    pendingAny = true;
+    const card = el('div', 'setup-pending-pkg');
+    card.appendChild(el('div', 'setup-kit-name', p.name));
+    for (const g of reqs) card.appendChild(el('div', 'setup-grant', `${g.kind}  ${g.value}`));
+    const cmd = el('code', 'setup-cmd', `elanus approve ${p.name}`);
+    cmd.title = 'click to copy';
+    cmd.onclick = () => navigator.clipboard?.writeText(`elanus approve ${p.name}`);
+    card.appendChild(cmd);
+    pendBox.appendChild(card);
+  }
+  if (!pendingAny) pendBox.appendChild(el('div', 'dim-note', 'nothing pending — the ledger is at rest'));
+
+  if (prof.ok) $('#setup-profile').value = prof.toml;
+  else $('#setup-profile').value = '';
+}
+
+$('#setup-profile-save').onclick = async () => {
+  const note = $('#setup-profile-note');
+  note.textContent = 'saving…';
+  const r = await fetch('/api/admin/profile?name=default', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ toml: $('#setup-profile').value }),
+  }).then((x) => x.json()).catch(() => ({ ok: false }));
+  note.textContent = r.ok ? 'saved — picked up on the next run' : 'save failed';
+};
 
 function selectAgent(name, tab) {
   const prev = sel;

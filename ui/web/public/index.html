@@ -32,6 +32,7 @@
     <div class="panel-head"><h2>instruments</h2></div>
     <div id="nav-list" class="nav-list">
       <button class="nav-item nav-signals" data-sel="signals"><span class="nav-sigil">◮</span> signals</button>
+      <button class="nav-item nav-setup" data-sel="setup"><span class="nav-sigil">⚒</span> setup</button>
       <div class="nav-label">agents</div>
       <div id="nav-agents"></div>
       <div id="nav-empty" class="nav-hint">listening for agents…</div>
@@ -66,6 +67,31 @@
       <div id="sessions-pane" class="sessions-pane"></div>
     </div>
 
+    <!-- setup: stage kits, watch the pending queue, edit profiles -->
+    <div id="view-setup" class="view" hidden>
+      <div class="setup-pane">
+        <section class="setup-block">
+          <h3>kits</h3>
+          <p class="dim-note">starter packs, staged here — every grant lands pending, nothing runs until you commit in the terminal.</p>
+          <div id="setup-kits"></div>
+        </section>
+        <section class="setup-block">
+          <h3>pending review</h3>
+          <p class="dim-note">requests are not grants. commit each package from your terminal — by design, this page cannot.</p>
+          <div id="setup-pending"></div>
+        </section>
+        <section class="setup-block">
+          <h3>profile <code>default</code></h3>
+          <p class="dim-note">model, sandbox, skill visibility — your file, edited in place (profiles are not ledger state).</p>
+          <textarea id="setup-profile" spellcheck="false" rows="14"></textarea>
+          <div class="setup-row">
+            <button id="setup-profile-save">save profile.toml</button>
+            <span id="setup-profile-note" class="dim-note"></span>
+          </div>
+        </section>
+      </div>
+    </div>
+
     <!-- telemetry / signals: the rail -->
     <div id="view-rail" class="view">
       <div class="rail-bar">
@@ -85,7 +111,7 @@
 <footer class="strip">
   <span id="stat-count">0 events</span>
   <span id="stat-broker"></span>
-  <span class="strip-note">read &amp; converse only — admin stays in the CLI</span>
+  <span class="strip-note">read, converse &amp; stage — commits stay in the CLI</span>
   <span class="strip-right">everything you see arrived over plain MQTT</span>
 </footer>
 

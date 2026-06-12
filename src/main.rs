@@ -175,7 +175,11 @@ enum KitCmd {
         pending: bool,
     },
     /// Kits installable right now, in resolution order (first hit wins)
-    List,
+    List {
+        /// One JSON object per kit
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a kit's README without installing it
     Show { kit: String },
 }
@@ -428,9 +432,13 @@ fn run(cli: Cli) -> Result<()> {
                     println!("{}", r.trim_end());
                 }
             }
-            KitCmd::List => {
+            KitCmd::List { json } => {
                 for (name, dir, hook) in kit::list()? {
-                    println!("{name:<16} {hook}  [{}]", dir.display());
+                    if json {
+                        println!("{}", serde_json::json!({ "name": name, "dir": dir, "hook": hook }));
+                    } else {
+                        println!("{name:<16} {hook}  [{}]", dir.display());
+                    }
                 }
             }
             KitCmd::Show { kit: kref } => {
