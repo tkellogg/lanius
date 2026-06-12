@@ -58,7 +58,18 @@ feature that turns install/grant/profile-edit into an endpoint (UI admin,
 `kit add` behind HTTP, MCP-exposed admin tools) erodes that justification.
 Browser-side extras for the UI server: CSRF from hostile origins, DNS
 rebinding, plus any local process can curl loopback (network is uncaged).
-Gate: these features ship as *staging* only until entry 4 is resolved.
+
+**[DECIDED 2026-06-12, Tim]** The UI commits (approve/revoke buttons). The
+earlier ship-as-staging-only gate claimed the CLI was a safer channel; per
+entries 3–4 it is not — the terminal is MORE available to an agent, and
+the ledger itself is cage-writable, so refusing the button bought zero
+containment while costing the workflow. What a browser adds that a
+terminal doesn't is hostile-ORIGIN traffic, and that differential is
+guarded for real: mutating routes require a genuinely-local Host (DNS
+rebinding) and a matching Origin when one is sent (CSRF); UI decisions
+carry decided_by=ui in the ledger for the trail. The endpoint inherits
+entry 3's blast radius, no more — and when the identity model lands, it
+authenticates like every other privileged client.
 
 ## 6. [LEGS] Secrets are readable
 

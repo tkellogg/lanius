@@ -33,6 +33,17 @@ const PKG_FILES: &[PkgFile] = &[
     PkgFile { rel: "window/scripts/stage", content: include_str!("../packages/window/scripts/stage"), exec: true },
 ];
 
+/// The stock kit, seeded into <root>/kits so a fresh root always has at
+/// least the stdlib resolvable — no env var, no repo checkout required.
+const CORE_KIT_FILES: &[PkgFile] = &[
+    PkgFile { rel: "core/README.md", content: include_str!("../kits/core/README.md"), exec: false },
+    PkgFile { rel: "core/packages/harness-doctrine/SKILL.md", content: include_str!("../kits/core/packages/harness-doctrine/SKILL.md"), exec: false },
+    PkgFile { rel: "core/packages/self-modify/SKILL.md", content: include_str!("../kits/core/packages/self-modify/SKILL.md"), exec: false },
+    PkgFile { rel: "core/packages/escalate/SKILL.md", content: include_str!("../kits/core/packages/escalate/SKILL.md"), exec: false },
+    PkgFile { rel: "core/profiles/architect/profile.toml", content: include_str!("../kits/core/profiles/architect/profile.toml"), exec: false },
+    PkgFile { rel: "core/profiles/architect/blocks/00-architect.md", content: include_str!("../kits/core/profiles/architect/blocks/00-architect.md"), exec: false },
+];
+
 const PROFILE_TOML: &str = include_str!("../templates/profile.toml");
 const RECORDER_TOML: &str = include_str!("../templates/recorder.toml");
 const BUS_TOML: &str = include_str!("../templates/bus.toml");
@@ -40,14 +51,23 @@ const BLOCK_SYSTEM: &str = include_str!("../templates/block-00-system.md");
 const BLOCK_CONTEXT: &str = include_str!("../templates/block-10-context.md");
 
 pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
-    // Resolve every kit BEFORE touching disk: a typo'd kit name must not
-    // leave a half-initialized root behind.
-    let kit_dirs = kits.iter().map(|k| kit::resolve(k)).collect::<Result<Vec<_>>>()?;
     std::fs::create_dir_all(&dir)?;
     let root = Root { dir: dir.canonicalize()? };
     for d in [root.packages(), root.run_dir(), root.profile_dir("default").join("blocks")] {
         std::fs::create_dir_all(d)?;
     }
+    // Seed <root>/kits with the stock kit FIRST so `init --kit core` (and
+    // every later `kit add`) resolves without env vars or a repo checkout.
+    for f in CORE_KIT_FILES {
+        let path = root.dir.join("kits").join(f.rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_if_missing(&path, f.content, f.exec)?;
+    }
+    // Resolve every kit BEFORE installing anything: a typo'd kit name must
+    // not leave a half-installed root behind.
+    let kit_dirs = kits.iter().map(|k| kit::resolve(&root, k)).collect::<Result<Vec<_>>>()?;
 
     write_if_missing(&root.recorder_file(), RECORDER_TOML, false)?;
     write_if_missing(&root.bus_file(), BUS_TOML, false)?;

@@ -46,8 +46,9 @@ right now, in resolution order), `elanus kit show <ref>` (README without
 installing).
 
 Resolution: a ref containing `/` is used as a path directly. A bare name
-resolves against `$ELANUS_KIT_PATH` (colon-separated directories, each
-containing kit dirs by name), then against a `kits/` directory found by
-walking up from the elanus executable — that last hop is a dev convenience
-so a repo build finds `<repo>/kits`; packaged installs should set
-`ELANUS_KIT_PATH`.
+resolves, in order, against `$ELANUS_KIT_PATH` (an override, not the
+mechanism), **`<root>/kits`** — the configured home: `elanus init` seeds it
+with the stock `core` kit, and dropping a directory there is the whole
+install story — then `~/.elanus/kits` (user-level, shared across roots),
+then a `kits/` directory found walking up from the elanus executable (dev
+convenience so a repo build finds `<repo>/kits`).

@@ -9,10 +9,15 @@ trace.jsonl beyond the admin seam below. The filesystem touches: this
 directory's static files, `<root>/bus.toml` for broker discovery, profile
 files, and the run/ dir for the history endpoint.
 
-**Authority: read, converse & STAGE — commits stay in the CLI.** The admin
-seam (`/api/admin/*`) shells out to the `elanus` CLI, so this server adds
+**Authority: the same as your terminal — because it shells out to it.**
+The admin seam (`/api/admin/*`) runs the `elanus` CLI, so this server adds
 no authority of its own and there is one code path for every human
-gesture:
+gesture. Commits included (Tim's call, 2026-06-12): pretending the CLI was
+a safer channel claimed a boundary that doesn't exist yet
+(docs/security.md entries 3–5). What a browser uniquely adds — hostile
+ORIGIN traffic — is guarded for real: mutating routes require a
+genuinely-local Host and a matching Origin when one is sent, and
+UI-driven decisions carry `decided_by=ui` in the ledger:
 
 - **Agents are profiles.** The nav lists every profile on disk (a silent
   root still shows its identities); *new agent* scaffolds one
@@ -23,14 +28,16 @@ gesture:
   under the old noun stays). Every form save goes through
   `elanus profile set`: comments survive, and a set that wouldn't load is
   refused before it lands.
-- **Kits stage, never land.** *kits & review* lists resolvable kits with
-  README previews and an `installed` badge from grant provenance; staging
-  runs `elanus kit add --pending` — every grant sits in the pending queue,
-  which renders each request with a click-to-copy `elanus approve <pkg>`.
-  Deliberately a command, not a button: every client on the loopback
-  broker is anonymous, so a web page must not commit anything you'd want
-  an identity trail for (docs/security.md entries 4–5). When the identity
-  model lands, the queue graduates to in-UI commit without redesign.
+- **Kits stage, then you commit — here or in the terminal.** *kits &
+  review* lists resolvable kits (`<root>/kits` is seeded with `core` at
+  init; drop more in, or `~/.elanus/kits`) with README previews and an
+  `installed` badge from grant provenance; staging runs
+  `elanus kit add --pending`, and the pending queue renders each request
+  with an approve button (ledger trail `decided_by=ui`) alongside the
+  equivalent terminal command.
+- **The model picker asks the provider.** `/api/admin/models` proxies
+  `elanus models` (GET /v1/models with the configured base_url/key);
+  compat layers without the endpoint degrade to static suggestions.
 
 ## Run
 

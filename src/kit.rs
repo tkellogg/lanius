@@ -26,11 +26,8 @@ pub enum Mode {
 }
 
 /// Resolve a kit reference to its directory. A value containing '/' is a
-/// path used directly. A bare name resolves against $ELANUS_KIT_PATH
-/// (colon-separated directories), then against a `kits/` directory found by
-/// walking up from the executable's location — dev convenience so a repo
-/// build sees <repo>/kits; packaged installs should set ELANUS_KIT_PATH.
-pub fn resolve(kit: &str) -> Result<PathBuf> {
+/// path used directly; a bare name resolves against search_dirs().
+pub fn resolve(root: &Root, kit: &str) -> Result<PathBuf> {
     if kit.contains('/') {
         let p = PathBuf::from(kit);
         if p.is_dir() {
@@ -39,7 +36,7 @@ pub fn resolve(kit: &str) -> Result<PathBuf> {
         bail!("kit path {kit:?} is not a directory");
     }
     let mut tried: Vec<String> = Vec::new();
-    for dir in search_dirs() {
+    for dir in search_dirs(root) {
         let p = dir.join(kit);
         if p.is_dir() {
             return Ok(p.canonicalize()?);
@@ -47,19 +44,28 @@ pub fn resolve(kit: &str) -> Result<PathBuf> {
         tried.push(p.display().to_string());
     }
     bail!(
-        "kit {kit:?} not found (tried: {}); set ELANUS_KIT_PATH or pass a path",
-        if tried.is_empty() { "nothing — no ELANUS_KIT_PATH".into() } else { tried.join(", ") }
+        "kit {kit:?} not found (tried: {}); drop it in <root>/kits or pass a path",
+        if tried.is_empty() { "nothing".into() } else { tried.join(", ") }
     )
 }
 
-/// The directories kits resolve against, in order: $ELANUS_KIT_PATH entries,
-/// then every `kits/` dir found walking up from the executable.
-fn search_dirs() -> Vec<PathBuf> {
+/// The directories kits resolve against, in order:
+/// 1. $ELANUS_KIT_PATH entries (an override, not the mechanism);
+/// 2. `<root>/kits` — THE configured home: init seeds the stock kits here,
+///    and dropping a directory in is the whole install story;
+/// 3. `~/.elanus/kits` — user-level, shared across roots;
+/// 4. every `kits/` dir walking up from the executable (dev convenience so
+///    a repo build sees <repo>/kits).
+fn search_dirs(root: &Root) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     if let Ok(kp) = std::env::var("ELANUS_KIT_PATH") {
         for entry in kp.split(':').filter(|s| !s.is_empty()) {
             out.push(PathBuf::from(entry));
         }
+    }
+    out.push(root.dir.join("kits"));
+    if let Some(home) = std::env::var_os("HOME") {
+        out.push(PathBuf::from(home).join(".elanus/kits"));
     }
     if let Ok(exe) = std::env::current_exe() {
         for anc in exe.ancestors().skip(1) {
@@ -190,9 +196,9 @@ fn link_package_path(root: &Root, pkgs_dir: &Path) -> Result<()> {
 
 /// Kits installable right now: (name, dir, first README line), resolution
 /// order, first hit per name wins — same shadowing rule as resolve().
-pub fn list() -> Result<Vec<(String, PathBuf, String)>> {
+pub fn list(root: &Root) -> Result<Vec<(String, PathBuf, String)>> {
     let mut out: Vec<(String, PathBuf, String)> = Vec::new();
-    for dir in search_dirs() {
+    for dir in search_dirs(root) {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
         entries.sort();
@@ -249,8 +255,8 @@ pub fn unlink(root: &Root, kit_dir: &Path) -> Result<()> {
 }
 
 /// The kit's README, without installing.
-pub fn show(kit: &str) -> Result<String> {
-    let dir = resolve(kit)?;
+pub fn show(root: &Root, kit: &str) -> Result<String> {
+    let dir = resolve(root, kit)?;
     let readme = dir.join("README.md");
     if !readme.is_file() {
         bail!("kit {} has no README.md", dir.display());

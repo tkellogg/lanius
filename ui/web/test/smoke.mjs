@@ -266,6 +266,36 @@ badset.status === 400 ? ok('admin: invalid set refused before it lands') : fail(
 const rdme = await (await fetch(`${BASE}/api/admin/kits/readme?kit=dev`)).json();
 rdme.ok && /git|workdir/i.test(rdme.readme) ? ok('admin: kit readme preview') : fail(`readme wrong: ${JSON.stringify(rdme)}`);
 
+// 10. commits from the UI (Tim's call: same authority as the terminal,
+// because it shells out to it) — guarded against the browser-only threats.
+const appr = await (await fetch(`${BASE}/api/admin/approve`, {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ package: 'git-protect' }),
+})).json();
+appr.ok ? ok('admin: approve commits from the UI') : fail(`approve failed: ${JSON.stringify(appr)}`);
+sql(`SELECT COUNT(*) FROM grants WHERE package='git-protect' AND state='approved' AND decided_by='ui'`) !== '0'
+  ? ok('admin: ledger trail says decided_by=ui')
+  : fail('no decided_by=ui rows after UI approve');
+const csrf = await fetch(`${BASE}/api/admin/approve`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+  body: JSON.stringify({ package: 'git-protect' }),
+});
+csrf.status === 403 ? ok('admin: hostile-origin mutation refused (CSRF guard)') : fail(`cross-origin approve got ${csrf.status}`);
+// fetch/undici refuses to forge Host; curl doesn't.
+const rebindCode = execFileSync('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}',
+  '-X', 'POST', '-H', 'Host: attacker.example', '-H', 'content-type: application/json',
+  '-d', '{"package":"git-protect"}', `${BASE}/api/admin/approve`], { encoding: 'utf8' });
+rebindCode === '403' ? ok('admin: non-local Host refused (DNS-rebinding guard)') : fail(`rebound host got ${rebindCode}`);
+const models = await (await fetch(`${BASE}/api/admin/models`)).json();
+models.ok && Array.isArray(models.models)
+  ? ok('admin: models endpoint answers gracefully (empty list without a provider)')
+  : fail(`models wrong: ${JSON.stringify(models)}`);
+const kitsHere = await (await fetch(`${BASE}/api/admin/kits`)).json();
+kitsHere.kits.some((k) => k.name === 'core')
+  ? ok('admin: core kit resolvable from <root>/kits (seeded at init)')
+  : fail(`core kit missing: ${JSON.stringify(kitsHere.kits?.map((k) => k.name))}`);
+
 // -- teardown --
 server.kill('SIGKILL');
 daemon.kill('SIGKILL');

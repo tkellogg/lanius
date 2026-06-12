@@ -11,11 +11,14 @@
 // <root>/run/pkg-history/http.json — discovery from harness state, never
 // retained bus messages (docs/security.md entry 11).
 //
-// AUTHORITY: read, converse, and STAGE. Admin endpoints compose pending
-// state (kit add --pending, profile file edits) but never commit grants —
-// approve/revoke stays in the CLI until the identity model lands
-// (HANDOFF phase 5; docs/security.md entries 4-5: staging is workflow,
-// not a boundary, and nothing here claims one).
+// AUTHORITY: the same as your terminal, because it shells out to it.
+// Tim's call (2026-06-12): the earlier commits-stay-in-the-CLI rule
+// claimed a boundary that doesn't exist — every local channel is equally
+// unforgeable-less until the identity model lands (docs/security.md
+// entries 3-5), so refusing an approve button here was theater. What IS
+// different about a browser is hostile-origin traffic (CSRF, DNS
+// rebinding), so every mutating route checks Origin/Host below, and
+// UI-driven decisions carry decided_by=ui in the ledger for the trail.
 //
 //   node server.mjs --root /tmp/elanus-live [--port 7180] [--agent main]
 import fs from 'node:fs';
@@ -136,8 +139,44 @@ function sendJson(res, code, body) {
 }
 
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const PKG_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+// Browser-borne threats are the ones a terminal doesn't have: a hostile
+// webpage POSTing to localhost (CSRF — browsers send these cross-origin
+// even if they can't read the answer) and DNS rebinding (a hostile name
+// resolving here, making its origin "same"). Mutations therefore require:
+// a Host header that is genuinely local, and — when a browser supplies
+// Origin — an Origin that matches it. curl/agents send no Origin and
+// pass: they are local processes, which entry 3 already owns.
+function originOk(req) {
+  const host = req.headers.host ?? '';
+  if (!/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(host)) return false;
+  const origin = req.headers.origin;
+  if (origin == null) return true;
+  try {
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}
 
 async function handleAdmin(url, req, res, body) {
+  if (req.method !== 'GET' && !originOk(req)) {
+    return sendJson(res, 403, { ok: false, error: 'cross-origin request refused (CSRF/DNS-rebinding guard)' });
+  }
+  if (url.pathname === '/api/admin/models' && req.method === 'GET') {
+    const r = await cli(['models', '--json']);
+    // A provider without /v1/models (some compat layers) is a graceful
+    // empty list — the UI keeps its static suggestions.
+    return sendJson(res, 200, r.ok ? { ok: true, models: jsonLines(r.stdout) } : { ok: true, models: [], note: (r.stderr || r.error || '').trim() });
+  }
+  if ((url.pathname === '/api/admin/approve' || url.pathname === '/api/admin/revoke') && req.method === 'POST') {
+    const pkg = body?.package;
+    if (typeof pkg !== 'string' || !PKG_NAME_RE.test(pkg)) return sendJson(res, 400, { ok: false, error: 'need {package}' });
+    const verb = url.pathname.endsWith('approve') ? 'approve' : 'revoke';
+    const r = await cli([verb, pkg, '--by', 'ui']);
+    return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
+  }
   if (url.pathname === '/api/admin/agents' && req.method === 'GET') {
     const r = await cli(['profile', 'list']);
     return sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, profiles: jsonLines(r.stdout) } : { ok: false, error: r.stderr || r.error });
@@ -266,6 +305,10 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (url.pathname === '/api/publish' && req.method === 'POST') {
+    if (!originOk(req)) {
+      res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'cross-origin request refused' }));
+      return;
+    }
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {

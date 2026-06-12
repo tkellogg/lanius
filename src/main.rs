@@ -13,6 +13,7 @@ mod initcmd;
 mod kit;
 mod manifest;
 mod mcp;
+mod models;
 mod packages;
 mod paths;
 mod profile;
@@ -46,9 +47,9 @@ enum Cmd {
         dir: Option<PathBuf>,
         /// Kit(s) to install: packages linked (or --copy vendored) + granted,
         /// profiles copied if missing, README printed. A value containing '/'
-        /// is a path; a bare name resolves against $ELANUS_KIT_PATH
-        /// (colon-separated), then a kits/ dir next to the executable's repo
-        /// (dev builds). Repeatable.
+        /// is a path; a bare name resolves against <root>/kits (seeded with
+        /// the stock kits), ~/.elanus/kits, $ELANUS_KIT_PATH, then the repo
+        /// kits/ (dev builds). Repeatable.
         #[arg(long)]
         kit: Vec<String>,
         /// Vendor kit packages into the root's packages/ instead of linking
@@ -67,6 +68,13 @@ enum Cmd {
     Kit {
         #[command(subcommand)]
         cmd: KitCmd,
+    },
+    /// Ask the configured provider for its model list (GET /v1/models)
+    Models {
+        #[arg(long, default_value = "default")]
+        profile: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Profiles: agent identities (list / get / set / new)
     Profile {
@@ -133,9 +141,18 @@ enum Cmd {
         json: bool,
     },
     /// Approve a package's requested capabilities (prints each one)
-    Approve { name: String },
+    Approve {
+        name: String,
+        /// Identity trail for the ledger's decided_by (e.g. "ui")
+        #[arg(long, default_value = "cli")]
+        by: String,
+    },
     /// Revoke a package's approved capabilities
-    Revoke { name: String },
+    Revoke {
+        name: String,
+        #[arg(long, default_value = "cli")]
+        by: String,
+    },
     /// What's blocked on you?
     Inbox,
     /// Answer an ask by event id
@@ -193,7 +210,8 @@ enum KitCmd {
     /// (or --copy vendored), profiles copied if missing, packages granted
     /// with provenance kit:<name>, README printed
     Add {
-        /// Kit name (resolved via $ELANUS_KIT_PATH, then <repo>/kits) or path
+        /// Kit name (resolved via <root>/kits, ~/.elanus/kits,
+        /// $ELANUS_KIT_PATH, <repo>/kits) or a path
         kit: String,
         /// Vendor packages into the root's packages/ instead of linking
         #[arg(long)]
@@ -455,7 +473,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Kit { cmd } => match cmd {
             KitCmd::Add { kit: kref, copy, pending } => {
-                let dir = kit::resolve(&kref)?;
+                let dir = kit::resolve(&root, &kref)?;
                 let conn = open(&root)?;
                 let mode = if copy { kit::Mode::Copy } else { kit::Mode::Link };
                 let readme = kit::install(&root, &conn, &dir, mode, !pending)?;
@@ -466,7 +484,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             KitCmd::List { json } => {
-                for (name, dir, hook) in kit::list()? {
+                for (name, dir, hook) in kit::list(&root)? {
                     if json {
                         println!("{}", serde_json::json!({ "name": name, "dir": dir, "hook": hook }));
                     } else {
@@ -475,13 +493,14 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             KitCmd::Show { kit: kref } => {
-                print!("{}", kit::show(&kref)?);
+                print!("{}", kit::show(&root, &kref)?);
             }
             KitCmd::Unlink { kit: kref } => {
-                let dir = kit::resolve(&kref)?;
+                let dir = kit::resolve(&root, &kref)?;
                 kit::unlink(&root, &dir)?;
             }
         },
+        Cmd::Models { profile: pname, json } => models::list(&root, &pname, json)?,
         Cmd::Profile { cmd } => match cmd {
             ProfileCmd::List => profilecli::list(&root)?,
             ProfileCmd::Get { name } => profilecli::get(&root, &name)?,
@@ -490,13 +509,13 @@ fn run(cli: Cli) -> Result<()> {
                 profilecli::new(&root, &name, agent.as_deref(), model.as_deref())?
             }
         },
-        Cmd::Approve { name } => {
+        Cmd::Approve { name, by } => {
             let conn = open(&root)?;
-            packages::decide(&root, &conn, &name, true, "cli")?;
+            packages::decide(&root, &conn, &name, true, &by)?;
         }
-        Cmd::Revoke { name } => {
+        Cmd::Revoke { name, by } => {
             let conn = open(&root)?;
-            packages::decide(&root, &conn, &name, false, "cli")?;
+            packages::decide(&root, &conn, &name, false, &by)?;
         }
         Cmd::Inbox => {
             let conn = open(&root)?;

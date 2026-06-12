@@ -225,10 +225,22 @@ async function loadSetup() {
     const card = el('div', 'setup-pending-pkg');
     card.appendChild(el('div', 'setup-kit-name', p.name));
     for (const g of reqs) card.appendChild(el('div', 'setup-grant', `${g.kind}  ${g.value}`));
+    const row = el('div', 'setup-row');
+    const approveBtn = el('button', '', `approve ${p.name}`);
+    approveBtn.onclick = async () => {
+      approveBtn.disabled = true; approveBtn.textContent = 'approving…';
+      const r = await fetch('/api/admin/approve', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ package: p.name }),
+      }).then((x) => x.json()).catch(() => ({ ok: false }));
+      if (r.ok) loadSetup(); else { approveBtn.textContent = 'failed'; }
+    };
+    row.appendChild(approveBtn);
     const cmd = el('code', 'setup-cmd', `elanus approve ${p.name}`);
-    cmd.title = 'click to copy';
+    cmd.title = 'the same gesture from a terminal — click to copy';
     cmd.onclick = () => navigator.clipboard?.writeText(`elanus approve ${p.name}`);
-    card.appendChild(cmd);
+    row.appendChild(cmd);
+    card.appendChild(row);
     pendBox.appendChild(card);
   }
   if (!pendingAny) pendBox.appendChild(el('div', 'dim-note', 'nothing pending — the ledger is at rest'));
@@ -762,6 +774,24 @@ es.onerror = () => {
   c.className = 'conn conn-down';
   $('#conn-text').textContent = 'server lost — retrying';
 };
+
+// Model suggestions from the provider's /v1/models when it has one; the
+// static datalist entries remain as the fallback.
+(async () => {
+  try {
+    const r = await fetch('/api/admin/models');
+    const j = await r.json();
+    if (!j.ok || !(j.models ?? []).length) return;
+    const dl = $('#model-suggestions');
+    dl.textContent = '';
+    for (const m of j.models) {
+      const o = document.createElement('option');
+      o.value = m.id;
+      if (m.display_name) o.label = m.display_name;
+      dl.appendChild(o);
+    }
+  } catch { /* static suggestions stand */ }
+})();
 
 // boot: signals view + disk agents (profiles ARE agents — a silent root
 // still shows its identities) + history probe (re-probed so a later

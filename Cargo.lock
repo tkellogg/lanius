@@ -660,6 +660,7 @@ dependencies = [
  "libc",
  "ntex",
  "ntex-mqtt",
+ "reqwest",
  "rumqttc",
  "rusqlite",
  "serde",
