@@ -1,18 +1,17 @@
 # history — the first reconstruction view (docs/bus.md [DECIDED]: the
 # in-process recorder is the flight recorder; reconstruction views are
 # USERLAND subscribers, never kernel). The ledger and transcripts in sqlite
-# are the truth; this package answers read-only queries about them over the
-# bus. Queries ride the obs plane on purpose — obs/# fans out without
-# touching the ledger, so a UI poking at history never becomes a ledger
-# event itself.
+# are the truth; this package answers read-only queries about them over
+# HTTP on a harness-negotiated loopback port (HANDOFF phase 3 — the old
+# obs/ui/history q/r protocol is retired: result sets, pagination and
+# projection want status codes and bodies, not pub/sub).
 #
-# Protocol: subscribe obs/ui/history/q, answer on obs/ui/history/r/<qid>
-# (qid minted by the requester, echoed back). See SKILL.md for query kinds.
-
-[request]
-subscribe = ["obs/ui/history/q"]
-publish   = ["obs/ui/history/r/#"]
+# process.http registers the "http" grant request: serving transcripts is
+# a capability the human approves (docs/security.md entry 10). Consumers
+# discover the endpoint from run/pkg-history/http.json — harness state,
+# never retained bus messages (entry 11). See SKILL.md for the query DSL.
 
 [process]
 mode = "daemon"
 run  = "scripts/main"
+http = true

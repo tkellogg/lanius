@@ -942,6 +942,32 @@ HARNESS_ROOT="$TMP5" elanus approve linker >/dev/null 2>&1 || fail "approve link
 HARNESS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
 wait_for "re-approved linked handler ran new code" "grep -q ran-v2 '$TMP5/linker.out'"
 
+echo "== 17. history over HTTP: negotiated port, granted serving, query DSL =="
+# The reconstruction view moved off the bus (HANDOFF phase 3): the daemon
+# assigns a loopback port (process.http), records it in run/pkg-history/
+# http.json (discovery from harness state, security.md entry 11), and the
+# package PARKS until the http grant is approved — transcripts are the
+# crown jewels (entry 10). The main root's daemon is still running.
+[ -f "$TMP/packages/history/elanus.toml" ] || cp -R "$REPO/packages/history" "$TMP/packages/"
+wait_for "http port negotiated (run/pkg-history/http.json)" "[ -s '$TMP/run/pkg-history/http.json' ]"
+HPORT=$(python3 -c "import json;print(json.load(open('$TMP/run/pkg-history/http.json'))['port'])")
+# Parked before approval: the port is reserved but nothing serves.
+curl -s -m 2 "http://127.0.0.1:$HPORT/healthz" >/dev/null 2>&1 \
+  && fail "history served before the http grant was approved" \
+  || ok "parked until approved (serving is a capability)"
+elanus approve history >/dev/null 2>&1 || fail "approve history"
+wait_for "history serving after approval (no restart dance)" \
+  "curl -s -m 2 'http://127.0.0.1:$HPORT/healthz' | grep -q '\"ok\": *true'"
+# A real query: sessions exist from the earlier sections.
+curl -s "http://127.0.0.1:$HPORT/query" -d '{"kind":"sessions"}' | grep -q '"sessions"' \
+  && ok "sessions query answers" || fail "sessions query failed"
+# The DSL: filter x projection x pagination, interpreted (never SQL).
+curl -s "http://127.0.0.1:$HPORT/query" \
+  -d '{"kind":"search","filter":{"roles":["user"]},"page":{"limit":2}}' \
+  | grep -q '"role": *"user"' && ok "search DSL: role filter" || fail "search DSL failed"
+curl -s "http://127.0.0.1:$HPORT/query" -d '{"kind":"search","filter":{"roles":["nope"]}}' \
+  | grep -q '"ok": *false' && ok "bad DSL rejected, not executed" || fail "bad DSL not rejected"
+
 echo
 if [ "$FAILS" -eq 0 ]; then
   echo "ALL PASS (root: $TMP)"

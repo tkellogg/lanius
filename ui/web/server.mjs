@@ -6,10 +6,10 @@
 // messages relayed over SSE, publishes accepted over POST. No sqlite, no
 // trace.jsonl, no privileged access; the only filesystem touches are this
 // directory's static files and <root>/bus.toml for broker discovery.
-// History reads stay on the bus too: GET /api/history is brokered as a
-// query/response pair over obs/ui/history/{q,r/<qid>} answered by the
-// userland `history` package (docs/bus.md: reconstruction views are
-// userland; the obs plane never ledgers).
+// History reads proxy to the userland `history` package's HTTP endpoint
+// (HANDOFF phase 3): the daemon assigns it a loopback port, recorded in
+// <root>/run/pkg-history/http.json — discovery from harness state, never
+// retained bus messages (docs/security.md entry 11).
 //
 // AUTHORITY: read-and-converse only. No approve/revoke/kill endpoints —
 // admin stays in the CLI until the identity model lands (docs/bus.md §7).
@@ -61,63 +61,52 @@ client.on('message', (topic, payload) => {
   } catch {
     env = { payload: payload.toString('utf8') };
   }
-  // History RPC traffic is brokered, not relayed: obs/ui/history/# would
-  // spam the rail with the explorer's own page loads (and transcript pages
-  // can be large). It still rides plain MQTT — just answered here.
-  if (topic.startsWith(HIST_R_PREFIX)) {
-    resolveHistory(topic.slice(HIST_R_PREFIX.length), env);
-    return;
-  }
-  if (topic === HIST_Q_TOPIC) return;
   const msg = { kind: 'message', seq: ++seq, topic, env };
   ring.push(msg);
   if (ring.length > RING_CAP) ring.shift();
   broadcast(msg);
 });
 
-// ---- history view brokering ------------------------------------------------
-// GET /api/history?kind=... → publish a query on obs/ui/history/q, await the
-// matching obs/ui/history/r/<qid> from the userland history package. The obs
-// plane fans out without ledgering, so UI reads never become ledger events.
-const HIST_Q_TOPIC = 'obs/ui/history/q';
-const HIST_R_PREFIX = 'obs/ui/history/r/';
-const HIST_TIMEOUT_MS = 5000;
-const HIST_KINDS = new Set(['agents', 'sessions', 'transcript', 'conversation']);
-const pendingHistory = new Map(); // qid -> {res, timer}
+// ---- history view proxy -----------------------------------------------------
+// /api/history → POST <history endpoint>/query. The endpoint is re-read per
+// request from run/pkg-history/http.json (cheap, and it heals across actor
+// restarts). GET maps query params onto the flat kinds; POST passes the
+// query DSL body through verbatim (kind "search": filter x select x page).
+const HIST_KINDS = new Set(['agents', 'sessions', 'transcript', 'conversation', 'search']);
+const ROOT = args.root ?? process.env.HARNESS_ROOT ?? null;
 
-function resolveHistory(qid, env) {
-  const p = pendingHistory.get(qid);
-  if (!p) return;
-  pendingHistory.delete(qid);
-  clearTimeout(p.timer);
-  // bus sub/pub of raw JSON: the response body IS the parsed payload, but
-  // tolerate an envelope wrapper ({payload: {...}}) just in case.
-  const body = env && env.qid === undefined && env.payload && env.payload.qid !== undefined ? env.payload : env;
-  p.res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body ?? { ok: false, error: 'empty response' }));
+function historyEndpoint() {
+  if (!ROOT) return null;
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(ROOT, 'run', 'pkg-history', 'http.json'), 'utf8'));
+    return j.port ? `http://127.0.0.1:${j.port}` : null;
+  } catch {
+    return null;
+  }
 }
 
-function handleHistory(url, res) {
-  const kind = url.searchParams.get('kind');
-  if (!HIST_KINDS.has(kind)) {
+async function handleHistory(query, res) {
+  if (!HIST_KINDS.has(query?.kind)) {
     res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: `kind must be one of ${[...HIST_KINDS].join('|')}` }));
     return;
   }
-  const q = { kind, qid: `q-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` };
-  for (const k of ['agent', 'session', 'correlation', 'limit', 'before_id']) {
-    const v = url.searchParams.get(k);
-    if (v != null) q[k] = v;
+  const base = historyEndpoint();
+  if (!base) {
+    res.writeHead(503, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'history view unavailable — is the history package running and approved? (no run/pkg-history/http.json)' }));
+    return;
   }
-  const timer = setTimeout(() => {
-    pendingHistory.delete(q.qid);
-    res.writeHead(504, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'history view timed out — is the history package installed and approved?' }));
-  }, HIST_TIMEOUT_MS);
-  pendingHistory.set(q.qid, { res, timer });
-  client.publish(HIST_Q_TOPIC, JSON.stringify(q), { qos: 0 }, (err) => {
-    if (err && pendingHistory.delete(q.qid)) {
-      clearTimeout(timer);
-      res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: String(err.message ?? err) }));
-    }
-  });
+  try {
+    const r = await fetch(`${base}/query`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(query),
+      signal: AbortSignal.timeout(5000),
+    });
+    const body = await r.text();
+    res.writeHead(r.status, { 'content-type': 'application/json' }).end(body);
+  } catch (err) {
+    res.writeHead(503, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: `history view unreachable: ${String(err.message ?? err)} — approve the history package if it is parked` }));
+  }
 }
 
 function broadcast(obj) {
@@ -143,8 +132,25 @@ const server = http.createServer((req, res) => {
     req.on('close', () => sseClients.delete(res));
     return;
   }
+  if (url.pathname === '/api/history' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      try {
+        handleHistory(JSON.parse(body), res);
+      } catch {
+        res.writeHead(400).end('bad json');
+      }
+    });
+    return;
+  }
   if (url.pathname === '/api/history') {
-    handleHistory(url, res);
+    const q = { kind: url.searchParams.get('kind') };
+    for (const k of ['agent', 'session', 'correlation', 'limit', 'before_id']) {
+      const v = url.searchParams.get(k);
+      if (v != null) q[k] = v;
+    }
+    handleHistory(q, res);
     return;
   }
   if (url.pathname === '/api/publish' && req.method === 'POST') {

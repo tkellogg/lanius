@@ -72,6 +72,15 @@ pub struct ProcessDecl {
     /// daemon only: forwarded to its bus session when it connects.
     #[serde(default = "default_session_expiry")]
     pub session_expiry_s: u64,
+    /// daemon only: ask for a harness-negotiated loopback HTTP port. The
+    /// dispatcher assigns one per spawn (ELANUS_HTTP_PORT, plus
+    /// run/pkg-<name>/http.json for consumers — discovery from harness
+    /// state, never retained bus messages: docs/security.md entry 11).
+    /// Declaring it registers a grant request (kind "http"): serving is a
+    /// capability the human approves (entry 10 — transcripts are the crown
+    /// jewels), and packages park until it lands.
+    #[serde(default)]
+    pub http: bool,
 }
 
 fn default_restart() -> String {

@@ -2,8 +2,8 @@
 // client, a plain HTTP client as the browser. Proves: SSE relay (bus → page),
 // publish endpoint (page → bus → ledger, correlation intact), ring catch-up,
 // and the history view in BOTH states — absent (live-only degradation: /api/
-// history → 504) and installed+approved (agents/sessions/transcript/
-// conversation queries answered end to end over obs/ui/history/{q,r/<qid>}).
+// history → 503, no endpoint file) and installed+approved (queries proxied
+// end to end to the package's harness-negotiated HTTP endpoint).
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -115,12 +115,13 @@ const lateText = await new Promise(async (resolve) => {
 lateText.includes('web-smoke') ? ok('late joiner got ring catch-up') : fail('no catch-up for late joiner');
 
 // 6. history view ABSENT: the explorer degrades to live-only, never breaks.
-// /api/history must answer with an honest 504 (the UI turns this into the
-// "history package not running — live view only" hint), not a hang or a 500.
+// /api/history must answer with an honest 503 (no run/pkg-history/http.json
+// yet — the UI turns this into the "history package not running — live view
+// only" hint), not a hang or a 500.
 const noHist = await fetch(`${BASE}/api/history?kind=agents`);
 const noHistJ = await noHist.json().catch(() => null);
-noHist.status === 504 && noHistJ?.ok === false
-  ? ok('history absent → 504 live-only degradation')
+noHist.status === 503 && noHistJ?.ok === false
+  ? ok('history absent → 503 live-only degradation')
   : fail(`history absent gave ${noHist.status} ${JSON.stringify(noHistJ)}`);
 const badKind = await fetch(`${BASE}/api/history?kind=drop_tables`);
 badKind.status === 400 ? ok('unknown history kind rejected (400)') : fail(`bad kind got ${badKind.status}`);
@@ -146,7 +147,7 @@ const hist = async (params) => {
 // the supervisor boots the actor on its next tick (with backoff if it raced
 // the approval), so the first probe retries until the view answers
 let agentsResp = null;
-await waitFor('history actor answering on the bus', async () => {
+await waitFor('history actor serving its negotiated endpoint', async () => {
   const { status, body } = await hist({ kind: 'agents' });
   if (status === 200 && body?.ok) { agentsResp = body; return true; }
   return false;
@@ -187,9 +188,21 @@ if (agentsResp) {
     : fail(`conversation wrong: ${JSON.stringify(conv.body)}`);
 
   const err = await hist({ kind: 'transcript' }); // missing {session}
-  err.status === 200 && err.body?.ok === false && /session/.test(err.body.error ?? '')
-    ? ok('view reports per-query errors on the response topic')
+  err.status === 400 && err.body?.ok === false && /session/.test(err.body.error ?? '')
+    ? ok('view reports per-query errors as real 400s')
     : fail(`error path wrong: ${err.status} ${JSON.stringify(err.body)}`);
+
+  // the search DSL over POST: filter x projection (truncate) x pagination
+  const search = await fetch(`${BASE}/api/history`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ kind: 'search', filter: { roles: ['tool'] }, select: { tool_results: { truncate: 1 } } }),
+  });
+  const sj = await search.json().catch(() => null);
+  const hit = (sj?.messages ?? []).find((m) => m.session === 's-hist-test');
+  search.status === 200 && hit && hit.content?.content === 'o…' && hit.content?.truncated_to === 1
+    ? ok('search DSL: role filter + tool_result truncation projection')
+    : fail(`search DSL wrong: ${search.status} ${JSON.stringify(sj)}`);
 }
 
 // -- teardown --

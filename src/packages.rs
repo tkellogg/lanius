@@ -127,6 +127,14 @@ pub fn sync(root: &Root, conn: &Connection) -> Result<()> {
             // riding the 'blocking' kind.
             .chain(m.stage.iter().map(|s| ("stage", &s.name)))
             .collect();
+        // process.http = true is likewise a request: serving an HTTP
+        // endpoint (loopback, harness-negotiated port) is a capability the
+        // human approves (docs/security.md entry 10).
+        let http_serve = "serve".to_string();
+        let mut requests = requests;
+        if m.process.as_ref().is_some_and(|p| p.http) {
+            requests.push(("http", &http_serve));
+        }
         for (kind, value) in requests {
             if matches!(kind, "subscribe" | "publish") && !crate::topic::valid_filter(value) {
                 eprintln!("[packages] {}: invalid {kind} filter {value:?}, skipped", pkg.name);

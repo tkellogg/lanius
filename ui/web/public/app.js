@@ -1,6 +1,6 @@
 // elanus web — agent explorer. Everything live arrived over plain MQTT
-// (relayed via SSE); everything historical came from the userland `history`
-// package over the bus (brokered by the server as GET /api/history).
+// (relayed via SSE); everything historical comes from the userland `history`
+// package's HTTP endpoint (proxied by the server as GET /api/history).
 // AUTHORITY: read-and-converse only — no approve/revoke/kill here.
 'use strict';
 
@@ -388,7 +388,7 @@ async function history(params) {
   try {
     const r = await fetch(`/api/history?${new URLSearchParams(params)}`);
     const j = await r.json().catch(() => null);
-    if (r.status === 504) { setHistoryOk(false); return null; }
+    if (r.status === 503 || r.status === 504) { setHistoryOk(false); return null; }
     if (!r.ok || !j?.ok) return j ?? null;
     setHistoryOk(true);
     return j;

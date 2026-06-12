@@ -61,17 +61,19 @@ elanus approve history          # the daemon supervises it from there
 
 History is **not** a server privilege — it's a userland reconstruction view
 (docs/bus.md: the recorder is a WAL; views that rebuild reality are ordinary
-subscribers). `GET /api/history?kind=…` makes the server publish a query on
-`obs/ui/history/q` and await the matching `obs/ui/history/r/<qid>` from
-`packages/history`, which reads the sqlite truth strictly read-only. Queries
-ride the obs plane on purpose: **a UI poking at history never becomes a
-ledger event**. Kinds: `agents`, `sessions` (`agent`), `transcript`
-(`session`, `limit`, `before_id`), `conversation` (`correlation`). The
-history RPC topics are answered by the server, not relayed to the rail — the
-explorer's own page loads shouldn't narrate themselves into telemetry.
+subscribers). `/api/history` proxies to `packages/history`'s HTTP endpoint
+on a harness-negotiated loopback port, discovered from
+`<root>/run/pkg-history/http.json` (harness state, never retained bus
+messages — docs/security.md entry 11); the package reads the sqlite truth
+strictly read-only and serving is a granted capability (`elanus approve
+history`). `GET /api/history?kind=…` maps query params onto the flat kinds
+(`agents`, `sessions`, `transcript`, `conversation`); `POST /api/history`
+passes the query DSL through verbatim (kind `search`: filter × projection ×
+pagination — see packages/history/SKILL.md). UI reads never become ledger
+events: nothing here touches the bus at all.
 
-**Graceful degradation**: if the history package isn't installed or approved,
-`/api/history` answers 504 after 5s and the explorer shows a dim
+**Graceful degradation**: if the history package isn't running or approved,
+`/api/history` answers 503 and the explorer shows a dim
 "history package not running — live view only" hint instead of breaking;
 converse and telemetry keep working from live traffic. The probe re-runs, so
 approving the package later heals the page without a reload.
@@ -81,7 +83,8 @@ approving the package later heals the page without a reload.
 `npm test` — real daemon on a throwaway root, the server as its MQTT client,
 a plain HTTP client as the browser: SSE relay, ask + answer round trip into
 the ledger with correlation intact, wildcard-publish rejection, ring
-catch-up — then the history view in **both states**: absent (504 live-only
+catch-up — then the history view in **both states**: absent (503 live-only
 degradation, bad-kind rejection) and installed+approved (agents/sessions/
-transcript/pagination/conversation end to end against a seeded transcript).
+transcript/pagination/conversation/search-DSL end to end against a seeded
+transcript).
 Not part of tests/e2e.sh (the repo gate stays node-free).

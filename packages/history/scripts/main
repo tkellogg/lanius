@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""history — reconstruction-view daemon: read-only history queries over the bus.
+"""history — reconstruction-view daemon: read-only history queries over HTTP.
 
 Doctrine (docs/bus.md, [DECIDED] flight recorder vs reconstruction views):
 the ledger and transcripts in sqlite are the truth; views that rebuild
@@ -7,38 +7,47 @@ reality from them are userland subscribers. This is the first one. It holds
 NO state of its own — every query is answered by a fresh read-only sqlite
 connection, so the answer is exactly as good as the ledger at that instant.
 
-Protocol (request/response over the obs plane — fan-out only, never ledger):
+Transport (2026-06-12, HANDOFF phase 3): HTTP on the harness-negotiated
+loopback port (ELANUS_HTTP_PORT; consumers discover it from
+run/pkg-history/http.json — harness state, never retained bus messages).
+The old obs/ui/history q/r protocol is retired: result sets, pagination and
+projection want status codes and bodies, not pub/sub. Serving is a granted
+capability (kind "http" in the ledger): transcripts are the crown jewels
+(docs/security.md entry 10), so this parks until `elanus approve history`.
 
-  query    -> obs/ui/history/q      {"kind": ..., "qid": "<requester-minted>", ...}
-  response -> obs/ui/history/r/<qid>  {"qid": ..., "ok": true, ...} | {"qid":..., "ok": false, "error": ...}
+  POST /query   one JSON body, dispatched on "kind":
+    agents                          -> {"agents":[{"agent","sessions":[...]}], "orphan_sessions":[...]}
+    sessions     {agent?}           -> {"sessions":[{"session","first_ts","last_ts","message_count","event_count"}]}
+    transcript   {session, limit?, before_id?}
+                                    -> {"session","messages":[...],"has_more"}
+    conversation {correlation}      -> {"correlation","events":[...],"truncated"}
+    search       {filter?, select?, page?}   the query DSL (filter x
+                 projection x pagination over transcript messages):
+      filter:  {channels: ["in/agent/main", ...],   event-type prefixes
+                involvement: "agent"|"all",         (default all)
+                roles: ["user","assistant","tool"],
+                text: "substring"}                  matched in content
+      select:  {tool_calls: true|false,             drop assistant tool_calls
+                tool_results: true|{"truncate": N}|false}
+      page:    {limit: 100, cursor: "<opaque>"}     cursor = last seen id
+  GET /healthz  -> {"ok": true}
 
-Query kinds:
-  agents                          -> {"agents":[{"agent","sessions":[...]}], "orphan_sessions":[...]}
-  sessions     {agent?}           -> {"sessions":[{"session","first_ts","last_ts","message_count","event_count"}]}
-  transcript   {session, limit?, before_id?}
-                                  -> {"session","messages":[{"id","role","content","event_id","created_at"}],"has_more"}
-  conversation {correlation}      -> {"correlation","events":[{"id","type","cause_id","state","payload","created_at"}],"truncated"}
-
-Bus access rides the `elanus bus` CLI as subprocesses (the linemux/discord
-pattern); the CLI authenticates from the supervisor-injected env, so this
-script holds no bus credentials. Crash-only: a dead subscription or a failed
-response publish exits nonzero and the supervisor restarts us with backoff.
+The DSL is INTERPRETED — parameters bind, nothing concatenates into SQL
+(entry 10). Crash-only: any fault exits nonzero and the supervisor restarts
+us with backoff.
 """
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 DB = os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("HARNESS_ROOT", "."), "harness.db")
-Q_TOPIC = "obs/ui/history/q"
-R_PREFIX = "obs/ui/history/r/"
-
-PAGE_DEFAULT = 80      # transcript page size if the requester doesn't say
-PAGE_MAX = 200         # hard cap — responses are single MQTT publishes
-CONTENT_CAP = 16 * 1024  # per-message content cap; bigger gets a preview stub
-CONV_CAP = 500         # conversation event cap
+PAGE_DEFAULT = 80
+PAGE_MAX = 200
+CONTENT_CAP = 16 * 1024
+CONV_CAP = 500
 
 
 def log(msg):
@@ -55,7 +64,7 @@ def ro():
 
 def capped_json(text):
     """Parse stored JSON; oversized content becomes an honest stub instead of
-    an oversized publish that the broker (or a browser tab) chokes on."""
+    an oversized response body nobody asked for."""
     if text is None:
         return None
     if len(text) > CONTENT_CAP:
@@ -67,7 +76,6 @@ def capped_json(text):
 
 
 def agent_of(event_type):
-    """in/agent/<noun>[/<conversation>...] -> noun, else None."""
     seg = (event_type or "").split("/")
     return seg[2] if len(seg) >= 3 and seg[0] == "in" and seg[1] == "agent" else None
 
@@ -128,11 +136,11 @@ def q_transcript(c, q):
         sql += " AND id < ?"
         params.append(int(before))
     sql += " ORDER BY id DESC LIMIT ?"
-    params.append(limit + 1)  # one extra row = honest has_more
+    params.append(limit + 1)
     rows = list(c.execute(sql, params))
     has_more = len(rows) > limit
     rows = rows[:limit]
-    rows.reverse()  # chronological for the reader
+    rows.reverse()
     return {
         "session": session,
         "messages": [
@@ -166,62 +174,143 @@ def q_conversation(c, q):
     }
 
 
-KINDS = {"agents": q_agents, "sessions": q_sessions,
-         "transcript": q_transcript, "conversation": q_conversation}
+def q_search(c, q):
+    """The DSL: filter x projection x pagination over transcript messages.
+    Every value BINDS as a parameter; the only SQL assembled is fixed
+    clause text chosen by key presence — nothing user-supplied is code."""
+    f = q.get("filter") or {}
+    sel = q.get("select") or {}
+    page = q.get("page") or {}
+
+    where = ["1=1"]
+    params = []
+    channels = f.get("channels") or []
+    if channels:
+        if not isinstance(channels, list) or len(channels) > 20:
+            raise ValueError("filter.channels: a list of up to 20 type prefixes")
+        ors = []
+        for ch in channels:
+            ors.append("(e.type = ? OR e.type LIKE ? || '/%')")
+            params.extend([str(ch), str(ch)])
+        where.append("(" + " OR ".join(ors) + ")")
+    if f.get("involvement") == "agent":
+        where.append("e.type LIKE 'in/agent/%'")
+    roles = f.get("roles") or []
+    if roles:
+        if not isinstance(roles, list) or any(r not in ("user", "assistant", "tool") for r in roles):
+            raise ValueError("filter.roles: subset of user|assistant|tool")
+        where.append("m.role IN (%s)" % ",".join("?" * len(roles)))
+        params.extend(roles)
+    text = f.get("text")
+    if text:
+        where.append("m.content LIKE '%' || ? || '%' ESCAPE '\\'")
+        params.append(str(text).replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_"))
+
+    limit = max(1, min(int(page.get("limit") or PAGE_DEFAULT), PAGE_MAX))
+    cursor = page.get("cursor")
+    if cursor:
+        where.append("m.id < ?")
+        params.append(int(cursor))
+
+    sql = (
+        "SELECT m.id, m.session_id, m.role, m.content, m.event_id, m.created_at, e.type AS event_type"
+        " FROM messages m LEFT JOIN events e ON m.event_id = e.id"
+        " WHERE " + " AND ".join(where) + " ORDER BY m.id DESC LIMIT ?"
+    )
+    params.append(limit + 1)
+    rows = list(c.execute(sql, params))
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    want_tool_calls = sel.get("tool_calls", True)
+    tr = sel.get("tool_results", True)
+    out = []
+    for r in rows:
+        content = capped_json(r["content"])
+        if isinstance(content, dict):
+            if r["role"] == "assistant" and not want_tool_calls:
+                content = {k: v for k, v in content.items() if k != "tool_calls"}
+            if r["role"] == "tool":
+                if tr is False:
+                    continue  # projected out entirely
+                if isinstance(tr, dict) and isinstance(tr.get("truncate"), int):
+                    n = max(0, tr["truncate"])
+                    inner = content.get("content")
+                    if isinstance(inner, str) and len(inner) > n:
+                        content["content"] = inner[:n] + "…"
+                        content["truncated_to"] = n
+        out.append({
+            "id": r["id"], "session": r["session_id"], "role": r["role"],
+            "event_id": r["event_id"], "event_type": r["event_type"],
+            "created_at": r["created_at"], "content": content,
+        })
+    return {
+        "messages": out,
+        "has_more": has_more,
+        "cursor": rows[-1]["id"] if has_more and rows else None,
+    }
+
+
+KINDS = {"agents": q_agents, "sessions": q_sessions, "transcript": q_transcript,
+         "conversation": q_conversation, "search": q_search}
 
 
 # ---- wire -------------------------------------------------------------------
 
-def valid_qid(qid):
-    """qid becomes one topic segment of the response topic; reject anything
-    that could change the topic shape or smuggle a wildcard."""
-    return (isinstance(qid, str) and 0 < len(qid) <= 128
-            and not any(ch in qid for ch in "/+#\x00") and qid.isprintable())
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body):
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            self._send(200, {"ok": True, "kinds": sorted(KINDS)})
+        else:
+            self._send(404, {"ok": False, "error": "POST /query or GET /healthz"})
+
+    def do_POST(self):
+        if self.path != "/query":
+            self._send(404, {"ok": False, "error": "POST /query"})
+            return
+        try:
+            n = int(self.headers.get("content-length", 0))
+            q = json.loads(self.rfile.read(n).decode())
+            if not isinstance(q, dict):
+                raise ValueError("body must be a JSON object")
+        except ValueError as e:
+            self._send(400, {"ok": False, "error": f"bad request body: {e}"})
+            return
+        fn = KINDS.get(q.get("kind"))
+        if fn is None:
+            self._send(400, {"ok": False, "error": f"unknown kind {q.get('kind')!r}", "kinds": sorted(KINDS)})
+            return
+        try:
+            with ro() as c:
+                body = fn(c, q)
+            body.update(ok=True, kind=q["kind"])
+            self._send(200, body)
+        except (ValueError, OverflowError, TypeError) as e:  # the requester's problem
+            self._send(400, {"ok": False, "kind": q.get("kind"), "error": str(e)})
+        except sqlite3.Error as e:
+            self._send(500, {"ok": False, "kind": q.get("kind"), "error": str(e)})
+
+    def log_message(self, *a):  # obs-quiet; faults go to stderr explicitly
+        pass
 
 
-def respond(qid, body):
-    body["qid"] = qid
-    # QoS 1: PUBACK means the broker took it; obs/# still never ledgers.
-    subprocess.run(
-        ["elanus", "bus", "pub", R_PREFIX + qid, json.dumps(body), "--qos", "1"],
-        check=True, timeout=30,
-    )
-
-
-def handle(query):
-    qid = query.get("qid")
-    if not valid_qid(qid):
-        log(f"[history] dropping query with bad qid: {query.get('qid')!r}")
-        return  # no valid response topic exists; nothing to answer on
-    kind = query.get("kind")
-    fn = KINDS.get(kind)
-    if fn is None:
-        respond(qid, {"ok": False, "error": f"unknown kind {kind!r}", "kinds": sorted(KINDS)})
-        return
-    try:
-        with ro() as c:
-            body = fn(c, query)
-        body["ok"] = True
-        body["kind"] = kind
-        respond(qid, body)
-    except subprocess.SubprocessError:
-        raise  # bus trouble is crash-only, not a per-query error
-    except Exception as e:  # bad args, sqlite hiccups: the requester's problem
-        respond(qid, {"ok": False, "kind": kind, "error": str(e)})
-
-
-def sub_grant_approved():
-    """The broker checks subscribe grants at SUBACK time but the CLI cannot
-    see a denied SUBACK — a too-early subscribe would hang silently holding
-    nothing. So park until the grant is visibly approved (ledger reads are
-    open by design); `elanus approve history` flips this without a restart
-    dance."""
+def http_grant_approved():
+    """Serving is a capability (grants kind 'http'); park until approved —
+    `elanus approve history` flips this without a restart dance."""
     try:
         with ro() as c:
             row = c.execute(
-                "SELECT state FROM grants WHERE package = ? AND kind = 'subscribe' AND value = ?"
+                "SELECT state FROM grants WHERE package = ? AND kind = 'http'"
                 " ORDER BY id DESC LIMIT 1",
-                (os.environ.get("ELANUS_PACKAGE", "history"), Q_TOPIC),
+                (os.environ.get("ELANUS_PACKAGE", "history"),),
             ).fetchone()
         return row is not None and row["state"] == "approved"
     except sqlite3.Error:
@@ -230,34 +319,21 @@ def sub_grant_approved():
 
 def main():
     if not os.path.exists(DB):
-        log(f"[history] no ledger at {DB}; parking is wrong here — the path is "
-            "supervisor-given, so a missing db is a real fault")
+        log(f"[history] no ledger at {DB}; the path is supervisor-given, so a missing db is a real fault")
+        sys.exit(1)
+    port = os.environ.get("ELANUS_HTTP_PORT")
+    if not port:
+        log("[history] no ELANUS_HTTP_PORT (needs a daemon with process.http support); exiting")
         sys.exit(1)
     waited = False
-    while not sub_grant_approved():
+    while not http_grant_approved():
         if not waited:
-            log(f"[history] subscribe grant on {Q_TOPIC} not approved yet; "
-                "parking until `elanus approve history` (this is not an error)")
+            log("[history] http grant not approved yet; parking until `elanus approve history` (this is not an error)")
             waited = True
         time.sleep(2)
-    proc = subprocess.Popen(["elanus", "bus", "sub", Q_TOPIC], stdout=subprocess.PIPE, text=True)
-    log(f"[history] serving {Q_TOPIC} -> {R_PREFIX}<qid> (db {DB}, read-only)")
-    for line in proc.stdout:
-        try:
-            query = json.loads(line).get("payload") or {}
-            # the broker fans obs publishes out inside a trace envelope
-            # ({"kind": <topic>, "payload": <published JSON>, "ts": ...});
-            # the query is the inner payload. A bare query (no envelope)
-            # also works — it carries its own qid.
-            if isinstance(query, dict) and "qid" not in query and isinstance(query.get("payload"), dict):
-                query = query["payload"]
-            if not isinstance(query, dict):
-                continue
-        except ValueError:
-            continue
-        handle(query)
-    log("[history] bus subscription died -> exiting for restart")
-    sys.exit(1)
+    srv = HTTPServer(("127.0.0.1", int(port)), Handler)
+    log(f"[history] serving http://127.0.0.1:{port} (db {DB}, read-only)")
+    srv.serve_forever()
 
 
 if __name__ == "__main__":

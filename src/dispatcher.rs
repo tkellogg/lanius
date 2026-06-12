@@ -257,6 +257,28 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
         let addr = crate::bus::connect_addr(&bus_cfg)
             .map(|a| a.to_string())
             .unwrap_or_default();
+        // Harness-negotiated HTTP port (manifest.rs ProcessDecl.http): bind
+        // 127.0.0.1:0 to pick a free port, record it in the run dir — the
+        // discovery channel is harness state, never a retained bus message
+        // (docs/security.md entry 11). The bind is dropped before spawn (the
+        // package binds it itself); the tiny race is the standard one.
+        let http_port: Option<u16> = if proc_.http {
+            match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => l.local_addr().ok().map(|a| a.port()),
+                Err(e) => {
+                    eprintln!("[daemon] {}: http port alloc failed: {e}", pkg.name);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(p) = http_port {
+            std::fs::write(
+                scratch.join("http.json"),
+                json!({ "port": p, "package": pkg.name, "bind": "127.0.0.1" }).to_string(),
+            )?;
+        }
         let out = std::fs::File::create(scratch.join("stdout.log"))?;
         let err = std::fs::File::create(scratch.join("stderr.log"))?;
         let mut cmd = cage.command(&script);
@@ -274,6 +296,7 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
             .env("ELANUS_BUS_ADDR", &addr)
             .env("ELANUS_BUS_TOKEN", &token)
             .env("ELANUS_SESSION_EXPIRY_S", proc_.session_expiry_s.to_string())
+            .env("ELANUS_HTTP_PORT", http_port.map(|p| p.to_string()).unwrap_or_default())
             .env(
                 "PATH",
                 format!("{}:{}", exe_dir.display(), std::env::var("PATH").unwrap_or_default()),
