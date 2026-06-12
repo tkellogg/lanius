@@ -350,7 +350,14 @@ fn run_system(
         match built {
             Ok(b) => {
                 let _ = ready_tx.send(Ok(()));
-                b.workers(1).run();
+                // disable_signals: ntex otherwise installs its own SIGINT/
+                // SIGTERM handlers, which gracefully stop the MQTT server and
+                // CONSUME the signal — leaving the daemon loop alive and
+                // Ctrl+C apparently dead. We want the process default:
+                // SIGINT kills the daemon. Crash-only is the design; there
+                // is nothing to flush (WAL ledger, O_APPEND trace, retained
+                // wills fire for connected clients on the dead socket).
+                b.workers(1).disable_signals().run();
             }
             Err(e) => {
                 let _ = ready_tx.send(Err(e.into()));
