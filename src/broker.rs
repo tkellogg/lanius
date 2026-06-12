@@ -689,6 +689,16 @@ async fn inbound(
         }
     }
     let text = String::from_utf8_lossy(&payload).into_owned();
+    // Stage RPC (docs/context.md, resident stages): request/response ride
+    // plain topics — fanned out so the serving daemon's `bus sub` receives
+    // them, NEVER written to disk (a context document is megabytes; the
+    // per-stage obs delta is the recorded artifact). The actor publish ACL
+    // above already ran: a package answers only with an approved publish
+    // grant on stageresp/#; the kernel's consult publishes anonymously.
+    if topic.starts_with("obs/harness/stagereq/") || topic.starts_with("obs/harness/stageresp/") {
+        fan_out(&st, &topic, &text);
+        return Ok(publish.ack());
+    }
     // Hook requests: the broker is the chain coordinator. The PUBACK below
     // means "request accepted"; the verdict rides the Response Topic. The
     // raw request also fans out to any plain subscribers (observation

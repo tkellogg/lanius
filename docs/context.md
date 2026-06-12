@@ -16,7 +16,7 @@ content; the kernel guarantees the wire.**
                 {"role": "tool", "tool_call_id": "...", "name": "...", "content": "..."} ],
   "event":    { "topic": "in/agent/main", "payload": {}, "correlation_id": null },
   "meta":     { "profile": "default", "agent": "main", "session": "s1",
-                "turn": 1, "model": "..." } }
+                "turn": 1, "model": "...", "vars": {} } }
 ```
 
 - `system` is an ordered list of named blocks; the final system prompt is
@@ -26,6 +26,9 @@ content; the kernel guarantees the wire.**
   sqlite), not the provider wire shape — stages transform dialogue, the
   kernel owns the conversion to the provider protocol afterward.
 - `event` is the dispatching event, null fields for CLI-direct runs.
+- `meta.vars` is the profile's `[vars]` — the config channel for stages: a
+  stage that wants a knob documents a var (e.g. `window_rows` for the stock
+  window stage); the human sets it per profile.
 
 ## [DECIDED] Seed and chain, per LLM call
 
@@ -62,9 +65,26 @@ mode  = "exec"             # "exec" | "resident"
 
 - `mode = "exec"`: spawned per call; document JSON on stdin, transformed
   document JSON on stdout; 10s budget.
-- `mode = "resident"`: the package's daemon actor is consulted over the
-  resident MQTT request/response seam — for stages with state (db handles,
-  caches). NOT MCP: MCP is a border protocol for third-party tool servers.
+- `mode = "resident"` (BUILT 2026-06-12): the package's daemon actor is
+  consulted over the bus — for stages with state (db handles, caches).
+  NOT MCP: MCP is a border protocol for third-party tool servers.
+  As-built wire (deviation from the hook seam, deliberate): response topic
+  and correlation ride IN THE BODY, not MQTT §4.10 properties — the broker
+  is not the coordinator here, and the serving daemon is a plain
+  `elanus bus sub | transform | elanus bus pub` pipeline the CLI supports
+  with no property plumbing.
+    request   obs/harness/stagereq/<package>/<stage>
+              {"doc": ..., "response_topic": ..., "correlation": ...}
+    response  <response_topic>
+              {"correlation": ..., "doc": ...} | {"correlation": ..., "error": ...}
+  Both prefixes are fan-out-only and never recorded (broker carve-out: a
+  document is megabytes; the per-stage obs delta is the record). The
+  consult FAILS CLOSED — connect failure, timeout (15s), daemon absent,
+  error response: the run fails, stage-attributed (opposite of resident
+  hooks, which allow when the radio dies — a stage composes meaning).
+  The manifest must request subscribe on its stagereq topic and publish on
+  obs/harness/stageresp/# — explicit grants, legible in review.
+  packages/recent-history is the exemplar (warm read-only sqlite + cache).
 - Stage scripts are covered by the manifest `code_hash`; each `[[stage]]`
   also registers a grant request (`kind = "stage"`), so a stage runs only
   approved, and an edit re-enters review like any process or hook.

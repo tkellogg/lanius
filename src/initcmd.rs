@@ -28,7 +28,9 @@ const PKG_FILES: &[PkgFile] = &[
     // Ships pending, NOT auto-approved below: an approved stage shapes every
     // prompt; activating it is the human's call (elanus approve recent-history).
     PkgFile { rel: "recent-history/elanus.toml", content: include_str!("../packages/recent-history/elanus.toml"), exec: false },
-    PkgFile { rel: "recent-history/scripts/stage", content: include_str!("../packages/recent-history/scripts/stage"), exec: true },
+    PkgFile { rel: "recent-history/scripts/main", content: include_str!("../packages/recent-history/scripts/main"), exec: true },
+    PkgFile { rel: "window/elanus.toml", content: include_str!("../packages/window/elanus.toml"), exec: false },
+    PkgFile { rel: "window/scripts/stage", content: include_str!("../packages/window/scripts/stage"), exec: true },
 ];
 
 const PROFILE_TOML: &str = include_str!("../templates/profile.toml");
@@ -112,6 +114,8 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     println!("  elanus emit in/agent/main --payload '{{\"prompt\":\"check in with me\"}}'");
     println!("  elanus inbox / elanus answer <id> \"...\"");
     println!("  elanus packages                     # what's installed, what's pending");
+    println!("  elanus approve history              # transcripts in the web UI (granted serving)");
+    println!("  elanus approve recent-history       # cross-run memory of recent mail (a context stage)");
     println!("  elanus bus sub 'obs/#'              # watch the live stream");
     println!("  tail -f {}", root.trace_file().display());
     for (name, readme) in &readmes {

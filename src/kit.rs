@@ -139,6 +139,12 @@ pub fn install(
                     continue;
                 }
             }
+            // Skill-only packages (no elanus.toml) carry no requests —
+            // nothing to decide, nothing to stage; their SKILL.md is inert
+            // content gated by profile visibility alone.
+            if packages::find(root, pkg)?.manifest.is_none() {
+                continue;
+            }
             if grant {
                 packages::decide(root, conn, pkg, true, &by)?;
             } else {
@@ -217,6 +223,29 @@ pub fn list() -> Result<Vec<(String, PathBuf, String)>> {
         }
     }
     Ok(out)
+}
+
+/// Remove a kit's packages dir from the default profile's package_path.
+/// Grants are NOT revoked here — they're inert without discovery, and
+/// revocation is its own gesture (`elanus revoke <pkg>`); we say so.
+pub fn unlink(root: &Root, kit_dir: &Path) -> Result<()> {
+    let entry = kit_dir.join("packages").canonicalize().unwrap_or(kit_dir.join("packages"));
+    let entry = entry.display().to_string();
+    let f = root.profile_dir("default").join("profile.toml");
+    let raw = std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?;
+    let mut doc: toml_edit::DocumentMut = raw.parse()?;
+    let Some(arr) = doc.get_mut("package_path").and_then(|i| i.as_array_mut()) else {
+        bail!("nothing linked (no package_path in the default profile)");
+    };
+    let before = arr.len();
+    arr.retain(|v| v.as_str() != Some(entry.as_str()));
+    if arr.len() == before {
+        bail!("{entry} is not on the package path");
+    }
+    std::fs::write(&f, doc.to_string())?;
+    println!("unlinked {entry}");
+    println!("grants for its packages remain in the ledger (inert without discovery); `elanus revoke <pkg>` to retire them");
+    Ok(())
 }
 
 /// The kit's README, without installing.

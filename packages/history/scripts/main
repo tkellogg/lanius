@@ -205,6 +205,13 @@ def q_search(c, q):
     if text:
         where.append("m.content LIKE '%' || ? || '%' ESCAPE '\\'")
         params.append(str(text).replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_"))
+    # ISO-8601 bounds compare lexicographically against created_at (the
+    # ledger stores strftime ISO UTC, so string order IS time order).
+    for key, op in (("since", ">="), ("until", "<")):
+        v = f.get(key)
+        if v:
+            where.append(f"m.created_at {op} ?")
+            params.append(str(v))
 
     limit = max(1, min(int(page.get("limit") or PAGE_DEFAULT), PAGE_MAX))
     cursor = page.get("cursor")
@@ -223,6 +230,10 @@ def q_search(c, q):
     rows = rows[:limit]
 
     want_tool_calls = sel.get("tool_calls", True)
+    # reasoning: True keeps what the transcript recorded, False strips it.
+    # (The real-vs-summary distinction awaits provider metadata the
+    # transcript doesn't carry yet — recorded in SKILL.md, not pretended.)
+    want_reasoning = sel.get("reasoning", True)
     tr = sel.get("tool_results", True)
     out = []
     for r in rows:
@@ -230,6 +241,8 @@ def q_search(c, q):
         if isinstance(content, dict):
             if r["role"] == "assistant" and not want_tool_calls:
                 content = {k: v for k, v in content.items() if k != "tool_calls"}
+            if r["role"] == "assistant" and not want_reasoning:
+                content = {k: v for k, v in content.items() if k != "reasoning"}
             if r["role"] == "tool":
                 if tr is False:
                     continue  # projected out entirely

@@ -23,6 +23,9 @@ fn client(addr: SocketAddr, tag: &str) -> (AsyncClient, rumqttc::v5::EventLoop) 
         addr.port(),
     );
     opts.set_keep_alive(Duration::from_secs(10));
+    // Resident stages move whole context documents through bus sub/pub;
+    // rumqttc's default inbound cap is 10KB (crate::resident::MAX_PACKET).
+    opts.set_max_packet_size(Some(crate::resident::MAX_PACKET));
     // Inside a supervised package actor, identity rides the environment the
     // supervisor injected: the CLI authenticates as the actor and the
     // broker scopes it to the package's grants.

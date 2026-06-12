@@ -31,6 +31,10 @@ pub struct Meta {
     pub session: String,
     pub turn: u32,
     pub model: String,
+    /// The profile's [vars] — the config channel for stages (a stage that
+    /// wants a knob documents a var; the human sets it per profile).
+    #[serde(default)]
+    pub vars: std::collections::BTreeMap<String, String>,
 }
 
 /// Document v1 (docs/context.md). `messages` carries transcript-row-shaped
@@ -171,9 +175,13 @@ fn doc_bytes(doc: &Doc) -> usize {
 fn run_stage(root: &Root, s: &StageRef, doc: &Doc) -> Result<Doc> {
     match s.mode.as_str() {
         "exec" => run_exec_stage(root, s, doc),
-        "resident" => bail!(
-            "resident stages are not wired yet (docs/context.md) — declare mode = \"exec\""
-        ),
+        "resident" => {
+            // The package's daemon actor serves; the consult fails closed
+            // (crate::resident::stage_consult — opposite of hooks).
+            let doc_v = serde_json::to_value(doc)?;
+            let out = crate::resident::stage_consult(root, &s.package, &s.name, &doc_v)?;
+            serde_json::from_value(out).context("stage returned an invalid context document")
+        }
         other => bail!("unknown stage mode {other:?}"),
     }
 }
@@ -285,7 +293,7 @@ mod tests {
     use super::*;
 
     fn meta() -> Meta {
-        Meta { profile: "default".into(), agent: "main".into(), session: "s".into(), turn: 1, model: "m".into() }
+        Meta { profile: "default".into(), agent: "main".into(), session: "s".into(), turn: 1, model: "m".into(), vars: Default::default() }
     }
 
     fn doc(messages: Vec<Value>) -> Doc {
@@ -336,6 +344,55 @@ mod tests {
             json!({"role":"tool","tool_call_id":"a","name":"shell","content":"again"}),
         ]);
         assert!(validate(&d).is_err());
+    }
+
+    #[test]
+    fn golden_parity_default_chain() {
+        // The phase-2 gate, frozen forward: with nothing declared, the
+        // assembled document is exactly (blocks + skills inventory) for
+        // system and the raw transcript rows for messages. Any change to
+        // this output is a behavior change for EVERY agent and must be
+        // deliberate.
+        let dir = std::env::temp_dir().join(format!("el-ctx-golden-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let root = crate::paths::Root { dir: dir.clone() };
+        std::fs::create_dir_all(dir.join("profiles/default/blocks")).unwrap();
+        std::fs::write(
+            dir.join("profiles/default/blocks/00-sys.md"),
+            "You are {{profile}} in {{root}}.",
+        )
+        .unwrap();
+        std::fs::write(dir.join("profiles/default/blocks/10-ctx.md"), "Second block.").unwrap();
+        let pkg = dir.join("packages/notesy");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("SKILL.md"),
+            "---\nname: notesy\ndescription: takes notes\n---\nbody\n",
+        )
+        .unwrap();
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+
+        let parts = crate::render::render_parts(&root, &conn, "default", "s1").unwrap();
+        let rows = vec![
+            json!({"role":"user","text":"hi"}),
+            json!({"role":"assistant","text":"hello"}),
+        ];
+        let doc = assemble(&root, &parts, rows.clone(), Value::Null, meta(), &[], &crate::trace::Ids::default())
+            .unwrap();
+
+        // Messages pass through untouched.
+        assert_eq!(doc.messages, rows);
+        // System is byte-frozen (root path normalized for portability).
+        let canon = dir.canonicalize().unwrap_or(dir.clone());
+        let got = doc.system_text()
+            .replace(&canon.display().to_string(), "<ROOT>")
+            .replace(&dir.display().to_string(), "<ROOT>");
+        let want = "You are default in <ROOT>.\n\nSecond block.\n\n\
+                    ## Skills\n- **notesy** — takes notes (read <ROOT>/packages/notesy/SKILL.md before first use)\n\n\
+                    Use the shell tool to read a SKILL.md and to run any scripts it describes.";
+        assert_eq!(got, want, "default-chain output changed — every agent's prompt just changed");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

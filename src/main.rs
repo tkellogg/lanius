@@ -16,6 +16,7 @@ mod mcp;
 mod packages;
 mod paths;
 mod profile;
+mod profilecli;
 mod recorder;
 mod render;
 mod resident;
@@ -66,6 +67,11 @@ enum Cmd {
     Kit {
         #[command(subcommand)]
         cmd: KitCmd,
+    },
+    /// Profiles: agent identities (list / get / set / new)
+    Profile {
+        #[command(subcommand)]
+        cmd: ProfileCmd,
     },
     /// Run the dispatcher: poll events, fork handlers, record exits
     Daemon {
@@ -158,6 +164,30 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum ProfileCmd {
+    /// All profiles, one JSON object per line
+    List,
+    /// One profile: parsed summary + raw TOML, as JSON
+    Get { name: String },
+    /// Set dotted keys, comments preserved, validated before writing:
+    /// elanus profile set default agent=kestrel model.max_turns=12
+    Set {
+        name: String,
+        /// key=value pairs; values parse as TOML when they can
+        pairs: Vec<String>,
+    },
+    /// Scaffold a profile (agent noun defaults to the name; blocks seeded
+    /// from the default profile)
+    New {
+        name: String,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum KitCmd {
     /// Install a kit into this root: packages linked onto the package path
     /// (or --copy vendored), profiles copied if missing, packages granted
@@ -182,6 +212,9 @@ enum KitCmd {
     },
     /// Print a kit's README without installing it
     Show { kit: String },
+    /// Remove a linked kit's packages dir from the package path (grants
+    /// stay in the ledger, inert; revoke per package to retire them)
+    Unlink { kit: String },
 }
 
 #[derive(Subcommand)]
@@ -443,6 +476,18 @@ fn run(cli: Cli) -> Result<()> {
             }
             KitCmd::Show { kit: kref } => {
                 print!("{}", kit::show(&kref)?);
+            }
+            KitCmd::Unlink { kit: kref } => {
+                let dir = kit::resolve(&kref)?;
+                kit::unlink(&root, &dir)?;
+            }
+        },
+        Cmd::Profile { cmd } => match cmd {
+            ProfileCmd::List => profilecli::list(&root)?,
+            ProfileCmd::Get { name } => profilecli::get(&root, &name)?,
+            ProfileCmd::Set { name, pairs } => profilecli::set(&root, &name, &pairs)?,
+            ProfileCmd::New { name, agent, model } => {
+                profilecli::new(&root, &name, agent.as_deref(), model.as_deref())?
             }
         },
         Cmd::Approve { name } => {

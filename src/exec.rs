@@ -185,6 +185,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 session: session.clone(),
                 turn: turns,
                 model: model.clone(),
+                vars: prof.vars.clone(),
             },
             &stages,
             &ids,
@@ -203,6 +204,12 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
             params![event_id, root_type, model, tokens_in, tokens_out],
         )?;
         let text = res.first_text().map(|s| s.to_string());
+        // Reasoning is RECORDED, never replayed: the transcript is the
+        // flight recorder's truth (and the history DSL projects it), but
+        // build_request ignores it on the wire — DeepSeek rejects echoed
+        // reasoning_content, and Anthropic thinking replay only matters
+        // once thinking mode is actually enabled in requests.
+        let reasoning = res.content.reasoning_contents().join("\n\n");
         let tool_calls: Vec<ToolCall> = res.into_tool_calls();
         trace::write(
             root,
@@ -214,12 +221,16 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 "output_tokens": tokens_out,
                 "tool_calls": tool_calls.iter().map(|t| t.fn_name.clone()).collect::<Vec<_>>(),
                 "text": text.as_deref().map(|t| trace::clip(t, 2000)),
+                "reasoning": (!reasoning.is_empty()).then(|| trace::clip(&reasoning, 2000)),
             }),
         );
 
         let mut amsg = json!({ "role": "assistant" });
         if let Some(t) = &text {
             amsg["text"] = json!(t);
+        }
+        if !reasoning.is_empty() {
+            amsg["reasoning"] = json!(reasoning);
         }
         if !tool_calls.is_empty() {
             amsg["tool_calls"] = json!(tool_calls

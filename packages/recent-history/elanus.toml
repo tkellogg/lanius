@@ -4,13 +4,27 @@
 # earned its way back in — the recent mail between the agent and its
 # humans — as a system block, rebuilt from the ledger every call.
 #
+# RESIDENT (docs/context.md): the daemon holds a warm read-only sqlite
+# connection and serves consults over the bus — request on
+# obs/harness/stagereq/recent-history/recent-history (response topic and
+# correlation ride the body), answer published point-to-point. Both
+# prefixes are fan-out-only, never recorded.
+#
 # A [[stage]] declaration is a request: this ships with the stock set but
 # stays inert until approved (`elanus approve recent-history`), because an
 # approved stage shapes every prompt the model sees. Profiles opt out with
 # the usual skills exclude (the funnel scout's include = [] already does).
 
+[request]
+subscribe = ["obs/harness/stagereq/recent-history/recent-history"]
+publish   = ["obs/harness/stageresp/#"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+
 [[stage]]
 name  = "recent-history"
-run   = "scripts/stage"
+run   = "scripts/main"   # the serving code; covered by code_hash
 order = 30
-mode  = "exec"
+mode  = "resident"

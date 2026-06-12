@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+# Context stage: drop complete leading turns when messages exceed the row
+# budget. The cut always lands on a user row (the wire requires the first
+# message be role=user), so whole turns vanish together and tool_use/
+# tool_result adjacency is preserved by construction.
+import json
+import sys
+
+doc = json.load(sys.stdin)
+msgs = doc.get("messages", [])
+try:
+    budget = int(doc.get("meta", {}).get("vars", {}).get("window_rows", 80))
+except (TypeError, ValueError):
+    budget = 80
+budget = max(2, budget)
+
+if len(msgs) > budget:
+    user_idx = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
+    # The smallest suffix that starts on a user row and fits the budget;
+    # if no cut fits (one giant turn), keep everything — never cut mid-turn.
+    cut = None
+    for i in user_idx:
+        if len(msgs) - i <= budget:
+            cut = i
+            break
+    if cut:
+        dropped = cut
+        msgs = msgs[cut:]
+        doc["messages"] = msgs
+        doc["system"].append({
+            "name": "window-note",
+            "text": f"(context window: the first {dropped} rows of this "
+                    f"session were dropped; the transcript on disk is complete)",
+        })
+
+json.dump(doc, sys.stdout)

@@ -1,0 +1,26 @@
+# architect — the strong-model identity escalations target (core kit).
+# Copied only if profiles/architect/ didn't already exist; edit freely,
+# especially the model line. Dispatch to it:
+#   elanus emit in/agent/architect --payload '{"prompt":"...","profile":"architect"}'
+
+agent = "architect"
+owner = "owner"
+
+[model]
+# The strongest model you have credentials for. Anthropic-compatible
+# providers work via the namespace form + base_url (same convention as
+# templates/profile.toml).
+model = "claude-fable-5"
+max_turns = 40
+
+[skills]
+# The architect sees everything: its job is the problems other rungs
+# couldn't absorb, so hiding skills from it only blinds the last resort.
+include = ["#"]
+exclude = []
+
+[throttle."in/agent/architect"]
+# The last rung is expensive by design; the throttle keeps an escalation
+# loop from becoming a billing incident.
+max_concurrent = 1
+llm_tokens_per_hour = 600000

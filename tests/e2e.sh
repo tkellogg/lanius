@@ -23,6 +23,7 @@ cleanup() {
   [ -n "${LLM_PID:-}" ] && kill -9 "$LLM_PID" 2>/dev/null
   [ -n "${LLM2_PID:-}" ] && kill -9 "$LLM2_PID" 2>/dev/null
   [ -n "${LLM3_PID:-}" ] && kill -9 "$LLM3_PID" 2>/dev/null
+  [ -n "${LLM5_PID:-}" ] && kill -9 "$LLM5_PID" 2>/dev/null
   # Supervised actors are children of the daemon but survive its death;
   # crash-only in production (their bus connection dies), explicit here.
   pkill -9 -f "$TMP/packages/" 2>/dev/null
@@ -282,9 +283,12 @@ elanus bus pub in/package/demo/echo '{"msg":"via-mqtt"}' || fail "bus pub"
 wait_for "mqtt-published work ran" "grep -q '\"msg\":\"via-mqtt\"' '$TMP/echo.log'"
 EVM=$(sql "SELECT id FROM events WHERE payload LIKE '%via-mqtt%'")
 [ -n "$EVM" ] && wait_for "event #$EVM done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVM\")\" = done ]" || fail "mqtt publish not in ledger"
-# Retained: a late subscriber still gets the last value.
+# Retained: a late subscriber still gets the last value. (Exact topic, not
+# obs/package/+/status: stock daemon actors — recent-history — retain their
+# own statuses now, and --count 1 on a wildcard grabs whichever replays
+# first.)
 elanus bus pub obs/package/demo/status '{"alive":true}' --retain || fail "bus pub --retain"
-elanus bus sub 'obs/package/+/status' --count 1 --timeout 5 | grep -q '"alive":true' && ok "retained replay to late subscriber" || fail "retained replay"
+elanus bus sub 'obs/package/demo/status' --count 1 --timeout 5 | grep -q '"alive":true' && ok "retained replay to late subscriber" || fail "retained replay"
 
 echo "== 8. daemon actor: supervised, token-authed, ACL-scoped =="
 mkdir -p "$TMP/packages/beacon/scripts"
@@ -760,17 +764,13 @@ HARNESS_ROOT="$TMP2" elanus exec "go" --session kit7 > "$TMP2/exec7.out" 2>&1 \
 grep -q "stagepkg/marker" "$TMP2/exec7.out" && ok "failure is stage-attributed" || fail "error not stage-attributed: $(cat "$TMP2/exec7.out")"
 rm -f "$TMP2/stage-break"
 
-# (g) recent-history, the stock cross-run reconstruction stage: prior mail
-# in the ledger reaches the model as a system block — the forgetting model's
-# deliberate re-injection (docs/context.md timescale doctrine).
+# (g) recent-history pending: the stock reconstruction stage ships inert —
+# nothing of it reaches the prompt until approved. (Its resident round trip
+# needs a broker; section 16 proves it against a live daemon.)
 HARNESS_ROOT="$TMP2" elanus emit in/human/owner --payload '{"text":"remember the blue key is under the mat"}' >/dev/null 2>&1
 HARNESS_ROOT="$TMP2" elanus exec "go" --session kit8 > "$TMP2/exec8.out" 2>&1 || fail "exec (recent-history pending): $(cat "$TMP2/exec8.out")"
 grep -q "blue key" "$TMP2/llm.body" && fail "pending recent-history leaked into the prompt" \
   || ok "recent-history ships pending (inert until approved)"
-HARNESS_ROOT="$TMP2" elanus approve recent-history >/dev/null 2>&1 || fail "approve recent-history"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session kit9 > "$TMP2/exec9.out" 2>&1 || fail "exec (recent-history): $(cat "$TMP2/exec9.out")"
-grep -q "blue key is under the mat" "$TMP2/llm.body" \
-  && ok "recent mail reconstructed into the prompt" || fail "recent-history block missing from llm request"
 
 # (h) MCP, the border protocol (src/mcp.rs): an approved [[mcp]] server's
 # tools enter the model's tool array as <server>__<tool>, a call round-trips
@@ -835,6 +835,17 @@ grep -q "TOOLS CHANGED" "$TMP2/execm3.out" && ok "refusal is loud and names the 
 HARNESS_ROOT="$TMP2" elanus approve adderpkg >/dev/null 2>&1 || fail "re-approve adderpkg"
 HARNESS_ROOT="$TMP2" elanus exec "go" --session mcp4 > "$TMP2/execm4.out" 2>&1 || fail "exec (re-pinned): $(cat "$TMP2/execm4.out")"
 grep -q "adder__add" "$TMP2/llm.body" && ok "re-approval re-pins (tools restored)" || fail "tools not restored after re-approval"
+
+# (i) core kit: the harness teaching itself. Skill-only packages install
+# with nothing to approve (content, not capability); the architect profile
+# lands with its identity block; render proves both reach a prompt.
+HARNESS_ROOT="$TMP2" elanus kit add core > "$TMP2/kitcore.out" 2>&1 || fail "kit add core: $(cat "$TMP2/kitcore.out")"
+[ -f "$TMP2/profiles/architect/profile.toml" ] && ok "architect profile installed" || fail "architect profile missing"
+HARNESS_ROOT="$TMP2" elanus render --profile architect --session corez > "$TMP2/render.out" 2>&1 || fail "render architect: $(cat "$TMP2/render.out")"
+grep -q "strongest rung" "$TMP2/render.out" && ok "architect identity block renders" || fail "architect block missing"
+grep -q "escalate" "$TMP2/render.out" && grep -q "harness-doctrine" "$TMP2/render.out" \
+  && ok "core skills in the inventory (no grants needed — content, not capability)" \
+  || fail "core skills missing from inventory"
 
 echo "== 15. funnel kit: the variety ladder end to end =="
 # Fresh root + its own daemon/broker: intake (daemon actor) -> sift (regex,
@@ -1043,6 +1054,41 @@ else: raise SystemExit(1)
 HARNESS_ROOT="$TMP5" elanus approve stager >/dev/null 2>&1 || fail "approve stager"
 HARNESS_ROOT="$TMP5" elanus emit in/package/stager/go >/dev/null 2>&1
 wait_for "approve committed the staged kit" "grep -q staged-ran '$TMP5/stager.out'"
+
+# Resident stage round trip: recent-history's daemon holds a warm read-only
+# sqlite handle and answers consults over the bus (docs/context.md) — prior
+# mail in the ledger reaches the model as a system block, the forgetting
+# model's deliberate re-injection. Fail-closed transport: the kernel would
+# fail the run if the daemon vanished mid-consult; here we prove the happy
+# path against this root's live broker.
+python3 "$TMP2/fake_llm2.py" "$TMP5/llm.port" "$TMP5/cmd.txt" "$TMP5/llm.body" &
+LLM5_PID=$!
+wait_for "link-root fake LLM bound" "[ -s '$TMP5/llm.port' ]"
+cat > "$TMP5/profiles/default/profile.toml" <<EOF
+agent = "main"
+owner = "owner"
+package_path = ["packages"]
+
+[model]
+model = "claude-3-5-haiku-latest"
+max_turns = 4
+base_url = "http://127.0.0.1:$(cat "$TMP5/llm.port")"
+api_key_env = "FAKE_LLM_KEY"
+EOF
+export FAKE_LLM_KEY=dummy
+HARNESS_ROOT="$TMP5" elanus emit in/human/owner --payload '{"text":"the launch code is petrichor-9"}' >/dev/null 2>&1
+HARNESS_ROOT="$TMP5" elanus approve recent-history >/dev/null 2>&1 || fail "approve recent-history"
+wait_for "recent-history daemon serving (parked -> approved, no restart)" \
+  "grep -q 'serving obs/harness/stagereq' '$TMP5/run/pkg-recent-history/stderr.log'"
+printf 'true' > "$TMP5/cmd.txt"
+HARNESS_ROOT="$TMP5" elanus exec "go" --session res1 > "$TMP5/execr.out" 2>&1 || fail "exec (resident stage): $(cat "$TMP5/execr.out")"
+grep -q "petrichor-9" "$TMP5/llm.body" \
+  && ok "resident consult round-tripped (ledger mail in the prompt)" || fail "resident stage block missing from llm request"
+grep -q '"kind":"obs/agent/main/res1/context/recent-history"' "$TMP5/trace.jsonl" \
+  && ok "resident stage delta on obs" || fail "no resident stage delta in trace"
+grep -q "stagereq" "$TMP5/trace.jsonl" \
+  && fail "stage RPC leaked into the flight recorder" || ok "stage RPC never recorded (carve-out holds)"
+kill -9 "$LLM5_PID" 2>/dev/null
 
 echo "== 17. history over HTTP: negotiated port, granted serving, query DSL =="
 # The reconstruction view moved off the bus (HANDOFF phase 3): the daemon

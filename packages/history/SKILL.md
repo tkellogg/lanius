@@ -47,11 +47,19 @@ curl -s "http://127.0.0.1:$PORT/query" -d '{"kind":"sessions","agent":"main"}'
   "filter": { "channels": ["in/agent/main"],        // event-type prefixes
               "involvement": "agent",                // or "all" (default)
               "roles": ["tool"],                     // user|assistant|tool
-              "text": "reactor pressure" },          // substring in content
+              "text": "reactor pressure",            // substring in content
+              "since": "2026-06-12T00:00:00Z",       // ISO bounds on created_at
+              "until": "2026-06-13T00:00:00Z" },
   "select": { "tool_calls": true,                    // false drops assistant tool_calls
+              "reasoning": true,                     // false strips recorded reasoning
               "tool_results": { "truncate": 500 } }, // or true / false (drop rows)
   "page":   { "limit": 100, "cursor": "12345" } }    // cursor = the returned cursor
 ```
+
+Reasoning note: transcripts record whatever reasoning the provider
+returned; the real-vs-summary distinction needs provider metadata the
+transcript doesn't carry yet, so `reasoning` is keep/strip, not a
+three-way filter.
 
 Answers `{"messages": [...], "has_more": bool, "cursor": <id|null>}` —
 newest first; pass `cursor` back to page deeper. The DSL is interpreted

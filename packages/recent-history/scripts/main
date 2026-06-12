@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""recent-history — resident context stage (docs/context.md).
+
+The cross-run reconstruction half of the forgetting doctrine: sessions are
+fresh by design; this daemon injects the recent mail between the agent and
+its humans as a system block, rebuilt from the ledger on every consult.
+
+Resident protocol (body-embedded addressing — the broker only fans out):
+  receive  obs/harness/stagereq/recent-history/recent-history
+           {"doc": <context document>, "response_topic": "...", "correlation": "..."}
+  answer   <response_topic>  {"correlation": ..., "doc": <transformed>}
+           or {"correlation": ..., "error": "..."} — the kernel fails the
+           run on error (stages fail closed; missing answers time out the
+           consult the same way).
+
+Why resident: a warm READ-ONLY sqlite connection (mode=ro — a view must be
+physically unable to write the truth it reconstructs) plus a tiny per-agent
+cache, instead of a process spawn per LLM call. Crash-only: bus trouble
+exits nonzero and the supervisor restarts us with backoff.
+"""
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+
+DB = os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("HARNESS_ROOT", "."), "harness.db")
+PKG = os.environ.get("ELANUS_PACKAGE", "recent-history")
+REQ_TOPIC = f"obs/harness/stagereq/{PKG}/recent-history"
+LIMIT = 12
+CLIP = 300
+CACHE_TTL = 2.0  # seconds; the ledger is local, this only absorbs tool loops
+
+_conn = None
+_cache = {}  # agent -> (expires, lines)
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def conn():
+    global _conn
+    if _conn is None:
+        _conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+    return _conn
+
+
+def recent_lines(agent, current_id):
+    now = time.monotonic()
+    hit = _cache.get(agent)
+    if hit and hit[0] > now and current_id is None:
+        return hit[1]
+    rows = conn().execute(
+        """SELECT id, type, payload, created_at FROM events
+           WHERE (type = ? OR type LIKE 'in/human/%')
+           ORDER BY id DESC LIMIT ?""",
+        (f"in/agent/{agent}", LIMIT + 1),
+    ).fetchall()
+    lines = []
+    for eid, etype, payload, created in reversed(rows):
+        if current_id is not None and eid == current_id:
+            continue  # the dispatching event IS the user message; don't echo it
+        try:
+            p = json.loads(payload) if payload else {}
+        except ValueError:
+            p = {}
+        text = p.get("text") or p.get("prompt") or p.get("answer") or ""
+        if not isinstance(text, str) or not text.strip():
+            continue
+        text = " ".join(text.split())
+        if len(text) > CLIP:
+            text = text[:CLIP] + "…"
+        lines.append(f"- [{created}] {etype}: {text}")
+    lines = lines[-LIMIT:]
+    _cache[agent] = (now + CACHE_TTL, lines)
+    return lines
+
+
+def transform(doc):
+    agent = doc.get("meta", {}).get("agent", "main")
+    current_id = (doc.get("event") or {}).get("id")
+    lines = recent_lines(agent, current_id)
+    if lines:
+        doc["system"].append({
+            "name": "recent-history",
+            "text": "## Recent mail (reconstructed from the ledger each call; "
+                    "sessions are fresh by design)\n" + "\n".join(lines),
+        })
+    return doc
+
+
+def respond(topic, body):
+    subprocess.run(
+        ["elanus", "bus", "pub", topic, json.dumps(body), "--qos", "1"],
+        check=True, timeout=30,
+    )
+
+
+def stage_grant_approved():
+    try:
+        c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+        row = c.execute(
+            "SELECT state FROM grants WHERE package = ? AND kind = 'stage'"
+            " ORDER BY id DESC LIMIT 1",
+            (PKG,),
+        ).fetchone()
+        c.close()
+        return row is not None and row[0] == "approved"
+    except sqlite3.Error:
+        return False
+
+
+def main():
+    if not os.path.exists(DB):
+        log(f"[recent-history] no ledger at {DB}; supervisor-given path missing is a real fault")
+        sys.exit(1)
+    waited = False
+    while not stage_grant_approved():
+        if not waited:
+            log("[recent-history] stage grant not approved yet; parking until "
+                "`elanus approve recent-history` (this is not an error)")
+            waited = True
+        time.sleep(2)
+    proc = subprocess.Popen(["elanus", "bus", "sub", REQ_TOPIC], stdout=subprocess.PIPE, text=True)
+    log(f"[recent-history] serving {REQ_TOPIC} (db {DB}, read-only, warm)")
+    for line in proc.stdout:
+        try:
+            req = json.loads(line).get("payload") or {}
+        except ValueError:
+            continue
+        rt = req.get("response_topic")
+        corr = req.get("correlation")
+        if not (isinstance(rt, str) and rt.startswith("obs/harness/stageresp/") and corr):
+            continue  # not a well-formed consult; nothing to answer on
+        try:
+            out = transform(req.get("doc") or {})
+            respond(rt, {"correlation": corr, "doc": out})
+        except subprocess.SubprocessError:
+            raise  # bus trouble is crash-only
+        except Exception as e:  # the kernel fails the run, attributed
+            respond(rt, {"correlation": corr, "error": str(e)})
+    log("[recent-history] bus subscription died -> exiting for restart")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

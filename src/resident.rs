@@ -146,6 +146,144 @@ fn drive(mut connection: Connection, tx: Sender<Msg>, client: Client, resp_topic
     }
 }
 
+// ── Resident STAGES (docs/context.md) ──────────────────────────────────────
+//
+// Same request/response idea as hooks, opposite failure semantics: a hook
+// that can't be reached allows (policy must not take the agent down with
+// the radio); a STAGE that can't be reached FAILS the run (it composes
+// meaning — silently skipping it corrupts the prompt). Hence its own
+// connection and state, never shared with the hook line.
+//
+// Addressing deviation from the hook seam, deliberate: response topic and
+// correlation ride IN THE BODY ({doc, response_topic, correlation}), not
+// MQTT §4.10 properties — the broker is not the coordinator here (it only
+// fans out and keeps these topics off disk), and the serving daemon is a
+// plain `elanus bus sub | transform | elanus bus pub` pipeline, which the
+// CLI supports today with no property plumbing. Topics:
+//   request:  obs/harness/stagereq/<package>/<stage>   (daemon subscribes)
+//   response: obs/harness/stageresp/req-<pid>-<uuid>   (consult subscribes)
+// Both prefixes are fan-out-only, never recorded (broker carve-out): a
+// context document is megabytes; the per-stage obs delta is the record.
+
+/// Stage budgets: resident stages get the same 10s an exec stage gets,
+/// plus connection slack.
+const STAGE_CAP: Duration = Duration::from_secs(15);
+/// Context documents are MBs; rumqttc's default inbound cap is 10KB.
+pub const MAX_PACKET: u32 = 64 * 1024 * 1024;
+
+static STAGE_STATE: OnceLock<Mutex<State>> = OnceLock::new();
+
+fn stage_state() -> &'static Mutex<State> {
+    STAGE_STATE.get_or_init(|| Mutex::new(State { line: None, retry_after: None }))
+}
+
+fn stage_connect(root: &Root) -> Option<Line> {
+    let cfg = bus::config(root);
+    if !cfg.enabled {
+        return None;
+    }
+    let addr = bus::connect_addr(&cfg)?;
+    let mut opts = MqttOptions::new(
+        format!("el-stage-{}", std::process::id()),
+        addr.ip().to_string(),
+        addr.port(),
+    );
+    opts.set_keep_alive(Duration::from_secs(10));
+    opts.set_max_packet_size(Some(MAX_PACKET));
+    let (client, connection) = Client::new(opts, 16);
+    let resp_topic = format!(
+        "obs/harness/stageresp/req-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    client.subscribe(&resp_topic, QoS::AtLeastOnce).ok()?;
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+    let resub = client.clone();
+    let resub_topic = resp_topic.clone();
+    std::thread::Builder::new()
+        .name("elanus-stageline".into())
+        .spawn(move || drive(connection, tx, resub, resub_topic))
+        .ok()?;
+    Some(Line { client, rx, resp_topic })
+}
+
+/// Consult a resident stage: publish the document, wait for the transformed
+/// one. Every failure is an Err — the caller (context::assemble) fails the
+/// run with a stage-attributed error. No retry_after backoff here: a stage
+/// consult failing must not silently degrade the NEXT call either; each
+/// call pays the connect attempt and reports honestly.
+pub fn stage_consult(
+    root: &Root,
+    package: &str,
+    stage: &str,
+    doc: &Value,
+) -> anyhow::Result<Value> {
+    use anyhow::{bail, Context as _};
+    let mut st = stage_state().lock().map_err(|_| anyhow::anyhow!("stage line poisoned"))?;
+    if st.line.is_none() {
+        st.line = stage_connect(root);
+    }
+    let Some(line) = st.line.as_ref() else {
+        bail!("bus disabled or unreachable (resident stages need the daemon's broker)");
+    };
+    while line.rx.try_recv().is_ok() {} // drop stale responses
+    let correlation = uuid::Uuid::new_v4().simple().to_string();
+    let req_topic = format!(
+        "obs/harness/stagereq/{}/{}",
+        crate::topic::encode_segment(package),
+        crate::topic::encode_segment(stage)
+    );
+    let body = json!({
+        "doc": doc,
+        "response_topic": line.resp_topic,
+        "correlation": correlation,
+    })
+    .to_string();
+    if line
+        .client
+        .publish(&req_topic, QoS::AtLeastOnce, false, body)
+        .is_err()
+    {
+        st.line = None; // reconnect next call
+        bail!("publish to {req_topic} failed");
+    }
+    let deadline = Instant::now() + STAGE_CAP;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("no response after {STAGE_CAP:?} — is the {package} daemon running and approved?");
+        }
+        match line.rx.recv_timeout(left) {
+            Ok(Msg::Pub { topic, payload }) if topic == line.resp_topic => {
+                let v: Value =
+                    serde_json::from_slice(&payload).context("response was not JSON")?;
+                if v["correlation"] != correlation.as_str() {
+                    continue; // stale response from an abandoned consult
+                }
+                if let Some(err) = v["error"].as_str() {
+                    bail!("stage daemon reported: {err}");
+                }
+                if !v["doc"].is_object() {
+                    bail!("response carried no document");
+                }
+                return Ok(v["doc"].clone());
+            }
+            Ok(Msg::Pub { .. }) => {}
+            Ok(Msg::Err) => {
+                st.line = None;
+                bail!("bus connection failed mid-consult");
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                bail!("no response after {STAGE_CAP:?} — is the {package} daemon running and approved?");
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                st.line = None;
+                bail!("stage line died");
+            }
+        }
+    }
+}
+
 /// Consult the resident-hook chain for `point` on `matched` (tool name for
 /// the tool-call points, event topic for pre_dispatch). Runs AFTER the
 /// exec-hook chain (see the chain-order note in src/exec.rs) and feeds it
