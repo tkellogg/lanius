@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>elanus — flight recorder</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="vignette" aria-hidden="true"></div>
+
+<header class="mast">
+  <div class="mast-left">
+    <span class="kite" aria-hidden="true">⟁</span>
+    <h1><em>elanus</em></h1>
+    <span class="mast-sub">flight recorder // live</span>
+  </div>
+  <div class="mast-right">
+    <button id="signal-lamp" class="lamp" title="algedonic channel — click to acknowledge">
+      <span class="lamp-dot"></span><span id="signal-label">signal</span>
+    </button>
+    <span id="conn" class="conn conn-down"><span class="conn-dot"></span><span id="conn-text">connecting</span></span>
+  </div>
+</header>
+
+<main class="deck">
+  <!-- ============ conversation ============ -->
+  <section class="conv panel" aria-label="conversation">
+    <div class="panel-head">
+      <h2>conversation</h2>
+      <span class="panel-note">in/agent ⇄ in/human — the mailbox view</span>
+    </div>
+    <div id="conv-feed" class="conv-feed">
+      <div class="conv-empty" id="conv-empty">
+        <p class="conv-empty-mark">⟁</p>
+        <p>nothing yet — say something below.<br/>asks and replies thread here by correlation.</p>
+      </div>
+    </div>
+    <form id="compose" class="compose" autocomplete="off">
+      <span class="compose-sigil">»</span>
+      <input id="compose-input" type="text" placeholder="message the agent…" spellcheck="false" />
+      <button type="submit" id="compose-send">transmit</button>
+    </form>
+  </section>
+
+  <!-- ============ telemetry ============ -->
+  <aside class="tele panel" aria-label="telemetry">
+    <div class="panel-head">
+      <h2>telemetry</h2>
+      <div class="tele-filters" role="tablist">
+        <button data-f="all" class="on">all</button>
+        <button data-f="work">work</button>
+        <button data-f="tools">tools</button>
+        <button data-f="signals">signals</button>
+        <button id="tele-pause" title="pause the feed">⏸</button>
+      </div>
+    </div>
+    <div id="tele-feed" class="tele-feed"></div>
+  </aside>
+</main>
+
+<footer class="strip">
+  <span id="stat-count">0 events</span>
+  <span id="stat-broker"></span>
+  <span class="strip-right">everything you see arrived over plain MQTT</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
