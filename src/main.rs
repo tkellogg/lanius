@@ -193,7 +193,14 @@ fn run(cli: Cli) -> Result<()> {
     dotenv::load(std::path::Path::new(".env"));
     match cli.cmd {
         Cmd::Init { dir } => {
-            return initcmd::init(dir.unwrap_or(std::env::current_dir()?));
+            // Same resolution order as every other command: explicit arg >
+            // HARNESS_ROOT > cwd. Init silently targeting cwd while the env
+            // var pointed elsewhere littered template roots into repos and
+            // test directories for a whole day before anyone noticed.
+            let dir = dir
+                .or_else(|| std::env::var("HARNESS_ROOT").ok().map(PathBuf::from))
+                .map_or_else(std::env::current_dir, Ok)?;
+            return initcmd::init(dir);
         }
         _ => {}
     }
