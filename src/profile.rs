@@ -149,7 +149,11 @@ fn default_max_turns() -> u32 {
     24
 }
 fn default_include() -> Vec<String> {
-    vec!["*".into()]
+    // "#" is match-all in the MQTT filter language this field speaks
+    // ("skill_visible" doc below). "*" — the old value — is a literal level
+    // there, so a profile without [skills] silently saw NOTHING: no skills
+    // inventory, no providers, no stages. Found by e2e 14(e).
+    vec!["#".into()]
 }
 
 pub fn load(root: &Root, name: &str) -> Result<(Profile, PathBuf)> {

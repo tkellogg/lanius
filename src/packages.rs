@@ -122,6 +122,10 @@ pub fn sync(root: &Root, conn: &Connection) -> Result<()> {
             .chain(m.request.publish.iter().map(|v| ("publish", v)))
             .chain(m.request.blocking.iter().map(|v| ("blocking", v)))
             .chain(m.request.fs_write.iter().map(|v| ("fs_write", v)))
+            // A [[stage]] declaration IS the request — a context transform
+            // runs only approved (docs/context.md), same shape as hooks
+            // riding the 'blocking' kind.
+            .chain(m.stage.iter().map(|s| ("stage", &s.name)))
             .collect();
         for (kind, value) in requests {
             if matches!(kind, "subscribe" | "publish") && !crate::topic::valid_filter(value) {

@@ -625,6 +625,8 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(n).decode()
+        with open(sys.argv[3], "w") as bf:
+            bf.write(body)
         if '"tool_result"' in body:
             content = [{"type": "text", "text": "done"}]
             stop = "end_turn"
@@ -649,7 +651,7 @@ with open(sys.argv[1], "w") as f:
     f.write(str(srv.server_address[1]))
 srv.serve_forever()
 EOF
-python3 "$TMP2/fake_llm2.py" "$TMP2/llm.port" "$TMP2/cmd.txt" &
+python3 "$TMP2/fake_llm2.py" "$TMP2/llm.port" "$TMP2/cmd.txt" "$TMP2/llm.body" &
 LLM2_PID=$!
 wait_for "kit fake LLM bound" "[ -s '$TMP2/llm.port' ]"
 LLM2_PORT=$(cat "$TMP2/llm.port")
@@ -706,6 +708,64 @@ grep '"kind":"obs/agent/main/kit3/tool/shell/result"' "$TMP2/trace.jsonl" | grep
 printf 'cd "%s/repo" && git status --short >/dev/null 2>&1; git push --force-with-lease origin main >/dev/null 2>&1; echo fine > "$HARNESS_ROOT/innocuous.txt"' "$WS" > "$TMP2/cmd.txt"
 HARNESS_ROOT="$TMP2" elanus exec "go" --session kit4 > "$TMP2/exec4.out" 2>&1 || fail "exec (innocuous): $(cat "$TMP2/exec4.out")"
 [ -f "$TMP2/innocuous.txt" ] && ok "innocuous git (incl. --force-with-lease) allowed" || fail "innocuous command blocked"
+
+# (e) context pipeline (docs/context.md): a [[stage]] declaration is a
+# REQUEST — inert until approved (loud skip on obs), then it transforms the
+# document the model actually sees, and a runtime failure fails closed with
+# a stage-attributed error.
+mkdir -p "$TMP2/packages/stagepkg/scripts"
+cat > "$TMP2/packages/stagepkg/elanus.toml" <<'EOF'
+[[stage]]
+name  = "marker"
+run   = "scripts/stage"
+order = 30
+EOF
+cat > "$TMP2/packages/stagepkg/scripts/stage" <<'EOF'
+#!/usr/bin/env python3
+import json, os, sys
+if os.path.exists(os.path.join(os.environ["HARNESS_ROOT"], "stage-break")):
+    sys.exit(1)
+doc = json.load(sys.stdin)
+doc["system"].append({"name": "marker", "text": "STAGEMARK-7c4f"})
+json.dump(doc, sys.stdout)
+EOF
+chmod +x "$TMP2/packages/stagepkg/scripts/stage"
+
+printf 'true' > "$TMP2/cmd.txt"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session kit5 > "$TMP2/exec5.out" 2>&1 || fail "exec (unapproved stage): $(cat "$TMP2/exec5.out")"
+grep -q "STAGEMARK-7c4f" "$TMP2/llm.body" && fail "unapproved stage ran" || ok "requested stage is inert (discovery is not authority)"
+grep -q '"kind":"obs/agent/main/kit5/context/marker-skipped"' "$TMP2/trace.jsonl" \
+  && ok "skip is loud on obs" || fail "no skipped-stage obs record"
+
+HARNESS_ROOT="$TMP2" elanus approve stagepkg >/dev/null 2>&1 || fail "approve stagepkg"
+HARNESS_ROOT="$TMP2" elanus stages | grep "stagepkg/marker" | grep -q "approved" \
+  && ok "elanus stages prints the effective chain" || fail "stages listing wrong"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session kit6 > "$TMP2/exec6.out" 2>&1 || fail "exec (approved stage): $(cat "$TMP2/exec6.out")"
+grep -q "STAGEMARK-7c4f" "$TMP2/llm.body" \
+  && ok "approved stage's block reached the model" || fail "stage block missing from llm request"
+grep -q '"kind":"obs/agent/main/kit6/context/marker"' "$TMP2/trace.jsonl" \
+  && ok "per-stage delta on obs (camera doctrine)" || fail "no stage delta in trace"
+
+# (f) fail-closed: same approved bytes, runtime error -> the run fails and
+# the error names the stage. (An EDITED script wouldn't even run: code_hash
+# pin de-approves it back to requested.)
+touch "$TMP2/stage-break"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session kit7 > "$TMP2/exec7.out" 2>&1 \
+  && fail "broken stage did not fail the run" || ok "broken stage fails closed"
+grep -q "stagepkg/marker" "$TMP2/exec7.out" && ok "failure is stage-attributed" || fail "error not stage-attributed: $(cat "$TMP2/exec7.out")"
+rm -f "$TMP2/stage-break"
+
+# (g) recent-history, the stock cross-run reconstruction stage: prior mail
+# in the ledger reaches the model as a system block — the forgetting model's
+# deliberate re-injection (docs/context.md timescale doctrine).
+HARNESS_ROOT="$TMP2" elanus emit in/human/owner --payload '{"text":"remember the blue key is under the mat"}' >/dev/null 2>&1
+HARNESS_ROOT="$TMP2" elanus exec "go" --session kit8 > "$TMP2/exec8.out" 2>&1 || fail "exec (recent-history pending): $(cat "$TMP2/exec8.out")"
+grep -q "blue key" "$TMP2/llm.body" && fail "pending recent-history leaked into the prompt" \
+  || ok "recent-history ships pending (inert until approved)"
+HARNESS_ROOT="$TMP2" elanus approve recent-history >/dev/null 2>&1 || fail "approve recent-history"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session kit9 > "$TMP2/exec9.out" 2>&1 || fail "exec (recent-history): $(cat "$TMP2/exec9.out")"
+grep -q "blue key is under the mat" "$TMP2/llm.body" \
+  && ok "recent mail reconstructed into the prompt" || fail "recent-history block missing from llm request"
 
 echo "== 15. funnel kit: the variety ladder end to end =="
 # Fresh root + its own daemon/broker: intake (daemon actor) -> sift (regex,

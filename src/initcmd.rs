@@ -25,6 +25,10 @@ const PKG_FILES: &[PkgFile] = &[
     PkgFile { rel: "watchdog/elanus.toml", content: include_str!("../packages/watchdog/elanus.toml"), exec: false },
     PkgFile { rel: "watchdog/scripts/scan", content: include_str!("../packages/watchdog/scripts/scan"), exec: true },
     PkgFile { rel: "notes/SKILL.md", content: include_str!("../packages/notes/SKILL.md"), exec: false },
+    // Ships pending, NOT auto-approved below: an approved stage shapes every
+    // prompt; activating it is the human's call (elanus approve recent-history).
+    PkgFile { rel: "recent-history/elanus.toml", content: include_str!("../packages/recent-history/elanus.toml"), exec: false },
+    PkgFile { rel: "recent-history/scripts/stage", content: include_str!("../packages/recent-history/scripts/stage"), exec: true },
 ];
 
 const PROFILE_TOML: &str = include_str!("../templates/profile.toml");

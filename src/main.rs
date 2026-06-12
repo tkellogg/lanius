@@ -1,6 +1,7 @@
 mod broker;
 mod bus;
 mod buscli;
+mod context;
 mod db;
 mod dispatcher;
 mod dotenv;
@@ -52,6 +53,13 @@ enum Cmd {
         /// the kit's dir onto the package path.
         #[arg(long)]
         copy: bool,
+    },
+    /// Print the effective context-pipeline chain for a profile
+    /// (docs/context.md): the built-in seed, then every package stage in
+    /// deterministic order (order, package, stage)
+    Stages {
+        #[arg(long, default_value = "default")]
+        profile: String,
     },
     /// Kits: starter packs of packages + profiles (add / list / show)
     Kit {
@@ -284,7 +292,7 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Cmd::Exec { prompt, session, profile, resume } => {
-            let result = exec::run(&root, exec::ExecOpts { session, profile, prompt, resume });
+            let result = exec::run(&root, exec::ExecOpts { session, profile, prompt, resume, event: None });
             if let Ok(conn) = open(&root) {
                 exec::release_own_leases(&conn);
             }
@@ -338,6 +346,28 @@ fn run(cli: Cli) -> Result<()> {
                     "{:<12} {:<12} mode={:<7} pending={:<3} granted={:<3} {}",
                     p.name, kind, mode, counts.0, counts.1, desc
                 );
+            }
+        }
+        Cmd::Stages { profile: pname } => {
+            let conn = open(&root)?;
+            let (prof, _) = profile::load(&root, &pname)?;
+            println!("seed (built-in, once per run): blocks -> providers -> skills-inventory");
+            let chain = context::chain(&root, &conn, &prof)?;
+            if chain.is_empty() {
+                println!("chain: (no package stages declared)");
+            } else {
+                println!("chain (per LLM call, order/package/stage):");
+                for s in &chain {
+                    println!(
+                        "  {:>5}  {}/{}  mode={}  {}  [{}]",
+                        s.order,
+                        s.package,
+                        s.name,
+                        s.mode,
+                        if s.approved { "approved" } else { "REQUESTED (inert until approved)" },
+                        s.script.display()
+                    );
+                }
             }
         }
         Cmd::Kit { cmd } => match cmd {

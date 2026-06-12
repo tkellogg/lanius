@@ -12,9 +12,27 @@ use std::time::{Duration, Instant};
 /// Context assembly: (blocks + render providers + skills inventory) -> the
 /// prompt's system context, per profile. Blocks exist only as a render
 /// target, never as a mutable store.
-pub fn render(root: &Root, _conn: &Connection, profile_name: &str, session: &str) -> Result<String> {
+pub fn render(root: &Root, conn: &Connection, profile_name: &str, session: &str) -> Result<String> {
+    Ok(render_parts(root, conn, profile_name, session)?
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+/// The same assembly as named parts — the seed of the context pipeline's
+/// `system` array (docs/context.md): each profile block, provider output,
+/// and the skills inventory is one (name, text) entry, in the order render()
+/// joins them. With no stages declared the pipeline's output is these parts
+/// joined — byte-identical to render() (the golden parity gate).
+pub fn render_parts(
+    root: &Root,
+    _conn: &Connection,
+    profile_name: &str,
+    session: &str,
+) -> Result<Vec<(String, String)>> {
     let (prof, pdir) = profile::load(root, profile_name)?;
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<(String, String)> = Vec::new();
 
     // 1. Static blocks with computed-register substitution.
     let blocks_dir = pdir.join("blocks");
@@ -27,7 +45,8 @@ pub fn render(root: &Root, _conn: &Connection, profile_name: &str, session: &str
         files.sort();
         for f in files {
             let raw = std::fs::read_to_string(&f)?;
-            parts.push(substitute(&raw, root, profile_name, session, &prof));
+            let name = f.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            parts.push((name, substitute(&raw, root, profile_name, session, &prof)));
         }
     }
 
@@ -50,7 +69,10 @@ pub fn render(root: &Root, _conn: &Connection, profile_name: &str, session: &str
             }
             match run_provider(root, &script, profile_name, session) {
                 Ok(out) if !out.trim().is_empty() => {
-                    parts.push(format!("## {} (provider)\n\n{}", skill.name, out.trim()));
+                    parts.push((
+                        format!("provider:{}", skill.name),
+                        format!("## {} (provider)\n\n{}", skill.name, out.trim()),
+                    ));
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!("[render] provider {} failed: {e:#}", script.display()),
@@ -76,10 +98,10 @@ pub fn render(root: &Root, _conn: &Connection, profile_name: &str, session: &str
             ));
         }
         block.push_str("\nUse the shell tool to read a SKILL.md and to run any scripts it describes.");
-        parts.push(block);
+        parts.push(("skills-inventory".into(), block));
     }
 
-    Ok(parts.join("\n\n"))
+    Ok(parts)
 }
 
 fn substitute(raw: &str, root: &Root, profile_name: &str, session: &str, prof: &profile::Profile) -> String {

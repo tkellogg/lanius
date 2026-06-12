@@ -1,0 +1,16 @@
+# recent-history — the stock cross-run reconstruction stage
+# (docs/context.md, timescale doctrine). Sessions are fresh by design:
+# nothing accumulates across runs. This stage deliberately injects what
+# earned its way back in — the recent mail between the agent and its
+# humans — as a system block, rebuilt from the ledger every call.
+#
+# A [[stage]] declaration is a request: this ships with the stock set but
+# stays inert until approved (`elanus approve recent-history`), because an
+# approved stage shapes every prompt the model sees. Profiles opt out with
+# the usual skills exclude (the funnel scout's include = [] already does).
+
+[[stage]]
+name  = "recent-history"
+run   = "scripts/stage"
+order = 30
+mode  = "exec"

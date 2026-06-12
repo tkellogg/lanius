@@ -27,6 +27,8 @@ pub struct Manifest {
     #[serde(default)]
     pub provider: Vec<ProviderDecl>,
     #[serde(default)]
+    pub stage: Vec<StageDecl>,
+    #[serde(default)]
     pub throttle: BTreeMap<String, ThrottleDecl>,
 }
 
@@ -126,6 +128,26 @@ pub struct ProviderDecl {
     pub order: u32,
 }
 
+/// A context-pipeline stage (docs/context.md): a program Context -> Context
+/// run before every LLM call. Like hooks, declaring one registers a grant
+/// request (kind = "stage") — a stage runs only approved, and its script is
+/// covered by code_hash so an edit re-enters review.
+#[derive(Debug, Deserialize)]
+pub struct StageDecl {
+    pub name: String, // one topic level; the chain sorts (order, package, name)
+    pub run: String,  // executable path relative to the package dir
+    #[serde(default = "default_order")]
+    pub order: u32,
+    /// "exec": spawned per call, document JSON stdin -> stdout.
+    /// "resident": the package's daemon actor is consulted over the bus.
+    #[serde(default = "default_stage_mode")]
+    pub mode: String,
+}
+
+fn default_stage_mode() -> String {
+    "exec".into()
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ThrottleDecl {
     pub max_concurrent: Option<i64>,
@@ -173,6 +195,14 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
             anyhow::bail!("{}: process.restart must be \"backoff\" or \"never\", got {:?}", f.display(), p.restart);
         }
     }
+    for s in &m.stage {
+        if s.mode != "exec" && s.mode != "resident" {
+            anyhow::bail!("{}: stage.mode must be \"exec\" or \"resident\", got {:?}", f.display(), s.mode);
+        }
+        if !crate::topic::valid_name(&s.name) || s.name.contains('/') {
+            anyhow::bail!("{}: stage name {:?} must be one topic level (no + # /)", f.display(), s.name);
+        }
+    }
     // code_hash = each referenced executable's bytes in a fixed order
     // (relative path + contents, so a rename is also a change). A missing
     // script hashes as its path + a sentinel — its later appearance is itself
@@ -183,6 +213,7 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
     }
     runs.extend(m.hook.iter().map(|h| h.run.clone()));
     runs.extend(m.provider.iter().map(|p| p.run.clone()));
+    runs.extend(m.stage.iter().map(|s| s.run.clone()));
     runs.sort();
     runs.dedup();
     let mut code = Sha256::new();

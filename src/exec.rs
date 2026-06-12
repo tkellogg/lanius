@@ -1,3 +1,4 @@
+use crate::context;
 use crate::db;
 use crate::events::{self, EmitOpts};
 use crate::hooks;
@@ -19,6 +20,9 @@ pub struct ExecOpts {
     pub profile: String,
     pub prompt: Option<String>,
     pub resume: Option<String>,
+    /// The dispatching event for the context document's `event` field
+    /// ({topic, payload, correlation_id}); None for CLI-direct runs.
+    pub event: Option<Value>,
 }
 
 /// What a tool invocation produced. Model-caused errors (bad args, unknown
@@ -119,7 +123,13 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         }
     }
 
-    let system = render::render(root, &conn, &opts.profile, &session)?;
+    // Context pipeline (docs/context.md): the system SEED is computed once
+    // per run (blocks + providers + skills inventory — pre-pipeline
+    // semantics, providers don't re-spawn per call); the chain runs before
+    // every LLM call over the freshly re-read transcript.
+    let system_seed = render::render_parts(root, &conn, &opts.profile, &session)?;
+    let stages = context::chain(root, &conn, &prof)?;
+    let event_doc = opts.event.clone().unwrap_or(Value::Null);
     // The cage is built once per exec from the profile's [sandbox] grant;
     // every shell tool call spawns inside it and gets boundary-diffed.
     let cage = sandbox::Cage::from_profile(root, &prof.sandbox);
@@ -159,7 +169,22 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
         }
         check_token_budget(root, &conn, &root_type, event_id)?;
 
-        let chat_req = build_request(&conn, &session, &system, &tools)?;
+        let doc = context::assemble(
+            root,
+            &system_seed,
+            transcript_rows(&conn, &session)?,
+            event_doc.clone(),
+            context::Meta {
+                profile: opts.profile.clone(),
+                agent: prof.agent.clone(),
+                session: session.clone(),
+                turn: turns,
+                model: model.clone(),
+            },
+            &stages,
+            &ids,
+        )?;
+        let chat_req = build_request(&doc, &tools)?;
         trace::write(root, &obs(&prof.agent, &session, "llm/request"), &ids, json!({ "model": model, "turn": turns }));
         let res = client
             .exec_chat(model.as_str(), chat_req, None)
@@ -710,16 +735,20 @@ fn repair_transcript(conn: &Connection, session: &str) -> Result<usize> {
     Ok(dangling.len())
 }
 
-/// Rebuild genai chat messages from the normalized transcript rows.
-fn build_request(conn: &Connection, session: &str, system: &str, tools: &[Tool]) -> Result<ChatRequest> {
-    let rows: Vec<String> = {
-        let mut stmt =
-            conn.prepare("SELECT content FROM messages WHERE session_id=?1 ORDER BY id ASC")?;
-        let r = stmt
-            .query_map([session], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        r
-    };
+/// The session transcript as row-shaped JSON values — the seed of the
+/// context document's `messages` (docs/context.md).
+fn transcript_rows(conn: &Connection, session: &str) -> Result<Vec<Value>> {
+    let mut stmt =
+        conn.prepare("SELECT content FROM messages WHERE session_id=?1 ORDER BY id ASC")?;
+    let raw = stmt
+        .query_map([session], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    raw.iter().map(|s| Ok(serde_json::from_str(s)?)).collect()
+}
+
+/// Build the genai chat request from the assembled (validated) document.
+fn build_request(doc: &context::Doc, tools: &[Tool]) -> Result<ChatRequest> {
+    let system = doc.system_text();
     let mut msgs: Vec<ChatMessage> = Vec::new();
     // Consecutive tool-result rows coalesce into ONE tool message: the
     // Anthropic protocol wants every tool_use answered by tool_result blocks
@@ -730,8 +759,7 @@ fn build_request(conn: &Connection, session: &str, system: &str, tools: &[Tool])
             msgs.push(ChatMessage::from(std::mem::take(pending)));
         }
     }
-    for raw in rows {
-        let m: Value = serde_json::from_str(&raw)?;
+    for m in &doc.messages {
         match m["role"].as_str().unwrap_or("") {
             "user" => {
                 flush_tools(&mut msgs, &mut pending_tools);
@@ -779,7 +807,7 @@ fn build_request(conn: &Connection, session: &str, system: &str, tools: &[Tool])
     }
     flush_tools(&mut msgs, &mut pending_tools);
     Ok(ChatRequest::new(msgs)
-        .with_system(system)
+        .with_system(&system)
         .with_tools(tools.to_vec()))
 }
 
@@ -1230,13 +1258,21 @@ pub fn handle_exec(root: &Root) -> Result<()> {
         .unwrap_or_else(|| format!("evt-{}", env["id"]));
     let profile = payload["profile"].as_str().unwrap_or("default").to_string();
     let resume = env.get("resume").filter(|r| !r.is_null());
+    // The dispatching event rides into the context document verbatim
+    // (docs/context.md): stages see topic, payload, correlation.
+    let event = json!({
+        "id": env["id"],
+        "topic": env["type"],
+        "payload": payload,
+        "correlation_id": env["correlation_id"],
+    });
     let opts = if let Some(r) = resume {
         let ans = match &r["payload"]["answer"] {
             Value::String(s) => s.clone(),
             Value::Null => "(no answer; deadline expired with no default)".to_string(),
             v => v.to_string(),
         };
-        ExecOpts { session: Some(session), profile, prompt: None, resume: Some(ans) }
+        ExecOpts { session: Some(session), profile, prompt: None, resume: Some(ans), event: Some(event) }
     } else {
         let prompt = payload["prompt"].as_str().or_else(|| payload["text"].as_str());
         let Some(prompt) = prompt else {
@@ -1252,7 +1288,7 @@ pub fn handle_exec(root: &Root) -> Result<()> {
             bail!("agent mailbox (in/agent/<noun>) payload needs a 'prompt' (or 'text') field");
         };
         let prompt = prompt.to_string();
-        ExecOpts { session: Some(session), profile, prompt: Some(prompt), resume: None }
+        ExecOpts { session: Some(session), profile, prompt: Some(prompt), resume: None, event: Some(event) }
     };
     run(root, opts)
 }
