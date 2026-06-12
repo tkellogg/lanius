@@ -1011,6 +1011,39 @@ HARNESS_ROOT="$TMP5" elanus approve linker >/dev/null 2>&1 || fail "approve link
 HARNESS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
 wait_for "re-approved linked handler ran new code" "grep -q ran-v2 '$TMP5/linker.out'"
 
+# Staging (--pending, the phase-5 path): files land, requests register,
+# NOTHING is granted — the commit gesture is a separate elanus approve.
+mkdir -p "$KITS5/stagekit/packages/stager/scripts"
+cat > "$KITS5/stagekit/packages/stager/elanus.toml" <<'EOF'
+[request]
+subscribe = ["in/package/stager/go"]
+[process]
+mode = "exec"
+run  = "scripts/main"
+EOF
+printf '#!/bin/sh\necho staged-ran >> "$HARNESS_ROOT/stager.out"\n' > "$KITS5/stagekit/packages/stager/scripts/main"
+chmod +x "$KITS5/stagekit/packages/stager/scripts/main"
+HARNESS_ROOT="$TMP5" elanus kit add "$KITS5/stagekit" --pending > "$TMP5/stage.out" 2>&1 \
+  || fail "kit add --pending: $(cat "$TMP5/stage.out")"
+grep -q "staged stager" "$TMP5/stage.out" && ok "kit add --pending stages" || fail "no staging message"
+[ "$(sql5 "SELECT COUNT(*) FROM grants WHERE package='stager' AND state='approved'")" = "0" ] \
+  && ok "staging granted nothing" || fail "staging approved grants"
+HARNESS_ROOT="$TMP5" elanus emit in/package/stager/go >/dev/null 2>&1
+sleep 1
+[ ! -f "$TMP5/stager.out" ] && ok "staged package is inert" || fail "staged package handled an event"
+HARNESS_ROOT="$TMP5" elanus packages --json | python3 -c '
+import json,sys
+for line in sys.stdin:
+    p = json.loads(line)
+    if p["name"] == "stager":
+        assert any(g["state"] == "requested" for g in p["grants"]), p
+        break
+else: raise SystemExit(1)
+' && ok "packages --json carries the pending queue" || fail "packages --json wrong"
+HARNESS_ROOT="$TMP5" elanus approve stager >/dev/null 2>&1 || fail "approve stager"
+HARNESS_ROOT="$TMP5" elanus emit in/package/stager/go >/dev/null 2>&1
+wait_for "approve committed the staged kit" "grep -q staged-ran '$TMP5/stager.out'"
+
 echo "== 17. history over HTTP: negotiated port, granted serving, query DSL =="
 # The reconstruction view moved off the bus (HANDOFF phase 3): the daemon
 # assigns a loopback port (process.http), records it in run/pkg-history/

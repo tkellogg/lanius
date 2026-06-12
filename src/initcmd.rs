@@ -87,7 +87,7 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     let mode = if copy_kits { kit::Mode::Copy } else { kit::Mode::Link };
     let mut readmes: Vec<(String, String)> = Vec::new();
     for (name, kit_dir) in kits.iter().zip(&kit_dirs) {
-        if let Some(readme) = kit::install(&root, &conn, kit_dir, mode)? {
+        if let Some(readme) = kit::install(&root, &conn, kit_dir, mode, true)? {
             readmes.push((name.clone(), readme));
         }
         println!("installed kit {name} from {}", kit_dir.display());

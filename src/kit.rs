@@ -73,12 +73,17 @@ fn search_dirs() -> Vec<PathBuf> {
 }
 
 /// Install a kit into the root. Returns the kit's README contents (for the
-/// caller to print — the kit's direction) if it has one.
+/// caller to print — the kit's direction) if it has one. `grant = false` is
+/// the STAGING path (HANDOFF phase 5): files land and requests register,
+/// but every grant stays pending review — the commit gesture is a separate
+/// `elanus approve`, which is what lets an un-trusted surface (the web UI,
+/// an agent) compose installs without authority.
 pub fn install(
     root: &Root,
     conn: &rusqlite::Connection,
     kit_dir: &Path,
     mode: Mode,
+    grant: bool,
 ) -> Result<Option<String>> {
     let name = kit_dir
         .file_name()
@@ -134,7 +139,11 @@ pub fn install(
                     continue;
                 }
             }
-            packages::decide(root, conn, pkg, true, &by)?;
+            if grant {
+                packages::decide(root, conn, pkg, true, &by)?;
+            } else {
+                println!("staged {pkg} (grants pending — `elanus approve {pkg}` to commit)");
+            }
         }
     }
     let readme = kit_dir.join("README.md");
@@ -283,7 +292,7 @@ mod tests {
         .unwrap();
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
-        let readme = install(&root, &conn, &kit, Mode::Link).unwrap();
+        let readme = install(&root, &conn, &kit, Mode::Link, true).unwrap();
         assert!(readme.unwrap().contains("directions"));
         // Not copied — discovered through the linked path.
         assert!(!root.packages().join("kpkg").exists());
@@ -305,7 +314,7 @@ mod tests {
         let (prof, _) = crate::profile::load(&root, "default").unwrap();
         assert_eq!(prof.package_path[0], "packages");
         // Idempotent: re-link adds no second entry.
-        install(&root, &conn, &kit, Mode::Link).unwrap();
+        install(&root, &conn, &kit, Mode::Link, true).unwrap();
         let (prof, _) = crate::profile::load(&root, "default").unwrap();
         assert_eq!(prof.package_path.len(), 2);
         std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
@@ -316,7 +325,7 @@ mod tests {
         let (root, kit) = scratch("copy");
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
-        install(&root, &conn, &kit, Mode::Copy).unwrap();
+        install(&root, &conn, &kit, Mode::Copy, true).unwrap();
         assert!(root.packages().join("kpkg/elanus.toml").exists());
         assert!(packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/go").unwrap());
         let (prof, _) = crate::profile::load(&root, "default").unwrap();
@@ -333,7 +342,7 @@ mod tests {
         std::fs::write(local.join("elanus.toml"), "[request]\nsubscribe=[\"in/package/kpkg/local\"]\n").unwrap();
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
-        install(&root, &conn, &kit, Mode::Link).unwrap();
+        install(&root, &conn, &kit, Mode::Link, true).unwrap();
         // The local one shadows; the kit must not have approved it.
         assert!(!packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/local").unwrap());
         assert!(!packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/go").unwrap());

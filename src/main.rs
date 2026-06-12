@@ -120,7 +120,12 @@ enum Cmd {
         session: String,
     },
     /// List packages: what's discovered, what's requested, what's granted
-    Packages,
+    Packages {
+        /// Machine-readable: one JSON object per package, including each
+        /// pending/approved grant row (the UI's pending-review queue)
+        #[arg(long)]
+        json: bool,
+    },
     /// Approve a package's requested capabilities (prints each one)
     Approve { name: String },
     /// Revoke a package's approved capabilities
@@ -163,6 +168,11 @@ enum KitCmd {
         /// Vendor packages into the root's packages/ instead of linking
         #[arg(long)]
         copy: bool,
+        /// STAGE only: files land and requests register, but every grant
+        /// stays pending — commit with `elanus approve <package>` (the
+        /// web UI / agent-staging path)
+        #[arg(long)]
+        pending: bool,
     },
     /// Kits installable right now, in resolution order (first hit wins)
     List,
@@ -304,10 +314,45 @@ fn run(cli: Cli) -> Result<()> {
             let conn = open(&root)?;
             println!("{}", render::render(&root, &conn, &profile, &session)?);
         }
-        Cmd::Packages => {
+        Cmd::Packages { json } => {
             let conn = open(&root)?;
             packages::sync(&root, &conn)?;
             for p in packages::discover(&root)? {
+                if json {
+                    let hash = p.manifest.as_ref().map(|lm| lm.hash.clone()).unwrap_or_default();
+                    let grants: Vec<Value> = if hash.is_empty() {
+                        vec![]
+                    } else {
+                        let mut stmt = conn.prepare(
+                            "SELECT kind, value, state, decided_by FROM grants
+                             WHERE package=?1 AND manifest_hash=?2 ORDER BY kind, value",
+                        )?;
+                        let rows = stmt
+                            .query_map(rusqlite::params![p.name, hash], |r| {
+                                Ok(serde_json::json!({
+                                    "kind": r.get::<_, String>(0)?,
+                                    "value": r.get::<_, String>(1)?,
+                                    "state": r.get::<_, String>(2)?,
+                                    "decided_by": r.get::<_, Option<String>>(3)?,
+                                }))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        rows
+                    };
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "name": p.name,
+                            "dir": p.dir,
+                            "mode": p.manifest.as_ref()
+                                .and_then(|lm| lm.manifest.process.as_ref().map(|pr| pr.mode.clone())),
+                            "skill": p.meta.as_ref().map(|m| serde_json::json!({
+                                "name": m.name, "description": m.description })),
+                            "grants": grants,
+                        })
+                    );
+                    continue;
+                }
                 let (mode, hash) = match &p.manifest {
                     Some(lm) => (
                         lm.manifest
@@ -372,11 +417,11 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Kit { cmd } => match cmd {
-            KitCmd::Add { kit: kref, copy } => {
+            KitCmd::Add { kit: kref, copy, pending } => {
                 let dir = kit::resolve(&kref)?;
                 let conn = open(&root)?;
                 let mode = if copy { kit::Mode::Copy } else { kit::Mode::Link };
-                let readme = kit::install(&root, &conn, &dir, mode)?;
+                let readme = kit::install(&root, &conn, &dir, mode, !pending)?;
                 println!("installed kit from {}", dir.display());
                 if let Some(r) = readme {
                     println!();
