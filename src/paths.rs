@@ -35,8 +35,17 @@ impl Root {
     }
 }
 
-/// Resolution order: explicit flag > HARNESS_ROOT env > walk up from cwd
-/// looking for harness.db.
+/// The default harness root: ~/.elanus/root. One predictable place, no
+/// cwd-dependence — running a daemon from the repo must not quietly make the
+/// repo a root (it did, before this).
+pub fn default_root() -> Result<PathBuf> {
+    let home = std::env::var("HOME")?;
+    Ok(PathBuf::from(home).join(".elanus/root"))
+}
+
+/// Resolution order: explicit flag > HARNESS_ROOT env > ~/.elanus/root.
+/// The old "walk up from cwd looking for harness.db" rule is gone: it made
+/// the active root a function of where you happened to be standing.
 pub fn resolve(cli: Option<PathBuf>) -> Result<Root> {
     if let Some(dir) = cli {
         return Ok(Root { dir: canon(dir)? });
@@ -44,16 +53,14 @@ pub fn resolve(cli: Option<PathBuf>) -> Result<Root> {
     if let Ok(dir) = std::env::var("HARNESS_ROOT") {
         return Ok(Root { dir: canon(PathBuf::from(dir))? });
     }
-    let mut cur = std::env::current_dir()?;
-    loop {
-        if cur.join("harness.db").exists() {
-            return Ok(Root { dir: cur });
-        }
-        if !cur.pop() {
-            break;
-        }
+    let def = default_root()?;
+    if def.join("harness.db").exists() {
+        return Ok(Root { dir: canon(def)? });
     }
-    bail!("no harness root found: run `elanus init [dir]`, set HARNESS_ROOT, or pass -C <dir>")
+    bail!(
+        "no harness root at {} — run `elanus init` to create it, or override with HARNESS_ROOT / -C <dir>",
+        def.display()
+    )
 }
 
 fn canon(p: PathBuf) -> Result<PathBuf> {

@@ -77,7 +77,16 @@ pub fn init(dir: PathBuf) -> Result<()> {
     println!("initialized harness root at {}", root.dir.display());
     println!();
     println!("next steps:");
-    println!("  export HARNESS_ROOT={}", root.dir.display());
+    // The default root needs no env var; only point at HARNESS_ROOT when
+    // this root actually requires it.
+    let is_default = crate::paths::default_root()
+        .ok()
+        .and_then(|d| d.canonicalize().ok())
+        .map(|d| d == root.dir)
+        .unwrap_or(false);
+    if !is_default {
+        println!("  export HARNESS_ROOT={}", root.dir.display());
+    }
     println!("  elanus daemon &                     # the dispatcher");
     println!("  elanus exec --session hi \"hello\"    # chat (needs ANTHROPIC_API_KEY)");
     println!("  elanus emit in/agent/main --payload '{{\"prompt\":\"check in with me\"}}'");

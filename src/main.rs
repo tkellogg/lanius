@@ -194,12 +194,13 @@ fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Init { dir } => {
             // Same resolution order as every other command: explicit arg >
-            // HARNESS_ROOT > cwd. Init silently targeting cwd while the env
-            // var pointed elsewhere littered template roots into repos and
-            // test directories for a whole day before anyone noticed.
-            let dir = dir
-                .or_else(|| std::env::var("HARNESS_ROOT").ok().map(PathBuf::from))
-                .map_or_else(std::env::current_dir, Ok)?;
+            // HARNESS_ROOT > ~/.elanus/root. Init once targeted cwd while
+            // the env var pointed elsewhere, littering template roots into
+            // repos and test directories.
+            let dir = match dir.or_else(|| std::env::var("HARNESS_ROOT").ok().map(PathBuf::from)) {
+                Some(d) => d,
+                None => paths::default_root()?,
+            };
             return initcmd::init(dir);
         }
         _ => {}
