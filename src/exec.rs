@@ -557,6 +557,40 @@ fn narrowed_cage(root: &Root, conn: &Connection, base: &sandbox::Cage) -> anyhow
     Ok(Some(sandbox::Cage::from_roots(roots, base.exclude.clone(), true)))
 }
 
+/// Resolve the profile's `[sandbox] workdir`: tilde-expanded, must be an
+/// absolute path to an existing directory. None = run in the harness root,
+/// as ever. This is *location*, not authority — writes still flow through
+/// the whole-agent grant + leases; the cage is unchanged by it.
+fn resolve_workdir(cfg: &profile::SandboxCfg) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let Some(w) = &cfg.workdir else { return Ok(None) };
+    let expanded = expand_tilde(w);
+    let p = std::path::PathBuf::from(&expanded);
+    if !p.is_absolute() {
+        anyhow::bail!("sandbox.workdir must be an absolute path, got {w:?}");
+    }
+    if !p.is_dir() {
+        anyhow::bail!(
+            "sandbox.workdir {} does not exist (or is not a directory); \
+             create it or fix the profile — refusing to fall back to the harness root",
+            p.display()
+        );
+    }
+    Ok(Some(p))
+}
+
+fn expand_tilde(s: &str) -> String {
+    if s == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return home;
+        }
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{rest}", home.trim_end_matches('/'));
+        }
+    }
+    s.to_string()
+}
+
 /// Standalone (non-dispatched) exec: release own leases on clean exit.
 pub fn release_own_leases(conn: &Connection) {
     let (dispatch, pid) = lease_holder();
@@ -753,7 +787,8 @@ fn tool_defs() -> Vec<Tool> {
     vec![
         Tool::new("shell")
             .with_description(
-                "Run a shell command on the host via sh -c. Working directory is the harness root. \
+                "Run a shell command on the host via sh -c. Working directory is the profile's \
+                 sandbox.workdir when set, else the harness root. \
                  Returns exit_code, stdout, stderr. Tools are the truth: prefer running a command over guessing.",
             )
             .with_schema(json!({
@@ -844,11 +879,17 @@ fn run_tool(
                 Err(e) => return err(format!("shell: cannot read active leases, refusing to run: {e:#}")),
             };
             let cage = narrowed.as_ref().unwrap_or(cage);
+            // Workdir is location, not authority: resolved fresh per call so
+            // a deleted dir fails loudly instead of falling back silently.
+            let workdir = match resolve_workdir(&prof.sandbox) {
+                Ok(w) => w,
+                Err(e) => return err(format!("shell: {e:#}")),
+            };
             // The camera: boundary diff of the writable roots around the
             // call. cause attribution is structural — this tool call IS the
             // bracket (docs/sandbox.md).
             let before = sandbox::snapshot(cage);
-            let out = run_shell(root, cage, cmd, timeout);
+            let out = run_shell(root, cage, cmd, timeout, workdir.as_deref());
             let after = sandbox::snapshot(cage);
             emit_fs_delta(root, &prof.agent, session, &call.call_id, cage, &before, &after);
             ToolOutcome::Output(out)
@@ -987,12 +1028,18 @@ fn emit_fs_delta(
     );
 }
 
-fn run_shell(root: &Root, cage: &sandbox::Cage, cmd: &str, timeout_secs: u64) -> String {
+fn run_shell(
+    root: &Root,
+    cage: &sandbox::Cage,
+    cmd: &str,
+    timeout_secs: u64,
+    workdir: Option<&std::path::Path>,
+) -> String {
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
     let mut c = cage.shell_command(cmd);
-    c.current_dir(&root.dir)
+    c.current_dir(workdir.unwrap_or(&root.dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1121,6 +1168,52 @@ fn store_msg(conn: &Connection, session: &str, event_id: Option<i64>, msg: &Valu
         params![session, msg["role"].as_str().unwrap_or("?"), msg.to_string(), event_id],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::SandboxCfg;
+
+    fn cfg(workdir: Option<&str>) -> SandboxCfg {
+        SandboxCfg { workdir: workdir.map(String::from), ..Default::default() }
+    }
+
+    #[test]
+    fn workdir_absent_means_none() {
+        assert!(resolve_workdir(&cfg(None)).unwrap().is_none());
+    }
+
+    #[test]
+    fn workdir_must_be_absolute() {
+        let e = resolve_workdir(&cfg(Some("relative/path"))).unwrap_err();
+        assert!(e.to_string().contains("absolute"), "{e}");
+    }
+
+    #[test]
+    fn missing_workdir_fails_loudly_not_silently() {
+        let p = std::env::temp_dir().join(format!("elanus-no-such-{}", uuid::Uuid::new_v4()));
+        let e = resolve_workdir(&cfg(Some(&p.display().to_string()))).unwrap_err();
+        assert!(e.to_string().contains("does not exist"), "{e}");
+    }
+
+    #[test]
+    fn existing_workdir_resolves() {
+        let p = std::env::temp_dir().join(format!("elanus-wd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        let got = resolve_workdir(&cfg(Some(&p.display().to_string()))).unwrap().unwrap();
+        assert_eq!(got, p);
+        std::fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn tilde_expands_against_home() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde("~/x/y"), format!("{home}/x/y"));
+        assert_eq!(expand_tilde("~"), home);
+        // not a tilde prefix: untouched
+        assert_eq!(expand_tilde("/a/~b"), "/a/~b");
+    }
 }
 
 /// `elanus handle-exec` — the two-line-script backend for exec-as-handler.

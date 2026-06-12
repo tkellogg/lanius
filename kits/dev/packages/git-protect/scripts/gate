@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""git-protect: pre_tool_call exec hook on the shell tool (docs/bus.md hook
+plane). Event JSON on stdin; exit 0 = allow, nonzero = deny with the reason
+on stdout. On allow we print NOTHING — stdout on exit 0 is interpreted as a
+rewritten subject, and this hook never rewrites.
+
+Conservative on purpose: deny only on a confident parse of an actual git
+invocation. Anything we cannot lex, and every non-git command, is allowed —
+false negatives are recoverable (git reflog exists for most of these),
+false positives would train the agent to distrust the harness."""
+
+import json
+import shlex
+import sys
+
+
+def deny(reason):
+    print(reason)  # nonzero exit: stdout+stderr become the hook's reason
+    sys.exit(2)
+
+
+def simple_commands(cmd):
+    """Split a shell command string into simple-command argv lists, cutting
+    at ; && || | & — punctuation_chars makes shlex emit those as their own
+    tokens even unspaced. A lex error yields nothing (allow)."""
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return []
+    cmds, cur = [], []
+    for t in tokens:
+        if t and all(ch in ";&|" for ch in t):
+            if cur:
+                cmds.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    if cur:
+        cmds.append(cur)
+    return cmds
+
+
+# git global options that consume the next token (so it is never mistaken
+# for the subcommand): git -C /repo push -f ...
+GIT_OPTS_WITH_ARG = {"-C", "-c", "--exec-path", "--git-dir", "--work-tree", "--namespace"}
+
+
+def check(argv):
+    i = 0
+    # Skip leading VAR=value environment assignments (GIT_DIR=x git ...).
+    while i < len(argv) and "=" in argv[i] and not argv[i].startswith("-"):
+        i += 1
+    if i >= len(argv) or argv[i].rsplit("/", 1)[-1] != "git":
+        return
+    j = i + 1
+    sub = None
+    while j < len(argv):
+        a = argv[j]
+        if a in GIT_OPTS_WITH_ARG:
+            j += 2
+            continue
+        if a.startswith("-"):
+            j += 1
+            continue
+        sub = a
+        break
+    if sub is None:
+        return
+    rest = argv[j + 1:]
+    if sub == "push":
+        for a in rest:
+            # exact matches only: --force-with-lease stays allowed
+            if a in ("--force", "-f"):
+                deny(f"git push {a}: force-push discards remote history; "
+                     "use --force-with-lease if you must")
+    elif sub == "reset":
+        if "--hard" in rest:
+            deny("git reset --hard: discards uncommitted working-tree changes")
+    elif sub == "clean":
+        for a in rest:
+            if a == "--force" or (a.startswith("-") and not a.startswith("--") and "f" in a[1:]):
+                deny(f"git clean {a}: deletes untracked files irrecoverably")
+    elif sub == "branch":
+        if "-D" in rest:
+            deny("git branch -D: force-deletes a branch regardless of merge state")
+    elif sub in ("checkout", "restore"):
+        if "." in rest:
+            deny(f"git {sub} .: tree-wide discard of uncommitted changes")
+
+
+def main():
+    try:
+        event = json.load(sys.stdin)
+    except Exception:
+        sys.exit(0)  # not a parseable event: not confident, allow
+    args = event.get("args") or {}
+    cmd = args.get("command")
+    if not isinstance(cmd, str):
+        sys.exit(0)
+    for argv in simple_commands(cmd):
+        check(argv)
+    sys.exit(0)
+
+
+main()

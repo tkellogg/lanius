@@ -38,7 +38,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Scaffold a harness root (db, trace log, default profile, stock skills)
-    Init { dir: Option<PathBuf> },
+    Init {
+        dir: Option<PathBuf>,
+        /// Kit(s) to install: packages copied + granted, profiles copied if
+        /// missing, README printed. A value containing '/' is a path; a bare
+        /// name resolves against $ELANUS_KIT_PATH (colon-separated), then a
+        /// kits/ dir next to the executable's repo (dev builds). Repeatable.
+        #[arg(long)]
+        kit: Vec<String>,
+    },
     /// Run the dispatcher: poll events, fork handlers, record exits
     Daemon {
         #[arg(long, default_value_t = 1000)]
@@ -192,16 +200,16 @@ fn run(cli: Cli) -> Result<()> {
     // .env once resolved. Real environment always wins over both.
     dotenv::load(std::path::Path::new(".env"));
     match cli.cmd {
-        Cmd::Init { dir } => {
+        Cmd::Init { ref dir, ref kit } => {
             // Same resolution order as every other command: explicit arg >
             // HARNESS_ROOT > ~/.elanus/root. Init once targeted cwd while
             // the env var pointed elsewhere, littering template roots into
             // repos and test directories.
-            let dir = match dir.or_else(|| std::env::var("HARNESS_ROOT").ok().map(PathBuf::from)) {
+            let dir = match dir.clone().or_else(|| std::env::var("HARNESS_ROOT").ok().map(PathBuf::from)) {
                 Some(d) => d,
                 None => paths::default_root()?,
             };
-            return initcmd::init(dir);
+            return initcmd::init(dir, kit.clone());
         }
         _ => {}
     }

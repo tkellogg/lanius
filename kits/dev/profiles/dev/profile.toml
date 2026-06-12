@@ -1,0 +1,20 @@
+# dev kit profile — a skeleton for coding-agent work. Use it with
+# `elanus exec --profile dev`, or fold the [sandbox] block into your default
+# profile. Copied only if profiles/dev/ didn't already exist.
+
+agent = "main"
+owner = "owner"
+
+[model]
+model = "claude-sonnet-4-6"
+max_turns = 24
+
+[sandbox]
+# Point the agent at your repo: the shell tool runs HERE instead of the
+# harness root. Location, not authority — writes still flow through the
+# fs_write grant + leases. Must exist, or shell calls fail loudly.
+# workdir = "~/code/myproject"
+#
+# The whole-agent write grant; the agent then leases subtrees (fs_lease)
+# before mutating them, and the spawn cage narrows to the lease.
+# fs_write = ["~/code/myproject"]

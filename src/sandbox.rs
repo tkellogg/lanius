@@ -283,6 +283,7 @@ mod tests {
         let cfg = SandboxCfg {
             fs_write: vec![root.dir.display().to_string()],
             capture_exclude: vec![],
+            workdir: None,
         };
         let cage = Cage::from_profile(&root, &cfg);
         assert!(cage.enforcing());

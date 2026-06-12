@@ -19,6 +19,7 @@ cleanup() {
   # later runs (random bus-section failures) — that bit us repeatedly.
   [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
   [ -n "${LLM_PID:-}" ] && kill -9 "$LLM_PID" 2>/dev/null
+  [ -n "${LLM2_PID:-}" ] && kill -9 "$LLM2_PID" 2>/dev/null
   # Supervised actors are children of the daemon but survive its death;
   # crash-only in production (their bus connection dies), explicit here.
   pkill -9 -f "$TMP/packages/" 2>/dev/null
@@ -594,6 +595,113 @@ printf '{"id":%s,"payload":{"prompt":"hi"}}' "$EV13B" | \
   HARNESS_EVENT_ID="$EV13B" elanus handle-exec >/dev/null 2>&1
 NTEXT2=$(sql "SELECT COUNT(*) FROM events WHERE type='in/human/owner' AND json_extract(payload,'\$.text') IS NOT NULL")
 [ "$NTEXT2" = "$NTEXT" ] && ok "uncorrelated run stays out of the inbox" || fail "uncorrelated run mailed the human"
+
+echo "== 14. dev kit: init --kit, workdir, git-protect =="
+# A fresh root, no daemon: `elanus exec` is standalone and the exec-hook
+# chain is in-process. The fake LLM here reads its tool command from a file
+# so each assertion drives a different shell call.
+TMP2=$(mktemp -d /tmp/elanus-kit.XXXXXX)
+elanus init "$TMP2" --kit "$REPO/kits/dev" > "$TMP2/init.out" 2>&1 || fail "init --kit kits/dev: $(cat "$TMP2/init.out")"
+[ -f "$TMP2/packages/git-protect/elanus.toml" ] && ok "git-protect materialized" || fail "git-protect not materialized"
+[ -x "$TMP2/packages/git-protect/scripts/gate" ] && ok "gate script executable" || fail "gate script not executable"
+[ -f "$TMP2/profiles/dev/profile.toml" ] && ok "kit profile copied" || fail "kit profile missing"
+grep -q "approved git-protect blocking pre_tool_call" "$TMP2/init.out" \
+  && ok "git-protect granted at init (init is the install gesture)" || fail "git-protect not approved by init"
+grep -q "dev kit" "$TMP2/init.out" && ok "kit README printed" || fail "kit README not printed"
+# Bare-name resolution: <repo>/kits found by walking up from the executable.
+TMP3=$(mktemp -d /tmp/elanus-kit3.XXXXXX)
+elanus init "$TMP3" --kit dev >/dev/null 2>&1 && [ -f "$TMP3/packages/git-protect/elanus.toml" ] \
+  && ok "bare kit name resolved against <repo>/kits" || fail "bare-name kit resolution"
+rm -rf "$TMP3"
+
+cat > "$TMP2/fake_llm2.py" <<'EOF'
+import json, sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(n).decode()
+        if '"tool_result"' in body:
+            content = [{"type": "text", "text": "done"}]
+            stop = "end_turn"
+        else:
+            with open(sys.argv[2]) as f:
+                cmd = f.read().strip()
+            content = [{"type": "tool_use", "id": "tc1", "name": "shell",
+                        "input": {"command": cmd}}]
+            stop = "tool_use"
+        resp = json.dumps({"id": "msg_1", "type": "message", "role": "assistant",
+                           "model": "claude-3-5-haiku-latest", "content": content,
+                           "stop_reason": stop,
+                           "usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+    def log_message(self, *a): pass
+srv = HTTPServer(("127.0.0.1", 0), H)
+with open(sys.argv[1], "w") as f:
+    f.write(str(srv.server_address[1]))
+srv.serve_forever()
+EOF
+python3 "$TMP2/fake_llm2.py" "$TMP2/llm.port" "$TMP2/cmd.txt" &
+LLM2_PID=$!
+wait_for "kit fake LLM bound" "[ -s '$TMP2/llm.port' ]"
+LLM2_PORT=$(cat "$TMP2/llm.port")
+export FAKE_LLM_KEY=dummy
+
+WS="$TMP2/agent-ws"
+mkdir -p "$WS"
+cat > "$TMP2/profiles/default/profile.toml" <<EOF
+agent = "main"
+owner = "owner"
+
+[model]
+model = "claude-3-5-haiku-latest"
+max_turns = 6
+base_url = "http://127.0.0.1:$LLM2_PORT"
+api_key_env = "FAKE_LLM_KEY"
+
+[sandbox]
+workdir = "$WS"
+EOF
+
+# (a) workdir: the shell tool's cwd is the profile's workdir, not the root.
+printf 'pwd -P > "$HARNESS_ROOT/pwd.out"' > "$TMP2/cmd.txt"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session kit1 > "$TMP2/exec1.out" 2>&1 || fail "exec (workdir pwd): $(cat "$TMP2/exec1.out")"
+WS_PHYS=$(cd "$WS" && pwd -P)
+[ "$(cat "$TMP2/pwd.out" 2>/dev/null)" = "$WS_PHYS" ] \
+  && ok "shell tool ran in workdir ($WS_PHYS)" || fail "pwd was '$(cat "$TMP2/pwd.out" 2>/dev/null)', wanted $WS_PHYS"
+
+# (b) a missing workdir fails the tool call loudly — never a silent fallback.
+sed "s,workdir = .*,workdir = \"$TMP2/no-such-dir\"," "$TMP2/profiles/default/profile.toml" > "$TMP2/p.tmp" \
+  && mv "$TMP2/p.tmp" "$TMP2/profiles/default/profile.toml"
+printf 'pwd > "$HARNESS_ROOT/fallback.out"' > "$TMP2/cmd.txt"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session kit2 > "$TMP2/exec2.out" 2>&1 || fail "exec (missing workdir)"
+[ ! -f "$TMP2/fallback.out" ] && ok "missing workdir: command never ran" || fail "missing workdir fell back silently"
+grep '"kind":"obs/agent/main/kit2/tool/shell/result"' "$TMP2/trace.jsonl" | grep -q "does not exist" \
+  && ok "missing workdir error is clear" || fail "missing-workdir error not surfaced"
+sed "s,workdir = .*,workdir = \"$WS\"," "$TMP2/profiles/default/profile.toml" > "$TMP2/p.tmp" \
+  && mv "$TMP2/p.tmp" "$TMP2/profiles/default/profile.toml"
+
+# (c) git-protect: a force push in a scratch repo is DENIED with the reason
+# echoed on obs/harness/hook, and the tool result carries the denial.
+git init -q "$WS/repo" || fail "git init scratch repo"
+printf 'cd "%s/repo" && git push --force origin main && echo pushed > "$HARNESS_ROOT/pushed.txt"' "$WS" > "$TMP2/cmd.txt"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session kit3 > "$TMP2/exec3.out" 2>&1 || fail "exec (git deny): $(cat "$TMP2/exec3.out")"
+[ ! -f "$TMP2/pushed.txt" ] && ok "force push denied (command never ran)" || fail "force push ran despite git-protect"
+grep '"kind":"obs/harness/hook/pre_tool_call/deny"' "$TMP2/trace.jsonl" | grep -q '"hook":"git-protect:' \
+  && ok "deny echoed on obs/harness/hook" || fail "no git-protect deny in trace"
+grep '"kind":"obs/harness/hook/pre_tool_call/deny"' "$TMP2/trace.jsonl" | grep -q 'force-push discards remote history' \
+  && ok "deny reason names the pattern" || fail "deny reason missing"
+grep '"kind":"obs/agent/main/kit3/tool/shell/result"' "$TMP2/trace.jsonl" | grep -q '"denied":true' \
+  && ok "denial on the tool result (transcript-visible)" || fail "denial not on tool result"
+
+# (d) innocuous commands pass: ordinary git, and --force-with-lease.
+printf 'cd "%s/repo" && git status --short >/dev/null 2>&1; git push --force-with-lease origin main >/dev/null 2>&1; echo fine > "$HARNESS_ROOT/innocuous.txt"' "$WS" > "$TMP2/cmd.txt"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session kit4 > "$TMP2/exec4.out" 2>&1 || fail "exec (innocuous): $(cat "$TMP2/exec4.out")"
+[ -f "$TMP2/innocuous.txt" ] && ok "innocuous git (incl. --force-with-lease) allowed" || fail "innocuous command blocked"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

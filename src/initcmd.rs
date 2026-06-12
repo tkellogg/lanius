@@ -2,7 +2,7 @@ use crate::db;
 use crate::manifest::ThrottleDecl;
 use crate::packages;
 use crate::paths::Root;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 
 struct PkgFile {
@@ -32,7 +32,10 @@ const BUS_TOML: &str = include_str!("../templates/bus.toml");
 const BLOCK_SYSTEM: &str = include_str!("../templates/block-00-system.md");
 const BLOCK_CONTEXT: &str = include_str!("../templates/block-10-context.md");
 
-pub fn init(dir: PathBuf) -> Result<()> {
+pub fn init(dir: PathBuf, kits: Vec<String>) -> Result<()> {
+    // Resolve every kit BEFORE touching disk: a typo'd kit name must not
+    // leave a half-initialized root behind.
+    let kit_dirs = kits.iter().map(|k| resolve_kit(k)).collect::<Result<Vec<_>>>()?;
     std::fs::create_dir_all(&dir)?;
     let root = Root { dir: dir.canonicalize()? };
     for d in [root.packages(), root.run_dir(), root.profile_dir("default").join("blocks")] {
@@ -73,6 +76,17 @@ pub fn init(dir: PathBuf) -> Result<()> {
         packages::decide(&root, &conn, name, true, "init")?;
     }
 
+    // Kits: starter packs. Their packages are copied in and granted exactly
+    // the way the stock packages above are — init IS the human install
+    // gesture, so kit provenance is the same "init" the stock set carries.
+    let mut readmes: Vec<(String, String)> = Vec::new();
+    for (name, kit_dir) in kits.iter().zip(&kit_dirs) {
+        if let Some(readme) = install_kit(&root, &conn, kit_dir)? {
+            readmes.push((name.clone(), readme));
+        }
+        println!("installed kit {name} from {}", kit_dir.display());
+    }
+
     println!();
     println!("initialized harness root at {}", root.dir.display());
     println!();
@@ -94,6 +108,110 @@ pub fn init(dir: PathBuf) -> Result<()> {
     println!("  elanus packages                     # what's installed, what's pending");
     println!("  elanus bus sub 'obs/#'              # watch the live stream");
     println!("  tail -f {}", root.trace_file().display());
+    for (name, readme) in &readmes {
+        println!();
+        println!("── kit {name} ─────────────────────────────────────────");
+        println!("{}", readme.trim_end());
+    }
+    Ok(())
+}
+
+/// Resolve a kit reference to its directory. A value containing '/' is a
+/// path used directly. A bare name resolves against $ELANUS_KIT_PATH
+/// (colon-separated directories), then against a `kits/` directory found by
+/// walking up from the executable's location — dev convenience so a repo
+/// build sees <repo>/kits; packaged installs should set ELANUS_KIT_PATH.
+fn resolve_kit(kit: &str) -> Result<PathBuf> {
+    if kit.contains('/') {
+        let p = PathBuf::from(kit);
+        if p.is_dir() {
+            return Ok(p.canonicalize()?);
+        }
+        bail!("kit path {kit:?} is not a directory");
+    }
+    let mut tried: Vec<String> = Vec::new();
+    if let Ok(kp) = std::env::var("ELANUS_KIT_PATH") {
+        for entry in kp.split(':').filter(|s| !s.is_empty()) {
+            let p = Path::new(entry).join(kit);
+            if p.is_dir() {
+                return Ok(p.canonicalize()?);
+            }
+            tried.push(p.display().to_string());
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors().skip(1) {
+            let p = anc.join("kits").join(kit);
+            if p.is_dir() {
+                return Ok(p.canonicalize()?);
+            }
+        }
+        tried.push(format!("kits/{kit} up from {}", exe.display()));
+    }
+    bail!(
+        "kit {kit:?} not found (tried: {}); set ELANUS_KIT_PATH or pass a path",
+        if tried.is_empty() { "nothing — no ELANUS_KIT_PATH".into() } else { tried.join(", ") }
+    )
+}
+
+/// A kit is a directory: `packages/` (copied into the root's packages/ and
+/// granted like the stock set), optional `profiles/<name>/...` (files copied
+/// if missing — an existing profile is never clobbered), optional README.md
+/// returned for printing.
+fn install_kit(root: &Root, conn: &rusqlite::Connection, kit_dir: &Path) -> Result<Option<String>> {
+    let mut names: Vec<String> = Vec::new();
+    let pkgs = kit_dir.join("packages");
+    if pkgs.is_dir() {
+        for e in sorted_dirs(&pkgs)? {
+            let name = e.file_name().unwrap().to_string_lossy().to_string();
+            copy_tree_if_missing(&e, &root.packages().join(&name))?;
+            names.push(name);
+        }
+    }
+    let profs = kit_dir.join("profiles");
+    if profs.is_dir() {
+        for e in sorted_dirs(&profs)? {
+            let name = e.file_name().unwrap().to_string_lossy().to_string();
+            copy_tree_if_missing(&e, &root.profile_dir(&name))?;
+        }
+    }
+    if !names.is_empty() {
+        packages::sync(root, conn)?;
+        for name in &names {
+            packages::decide(root, conn, name, true, "init")?;
+        }
+    }
+    let readme = kit_dir.join("README.md");
+    if readme.is_file() {
+        return Ok(Some(std::fs::read_to_string(readme)?));
+    }
+    Ok(None)
+}
+
+fn sorted_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// Recursive copy that never overwrites: each file lands only if absent
+/// (same contract as write_if_missing for the stock templates). fs::copy
+/// preserves the exec bit, so kit hook scripts stay executable.
+fn copy_tree_if_missing(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)?.filter_map(|e| e.ok()) {
+        let from = e.path();
+        let to = dst.join(e.file_name());
+        if from.is_dir() {
+            copy_tree_if_missing(&from, &to)?;
+        } else if !to.exists() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
     Ok(())
 }
 

@@ -125,6 +125,13 @@ pub struct SandboxCfg {
     /// Exclusion is never silent: deltas carry the active patterns.
     #[serde(default = "default_capture_exclude")]
     pub capture_exclude: Vec<String>,
+    /// Working directory for the shell tool's subprocess spawns. LOCATION,
+    /// not authority: writes still flow through the whole-agent grant +
+    /// leases exactly as without it; reads are already open. Absolute path
+    /// (~ expands); if it doesn't exist the tool call fails with a clear
+    /// error rather than silently falling back to the harness root.
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 fn default_capture_exclude() -> Vec<String> {

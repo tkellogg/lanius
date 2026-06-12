@@ -1,0 +1,15 @@
+# git-protect — destructive-git veto as a hook package; the kernel knows
+# nothing about git. A pre_tool_call exec hook on the shell tool denies
+# force-pushes, hard resets, forced cleans, branch -D, and tree-wide
+# discards, with a reason naming the pattern. Conservative by construction:
+# only confident matches deny; non-git commands always pass.
+
+[request]
+blocking = ["pre_tool_call"]
+
+[[hook]]
+point = "pre_tool_call"
+run = "scripts/gate"
+match = "shell"
+timeout_ms = 3000
+on_timeout = "deny"

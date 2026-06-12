@@ -30,6 +30,10 @@ llm_tokens_per_hour = 400000
 # absent = no cage (camera still records obs/fs/ deltas of the root).
 # fs_write = ["workspace"]
 # capture_exclude = ["harness.db", "trace.jsonl", "run/", ".env", ".git/", "target/", "node_modules/"]
+# Where the shell tool runs (location, not authority — writes still flow
+# through the grant + leases). Absolute, ~ expands; must exist or the tool
+# call fails rather than silently falling back to the harness root.
+# workdir = "~/code/myproject"
 
 [vars]
 # {{key}} substitutions available in blocks/*.md
