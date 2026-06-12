@@ -80,10 +80,15 @@ resolved version in the grant.
 ## 8. [LATENT] MCP surface (when [[mcp]] lands)
 
 - **Tool poisoning**: server-supplied tool descriptions enter the prompt as
-  trusted text; a hostile/compromised server injects through them. Treat
-  descriptions as untrusted input; pin them at grant time (description hash
-  in the manifest review) so a server that changes its tools goes stale like
-  edited code.
+  trusted text; a hostile/compromised server injects through them. As built
+  (2026-06-12): TOFU pin — sorted tools JSON hashed into kv on first load,
+  mismatch refuses the tools until `elanus approve` re-pins. Two honest
+  limits: the FIRST load is unreviewed (TOFU catches drift, not day-one
+  malice), and the pin lives in harness.db, which entry 3 says is writable
+  from inside every cage — so it is drift-detection, not a defense against
+  a ledger-writing attacker. Pin-at-review (a sandboxed dry-run launch of
+  the server during decide()) is the upgrade path; it was not built because
+  it executes code as part of deciding whether to approve that code.
 - **Port squatting**: harness-negotiated ports mean a local process can bind
   the port first or impersonate the server across restarts. Bind
   127.0.0.1 only; verify liveness via the harness-spawned pid, not the port.
