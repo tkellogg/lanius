@@ -18,11 +18,14 @@ cleanup() {
   # is crash-only by design. A surviving daemon holds its port and poisons
   # later runs (random bus-section failures) — that bit us repeatedly.
   [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
+  [ -n "${DAEMON2_PID:-}" ] && kill -9 "$DAEMON2_PID" 2>/dev/null
   [ -n "${LLM_PID:-}" ] && kill -9 "$LLM_PID" 2>/dev/null
   [ -n "${LLM2_PID:-}" ] && kill -9 "$LLM2_PID" 2>/dev/null
+  [ -n "${LLM3_PID:-}" ] && kill -9 "$LLM3_PID" 2>/dev/null
   # Supervised actors are children of the daemon but survive its death;
   # crash-only in production (their bus connection dies), explicit here.
   pkill -9 -f "$TMP/packages/" 2>/dev/null
+  [ -n "${TMP4:-}" ] && pkill -9 -f "$TMP4/packages/" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
@@ -702,6 +705,114 @@ grep '"kind":"obs/agent/main/kit3/tool/shell/result"' "$TMP2/trace.jsonl" | grep
 printf 'cd "%s/repo" && git status --short >/dev/null 2>&1; git push --force-with-lease origin main >/dev/null 2>&1; echo fine > "$HARNESS_ROOT/innocuous.txt"' "$WS" > "$TMP2/cmd.txt"
 HARNESS_ROOT="$TMP2" elanus exec "go" --session kit4 > "$TMP2/exec4.out" 2>&1 || fail "exec (innocuous): $(cat "$TMP2/exec4.out")"
 [ -f "$TMP2/innocuous.txt" ] && ok "innocuous git (incl. --force-with-lease) allowed" || fail "innocuous command blocked"
+
+echo "== 15. funnel kit: the variety ladder end to end =="
+# Fresh root + its own daemon/broker: intake (daemon actor) -> sift (regex,
+# zero tokens) -> scout (fake cheap LLM) -> emit_event KEEP mail. Three
+# lines go in; two die on the regex rung, one survives to the scout, and
+# the KEEP lands in the human's inbox carrying the original item.
+TMP4=$(mktemp -d /tmp/elanus-funnel.XXXXXX)
+elanus init "$TMP4" --kit "$REPO/kits/funnel" > "$TMP4/init.out" 2>&1 || fail "init --kit kits/funnel: $(cat "$TMP4/init.out")"
+[ -f "$TMP4/packages/funnel-intake/elanus.toml" ] && ok "funnel-intake materialized" || fail "funnel-intake not materialized"
+[ -f "$TMP4/packages/funnel-sift/rules.txt" ] && ok "sift rules file shipped" || fail "rules.txt missing"
+[ -f "$TMP4/profiles/scout/profile.toml" ] && ok "scout profile copied" || fail "scout profile missing"
+for p in funnel-intake funnel-sift funnel-scout; do
+  HARNESS_ROOT="$TMP4" elanus packages | grep -q "^$p .*granted=[1-9]" \
+    && ok "$p granted at init" || fail "$p not approved by init"
+done
+
+# The scout's fake cheap model: first request answers with an emit_event
+# tool call escalating the item to in/human/owner (what the scout profile's
+# system block instructs); the follow-up (carrying the tool_result) answers
+# the bare verdict. The item is parsed out of the prompt, not hardcoded.
+cat > "$TMP4/fake_llm3.py" <<'EOF'
+import json, re, sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(n).decode()
+        if '"tool_result"' in body:
+            content = [{"type": "text", "text": "KEEP interesting because reasons"}]
+            stop = "end_turn"
+        else:
+            m = re.search(r'ITEM:\\n(.*?)(?:\\n|")', body)
+            item = m.group(1) if m else "unparsed item"
+            content = [{"type": "tool_use", "id": "tc1", "name": "emit_event",
+                        "input": {"type": "in/human/owner",
+                                  "payload": {"text": "KEEP: %s — interesting because reasons" % item}}}]
+            stop = "tool_use"
+        resp = json.dumps({"id": "msg_1", "type": "message", "role": "assistant",
+                           "model": "claude-3-5-haiku-latest", "content": content,
+                           "stop_reason": stop,
+                           "usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+    def log_message(self, *a): pass
+srv = HTTPServer(("127.0.0.1", 0), H)
+with open(sys.argv[1], "w") as f:
+    f.write(str(srv.server_address[1]))
+srv.serve_forever()
+EOF
+python3 "$TMP4/fake_llm3.py" "$TMP4/llm.port" &
+LLM3_PID=$!
+wait_for "funnel fake LLM bound" "[ -s '$TMP4/llm.port' ]"
+LLM3_PORT=$(cat "$TMP4/llm.port")
+export FAKE_LLM_KEY=dummy
+# Point the kit's scout profile at the fake LLM; keep its blocks/ as shipped.
+cat > "$TMP4/profiles/scout/profile.toml" <<EOF
+agent = "scout"
+owner = "owner"
+
+[model]
+model = "claude-3-5-haiku-latest"
+max_turns = 4
+base_url = "http://127.0.0.1:$LLM3_PORT"
+api_key_env = "FAKE_LLM_KEY"
+
+[skills]
+include = []
+EOF
+
+# Second daemon, own port — the section-7 daemon keeps running on $BUS_PORT.
+BUS_PORT2=$((BUS_PORT + 1))
+lsof -ti "tcp:$BUS_PORT2" 2>/dev/null | xargs kill -9 2>/dev/null
+printf 'enabled = true\nbind = "127.0.0.1:%s"\n' "$BUS_PORT2" > "$TMP4/bus.toml"
+HARNESS_ROOT="$TMP4" elanus daemon --interval-ms 200 >"$TMP4/daemon.log" 2>&1 &
+DAEMON2_PID=$!
+sleep 1
+wait_for "funnel-intake alive (retained status)" \
+  "HARNESS_ROOT='$TMP4' elanus bus sub 'obs/package/funnel-intake/status' --count 1 --timeout 2 | grep -q '\"state\":\"alive\"'"
+
+sql4() { sqlite3 "$TMP4/harness.db" "$1"; }
+# Three lines: one killed by a drop rule, one falls to the default drop,
+# one passes (matches the shipped `pass ...alert...` rule).
+mkdir -p "$TMP4/run/pkg-funnel-intake/inbox"
+cat > "$TMP4/run/pkg-funnel-intake/inbox/feed.line" <<'EOF'
+heartbeat ok from node 7
+routine sync completed
+ALERT: reactor pressure rising
+EOF
+# Every line is ledgered on arrival — dropped ones included; nothing silent.
+wait_for "all 3 lines ledgered as in/package/funnel/sift" \
+  "[ \"\$(sql4 \"SELECT COUNT(*) FROM events WHERE type='in/package/funnel/sift'\")\" -ge 3 ]"
+[ ! -e "$TMP4/run/pkg-funnel-intake/inbox/feed.line" ] && ok "consumed file removed after PUBACK" || fail "intake file not consumed"
+# The regex rung absorbs two, escalates one.
+wait_for "passing line escalated to in/agent/scout" \
+  "[ \"\$(sql4 \"SELECT COUNT(*) FROM events WHERE type='in/agent/scout' AND payload LIKE '%reactor pressure%'\")\" -ge 1 ]"
+NSCOUT=$(sql4 "SELECT COUNT(*) FROM events WHERE type='in/agent/scout'")
+[ "$NSCOUT" = 1 ] && ok "dropped lines produced no scout work (exactly 1 escalation)" || fail "expected 1 in/agent/scout event, saw $NSCOUT"
+# The scout ran and its KEEP reached the human via its own emit_event —
+# mail carries the original item, and the cause chain is intact.
+wait_for "KEEP landed as in/human/owner mail with the original item" \
+  "sql4 \"SELECT json_extract(payload,'\\\$.text') FROM events WHERE type='in/human/owner'\" | grep -q 'reactor pressure rising'"
+sql4 "SELECT json_extract(payload,'\$.text') FROM events WHERE type='in/human/owner'" | grep -q '^KEEP:' \
+  && ok "mail carries the scout's verdict + reason" || fail "KEEP mail malformed"
+NMAIL=$(sql4 "SELECT COUNT(*) FROM events WHERE type='in/human/owner'")
+[ "$NMAIL" = 1 ] && ok "exactly one KEEP mail (no reply-mail leak from the run)" || fail "expected 1 in/human/owner event, saw $NMAIL"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

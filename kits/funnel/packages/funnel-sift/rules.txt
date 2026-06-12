@@ -1,0 +1,21 @@
+# funnel-sift rules — the zero-token rung's whole policy, yours to edit.
+#
+#   <action> <regex>      action is `drop` or `pass`
+#
+# First matching rule wins, top to bottom. Regexes are Python re,
+# case-insensitive, matched anywhere in the line. Blank lines and #-comments
+# are ignored. NO MATCH MEANS DROP: the funnel is default-closed, so add
+# `pass` rules for what you care about rather than `drop` rules for noise —
+# noise is infinite, interest is enumerable.
+#
+# Editing this file changes the package's code hash and re-enters review:
+# `elanus approve funnel-sift` after each edit.
+
+# Absorb obvious heartbeat chatter before the pass rules even run.
+drop \b(heartbeat|keepalive|ping|pong)\b
+
+# Escalate what smells like trouble or explicit attention requests.
+pass \b(error|fail(ed|ure)?|alert|urgent|panic|fatal|breach)\b
+pass \battention:\s
+
+# Everything else falls through to the default: drop.

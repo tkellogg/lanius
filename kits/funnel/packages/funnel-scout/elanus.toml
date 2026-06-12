@@ -1,0 +1,15 @@
+# funnel-scout — the cheap-model rung: turns in/agent/scout into an
+# `elanus exec` run under the scout profile (payload.profile selects it).
+# publish = ["#"] is the chat-package pattern and worth reading twice: an
+# agent run is a variety machine and can emit anything — here that authority
+# is exactly what lets the scout's emit_event reach in/human/owner on KEEP.
+# Approving this package is approving that.
+
+[request]
+subscribe = ["in/agent/scout"]
+publish   = ["#"]
+
+[process]
+mode = "exec"
+run  = "scripts/run"
+order = 0

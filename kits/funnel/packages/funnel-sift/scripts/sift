@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""funnel-sift: the regex rung. Reads the event envelope from stdin, applies
+rules.txt (sibling of scripts/), and escalates survivors to in/agent/scout.
+
+Rules file format, line-oriented:
+    drop <regex>    absorb the line here (zero tokens)
+    pass <regex>    escalate to the scout rung
+First matching rule wins; '#' comments and blank lines are ignored; regexes
+are Python re, case-insensitive, matched anywhere in the line (re.search).
+No rule matches => DROP. The funnel is default-closed: silence is cheap,
+and a missing rule should never leak tokens.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+event = json.load(sys.stdin)
+text = (event.get("payload") or {}).get("text") or ""
+
+rules_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), os.pardir, "rules.txt"
+)
+verdict, matched = "drop", None  # default-drop
+try:
+    with open(rules_path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            action, _, pattern = line.partition(" ")
+            pattern = pattern.strip()
+            if action not in ("pass", "drop") or not pattern:
+                print(f"sift: ignoring malformed rule: {line!r}", file=sys.stderr)
+                continue
+            try:
+                if re.search(pattern, text, re.IGNORECASE):
+                    verdict, matched = action, pattern
+                    break
+            except re.error as e:
+                print(f"sift: bad regex {pattern!r}: {e}", file=sys.stderr)
+except FileNotFoundError:
+    print(f"sift: no rules file at {rules_path}; default-drop", file=sys.stderr)
+
+# The verdict on record: stdout lands in run/d<id>.out, the exit echoes to
+# obs/harness/dispatch/exit — dropped lines are observable, never silent.
+print(json.dumps({"verdict": verdict, "rule": matched, "text": text[:200]}))
+
+if verdict == "pass":
+    prompt = (
+        "One inbound item from the funnel follows. Apply your filter "
+        "instructions to it.\n\nITEM:\n" + text
+    )
+    payload = json.dumps({"prompt": prompt, "profile": "scout", "item": text})
+    # No --correlation: an uncorrelated agent run stays out of the human's
+    # inbox; only the scout's explicit KEEP emit reaches in/human/owner.
+    subprocess.run(
+        ["elanus", "emit", "in/agent/scout", "--payload", payload],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )

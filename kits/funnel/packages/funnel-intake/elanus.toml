@@ -1,0 +1,12 @@
+# funnel-intake — the funnel's ingress bridge (the linemux pattern, per
+# line): drop a *.line file into this actor's scratch inbox and EACH LINE
+# becomes one ledger-backed in/package/funnel/sift event, published QoS 1 and
+# addressed to the sift rung. The file is deleted only after every line's
+# PUBACK — at-least-once: a crash mid-file re-publishes its earlier lines.
+
+[request]
+publish = ["in/package/funnel/sift"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"

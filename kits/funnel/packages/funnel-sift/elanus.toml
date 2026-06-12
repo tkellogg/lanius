@@ -1,0 +1,19 @@
+# funnel-sift — the zero-token rung. A regex filter over each inbound line,
+# driven by rules.txt in this package dir (first match wins, default DROP).
+# Survivors become in/agent/scout work for the cheap-model rung; everything
+# else is absorbed here. Nothing is silent: every arrival was ledgered as
+# in/package/funnel/sift, this handler's verdict goes to stdout (captured
+# under run/), and its exit echoes to obs/harness/dispatch/exit.
+#
+# The emit is deliberately UNcorrelated: the scout's final text must not
+# become reply mail to the human — escalation is the scout's own emit_event,
+# only on KEEP.
+
+[request]
+subscribe = ["in/package/funnel/sift"]
+publish   = ["in/agent/scout"]
+
+[process]
+mode = "exec"
+run  = "scripts/sift"
+order = 0

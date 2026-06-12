@@ -1,0 +1,4 @@
+#!/bin/sh
+# in/agent/scout -> an agent turn under the scout profile. All event-JSON
+# parsing lives in the binary; this script exists so the wiring stays visible.
+exec elanus handle-exec

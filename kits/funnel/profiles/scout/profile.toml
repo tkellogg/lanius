@@ -1,0 +1,22 @@
+# funnel scout profile — the cheap-model rung. Deliberately tiny: a cheap
+# model, two turns (one to emit, one to answer), no skills in the prompt.
+# Copied only if profiles/scout/ didn't already exist.
+
+agent = "scout"
+owner = "owner"
+
+[model]
+model = "claude-3-5-haiku-latest"
+max_turns = 2
+# This rung is where a cheap anthropic-compatible provider pays off. The
+# DeepSeek-style setup (same convention as templates/profile.toml): force
+# the adapter with the namespace form and point base_url at the provider.
+#   model = "anthropic::deepseek-chat"
+#   base_url = "https://api.deepseek.com/anthropic"
+#   api_key_env = "DEEPSEEK_API_KEY"   # if not ANTHROPIC_API_KEY
+
+[skills]
+# A filter needs no skills inventory in its prompt: every block is tokens,
+# and this profile runs once per surviving line.
+include = []
+exclude = []

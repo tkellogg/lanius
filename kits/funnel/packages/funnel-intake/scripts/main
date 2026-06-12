@@ -1,0 +1,46 @@
+#!/bin/sh
+# funnel-intake: bridge $ELANUS_SCRATCH/inbox/*.line files onto the bus,
+# one event per line. Crash-only: any bus failure exits nonzero; the
+# supervisor restarts us with backoff. Delete-after-PUBACK, per file: the
+# file survives until every line is accepted, so a crash mid-file means
+# duplicates (at-least-once), never silent loss.
+set -u
+
+INBOX="$ELANUS_SCRATCH/inbox"
+mkdir -p "$INBOX"
+
+while true; do
+  for f in "$INBOX"/*.line; do
+    [ -e "$f" ] || continue
+    tmp="$ELANUS_SCRATCH/payloads.$$"
+    # One JSON payload per stdout line (json escapes embedded newlines, so
+    # line-oriented reading downstream is safe). Caps keep a giant drop from
+    # becoming oversized publishes that wedge the bridge in a retry loop.
+    python3 -c '
+import json, sys, datetime
+FILE_CAP = 256 * 1024   # read at most this much of the file
+LINE_CAP = 8 * 1024     # publish at most this much of any one line
+with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
+    text = fh.read(FILE_CAP + 1)
+file_truncated = len(text) > FILE_CAP
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+for line in text[:FILE_CAP].splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    print(json.dumps({
+        "text": line[:LINE_CAP],
+        "truncated": file_truncated or len(line) > LINE_CAP,
+        "source": "funnel-intake",
+        "received_at": now,
+    }))' "$f" > "$tmp" || { rm -f "$f" "$tmp"; continue; }
+    # QoS 1: PUBACK means the kernel ledgered the work item. Any failure is
+    # a crash; the un-deleted file is the retry state.
+    while IFS= read -r payload; do
+      [ -n "$payload" ] || continue
+      elanus bus pub in/package/funnel/sift "$payload" --qos 1 || exit 1
+    done < "$tmp"
+    rm -f "$f" "$tmp"
+  done
+  sleep 1
+done
