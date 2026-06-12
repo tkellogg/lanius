@@ -6,6 +6,13 @@
 // messages relayed over SSE, publishes accepted over POST. No sqlite, no
 // trace.jsonl, no privileged access; the only filesystem touches are this
 // directory's static files and <root>/bus.toml for broker discovery.
+// History reads stay on the bus too: GET /api/history is brokered as a
+// query/response pair over obs/ui/history/{q,r/<qid>} answered by the
+// userland `history` package (docs/bus.md: reconstruction views are
+// userland; the obs plane never ledgers).
+//
+// AUTHORITY: read-and-converse only. No approve/revoke/kill endpoints —
+// admin stays in the CLI until the identity model lands (docs/bus.md §7).
 //
 //   node server.mjs --root /tmp/elanus-live [--port 7180] [--agent main]
 import fs from 'node:fs';
@@ -54,11 +61,64 @@ client.on('message', (topic, payload) => {
   } catch {
     env = { payload: payload.toString('utf8') };
   }
+  // History RPC traffic is brokered, not relayed: obs/ui/history/# would
+  // spam the rail with the explorer's own page loads (and transcript pages
+  // can be large). It still rides plain MQTT — just answered here.
+  if (topic.startsWith(HIST_R_PREFIX)) {
+    resolveHistory(topic.slice(HIST_R_PREFIX.length), env);
+    return;
+  }
+  if (topic === HIST_Q_TOPIC) return;
   const msg = { kind: 'message', seq: ++seq, topic, env };
   ring.push(msg);
   if (ring.length > RING_CAP) ring.shift();
   broadcast(msg);
 });
+
+// ---- history view brokering ------------------------------------------------
+// GET /api/history?kind=... → publish a query on obs/ui/history/q, await the
+// matching obs/ui/history/r/<qid> from the userland history package. The obs
+// plane fans out without ledgering, so UI reads never become ledger events.
+const HIST_Q_TOPIC = 'obs/ui/history/q';
+const HIST_R_PREFIX = 'obs/ui/history/r/';
+const HIST_TIMEOUT_MS = 5000;
+const HIST_KINDS = new Set(['agents', 'sessions', 'transcript', 'conversation']);
+const pendingHistory = new Map(); // qid -> {res, timer}
+
+function resolveHistory(qid, env) {
+  const p = pendingHistory.get(qid);
+  if (!p) return;
+  pendingHistory.delete(qid);
+  clearTimeout(p.timer);
+  // bus sub/pub of raw JSON: the response body IS the parsed payload, but
+  // tolerate an envelope wrapper ({payload: {...}}) just in case.
+  const body = env && env.qid === undefined && env.payload && env.payload.qid !== undefined ? env.payload : env;
+  p.res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body ?? { ok: false, error: 'empty response' }));
+}
+
+function handleHistory(url, res) {
+  const kind = url.searchParams.get('kind');
+  if (!HIST_KINDS.has(kind)) {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: `kind must be one of ${[...HIST_KINDS].join('|')}` }));
+    return;
+  }
+  const q = { kind, qid: `q-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` };
+  for (const k of ['agent', 'session', 'correlation', 'limit', 'before_id']) {
+    const v = url.searchParams.get(k);
+    if (v != null) q[k] = v;
+  }
+  const timer = setTimeout(() => {
+    pendingHistory.delete(q.qid);
+    res.writeHead(504, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'history view timed out — is the history package installed and approved?' }));
+  }, HIST_TIMEOUT_MS);
+  pendingHistory.set(q.qid, { res, timer });
+  client.publish(HIST_Q_TOPIC, JSON.stringify(q), { qos: 0 }, (err) => {
+    if (err && pendingHistory.delete(q.qid)) {
+      clearTimeout(timer);
+      res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: String(err.message ?? err) }));
+    }
+  });
+}
 
 function broadcast(obj) {
   const line = `data: ${JSON.stringify(obj)}\n\n`;
@@ -81,6 +141,10 @@ const server = http.createServer((req, res) => {
     for (const m of ring) res.write(`data: ${JSON.stringify(m)}\n\n`);
     sseClients.add(res);
     req.on('close', () => sseClients.delete(res));
+    return;
+  }
+  if (url.pathname === '/api/history') {
+    handleHistory(url, res);
     return;
   }
   if (url.pathname === '/api/publish' && req.method === 'POST') {

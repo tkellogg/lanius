@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>elanus — flight recorder</title>
+<title>elanus — agent explorer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" />
@@ -16,7 +16,7 @@
   <div class="mast-left">
     <span class="kite" aria-hidden="true">⟁</span>
     <h1><em>elanus</em></h1>
-    <span class="mast-sub">flight recorder // live</span>
+    <span class="mast-sub">agent explorer // live</span>
   </div>
   <div class="mast-right">
     <button id="signal-lamp" class="lamp" title="algedonic channel — click to acknowledge">
@@ -27,44 +27,65 @@
 </header>
 
 <main class="deck">
-  <!-- ============ conversation ============ -->
-  <section class="conv panel" aria-label="conversation">
-    <div class="panel-head">
-      <h2>conversation</h2>
-      <span class="panel-note">in/agent ⇄ in/human — the mailbox view</span>
+  <!-- ============ explorer nav ============ -->
+  <nav class="nav panel" aria-label="explorer">
+    <div class="panel-head"><h2>instruments</h2></div>
+    <div id="nav-list" class="nav-list">
+      <button class="nav-item nav-signals" data-sel="signals"><span class="nav-sigil">◮</span> signals</button>
+      <div class="nav-label">agents</div>
+      <div id="nav-agents"></div>
+      <div id="nav-empty" class="nav-hint">listening for agents…</div>
     </div>
-    <div id="conv-feed" class="conv-feed">
-      <div class="conv-empty" id="conv-empty">
-        <p class="conv-empty-mark">⟁</p>
-        <p>nothing yet — say something below.<br/>asks and replies thread here by correlation.</p>
-      </div>
-    </div>
-    <form id="compose" class="compose" autocomplete="off">
-      <span class="compose-sigil">»</span>
-      <input id="compose-input" type="text" placeholder="message the agent…" spellcheck="false" />
-      <button type="submit" id="compose-send">transmit</button>
-    </form>
-  </section>
+    <div id="history-hint" class="nav-hint nav-foot" hidden>history package not running — live view only</div>
+  </nav>
 
-  <!-- ============ telemetry ============ -->
-  <aside class="tele panel" aria-label="telemetry">
+  <!-- ============ stage ============ -->
+  <section class="stage panel" aria-label="view">
     <div class="panel-head">
-      <h2>telemetry</h2>
-      <div class="tele-filters" role="tablist">
-        <button data-f="all" class="on">all</button>
-        <button data-f="work">work</button>
-        <button data-f="tools">tools</button>
-        <button data-f="signals">signals</button>
-        <button id="tele-pause" title="pause the feed">⏸</button>
+      <h2 id="stage-title">signals</h2>
+      <div id="agent-tabs" class="tabs" role="tablist" hidden>
+        <button data-tab="converse" class="on">converse</button>
+        <button data-tab="sessions">sessions</button>
+        <button data-tab="telemetry">telemetry</button>
       </div>
+      <span id="stage-note" class="panel-note"></span>
     </div>
-    <div id="tele-feed" class="tele-feed"></div>
-  </aside>
+
+    <!-- converse: the mailbox view, per agent -->
+    <div id="view-converse" class="view" hidden>
+      <div id="conv-holder" class="conv-feed-holder"></div>
+      <form id="compose" class="compose" autocomplete="off">
+        <span class="compose-sigil">»</span>
+        <input id="compose-input" type="text" placeholder="message the agent…" spellcheck="false" />
+        <button type="submit" id="compose-send">transmit</button>
+      </form>
+    </div>
+
+    <!-- sessions: list from the history view; click for the transcript -->
+    <div id="view-sessions" class="view" hidden>
+      <div id="sessions-pane" class="sessions-pane"></div>
+    </div>
+
+    <!-- telemetry / signals: the rail -->
+    <div id="view-rail" class="view">
+      <div class="rail-bar">
+        <div class="tele-filters" role="tablist">
+          <button data-f="all" class="on">all</button>
+          <button data-f="work">work</button>
+          <button data-f="tools">tools</button>
+          <button data-f="signals">signals</button>
+          <button id="tele-pause" title="pause the feed">⏸</button>
+        </div>
+      </div>
+      <div id="tele-feed" class="tele-feed"></div>
+    </div>
+  </section>
 </main>
 
 <footer class="strip">
   <span id="stat-count">0 events</span>
   <span id="stat-broker"></span>
+  <span class="strip-note">read &amp; converse only — admin stays in the CLI</span>
   <span class="strip-right">everything you see arrived over plain MQTT</span>
 </footer>
 

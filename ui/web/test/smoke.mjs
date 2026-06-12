@@ -1,6 +1,9 @@
 // Smoke: a REAL daemon on a throwaway root, the web server as the pure MQTT
 // client, a plain HTTP client as the browser. Proves: SSE relay (bus → page),
-// publish endpoint (page → bus → ledger, correlation intact), ring catch-up.
+// publish endpoint (page → bus → ledger, correlation intact), ring catch-up,
+// and the history view in BOTH states — absent (live-only degradation: /api/
+// history → 504) and installed+approved (agents/sessions/transcript/
+// conversation queries answered end to end over obs/ui/history/{q,r/<qid>}).
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -28,7 +31,8 @@ async function waitFor(desc, fn, timeoutMs = 15000) {
   return false;
 }
 const elanus = (...a) => execFileSync(path.join(BIN, 'elanus'), a, { env: ENV, encoding: 'utf8' });
-const sql = (q) => execFileSync('sqlite3', [path.join(TMP, 'harness.db'), q], { encoding: 'utf8' }).trim();
+// .timeout: the daemon holds the db in WAL; writers must wait, not fail
+const sql = (q) => execFileSync('sqlite3', ['-cmd', '.timeout 5000', path.join(TMP, 'harness.db'), q], { encoding: 'utf8' }).trim();
 
 // -- daemon on a throwaway root --
 elanus('init');
@@ -109,6 +113,84 @@ const lateText = await new Promise(async (resolve) => {
   }
 });
 lateText.includes('web-smoke') ? ok('late joiner got ring catch-up') : fail('no catch-up for late joiner');
+
+// 6. history view ABSENT: the explorer degrades to live-only, never breaks.
+// /api/history must answer with an honest 504 (the UI turns this into the
+// "history package not running — live view only" hint), not a hang or a 500.
+const noHist = await fetch(`${BASE}/api/history?kind=agents`);
+const noHistJ = await noHist.json().catch(() => null);
+noHist.status === 504 && noHistJ?.ok === false
+  ? ok('history absent → 504 live-only degradation')
+  : fail(`history absent gave ${noHist.status} ${JSON.stringify(noHistJ)}`);
+const badKind = await fetch(`${BASE}/api/history?kind=drop_tables`);
+badKind.status === 400 ? ok('unknown history kind rejected (400)') : fail(`bad kind got ${badKind.status}`);
+
+// 7. install + approve the history package, seed a transcript, query it.
+// (Seed BEFORE the actor answers so the first successful query sees it.)
+fs.cpSync(path.join(REPO, 'packages/history'), path.join(TMP, 'packages/history'), { recursive: true });
+elanus('approve', 'history');
+/^history\s/m.test(elanus('packages')) ? ok('history package discovered') : fail('history package not discovered');
+sql(`INSERT INTO events(type, payload, state, correlation_id)
+     VALUES ('in/agent/main','{"prompt":"hi"}','done','web-hist-conv');
+     INSERT INTO messages(session_id, role, content, event_id) VALUES
+       ('s-hist-test','user','{"role":"user","text":"hi"}', last_insert_rowid()),
+       ('s-hist-test','assistant','{"role":"assistant","text":"hello","tool_calls":[{"call_id":"c1","fn_name":"shell","fn_arguments":"{\\"cmd\\":\\"ls\\"}"}]}',
+        (SELECT id FROM events WHERE correlation_id='web-hist-conv')),
+       ('s-hist-test','tool','{"role":"tool","tool_call_id":"c1","name":"shell","content":"ok"}',
+        (SELECT id FROM events WHERE correlation_id='web-hist-conv'));`);
+
+const hist = async (params) => {
+  const r = await fetch(`${BASE}/api/history?${new URLSearchParams(params)}`);
+  return { status: r.status, body: await r.json().catch(() => null) };
+};
+// the supervisor boots the actor on its next tick (with backoff if it raced
+// the approval), so the first probe retries until the view answers
+let agentsResp = null;
+await waitFor('history actor answering on the bus', async () => {
+  const { status, body } = await hist({ kind: 'agents' });
+  if (status === 200 && body?.ok) { agentsResp = body; return true; }
+  return false;
+}, 30000);
+if (agentsResp) {
+  const main = (agentsResp.agents ?? []).find((a) => a.agent === 'main');
+  main && main.sessions.includes('s-hist-test')
+    ? ok('agents query: main + seeded session')
+    : fail(`agents query wrong: ${JSON.stringify(agentsResp)}`);
+
+  const sess = await hist({ kind: 'sessions', agent: 'main' });
+  const s = (sess.body?.sessions ?? []).find((x) => x.session === 's-hist-test');
+  s && s.message_count === 3 && s.first_ts && s.last_ts
+    ? ok('sessions query: counts + timestamps')
+    : fail(`sessions query wrong: ${JSON.stringify(sess.body)}`);
+
+  const tr = await hist({ kind: 'transcript', session: 's-hist-test' });
+  const roles = (tr.body?.messages ?? []).map((m) => m.role).join(',');
+  roles === 'user,assistant,tool' && tr.body.has_more === false
+    && tr.body.messages[1].content.tool_calls?.[0]?.fn_name === 'shell'
+    ? ok('transcript query: roles in order, tool call intact')
+    : fail(`transcript wrong: ${JSON.stringify(tr.body)}`);
+
+  // pagination: limit=2 → the LAST two messages, has_more, then page back
+  const page = await hist({ kind: 'transcript', session: 's-hist-test', limit: '2' });
+  const pRoles = (page.body?.messages ?? []).map((m) => m.role).join(',');
+  pRoles === 'assistant,tool' && page.body.has_more === true
+    ? ok('transcript pagination: tail page + has_more')
+    : fail(`pagination wrong: ${JSON.stringify(page.body)}`);
+  const earlier = await hist({ kind: 'transcript', session: 's-hist-test', before_id: String(page.body?.messages?.[0]?.id ?? 0) });
+  (earlier.body?.messages ?? []).map((m) => m.role).join(',') === 'user' && earlier.body.has_more === false
+    ? ok('transcript pagination: before_id pages back')
+    : fail(`before_id wrong: ${JSON.stringify(earlier.body)}`);
+
+  const conv = await hist({ kind: 'conversation', correlation: 'web-hist-conv' });
+  (conv.body?.events ?? []).some((e) => e.type === 'in/agent/main' && e.payload?.prompt === 'hi')
+    ? ok('conversation query: events by correlation')
+    : fail(`conversation wrong: ${JSON.stringify(conv.body)}`);
+
+  const err = await hist({ kind: 'transcript' }); // missing {session}
+  err.status === 200 && err.body?.ok === false && /session/.test(err.body.error ?? '')
+    ? ok('view reports per-query errors on the response topic')
+    : fail(`error path wrong: ${err.status} ${JSON.stringify(err.body)}`);
+}
 
 // -- teardown --
 server.kill('SIGKILL');

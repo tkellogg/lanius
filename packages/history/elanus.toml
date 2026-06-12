@@ -1,0 +1,18 @@
+# history — the first reconstruction view (docs/bus.md [DECIDED]: the
+# in-process recorder is the flight recorder; reconstruction views are
+# USERLAND subscribers, never kernel). The ledger and transcripts in sqlite
+# are the truth; this package answers read-only queries about them over the
+# bus. Queries ride the obs plane on purpose — obs/# fans out without
+# touching the ledger, so a UI poking at history never becomes a ledger
+# event itself.
+#
+# Protocol: subscribe obs/ui/history/q, answer on obs/ui/history/r/<qid>
+# (qid minted by the requester, echoed back). See SKILL.md for query kinds.
+
+[request]
+subscribe = ["obs/ui/history/q"]
+publish   = ["obs/ui/history/r/#"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
