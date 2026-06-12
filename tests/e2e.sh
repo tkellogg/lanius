@@ -19,6 +19,7 @@ cleanup() {
   # later runs (random bus-section failures) — that bit us repeatedly.
   [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
   [ -n "${DAEMON2_PID:-}" ] && kill -9 "$DAEMON2_PID" 2>/dev/null
+  [ -n "${DAEMON3_PID:-}" ] && kill -9 "$DAEMON3_PID" 2>/dev/null
   [ -n "${LLM_PID:-}" ] && kill -9 "$LLM_PID" 2>/dev/null
   [ -n "${LLM2_PID:-}" ] && kill -9 "$LLM2_PID" 2>/dev/null
   [ -n "${LLM3_PID:-}" ] && kill -9 "$LLM3_PID" 2>/dev/null
@@ -604,7 +605,7 @@ echo "== 14. dev kit: init --kit, workdir, git-protect =="
 # chain is in-process. The fake LLM here reads its tool command from a file
 # so each assertion drives a different shell call.
 TMP2=$(mktemp -d /tmp/elanus-kit.XXXXXX)
-elanus init "$TMP2" --kit "$REPO/kits/dev" > "$TMP2/init.out" 2>&1 || fail "init --kit kits/dev: $(cat "$TMP2/init.out")"
+elanus init "$TMP2" --kit "$REPO/kits/dev" --copy > "$TMP2/init.out" 2>&1 || fail "init --kit kits/dev: $(cat "$TMP2/init.out")"
 [ -f "$TMP2/packages/git-protect/elanus.toml" ] && ok "git-protect materialized" || fail "git-protect not materialized"
 [ -x "$TMP2/packages/git-protect/scripts/gate" ] && ok "gate script executable" || fail "gate script not executable"
 [ -f "$TMP2/profiles/dev/profile.toml" ] && ok "kit profile copied" || fail "kit profile missing"
@@ -613,7 +614,7 @@ grep -q "approved git-protect blocking pre_tool_call" "$TMP2/init.out" \
 grep -q "dev kit" "$TMP2/init.out" && ok "kit README printed" || fail "kit README not printed"
 # Bare-name resolution: <repo>/kits found by walking up from the executable.
 TMP3=$(mktemp -d /tmp/elanus-kit3.XXXXXX)
-elanus init "$TMP3" --kit dev >/dev/null 2>&1 && [ -f "$TMP3/packages/git-protect/elanus.toml" ] \
+elanus init "$TMP3" --kit dev --copy >/dev/null 2>&1 && [ -f "$TMP3/packages/git-protect/elanus.toml" ] \
   && ok "bare kit name resolved against <repo>/kits" || fail "bare-name kit resolution"
 rm -rf "$TMP3"
 
@@ -712,7 +713,7 @@ echo "== 15. funnel kit: the variety ladder end to end =="
 # lines go in; two die on the regex rung, one survives to the scout, and
 # the KEEP lands in the human's inbox carrying the original item.
 TMP4=$(mktemp -d /tmp/elanus-funnel.XXXXXX)
-elanus init "$TMP4" --kit "$REPO/kits/funnel" > "$TMP4/init.out" 2>&1 || fail "init --kit kits/funnel: $(cat "$TMP4/init.out")"
+elanus init "$TMP4" --kit "$REPO/kits/funnel" --copy > "$TMP4/init.out" 2>&1 || fail "init --kit kits/funnel: $(cat "$TMP4/init.out")"
 [ -f "$TMP4/packages/funnel-intake/elanus.toml" ] && ok "funnel-intake materialized" || fail "funnel-intake not materialized"
 [ -f "$TMP4/packages/funnel-sift/rules.txt" ] && ok "sift rules file shipped" || fail "rules.txt missing"
 [ -f "$TMP4/profiles/scout/profile.toml" ] && ok "scout profile copied" || fail "scout profile missing"
@@ -813,6 +814,73 @@ sql4 "SELECT json_extract(payload,'\$.text') FROM events WHERE type='in/human/ow
   && ok "mail carries the scout's verdict + reason" || fail "KEEP mail malformed"
 NMAIL=$(sql4 "SELECT COUNT(*) FROM events WHERE type='in/human/owner'")
 [ "$NMAIL" = 1 ] && ok "exactly one KEEP mail (no reply-mail leak from the run)" || fail "expected 1 in/human/owner event, saw $NMAIL"
+
+echo "== 16. kit linking: elanus kit add, stale-at-dispatch, list/show =="
+# A kit installed by LINK (the default): packages stay in the kit dir,
+# discovery rides the default profile's package_path, and the hash pin
+# means an upstream edit re-enters review in the linking root — enforced
+# AT DISPATCH (fresh-hash check), so there is no window between the edit
+# and the next sync (docs/security.md entry 9).
+TMP5=$(mktemp -d /tmp/elanus-linkroot.XXXXXX)
+KITS5=$(mktemp -d /tmp/elanus-kits.XXXXXX)
+mkdir -p "$KITS5/linkkit/packages/linker/scripts"
+cat > "$KITS5/linkkit/packages/linker/elanus.toml" <<'EOF'
+[request]
+subscribe = ["in/package/linker/go"]
+[process]
+mode = "exec"
+run  = "scripts/main"
+EOF
+cat > "$KITS5/linkkit/packages/linker/scripts/main" <<'EOF'
+#!/bin/sh
+echo ran-v1 >> "$HARNESS_ROOT/linker.out"
+EOF
+chmod +x "$KITS5/linkkit/packages/linker/scripts/main"
+printf '# link kit\n\nthe linking starter\n' > "$KITS5/linkkit/README.md"
+
+elanus init "$TMP5" >/dev/null 2>&1 || fail "init link root"
+HARNESS_ROOT="$TMP5" elanus kit add "$KITS5/linkkit" > "$TMP5/kitadd.out" 2>&1 \
+  || fail "kit add: $(cat "$TMP5/kitadd.out")"
+[ ! -e "$TMP5/packages/linker" ] && ok "linked, not copied" || fail "kit add copied despite link default"
+grep -q "$KITS5/linkkit/packages" "$TMP5/profiles/default/profile.toml" \
+  && ok "package_path carries the link" || fail "package_path not updated"
+sql5() { sqlite3 "$TMP5/harness.db" "$1"; }
+[ "$(sql5 "SELECT decided_by FROM grants WHERE package='linker' AND state='approved' LIMIT 1")" = "kit:linkkit" ] \
+  && ok "grant provenance is kit:linkkit" || fail "kit provenance missing on grants"
+grep -q "the linking starter" "$TMP5/kitadd.out" && ok "kit add prints the README" || fail "README not printed"
+ELANUS_KIT_PATH="$KITS5" elanus kit list | grep -q '^linkkit ' \
+  && ok "kit list resolves via ELANUS_KIT_PATH" || fail "kit list missed linkkit"
+ELANUS_KIT_PATH="$KITS5" elanus kit show linkkit | grep -q "the linking starter" \
+  && ok "kit show prints without installing" || fail "kit show failed"
+
+# Dispatch flows through the linked dir.
+BUS_PORT3=$((BUS_PORT + 2))
+lsof -ti "tcp:$BUS_PORT3" 2>/dev/null | xargs kill -9 2>/dev/null
+printf 'enabled = true\nbind = "127.0.0.1:%s"\n' "$BUS_PORT3" > "$TMP5/bus.toml"
+HARNESS_ROOT="$TMP5" elanus daemon --interval-ms 200 >"$TMP5/daemon.log" 2>&1 &
+DAEMON3_PID=$!
+sleep 1
+HARNESS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
+wait_for "linked handler dispatched" "grep -q ran-v1 '$TMP5/linker.out'"
+
+# Upstream edit under a RUNNING daemon: the grant is pinned to the bytes,
+# so the edited script must not run — not even in the same tick.
+cat > "$KITS5/linkkit/packages/linker/scripts/main" <<'EOF'
+#!/bin/sh
+echo ran-v2 >> "$HARNESS_ROOT/linker.out"
+EOF
+chmod +x "$KITS5/linkkit/packages/linker/scripts/main"
+HARNESS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
+wait_for "drift re-entered review (requested rows under new hash)" \
+  "[ \"\$(sql5 \"SELECT COUNT(*) FROM grants WHERE package='linker' AND state='requested'\")\" -ge 1 ]"
+sleep 1
+grep -q ran-v2 "$TMP5/linker.out" 2>/dev/null \
+  && fail "edited linked script ran while stale" || ok "stale at dispatch: edited code did not run"
+
+# Re-approval heals: the same gesture as any package review.
+HARNESS_ROOT="$TMP5" elanus approve linker >/dev/null 2>&1 || fail "approve linker after edit"
+HARNESS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
+wait_for "re-approved linked handler ran new code" "grep -q ran-v2 '$TMP5/linker.out'"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

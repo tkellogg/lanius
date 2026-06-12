@@ -303,6 +303,20 @@ pub fn approved(conn: &Connection, package: &str, kind: &str) -> Result<Vec<Stri
     let Some(hash) = crate::db::kv_get(conn, &format!("pkg_hash:{package}"))? else {
         return Ok(Vec::new());
     };
+    approved_under(conn, package, &hash, kind)
+}
+
+/// Approved values keyed on an explicit hash. Callers holding a manifest
+/// freshly loaded from disk pass lm.hash: that pins the approval to the
+/// bytes about to execute, with no window between an edit and the next
+/// sync — load-bearing for LINKED packages, whose code can change under a
+/// running daemon (docs/security.md entry 9).
+pub fn approved_under(
+    conn: &Connection,
+    package: &str,
+    hash: &str,
+    kind: &str,
+) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT value FROM grants
          WHERE package=?1 AND manifest_hash=?2 AND kind=?3 AND state='approved' ORDER BY value",
@@ -311,6 +325,23 @@ pub fn approved(conn: &Connection, package: &str, kind: &str) -> Result<Vec<Stri
         .query_map(params![package, hash, kind], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(r)
+}
+
+/// Re-sync iff any discovered manifest's hash differs from the ledger's
+/// recorded pkg_hash. The dispatcher calls this each tick: reads + hashing
+/// only on the steady state, writes only when something actually changed —
+/// so an upstream edit to a linked package heals the kv (and re-enters
+/// review) within one tick instead of at the next daemon restart.
+pub fn sync_if_drifted(root: &Root, conn: &Connection) -> Result<()> {
+    for pkg in discover(root)? {
+        let Some(lm) = &pkg.manifest else { continue };
+        if crate::db::kv_get(conn, &format!("pkg_hash:{}", pkg.name))?.as_deref()
+            != Some(lm.hash.as_str())
+        {
+            return sync(root, conn);
+        }
+    }
+    Ok(())
 }
 
 /// Does this package's topic match any approved filter of `kind`?
@@ -336,7 +367,9 @@ pub fn matching_exec_handlers(
         if proc_.mode != "exec" {
             continue;
         }
-        let hit = approved(conn, &pkg.name, "subscribe")?
+        // Pin on the FRESH hash (the bytes about to run), not the kv: an
+        // edited script must be stale at dispatch even before any sync.
+        let hit = approved_under(conn, &pkg.name, &lm.hash, "subscribe")?
             .iter()
             .any(|f| crate::topic::matches(f, etype));
         if hit {

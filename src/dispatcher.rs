@@ -102,6 +102,11 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
 }
 
 fn tick(root: &Root, conn: &Connection, running: &mut Vec<Running>, actors: &mut Actors) -> Result<()> {
+    // Linked packages can change on disk under a running daemon; drift
+    // detection re-enters review within a tick (reads only when steady).
+    if let Err(e) = packages::sync_if_drifted(root, conn) {
+        eprintln!("[daemon] drift sync: {e:#}");
+    }
     tick_crons(root, conn)?;
     expire_deadlines(root, conn)?;
     announce_ledger_events(root, conn)?;

@@ -9,6 +9,7 @@ mod exec;
 mod hooks;
 mod human;
 mod initcmd;
+mod kit;
 mod manifest;
 mod packages;
 mod paths;
@@ -40,12 +41,22 @@ enum Cmd {
     /// Scaffold a harness root (db, trace log, default profile, stock skills)
     Init {
         dir: Option<PathBuf>,
-        /// Kit(s) to install: packages copied + granted, profiles copied if
-        /// missing, README printed. A value containing '/' is a path; a bare
-        /// name resolves against $ELANUS_KIT_PATH (colon-separated), then a
-        /// kits/ dir next to the executable's repo (dev builds). Repeatable.
+        /// Kit(s) to install: packages linked (or --copy vendored) + granted,
+        /// profiles copied if missing, README printed. A value containing '/'
+        /// is a path; a bare name resolves against $ELANUS_KIT_PATH
+        /// (colon-separated), then a kits/ dir next to the executable's repo
+        /// (dev builds). Repeatable.
         #[arg(long)]
         kit: Vec<String>,
+        /// Vendor kit packages into the root's packages/ instead of linking
+        /// the kit's dir onto the package path.
+        #[arg(long)]
+        copy: bool,
+    },
+    /// Kits: starter packs of packages + profiles (add / list / show)
+    Kit {
+        #[command(subcommand)]
+        cmd: KitCmd,
     },
     /// Run the dispatcher: poll events, fork handlers, record exits
     Daemon {
@@ -133,6 +144,24 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum KitCmd {
+    /// Install a kit into this root: packages linked onto the package path
+    /// (or --copy vendored), profiles copied if missing, packages granted
+    /// with provenance kit:<name>, README printed
+    Add {
+        /// Kit name (resolved via $ELANUS_KIT_PATH, then <repo>/kits) or path
+        kit: String,
+        /// Vendor packages into the root's packages/ instead of linking
+        #[arg(long)]
+        copy: bool,
+    },
+    /// Kits installable right now, in resolution order (first hit wins)
+    List,
+    /// Print a kit's README without installing it
+    Show { kit: String },
+}
+
+#[derive(Subcommand)]
 enum BusCmd {
     /// Publish once; QoS 1 (default) waits for the broker to accept
     Pub {
@@ -200,7 +229,7 @@ fn run(cli: Cli) -> Result<()> {
     // .env once resolved. Real environment always wins over both.
     dotenv::load(std::path::Path::new(".env"));
     match cli.cmd {
-        Cmd::Init { ref dir, ref kit } => {
+        Cmd::Init { ref dir, ref kit, copy } => {
             // Same resolution order as every other command: explicit arg >
             // HARNESS_ROOT > ~/.elanus/root. Init once targeted cwd while
             // the env var pointed elsewhere, littering template roots into
@@ -209,7 +238,7 @@ fn run(cli: Cli) -> Result<()> {
                 Some(d) => d,
                 None => paths::default_root()?,
             };
-            return initcmd::init(dir, kit.clone());
+            return initcmd::init(dir, kit.clone(), copy);
         }
         _ => {}
     }
@@ -311,6 +340,27 @@ fn run(cli: Cli) -> Result<()> {
                 );
             }
         }
+        Cmd::Kit { cmd } => match cmd {
+            KitCmd::Add { kit: kref, copy } => {
+                let dir = kit::resolve(&kref)?;
+                let conn = open(&root)?;
+                let mode = if copy { kit::Mode::Copy } else { kit::Mode::Link };
+                let readme = kit::install(&root, &conn, &dir, mode)?;
+                println!("installed kit from {}", dir.display());
+                if let Some(r) = readme {
+                    println!();
+                    println!("{}", r.trim_end());
+                }
+            }
+            KitCmd::List => {
+                for (name, dir, hook) in kit::list()? {
+                    println!("{name:<16} {hook}  [{}]", dir.display());
+                }
+            }
+            KitCmd::Show { kit: kref } => {
+                print!("{}", kit::show(&kref)?);
+            }
+        },
         Cmd::Approve { name } => {
             let conn = open(&root)?;
             packages::decide(&root, &conn, &name, true, "cli")?;
