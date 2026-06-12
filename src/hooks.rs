@@ -281,8 +281,8 @@ mod tests {
         let (root, conn) = setup();
         let h1 = write_hook(&root, "deny.sh", "echo 'nope: policy says no'; exit 1");
         let h2 = write_hook(&root, "never.sh", "echo '{\"x\":2}'");
-        register(&conn, "pre_tool_call", &h1, 10, 1000, "deny", "#");
-        register(&conn, "pre_tool_call", &h2, 20, 1000, "deny", "#");
+        register(&conn, "pre_tool_call", &h1, 10, 10_000, "deny", "#");
+        register(&conn, "pre_tool_call", &h2, 20, 10_000, "deny", "#");
         let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({"x":1}), &trace::Ids::default()).unwrap();
         assert!(!d.allow);
         assert_eq!(d.denied_by.as_deref(), Some(&*format!("test:{h1}")));
@@ -300,8 +300,8 @@ mod tests {
             "check.sh",
             "grep -q '\"x\":2' || exit 1",
         );
-        register(&conn, "pre_tool_call", &h1, 10, 1000, "deny", "#");
-        register(&conn, "pre_tool_call", &h2, 20, 1000, "deny", "#");
+        register(&conn, "pre_tool_call", &h1, 10, 10_000, "deny", "#");
+        register(&conn, "pre_tool_call", &h2, 20, 10_000, "deny", "#");
         let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({"x":1}), &trace::Ids::default()).unwrap();
         assert!(d.allow);
         assert_eq!(d.subject, json!({"x":2}));
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn spawn_error_respects_declaration() {
         let (root, conn) = setup();
-        register(&conn, "pre_tool_call", "does/not/exist", 10, 1000, "deny", "#");
+        register(&conn, "pre_tool_call", "does/not/exist", 10, 10_000, "deny", "#");
         let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({}), &trace::Ids::default()).unwrap();
         assert!(!d.allow);
     }
@@ -334,7 +334,7 @@ mod tests {
     fn match_filter_scopes_hook() {
         let (root, conn) = setup();
         let deny = write_hook(&root, "deny.sh", "exit 1");
-        register(&conn, "pre_tool_call", &deny, 10, 1000, "deny", "shell");
+        register(&conn, "pre_tool_call", &deny, 10, 10_000, "deny", "shell");
         let d = run_chain(&root, &conn, "pre_tool_call", "emit_event", json!({}), &trace::Ids::default()).unwrap();
         assert!(d.allow, "filter 'shell' must not match tool 'emit_event'");
         let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({}), &trace::Ids::default()).unwrap();
@@ -345,7 +345,7 @@ mod tests {
     fn debug_noise_is_not_a_rewrite() {
         let (root, conn) = setup();
         let noisy = write_hook(&root, "noisy.sh", "echo 'just logging something'");
-        register(&conn, "pre_tool_call", &noisy, 10, 1000, "deny", "#");
+        register(&conn, "pre_tool_call", &noisy, 10, 10_000, "deny", "#");
         let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({"k":"v"}), &trace::Ids::default()).unwrap();
         assert!(d.allow);
         assert_eq!(d.subject, json!({"k":"v"}));
