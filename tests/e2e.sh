@@ -633,8 +633,13 @@ class H(BaseHTTPRequestHandler):
         else:
             with open(sys.argv[2]) as f:
                 cmd = f.read().strip()
-            content = [{"type": "tool_use", "id": "tc1", "name": "shell",
-                        "input": {"command": cmd}}]
+            if cmd.startswith("TOOL:"):
+                spec = json.loads(cmd[5:])
+                content = [{"type": "tool_use", "id": "tc1",
+                            "name": spec["name"], "input": spec["input"]}]
+            else:
+                content = [{"type": "tool_use", "id": "tc1", "name": "shell",
+                            "input": {"command": cmd}}]
             stop = "tool_use"
         resp = json.dumps({"id": "msg_1", "type": "message", "role": "assistant",
                            "model": "claude-3-5-haiku-latest", "content": content,
@@ -766,6 +771,70 @@ HARNESS_ROOT="$TMP2" elanus approve recent-history >/dev/null 2>&1 || fail "appr
 HARNESS_ROOT="$TMP2" elanus exec "go" --session kit9 > "$TMP2/exec9.out" 2>&1 || fail "exec (recent-history): $(cat "$TMP2/exec9.out")"
 grep -q "blue key is under the mat" "$TMP2/llm.body" \
   && ok "recent mail reconstructed into the prompt" || fail "recent-history block missing from llm request"
+
+# (h) MCP, the border protocol (src/mcp.rs): an approved [[mcp]] server's
+# tools enter the model's tool array as <server>__<tool>, a call round-trips
+# over stdio JSON-RPC, and changed tool descriptions (tool poisoning) are
+# refused until the human re-approves (TOFU pin, cleared by decide).
+mkdir -p "$TMP2/packages/adderpkg/scripts"
+cat > "$TMP2/packages/adderpkg/elanus.toml" <<'EOF'
+[[mcp]]
+name = "adder"
+run  = "scripts/server"
+EOF
+cat > "$TMP2/packages/adderpkg/scripts/server" <<'EOF'
+#!/usr/bin/env python3
+import json, sys
+DESC = "add two integers"
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method")
+    if msg.get("id") is None:
+        continue
+    if m == "initialize":
+        r = {"protocolVersion": msg["params"]["protocolVersion"],
+             "capabilities": {"tools": {}}, "serverInfo": {"name": "adder", "version": "0"}}
+    elif m == "tools/list":
+        r = {"tools": [{"name": "add", "description": DESC,
+                        "inputSchema": {"type": "object",
+                                        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                                        "required": ["a", "b"]}}]}
+    elif m == "tools/call":
+        a = msg["params"]["arguments"]
+        r = {"content": [{"type": "text", "text": str(a["a"] + a["b"])}], "isError": False}
+    else:
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"],
+                                     "error": {"code": -32601, "message": "nope"}}) + "\n")
+        sys.stdout.flush()
+        continue
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": r}) + "\n")
+    sys.stdout.flush()
+EOF
+chmod +x "$TMP2/packages/adderpkg/scripts/server"
+
+printf 'true' > "$TMP2/cmd.txt"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session mcp1 > "$TMP2/execm1.out" 2>&1 || fail "exec (unapproved mcp): $(cat "$TMP2/execm1.out")"
+grep -q "adder__add" "$TMP2/llm.body" && fail "unapproved mcp tools reached the model" \
+  || ok "requested mcp server is inert"
+HARNESS_ROOT="$TMP2" elanus approve adderpkg >/dev/null 2>&1 || fail "approve adderpkg"
+printf 'TOOL:{"name":"adder__add","input":{"a":19,"b":23}}' > "$TMP2/cmd.txt"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session mcp2 > "$TMP2/execm2.out" 2>&1 || fail "exec (mcp call): $(cat "$TMP2/execm2.out")"
+grep -q '"adder__add"' "$TMP2/llm.body" && ok "mcp tools in the model's tool array" || fail "adder__add not offered to the model"
+grep -q '"content":"42"' "$TMP2/llm.body" || grep -q '"content": *"42"' "$TMP2/llm.body" \
+  && ok "mcp tool call round-tripped (19+23=42 in the tool_result)" || fail "tool_result 42 missing from llm request"
+
+# Tool poisoning: change the description in place (same code_hash would be a
+# lie — so this edits the file, which ALSO re-gates the grant; prove the pin
+# alone by tampering the kv instead).
+sqlite3 "$TMP2/harness.db" "UPDATE kv SET value='tampered' WHERE key='mcp_tools:adderpkg:adder'"
+printf 'true' > "$TMP2/cmd.txt"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session mcp3 > "$TMP2/execm3.out" 2>&1 || fail "exec (pin mismatch): $(cat "$TMP2/execm3.out")"
+grep -q "adder__add" "$TMP2/llm.body" && fail "changed tools served despite pin mismatch" \
+  || ok "pin mismatch refuses the server's tools"
+grep -q "TOOLS CHANGED" "$TMP2/execm3.out" && ok "refusal is loud and names the cure" || fail "no loud refusal"
+HARNESS_ROOT="$TMP2" elanus approve adderpkg >/dev/null 2>&1 || fail "re-approve adderpkg"
+HARNESS_ROOT="$TMP2" elanus exec "go" --session mcp4 > "$TMP2/execm4.out" 2>&1 || fail "exec (re-pinned): $(cat "$TMP2/execm4.out")"
+grep -q "adder__add" "$TMP2/llm.body" && ok "re-approval re-pins (tools restored)" || fail "tools not restored after re-approval"
 
 echo "== 15. funnel kit: the variety ladder end to end =="
 # Fresh root + its own daemon/broker: intake (daemon actor) -> sift (regex,

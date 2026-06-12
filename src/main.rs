@@ -12,6 +12,7 @@ mod human;
 mod initcmd;
 mod kit;
 mod manifest;
+mod mcp;
 mod packages;
 mod paths;
 mod profile;

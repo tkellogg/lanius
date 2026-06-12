@@ -126,6 +126,9 @@ pub fn sync(root: &Root, conn: &Connection) -> Result<()> {
             // runs only approved (docs/context.md), same shape as hooks
             // riding the 'blocking' kind.
             .chain(m.stage.iter().map(|s| ("stage", &s.name)))
+            // An [[mcp]] server likewise: third-party tools enter the
+            // model's tool array only approved (src/mcp.rs).
+            .chain(m.mcp.iter().map(|s| ("mcp", &s.name)))
             .collect();
         // process.http = true is likewise a request: serving an HTTP
         // endpoint (loopback, harness-negotiated port) is a capability the
@@ -281,6 +284,13 @@ pub fn decide(root: &Root, conn: &Connection, name: &str, approve: bool, by: &st
             .collect::<rusqlite::Result<Vec<_>>>()?;
         r
     };
+    // The approval gesture re-pins MCP tool descriptions even when no grant
+    // rows are pending — "review and `elanus approve` again" is the cure for
+    // a server whose tools changed (src/mcp.rs TOFU pin), and that package's
+    // grants are typically already approved.
+    if approve {
+        crate::mcp::clear_pins(conn, name)?;
+    }
     if rows.is_empty() {
         println!("{name}: nothing {from}");
         return Ok(());

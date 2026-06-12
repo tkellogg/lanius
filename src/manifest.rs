@@ -29,6 +29,8 @@ pub struct Manifest {
     #[serde(default)]
     pub stage: Vec<StageDecl>,
     #[serde(default)]
+    pub mcp: Vec<McpDecl>,
+    #[serde(default)]
     pub throttle: BTreeMap<String, ThrottleDecl>,
 }
 
@@ -157,6 +159,27 @@ fn default_stage_mode() -> String {
     "exec".into()
 }
 
+/// A third-party MCP tool server (src/mcp.rs — MCP is a border protocol;
+/// first-party mechanisms use the bus/HTTP/skills). Declaring one registers
+/// a grant request (kind "mcp"); the server spawns only approved, inside
+/// the agent's cage, and its tools enter the model's tool array as
+/// `<name>__<tool>`.
+#[derive(Debug, Deserialize)]
+pub struct McpDecl {
+    pub name: String, // one topic level; namespaces the server's tools
+    pub run: String,  // executable path relative to the package dir
+    /// Extra argv (e.g. for npx-style launchers wrapped in scripts).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// "stdio" today; "http" (streamable, negotiated port) is designed.
+    #[serde(default = "default_mcp_transport")]
+    pub transport: String,
+}
+
+fn default_mcp_transport() -> String {
+    "stdio".into()
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ThrottleDecl {
     pub max_concurrent: Option<i64>,
@@ -212,6 +235,14 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
             anyhow::bail!("{}: stage name {:?} must be one topic level (no + # /)", f.display(), s.name);
         }
     }
+    for s in &m.mcp {
+        if s.transport != "stdio" {
+            anyhow::bail!("{}: mcp.transport {:?} not supported yet (stdio only; http is designed)", f.display(), s.transport);
+        }
+        if !crate::topic::valid_name(&s.name) || s.name.contains('/') || s.name.contains("__") {
+            anyhow::bail!("{}: mcp name {:?} must be one topic level without '__' (it namespaces tools)", f.display(), s.name);
+        }
+    }
     // code_hash = each referenced executable's bytes in a fixed order
     // (relative path + contents, so a rename is also a change). A missing
     // script hashes as its path + a sentinel — its later appearance is itself
@@ -223,6 +254,7 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
     runs.extend(m.hook.iter().map(|h| h.run.clone()));
     runs.extend(m.provider.iter().map(|p| p.run.clone()));
     runs.extend(m.stage.iter().map(|s| s.run.clone()));
+    runs.extend(m.mcp.iter().map(|s| s.run.clone()));
     runs.sort();
     runs.dedup();
     let mut code = Sha256::new();

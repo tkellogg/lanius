@@ -135,7 +135,12 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
     let cage = sandbox::Cage::from_profile(root, &prof.sandbox);
     let client = build_client(&prof);
     let model = prof.model.model.clone();
-    let tools = tool_defs();
+    // MCP servers (border protocol, src/mcp.rs): approved third-party tool
+    // servers spawn inside the agent's cage for the run; their tools join
+    // the array as <server>__<tool>. Failures degrade loudly, never fatal.
+    let mcp_pool = crate::mcp::Pool::load(root, &conn, &prof, &cage);
+    let mut tools = tool_defs();
+    tools.extend(mcp_pool.tool_defs());
     let root_type = match event_id {
         Some(id) => db::root_type(&conn, id).unwrap_or_else(|_| "cli".into()),
         None => "cli".into(),
@@ -320,7 +325,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
                 )?;
                 continue;
             }
-            match run_tool(root, &conn, &cage, &prof, &session, event_id, in_handler, &eff, &mut self_emitted) {
+            match run_tool(root, &conn, &cage, &prof, &session, event_id, in_handler, &eff, &mut self_emitted, &mcp_pool) {
                 ToolOutcome::Output(result) => {
                     // Hook plane, post_tool_call: may scrub/rewrite the result
                     // or veto it (the model then sees the denial, not the data).
@@ -888,6 +893,7 @@ fn run_tool(
     in_handler: bool,
     call: &ToolCall,
     self_emitted: &mut HashSet<i64>,
+    mcp_pool: &crate::mcp::Pool,
 ) -> ToolOutcome {
     let args = &call.fn_arguments;
     let err = |msg: String| ToolOutcome::Output(json!({ "error": msg }).to_string());
@@ -1013,7 +1019,14 @@ fn run_tool(
             eprintln!("suspending: waiting on human (ask #{ask_id}, correlation {corr})");
             ToolOutcome::Suspend
         }
-        other => err(format!("unknown tool: {other}")),
+        other => {
+            // Namespaced MCP tools (<server>__<tool>) route to the pool; the
+            // pool answers None only when no approved server claims the name.
+            if let Some(out) = mcp_pool.call(other, args) {
+                return ToolOutcome::Output(out);
+            }
+            err(format!("unknown tool: {other}"))
+        }
     }
 }
 
