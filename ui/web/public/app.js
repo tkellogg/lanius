@@ -46,12 +46,31 @@ const agentOf = (topic) => {
 };
 
 // ---------- nav ----------
-function touchAgent(name, { live = false, sessions = [] } = {}) {
+function touchAgent(name, { live = false, sessions = [], profile = null } = {}) {
   if (!name) return;
   let a = agents.get(name);
-  if (!a) { a = { sessions: new Set(), live: false }; agents.set(name, a); }
+  if (!a) { a = { sessions: new Set(), live: false, profile: null }; agents.set(name, a); }
   if (live) a.live = true;
+  if (profile) a.profile = profile;
   for (const s of sessions) a.sessions.add(s);
+}
+
+// Disk is an agent source too: every profile IS an agent identity, visible
+// before it ever speaks. A blank root shows its default agent immediately.
+let diskProfiles = [];
+async function loadDiskAgents() {
+  try {
+    const r = await fetch('/api/admin/agents');
+    const j = await r.json();
+    if (!j.ok) return;
+    diskProfiles = j.profiles ?? [];
+    for (const p of diskProfiles) touchAgent(p.agent, { profile: p.profile });
+    renderNav();
+  } catch { /* admin endpoints absent: live-only nav, same as before */ }
+}
+function profileOf(agentName) {
+  return diskProfiles.find((p) => p.agent === agentName)
+    ?? diskProfiles.find((p) => p.profile === agentName) ?? null;
 }
 
 function renderNav() {
@@ -91,6 +110,23 @@ $('#nav-list').addEventListener('keydown', (e) => {
 });
 $('.nav-signals').onclick = () => selectSignals();
 $('.nav-setup').onclick = () => selectSetup();
+$('#nav-new-agent').onclick = () => { selectSetup(); $('#na-name').focus(); };
+$('#na-create').onclick = async () => {
+  const name = $('#na-name').value.trim();
+  const model = $('#na-model').value.trim();
+  const note = $('#na-note');
+  if (!name) { note.textContent = 'name it first'; return; }
+  note.textContent = 'creating…';
+  const r = await fetch('/api/admin/agents', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name, ...(model ? { model } : {}) }),
+  }).then((x) => x.json()).catch(() => ({ ok: false, error: 'unreachable' }));
+  if (!r.ok) { note.textContent = r.error ?? 'failed'; return; }
+  note.textContent = '';
+  $('#na-name').value = ''; $('#na-model').value = '';
+  await loadDiskAgents();
+  selectAgent(name, 'configure');
+};
 
 // ---------- view switching ----------
 function show(view) {
@@ -98,6 +134,7 @@ function show(view) {
   $('#view-sessions').hidden = view !== 'sessions';
   $('#view-rail').hidden = view !== 'rail';
   $('#view-setup').hidden = view !== 'setup';
+  $('#view-configure').hidden = view !== 'configure';
 }
 
 function selectSignals() {
@@ -132,26 +169,49 @@ async function loadSetup() {
   kitsBox.textContent = 'resolving…';
   pendBox.textContent = 'reading the ledger…';
 
-  const [kits, pkgs, prof] = await Promise.all([
-    adminGet('kits'), adminGet('packages'), adminGet('profile?name=default'),
-  ]);
+  const [kits, pkgs] = await Promise.all([adminGet('kits'), adminGet('packages')]);
+  await loadDiskAgents();
+
+  // Which kits already touched this root? Provenance is the ledger's
+  // answer (decided_by = kit:<name>), staged shows as pending requests.
+  const provenance = new Set();
+  for (const p of pkgs.packages ?? [])
+    for (const g of p.grants ?? [])
+      if (g.decided_by?.startsWith('kit:')) provenance.add(g.decided_by.slice(4));
 
   kitsBox.textContent = '';
   for (const k of kits.kits ?? []) {
     const row = el('div', 'setup-kit');
-    row.appendChild(el('span', 'setup-kit-name', k.name));
-    row.appendChild(el('span', 'dim-note', k.hook || ''));
-    const b = el('button', '', 'stage');
-    b.onclick = async () => {
-      b.disabled = true; b.textContent = 'staging…';
+    const head = el('div', 'setup-kit-head');
+    head.appendChild(el('span', 'setup-kit-name', k.name));
+    head.appendChild(el('span', 'setup-kit-hook dim-note', k.hook || ''));
+    if (provenance.has(k.name)) head.appendChild(el('span', 'badge', 'installed'));
+    const readmeBtn = el('button', 'ghost', 'readme');
+    const stageBtn = el('button', '', provenance.has(k.name) ? 'stage again' : 'stage');
+    head.appendChild(readmeBtn);
+    head.appendChild(stageBtn);
+    row.appendChild(head);
+    const pre = el('pre', 'setup-readme');
+    pre.hidden = true;
+    row.appendChild(pre);
+    readmeBtn.onclick = async () => {
+      if (pre.hidden && !pre.textContent) {
+        pre.textContent = 'fetching…';
+        const r = await fetch(`/api/admin/kits/readme?kit=${encodeURIComponent(k.name)}`)
+          .then((x) => x.json()).catch(() => ({ ok: false }));
+        pre.textContent = r.ok ? r.readme : (r.error ?? 'no readme');
+      }
+      pre.hidden = !pre.hidden;
+    };
+    stageBtn.onclick = async () => {
+      stageBtn.disabled = true; stageBtn.textContent = 'staging…';
       const r = await fetch('/api/admin/kits/add', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ kit: k.name }),
       }).then((x) => x.json()).catch(() => ({ ok: false }));
-      b.textContent = r.ok ? 'staged' : 'failed';
+      stageBtn.textContent = r.ok ? 'staged' : 'failed';
       if (r.ok) loadSetup();
     };
-    row.appendChild(b);
     kitsBox.appendChild(row);
   }
   if (!(kits.kits ?? []).length) kitsBox.appendChild(el('div', 'dim-note', 'no kits resolvable — set ELANUS_KIT_PATH where the server runs'));
@@ -172,20 +232,7 @@ async function loadSetup() {
     pendBox.appendChild(card);
   }
   if (!pendingAny) pendBox.appendChild(el('div', 'dim-note', 'nothing pending — the ledger is at rest'));
-
-  if (prof.ok) $('#setup-profile').value = prof.toml;
-  else $('#setup-profile').value = '';
 }
-
-$('#setup-profile-save').onclick = async () => {
-  const note = $('#setup-profile-note');
-  note.textContent = 'saving…';
-  const r = await fetch('/api/admin/profile?name=default', {
-    method: 'PUT', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ toml: $('#setup-profile').value }),
-  }).then((x) => x.json()).catch(() => ({ ok: false }));
-  note.textContent = r.ok ? 'saved — picked up on the next run' : 'save failed';
-};
 
 function selectAgent(name, tab) {
   const prev = sel;
@@ -203,6 +250,10 @@ function selectAgent(name, tab) {
     $('#stage-note').textContent = 'transcripts from the ledger, via the history view';
     show('sessions');
     loadSessions(name);
+  } else if (sel.tab === 'configure') {
+    $('#stage-note').textContent = 'who this agent is — model, mailbox, visibility';
+    show('configure');
+    loadConfigure(name);
   } else {
     $('#stage-note').textContent = `obs/agent/${name}/# — this agent's telemetry`;
     setFilter('all');
@@ -210,6 +261,74 @@ function selectAgent(name, tab) {
     renderRail();
   }
 }
+
+// ---------- configure (per-agent identity) ----------
+let cfgProfile = null; // the profile NAME backing the form
+async function loadConfigure(agentName) {
+  const p = profileOf(agentName);
+  cfgProfile = p?.profile ?? agentName;
+  $('#cfg-note').textContent = '';
+  $('#cfg-file').textContent = `profiles/${cfgProfile}/profile.toml`;
+  const r = await fetch(`/api/admin/profile?name=${encodeURIComponent(cfgProfile)}`)
+    .then((x) => x.json()).catch(() => ({ ok: false }));
+  if (!r.ok) {
+    $('#cfg-note').textContent = `no profile file for ${cfgProfile} — this agent only exists as traffic; create a profile to configure it`;
+  }
+  $('#cfg-toml').value = r.ok ? r.toml : '';
+  // The parsed view comes from profile list (same loader the kernel uses).
+  await loadDiskAgents();
+  const d = profileOf(agentName) ?? {};
+  $('#cfg-agent').value = d.agent ?? agentName;
+  $('#cfg-model').value = d.model ?? '';
+  $('#cfg-turns').value = d.max_turns ?? '';
+  $('#cfg-workdir').value = d.workdir ?? '';
+  $('#cfg-include').value = (d.skills?.include ?? []).join(', ');
+  $('#cfg-exclude').value = (d.skills?.exclude ?? []).join(', ');
+}
+
+$('#cfg-save').onclick = async () => {
+  if (!cfgProfile) return;
+  const note = $('#cfg-note');
+  note.textContent = 'saving…';
+  const set = {};
+  const newAgent = $('#cfg-agent').value.trim();
+  if (newAgent) set['agent'] = newAgent;
+  if ($('#cfg-model').value.trim()) set['model.model'] = $('#cfg-model').value.trim();
+  if ($('#cfg-turns').value) set['model.max_turns'] = Number($('#cfg-turns').value);
+  set['sandbox.workdir'] = $('#cfg-workdir').value.trim();
+  const arr = (v) => v.split(',').map((x) => x.trim()).filter(Boolean);
+  set['skills.include'] = JSON.stringify(arr($('#cfg-include').value).length ? arr($('#cfg-include').value) : ['#']).replaceAll('"', '\u0022');
+  const r = await fetch('/api/admin/agents/set', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: cfgProfile, set: prunedSet(set) }),
+  }).then((x) => x.json()).catch(() => ({ ok: false, error: 'unreachable' }));
+  if (!r.ok) { note.textContent = r.error ?? 'save failed'; return; }
+  note.textContent = 'saved — applies on the next run';
+  const renamed = newAgent && sel.kind === 'agent' && newAgent !== sel.agent;
+  await loadDiskAgents();
+  if (renamed) selectAgent(newAgent, 'configure');
+};
+// Drop empty-string entries except workdir-clearing, and send arrays as TOML text.
+function prunedSet(set) {
+  const out = {};
+  for (const [k, v] of Object.entries(set)) {
+    if (v === '' && k !== 'sandbox.workdir') continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+$('#cfg-toml-save').onclick = async () => {
+  if (!cfgProfile) return;
+  const note = $('#cfg-toml-note');
+  note.textContent = 'saving…';
+  const r = await fetch(`/api/admin/profile?name=${encodeURIComponent(cfgProfile)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ toml: $('#cfg-toml').value }),
+  }).then((x) => x.json()).catch(() => ({ ok: false }));
+  note.textContent = r.ok ? 'saved' : 'save failed';
+  if (r.ok) loadConfigure(sel.agent);
+};
 
 for (const b of document.querySelectorAll('#agent-tabs button')) {
   b.onclick = () => { if (sel.kind === 'agent') selectAgent(sel.agent, b.dataset.tab); };
@@ -644,7 +763,10 @@ es.onerror = () => {
   $('#conn-text').textContent = 'server lost — retrying';
 };
 
-// boot: signals view + history probe (re-probed so a later approve heals us)
+// boot: signals view + disk agents (profiles ARE agents — a silent root
+// still shows its identities) + history probe (re-probed so a later
+// approve heals us)
 selectSignals();
+loadDiskAgents();
 refreshAgents();
 setInterval(refreshAgents, 15000);

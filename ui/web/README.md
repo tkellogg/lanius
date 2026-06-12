@@ -5,14 +5,32 @@ carries over one hop: browsers can't speak raw TCP MQTT, so `server.mjs` is
 the ordinary anonymous loopback MQTT 5 client, and the browser talks to *it*
 — bus messages relayed over SSE, publishes accepted over POST, history
 queries brokered as request/response pairs on the bus. No sqlite, no
-trace.jsonl, no privileged access. The only filesystem touches: this
-directory's static files and `<root>/bus.toml` for broker discovery.
+trace.jsonl beyond the admin seam below. The filesystem touches: this
+directory's static files, `<root>/bus.toml` for broker discovery, profile
+files, and the run/ dir for the history endpoint.
 
-**Authority: read-and-converse only.** There are deliberately no
-approve/revoke/kill affordances here — every client on the loopback broker
-is currently anonymous, so a web page must not be able to do anything you'd
-want an identity trail for. Admin stays in the CLI until the identity model
-lands (docs/bus.md, security section / open question 7).
+**Authority: read, converse & STAGE — commits stay in the CLI.** The admin
+seam (`/api/admin/*`) shells out to the `elanus` CLI, so this server adds
+no authority of its own and there is one code path for every human
+gesture:
+
+- **Agents are profiles.** The nav lists every profile on disk (a silent
+  root still shows its identities); *new agent* scaffolds one
+  (`elanus profile new` — instant, profiles are your files, no review);
+  the per-agent **configure** tab edits identity as a form — model, turn
+  budget, workdir, skill visibility, and the agent name itself (renaming
+  moves the mailbox to `in/agent/<new>` going forward; ledger history
+  under the old noun stays). Every form save goes through
+  `elanus profile set`: comments survive, and a set that wouldn't load is
+  refused before it lands.
+- **Kits stage, never land.** *kits & review* lists resolvable kits with
+  README previews and an `installed` badge from grant provenance; staging
+  runs `elanus kit add --pending` — every grant sits in the pending queue,
+  which renders each request with a click-to-copy `elanus approve <pkg>`.
+  Deliberately a command, not a button: every client on the loopback
+  broker is anonymous, so a web page must not commit anything you'd want
+  an identity trail for (docs/security.md entries 4–5). When the identity
+  model lands, the queue graduates to in-UI commit without redesign.
 
 ## Run
 

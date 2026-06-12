@@ -138,6 +138,36 @@ function sendJson(res, code, body) {
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 async function handleAdmin(url, req, res, body) {
+  if (url.pathname === '/api/admin/agents' && req.method === 'GET') {
+    const r = await cli(['profile', 'list']);
+    return sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, profiles: jsonLines(r.stdout) } : { ok: false, error: r.stderr || r.error });
+  }
+  if (url.pathname === '/api/admin/agents' && req.method === 'POST') {
+    const { name, agent, model } = body ?? {};
+    if (typeof name !== 'string' || !PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: 'bad profile name' });
+    const args = ['profile', 'new', name];
+    if (agent) args.push('--agent', String(agent));
+    if (model) args.push('--model', String(model));
+    const r = await cli(args);
+    return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
+  }
+  if (url.pathname === '/api/admin/agents/set' && req.method === 'POST') {
+    // {name, set: {"agent": "kestrel", "model.max_turns": 12, ...}} →
+    // elanus profile set <name> k=v... — the kernel owns the TOML edit
+    // (comments survive, the result is validated before it lands).
+    const { name, set } = body ?? {};
+    if (typeof name !== 'string' || !PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: 'bad profile name' });
+    if (!set || typeof set !== 'object' || !Object.keys(set).length) return sendJson(res, 400, { ok: false, error: 'need {set}' });
+    const pairs = Object.entries(set).map(([k, v]) => `${k}=${typeof v === 'string' ? JSON.stringify(v) : v}`);
+    const r = await cli(['profile', 'set', name, ...pairs]);
+    return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
+  }
+  if (url.pathname === '/api/admin/kits/readme' && req.method === 'GET') {
+    const kit = url.searchParams.get('kit');
+    if (!kit) return sendJson(res, 400, { ok: false, error: 'need ?kit=' });
+    const r = await cli(['kit', 'show', kit]);
+    return sendJson(res, r.ok ? 200 : 404, r.ok ? { ok: true, readme: r.stdout } : { ok: false, error: r.stderr || r.error });
+  }
   if (url.pathname === '/api/admin/kits' && req.method === 'GET') {
     const r = await cli(['kit', 'list', '--json']);
     return sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, kits: jsonLines(r.stdout) } : { ok: false, error: r.stderr || r.error });

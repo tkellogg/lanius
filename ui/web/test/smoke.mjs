@@ -237,6 +237,35 @@ const prof1 = await (await fetch(`${BASE}/api/admin/profile?name=default`)).json
 const trav = await fetch(`${BASE}/api/admin/profile?name=../evil`);
 trav.status === 400 ? ok('admin: profile name traversal rejected') : fail(`traversal got ${trav.status}`);
 
+// 9. agent management: profiles ARE agents — list them from disk, create
+// one, reconfigure it, rename it (the kernel's profile CLI does the toml).
+const ags0 = await (await fetch(`${BASE}/api/admin/agents`)).json();
+ags0.ok && ags0.profiles.some((p) => p.profile === 'default')
+  ? ok('admin: agents listed from profiles on disk')
+  : fail(`agents list wrong: ${JSON.stringify(ags0)}`);
+const mk = await (await fetch(`${BASE}/api/admin/agents`, {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ name: 'kestrel', model: 'claude-haiku-4-5-20251001' }),
+})).json();
+mk.ok ? ok('admin: agent created') : fail(`create failed: ${JSON.stringify(mk)}`);
+const setr = await (await fetch(`${BASE}/api/admin/agents/set`, {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ name: 'kestrel', set: { agent: 'falcon', 'model.max_turns': 9 } }),
+})).json();
+setr.ok ? ok('admin: agent reconfigured + renamed') : fail(`set failed: ${JSON.stringify(setr)}`);
+const ags1 = await (await fetch(`${BASE}/api/admin/agents`)).json();
+const kf = (ags1.profiles ?? []).find((p) => p.profile === 'kestrel');
+kf && kf.agent === 'falcon' && kf.max_turns === 9 && kf.model === 'claude-haiku-4-5-20251001'
+  ? ok('admin: rename + knobs visible through the kernel loader')
+  : fail(`reloaded profile wrong: ${JSON.stringify(kf)}`);
+const badset = await fetch(`${BASE}/api/admin/agents/set`, {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ name: 'kestrel', set: { 'model.max_turns': 'lots' } }),
+});
+badset.status === 400 ? ok('admin: invalid set refused before it lands') : fail(`bad set got ${badset.status}`);
+const rdme = await (await fetch(`${BASE}/api/admin/kits/readme?kit=dev`)).json();
+rdme.ok && /git|workdir/i.test(rdme.readme) ? ok('admin: kit readme preview') : fail(`readme wrong: ${JSON.stringify(rdme)}`);
+
 // -- teardown --
 server.kill('SIGKILL');
 daemon.kill('SIGKILL');

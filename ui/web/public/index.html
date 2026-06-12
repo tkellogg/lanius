@@ -32,10 +32,11 @@
     <div class="panel-head"><h2>instruments</h2></div>
     <div id="nav-list" class="nav-list">
       <button class="nav-item nav-signals" data-sel="signals"><span class="nav-sigil">◮</span> signals</button>
-      <button class="nav-item nav-setup" data-sel="setup"><span class="nav-sigil">⚒</span> setup</button>
+      <button class="nav-item nav-setup" data-sel="setup"><span class="nav-sigil">⚒</span> kits &amp; review</button>
       <div class="nav-label">agents</div>
       <div id="nav-agents"></div>
-      <div id="nav-empty" class="nav-hint">listening for agents…</div>
+      <div id="nav-empty" class="nav-hint">no agents yet — create one below</div>
+      <button id="nav-new-agent" class="nav-item nav-new"><span class="nav-sigil">＋</span> new agent</button>
     </div>
     <div id="history-hint" class="nav-hint nav-foot" hidden>history package not running — live view only</div>
   </nav>
@@ -48,6 +49,7 @@
         <button data-tab="converse" class="on">converse</button>
         <button data-tab="sessions">sessions</button>
         <button data-tab="telemetry">telemetry</button>
+        <button data-tab="configure">configure</button>
       </div>
       <span id="stage-note" class="panel-note"></span>
     </div>
@@ -67,27 +69,73 @@
       <div id="sessions-pane" class="sessions-pane"></div>
     </div>
 
+    <!-- configure: this agent's identity, as a form -->
+    <div id="view-configure" class="view" hidden>
+      <div class="setup-pane">
+        <section class="setup-block">
+          <h3>identity</h3>
+          <p class="dim-note">edits land in <code id="cfg-file">profile.toml</code> (comments survive) and apply on the agent's next run.</p>
+          <div class="cfg-grid">
+            <label>agent name <input id="cfg-agent" spellcheck="false" /></label>
+            <label>model <input id="cfg-model" spellcheck="false" list="model-suggestions" /></label>
+            <label>max turns <input id="cfg-turns" type="number" min="1" max="200" /></label>
+            <label>working directory <input id="cfg-workdir" spellcheck="false" placeholder="(harness root)" /></label>
+          </div>
+          <datalist id="model-suggestions">
+            <option value="claude-fable-5"></option>
+            <option value="claude-sonnet-4-6"></option>
+            <option value="claude-haiku-4-5-20251001"></option>
+            <option value="anthropic::deepseek-chat"></option>
+          </datalist>
+          <div class="setup-row">
+            <button id="cfg-save">save</button>
+            <span id="cfg-note" class="dim-note"></span>
+          </div>
+          <p class="dim-note">renaming changes the mailbox to <code>in/agent/&lt;name&gt;</code> going forward; history under the old name stays in the ledger.</p>
+        </section>
+        <section class="setup-block">
+          <h3>kits &amp; capabilities</h3>
+          <p class="dim-note">kits and package grants are root-wide, not per-agent — manage them under <b>⚒ kits &amp; review</b>. this agent's view of them is filtered by its skill visibility:</p>
+          <div class="cfg-grid">
+            <label>skills include <input id="cfg-include" spellcheck="false" placeholder='# (everything)' /></label>
+            <label>skills exclude <input id="cfg-exclude" spellcheck="false" placeholder="(nothing)" /></label>
+          </div>
+        </section>
+        <section class="setup-block">
+          <details>
+            <summary class="dim-note">the raw profile.toml</summary>
+            <textarea id="cfg-toml" spellcheck="false" rows="14"></textarea>
+            <div class="setup-row">
+              <button id="cfg-toml-save">save raw file</button>
+              <span id="cfg-toml-note" class="dim-note"></span>
+            </div>
+          </details>
+        </section>
+      </div>
+    </div>
+
     <!-- setup: stage kits, watch the pending queue, edit profiles -->
     <div id="view-setup" class="view" hidden>
       <div class="setup-pane">
         <section class="setup-block">
+          <h3>new agent</h3>
+          <p class="dim-note">an agent is a profile: a mailbox (<code>in/agent/&lt;name&gt;</code>), a model, an identity to edit. created instantly — no review needed, profiles are your files.</p>
+          <div class="setup-row">
+            <input id="na-name" placeholder="name (e.g. kestrel)" spellcheck="false" />
+            <input id="na-model" placeholder="model (default: claude-sonnet-4-6)" spellcheck="false" list="model-suggestions" />
+            <button id="na-create">create agent</button>
+            <span id="na-note" class="dim-note"></span>
+          </div>
+        </section>
+        <section class="setup-block">
           <h3>kits</h3>
-          <p class="dim-note">starter packs, staged here — every grant lands pending, nothing runs until you commit in the terminal.</p>
+          <p class="dim-note">starter packs of packages + profiles, shared by every agent on this root. staging lands every grant as <em>pending</em>; nothing runs until you commit in the terminal.</p>
           <div id="setup-kits"></div>
         </section>
         <section class="setup-block">
           <h3>pending review</h3>
           <p class="dim-note">requests are not grants. commit each package from your terminal — by design, this page cannot.</p>
           <div id="setup-pending"></div>
-        </section>
-        <section class="setup-block">
-          <h3>profile <code>default</code></h3>
-          <p class="dim-note">model, sandbox, skill visibility — your file, edited in place (profiles are not ledger state).</p>
-          <textarea id="setup-profile" spellcheck="false" rows="14"></textarea>
-          <div class="setup-row">
-            <button id="setup-profile-save">save profile.toml</button>
-            <span id="setup-profile-note" class="dim-note"></span>
-          </div>
         </section>
       </div>
     </div>
