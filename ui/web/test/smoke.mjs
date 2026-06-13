@@ -258,6 +258,19 @@ const kf = (ags1.profiles ?? []).find((p) => p.profile === 'kestrel');
 kf && kf.agent === 'falcon' && kf.max_turns === 9 && kf.model === 'claude-haiku-4-5-20251001'
   ? ok('admin: rename + knobs visible through the kernel loader')
   : fail(`reloaded profile wrong: ${JSON.stringify(kf)}`);
+// Arrays must round-trip as TOML arrays — the exact regression Tim hit:
+// skills.include arrived as the STRING "[\"*\"]" and the kernel refused it.
+const arrset = await (await fetch(`${BASE}/api/admin/agents/set`, {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ name: 'kestrel', set: { 'skills.include': ['#'], 'skills.exclude': ['notes'], 'sandbox.workdir': '' } }),
+})).json();
+arrset.ok ? ok('admin: array knobs accepted') : fail(`array set failed: ${JSON.stringify(arrset)}`);
+const ags2 = await (await fetch(`${BASE}/api/admin/agents`)).json();
+const k2 = (ags2.profiles ?? []).find((p) => p.profile === 'kestrel');
+JSON.stringify(k2?.skills?.include) === '["#"]' && JSON.stringify(k2?.skills?.exclude) === '["notes"]'
+  ? ok('admin: skills arrays round-trip through the kernel loader')
+  : fail(`skills wrong after array set: ${JSON.stringify(k2?.skills)}`);
+
 const badset = await fetch(`${BASE}/api/admin/agents/set`, {
   method: 'POST', headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ name: 'kestrel', set: { 'model.max_turns': 'lots' } }),

@@ -313,7 +313,13 @@ $('#cfg-save').onclick = async () => {
   if ($('#cfg-turns').value) set['model.max_turns'] = Number($('#cfg-turns').value);
   set['sandbox.workdir'] = $('#cfg-workdir').value.trim();
   const arr = (v) => v.split(',').map((x) => x.trim()).filter(Boolean);
-  set['skills.include'] = JSON.stringify(arr($('#cfg-include').value).length ? arr($('#cfg-include').value) : ['#']).replaceAll('"', '\u0022');
+  // Send as a real JS array — server's tomlValue sees Array.isArray and
+  // encodes it as a TOML array. Sending a JSON-stringified string here was
+  // the regression: it arrived as the string '["#"]' and the kernel refused.
+  set['skills.include'] = arr($('#cfg-include').value).length ? arr($('#cfg-include').value) : ['#'];
+  // Always sent: an EMPTY exclude list is a meaningful save (clearing it),
+  // and an omitted key would silently keep the old value.
+  set['skills.exclude'] = arr($('#cfg-exclude').value);
   const r = await fetch('/api/admin/agents/set', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ name: cfgProfile, set: prunedSet(set) }),

@@ -206,7 +206,15 @@ async function handleAdmin(url, req, res, body) {
     const { name, set } = body ?? {};
     if (typeof name !== 'string' || !PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: 'bad profile name' });
     if (!set || typeof set !== 'object' || !Object.keys(set).length) return sendJson(res, 400, { ok: false, error: 'need {set}' });
-    const pairs = Object.entries(set).map(([k, v]) => `${k}=${typeof v === 'string' ? JSON.stringify(v) : v}`);
+    // Encode each JSON value as TOML value text for `profile set`: arrays
+    // become real TOML arrays (a JSON string array IS one), strings get
+    // quoted, numbers/bools pass bare. Mis-encoding here is how
+    // include = "[\"#\"]" once reached a profile (it was refused by the
+    // kernel's validate-before-write, but the save still failed).
+    const tomlValue = (v) => Array.isArray(v)
+      ? `[${v.map((x) => JSON.stringify(String(x))).join(', ')}]`
+      : typeof v === 'string' ? JSON.stringify(v) : String(v);
+    const pairs = Object.entries(set).map(([k, v]) => `${k}=${tomlValue(v)}`);
     const r = await cli(['profile', 'set', name, ...pairs]);
     return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
   }

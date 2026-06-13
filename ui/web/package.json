@@ -7,9 +7,14 @@
   "main": "server.mjs",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs",
+    "test:ui": "node test/ui.spec.mjs",
+    "walkthrough": "node test/walkthrough.mjs"
   },
   "dependencies": {
     "mqtt": "^5.15.1"
+  },
+  "devDependencies": {
+    "playwright": "^1.50.0"
   }
 }
