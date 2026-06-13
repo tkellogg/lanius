@@ -116,7 +116,7 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
 /// The full event envelope, as handlers receive it on stdin.
 pub fn envelope(conn: &Connection, id: i64) -> Result<Value> {
     let v = conn.query_row(
-        "SELECT id, type, cause_id, correlation_id, payload, state, priority, deadline, default_action, created_at
+        "SELECT id, type, cause_id, correlation_id, payload, state, priority, deadline, default_action, created_at, sender
          FROM events WHERE id = ?1",
         [id],
         |r| {
@@ -133,6 +133,10 @@ pub fn envelope(conn: &Connection, id: i64) -> Result<Value> {
                 "deadline": r.get::<_, Option<String>>(7)?,
                 "default_action": parse_or_null(default_action),
                 "created_at": r.get::<_, String>(9)?,
+                // The kernel-recorded sender (docs/identity.md) travels to the
+                // handler so it can act on who sent the event it is handling.
+                // NULL on pre-migration rows — treat absent as "unknown".
+                "sender": r.get::<_, Option<String>>(10)?,
             }))
         },
     )?;

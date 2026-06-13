@@ -269,6 +269,21 @@ hold in five places at once, which is why it has felt large:
 - **The interface** carries the human's delegated authority and asks for an
   out-of-band gesture on the actions where being a real person is the point.
 
+## Implementation notes (increment 1, as built)
+
+The verified-sender foundation is in. The broker derives the sender from the
+authenticated connection and records it on every ledgered event; it also
+rides on the forwarded observation envelopes, so bus subscribers (the web
+interface among them) and the handler that the dispatcher hands an event to
+all see who the kernel holds responsible. The sender is set from the
+session, never read from the message, so it cannot be forged by a payload
+field. Events the kernel mints itself are "kernel"; events an agent's run
+emits are attributed to that agent (self-reported for now, since the run
+writes the ledger directly — the broker-verified path is the unforgeable
+one, and the later increments close the gap by making the ledger
+kernel-only-writable). Rows written before this existed have no sender;
+absent should be read as "unknown", never silently treated as trusted.
+
 ## Settled in this round (2026-06-13)
 
 - **Scope of the first pass.** The sandbox-protected credential everywhere,

@@ -206,6 +206,9 @@ echo "== 1. emit -> dispatch -> handler =="
 EV1=$(elanus emit in/package/demo/echo --payload '{"msg":"hello"}')
 wait_for "echo handler ran" "grep -q '\"msg\":\"hello\"' '$TMP/echo.log'"
 wait_for "event #$EV1 done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EV1\")\" = done ]"
+# The verified sender reaches the handler in its event envelope (docs/
+# identity.md) — a CLI emit is kernel-originated, so sender is "kernel".
+grep -q '"sender":"kernel"' "$TMP/echo.log" && ok "handler envelope carries the verified sender" || fail "handler did not receive sender in its envelope"
 
 echo "== 2. suspend -> answer -> resume =="
 EV2=$(elanus emit in/package/test/ask)
