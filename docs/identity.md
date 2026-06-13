@@ -43,15 +43,26 @@ no second door into authority.
 
 In concrete pieces:
 
-1. **Every actor proves who it is when it connects.** The kernel mints a
-   secret for an actor when it launches it — this already happens for
-   background package processes — and the actor presents that secret once,
-   when it opens its connection to the broker. The broker then remembers,
-   for the life of that connection, which actor it is talking to. The secret
-   does not need to ride on every message; the connection itself carries the
-   established identity. (This is a small correction to the first sketch: it
-   is a connection credential, not a per-message stamp, and it is the model
-   the background actors already use.)
+1. **Every actor carries the identity its launcher gave it.** The important
+   refinement (Tim, 2026-06-13): a thing the kernel *launches* does not have
+   to authenticate from scratch, because the launcher already knows who it
+   started. The kernel mints a per-spawn secret for the actor when it
+   launches it — this already happens for background package processes — and
+   the actor presents that secret once, when it connects; the broker maps it
+   back to the identity the kernel assigned, for the life of the connection.
+   The secret does not ride on every message; the connection carries the
+   established identity. This means almost nothing has to "log in" — the
+   kernel vouches for everything it starts.
+
+   The exceptions are the entry points a *person* starts by hand. The
+   human's command line is the clearest: it is not launched by the kernel,
+   so it reads the human's credential from the fenced store (a secret the
+   kernel wrote that agents cannot reach) and presents that. The web
+   interface should move to being kernel-launched — a supervised service the
+   kernel brings up — so that it, too, gets a vouched identity automatically
+   instead of being hand-started; that is both safer (the kernel knows it
+   started it) and simpler to run day to day. The person then authenticates
+   to that interface separately (see "the human is the hard case").
 
 2. **The broker stamps every forwarded message with the sender it verified,
    and it ignores any sender a message claims for itself.** A subscriber
@@ -186,41 +197,42 @@ the browser and speak to the server itself. The real task is to make sure
 the thing that proves "a real person did this" is something an agent cannot
 obtain or replay.
 
-How hard we make that is a spectrum, and each rung is worth being honest
-about:
+Human proof is a configurable spectrum, not one mandatory mechanism, because
+most people do not want a heavy lock on their own door — and for many, none
+at all is the right setting. The mechanism is pluggable; an installation
+picks where on the spectrum it sits:
 
-- **A credential the agent's sandbox cannot read.** The human's surfaces —
-  the command line, the web server — hold a credential that lets them act
-  for the human. It lives where no agent's sandbox can read it. This defeats
-  the threat that actually shows up day to day: an agent that has been
-  tricked once into trying something it should not. It does not, on its own,
-  defeat an agent that has broken out of its sandbox, because then it can
-  read that credential like anything else.
+- **None.** Trust the local human implicitly. This is a first-class, common
+  choice, not a shameful fallback — on a single-user machine the person may
+  simply not care, and the threat it accepts (an agent could, in principle,
+  act as the human on that box) is one they are entitled to accept. It
+  should be honestly labeled, but it is a perfectly good default for a lot of
+  people.
 
-- **An out-of-band gesture for the actions that matter most.** The only
-  thing a determined local agent genuinely cannot do is something that
-  happens on a channel or a device it has no access to — a confirmation on
-  your phone, a hardware key, a passkey whose private half never leaves a
-  secure enclave and which has to answer a fresh challenge every time. For
-  the highest-stakes actions, requiring a gesture like that is the only real
-  defense, because no amount of reading files on the machine produces it.
+- **A light out-of-band tap.** When an action wants confirmation, send a
+  desktop notification — "elanus: approve installing X?" with a yes — to the
+  person's logged-in session. This is out-of-band in the way that matters
+  here: it lands in the human's interactive desktop, where a headless agent
+  is not, so the agent cannot answer it without driving the GUI (which the
+  sandbox should deny). It is cheap, pleasant, and good enough for most
+  people who want *some* check. (Desktop notifications are easy on macOS;
+  other platforms vary, so this degrades to the next option or to none.)
 
-The posture, settled in this round: solve the browser in this pass, not
-later. The web surface authenticates the person with a passkey where it can,
-falls back gracefully where browser support is poor, and leans on that
-passkey gesture for the actions that matter most, because it is the one thing
-a local agent cannot produce. The lower rung — a credential the sandbox keeps
-out of agents' reach — still underpins every surface that carries delegated
-authority; the passkey is what lifts the human's own gestures above what an
-escaped agent could fake.
+- **A passkey.** The strong case: a gesture whose secret never leaves a
+  secure enclave and that answers a fresh challenge each time, so no amount
+  of reading files on the machine reproduces it. For the security-conscious,
+  or for the highest-stakes actions, this is the only thing that survives an
+  agent breaking out of its sandbox.
 
-And because not everyone wants a lock on their own door, the person can opt
-out of authenticating themselves entirely. An installation can choose to
-trust the local human implicitly, accepting that on that machine an agent
-could in principle act as the human. This is a deliberate posture, not a
-default to stumble into: a product aimed at ordinary people should authenticate
-out of the box and make opting out an explicit, informed choice, rather than
-the reverse.
+Underneath all three, the credential a surface holds to act for the human
+still lives where agents cannot read it — that is what keeps "none" from
+being worse than it has to be, and what every surface relies on. The point
+of the spectrum is that the *extra* gesture on top is the human's choice,
+from nothing to a hardware key, and the design must not hardcode one rung.
+
+We do not need to build the passkey rung first. None and the notification tap
+are the easy, high-value paths; passkeys can follow for the people who want
+them.
 
 ## "On behalf of," stated plainly
 
@@ -287,9 +299,15 @@ absent should be read as "unknown", never silently treated as trusted.
 ## Settled in this round (2026-06-13)
 
 - **Scope of the first pass.** The sandbox-protected credential everywhere,
-  and the browser solved now — not deferred — with passkeys where the browser
-  cooperates and graceful degradation where it does not. The person can opt
-  out of authenticating entirely (an explicit posture, not the default).
+  and human proof as a configurable spectrum — none (a fine, common
+  default), a desktop-notification tap (the easy middle), or a passkey (the
+  strong case, which we do not have to build first). The mechanism is
+  pluggable; nothing hardcodes passkeys.
+- **Launcher-vouched identity.** Anything the kernel launches carries the
+  identity the kernel gave it (a per-spawn secret), so it does not log in
+  from scratch. Only human-typed entry points read the human credential from
+  the fenced store, and the web interface should become kernel-launched so it
+  is vouched-for automatically (and simpler to run).
 - **One push.** Broker authentication, only-the-kernel-writes for the
   approvals ledger, and the sandbox read-scoping that keeps secrets out of
   actors' reach all ship together, because the latter two are what make the
