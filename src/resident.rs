@@ -96,8 +96,12 @@ fn connect(root: &Root) -> Option<Line> {
         addr.port(),
     );
     opts.set_keep_alive(Duration::from_secs(10));
-    // Deliberately anonymous: the consult is kernel machinery (exec, the
-    // dispatcher), not a package actor — same identity as the mirror.
+    // The consult is kernel machinery running inside the (uncaged) exec
+    // process, so it presents the kernel credential (docs/identity.md) — not
+    // a package token, and not anonymous once deny-by-default is live.
+    if let Some(secret) = crate::secrets::read(root, crate::secrets::KERNEL) {
+        opts.set_credentials(crate::secrets::KERNEL, secret);
+    }
     let (client, connection) = Client::new(opts, 16);
     let resp_topic = format!(
         "obs/harness/hookresp/req-{}-{}",
@@ -190,6 +194,10 @@ fn stage_connect(root: &Root) -> Option<Line> {
     );
     opts.set_keep_alive(Duration::from_secs(10));
     opts.set_max_packet_size(Some(MAX_PACKET));
+    // Kernel machinery in the exec process — present the kernel credential.
+    if let Some(secret) = crate::secrets::read(root, crate::secrets::KERNEL) {
+        opts.set_credentials(crate::secrets::KERNEL, secret);
+    }
     let (client, connection) = Client::new(opts, 16);
     let resp_topic = format!(
         "obs/harness/stageresp/req-{}-{}",

@@ -4,8 +4,22 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
 import mqtt from 'mqtt';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const h = React.createElement;
+
+// The TUI is a human surface: present the human credential from the fenced
+// store so the broker stamps its events as "human" (docs/identity.md).
+function humanCredential(root) {
+  if (!root) return {};
+  try {
+    const secret = fs.readFileSync(path.join(root, '.secrets', 'human'), 'utf8').trim();
+    return secret ? { username: 'human', password: secret } : {};
+  } catch {
+    return {};
+  }
+}
 
 const STREAM_CAP = 500; // ring buffer of parsed lines
 const STREAM_ROWS = 14; // lines shown in the stream pane
@@ -56,7 +70,7 @@ function timeOf(env) {
 
 let seq = 0;
 
-export default function App({ url, agent = 'main' }) {
+export default function App({ url, agent = 'main', root = null }) {
   const { exit } = useApp();
   const clientRef = useRef(null);
   const [status, setStatus] = useState('connecting');
@@ -76,6 +90,7 @@ export default function App({ url, agent = 'main' }) {
       clientId: `el-tui-${process.pid}`,
       reconnectPeriod: 1000,
       connectTimeout: 5000,
+      ...humanCredential(root),
     });
     clientRef.current = client;
     client.on('connect', () => {

@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-fn client(addr: SocketAddr, tag: &str) -> (AsyncClient, rumqttc::v5::EventLoop) {
+fn client(root: &Root, addr: SocketAddr, tag: &str) -> (AsyncClient, rumqttc::v5::EventLoop) {
     let mut opts = MqttOptions::new(
         format!("el-{tag}-{}", std::process::id()),
         addr.ip().to_string(),
@@ -26,11 +26,18 @@ fn client(addr: SocketAddr, tag: &str) -> (AsyncClient, rumqttc::v5::EventLoop) 
     // Resident stages move whole context documents through bus sub/pub;
     // rumqttc's default inbound cap is 10KB (crate::resident::MAX_PACKET).
     opts.set_max_packet_size(Some(crate::resident::MAX_PACKET));
-    // Inside a supervised package actor, identity rides the environment the
-    // supervisor injected: the CLI authenticates as the actor and the
-    // broker scopes it to the package's grants.
+    // Identity (docs/identity.md), in priority order:
+    //  - inside a supervised package actor, the supervisor injected the
+    //    actor's token in the environment: authenticate as the package, so
+    //    the broker scopes the session to its grants;
+    //  - otherwise this is the human's own command line: present the human
+    //    credential from the fenced store. A caged agent shell running the
+    //    CLI cannot read that store, so it stays anonymous — and is refused
+    //    once the deny-by-default flip is live, which is the point.
     if let (Ok(pkg), Ok(token)) = (std::env::var("ELANUS_PACKAGE"), std::env::var("ELANUS_BUS_TOKEN")) {
         opts.set_credentials(pkg, token);
+    } else if let Some(secret) = crate::secrets::read(root, crate::secrets::HUMAN) {
+        opts.set_credentials(crate::secrets::HUMAN, secret);
     }
     AsyncClient::new(opts, 64)
 }
@@ -68,7 +75,7 @@ pub fn publish(
     let addr = addr(root)?;
     let correlation = correlation.map(str::to_owned);
     runtime()?.block_on(async move {
-        let (client, mut eventloop) = client(addr, "pub");
+        let (client, mut eventloop) = client(root, addr, "pub");
         // Envelope correlation rides the el-correlation user property
         // (topics.md ID taxonomy: MQTT Correlation Data stays reserved for
         // the hook round trip).
@@ -155,7 +162,7 @@ pub fn subscribe(
     }
     let addr = addr(root)?;
     runtime()?.block_on(async move {
-        let (client, mut eventloop) = client(addr, "sub");
+        let (client, mut eventloop) = client(root, addr, "sub");
         match &blocking {
             Some(b) => {
                 let mut user_properties = vec![

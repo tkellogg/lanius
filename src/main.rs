@@ -22,6 +22,7 @@ mod recorder;
 mod render;
 mod resident;
 mod sandbox;
+mod secrets;
 mod topic;
 mod trace;
 

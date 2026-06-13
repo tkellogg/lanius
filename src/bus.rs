@@ -113,6 +113,11 @@ pub fn init_daemon(root: &Root) {
         let _ = HANDLE.set(Handle::Off);
         return;
     }
+    // Mint the reserved credentials before the broker reads them, so a secret
+    // always exists by the time anything can connect (docs/identity.md).
+    if let Err(e) = crate::secrets::ensure(root) {
+        eprintln!("[bus] could not mint kernel secrets: {e}");
+    }
     if let Ok(bound) = cfg.bind.parse::<SocketAddr>() {
         if !bound.ip().is_loopback() {
             eprintln!(
@@ -150,7 +155,7 @@ pub fn publish_with(root: &Root, topic: &str, line: &str, retain: bool) {
             return Handle::Off;
         }
         match connect_addr(&cfg) {
-            Some(addr) => Handle::Mirror(Mutex::new(Mirror::new(addr))),
+            Some(addr) => Handle::Mirror(Mutex::new(Mirror::new(addr, mirror_creds(root)))),
             None => Handle::Off,
         }
     });
@@ -187,15 +192,28 @@ pub fn register_actor(name: &str, token: Option<&str>) {
 /// three packets (CONNECT, PUBLISH, and reads one CONNACK); anything fancier
 /// belongs in a real client library — but real client libraries bring their
 /// own runtime, and this runs on the flight path.
+/// The credential the mirror presents (docs/identity.md): the package token
+/// when this process is a supervised actor, else the kernel credential from
+/// the fenced store. A caged process cannot read that store, so its mirror
+/// connects anonymously and is refused once deny-by-default is live — which
+/// is fine, its obs are still on disk via the WAL.
+fn mirror_creds(root: &Root) -> Option<(String, String)> {
+    if let (Ok(pkg), Ok(token)) = (std::env::var("ELANUS_PACKAGE"), std::env::var("ELANUS_BUS_TOKEN")) {
+        return Some((pkg, token));
+    }
+    crate::secrets::read(root, crate::secrets::KERNEL).map(|s| (crate::secrets::KERNEL.to_string(), s))
+}
+
 struct Mirror {
     addr: SocketAddr,
     conn: Option<TcpStream>,
     retry_after: Option<Instant>,
+    creds: Option<(String, String)>,
 }
 
 impl Mirror {
-    fn new(addr: SocketAddr) -> Mirror {
-        Mirror { addr, conn: None, retry_after: None }
+    fn new(addr: SocketAddr, creds: Option<(String, String)>) -> Mirror {
+        Mirror { addr, conn: None, retry_after: None, creds }
     }
 
     fn publish(&mut self, topic: &str, payload: &[u8]) {
@@ -203,7 +221,7 @@ impl Mirror {
             if self.retry_after.is_some_and(|t| Instant::now() < t) {
                 return;
             }
-            match connect(self.addr) {
+            match connect(self.addr, self.creds.as_ref()) {
                 Ok(s) => {
                     self.conn = Some(s);
                     self.retry_after = None;
@@ -222,12 +240,12 @@ impl Mirror {
     }
 }
 
-fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
+fn connect(addr: SocketAddr, creds: Option<&(String, String)>) -> std::io::Result<TcpStream> {
     let mut s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     s.set_nodelay(true)?;
     s.set_read_timeout(Some(IO_TIMEOUT))?;
     s.set_write_timeout(Some(IO_TIMEOUT))?;
-    s.write_all(&encode_connect(&format!("el-mirror-{}", std::process::id())))?;
+    s.write_all(&encode_connect(&format!("el-mirror-{}", std::process::id()), creds))?;
     read_connack(&mut s)?;
     Ok(s)
 }
@@ -260,14 +278,23 @@ fn frame(byte0: u8, body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn encode_connect(client_id: &str) -> Vec<u8> {
+fn encode_connect(client_id: &str, creds: Option<&(String, String)>) -> Vec<u8> {
     let mut body = Vec::new();
     utf8("MQTT", &mut body);
     body.push(0x05); // protocol version 5
-    body.push(0x02); // clean start, no will, no auth
+    // Clean start (0x02); set the username (0x80) and password (0x40) flags
+    // when we have a credential to present.
+    let flags = 0x02 | if creds.is_some() { 0xC0 } else { 0x00 };
+    body.push(flags);
     body.extend_from_slice(&[0, 0]); // keep alive disabled
     body.push(0x00); // empty properties
     utf8(client_id, &mut body);
+    if let Some((user, pass)) = creds {
+        utf8(user, &mut body);
+        // MQTT 5 password is binary data: a u16 length prefix then the bytes.
+        body.extend_from_slice(&(pass.len() as u16).to_be_bytes());
+        body.extend_from_slice(pass.as_bytes());
+    }
     frame(0x10, &body)
 }
 
@@ -349,11 +376,22 @@ mod tests {
 
     #[test]
     fn connect_frame_shape() {
-        let f = encode_connect("me");
+        let f = encode_connect("me", None);
         assert_eq!(f[0], 0x10);
         assert_eq!(&f[2..8], &[0x00, 0x04, b'M', b'Q', b'T', b'T']);
         assert_eq!(f[8], 0x05); // version
-        assert_eq!(f[9], 0x02); // clean start
+        assert_eq!(f[9], 0x02); // clean start, no auth flags
+    }
+
+    #[test]
+    fn connect_frame_with_credentials() {
+        let f = encode_connect("me", Some(&("kernel".into(), "s3cr3t".into())));
+        assert_eq!(f[0], 0x10);
+        assert_eq!(f[9], 0x02 | 0xC0); // clean start + username + password flags
+        // username and password bytes ride at the end of the payload.
+        let tail = String::from_utf8_lossy(&f);
+        assert!(tail.contains("kernel"));
+        assert!(tail.contains("s3cr3t"));
     }
 
     #[test]

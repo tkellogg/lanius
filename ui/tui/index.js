@@ -24,4 +24,4 @@ try {
   process.exit(1);
 }
 
-render(React.createElement(App, { url, agent: args.agent ?? 'main' }));
+render(React.createElement(App, { url, agent: args.agent ?? 'main', root: args.root ?? process.env.HARNESS_ROOT ?? null }));

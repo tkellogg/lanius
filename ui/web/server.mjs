@@ -37,6 +37,21 @@ const BROKER = brokerUrl(args);
 const PORT = args.port ?? Number(process.env.ELANUS_WEB_PORT ?? 7180);
 const AGENT = args.agent ?? 'main';
 const PUB = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
+const ROOT = args.root ?? process.env.HARNESS_ROOT ?? null;
+
+// The web server is a trusted surface acting for the human (docs/identity.md):
+// it presents the human credential from the fenced secret store, so the
+// broker stamps its events as "human". Read once at startup; absent means we
+// connect anonymously (works until the deny-by-default flip, then refused).
+function humanCredential() {
+  if (!ROOT) return null;
+  try {
+    const secret = fs.readFileSync(path.join(ROOT, '.secrets', 'human'), 'utf8').trim();
+    return secret ? { username: 'human', password: secret } : null;
+  } catch {
+    return null;
+  }
+}
 
 // ---- bus side -------------------------------------------------------------
 const RING_CAP = 1000; // late-joining browsers get recent history
@@ -49,6 +64,7 @@ const client = mqtt.connect(BROKER, {
   clean: true,
   clientId: `el-web-${process.pid}`,
   reconnectPeriod: 2000,
+  ...(humanCredential() ?? {}),
 });
 let connected = false;
 client.on('connect', () => {
@@ -79,7 +95,6 @@ client.on('message', (topic, payload) => {
 // restarts). GET maps query params onto the flat kinds; POST passes the
 // query DSL body through verbatim (kind "search": filter x select x page).
 const HIST_KINDS = new Set(['agents', 'sessions', 'transcript', 'conversation', 'search']);
-const ROOT = args.root ?? process.env.HARNESS_ROOT ?? null;
 
 function historyEndpoint() {
   if (!ROOT) return null;
