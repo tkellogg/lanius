@@ -785,7 +785,16 @@ es.onerror = () => {
   try {
     const r = await fetch('/api/admin/models');
     const j = await r.json();
-    if (!j.ok || !(j.models ?? []).length) return;
+    if (!(j.models ?? []).length) {
+      // Say WHY the picker is running on canned suggestions — a missing
+      // .env or a provider without /models should be visible, not silent.
+      if (j.note) {
+        const hint = $('#models-hint');
+        if (hint) { hint.textContent = `model list unavailable: ${j.note}`; hint.hidden = false; }
+        console.warn('models:', j.note);
+      }
+      return;
+    }
     const dl = $('#model-suggestions');
     dl.textContent = '';
     for (const m of j.models) {

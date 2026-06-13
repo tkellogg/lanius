@@ -120,8 +120,17 @@ async function handleHistory(query, res) {
 // human gesture, and this server adds no authority of its own. Kit installs
 // are ALWAYS staged (--pending); profile files are edited directly (the
 // same trust as the human's text editor — profiles are not ledger state).
-import { execFile } from 'node:child_process';
-const ELANUS_BIN = process.env.ELANUS_BIN || 'elanus';
+import { execFile, execFileSync } from 'node:child_process';
+// Which elanus answers admin calls matters (a stale install on PATH fails
+// silently): prefer an explicit ELANUS_BIN, then the sibling dev build
+// (this file lives in <repo>/ui/web), then PATH — and say so at startup.
+const DEV_BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../target/debug/elanus');
+const ELANUS_BIN = process.env.ELANUS_BIN || (fs.existsSync(DEV_BIN) ? DEV_BIN : 'elanus');
+try {
+  console.log(`elanus binary: ${ELANUS_BIN} (${execFileSync(ELANUS_BIN, ['--version'], { encoding: 'utf8' }).trim()})`);
+} catch (e) {
+  console.error(`elanus binary ${ELANUS_BIN} not runnable: ${e.message} — admin endpoints will fail`);
+}
 
 function cli(cliArgs) {
   return new Promise((resolve) => {
