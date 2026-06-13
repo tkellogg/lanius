@@ -604,6 +604,33 @@ printf '{"id":%s,"payload":{"prompt":"hi"}}' "$EV13B" | \
 NTEXT2=$(sql "SELECT COUNT(*) FROM events WHERE type='in/human/owner' AND json_extract(payload,'\$.text') IS NOT NULL")
 [ "$NTEXT2" = "$NTEXT" ] && ok "uncorrelated run stays out of the inbox" || fail "uncorrelated run mailed the human"
 
+# 13b. agent FAILURE is mail too (Tim: if anything is wrong with the agent,
+# every client must be told). A correlated run whose agent can't work —
+# here a profile pointed at a dead LLM port — emits a labeled failure on the
+# same correlation channel as a reply would, so the converse view never
+# strands a delivered message.
+mkdir -p "$TMP/profiles/broken"
+cat > "$TMP/profiles/broken/profile.toml" <<EOF
+agent = "broken"
+owner = "owner"
+[model]
+model = "claude-3-5-haiku-latest"
+base_url = "http://127.0.0.1:1"
+api_key_env = "FAKE_LLM_KEY"
+EOF
+EVF=$(elanus emit obs/e2e/fail-anchor --correlation fail-corr-1)
+printf '{"id":%s,"correlation_id":"fail-corr-1","payload":{"prompt":"hi","profile":"broken"}}' "$EVF" | \
+  FAKE_LLM_KEY=dummy HARNESS_EVENT_ID="$EVF" HARNESS_CORRELATION_ID=fail-corr-1 elanus handle-exec >/dev/null 2>&1
+FAILED=$(sql "SELECT json_extract(payload,'\$.failed') FROM events WHERE type='in/human/owner' AND correlation_id='fail-corr-1'")
+[ "$FAILED" = "1" ] && ok "agent failure mailed to the human, labeled failed:true" || fail "failure mail missing (failed='$FAILED')"
+FERR=$(sql "SELECT json_extract(payload,'\$.error') FROM events WHERE type='in/human/owner' AND correlation_id='fail-corr-1'")
+[ -n "$FERR" ] && ok "failure mail carries the reason ($(echo "$FERR" | head -c 40)…)" || fail "failure mail has no error reason"
+# A CLI-direct failure (no correlation) does NOT mail anyone.
+NFAIL=$(sql "SELECT COUNT(*) FROM events WHERE type='in/human/owner' AND json_extract(payload,'\$.failed')=1")
+FAKE_LLM_KEY=dummy elanus exec "hi" --profile broken >/dev/null 2>&1
+NFAIL2=$(sql "SELECT COUNT(*) FROM events WHERE type='in/human/owner' AND json_extract(payload,'\$.failed')=1")
+[ "$NFAIL2" = "$NFAIL" ] && ok "CLI-direct failure stays out of the inbox (error went to the terminal)" || fail "CLI-direct failure mailed the human"
+
 echo "== 14. dev kit: init --kit, workdir, git-protect =="
 # A fresh root, no daemon: `elanus exec` is standalone and the exec-hook
 # chain is in-process. The fake LLM here reads its tool command from a file

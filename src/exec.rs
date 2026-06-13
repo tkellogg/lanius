@@ -43,7 +43,56 @@ pub fn run(root: &Root, opts: ExecOpts) -> Result<()> {
     rt.block_on(run_async(root, opts))
 }
 
+/// Wrap the turn so ANY failure of a correlated, dispatched run is reported
+/// back on its correlation channel. The message was delivered and the agent
+/// picked it up — the agent is what broke — so silence would strand the
+/// client (Tim's call). The reply-mail success path already speaks this
+/// channel; this is its failure twin. Best-effort and never masks the
+/// original error: the dispatch still records the failure.
 async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
+    let profile_name = opts.profile.clone();
+    let session = opts.session.clone();
+    let result = run_turn(root, opts).await;
+    if let Err(e) = &result {
+        report_agent_failure(root, &profile_name, session.as_deref(), e);
+    }
+    result
+}
+
+/// Emit a labeled failure to the human mailbox for a dispatched, correlated
+/// run. `failed: true` so any client (web, TUI, …) threads it by
+/// correlation and dedups against the run that produced it. CLI-direct runs
+/// (no event/correlation) are skipped — their error already hit the
+/// terminal.
+fn report_agent_failure(root: &Root, profile_name: &str, session: Option<&str>, err: &anyhow::Error) {
+    let ids = trace::Ids::from_env();
+    let (Some(event_id), Some(corr)) = (ids.event_id, ids.correlation_id.clone()) else {
+        return;
+    };
+    let Ok(conn) = db::open(root) else { return };
+    let (prof, _) = match profile::load(root, profile_name) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let reason = trace::clip(&format!("{err:#}"), 800);
+    let _ = events::emit(
+        root,
+        &conn,
+        EmitOpts {
+            payload: Some(json!({
+                "failed": true,
+                "error": reason,
+                "agent": prof.agent,
+                "session": session,
+            })),
+            correlation: Some(corr),
+            cause: Some(event_id),
+            ..EmitOpts::new(&crate::topic::human_mailbox(&prof.owner))
+        },
+    );
+}
+
+async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
     let (prof, _pdir) = profile::load(root, &opts.profile)?;

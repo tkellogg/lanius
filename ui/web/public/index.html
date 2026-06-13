@@ -13,11 +13,11 @@
 <div class="vignette" aria-hidden="true"></div>
 
 <header class="mast">
-  <div class="mast-left">
+  <button class="mast-left" id="mast-home" title="home">
     <span class="kite" aria-hidden="true">⟁</span>
     <h1><em>elanus</em></h1>
     <span class="mast-sub">agent explorer // live</span>
-  </div>
+  </button>
   <div class="mast-right">
     <button id="signal-lamp" class="lamp" title="algedonic channel — click to acknowledge">
       <span class="lamp-dot"></span><span id="signal-label">signal</span>
@@ -52,6 +52,20 @@
         <button data-tab="configure">configure</button>
       </div>
       <span id="stage-note" class="panel-note"></span>
+    </div>
+
+    <!-- welcome: the front door — orient, then route to the primary agent -->
+    <div id="view-welcome" class="view" hidden>
+      <div class="welcome-pane">
+        <p class="welcome-lead">talk to your agents, watch the bus, stage capabilities.</p>
+        <div id="welcome-agent" class="welcome-agent"></div>
+        <div class="welcome-actions">
+          <button id="welcome-new" class="ghost">＋ new agent</button>
+          <button id="welcome-kits" class="ghost">⚒ stage a kit</button>
+          <button id="welcome-signals" class="ghost">◮ live signals</button>
+        </div>
+        <p id="welcome-hint" class="dim-note"></p>
+      </div>
     </div>
 
     <!-- converse: the mailbox view, per agent -->

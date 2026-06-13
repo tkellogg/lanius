@@ -319,3 +319,19 @@ body {
 #cfg-toml { width: 100%; box-sizing: border-box; background: rgba(0,0,0,0.25); color: inherit; font: inherit; font-size: 12px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 10px; resize: vertical; margin-top: 8px; }
 .nav-new { color: var(--dim); }
 .setup-row input { background: rgba(0,0,0,0.25); color: inherit; font: inherit; font-size: 13px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 7px 9px; }
+
+/* ---------- welcome (front door) ---------- */
+.welcome-pane { flex: 1; overflow-y: auto; padding: 32px 28px; display: flex; flex-direction: column; gap: 22px; max-width: 720px; }
+.welcome-lead { font-size: 15px; color: var(--ink); margin: 0; }
+.welcome-agent-label { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim); margin-bottom: 6px; }
+.welcome-agent-row { display: flex; align-items: center; gap: 12px; }
+.welcome-agent-name { font-weight: 600; font-size: 15px; min-width: 8ch; }
+.welcome-actions { display: flex; gap: 10px; flex-wrap: wrap; padding-top: 6px; border-top: 1px solid rgba(255,255,255,0.06); }
+button.mast-left { background: none; border: none; cursor: pointer; text-align: left; font: inherit; color: inherit; }
+button.mast-left.on h1 { color: var(--ink); }
+
+/* ---------- converse failure bubble ---------- */
+.msg.failed .msg-who { color: #d98a5c; }
+.msg.failed .msg-body { border-left: 2px solid #d98a5c; padding-left: 10px; }
+.fail-reason { font-family: var(--mono, monospace); font-size: 12px; color: #e0b48c; white-space: pre-wrap; }
+.fail-hint { font-size: 11px; color: var(--dim); margin-top: 4px; }

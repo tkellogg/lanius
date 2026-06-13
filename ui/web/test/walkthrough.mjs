@@ -52,13 +52,16 @@ await waitFor(async () => { try { return (await fetch(`${BASE}/`)).ok; } catch {
 const browser = await chromium.launch({ headless: true });
 const ctx = await browser.newContext({ baseURL: BASE, viewport: { width: 1280, height: 800 } });
 
-// ── 1. blank root — signals view ──────────────────────────────────────────────
+// ── 1. blank root — welcome front door, then signals ──────────────────────────
 {
   const page = await ctx.newPage();
   await page.goto('/');
-  await page.waitForSelector('#view-rail');
+  await page.waitForSelector('#view-welcome');
   await sleep(1500); // let SSE connect + disk agents load
-  await shot(page, '01-signals-blank-root');
+  await shot(page, '01-welcome-front-door');
+  await page.click('.nav-signals');
+  await page.waitForSelector('#view-rail:not([hidden])');
+  await shot(page, '01b-signals-blank-root');
   await page.close();
 }
 
@@ -173,6 +176,13 @@ const ctx = await browser.newContext({ baseURL: BASE, viewport: { width: 1280, h
   await page.click('#compose-send');
   await sleep(1500);
   await shot(page, '10-converse-sent');
+  // A harness-emitted failure threads into the conversation as an explicit
+  // error bubble — the realistic out-of-box state (agent can't reach a model).
+  const corr = await page.$eval('#conv-holder .msg.you', (el) => (el.title || '').replace('correlation ', '')).catch(() => 'wt-fail');
+  elanus('emit', 'in/human/owner', '--correlation', corr || 'wt-fail', '--payload',
+    JSON.stringify({ failed: true, error: 'llm call failed (model claude-…): connection refused', agent: 'main' }));
+  await sleep(1200);
+  await shot(page, '10b-converse-failure');
   await page.close();
 }
 

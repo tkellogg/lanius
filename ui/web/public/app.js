@@ -66,6 +66,7 @@ async function loadDiskAgents() {
     diskProfiles = j.profiles ?? [];
     for (const p of diskProfiles) touchAgent(p.agent, { profile: p.profile });
     renderNav();
+    if (sel.kind === 'welcome') renderWelcome();
   } catch { /* admin endpoints absent: live-only nav, same as before */ }
 }
 function profileOf(agentName) {
@@ -97,6 +98,7 @@ function renderNav() {
   }
   $('.nav-signals').classList.toggle('on', sel.kind === 'signals');
   $('.nav-setup').classList.toggle('on', sel.kind === 'setup');
+  $('#mast-home').classList.toggle('on', sel.kind === 'welcome');
 }
 
 // arrow keys walk the nav like a real instrument panel
@@ -111,6 +113,10 @@ $('#nav-list').addEventListener('keydown', (e) => {
 $('.nav-signals').onclick = () => selectSignals();
 $('.nav-setup').onclick = () => selectSetup();
 $('#nav-new-agent').onclick = () => { selectSetup(); $('#na-name').focus(); };
+$('#mast-home').onclick = () => selectWelcome();
+$('#welcome-new').onclick = () => { selectSetup(); $('#na-name').focus(); };
+$('#welcome-kits').onclick = () => selectSetup();
+$('#welcome-signals').onclick = () => selectSignals();
 $('#na-create').onclick = async () => {
   const name = $('#na-name').value.trim();
   const model = $('#na-model').value.trim();
@@ -133,11 +139,56 @@ $('#na-create').onclick = async () => {
 
 // ---------- view switching ----------
 function show(view) {
+  $('#view-welcome').hidden = view !== 'welcome';
   $('#view-converse').hidden = view !== 'converse';
   $('#view-sessions').hidden = view !== 'sessions';
   $('#view-rail').hidden = view !== 'rail';
   $('#view-setup').hidden = view !== 'setup';
   $('#view-configure').hidden = view !== 'configure';
+}
+
+// ---------- welcome (the front door) ----------
+// The primary agent is the default profile's, else the first on disk, else
+// whatever the bus named. Welcome orients and ROUTES — converse if you want
+// to talk, configure if you want to set it up (Tim: depending what you're
+// vibing) — it is never a dead end.
+function primaryAgent() {
+  const def = diskProfiles.find((p) => p.profile === 'default');
+  if (def) return def.agent;
+  if (diskProfiles[0]) return diskProfiles[0].agent;
+  return [...agents.keys()][0] ?? null;
+}
+
+function selectWelcome() {
+  sel = { kind: 'welcome' };
+  $('#stage-title').textContent = 'welcome';
+  $('#stage-note').textContent = 'orient, then dive in';
+  $('#agent-tabs').hidden = true;
+  show('welcome');
+  renderWelcome();
+  renderNav();
+}
+
+function renderWelcome() {
+  const box = $('#welcome-agent');
+  box.textContent = '';
+  const name = primaryAgent();
+  if (!name) {
+    box.appendChild(el('div', 'dim-note', 'no agents yet — create your first one.'));
+  } else {
+    box.appendChild(el('div', 'welcome-agent-label', 'your agent'));
+    const row = el('div', 'welcome-agent-row');
+    row.appendChild(el('span', 'welcome-agent-name', name));
+    const conv = el('button', '', `converse with ${name}`);
+    conv.onclick = () => selectAgent(name, 'converse');
+    const cfg = el('button', 'ghost', 'configure');
+    cfg.onclick = () => selectAgent(name, 'configure');
+    row.append(conv, cfg);
+    box.appendChild(row);
+  }
+  $('#welcome-hint').textContent = historyOk === false
+    ? 'transcripts are off until you approve the history package (kits & review).'
+    : '';
 }
 
 function selectSignals() {
@@ -461,6 +512,21 @@ function convMsg(agent, who, cls, text, corr) {
   return { m, body };
 }
 
+// A labeled failure (payload.failed) from the harness: the message was
+// delivered, the agent broke. Render it explicitly in the thread, deduped
+// by correlation so a replayed run can't stack identical failures.
+const seenFailures = new Set();
+function convFailure(agent, env) {
+  const corr = env.correlation_id;
+  if (corr && seenFailures.has(corr)) return;
+  if (corr) seenFailures.add(corr);
+  const p = env?.payload ?? {};
+  const { body } = convMsg(agent, 'agent failed', 'failed', '', corr);
+  body.textContent = '';
+  body.appendChild(el('div', 'fail-reason', p.error || 'the agent failed with no detail.'));
+  body.appendChild(el('div', 'fail-hint', 'check the agent: a model set (configure), the daemon running, grants approved.'));
+}
+
 function routeHumanMail(env) {
   // in/human mail is owner-addressed, not agent-addressed; route by the
   // correlation we've seen on the agent side, else the selected agent.
@@ -560,7 +626,8 @@ function onMessage(msg) {
   }
   if (topic.startsWith('in/human/')) {
     const agent = routeHumanMail(env);
-    if (p.question != null) renderAsk(agent, env);
+    if (p.failed) convFailure(agent, env);
+    else if (p.question != null) renderAsk(agent, env);
     else if (typeof p.text === 'string') convMsg(agent, 'agent', 'agent', p.text, env.correlation_id);
     return;
   }
@@ -817,10 +884,10 @@ es.onerror = () => {
   } catch { /* static suggestions stand */ }
 })();
 
-// boot: signals view + disk agents (profiles ARE agents — a silent root
-// still shows its identities) + history probe (re-probed so a later
-// approve heals us)
-selectSignals();
+// boot: the welcome front door (orients + routes to the primary agent) +
+// disk agents (profiles ARE agents — a silent root still shows its
+// identities) + history probe (re-probed so a later approve heals us).
+selectWelcome();
 loadDiskAgents();
 refreshAgents();
 setInterval(refreshAgents, 15000);

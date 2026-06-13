@@ -88,7 +88,8 @@ async function waitForConfigureLoaded(page) {
 }
 
 // ── flow 1: boot ─────────────────────────────────────────────────────────────
-// Signals view renders on load; the default agent appears in nav from disk.
+// Welcome view is the front door on load, routing to the primary agent; the
+// default agent appears in nav from disk.
 {
   const page = await newPage();
   await page.goto('/');
@@ -98,8 +99,20 @@ async function waitForConfigureLoaded(page) {
     const items = await page.$$eval('#nav-agents .nav-item', (els) => els.map((e) => e.textContent));
     return items.some((t) => t.includes('main') || t.includes('default'));
   });
-  const railVisible = await page.$eval('#view-rail', (el) => !el.hidden);
-  railVisible ? ok('boot: signals/rail view is visible on load') : fail('boot: rail view hidden on load');
+  const welcomeVisible = await page.$eval('#view-welcome', (el) => !el.hidden);
+  welcomeVisible ? ok('boot: welcome view is the front door on load') : fail('boot: welcome view hidden on load');
+  // The welcome routes to the primary agent — converse button is present.
+  await waitFor('boot: welcome offers the primary agent', async () => {
+    const t = await page.$eval('#welcome-agent', (el) => el.textContent).catch(() => '');
+    return /converse with/.test(t);
+  });
+  // Agent tabs must NOT show on welcome (the [hidden] regression guard).
+  const tabsHidden = await page.$eval('#agent-tabs', (el) => el.hidden && getComputedStyle(el).display === 'none');
+  tabsHidden ? ok('boot: agent tabs hidden off-agent (no leak)') : fail('boot: agent tabs leaked onto welcome');
+  // Signals still reachable from the nav.
+  await page.click('.nav-signals');
+  await page.waitForSelector('#view-rail:not([hidden])', { timeout: 5000 });
+  ok('boot: signals reachable from nav');
   await page.close();
 }
 
@@ -313,6 +326,16 @@ const renamedAgent = 'falcon';
   // MQTT echo arrives, so the feed should update immediately.
   await waitFor('converse: message in feed', async () => {
     return (await page.$eval('#conv-holder', (el) => el.textContent)).includes(msg);
+  }, 8000);
+  // A labeled failure (harness emits these when an agent run breaks) renders
+  // as an explicit error bubble in the thread, not silence. Inject one with
+  // the correlation of the message we just sent so it threads here.
+  const corr = await page.$eval('#conv-holder .msg.you', (el) => (el.title || '').replace('correlation ', '')).catch(() => '');
+  const agentName = await page.$eval('#nav-agents .nav-item.on', (el) => el.textContent.trim().replace(/^⟁\s*/, '').replace(/·live$/, '').trim()).catch(() => 'main');
+  elanus('emit', `in/human/owner`, '--correlation', corr || 'spec-fail', '--payload',
+    JSON.stringify({ failed: true, error: 'spec-injected failure', agent: agentName }));
+  await waitFor('converse: agent failure renders as an error bubble', async () => {
+    return (await page.$eval('#conv-holder', (el) => el.textContent)).includes('spec-injected failure');
   }, 8000);
   await page.close();
 }
