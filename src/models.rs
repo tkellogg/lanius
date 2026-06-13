@@ -20,7 +20,27 @@ pub fn list(root: &Root, profile_name: &str, json: bool) -> Result<()> {
         .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "https://api.anthropic.com".into());
     let base = base.trim_end_matches('/');
-    let url = if base.ends_with("/v1") { format!("{base}/models") } else { format!("{base}/v1/models") };
+    // Compat layers put /models in different places: Anthropic serves
+    // {base}/v1/models, DeepSeek's anthropic shim serves NOTHING under
+    // /anthropic but the account's native API has {origin}/models
+    // (OpenAI-style). Probe the plausible spots in order, first list wins.
+    let mut candidates: Vec<String> = Vec::new();
+    if base.ends_with("/v1") {
+        candidates.push(format!("{base}/models"));
+    } else {
+        candidates.push(format!("{base}/v1/models"));
+        candidates.push(format!("{base}/models"));
+    }
+    if let Ok(u) = reqwest::Url::parse(base) {
+        if let Some(host) = u.host_str() {
+            let origin = format!("{}://{host}{}", u.scheme(), u.port().map(|p| format!(":{p}")).unwrap_or_default());
+            for c in [format!("{origin}/models"), format!("{origin}/v1/models")] {
+                if !candidates.contains(&c) {
+                    candidates.push(c);
+                }
+            }
+        }
+    }
     let key_env = prof.model.api_key_env.clone().unwrap_or_else(|| "ANTHROPIC_API_KEY".into());
     let key = std::env::var(&key_env)
         .ok()
@@ -29,23 +49,35 @@ pub fn list(root: &Root, profile_name: &str, json: bool) -> Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     let body: Value = rt.block_on(async {
-        let res = reqwest::Client::new()
-            .get(&url)
-            .header("x-api-key", &key)
-            .header("anthropic-version", "2023-06-01")
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
-        if !res.status().is_success() {
-            bail!("{url} answered {} (provider may not implement /models)", res.status());
+        let client = reqwest::Client::new();
+        let mut tried: Vec<String> = Vec::new();
+        for url in &candidates {
+            // Both auth dialects on every attempt: Anthropic wants
+            // x-api-key, OpenAI-style wants a Bearer. Extra headers are
+            // ignored by whichever side doesn't use them.
+            let res = client
+                .get(url)
+                .header("x-api-key", &key)
+                .header("authorization", format!("Bearer {key}"))
+                .header("anthropic-version", "2023-06-01")
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await;
+            match res {
+                Ok(r) if r.status().is_success() => {
+                    let v: Value = r.json().await.context("response was not JSON")?;
+                    if v["data"].as_array().is_some_and(|a| !a.is_empty()) {
+                        return Ok(v);
+                    }
+                    tried.push(format!("{url} (200 but no model list)"));
+                }
+                Ok(r) => tried.push(format!("{url} ({})", r.status())),
+                Err(e) => tried.push(format!("{url} ({e})")),
+            }
         }
-        res.json::<Value>().await.context("response was not JSON")
+        bail!("no /models endpoint answered (tried: {})", tried.join(", "));
     })?;
     let models = body["data"].as_array().cloned().unwrap_or_default();
-    if models.is_empty() {
-        bail!("{url} answered but listed no models");
-    }
     for m in &models {
         let id = m["id"].as_str().unwrap_or_default();
         let name = m["display_name"].as_str().unwrap_or("");

@@ -33,15 +33,31 @@ const PKG_FILES: &[PkgFile] = &[
     PkgFile { rel: "window/scripts/stage", content: include_str!("../packages/window/scripts/stage"), exec: true },
 ];
 
-/// The stock kit, seeded into <root>/kits so a fresh root always has at
-/// least the stdlib resolvable — no env var, no repo checkout required.
-const CORE_KIT_FILES: &[PkgFile] = &[
+/// ALL stock kits, seeded into <root>/kits so every root has the
+/// out-of-the-box set resolvable — no env var, no repo checkout. The kit
+/// dir is the config; these are just its defaults (write_if_missing, so
+/// edits and deletions stick).
+const STOCK_KIT_FILES: &[PkgFile] = &[
     PkgFile { rel: "core/README.md", content: include_str!("../kits/core/README.md"), exec: false },
     PkgFile { rel: "core/packages/harness-doctrine/SKILL.md", content: include_str!("../kits/core/packages/harness-doctrine/SKILL.md"), exec: false },
     PkgFile { rel: "core/packages/self-modify/SKILL.md", content: include_str!("../kits/core/packages/self-modify/SKILL.md"), exec: false },
     PkgFile { rel: "core/packages/escalate/SKILL.md", content: include_str!("../kits/core/packages/escalate/SKILL.md"), exec: false },
     PkgFile { rel: "core/profiles/architect/profile.toml", content: include_str!("../kits/core/profiles/architect/profile.toml"), exec: false },
     PkgFile { rel: "core/profiles/architect/blocks/00-architect.md", content: include_str!("../kits/core/profiles/architect/blocks/00-architect.md"), exec: false },
+    PkgFile { rel: "dev/README.md", content: include_str!("../kits/dev/README.md"), exec: false },
+    PkgFile { rel: "dev/packages/git-protect/elanus.toml", content: include_str!("../kits/dev/packages/git-protect/elanus.toml"), exec: false },
+    PkgFile { rel: "dev/packages/git-protect/scripts/gate", content: include_str!("../kits/dev/packages/git-protect/scripts/gate"), exec: true },
+    PkgFile { rel: "dev/profiles/dev/profile.toml", content: include_str!("../kits/dev/profiles/dev/profile.toml"), exec: false },
+    PkgFile { rel: "funnel/README.md", content: include_str!("../kits/funnel/README.md"), exec: false },
+    PkgFile { rel: "funnel/packages/funnel-intake/elanus.toml", content: include_str!("../kits/funnel/packages/funnel-intake/elanus.toml"), exec: false },
+    PkgFile { rel: "funnel/packages/funnel-intake/scripts/main", content: include_str!("../kits/funnel/packages/funnel-intake/scripts/main"), exec: true },
+    PkgFile { rel: "funnel/packages/funnel-sift/elanus.toml", content: include_str!("../kits/funnel/packages/funnel-sift/elanus.toml"), exec: false },
+    PkgFile { rel: "funnel/packages/funnel-sift/rules.txt", content: include_str!("../kits/funnel/packages/funnel-sift/rules.txt"), exec: false },
+    PkgFile { rel: "funnel/packages/funnel-sift/scripts/sift", content: include_str!("../kits/funnel/packages/funnel-sift/scripts/sift"), exec: true },
+    PkgFile { rel: "funnel/packages/funnel-scout/elanus.toml", content: include_str!("../kits/funnel/packages/funnel-scout/elanus.toml"), exec: false },
+    PkgFile { rel: "funnel/packages/funnel-scout/scripts/run", content: include_str!("../kits/funnel/packages/funnel-scout/scripts/run"), exec: true },
+    PkgFile { rel: "funnel/profiles/scout/profile.toml", content: include_str!("../kits/funnel/profiles/scout/profile.toml"), exec: false },
+    PkgFile { rel: "funnel/profiles/scout/blocks/00-scout.md", content: include_str!("../kits/funnel/profiles/scout/blocks/00-scout.md"), exec: false },
 ];
 
 const PROFILE_TOML: &str = include_str!("../templates/profile.toml");
@@ -56,9 +72,9 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     for d in [root.packages(), root.run_dir(), root.profile_dir("default").join("blocks")] {
         std::fs::create_dir_all(d)?;
     }
-    // Seed <root>/kits with the stock kit FIRST so `init --kit core` (and
+    // Seed <root>/kits with the stock kits FIRST so `init --kit core` (and
     // every later `kit add`) resolves without env vars or a repo checkout.
-    for f in CORE_KIT_FILES {
+    for f in STOCK_KIT_FILES {
         let path = root.dir.join("kits").join(f.rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

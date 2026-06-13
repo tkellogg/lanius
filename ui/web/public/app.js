@@ -214,7 +214,11 @@ async function loadSetup() {
     };
     kitsBox.appendChild(row);
   }
-  if (!(kits.kits ?? []).length) kitsBox.appendChild(el('div', 'dim-note', 'no kits resolvable — set ELANUS_KIT_PATH where the server runs'));
+  if (!(kits.kits ?? []).length) {
+    kitsBox.appendChild(el('div', 'dim-note', kits.ok === false
+      ? `kit list failed: ${kits.error ?? 'unknown - is the elanus binary on the server PATH current?'}`
+      : 'no kits resolvable — drop one in <root>/kits'));
+  }
 
   pendBox.textContent = '';
   let pendingAny = false;
