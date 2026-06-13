@@ -113,6 +113,9 @@ body {
 
 /* ---------------- stage & tabs ---------------- */
 .tabs { display: flex; gap: 4px; }
+/* [hidden] is display:none at UA specificity; .tabs's display:flex would
+   beat it, so the agent tabs leaked onto signals/setup. Restore the hide. */
+.tabs[hidden] { display: none; }
 .tabs button {
   font: 10.5px var(--mono); letter-spacing: 0.12em; text-transform: uppercase;
   color: var(--dim); background: none; border: 1px solid transparent;

@@ -126,6 +126,9 @@ $('#na-create').onclick = async () => {
   $('#na-name').value = ''; $('#na-model').value = '';
   await loadDiskAgents();
   selectAgent(name, 'configure');
+  // Land on configure with an explicit confirmation — the nav selection
+  // changing is otherwise the only signal the create succeeded.
+  $('#cfg-note').textContent = `created ${name} — set its identity below, then converse`;
 };
 
 // ---------- view switching ----------
@@ -150,8 +153,8 @@ function selectSignals() {
 
 function selectSetup() {
   sel = { kind: 'setup' };
-  $('#stage-title').textContent = 'setup';
-  $('#stage-note').textContent = 'stage here, commit in the terminal';
+  $('#stage-title').textContent = 'kits & review';
+  $('#stage-note').textContent = 'kits & grants — stage, then approve (here or in your terminal)';
   $('#agent-tabs').hidden = true;
   show('setup');
   renderNav();
@@ -445,9 +448,11 @@ function convMsg(agent, who, cls, text, corr) {
   feed.querySelector('.conv-empty')?.remove();
   const was = atBottom(feed);
   const m = el('div', `msg ${cls}`);
+  // Threading still keys on correlation internally; the id is debug detail,
+  // so it rides the element title (hover) instead of cluttering every bubble.
+  if (corr) m.title = `correlation ${corr}`;
   const head = el('div', 'msg-meta');
   head.appendChild(el('span', 'msg-who', who));
-  if (corr) head.appendChild(el('span', 'msg-corr', corr.slice(0, 18)));
   m.appendChild(head);
   const body = el('div', 'msg-body', text);
   m.appendChild(body);
@@ -530,7 +535,7 @@ function closeAskFromOutside(corr, ans) {
 function onMessage(msg) {
   const { topic, env } = msg;
   count++;
-  $('#stat-count').textContent = `${count} events`;
+  $('#stat-count').textContent = `${count} event${count === 1 ? '' : 's'}`;
   buffer.push(msg);
   if (buffer.length > BUFFER_CAP) buffer.shift();
 
@@ -646,7 +651,7 @@ async function loadSessions(agent) {
   if (sel.kind !== 'agent' || sel.agent !== agent || sel.tab !== 'sessions') return;
   sessionsPane.textContent = '';
   if (!j?.ok) {
-    sessionsPane.appendChild(liveOnlyNote('install & approve packages/history to browse transcripts.'));
+    sessionsPane.appendChild(liveOnlyNote('approve the history package under “kits & review” to browse transcripts.'));
     return;
   }
   const list = j.sessions ?? [];
