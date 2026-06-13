@@ -293,7 +293,18 @@ EVM=$(sql "SELECT id FROM events WHERE payload LIKE '%via-mqtt%'")
 elanus bus pub in/package/demo/echo '{"msg":"forgery","sender":"admin"}' || fail "bus pub forge"
 wait_for "forged-sender event ledgered" "[ -n \"\$(sql \"SELECT id FROM events WHERE payload LIKE '%forgery%'\")\" ]"
 FSND=$(sql "SELECT sender FROM events WHERE payload LIKE '%forgery%' ORDER BY id DESC LIMIT 1")
-[ "$FSND" = "human" ] && ok "anonymous publish stamped 'human'; forged payload sender ignored" || fail "verified sender was '$FSND', expected human"
+[ "$FSND" = "human" ] && ok "publish stamped 'human'; forged payload sender ignored" || fail "verified sender was '$FSND', expected human"
+# Deny-by-default (docs/identity.md): a connection with no credential is
+# refused. The CLI normally presents the human secret from the fenced store;
+# hide it and the CLI is in the same spot as a caged agent that cannot read
+# the store — its connection must be refused, so the publish fails.
+mv "$TMP/.secrets/human" "$TMP/.secrets/human.hidden"
+if elanus bus pub obs/e2e/should-be-refused '{}' >/dev/null 2>&1; then
+  fail "unauthenticated publish was accepted (deny-by-default not enforced)"
+else
+  ok "deny-by-default: unauthenticated connection refused"
+fi
+mv "$TMP/.secrets/human.hidden" "$TMP/.secrets/human"
 # Retained: a late subscriber still gets the last value. (Exact topic, not
 # obs/package/+/status: stock daemon actors — recent-history — retain their
 # own statuses now, and --count 1 on a wildcard grabs whichever replays

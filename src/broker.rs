@@ -428,9 +428,15 @@ async fn handshake(st: Rc<Broker>, h: v5::Handshake) -> Result<v5::HandshakeAck<
             }
             (Some(name.clone()), name)
         }
-        // Anonymous (interim): full access, attributed to the human. The
-        // deny-by-default flip replaces this arm with a refusal.
-        _ => (None, crate::secrets::HUMAN.to_string()),
+        // Deny by default (docs/identity.md): no credential, no authority.
+        // Every first-party client now presents one (a package token, or the
+        // human/kernel secret from the fenced store), so a connection without
+        // credentials is a stray or a caged agent that could not read the
+        // store — refuse it rather than hand it the human's standing.
+        (None, _) | (_, None) => {
+            eprintln!("[bus] CONNECT refused: no credential presented (deny-by-default)");
+            return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
+        }
     };
     let will = pkt.last_will.as_ref().map(|w| Will {
         topic: w.topic.to_string(),

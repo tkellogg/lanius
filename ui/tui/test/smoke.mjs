@@ -116,8 +116,11 @@ await waitFor(
 );
 
 // -- a second, independent MQTT client to observe what the TUI publishes --
+// Both the observer and the TUI act as the human; present the human
+// credential (minted at init) so they are accepted once anonymous is denied.
+const humanSecret = fs.readFileSync(path.join(TMP, '.secrets', 'human'), 'utf8').trim();
 const observed = [];
-observer = mqtt.connect(URL, { protocolVersion: 5, clean: true, clientId: `el-tui-observer-${process.pid}` });
+observer = mqtt.connect(URL, { protocolVersion: 5, clean: true, clientId: `el-tui-observer-${process.pid}`, username: 'human', password: humanSecret });
 await new Promise((resolve, reject) => {
   observer.on('connect', () => observer.subscribe({ 'in/agent/#': { qos: 1 } }, resolve));
   observer.on('error', reject);
@@ -131,7 +134,7 @@ observer.on('message', (topic, payload) => {
 });
 
 // -- the TUI under test: ink-testing-library drives a real render --
-tui = render(h(App, { url: URL, agent: 'main' }));
+tui = render(h(App, { url: URL, agent: 'main', root: TMP }));
 const frame = () => tui.lastFrame() ?? '';
 await waitFor('tui connected', () => frame().includes('● connected'));
 

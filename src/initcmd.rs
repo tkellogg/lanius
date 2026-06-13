@@ -79,6 +79,10 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(root.secrets(), std::fs::Permissions::from_mode(0o700));
     }
+    // Mint the human and kernel credentials now, so they exist right after
+    // init — the human's surfaces can read them before any daemon is up, and
+    // the daemon's own ensure() at startup is then idempotent.
+    crate::secrets::ensure(&root)?;
     // Seed <root>/kits with the stock kits FIRST so `init --kit core` (and
     // every later `kit add`) resolves without env vars or a repo checkout.
     for f in STOCK_KIT_FILES {
