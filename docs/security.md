@@ -17,6 +17,52 @@ human has (CLI, files, loopback) is at least as available to an agent with a
 shell tool, and the ledger itself sits inside every cage. Everything below is
 a facet of that.
 
+## 0. [DOCTRINE] The boundary: fence the inside, invite the world in
+
+A hard rule, decided 2026-06-13, and the lens for reading everything else in
+this file. **elanus guarantees its security fences *within* elanus** — among
+the actors that participate through its own mechanisms: the write-cage, the
+bus, the grants ledger, identity. It does **not** try to defend the machine
+against the outside world. If a person with shell access, or a process that
+is not an elanus actor, reaches around elanus and edits a file, reads another
+process's memory, or otherwise meddles from outside the system's mechanisms,
+that is outside the contract. We do not try to save the world; we try to
+invite the world into a safe place.
+
+This boundary is not a cop-out — it is set by the goal it serves. The
+direction for elanus is to **host other agents**: to load tools like Claude
+Code, Codex, or Cursor *into* elanus so they run as ordinary actors and
+automatically inherit the same safeguards every actor has — the write-cage,
+the leases that stop two actors clobbering the same files, the grants that
+bound what each may touch, the identity that records who did what. The fences
+exist so that inviting a powerful, possibly careless, possibly
+prompt-injected agent into the system is safe for the other actors and for
+the human. They are hospitality infrastructure, not a wall against the
+universe.
+
+Two consequences:
+
+- **The in-scope adversary is a participant misbehaving** — most concretely,
+  an agent that has been prompt-injected and is now trying, through its
+  ordinary tools, to read another actor's secrets, forge a message, grab
+  authority it was not granted, or trample another actor's files. The fences
+  must hold against that, because that is exactly the case we are inviting in.
+- **The out-of-scope adversary is anything operating outside elanus's
+  mechanisms** — the operating system turning hostile, a separate process the
+  user starts by hand, someone with direct disk or memory access. We make no
+  promise against these and will not contort the design chasing them.
+
+A corollary about fence *strength*: a fence is only as strong as the
+operating system's sandbox beneath it. On macOS the sandbox can deny reads,
+so an actor genuinely cannot read another's secrets. On Linux before Landlock
+the sandbox cannot fence reads at all, so isolation between co-resident
+actors is best-effort there until Landlock (or an equivalent) is in place.
+That is a limitation of the fence's strength on a platform — it concerns one
+in-scope actor reading another — and the fix is a stronger OS sandbox, not a
+change to the boundary above. It does not weaken the elanus-versus-outside
+line; it weakens actor-versus-actor isolation on one OS, which is a known
+gap to close, not a hole in the promise.
+
 ## 1. [LEGS] The containment boundary (canonical: bus.md KNOWN GAP)
 
 Three interlocking legs that must move together: bus authz default
