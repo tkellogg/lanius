@@ -250,7 +250,7 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
                 write_roots.push(c);
             }
         }
-        let cage = sandbox::Cage::from_roots(write_roots, Vec::new(), true);
+        let cage = sandbox::Cage::from_roots(write_roots, Vec::new(), true, &sandbox::Protect::for_root(root));
         let token = uuid::Uuid::new_v4().to_string();
         crate::bus::register_actor(&pkg.name, Some(&token));
         let bus_cfg = crate::bus::config(root);

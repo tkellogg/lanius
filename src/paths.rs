@@ -33,6 +33,14 @@ impl Root {
     pub fn run_dir(&self) -> PathBuf {
         self.dir.join("run")
     }
+    /// The fenced secret store (docs/identity.md): kernel-minted credentials
+    /// and, later, the ledger-integrity key. The kernel (uncaged) reads and
+    /// writes it; every actor's cage denies it both ways, so a secret here is
+    /// not readable by another actor. Empty today; the credential increments
+    /// fill it.
+    pub fn secrets(&self) -> PathBuf {
+        self.dir.join(".secrets")
+    }
 }
 
 /// The default harness root: ~/.elanus/root. One predictable place, no

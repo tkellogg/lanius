@@ -29,6 +29,31 @@ pub struct Cage {
     sbpl: Option<String>,
 }
 
+/// Paths the cage fences from actors even though they sit inside an allowed
+/// write root (docs/identity.md): the kernel writes them, actors must not.
+/// `deny_write` is the approvals ledger and its write-ahead log — where a
+/// committed grant would have to land, so denying these stops an actor from
+/// granting itself authority by editing the database directly. The `-shm`
+/// shared-memory index is deliberately NOT denied: read-only consumers (the
+/// history view) need it, and it cannot conjure an approved row on its own
+/// while the database and its log are write-denied. `deny_read` is the
+/// secret store — a secret no other actor may read.
+pub struct Protect {
+    pub deny_write: Vec<PathBuf>,
+    pub deny_read: Vec<PathBuf>,
+}
+
+impl Protect {
+    pub fn for_root(root: &Root) -> Protect {
+        let db = root.db();
+        let wal = db.with_extension("db-wal");
+        Protect {
+            deny_write: vec![db, wal],
+            deny_read: vec![root.secrets()],
+        }
+    }
+}
+
 impl Cage {
     pub fn from_profile(root: &Root, cfg: &SandboxCfg) -> Cage {
         let mut roots: Vec<PathBuf> = vec![root.dir.clone()];
@@ -45,13 +70,15 @@ impl Cage {
         }
         // The whole-agent grant cage only enforces when fs_write is declared:
         // an empty declaration means "no cage", v1 behavior preserved.
-        Cage::from_roots(roots, cfg.exclude_or_default(), !cfg.fs_write.is_empty())
+        Cage::from_roots(roots, cfg.exclude_or_default(), !cfg.fs_write.is_empty(), &Protect::for_root(root))
     }
 
     /// A cage over an explicit write set — what leases and package actors
     /// spawn under. `enforce` still requires a platform mechanism; without
-    /// one the cage is camera-scope only (warned, never silent).
-    pub fn from_roots(roots: Vec<PathBuf>, exclude: Vec<String>, enforce: bool) -> Cage {
+    /// one the cage is camera-scope only (warned, never silent). `protect`
+    /// fences the ledger and the secret store from the actor even though they
+    /// sit inside a write root (docs/identity.md).
+    pub fn from_roots(roots: Vec<PathBuf>, exclude: Vec<String>, enforce: bool, protect: &Protect) -> Cage {
         let mut roots = roots;
         roots.sort();
         roots.dedup();
@@ -67,7 +94,7 @@ impl Cage {
         if enforce && !can_enforce {
             eprintln!("[sandbox] enforcement requested but no mechanism on this platform; camera only");
         }
-        let sbpl = can_enforce.then(|| sbpl(&top));
+        let sbpl = can_enforce.then(|| sbpl(&top, protect));
         Cage { write_roots: top, exclude, sbpl }
     }
 
@@ -114,14 +141,28 @@ impl SandboxCfg {
 /// the write roots, system temp, and /dev. Temp dirs are an accepted hole
 /// (staging is visible-by-absence; exfil needs network, the cage's other
 /// half — docs/sandbox.md).
-fn sbpl(write_roots: &[PathBuf]) -> String {
+fn sbpl(write_roots: &[PathBuf], protect: &Protect) -> String {
     let mut allow = String::new();
     for r in write_roots {
         allow.push_str(&format!("  (subpath \"{}\")\n", sbpl_escape(&r.display().to_string())));
     }
+    // Fence the ledger and secrets even though they live inside a write root.
+    // SBPL is last-match-wins, so these denials come AFTER the allow block and
+    // override it. The kernel and exec handlers run uncaged and are unaffected.
+    let mut fence = String::new();
+    for p in &protect.deny_write {
+        fence.push_str(&format!("(deny file-write* (literal \"{}\"))\n", sbpl_escape(&p.display().to_string())));
+    }
+    for p in &protect.deny_read {
+        // Deny both directions for secrets: unreadable and unwritable.
+        fence.push_str(&format!(
+            "(deny file-read* (subpath \"{p}\"))\n(deny file-write* (subpath \"{p}\"))\n",
+            p = sbpl_escape(&p.display().to_string())
+        ));
+    }
     format!(
         "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n{allow}\
-         \x20 (subpath \"/private/tmp\")\n  (subpath \"/private/var/folders\")\n  (subpath \"/dev\")\n)\n"
+         \x20 (subpath \"/private/tmp\")\n  (subpath \"/private/var/folders\")\n  (subpath \"/dev\")\n)\n{fence}"
     )
 }
 
@@ -267,10 +308,24 @@ mod tests {
 
     #[test]
     fn sbpl_contains_roots_and_denies_writes() {
-        let p = sbpl(&[PathBuf::from("/tmp/ws")]);
+        let protect = Protect {
+            deny_write: vec![PathBuf::from("/r/harness.db"), PathBuf::from("/r/harness.db-wal")],
+            deny_read: vec![PathBuf::from("/r/.secrets")],
+        };
+        let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect);
         assert!(p.contains("(deny file-write*)"));
         assert!(p.contains("(subpath \"/tmp/ws\")"));
         assert!(p.contains("(subpath \"/dev\")"));
+        // The ledger and its log are fenced; the -shm index is not.
+        assert!(p.contains("(deny file-write* (literal \"/r/harness.db\"))"));
+        assert!(p.contains("(deny file-write* (literal \"/r/harness.db-wal\"))"));
+        assert!(!p.contains("harness.db-shm"));
+        // Secrets are fenced both ways.
+        assert!(p.contains("(deny file-read* (subpath \"/r/.secrets\"))"));
+        // The fence comes AFTER the allow block (last-match-wins).
+        let allow_at = p.find("(allow file-write*").unwrap();
+        let deny_at = p.find("(deny file-write* (literal").unwrap();
+        assert!(deny_at > allow_at, "fence must override the allow");
     }
 
     #[test]
@@ -304,5 +359,31 @@ mod tests {
         let _ = std::fs::remove_file(&home_target);
         let _ = std::fs::remove_file(&target);
         assert!(!denied.status.success(), "write outside roots must fail");
+
+        // The ledger is fenced even though it sits inside an allowed root: an
+        // actor may read it (the history view does) but never write it, so it
+        // cannot grant itself authority by editing the database.
+        let db = root.db();
+        std::fs::write(&db, "seed").unwrap(); // the uncaged test stands in for the kernel
+        let db_write = cage
+            .shell_command(&format!("echo x >> {}", db.display()))
+            .output()
+            .unwrap();
+        assert!(!db_write.status.success(), "writing the ledger from the cage must fail");
+        let db_read = cage
+            .shell_command(&format!("cat {} > /dev/null", db.display()))
+            .output()
+            .unwrap();
+        assert!(db_read.status.success(), "reading the ledger from the cage must succeed");
+
+        // The secret store is unreadable from the cage.
+        std::fs::create_dir_all(root.secrets()).unwrap();
+        let tok = root.secrets().join("tok");
+        std::fs::write(&tok, "s3cr3t").unwrap();
+        let sec_read = cage
+            .shell_command(&format!("cat {}", tok.display()))
+            .output()
+            .unwrap();
+        assert!(!sec_read.status.success(), "reading a secret from the cage must fail");
     }
 }

@@ -651,7 +651,7 @@ fn narrowed_cage(root: &Root, conn: &Connection, base: &sandbox::Cage) -> anyhow
     }
     let mut roots = vec![root.dir.clone()];
     roots.extend(held.into_iter().map(std::path::PathBuf::from));
-    Ok(Some(sandbox::Cage::from_roots(roots, base.exclude.clone(), true)))
+    Ok(Some(sandbox::Cage::from_roots(roots, base.exclude.clone(), true, &sandbox::Protect::for_root(root))))
 }
 
 /// Resolve the profile's `[sandbox] workdir`: tilde-expanded, must be an

@@ -69,8 +69,15 @@ const BLOCK_CONTEXT: &str = include_str!("../templates/block-10-context.md");
 pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let root = Root { dir: dir.canonicalize()? };
-    for d in [root.packages(), root.run_dir(), root.profile_dir("default").join("blocks")] {
+    for d in [root.packages(), root.run_dir(), root.profile_dir("default").join("blocks"), root.secrets()] {
         std::fs::create_dir_all(d)?;
+    }
+    // The secret store is the kernel's; keep it 0700 so even outside the cage
+    // it is not casually readable. The cage fences it from actors regardless.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(root.secrets(), std::fs::Permissions::from_mode(0o700));
     }
     // Seed <root>/kits with the stock kits FIRST so `init --kit core` (and
     // every later `kit add`) resolves without env vars or a repo checkout.
