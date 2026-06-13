@@ -283,6 +283,14 @@ elanus bus pub in/package/demo/echo '{"msg":"via-mqtt"}' || fail "bus pub"
 wait_for "mqtt-published work ran" "grep -q '\"msg\":\"via-mqtt\"' '$TMP/echo.log'"
 EVM=$(sql "SELECT id FROM events WHERE payload LIKE '%via-mqtt%'")
 [ -n "$EVM" ] && wait_for "event #$EVM done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVM\")\" = done ]" || fail "mqtt publish not in ledger"
+# Verified sender (docs/identity.md): the broker stamps who it authenticated
+# onto the ledgered event, derived from the connection — a client cannot
+# forge it by putting a sender in the payload. `elanus bus pub` is anonymous,
+# so the verified sender is "human".
+elanus bus pub in/package/demo/echo '{"msg":"forgery","sender":"admin"}' || fail "bus pub forge"
+wait_for "forged-sender event ledgered" "[ -n \"\$(sql \"SELECT id FROM events WHERE payload LIKE '%forgery%'\")\" ]"
+FSND=$(sql "SELECT sender FROM events WHERE payload LIKE '%forgery%' ORDER BY id DESC LIMIT 1")
+[ "$FSND" = "human" ] && ok "anonymous publish stamped 'human'; forged payload sender ignored" || fail "verified sender was '$FSND', expected human"
 # Retained: a late subscriber still gets the last value. (Exact topic, not
 # obs/package/+/status: stock daemon actors — recent-history — retain their
 # own statuses now, and --count 1 on a wildcard grabs whichever replays
@@ -595,6 +603,10 @@ REPLY=$(sql "SELECT json_extract(payload,'\$.text') FROM events WHERE type='in/h
 [ "$REPLY" = "task complete" ] \
   && ok "reply mailed to the human with the conversation correlation" \
   || fail "reply mail missing/wrong: '$REPLY'"
+# Provenance: the agent's reply attributes to the agent (HARNESS_ACTOR set
+# by exec from the profile), not to the kernel.
+RSND=$(sql "SELECT sender FROM events WHERE type='in/human/owner' AND correlation_id='chat-corr-1'")
+[ "$RSND" = "main" ] && ok "agent reply attributed to the agent (sender=main)" || fail "reply sender was '$RSND', expected main"
 # An UNcorrelated run stays quiet: background work lives in the transcript,
 # never the human's inbox.
 NTEXT=$(sql "SELECT COUNT(*) FROM events WHERE type='in/human/owner' AND json_extract(payload,'\$.text') IS NOT NULL")
@@ -968,6 +980,10 @@ EOF
 wait_for "all 3 lines ledgered as in/package/funnel/sift" \
   "[ \"\$(sql4 \"SELECT COUNT(*) FROM events WHERE type='in/package/funnel/sift'\")\" -ge 3 ]"
 [ ! -e "$TMP4/run/pkg-funnel-intake/inbox/feed.line" ] && ok "consumed file removed after PUBACK" || fail "intake file not consumed"
+# Verified sender: events published by a token-authed daemon actor attribute
+# to that actor, not to "human".
+SIFTSND=$(sql4 "SELECT sender FROM events WHERE type='in/package/funnel/sift' ORDER BY id DESC LIMIT 1")
+[ "$SIFTSND" = "funnel-intake" ] && ok "daemon actor's events attributed to it (sender=funnel-intake)" || fail "sift sender was '$SIFTSND', expected funnel-intake"
 # The regex rung absorbs two, escalates one.
 wait_for "passing line escalated to in/agent/scout" \
   "[ \"\$(sql4 \"SELECT COUNT(*) FROM events WHERE type='in/agent/scout' AND payload LIKE '%reactor pressure%'\")\" -ge 1 ]"

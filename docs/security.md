@@ -25,11 +25,21 @@ the credential is just read off disk), exec-handler containment (uncaged,
 holds HARNESS_DB). Closing one alone closes nothing. Network-egress control
 is the cleaner cut for leg 1.
 
-## 2. [OPEN-TIM] Identity model
+## 2. [DESIGN DRAFTED] Identity model — see docs/identity.md
 
-Should privileged local clients authenticate positively (daemon-minted 0600
-cookie or similar) so unauthenticated becomes deny? Deferred to Tim at the
-end of bus.md "Packages". Legs 1–3 sequencing starts here.
+The question that was deferred here — should local clients authenticate
+positively so that unauthenticated becomes deny — now has a full design in
+docs/identity.md (2026-06-13). The short version: the broker is the one
+thing that says who sent a message, and the ledger can change only by going
+through the broker; the kernel mints a per-actor secret presented once at
+connect; the broker stamps the verified sender and ignores any claimed one;
+the human is a deliberately special actor whose surfaces carry delegated
+authority, with an out-of-band gesture reserved for the highest-stakes
+actions. Crucially, identity is the same work as legs 1–3 below — it is not
+real until the ledger is kernel-only-writable (legs 3 and entry 3) and
+secrets are unreadable by other actors (leg 2 / entry 6). Identity is the
+purpose those legs serve; finishing them is finishing identity. Open
+decisions on scope and sequencing are listed at the end of docs/identity.md.
 
 ## 3. [LEGS] The ledger is inside every cage
 

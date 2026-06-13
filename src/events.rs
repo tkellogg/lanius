@@ -20,6 +20,13 @@ pub struct EmitOpts {
     /// false and the daemon's announce sweep (dispatcher) publishes it.
     /// This flag is what makes "announce exactly once" a row-level fact.
     pub pre_announced: bool,
+    /// Who the kernel holds responsible for this event (docs/identity.md).
+    /// The broker sets it from the authenticated connection for bus-origin
+    /// events, overwriting anything the message claimed — that is the
+    /// verified, unforgeable case. Left None elsewhere, where emit() falls
+    /// back to the emitting process's declared actor (HARNESS_ACTOR) or, for
+    /// the kernel's own machinery, "kernel".
+    pub sender: Option<String>,
 }
 
 impl EmitOpts {
@@ -34,6 +41,7 @@ impl EmitOpts {
             idempotency: None,
             cause: None,
             pre_announced: false,
+            sender: None,
         }
     }
 }
@@ -49,11 +57,21 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
         o.cause = std::env::var("HARNESS_EVENT_ID").ok().and_then(|v| v.parse().ok());
     }
     let dispatch: Option<i64> = std::env::var("HARNESS_DISPATCH_ID").ok().and_then(|v| v.parse().ok());
+    // Provenance (docs/identity.md): a broker-verified sender wins; otherwise
+    // the emitting process's declared actor (HARNESS_ACTOR, set by exec for
+    // the agent it is running); otherwise the kernel itself. The broker path
+    // is the only one that is unforgeable — the others are self-reported until
+    // the ledger becomes kernel-only-writable.
+    let sender = o
+        .sender
+        .clone()
+        .or_else(|| std::env::var("HARNESS_ACTOR").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "kernel".to_string());
     // Atomic idempotency: ON CONFLICT DO NOTHING avoids the check-then-insert
     // race where two concurrent emitters of the same key both pass a SELECT.
     let inserted = conn.execute(
-        "INSERT INTO events(type, cause_id, correlation_id, payload, priority, deadline, default_action, idempotency_key, emitted_by_dispatch, announced)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO events(type, cause_id, correlation_id, payload, priority, deadline, default_action, idempotency_key, emitted_by_dispatch, announced, sender)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(idempotency_key) DO NOTHING",
         params![
             o.etype,
@@ -66,6 +84,7 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
             o.idempotency,
             dispatch,
             o.pre_announced as i64,
+            sender,
         ],
     )?;
     if inserted == 0 {

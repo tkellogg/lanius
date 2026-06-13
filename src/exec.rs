@@ -96,6 +96,13 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
     let (prof, _pdir) = profile::load(root, &opts.profile)?;
+    // Provenance (docs/identity.md): events this run emits — its reply mail,
+    // failure mail, ask_human, any emit_event tool call, and anything the
+    // shell tool runs via `elanus emit` — attribute to the agent. This is
+    // self-reported (the run writes the ledger directly) until the ledger
+    // becomes kernel-only-writable; the broker-verified path is the
+    // unforgeable one.
+    std::env::set_var("HARNESS_ACTOR", &prof.agent);
     let session = opts
         .session
         .unwrap_or_else(|| format!("s-{}", &uuid::Uuid::new_v4().to_string()[..8]));

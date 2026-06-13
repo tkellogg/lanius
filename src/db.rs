@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS events (
   -- events::emit (and pre-migration rows, see ALTER below) are never
   -- blasted onto the bus retroactively; emit() always binds the value.
   announced       INTEGER NOT NULL DEFAULT 1,
+  -- Who the kernel verified sent this event (docs/identity.md). For events
+  -- that arrive over the bus, the broker sets this from the authenticated
+  -- connection and overwrites anything the message tried to claim, so it is
+  -- a fact the kernel vouches for, not a self-report. 'kernel' for events the
+  -- kernel mints itself; 'human' for an unauthenticated local session (until
+  -- the identity model makes humans authenticate positively). NULL only on
+  -- rows written before this column existed.
+  sender          TEXT,
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   finished_at     TEXT
 );
@@ -159,6 +167,7 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     // DEFAULT 1: pre-existing rows count as already announced — upgrading
     // must not replay history onto the bus.
     let _ = conn.execute("ALTER TABLE events ADD COLUMN announced INTEGER NOT NULL DEFAULT 1", []);
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN sender TEXT", []);
     // Depends on the column above, so it lives after the migration, not in
     // the batch (a pre-`announced` DB would fail the whole batch otherwise).
     conn.execute(

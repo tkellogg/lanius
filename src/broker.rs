@@ -717,6 +717,12 @@ async fn inbound(
     let first = topic.split('/').next().unwrap_or("");
     let is_ledger = matches!(first, "in" | "signal");
 
+    // The verified sender (docs/identity.md): who the broker confirmed this
+    // connection belongs to — an authenticated package actor, or "human" for
+    // an anonymous local session (until the identity model makes humans
+    // authenticate positively). It is derived from the session, never read
+    // from the message, so a client cannot claim to be someone else.
+    let verified_sender = actor.clone().unwrap_or_else(|| "human".to_string());
     let out_line = if is_ledger {
         // Ledger topics ALWAYS materialize, el-mirror or not: the mirror's
         // "already recorded, forward verbatim" shortcut is for observations
@@ -732,6 +738,10 @@ async fn inbound(
         let mut opts = EmitOpts::new(&topic);
         opts.payload = Some(pv.clone());
         opts.correlation = el_corr.clone();
+        // The broker is the trust anchor for identity: it sets the sender
+        // from the connection it authenticated, so the ledger records who
+        // really sent the event rather than who the event says sent it.
+        opts.sender = Some(verified_sender.clone());
         // This same function fans the materialized event out below, so the
         // row is born already-announced; the dispatcher's announce sweep
         // must not publish it a second time.
@@ -739,7 +749,7 @@ async fn inbound(
         match events::emit(&st.root, conn, opts) {
             Ok(id) => json!({
                 "ts": trace::now_iso(), "kind": topic, "payload": pv, "event_id": id,
-                "correlation_id": el_corr
+                "correlation_id": el_corr, "sender": verified_sender
             })
             .to_string(),
             Err(e) => {
@@ -752,9 +762,10 @@ async fn inbound(
         text
     } else {
         // Observation from an external client: standard envelope, the
-        // recorder decides disk, fan-out regardless.
+        // recorder decides disk, fan-out regardless. The sender stamp rides
+        // along so subscribers see the broker-vouched origin.
         let pv: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        let line = json!({ "ts": trace::now_iso(), "kind": topic, "payload": pv }).to_string();
+        let line = json!({ "ts": trace::now_iso(), "kind": topic, "payload": pv, "sender": verified_sender }).to_string();
         if recorder::get(&st.root).sink_for(&topic) == recorder::Sink::Trace {
             trace::append_line(&st.root, &line);
         }
