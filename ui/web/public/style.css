@@ -317,7 +317,8 @@ body {
 .cfg-grid input { background: rgba(0,0,0,0.25); color: inherit; font: inherit; font-size: 13px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 7px 9px; }
 .cfg-grid input:focus { outline: none; border-color: rgba(255,255,255,0.35); }
 #cfg-toml { width: 100%; box-sizing: border-box; background: rgba(0,0,0,0.25); color: inherit; font: inherit; font-size: 12px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 10px; resize: vertical; margin-top: 8px; }
-.nav-new { color: var(--dim); }
+/* An action, not an agent — set it off from the agent list above. */
+.nav-new { color: var(--dim); border-top: 1px dashed var(--panel-edge); margin-top: 5px; padding-top: 7px; }
 .setup-row input { background: rgba(0,0,0,0.25); color: inherit; font: inherit; font-size: 13px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 7px 9px; }
 
 /* ---------- welcome (front door) ---------- */
