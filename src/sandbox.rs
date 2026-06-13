@@ -30,17 +30,25 @@ pub struct Cage {
 }
 
 /// Paths the cage fences from actors even though they sit inside an allowed
-/// write root (docs/identity.md): the kernel writes them, actors must not.
-/// `deny_write` is the approvals ledger and its write-ahead log — where a
-/// committed grant would have to land, so denying these stops an actor from
-/// granting itself authority by editing the database directly. The `-shm`
-/// shared-memory index is deliberately NOT denied: read-only consumers (the
-/// history view) need it, and it cannot conjure an approved row on its own
-/// while the database and its log are write-denied. `deny_read` is the
-/// secret store — a secret no other actor may read.
+/// write root (docs/identity.md): the kernel and the human's uncaged
+/// surfaces write them, caged actors must not.
+///
+/// - `deny_write_files`: the approvals ledger and its write-ahead log (exact
+///   files) — where a committed grant would have to land, so denying these
+///   stops an actor granting itself authority by editing the database. The
+///   `-shm` index is spared: read-only consumers (the history view) need it,
+///   and it cannot conjure an approved row while the db and its log are
+///   write-denied.
+/// - `deny_write_trees`: the profiles directory — a profile confers authority
+///   (writable prefixes, model, skill visibility) with no grant gate, so an
+///   agent editing one would escalate. The human edits profiles from an
+///   uncaged surface; caged actors are kept out.
+/// - `deny_all_trees`: the secret store — neither readable nor writable by
+///   any actor.
 pub struct Protect {
-    pub deny_write: Vec<PathBuf>,
-    pub deny_read: Vec<PathBuf>,
+    pub deny_write_files: Vec<PathBuf>,
+    pub deny_write_trees: Vec<PathBuf>,
+    pub deny_all_trees: Vec<PathBuf>,
 }
 
 impl Protect {
@@ -48,8 +56,9 @@ impl Protect {
         let db = root.db();
         let wal = db.with_extension("db-wal");
         Protect {
-            deny_write: vec![db, wal],
-            deny_read: vec![root.secrets()],
+            deny_write_files: vec![db, wal],
+            deny_write_trees: vec![root.profiles()],
+            deny_all_trees: vec![root.secrets()],
         }
     }
 }
@@ -146,15 +155,19 @@ fn sbpl(write_roots: &[PathBuf], protect: &Protect) -> String {
     for r in write_roots {
         allow.push_str(&format!("  (subpath \"{}\")\n", sbpl_escape(&r.display().to_string())));
     }
-    // Fence the ledger and secrets even though they live inside a write root.
-    // SBPL is last-match-wins, so these denials come AFTER the allow block and
-    // override it. The kernel and exec handlers run uncaged and are unaffected.
+    // Fence the ledger, the profiles tree, and the secrets even though they
+    // live inside a write root. SBPL is last-match-wins, so these denials come
+    // AFTER the allow block and override it. The kernel and exec handlers run
+    // uncaged and are unaffected.
     let mut fence = String::new();
-    for p in &protect.deny_write {
+    for p in &protect.deny_write_files {
         fence.push_str(&format!("(deny file-write* (literal \"{}\"))\n", sbpl_escape(&p.display().to_string())));
     }
-    for p in &protect.deny_read {
-        // Deny both directions for secrets: unreadable and unwritable.
+    for p in &protect.deny_write_trees {
+        fence.push_str(&format!("(deny file-write* (subpath \"{}\"))\n", sbpl_escape(&p.display().to_string())));
+    }
+    for p in &protect.deny_all_trees {
+        // Deny both directions: unreadable and unwritable.
         fence.push_str(&format!(
             "(deny file-read* (subpath \"{p}\"))\n(deny file-write* (subpath \"{p}\"))\n",
             p = sbpl_escape(&p.display().to_string())
@@ -309,8 +322,9 @@ mod tests {
     #[test]
     fn sbpl_contains_roots_and_denies_writes() {
         let protect = Protect {
-            deny_write: vec![PathBuf::from("/r/harness.db"), PathBuf::from("/r/harness.db-wal")],
-            deny_read: vec![PathBuf::from("/r/.secrets")],
+            deny_write_files: vec![PathBuf::from("/r/harness.db"), PathBuf::from("/r/harness.db-wal")],
+            deny_write_trees: vec![PathBuf::from("/r/profiles")],
+            deny_all_trees: vec![PathBuf::from("/r/.secrets")],
         };
         let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect);
         assert!(p.contains("(deny file-write*)"));
@@ -320,6 +334,8 @@ mod tests {
         assert!(p.contains("(deny file-write* (literal \"/r/harness.db\"))"));
         assert!(p.contains("(deny file-write* (literal \"/r/harness.db-wal\"))"));
         assert!(!p.contains("harness.db-shm"));
+        // Profiles are write-fenced (a profile confers authority).
+        assert!(p.contains("(deny file-write* (subpath \"/r/profiles\"))"));
         // Secrets are fenced both ways.
         assert!(p.contains("(deny file-read* (subpath \"/r/.secrets\"))"));
         // The fence comes AFTER the allow block (last-match-wins).
@@ -385,5 +401,15 @@ mod tests {
             .output()
             .unwrap();
         assert!(!sec_read.status.success(), "reading a secret from the cage must fail");
+
+        // Profiles confer authority; a caged actor cannot write them.
+        std::fs::create_dir_all(root.profiles()).unwrap();
+        let prof = root.profiles().join("default");
+        std::fs::create_dir_all(&prof).unwrap();
+        let prof_write = cage
+            .shell_command(&format!("echo 'fs_write=[\"/\"]' >> {}", prof.join("profile.toml").display()))
+            .output()
+            .unwrap();
+        assert!(!prof_write.status.success(), "editing a profile from the cage must fail");
     }
 }
