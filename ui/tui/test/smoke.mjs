@@ -116,11 +116,11 @@ await waitFor(
 );
 
 // -- a second, independent MQTT client to observe what the TUI publishes --
-// Both the observer and the TUI act as the human; present the human
+// Both the observer and the TUI act as the owner; present the owner
 // credential (minted at init) so they are accepted once anonymous is denied.
-const humanSecret = fs.readFileSync(path.join(TMP, '.secrets', 'human'), 'utf8').trim();
+const humanSecret = fs.readFileSync(path.join(TMP, '.secrets', 'owner'), 'utf8').trim();
 const observed = [];
-observer = mqtt.connect(URL, { protocolVersion: 5, clean: true, clientId: `el-tui-observer-${process.pid}`, username: 'human', password: humanSecret });
+observer = mqtt.connect(URL, { protocolVersion: 5, clean: true, clientId: `el-tui-observer-${process.pid}`, username: 'owner', password: humanSecret });
 await new Promise((resolve, reject) => {
   observer.on('connect', () => observer.subscribe({ 'in/agent/#': { qos: 1 } }, resolve));
   observer.on('error', reject);

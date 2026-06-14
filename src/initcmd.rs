@@ -145,6 +145,12 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     println!();
     println!("initialized harness root at {}", root.dir.display());
     println!();
+    println!(
+        "you are \"{}\" here (the default identity). to use your own name:",
+        crate::secrets::owner_name(&root)
+    );
+    println!("  elanus profile set default owner=<yourname>   # then restart the daemon");
+    println!();
     println!("next steps:");
     // The default root needs no env var; only point at HARNESS_ROOT when
     // this root actually requires it.

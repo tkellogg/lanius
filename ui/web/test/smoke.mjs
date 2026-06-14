@@ -38,10 +38,10 @@ const sql = (q) => execFileSync('sqlite3', ['-cmd', '.timeout 5000', path.join(T
 elanus('init');
 fs.writeFileSync(path.join(TMP, 'bus.toml'), `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\n`);
 const daemon = spawn(path.join(BIN, 'elanus'), ['daemon', '--interval-ms', '200'], { env: ENV, stdio: 'ignore' });
-// The probe acts as the human: present the human credential (minted at init)
+// The probe acts as the owner: present the owner credential (minted at init)
 // so it is accepted once unauthenticated connections are denied.
-const humanSecret = fs.readFileSync(path.join(TMP, '.secrets', 'human'), 'utf8').trim();
-const probe = mqtt.connect(`mqtt://127.0.0.1:${BUS_PORT}`, { protocolVersion: 5, reconnectPeriod: 300, username: 'human', password: humanSecret });
+const humanSecret = fs.readFileSync(path.join(TMP, '.secrets', 'owner'), 'utf8').trim();
+const probe = mqtt.connect(`mqtt://127.0.0.1:${BUS_PORT}`, { protocolVersion: 5, reconnectPeriod: 300, username: 'owner', password: humanSecret });
 await waitFor('daemon listener bound', () => new Promise((r) => { probe.connected ? r(true) : probe.once('connect', () => r(true)); setTimeout(() => r(probe.connected), 250); }));
 
 // -- the server under test --

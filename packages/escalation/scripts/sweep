@@ -21,7 +21,7 @@ DB="$HARNESS_DB"
 
 for ask_id in $(sqlite3 "$DB" "
   SELECT e.id FROM events e
-   WHERE e.type = 'in/human/owner'
+   WHERE e.type LIKE 'in/human/%'
      AND json_extract(e.payload, '\$.question') IS NOT NULL
      -- ^ only actual asks nag; agent REPLIES are also human mail ({text})
      --   and must never be escalated as unanswered

@@ -414,6 +414,27 @@ one, and the later increments close the gap by making the ledger
 kernel-only-writable). Rows written before this existed have no sender;
 absent should be read as "unknown", never silently treated as trusted.
 
+## Implementation notes (increment 3, as built — 2026-06-14)
+
+The principal became a name, not a role. The broker handshake authenticates
+any fenced secret `.secrets/<name>` as a full-authority identity (the owner,
+the kernel, another human), checked before any package token; a package token
+is grant-scoped; no credential is refused (deny-by-default, shipped). "human"
+is no longer a keyword — the default owner identity is named "owner" (configur-
+able), and `kernel` and `owner` are just two fenced-secret names, so dropping
+`.secrets/alice` makes "alice" authenticate too (multi-human is model-ready;
+provisioning/UX is deferred). The owner's name has one source of truth — the
+default profile's `owner` field — and `.secrets/.owner-name` is a cache of it
+the surfaces read; `ensure` keeps the cache in sync and, on a rename or an
+upgrade from a pre-rename `.secrets/human`, *moves* the existing secret to the
+new name so the auth identity, the `in/human/<owner>` mailbox, and the
+credential always agree and nothing is orphaned. `ELANUS_OWNER` is a runtime
+override. The stock human-proxy packages (notify, escalation) match
+`in/human/#` so a renamed owner still receives asks. The cage fences
+`.secrets` read+write, so only the human/kernel can place a full-authority
+secret; a caged agent cannot mint or read one (macOS — the Linux read-fence
+gap remains the deferred limitation in section 0).
+
 ## Settled in this round (2026-06-13)
 
 - **Scope of the first pass.** The sandbox-protected credential everywhere,

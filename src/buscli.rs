@@ -30,14 +30,20 @@ fn client(root: &Root, addr: SocketAddr, tag: &str) -> (AsyncClient, rumqttc::v5
     //  - inside a supervised package actor, the supervisor injected the
     //    actor's token in the environment: authenticate as the package, so
     //    the broker scopes the session to its grants;
-    //  - otherwise this is the human's own command line: present the human
-    //    credential from the fenced store. A caged agent shell running the
-    //    CLI cannot read that store, so it stays anonymous — and is refused
-    //    once the deny-by-default flip is live, which is the point.
+    //  - otherwise this is the human's own command line: present the owner
+    //    identity from the fenced store. A caged agent shell running the CLI
+    //    cannot read that store, so it presents no credential — and is refused
+    //    (deny-by-default), which is the point.
     if let (Ok(pkg), Ok(token)) = (std::env::var("ELANUS_PACKAGE"), std::env::var("ELANUS_BUS_TOKEN")) {
         opts.set_credentials(pkg, token);
-    } else if let Some(secret) = crate::secrets::read(root, crate::secrets::HUMAN) {
-        opts.set_credentials(crate::secrets::HUMAN, secret);
+    } else {
+        // The human's own command line: present the owner identity from the
+        // fenced store. A caged agent shell cannot read that store, so it
+        // stays credential-less and is refused (deny-by-default).
+        let owner = crate::secrets::owner_name(root);
+        if let Some(secret) = crate::secrets::read(root, &owner) {
+            opts.set_credentials(owner, secret);
+        }
     }
     AsyncClient::new(opts, 64)
 }

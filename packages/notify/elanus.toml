@@ -4,8 +4,11 @@
 # Every surfaced ask leaves an obs/channel/desktop/sent receipt (ok reflects
 # whether the notification mechanism worked) — escalation reads these.
 
+# in/human/# (not a single owner): a human's mailbox is in/human/<name>, and
+# the owner's name is configurable (docs/identity.md), so surface asks for any
+# human mailbox rather than pinning to the default "owner".
 [request]
-subscribe = ["in/human/owner", "signal/#"]
+subscribe = ["in/human/#", "signal/#"]
 publish   = ["obs/channel/desktop/sent"]
 
 [process]

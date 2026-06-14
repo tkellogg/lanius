@@ -40,9 +40,9 @@ CREATE TABLE IF NOT EXISTS events (
   -- that arrive over the bus, the broker sets this from the authenticated
   -- connection and overwrites anything the message tried to claim, so it is
   -- a fact the kernel vouches for, not a self-report. 'kernel' for events the
-  -- kernel mints itself; 'human' for an unauthenticated local session (until
-  -- the identity model makes humans authenticate positively). NULL only on
-  -- rows written before this column existed.
+  -- kernel mints itself; the owner identity name (default 'owner') for the
+  -- human's surfaces; the package name for a package actor. NULL only on rows
+  -- written before this column existed.
   sender          TEXT,
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   finished_at     TEXT

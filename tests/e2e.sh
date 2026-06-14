@@ -288,23 +288,36 @@ EVM=$(sql "SELECT id FROM events WHERE payload LIKE '%via-mqtt%'")
 [ -n "$EVM" ] && wait_for "event #$EVM done" "[ \"\$(sql \"SELECT state FROM events WHERE id=$EVM\")\" = done ]" || fail "mqtt publish not in ledger"
 # Verified sender (docs/identity.md): the broker stamps who it authenticated
 # onto the ledgered event, derived from the connection — a client cannot
-# forge it by putting a sender in the payload. `elanus bus pub` is anonymous,
-# so the verified sender is "human".
+# forge it by putting a sender in the payload. `elanus bus pub` presents the
+# owner identity (default "owner") from the fenced store.
 elanus bus pub in/package/demo/echo '{"msg":"forgery","sender":"admin"}' || fail "bus pub forge"
 wait_for "forged-sender event ledgered" "[ -n \"\$(sql \"SELECT id FROM events WHERE payload LIKE '%forgery%'\")\" ]"
 FSND=$(sql "SELECT sender FROM events WHERE payload LIKE '%forgery%' ORDER BY id DESC LIMIT 1")
-[ "$FSND" = "human" ] && ok "publish stamped 'human'; forged payload sender ignored" || fail "verified sender was '$FSND', expected human"
+[ "$FSND" = "owner" ] && ok "publish stamped 'owner'; forged payload sender ignored" || fail "verified sender was '$FSND', expected owner"
+# Multi-human / identity-as-a-name (docs/identity.md): a second fenced secret is
+# a second full-authority identity, and ELANUS_OWNER picks which one a surface
+# presents. The broker stamps the real one — proving the principal is a name,
+# not the role "human". (The broker reads the store per-connect, so a freshly
+# dropped secret is honored immediately.)
+printf 'alice-secret-xyzxyzxyz' > "$TMP/.secrets/alice"
+ELANUS_OWNER=alice elanus bus pub in/package/demo/echo '{"msg":"as-alice"}' || fail "bus pub as alice"
+wait_for "alice's event ledgered" "[ -n \"\$(sql \"SELECT id FROM events WHERE payload LIKE '%as-alice%'\")\" ]"
+ASND=$(sql "SELECT sender FROM events WHERE payload LIKE '%as-alice%' ORDER BY id DESC LIMIT 1")
+[ "$ASND" = "alice" ] && ok "a second identity authenticates and is stamped 'alice'" || fail "second-identity sender was '$ASND', expected alice"
 # Deny-by-default (docs/identity.md): a connection with no credential is
-# refused. The CLI normally presents the human secret from the fenced store;
+# refused. The CLI normally presents the owner secret from the fenced store;
 # hide it and the CLI is in the same spot as a caged agent that cannot read
 # the store — its connection must be refused, so the publish fails.
-mv "$TMP/.secrets/human" "$TMP/.secrets/human.hidden"
+mv "$TMP/.secrets/owner" "$TMP/.secrets/owner.hidden"
 if elanus bus pub obs/e2e/should-be-refused '{}' >/dev/null 2>&1; then
   fail "unauthenticated publish was accepted (deny-by-default not enforced)"
 else
   ok "deny-by-default: unauthenticated connection refused"
 fi
-mv "$TMP/.secrets/human.hidden" "$TMP/.secrets/human"
+mv "$TMP/.secrets/owner.hidden" "$TMP/.secrets/owner"
+# The owner name has a cache the surfaces read (kept in sync with the profile).
+[ "$(cat "$TMP/.secrets/.owner-name" 2>/dev/null)" = "owner" ] \
+  && ok ".owner-name cache written (surfaces resolve the owner identity)" || fail ".owner-name cache missing/wrong"
 # Retained: a late subscriber still gets the last value. (Exact topic, not
 # obs/package/+/status: stock daemon actors — recent-history — retain their
 # own statuses now, and --count 1 on a wildcard grabs whichever replays
@@ -1188,14 +1201,14 @@ curl -s -m 2 "http://127.0.0.1:$PBPORT/healthz" >/dev/null 2>&1 \
 elanus approve phonebook >/dev/null 2>&1 || fail "approve phonebook"
 wait_for "phonebook serving after approval" \
   "curl -s -m 2 'http://127.0.0.1:$PBPORT/healthz' | grep -q '\"ok\": *true'"
-# Writes go over the bus; the CLI authenticates as the human, so the broker
-# stamps provenance "human" — an unforgeable claim, not a chosen field.
+# Writes go over the bus; the CLI authenticates as the owner identity, so the
+# broker stamps provenance "owner" — an unforgeable claim, not a chosen field.
 elanus bus pub in/package/phonebook/identity '{"id":"tim","kind":"human","canonical":"Tim"}' --qos 1 >/dev/null || fail "pub identity"
 elanus bus pub in/package/phonebook/channel '{"channel_kind":"bluesky","address":"@tim","identity":"tim","confidence":1.0}' --qos 1 >/dev/null || fail "pub channel"
 elanus bus pub in/package/phonebook/channel '{"channel_kind":"discord","address":"tim#1"}' --qos 1 >/dev/null || fail "pub unresolved channel"
 wait_for "channel resolves to its identity" \
   "curl -s 'http://127.0.0.1:$PBPORT/query' -d '{\"kind\":\"resolve\",\"channel_kind\":\"bluesky\",\"address\":\"@tim\"}' | grep -q '\"id\": *\"tim\"'"
-curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"resolve","channel_kind":"bluesky","address":"@tim"}' | grep -q '"provenance": *"human"' \
+curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"resolve","channel_kind":"bluesky","address":"@tim"}' | grep -q '"provenance": *"owner"' \
   && ok "link provenance = broker-verified sender (not a payload field)" || fail "provenance is not the verified sender"
 # A sighting recorded before it is matched — the matcher's work queue.
 curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"resolve","channel_kind":"discord","address":"tim#1"}' | grep -q '"resolved": *false' \

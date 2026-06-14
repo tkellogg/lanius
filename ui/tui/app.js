@@ -9,13 +9,29 @@ import path from 'node:path';
 
 const h = React.createElement;
 
-// The TUI is a human surface: present the human credential from the fenced
-// store so the broker stamps its events as "human" (docs/identity.md).
+// The TUI is a human surface: present the owner identity from the fenced
+// store so the broker stamps its events as the owner (docs/identity.md — the
+// principal is an identity, default "owner", not the role "human").
+// Matches src/secrets.rs valid_principal — keep in sync (see ui/web/server.mjs).
+function validPrincipal(name) {
+  return !!name && name.length <= 64 && !name.startsWith('.') && !name.includes('/') && !name.includes('\\');
+}
+function ownerName(root) {
+  const env = (process.env.ELANUS_OWNER || '').trim();
+  if (validPrincipal(env)) return env;
+  try {
+    const n = fs.readFileSync(path.join(root, '.secrets', '.owner-name'), 'utf8').trim();
+    return validPrincipal(n) ? n : 'owner';
+  } catch {
+    return 'owner';
+  }
+}
 function humanCredential(root) {
   if (!root) return {};
   try {
-    const secret = fs.readFileSync(path.join(root, '.secrets', 'human'), 'utf8').trim();
-    return secret ? { username: 'human', password: secret } : {};
+    const username = ownerName(root);
+    const secret = fs.readFileSync(path.join(root, '.secrets', username), 'utf8').trim();
+    return secret ? { username, password: secret } : {};
   } catch {
     return {};
   }

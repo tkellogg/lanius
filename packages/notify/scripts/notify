@@ -19,7 +19,7 @@ if options:
     body += "  [" + " | ".join(str(o) for o in options) + "]"
 # The answer hint belongs on asks only; agent replies ({text}) are also
 # human mail and need no response.
-if etype == "in/human/owner" and payload.get("question"):
+if etype.startswith("in/human/") and payload.get("question"):
     body += f'  — answer: elanus answer {event.get("id")} "..."'
 
 script = 'on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run'
@@ -33,7 +33,7 @@ except Exception:
 # The receipt: "we attempted delivery on this channel, and it did/didn't
 # work". sent != acked — acked means a human demonstrably saw it, which the
 # desktop channel cannot know. Escalation logic keys off these.
-if etype == "in/human/owner":
+if etype.startswith("in/human/"):
     receipt = json.dumps({"ask_id": event.get("id"), "channel": "desktop", "ok": ok})
     try:
         subprocess.run(

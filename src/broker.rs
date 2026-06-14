@@ -131,13 +131,15 @@ struct SessionRec {
     /// Some(package) when CONNECT authenticated with a supervisor-minted
     /// token: this session is that package actor, and its subscribe/publish
     /// are scoped to the package's approved grants. None for the full-
-    /// authority identities — the human, the kernel's own machinery, and
-    /// (until the deny-by-default flip) an anonymous local client. The ACL
-    /// only constrains package actors; None means full access.
+    /// authority identities authenticated by a fenced secret — the owner, the
+    /// kernel's own machinery, another human. The ACL only constrains package
+    /// actors; None means full access. (No-credential connections are refused
+    /// at CONNECT, so there is no anonymous session.)
     actor: Option<String>,
     /// The verified sender the broker stamps on this session's ledgered
-    /// events (docs/identity.md): the package name, or "human" / "kernel".
-    /// Derived from the authenticated connection, never from the message.
+    /// events (docs/identity.md): the owner identity name, another human, a
+    /// package name, or "kernel". Derived from the authenticated connection,
+    /// never from the message.
     sender: String,
     /// CONNECT last will, fired on abnormal close (crash-only liveness).
     will: Option<Will>,
@@ -169,12 +171,6 @@ struct Broker {
     /// Registration sequence counter (ordering tiebreak).
     reg_seq: Cell<u64>,
     next_key: Cell<u64>,
-    /// The reserved human and kernel credentials (docs/identity.md), read
-    /// once from the fenced secret store at startup. None if the store could
-    /// not be read — then those identities cannot authenticate, which fails
-    /// safe (refused) rather than open.
-    human_secret: Option<String>,
-    kernel_secret: Option<String>,
 }
 
 impl Broker {
@@ -186,8 +182,6 @@ impl Broker {
                 None
             }
         };
-        let human_secret = crate::secrets::read(&root, crate::secrets::HUMAN);
-        let kernel_secret = crate::secrets::read(&root, crate::secrets::KERNEL);
         let b = Broker {
             root,
             conn,
@@ -198,8 +192,6 @@ impl Broker {
             pending_verdicts: RefCell::new(HashMap::new()),
             reg_seq: Cell::new(1),
             next_key: Cell::new(1),
-            human_secret,
-            kernel_secret,
         };
         // A fresh broker has zero resident registrations by construction;
         // clear any stale active-points row a crashed daemon left behind so
@@ -389,50 +381,48 @@ fn run_system(
 async fn handshake(st: Rc<Broker>, h: v5::Handshake) -> Result<v5::HandshakeAck<BusSession>, ServerError> {
     let pkt = h.packet();
     // Identity (docs/identity.md). Username+password is one of:
-    //   "human"  + the kernel-minted human secret   -> the person's surfaces
-    //   "kernel" + the kernel-minted kernel secret   -> the kernel's own
-    //              machinery running in a forked process (mirror, consult)
-    //   <package> + the supervisor-minted spawn token -> that package actor
-    // The reserved names are checked against the fenced secrets; a package
-    // can never collide (its name is one topic level, and these match first).
-    // Wrong credentials are refused. NO credentials is, for now, an anonymous
-    // local client with full access — the deny-by-default flip lands once
-    // every first-party client presents a credential.
+    //   <name> + a fenced secret (`.secrets/<name>`)  -> a full-authority
+    //            identity: the owner (default "owner"), the kernel, or another
+    //            human. The fenced store is checked FIRST, so such a name
+    //            shadows any like-named package; only the human/kernel can
+    //            place a secret there (the cage fences the store from agents).
+    //   <package> + the supervisor-minted spawn token -> that package actor,
+    //            grant-scoped.
+    // Wrong credentials AND no credentials are both refused (deny-by-default,
+    // enforced below): a connection with no verified identity gets none.
     // `actor` is Some only for a grant-scoped package; `sender` is the
     // verified stamp for the ledger.
     let (actor, sender) = match (&pkt.username, &pkt.password) {
-        (Some(u), Some(p)) if u.as_str() == crate::secrets::HUMAN => {
-            if st.human_secret.as_deref().map(str::as_bytes) != Some(p.as_ref()) {
-                eprintln!("[bus] CONNECT refused: bad human credential");
-                return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
-            }
-            (None, crate::secrets::HUMAN.to_string())
-        }
-        (Some(u), Some(p)) if u.as_str() == crate::secrets::KERNEL => {
-            if st.kernel_secret.as_deref().map(str::as_bytes) != Some(p.as_ref()) {
-                eprintln!("[bus] CONNECT refused: bad kernel credential");
-                return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
-            }
-            (None, crate::secrets::KERNEL.to_string())
-        }
         (Some(u), Some(p)) => {
             let name = u.to_string();
-            let token_ok = st
+            // A fenced secret named for this principal is full authority — the
+            // owner, the kernel, or another human. `secrets::read` rejects
+            // path-unsafe and dot-prefixed names, so a crafted username cannot
+            // traverse the store or read the config file. The store is
+            // cage-fenced, so only the human/kernel can place such a secret;
+            // an agent cannot mint itself a full-authority identity.
+            if let Some(secret) = crate::secrets::read(&st.root, &name) {
+                if secret.as_bytes() != p.as_ref() {
+                    eprintln!("[bus] CONNECT refused: bad credential for identity {name:?}");
+                    return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
+                }
+                (None, name)
+            } else if st
                 .actors
                 .borrow()
                 .get(&name)
-                .is_some_and(|t| t.as_bytes() == p.as_ref());
-            if !token_ok {
-                eprintln!("[bus] CONNECT refused: bad token for actor {name:?}");
+                .is_some_and(|t| t.as_bytes() == p.as_ref())
+            {
+                (Some(name.clone()), name) // a package actor, grant-scoped to its grants
+            } else {
+                eprintln!("[bus] CONNECT refused: bad token / unknown identity {name:?}");
                 return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
             }
-            (Some(name.clone()), name)
         }
-        // Deny by default (docs/identity.md): no credential, no authority.
-        // Every first-party client now presents one (a package token, or the
-        // human/kernel secret from the fenced store), so a connection without
-        // credentials is a stray or a caged agent that could not read the
-        // store — refuse it rather than hand it the human's standing.
+        // Deny by default (docs/identity.md): no credential, no authority. A
+        // connection without credentials is a stray or a caged agent that
+        // could not read the fenced store — refuse it rather than hand it the
+        // owner's standing.
         (None, _) | (_, None) => {
             eprintln!("[bus] CONNECT refused: no credential presented (deny-by-default)");
             return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
@@ -685,8 +675,24 @@ async fn inbound(
         eprintln!("[bus] rejecting inbound publish to invalid topic {topic:?}");
         return nack(Nack::TopicNameInvalid);
     }
-    let actor: Option<String> =
-        st.sessions.borrow().get(&session.key).and_then(|r| r.actor.clone());
+    // Resolve the session once (docs/identity.md): both the grant-scoping
+    // actor and the verified sender come from the same authenticated session.
+    // A deny-by-default broker only acks a CONNECT after inserting the session,
+    // so a publish from a session not in the map has no verified identity —
+    // refuse it rather than treat "absent" as the full-authority owner (a
+    // missing session must never be silently trusted).
+    let (actor, verified_sender): (Option<String>, String) = match st
+        .sessions
+        .borrow()
+        .get(&session.key)
+        .map(|r| (r.actor.clone(), r.sender.clone()))
+    {
+        Some(pair) => pair,
+        None => {
+            eprintln!("[bus] inbound from an unknown session — refusing (no verified identity)");
+            return nack(Nack::NotAuthorized);
+        }
+    };
     // Hook verdicts: point-to-point RPC plumbing, intercepted before generic
     // routing — never fanned out, never written to disk (the
     // obs/harness/hook/<point>/<outcome> echo is the recorded artifact).
@@ -763,17 +769,10 @@ async fn inbound(
     let first = topic.split('/').next().unwrap_or("");
     let is_ledger = matches!(first, "in" | "signal");
 
-    // The verified sender (docs/identity.md): who the broker confirmed this
-    // connection belongs to, recorded on the session at CONNECT — the package
-    // name, or "human"/"kernel". It is derived from the authenticated
-    // connection, never read from the message, so a client cannot claim to be
-    // someone else.
-    let verified_sender = st
-        .sessions
-        .borrow()
-        .get(&session.key)
-        .map(|r| r.sender.clone())
-        .unwrap_or_else(|| crate::secrets::HUMAN.to_string());
+    // `verified_sender` was resolved once at the top of this function, from the
+    // authenticated session — the owner identity, another human, a package
+    // name, or "kernel". It is never read from the message, so a client cannot
+    // claim to be someone else.
     let out_line = if is_ledger {
         // Ledger topics ALWAYS materialize, el-mirror or not: the mirror's
         // "already recorded, forward verbatim" shortcut is for observations

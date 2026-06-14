@@ -40,14 +40,33 @@ const PUB = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
 const ROOT = args.root ?? process.env.HARNESS_ROOT ?? null;
 
 // The web server is a trusted surface acting for the human (docs/identity.md):
-// it presents the human credential from the fenced secret store, so the
-// broker stamps its events as "human". Read once at startup; absent means we
-// connect anonymously (works until the deny-by-default flip, then refused).
+// it presents the owner identity from the fenced secret store, so the broker
+// stamps its events as the owner (the principal is an identity, default
+// "owner", not the role "human"). Absent means we connect credential-less and
+// are refused (deny-by-default).
+// Matches src/secrets.rs valid_principal — keep in sync, or the surface could
+// present a principal the broker would never resolve under that name (or a
+// path-unsafe one). Falls back to "owner" exactly as the Rust resolution does.
+function validPrincipal(name) {
+  return !!name && name.length <= 64 && !name.startsWith('.') && !name.includes('/') && !name.includes('\\');
+}
+function ownerName() {
+  const env = (process.env.ELANUS_OWNER || '').trim();
+  if (validPrincipal(env)) return env;
+  if (!ROOT) return 'owner';
+  try {
+    const n = fs.readFileSync(path.join(ROOT, '.secrets', '.owner-name'), 'utf8').trim();
+    return validPrincipal(n) ? n : 'owner';
+  } catch {
+    return 'owner';
+  }
+}
 function humanCredential() {
   if (!ROOT) return null;
   try {
-    const secret = fs.readFileSync(path.join(ROOT, '.secrets', 'human'), 'utf8').trim();
-    return secret ? { username: 'human', password: secret } : null;
+    const username = ownerName();
+    const secret = fs.readFileSync(path.join(ROOT, '.secrets', username), 'utf8').trim();
+    return secret ? { username, password: secret } : null;
   } catch {
     return null;
   }
