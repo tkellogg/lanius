@@ -281,6 +281,124 @@ hold in five places at once, which is why it has felt large:
 - **The interface** carries the human's delegated authority and asks for an
   out-of-band gesture on the actions where being a real person is the point.
 
+## What an identity is: a name, not a role
+
+A correction to how the first increment shipped, decided with Tim 2026-06-13.
+The credential work above authenticates a *principal* — and it used the word
+"human" as that principal. That was a role wearing an identity's clothes.
+"human" is a *kind* of actor, not a *who*. The principal is an identity with a
+name — `owner`, or `tim`, or `alice` — and "human" survives as an attribute of
+it (its kind), not as its name.
+
+This is the same point the actor model already makes (docs/actors.md): a human
+is an actor like any other, named like any other. An agent's principal is
+`kestrel`, not "agent"; a person's principal should be `tim`, not "human". The
+mechanism already allows it — the secret store is keyed by name, and the broker
+matches a presented name against `.secrets/<name>` — so making the principal an
+identity is mostly letting the rest of the system catch up to where the topic
+grammar already pointed (the human mailbox has always had an `<owner>` slot).
+
+The default owner identity is named `owner` (it is the first identity, and on a
+fresh single-person install that reads right). It is only a default: the system
+should nudge the person to set their real name, after which they are `tim`
+everywhere. Multiple humans fall straight out of this — they are just more
+named identities of kind human — but provisioning and managing several of them
+waits on a stronger human-authentication story (the spectrum above); the
+*model* is multi-ready now, the *management* is deferred.
+
+## Identities, channels, and names
+
+An identity is **identifiable but not singularly addressable.** A person is one
+stable identity reachable many ways — the elanus interface, a phone, Bluesky, a
+front door — and called by many names. Agents have this shape too. So an
+identity is not an address; it sits above its addresses. Three pieces:
+
+- **Identity** — the stable entity. `tim`. Has a kind (human / agent / script /
+  external) and a canonical display name. The *who*. An identity's
+  authenticated elanus principal (the credential work above) is simply one of
+  its channels: the *elanus channel*.
+- **Channel** — an addressable endpoint, a `(kind, address)` pair: the elanus
+  channel, `(bluesky, @handle)`, `(discord, id)`, `(sms, +1…)`, `(email, …)`.
+  Many per identity. The *where to reach them*.
+- **Name / alias** — a name others use for the identity. Many per identity, and
+  **not unique** — two people can both be "Sam", and one person can be "Tim",
+  "tk", and "dad". A name is a label, never an address.
+
+Two confidences live here and must not be confused. *Did this message really
+come from this channel* is channel authentication — for the elanus channel that
+is exactly the broker-verified sender above; for an external channel it is only
+as strong as the bridge that carried it. *Is this channel really this identity*
+is a separate, fuzzier judgement — the linkage — and it is the heart of the
+phonebook.
+
+## The phonebook
+
+The phonebook is the record of which channels belong to which identity. It is
+**SQL, and shared** (Tim's call): one agent that works out a Bluesky handle and
+a Discord handle are the same person writes that down once, and the whole fleet
+sees it. This is the master-data / record-linkage problem that fintech's
+three-way match and healthcare patient-matching also face (the formal name is
+probabilistic record linkage, Fellegi–Sunter; the everyday shape is a vCard —
+one card, many numbers and emails; the modern identity shape is a DID or
+ActivityPub actor's `alsoKnownAs` — one subject, many endpoints). **We do not
+set out to solve the matching. We ship the data model that makes it solvable**,
+and leave the matching policy to agents, to people, and to later work. A
+readable `phonebook.md` for an agent to consult is then just a rendered view of
+the table; the SQL is the truth, so things other than the agent can use it too.
+
+Four properties keep the hard part open instead of frozen:
+
+1. **A channel can be recorded before it is resolved.** A message from an
+   unknown handle is logged as a channel with no identity yet — seen, but
+   unmatched. You capture faithfully first and decide who it is later. (This is
+   exactly what has been hard for agents talking across Bluesky and Discord:
+   forced to decide "same person?" the moment a message arrives, with the least
+   information. Logging the channel unresolved lets the judgement happen later,
+   with more.)
+2. **Each link carries a confidence and a provenance.** Not "this channel is
+   tim" but "0.6, proposed by agent kestrel from a fuzzy match" versus "1.0,
+   confirmed by tim himself." A matcher proposes; policy decides. We ship the
+   columns, not the threshold — and because the writes that set provenance
+   arrive over the authenticated bus, the provenance *is* the broker-verified
+   sender, so an agent can only ever propose as itself, never confirm as the
+   human.
+3. **Resolution is revisable and retroactive.** Unifying an identity's messages
+   is a query-time join — channel to identity — so correcting a link re-unifies
+   all of history at once. Resolving at the moment a message arrives, by
+   contrast, would freeze each guess into the immutable record; that is why
+   messages are addressed by *channel* on the wire and identity is resolved at
+   recall, not baked into the topic.
+4. **Merge re-points; it never collapses, so a split can undo it.** When two
+   identities turn out to be one, their channels and names are re-pointed to a
+   single identity; the rows are not destroyed. Being wrong later — they were
+   two people after all — is then a cheap re-point back. Split is the operation
+   everyone forgets until they need it; non-destructive merge is how you keep it
+   available.
+
+Sketch of the shape (final column names settle when it is built):
+
+```
+identity( id, kind, canonical, … )
+channel ( channel_kind, address, identity_id NULL, confidence, provenance, … )
+alias   ( identity_id, name, context NULL )      -- name is non-unique
+```
+
+A null `identity_id` on a channel is the unresolved state in (1); confidence
+and provenance are (2); the join is (3); re-pointing rather than deleting is
+(4). Because the phonebook must accept writes from agents but the approvals
+ledger must not, the phonebook is its own store, written by the phonebook
+service over the authenticated bus — never the kernel-only-writable harness.db.
+
+## Recall: the unified frame, made easy but not forced
+
+Because topics stay channel-faithful, an identity's conversation is spread
+across several channels' worth of messages. Pulling them into one linear frame
+— "everything to and from Tim, in order, as if it were a single chat" — is a
+join over the phonebook and the ledger, and we make it a stock context-pipeline
+stage (the same shape as recent-history): hand it an identity, get back the
+merged timeline. The harness is never *required* to unify channels — the raw
+per-channel threads stay faithful and usable — it is simply made trivial to.
+
 ## Implementation notes (increment 1, as built)
 
 The verified-sender foundation is in. The broker derives the sender from the

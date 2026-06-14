@@ -134,3 +134,37 @@ published separately, so that every elanus installation benefits from the
 same maintained information. We are explicitly not trying to get this perfect
 up front; "price unknown" is a perfectly acceptable answer until the data
 fills in.
+
+## Reaching an actor: channels, and which way they flow
+
+An actor — a person especially, but agents too — is reachable through more than
+one mechanism: the elanus interface, the command line, email, a chat network.
+Each such mechanism is a *channel* of that actor's identity; the full model of
+identities, channels, and names lives in docs/identity.md. What belongs here is
+how messages on those channels move, because ingress and egress are not
+symmetric, and pretending they are would distort the design.
+
+**Ingress is event-shaped.** Messages arrive unbidden, fan out to whoever is
+listening, and the flight recorder wants to capture them. That is what the bus
+is for, so external messages come *in* over the bus, through small ingress
+bridges (the existing shape: a daemon that watches a source and publishes what
+it sees). They are addressed by the channel they actually arrived on —
+`in/dm/bluesky/<handle>`, not `in/dm/tim` — because the topic should record
+what is true on the wire; deciding *who* that handle is belongs to the
+phonebook, resolved later, not frozen into the topic now.
+
+**Egress is command-shaped.** Sending a message out is a specific action with a
+result — it succeeded, here is the id, or it failed — which is what HTTP and
+service SDKs are built around and what fire-and-forget publish/subscribe is
+not. So egress goes *direct*: the actor, or a small bridge that holds the
+service's credential so no agent has to, calls the outside service over HTTP or
+its SDK. It is not forced back through the bus as transport. What we keep is the
+*record*: the send still emits an observation on the bus — "sent this to that
+channel, here is the result" — so the flight recorder and the provenance trail
+stay whole even though the delivery itself left the bus. The bus remains the
+universal record plane even where it is not the transport plane.
+
+This asymmetry is also why there is no `out/` plane (it was proposed and
+deliberately dropped). Sending to another elanus actor is just writing to that
+actor's inbox; sending to the outside world is a direct command that gets
+observed. Neither one needs an outbox.
