@@ -1173,6 +1173,78 @@ curl -s "http://127.0.0.1:$HPORT/query" \
 curl -s "http://127.0.0.1:$HPORT/query" -d '{"kind":"search","filter":{"roles":["nope"]}}' \
   | grep -q '"ok": *false' && ok "bad DSL rejected, not executed" || fail "bad DSL not rejected"
 
+echo "== 18. phonebook: identity directory, HTTP reads + bus writes (verified provenance) =="
+# An identity is reachable through many channels; the phonebook records which
+# channel belongs to whom (docs/identity.md). Reads over HTTP like history;
+# WRITES over the authenticated bus so a link's provenance is the
+# broker-verified sender, never a payload field. The store is the phonebook's
+# OWN sqlite in its scratch, never harness.db. Ships PENDING; parks until
+# approved. The main root's daemon is still running and picks it up.
+[ -f "$TMP/packages/phonebook/elanus.toml" ] || cp -R "$REPO/packages/phonebook" "$TMP/packages/"
+wait_for "phonebook http port negotiated (run/pkg-phonebook/http.json)" "[ -s '$TMP/run/pkg-phonebook/http.json' ]"
+PBPORT=$(python3 -c "import json;print(json.load(open('$TMP/run/pkg-phonebook/http.json'))['port'])")
+curl -s -m 2 "http://127.0.0.1:$PBPORT/healthz" >/dev/null 2>&1 \
+  && fail "phonebook served before approval" || ok "parked until approved (serving + writing is a capability)"
+elanus approve phonebook >/dev/null 2>&1 || fail "approve phonebook"
+wait_for "phonebook serving after approval" \
+  "curl -s -m 2 'http://127.0.0.1:$PBPORT/healthz' | grep -q '\"ok\": *true'"
+# Writes go over the bus; the CLI authenticates as the human, so the broker
+# stamps provenance "human" — an unforgeable claim, not a chosen field.
+elanus bus pub in/package/phonebook/identity '{"id":"tim","kind":"human","canonical":"Tim"}' --qos 1 >/dev/null || fail "pub identity"
+elanus bus pub in/package/phonebook/channel '{"channel_kind":"bluesky","address":"@tim","identity":"tim","confidence":1.0}' --qos 1 >/dev/null || fail "pub channel"
+elanus bus pub in/package/phonebook/channel '{"channel_kind":"discord","address":"tim#1"}' --qos 1 >/dev/null || fail "pub unresolved channel"
+wait_for "channel resolves to its identity" \
+  "curl -s 'http://127.0.0.1:$PBPORT/query' -d '{\"kind\":\"resolve\",\"channel_kind\":\"bluesky\",\"address\":\"@tim\"}' | grep -q '\"id\": *\"tim\"'"
+curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"resolve","channel_kind":"bluesky","address":"@tim"}' | grep -q '"provenance": *"human"' \
+  && ok "link provenance = broker-verified sender (not a payload field)" || fail "provenance is not the verified sender"
+# A sighting recorded before it is matched — the matcher's work queue.
+curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"resolve","channel_kind":"discord","address":"tim#1"}' | grep -q '"resolved": *false' \
+  && ok "unresolved channel recorded before it is matched" || fail "unresolved sighting missing"
+# Link it later -> retroactive resolution (the guess was never frozen).
+elanus bus pub in/package/phonebook/link '{"channel_kind":"discord","address":"tim#1","identity":"tim","confidence":0.7}' --qos 1 >/dev/null || fail "pub link"
+wait_for "a late link resolves the earlier sighting" \
+  "curl -s 'http://127.0.0.1:$PBPORT/query' -d '{\"kind\":\"resolve\",\"channel_kind\":\"discord\",\"address\":\"tim#1\"}' | grep -q '\"resolved\": *true'"
+# Non-destructive merge, then split reverts it (channels never move).
+elanus bus pub in/package/phonebook/identity '{"id":"timothy","kind":"human","canonical":"Timothy"}' --qos 1 >/dev/null || fail "pub identity2"
+elanus bus pub in/package/phonebook/channel '{"channel_kind":"email","address":"t@x","identity":"timothy","confidence":1.0}' --qos 1 >/dev/null || fail "pub email"
+elanus bus pub in/package/phonebook/merge '{"from":"timothy","into":"tim"}' --qos 1 >/dev/null || fail "pub merge"
+wait_for "a merged identity's channel resolves to the survivor" \
+  "curl -s 'http://127.0.0.1:$PBPORT/query' -d '{\"kind\":\"resolve\",\"channel_kind\":\"email\",\"address\":\"t@x\"}' | grep -q '\"id\": *\"tim\"'"
+elanus bus pub in/package/phonebook/split '{"id":"timothy"}' --qos 1 >/dev/null || fail "pub split"
+wait_for "split reverts the channel to its origin (merge was non-destructive)" \
+  "curl -s 'http://127.0.0.1:$PBPORT/query' -d '{\"kind\":\"resolve\",\"channel_kind\":\"email\",\"address\":\"t@x\"}' | grep -q '\"id\": *\"timothy\"'"
+# Names: alias + the human-facing whois lookup + the full identity record.
+elanus bus pub in/package/phonebook/alias '{"identity":"tim","name":"tk"}' --qos 1 >/dev/null || fail "pub alias"
+wait_for "whois finds an identity by a (non-unique) name" \
+  "curl -s 'http://127.0.0.1:$PBPORT/query' -d '{\"kind\":\"whois\",\"name\":\"tk\"}' | grep -q '\"canonical\": *\"tim\"'"
+curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"identity","id":"tim"}' | grep -q '"name": *"tk"' \
+  && ok "identity record lists channels and aliases" || fail "identity record missing alias"
+# The matcher's work queue: an unresolved sighting shows in channels{resolved:false}.
+elanus bus pub in/package/phonebook/channel '{"channel_kind":"sms","address":"+1555"}' --qos 1 >/dev/null || fail "pub sighting"
+wait_for "an unresolved sighting appears in the work queue" \
+  "curl -s 'http://127.0.0.1:$PBPORT/query' -d '{\"kind\":\"channels\",\"resolved\":false}' | grep -q '\"+1555\"'"
+# Regression (data integrity): a bare re-sighting of an already-linked channel
+# must NOT wipe the prior link's confidence (bluesky/@tim was linked at 1.0).
+elanus bus pub in/package/phonebook/channel '{"channel_kind":"bluesky","address":"@tim"}' --qos 1 >/dev/null || fail "pub re-sighting"
+sleep 0.5
+curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"resolve","channel_kind":"bluesky","address":"@tim"}' | grep -q '"confidence": *1' \
+  && ok "bare re-sighting preserves the prior link's confidence" || fail "re-sighting wiped the link's confidence"
+# Regression (crash-DoS): a malformed write is answered with an error, and the
+# daemon stays up — a single bad publish must not crash-loop the service.
+( elanus bus sub obs/package/phonebook/result --count 1 --timeout 6 > "$TMP/pb_result.out" 2>/dev/null ) &
+PBSUB=$!
+sleep 0.5
+elanus bus pub in/package/phonebook/link '{"channel_kind":"x","address":"y","identity":"tim","confidence":{}}' --qos 1 >/dev/null || fail "pub malformed"
+wait "$PBSUB" 2>/dev/null
+grep -q '"ok": *false' "$TMP/pb_result.out" \
+  && ok "malformed write answered with an error result" || fail "no error result for a malformed write"
+curl -s -m 2 "http://127.0.0.1:$PBPORT/healthz" | grep -q '"ok": *true' \
+  && ok "daemon survived the malformed write (no crash-loop)" || fail "daemon died on a malformed write"
+curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"nope"}' | grep -q '"ok": *false' \
+  && ok "unknown query kind rejected, not executed" || fail "unknown kind not rejected"
+[ -s "$TMP/run/pkg-phonebook/phonebook.db" ] \
+  && ok "phonebook owns its store (scratch, not harness.db)" || fail "phonebook.db missing in scratch"
+
 echo
 if [ "$FAILS" -eq 0 ]; then
   echo "ALL PASS (root: $TMP)"

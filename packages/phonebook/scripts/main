@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""phonebook — the identity directory (docs/identity.md).
+
+An identity is identifiable but not singularly addressable: one stable
+entity reachable through many channels (the elanus interface, Bluesky,
+Discord, SMS, email, a front door) and called by many names. This daemon
+holds the record of which channel belongs to which identity, and which
+names point at it. It is the data model that makes cross-system identity
+*matching* solvable; it does not itself solve the matching (we ship the
+columns, not the threshold — agents and people propose links, policy
+decides).
+
+Two halves, by the transport doctrine (docs/actors.md):
+  reads  over HTTP on the harness-negotiated loopback port — resolve a
+         channel to an identity, look up who is called a name, list the
+         book. Discovery: run/pkg-phonebook/http.json. Serving is a
+         granted capability (kind "http"); parks until approved.
+  writes over the authenticated bus, so the provenance of every link is
+         the BROKER-VERIFIED sender, never a field the writer chose:
+           in/package/phonebook/identity  {id?, kind, canonical}
+           in/package/phonebook/channel   {channel_kind, address, identity?, confidence?}
+           in/package/phonebook/link      {channel_kind, address, identity, confidence?}
+           in/package/phonebook/alias     {identity, name, context?}
+           in/package/phonebook/merge     {from, into}
+           in/package/phonebook/split     {id}
+         An agent can therefore only ever propose AS ITSELF; it cannot
+         write a link stamped "human". Every write is also a ledgered
+         in/ event, so harness.db carries the audit trail of who claimed
+         what. Results (and errors) fan out on obs/package/phonebook/result,
+         echoing the request's correlation id so a caller can match them.
+         Writes are AUTHENTICATED but not AUTHORIZED: any granted writer may
+         merge/split/overwrite; provenance is the audit trail, not access
+         control. Per-sender restriction waits on the identity-model
+         increment (HANDOFF increment 3).
+
+The store is the phonebook's OWN sqlite in its writable scratch — never
+the kernel-only-writable harness.db (the approvals ledger must not be
+agent-writable; the phonebook must be, hence a separate store).
+
+Merge is non-destructive so split can undo it: an identity carries an
+optional merged_into pointer, resolution follows the chain, and channels
+never move — so splitting is just clearing the pointer, and origin is
+preserved.
+
+Crash-only, but ONLY for genuine infrastructure faults: bus death exits
+nonzero and the supervisor restarts us. A malformed request from a peer is
+NOT a fault — it is answered with an error and the daemon keeps running, so
+a single bad publish cannot crash-loop the service.
+"""
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+PKG = os.environ.get("ELANUS_PACKAGE", "phonebook")
+SCRATCH = os.environ.get("ELANUS_SCRATCH") or "."
+DB = os.path.join(SCRATCH, "phonebook.db")
+# The kernel ledger, read-only, only to check our own grant state.
+LEDGER = os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("HARNESS_ROOT", "."), "harness.db")
+
+REQ_FILTER = "in/package/phonebook/#"
+RESULT_TOPIC = "obs/package/phonebook/result"
+KINDS_OF_IDENTITY = ("human", "agent", "script", "external")
+CHANNELS_LIMIT = 500  # work-queue page size; responses carry `truncated`
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ---- field coercion (a bad field is the requester's error, never a crash) ----
+
+def _opt(p, key):
+    """An optional string field: trimmed, or '' if absent. Rejects non-scalars
+    (a list/object/bool where a string belongs is the caller's mistake, raised
+    as ValueError so it rides back on the result channel, not a daemon crash)."""
+    v = p.get(key)
+    if v is None:
+        return ""
+    if isinstance(v, bool) or not isinstance(v, (str, int, float)):
+        raise ValueError(f"{key} must be a string")
+    return str(v).strip()
+
+
+def _req(p, key):
+    """A required non-empty string field; trims and rejects empty/whitespace."""
+    s = _opt(p, key)
+    if not s:
+        raise ValueError(f"{key} is required")
+    return s
+
+
+def _conf(v, default=0.5):
+    """Coerce a confidence to a float in [0,1]; reject junk loudly. The model
+    documents confidence as 0..1, so an out-of-range or non-numeric value is a
+    caller error (returned on the result channel), not a stored meaningless
+    number and not a crash."""
+    if v is None:
+        return default
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError("confidence must be a number")
+    if f != f or f < 0.0 or f > 1.0:  # NaN, or outside [0,1]
+        raise ValueError("confidence must be between 0 and 1")
+    return f
+
+
+# ---- store ------------------------------------------------------------------
+
+def db_rw():
+    """The writer's connection (the bus loop owns it). WAL so the HTTP reader
+    threads see a consistent view without blocking writes."""
+    c = sqlite3.connect(DB, timeout=5)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA foreign_keys=ON")
+    return c
+
+
+def db_ro():
+    """Fresh read-only connection per HTTP query."""
+    c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def init_schema(c):
+    c.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS identity (
+          id          TEXT PRIMARY KEY,
+          kind        TEXT NOT NULL,
+          canonical   TEXT NOT NULL,
+          merged_into TEXT REFERENCES identity(id),  -- NULL = canonical
+          provenance  TEXT,                          -- who last wrote this identity
+          created_at  TEXT NOT NULL,
+          updated_at  TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS channel (
+          channel_kind TEXT NOT NULL,
+          address      TEXT NOT NULL,
+          identity_id  TEXT REFERENCES identity(id),  -- NULLABLE = unresolved
+          confidence   REAL,
+          provenance   TEXT,
+          first_seen   TEXT NOT NULL,
+          last_seen    TEXT NOT NULL,
+          PRIMARY KEY (channel_kind, address)
+        );
+        CREATE TABLE IF NOT EXISTS alias (
+          identity_id TEXT NOT NULL REFERENCES identity(id),
+          name        TEXT NOT NULL,        -- non-unique on purpose
+          context     TEXT,
+          provenance  TEXT,
+          created_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_channel_identity ON channel(identity_id);
+        CREATE INDEX IF NOT EXISTS idx_alias_identity ON alias(identity_id);
+        CREATE INDEX IF NOT EXISTS idx_alias_name ON alias(name);
+        """
+    )
+    c.commit()
+
+
+def canonical_id(c, identity_id):
+    """Follow the merged_into chain to the surviving canonical identity.
+    The `seen` set guarantees termination (finitely many identities; we stop
+    on revisit), so no arbitrary depth cap is needed — a long but legitimate
+    chain still resolves. Returns None for an unknown id, a dangling pointer,
+    or a cycle (the last is logged so a corrupt chain is observable rather
+    than silently presenting as unresolved; op_merge's guard prevents cycles
+    from ever being created, so this is a backstop)."""
+    seen = set()
+    cur = identity_id
+    while cur is not None and cur not in seen:
+        seen.add(cur)
+        row = c.execute("SELECT merged_into FROM identity WHERE id = ?", (cur,)).fetchone()
+        if row is None:
+            return None  # dangling reference
+        if row["merged_into"] is None:
+            return cur  # canonical
+        cur = row["merged_into"]
+    if cur is not None:
+        log(f"[phonebook] merge cycle detected at {cur!r}; treating as unresolved")
+    return None
+
+
+def identity_row(c, identity_id):
+    r = c.execute("SELECT id, kind, canonical, merged_into FROM identity WHERE id = ?", (identity_id,)).fetchone()
+    return dict(r) if r else None
+
+
+# ---- write ops (over the authenticated bus; provenance = verified sender) ----
+
+def op_identity(c, sender, p):
+    iid = _opt(p, "id") or uuid.uuid4().hex
+    kind = p.get("kind")
+    if kind not in KINDS_OF_IDENTITY:
+        raise ValueError(f"kind must be one of {'|'.join(KINDS_OF_IDENTITY)}")
+    canonical = _opt(p, "canonical") or iid
+    ts = now()
+    c.execute(
+        """INSERT INTO identity(id, kind, canonical, provenance, created_at, updated_at)
+           VALUES(?,?,?,?,?,?)
+           ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,
+             canonical=excluded.canonical, provenance=excluded.provenance,
+             updated_at=excluded.updated_at""",
+        (iid, kind, canonical, sender, ts, ts),
+    )
+    c.commit()
+    return {"identity": iid, "kind": kind, "canonical": canonical}
+
+
+def _upsert_channel(c, sender, channel_kind, address, identity_id, confidence):
+    ts = now()
+    c.execute(
+        """INSERT INTO channel(channel_kind, address, identity_id, confidence, provenance, first_seen, last_seen)
+           VALUES(?,?,?,?,?,?,?)
+           ON CONFLICT(channel_kind, address) DO UPDATE SET
+             identity_id = COALESCE(excluded.identity_id, channel.identity_id),
+             -- a bare re-sighting (no identity claim) must not wipe a prior
+             -- link's confidence or rewrite who asserted it; only a write that
+             -- actually carries an identity updates those fields
+             confidence  = CASE WHEN excluded.identity_id IS NULL THEN channel.confidence ELSE excluded.confidence END,
+             provenance  = CASE WHEN excluded.identity_id IS NULL THEN channel.provenance ELSE excluded.provenance END,
+             last_seen   = excluded.last_seen""",
+        (channel_kind, address, identity_id, confidence, sender, ts, ts),
+    )
+    c.commit()
+
+
+def op_channel(c, sender, p):
+    """Record a channel sighting. identity optional — a channel may be SEEN
+    before it is resolved (identity_id stays NULL until linked)."""
+    ck = _req(p, "channel_kind")
+    addr = _req(p, "address")
+    iid = _opt(p, "identity") or None
+    if iid is not None and identity_row(c, iid) is None:
+        raise ValueError(f"unknown identity {iid!r} — create it first or omit it (unresolved)")
+    conf = _conf(p.get("confidence")) if iid is not None else None
+    _upsert_channel(c, sender, ck, addr, iid, conf)
+    return {"channel": [ck, addr], "identity": iid, "resolved": iid is not None}
+
+
+def op_link(c, sender, p):
+    """Link a (possibly previously-unresolved) channel to an identity, with a
+    confidence. Provenance is the verified sender, so an agent links AS the
+    agent — never as the human."""
+    ck = _req(p, "channel_kind")
+    addr = _req(p, "address")
+    iid = _req(p, "identity")
+    if identity_row(c, iid) is None:
+        raise ValueError(f"unknown identity {iid!r}")
+    conf = _conf(p.get("confidence"))
+    _upsert_channel(c, sender, ck, addr, iid, conf)
+    return {"channel": [ck, addr], "identity": iid, "confidence": conf, "by": sender}
+
+
+def op_alias(c, sender, p):
+    iid = _req(p, "identity")
+    name = _req(p, "name")
+    if identity_row(c, iid) is None:
+        raise ValueError(f"unknown identity {iid!r}")
+    context = _opt(p, "context") or None
+    c.execute(
+        "INSERT INTO alias(identity_id, name, context, provenance, created_at) VALUES(?,?,?,?,?)",
+        (iid, name, context, sender, now()),
+    )
+    c.commit()
+    return {"identity": iid, "name": name}
+
+
+def op_merge(c, sender, p):
+    """Non-destructive: mark `from` as merged_into `into`. Channels/aliases
+    are NOT moved — resolution follows the pointer — so a split can undo it
+    and origin is preserved."""
+    a = _req(p, "from")
+    b = _req(p, "into")
+    if a == b:
+        raise ValueError("cannot merge an identity into itself")
+    if identity_row(c, a) is None or identity_row(c, b) is None:
+        raise ValueError("merge needs two existing identities")
+    # Guard a cycle: `into` must not already resolve back to `from`.
+    if canonical_id(c, b) == a:
+        raise ValueError("merge would create a cycle")
+    c.execute("UPDATE identity SET merged_into = ?, updated_at = ? WHERE id = ?", (b, now(), a))
+    c.commit()
+    return {"merged": a, "into": b, "canonical": canonical_id(c, a)}
+
+
+def op_split(c, sender, p):
+    """Undo a merge: clear merged_into. `id` becomes canonical again and its
+    original channels/aliases resolve back to it (they never moved)."""
+    iid = _req(p, "id")
+    if identity_row(c, iid) is None:
+        raise ValueError(f"unknown identity {iid!r}")
+    c.execute("UPDATE identity SET merged_into = NULL, updated_at = ? WHERE id = ?", (now(), iid))
+    c.commit()
+    return {"split": iid}
+
+
+WRITE_OPS = {
+    "identity": op_identity, "channel": op_channel, "link": op_link,
+    "alias": op_alias, "merge": op_merge, "split": op_split,
+}
+
+
+# ---- read queries (over HTTP) -----------------------------------------------
+
+def q_resolve(c, q):
+    """Channel -> identity, following the merge chain. The core lookup."""
+    ck = q.get("channel_kind")
+    addr = q.get("address")
+    if not ck or not addr:
+        raise ValueError("resolve needs {channel_kind, address}")
+    row = c.execute(
+        "SELECT channel_kind, address, identity_id, confidence, provenance FROM channel WHERE channel_kind=? AND address=?",
+        (ck, addr),
+    ).fetchone()
+    if row is None:
+        return {"found": False, "channel": [ck, addr]}
+    canon = canonical_id(c, row["identity_id"]) if row["identity_id"] else None
+    ident = identity_row(c, canon) if canon else None
+    return {
+        "found": True,
+        "channel": [ck, addr],
+        # `linked` = a claim exists on this channel; `resolved` = that claim
+        # leads to a live canonical identity. They differ only for a corrupt
+        # chain (see canonical_id), which the merge guard prevents.
+        "linked": row["identity_id"] is not None,
+        "resolved": canon is not None,
+        "identity": ident,
+        "confidence": row["confidence"],
+        "provenance": row["provenance"],
+    }
+
+
+def q_identity(c, q):
+    """An identity with all channels and names that resolve to it (directly
+    or through a merge)."""
+    iid = q.get("id")
+    if not iid:
+        raise ValueError("identity needs {id}")
+    ident = identity_row(c, iid)
+    if ident is None:
+        return {"found": False, "id": iid}
+    canon = canonical_id(c, iid)
+    # gather every identity that resolves to this canonical one
+    members = [r["id"] for r in c.execute("SELECT id FROM identity").fetchall()
+               if canonical_id(c, r["id"]) == canon]
+    qmarks = ",".join("?" * len(members)) or "''"
+    channels = [dict(r) for r in c.execute(
+        f"SELECT channel_kind, address, identity_id, confidence, provenance FROM channel WHERE identity_id IN ({qmarks})",
+        members,
+    ).fetchall()]
+    aliases = [dict(r) for r in c.execute(
+        f"SELECT name, context, provenance FROM alias WHERE identity_id IN ({qmarks})",
+        members,
+    ).fetchall()]
+    return {"found": True, "identity": ident, "canonical": canon,
+            "merged_members": [m for m in members if m != canon],
+            "channels": channels, "aliases": aliases}
+
+
+def q_identities(c, q):
+    rows = [dict(r) for r in c.execute(
+        "SELECT id, kind, canonical, merged_into FROM identity ORDER BY canonical"
+    ).fetchall()]
+    return {"identities": rows}
+
+
+def q_channels(c, q):
+    """List channels. resolved: true|false filters to (un)resolved ones — the
+    unresolved list is the work queue for the matcher. Capped; the response
+    carries `truncated` so a consumer knows when it is seeing a partial view."""
+    want = q.get("resolved")
+    sql = "SELECT channel_kind, address, identity_id, confidence, provenance, last_seen FROM channel"
+    if want is True:
+        sql += " WHERE identity_id IS NOT NULL"
+    elif want is False:
+        sql += " WHERE identity_id IS NULL"
+    sql += " ORDER BY last_seen DESC LIMIT ?"
+    rows = [dict(r) for r in c.execute(sql, (CHANNELS_LIMIT + 1,)).fetchall()]
+    truncated = len(rows) > CHANNELS_LIMIT
+    return {"channels": rows[:CHANNELS_LIMIT], "truncated": truncated, "limit": CHANNELS_LIMIT}
+
+
+def q_whois(c, q):
+    """Who is called <name>? Returns identities matching an alias OR a
+    canonical name — the human-facing lookup, deliberately fuzzy on names
+    (which are non-unique)."""
+    name = q.get("name")
+    if not name:
+        raise ValueError("whois needs {name}")
+    ids = set()
+    for r in c.execute("SELECT identity_id FROM alias WHERE name = ?", (name,)).fetchall():
+        ids.add(r["identity_id"])
+    for r in c.execute("SELECT id FROM identity WHERE canonical = ?", (name,)).fetchall():
+        ids.add(r["id"])
+    out = []
+    for i in ids:
+        canon = canonical_id(c, i)
+        out.append({"matched": i, "canonical": canon, "identity": identity_row(c, canon) if canon else None})
+    return {"name": name, "matches": out}
+
+
+QUERIES = {"resolve": q_resolve, "identity": q_identity, "identities": q_identities,
+           "channels": q_channels, "whois": q_whois}
+
+
+# ---- HTTP wire (reads) ------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body):
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            self._send(200, {"ok": True, "kinds": sorted(QUERIES)})
+        else:
+            self._send(404, {"ok": False, "error": "POST /query or GET /healthz"})
+
+    def do_POST(self):
+        if self.path != "/query":
+            self._send(404, {"ok": False, "error": "POST /query"})
+            return
+        try:
+            n = int(self.headers.get("content-length", 0))
+            q = json.loads(self.rfile.read(n).decode())
+            if not isinstance(q, dict):
+                raise ValueError("body must be a JSON object")
+        except ValueError as e:
+            self._send(400, {"ok": False, "error": f"bad request body: {e}"})
+            return
+        fn = QUERIES.get(q.get("kind"))
+        if fn is None:
+            self._send(400, {"ok": False, "error": f"unknown kind {q.get('kind')!r}", "kinds": sorted(QUERIES)})
+            return
+        try:
+            with db_ro() as c:
+                body = fn(c, q)
+            body.update(ok=True, kind=q["kind"])
+            self._send(200, body)
+        except (ValueError, OverflowError, TypeError) as e:
+            self._send(400, {"ok": False, "kind": q.get("kind"), "error": str(e)})
+        except sqlite3.Error as e:
+            self._send(500, {"ok": False, "kind": q.get("kind"), "error": str(e)})
+
+    def log_message(self, *a):  # obs-quiet; faults go to stderr explicitly
+        pass
+
+
+def serve_http(port):
+    srv = HTTPServer(("127.0.0.1", int(port)), Handler)
+    log(f"[phonebook] serving http://127.0.0.1:{port} (reads; db {DB})")
+    srv.serve_forever()
+
+
+# ---- bus wire (writes) ------------------------------------------------------
+
+def respond(body):
+    try:
+        subprocess.run(["elanus", "bus", "pub", RESULT_TOPIC, json.dumps(body), "--qos", "1"],
+                       check=False, timeout=10)
+    except subprocess.SubprocessError:
+        pass  # a result fan-out is best-effort; the write already committed
+
+
+def bus_loop(c):
+    proc = subprocess.Popen(["elanus", "bus", "sub", REQ_FILTER], stdout=subprocess.PIPE, text=True)
+    log(f"[phonebook] subscribed {REQ_FILTER} (writes; provenance = broker-verified sender)")
+    for line in proc.stdout:
+        try:
+            outer = json.loads(line)
+        except ValueError:
+            continue
+        # `elanus bus sub` wraps each delivery as {"topic":..., "payload": <env>},
+        # where <env> is the broker's ledger envelope carrying the verified
+        # sender, the request correlation id, and the body at env["payload"].
+        env = outer.get("payload")
+        if not isinstance(env, dict):
+            continue
+        topic = outer.get("topic") or env.get("kind") or ""
+        sender = env.get("sender")              # broker-verified; never from the body
+        corr = env.get("correlation_id")        # echoed so a caller can match the result
+        payload = env.get("payload")            # the actual message content
+        if not isinstance(payload, dict):
+            payload = {}
+        op = topic.rsplit("/", 1)[-1] if topic.startswith("in/package/phonebook/") else None
+        fn = WRITE_OPS.get(op)
+        if fn is None:
+            continue  # not an op we serve; ignore quietly
+        if not sender:
+            respond({"ok": False, "op": op, "correlation": corr, "error": "no verified sender; refused"})
+            continue
+        try:
+            result = fn(c, sender, payload)
+            respond({"ok": True, "op": op, "by": sender, "correlation": corr, **result})
+        except subprocess.SubprocessError:
+            raise  # bus trouble is the ONLY crash-only trigger
+        except Exception as e:  # a malformed request must never take the daemon down
+            respond({"ok": False, "op": op, "by": sender, "correlation": corr, "error": str(e)})
+    log("[phonebook] bus subscription died -> exiting for restart")
+    sys.exit(1)
+
+
+# ---- lifecycle --------------------------------------------------------------
+
+def http_grant_approved():
+    """Serving + accepting writes is a capability (grants kind 'http'); park
+    until approved — `elanus approve phonebook` flips this without a restart."""
+    try:
+        c = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True, timeout=5)
+        row = c.execute(
+            "SELECT state FROM grants WHERE package = ? AND kind = 'http' ORDER BY id DESC LIMIT 1",
+            (PKG,),
+        ).fetchone()
+        c.close()
+        return row is not None and row[0] == "approved"
+    except sqlite3.Error:
+        return False
+
+
+def main():
+    port = os.environ.get("ELANUS_HTTP_PORT")
+    if not port:
+        log("[phonebook] no ELANUS_HTTP_PORT (needs a daemon with process.http); exiting")
+        sys.exit(1)
+    waited = False
+    while not http_grant_approved():
+        if not waited:
+            log("[phonebook] grant not approved yet; parking until `elanus approve phonebook` (this is not an error)")
+            waited = True
+        time.sleep(2)
+    writer = db_rw()
+    init_schema(writer)
+    threading.Thread(target=serve_http, args=(port,), daemon=True).start()
+    bus_loop(writer)
+
+
+if __name__ == "__main__":
+    main()

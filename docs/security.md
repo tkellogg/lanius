@@ -127,6 +127,13 @@ carry decided_by=ui in the ledger for the trail. The endpoint inherits
 entry 3's blast radius, no more — and when the identity model lands, it
 authenticates like every other privileged client.
 
+**[UPDATE 2026-06-13]** "no more" is now too generous. The identity
+increments fenced the ledger (entry 3) and gated the CLI read-path on macOS,
+but the web server did not change — it still reads the human secret at
+startup and acts for any loopback client. So on macOS it is no longer an
+equal of entry 3; it is the PRIMARY remaining path to human authority for a
+caged agent. Tracked, with the precise mechanism, as entry 13.
+
 ## 6. [LEGS] Secrets are readable
 
 .env (API keys, 600 but same-uid), future cookies/tokens, and
@@ -198,3 +205,76 @@ was going to do anyway. Prompt *position* (system vs message) is a severity
 dial worth defaulting sensibly (stock context stages keep payload in message
 position), but no design may claim safety from position alone. Kit-config
 tampering is covered by grant review; payload content never is.
+
+## 13. [OPEN-TIM] The web server is a confused deputy for the human credential
+
+The CLI and the web server both authenticate as the human by reading
+`<root>/.secrets/human` and presenting it at connect. They differ in WHEN
+the read happens relative to the cage, and that difference is the whole
+security story:
+
+- The **CLI fuses holding and using the credential in one caged act.** An
+  agent's shell running `elanus bus pub` reads `.secrets/human` at point of
+  use, inside its own sandbox, so the Seatbelt deny-read rule fires and the
+  read fails — on macOS the agent is refused. (On Linux pre-Landlock the
+  read is not fenced — entry 6 / leg 2 — so the CLI loses this property
+  there too; "the CLI is secure" is a macOS statement.)
+- The **web server splits holding from using, across the cage boundary.**
+  The human launches it uncaged; it reads the secret once at startup; from
+  then on it acts as `human` for whoever reaches `127.0.0.1:7180`. A caged
+  agent never touches the file — it `curl`s the loopback port and the server
+  spends the credential on its behalf. The cage fences the FILE, not the
+  PORT, and the network is uncaged (entries 5/10/11), so the server launders
+  cage-fenced authority onto an unfenced channel. A classic confused deputy.
+
+The Origin/Host guard does not close this: by design (server.mjs `originOk`)
+a request with no `Origin` header passes — that guard targets hostile
+browsers (CSRF, DNS rebinding), explicitly NOT local processes. So a caged
+agent's `curl` reaches `POST /api/publish` (publish as human) and
+`POST /api/admin/approve` (approve its own grants, decided_by=ui) unguarded.
+This works on macOS too, where the file fence is solid — because the cage
+fences the file, not the port.
+
+Why this entry exists now: the identity increments (2026-06-13) closed the
+direct-sqlite path (the ledger is fenced, entry 3) and the direct-CLI path
+(the cage gates the read, on macOS). **The web server is the last confused
+deputy standing on macOS** — the one side door that bypasses both, and the
+reason entry 5's "no more" needed the update above.
+
+The fix shape, for when this is taken up: the web surface must stop being a
+free deputy. Either it requires the client to prove the human for mutations
+— the layered model: free reads/converse, a gesture (notification tap or
+passkey) gating approve and publish-as-human — or it becomes kernel-launched
+with that gesture wired to high-stakes actions. An OS-level complement is to
+deny caged actors loopback egress to the web port (a network-cage), so the
+deputy is simply unreachable from inside the cage.
+
+**[DECIDED 2026-06-13, Tim] Deferred.** "The CLI actually is secure afaict,
+but the web UI is a hole. But that's fine. We can close that some other
+time." Recorded so the web path is not mistaken for covered by the identity
+work; not the next action.
+
+## 14. [LATENT] Phonebook identity directory over unauthenticated loopback HTTP
+
+The phonebook package (docs/identity.md) serves its read plane — `POST /query`
+(resolve / identity / identities / channels / whois) — on a negotiated
+127.0.0.1 port with NO authentication and no Origin/Host guard, exactly like
+the history package. The network is uncaged (entries 5/10/11/13) and the port
+is discoverable from `run/pkg-phonebook/http.json` (which the cage does not
+fence), so any local process and any caged agent can `curl` it and read the
+whole who-is-who graph: every identity, every channel address (Bluesky /
+Discord / SMS / email handles), every alias, and the confidence/provenance on
+each link. That is reconnaissance-grade for a prompt-injected agent (who can I
+impersonate, who talks to whom, what addresses reach the human) — the same
+class as entry 10 (history transcripts over HTTP), lower sensitivity but a
+contact graph rather than message bodies.
+
+Free reads are a deliberate design choice (the ingress-event / egress-command
+split in docs/actors.md; reads mirror history), so this is recorded as
+acceptable-for-v1, not a new defect. The fix arrives with the identity model's
+authenticated read plane (the same work that closes entry 10). Mitigation
+already present: the query DSL is an interpreted structure (the `QUERIES`
+dict with bound parameters), never SQL passthrough, satisfying entry 10's
+second requirement. WRITES are not exposed here — they go over the
+authenticated bus, where the broker stamps the verified sender as provenance,
+so an agent can only ever propose as itself (verified end to end).

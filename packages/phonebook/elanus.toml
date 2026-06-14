@@ -1,0 +1,30 @@
+# phonebook — the identity directory (docs/identity.md): which channels
+# belong to which identity, and which names point at it. An identity is
+# identifiable but not singularly addressable — one entity, many channels
+# (elanus, Bluesky, Discord, SMS, email), many names. This is the data
+# model that makes cross-system identity matching SOLVABLE; it does not
+# itself solve the matching (we ship the columns, not the threshold).
+#
+# Reads over HTTP (process.http -> grant kind "http"; consumers discover
+# the port from run/pkg-phonebook/http.json — harness state, never the
+# bus). Writes over the AUTHENTICATED bus (in/package/phonebook/<op>) so
+# every link's provenance is the broker-verified sender, never a field the
+# writer chose — an agent can only ever propose AS ITSELF, never confirm as
+# the human. Results fan out on obs/package/phonebook/result.
+#
+# The store is the phonebook's OWN sqlite in its writable scratch
+# ($ELANUS_SCRATCH/phonebook.db) — never the kernel-only-writable
+# harness.db, because the phonebook must accept agent writes and the
+# approvals ledger must not.
+#
+# Ships PENDING: it accepts writes and answers questions about people, so
+# it parks until `elanus approve phonebook`.
+
+[request]
+subscribe = ["in/package/phonebook/#"]
+publish   = ["obs/package/phonebook/#"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+http = true
