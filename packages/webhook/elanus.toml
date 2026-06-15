@@ -1,0 +1,25 @@
+# webhook — an EGRESS exemplar (docs/actors.md: ingress is event-shaped, egress
+# is command-shaped). A bridge is a long-running ACTOR with its own identity —
+# a daemon, not a per-event exec handler — so its sends are attributed to IT:
+# spawned with its package token, its `elanus bus pub` authenticates as
+# "webhook" and the broker stamps sender=webhook on the receipt, which is the
+# provenance the egress record exists to carry. (An uncaged, tokenless exec
+# handler would authenticate as the owner and mislabel every send — see
+# docs/security.md entry 16; that is why a real egress bridge is a daemon.)
+#
+# Egress is command-shaped: the request arrives addressed to this actor's INBOX
+# (in/package/webhook/send {url, text}); delivery is DIRECT (an HTTP POST, off
+# the bus); the outcome is an obs/channel/webhook/sent record. There is no out/
+# plane. Swap the POST for any service's SDK and this is the template for a real
+# external-channel egress bridge.
+#
+# Ships PENDING: it can send to the outside, so it parks until `elanus approve
+# webhook`.
+
+[request]
+subscribe = ["in/package/webhook/send"]
+publish   = ["obs/channel/webhook/sent"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"

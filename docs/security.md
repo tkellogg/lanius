@@ -252,7 +252,10 @@ deputy is simply unreachable from inside the cage.
 **[DECIDED 2026-06-13, Tim] Deferred.** "The CLI actually is secure afaict,
 but the web UI is a hole. But that's fine. We can close that some other
 time." Recorded so the web path is not mistaken for covered by the identity
-work; not the next action.
+work; not the next action. (When taken up, note that the web server resolves
+the owner name + secret once at startup; with the configurable owner name
+(entry-free identity work), a rename needs a re-read or per-request resolution
+so the surface follows the renamed owner without a restart.)
 
 ## 14. [LATENT] Phonebook identity directory over unauthenticated loopback HTTP
 
@@ -278,6 +281,16 @@ dict with bound parameters), never SQL passthrough, satisfying entry 10's
 second requirement. WRITES are not exposed here — they go over the
 authenticated bus, where the broker stamps the verified sender as provenance,
 so an agent can only ever propose as itself (verified end to end).
+
+**[UPDATE 2026-06-14]** The HTTP read plane is not the only exposure: phonebook
+writes go over `in/package/phonebook/...`, which are ledgered events, so the
+who-is-who graph (identities, channel addresses, links) also lands in
+harness.db as event payloads — readable by any caged agent via a raw `sqlite3`
+read, the same cross-actor db-read gap that exposes transcripts and mail (the
+deferred read-confidentiality item; section 0 / Linux read-fence). So the fix
+"arrives with the authenticated read plane" only for the HTTP port; the raw-
+ledger copy is closed by the read-fence work (Landlock / scoped reads), not by
+authenticating the port.
 
 ## 15. [DECIDED 2026-06-14 / LATENT residual] Recall must key the correspondent on verified provenance
 
@@ -307,3 +320,41 @@ to reserve the ingress prefix — only ingress bridges, never agents, may publis
 `in/dm/...` — which belongs with the actor-authorization work (narrowing agent
 publish grants; bridges vs agents). Until then: keep agent publish grants
 scoped, and treat channel-plane agent dispatch as opt-in.
+
+**[UPDATE 2026-06-14]** The residual is reachable WITHOUT a broad bus grant:
+the `emit_event` agent tool calls `events::emit` directly (a ledger write), not
+a bus publish, so it is not checked against the publish ACL at all — an agent
+can mint an event of any `type` (topic) that way. So "keep agent publish grants
+scoped" does not fully bound it; the real fix is a reserved-prefix guard in
+`events::emit` itself (refuse agent-origin `in/dm/*`), part of the same
+actor-authorization work. recall's self-sender gate still holds (a self-forged
+dispatch never recalls); the residual is the multi-agent case.
+
+## 16. [LEGS / LATENT] Exec handlers publish as the owner, not as themselves
+
+Reacting (`mode = "exec"`) package handlers are spawned by the dispatcher
+UNCAGED and WITHOUT a per-spawn token (src/dispatcher.rs spawn_handler — no
+`ELANUS_BUS_TOKEN`/`ELANUS_PACKAGE`, no cage; contrast the daemon path which
+injects both and cages). So when an exec handler runs `elanus bus pub`,
+buscli finds no package token and — because it is uncaged — reads
+`.secrets/owner` and authenticates AS THE OWNER; the broker then stamps the
+event `sender = owner`. (An exec handler using `elanus emit` instead writes the
+ledger directly with `sender` falling back to `kernel`.) Either way an exec
+handler's emitted events are mis-attributed — never to the package that
+actually produced them. This inverts the identity model's whole point
+(provenance is the verified sender) for the exec-handler path, and it is
+especially dangerous in a *template*: a naive egress bridge written as an exec
+handler labels every outbound send as owner-originated.
+
+This surfaced building the webhook egress exemplar (increment 5). The exemplar
+was made a **daemon** instead — daemons are spawned token-authed and caged, so
+webhook's receipt correctly carries `sender = webhook` (e2e section 20 asserts
+it). That is the right shape for any emitting/egress bridge and the documented
+recommendation (docs/actors.md). The general fix for the exec-handler path is
+part of the deferred exec-handler containment work (entry 1 / leg 3): spawn
+exec handlers token-authed as their package (and set `HARNESS_ACTOR` so the
+`elanus emit` path attributes correctly too), so their publishes attribute to
+the package and their declared publish grants are actually the thing enforced.
+Until then, an emitting handler's `sender` should be read as the surface
+(owner/kernel), not the package, and bridges that must attribute correctly
+should be daemons.

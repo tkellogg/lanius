@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""webhook — an egress exemplar (docs/actors.md), built as a daemon bridge.
+
+A bridge is a long-running actor with its own identity, so its sends attribute
+to IT. Spawned with its package token, `elanus bus pub` authenticates as
+"webhook", and the broker stamps the receipt sender=webhook — the provenance
+the egress record exists to carry. (A per-event exec handler runs uncaged and
+tokenless, so it would authenticate as the OWNER and mislabel every send; that
+is why a real egress bridge is a daemon — docs/security.md entry 16.)
+
+Egress is command-shaped: the request arrives addressed to this actor's inbox
+(in/package/webhook/send {url, text}); delivery is DIRECT (an HTTP POST, off
+the bus, the wrong tool for a command-with-a-result); the outcome is an
+obs/channel/webhook/sent record carrying the triggering correlation, so the
+send is causally linked to the request. Swap the POST for any service's API or
+SDK (and its credentials, which a real bridge holds so no agent has to) and
+this is the shape of an external-channel egress bridge.
+
+Crash-only: bus trouble exits nonzero and the supervisor restarts us. A failed
+send is a recorded outcome (ok:false), never a crash.
+"""
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+
+DB = os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("HARNESS_ROOT", "."), "harness.db")
+PKG = os.environ.get("ELANUS_PACKAGE", "webhook")
+REQ = "in/package/webhook/send"
+RESULT = "obs/channel/webhook/sent"
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def deliver(payload):
+    """The direct send. A failed send is a recorded outcome, not a crash."""
+    url = payload.get("url")
+    text = payload.get("text", "")
+    if not url:
+        return {"url": None, "ok": False, "detail": "send needs {url}"}
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps({"text": text}).encode(),
+            headers={"content-type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return {"url": url, "ok": 200 <= r.status < 300, "status": r.status}
+    except Exception as e:
+        return {"url": url, "ok": False, "detail": str(e)}
+
+
+def subscribe_grant_approved():
+    try:
+        c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+        row = c.execute(
+            "SELECT state FROM grants WHERE package = ? AND kind = 'subscribe' ORDER BY id DESC LIMIT 1",
+            (PKG,),
+        ).fetchone()
+        c.close()
+        return row is not None and row[0] == "approved"
+    except sqlite3.Error:
+        return False
+
+
+def main():
+    waited = False
+    while not subscribe_grant_approved():
+        if not waited:
+            log("[webhook] grant not approved yet; parking until `elanus approve webhook` (this is not an error)")
+            waited = True
+        time.sleep(2)
+    proc = subprocess.Popen(["elanus", "bus", "sub", REQ], stdout=subprocess.PIPE, text=True)
+    log(f"[webhook] serving {REQ} (egress bridge; direct send + obs record, attributed to this actor)")
+    for line in proc.stdout:
+        try:
+            env = json.loads(line)
+        except ValueError:
+            continue
+        # `elanus bus sub` wraps each delivery as {"topic", "payload": <broker
+        # envelope>}; the broker envelope carries the request body and the
+        # triggering correlation.
+        inner = env.get("payload") if isinstance(env.get("payload"), dict) else {}
+        payload = inner.get("payload") if isinstance(inner.get("payload"), dict) else {}
+        corr = inner.get("correlation_id")
+        result = deliver(payload)
+        # The record: the delivery left the bus, but the FACT of it is observed
+        # here — attributed to this bridge (the broker stamps sender=webhook)
+        # and linked to the request's correlation.
+        receipt = json.dumps({**result, "correlation": corr})
+        args = ["elanus", "bus", "pub", RESULT, receipt, "--qos", "1"]
+        if corr:
+            args += ["--correlation", corr]
+        try:
+            subprocess.run(args, check=False, timeout=10)
+        except subprocess.SubprocessError:
+            raise  # bus trouble is crash-only
+    log("[webhook] bus subscription died -> exiting for restart")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

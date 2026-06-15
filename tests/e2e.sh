@@ -25,6 +25,7 @@ cleanup() {
   [ -n "${LLM3_PID:-}" ] && kill -9 "$LLM3_PID" 2>/dev/null
   [ -n "${LLM5_PID:-}" ] && kill -9 "$LLM5_PID" 2>/dev/null
   [ -n "${LLM6_PID:-}" ] && kill -9 "$LLM6_PID" 2>/dev/null
+  [ -n "${WH_PID:-}" ] && kill -9 "$WH_PID" 2>/dev/null
   # Supervised actors are children of the daemon but survive its death;
   # crash-only in production (their bus connection dies), explicit here.
   pkill -9 -f "$TMP/packages/" 2>/dev/null
@@ -1324,6 +1325,50 @@ grep -q "lone sms message" "$TMP/llm3.body" \
   && ok "unresolved channel still recalls its own thread (degrade, not fail)" \
   || fail "degrade path did not recall the single channel"
 kill -9 "$LLM6_PID" 2>/dev/null
+
+echo "== 20. egress doctrine: a direct send + an obs record (no out/ plane) =="
+# Egress is command-shaped (docs/actors.md): it goes DIRECT (here an HTTP POST),
+# not through the bus as transport — but the send emits an obs/ record so the
+# flight recorder stays whole. The webhook package is the worked exemplar.
+cat > "$TMP/webhook_stub.py" <<'EOF'
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length', 0))
+        open(sys.argv[2], "wb").write(self.rfile.read(n))   # record what was delivered
+        self.send_response(200); self.end_headers()
+    def log_message(self, *a): pass
+srv = HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
+EOF
+python3 "$TMP/webhook_stub.py" "$TMP/wh.port" "$TMP/wh.received" &
+WH_PID=$!
+wait_for "webhook stub bound" "[ -s '$TMP/wh.port' ]"
+# webhook is a DAEMON bridge (its own identity), so its receipt attributes to
+# IT, not the owner — that is the provenance the egress record carries.
+[ -f "$TMP/packages/webhook/elanus.toml" ] || cp -R "$REPO/packages/webhook" "$TMP/packages/"
+elanus approve webhook >/dev/null 2>&1 || fail "approve webhook"
+wait_for "webhook bridge serving (parked -> approved)" "grep -q 'webhook\] serving' '$TMP/run/pkg-webhook/stderr.log'"
+# Capture the egress record off the bus, then trigger a send (correlated).
+( elanus bus sub obs/channel/webhook/sent --count 1 --timeout 10 > "$TMP/wh.receipt" 2>/dev/null ) &
+WHSUB=$!
+sleep 0.5
+elanus emit "in/package/webhook/send" --correlation wh-corr-1 --payload "{\"url\":\"http://127.0.0.1:$(cat "$TMP/wh.port")/hook\",\"text\":\"ping-egress\"}" >/dev/null 2>&1
+wait_for "the send was delivered DIRECTLY (off the bus)" "grep -q ping-egress '$TMP/wh.received' 2>/dev/null"
+ok "egress went direct (HTTP POST), not relayed over the bus"
+wait "$WHSUB" 2>/dev/null
+grep -q '"ok": *true' "$TMP/wh.receipt" \
+  && ok "the send emitted an obs record (bus stays the record plane)" || fail "no egress obs record"
+grep -q '"sender": *"webhook"' "$TMP/wh.receipt" \
+  && ok "the receipt is attributed to the bridge (sender=webhook, not the owner)" || fail "egress receipt misattributed: $(cat "$TMP/wh.receipt")"
+grep -q "wh-corr-1" "$TMP/wh.receipt" \
+  && ok "the receipt is causally linked to the request (correlation threaded)" || fail "receipt not correlated to the request"
+# out/ stays absent: sending is an inbox + a direct send + an obs record.
+[ -z "$(sql "SELECT id FROM events WHERE type LIKE 'out/%' LIMIT 1")" ] \
+  && ok "no out/ plane anywhere (the egress asymmetry holds)" || fail "an out/ event exists"
+kill -9 "$WH_PID" 2>/dev/null
 
 echo
 if [ "$FAILS" -eq 0 ]; then

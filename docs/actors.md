@@ -168,3 +168,20 @@ This asymmetry is also why there is no `out/` plane (it was proposed and
 deliberately dropped). Sending to another elanus actor is just writing to that
 actor's inbox; sending to the outside world is a direct command that gets
 observed. Neither one needs an outbox.
+
+Two shipped exemplars make the egress shape concrete; both follow the same
+principle — a direct send, then an `obs/channel/<kind>/sent` record, nothing
+relayed through the bus as transport — but they are built differently, and the
+difference matters for provenance. The `notify` package is a reacting exec
+handler: it receives an ask and fires a desktop notification via the OS,
+directly. The `webhook` package is a **daemon bridge**: a request arrives
+addressed to its inbox (`in/package/webhook/send`), it POSTs directly to the
+URL, and it emits its record. The daemon shape is the one to copy for a real
+external-channel bridge, because a daemon carries its own identity (its package
+token), so the broker stamps its record's sender as the bridge itself —
+genuine provenance. An exec handler runs uncaged and tokenless and so
+authenticates as the owner, mislabeling its sends (docs/security.md entry 16);
+that is a containment gap to close, not a pattern to imitate. For a real
+channel, replace the POST with the service's own API or SDK (whose credentials
+the bridge holds, so no agent has to), keep the `obs/channel/<kind>/sent`
+record, and run it as a daemon.

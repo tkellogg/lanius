@@ -449,6 +449,37 @@ override. The stock human-proxy packages (notify, escalation) match
 secret; a caged agent cannot mint or read one (macOS — the Linux read-fence
 gap remains the deferred limitation in section 0).
 
+## Implementation notes (increments 2, 4, 5, as built — 2026-06-14)
+
+- **Phonebook (increment 2)** — `packages/phonebook`, a daemon owning its own
+  sqlite in its scratch (never harness.db). Reads over HTTP (resolve / identity
+  / identities / channels / whois); writes over the authenticated bus
+  (`in/package/phonebook/<op>`), so each link's provenance is the broker-
+  verified sender — an agent proposes only as itself. Merge is non-destructive
+  (a `merged_into` pointer), so split reverts; a channel can be recorded before
+  it is resolved; resolution is a query-time join. The who-is-who graph also
+  lands in harness.db as the ledgered write events (security.md entry 14
+  update).
+- **Recall (increment 4)** — `packages/recall`, a resident context stage
+  (order 25). Given an incoming channel, it assembles the conversation with
+  that person across every channel the phonebook knows, as one frame. The
+  correspondent is taken ONLY from the broker-verified topic and never on a
+  self-emitted event (the provenance gate; security.md entry 15) — because who
+  you are talking to decides whose history loads.
+- **Egress (increment 5)** — `packages/webhook`, the egress exemplar, built as
+  a daemon bridge so its send attributes to it (security.md entry 16). Direct
+  delivery off the bus + an `obs/channel/<kind>/sent` record; no `out/` plane.
+- **Owner not auto-registered in the phonebook (decided to defer).** The owner
+  is a first-class *principal* (a fenced secret + the `in/human/<owner>`
+  mailbox), but nothing writes an `identity {id:owner, kind:human}` + an
+  `(elanus, owner)` channel into the phonebook, so the directory and the
+  principal namespace are not yet stitched together (recall does not work for
+  the owner out of the box; the owner is reached as the agent's human via
+  `in/human/<owner>`, not as a recalled correspondent). Seeding it (at
+  phonebook startup, or init) is a small, clean follow-up; recorded here so the
+  gap between "principal" and "phonebook identity" is a known, deliberate v1
+  edge, not an oversight.
+
 ## Settled in this round (2026-06-13)
 
 - **Scope of the first pass.** The sandbox-protected credential everywhere,
