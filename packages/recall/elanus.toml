@@ -1,0 +1,31 @@
+# recall — the unified cross-channel frame (docs/identity.md, docs/context.md).
+#
+# A person is one identity reachable through many channels. When a message
+# arrives on one channel, this resident context stage pulls the whole
+# conversation with that person — across every channel the phonebook knows
+# them by — into one linear frame. It is the made-easy payoff of the
+# resolve-at-recall design: topics stay channel-faithful (in/dm/<kind>/<addr>),
+# and unification is a query-time join over the phonebook and the ledger.
+#
+# RESIDENT (docs/context.md): the daemon holds a warm read-only sqlite
+# connection and consults the phonebook's HTTP read plane; it serves stage
+# consults over the bus (request on obs/harness/stagereq/recall/recall,
+# response point-to-point). Both prefixes are fan-out-only, never recorded.
+#
+# A [[stage]] is a request: this ships with the stock set but stays inert until
+# approved (`elanus approve recall`), because an approved stage shapes every
+# prompt the model sees. Profiles opt out with the usual skills exclude.
+
+[request]
+subscribe = ["obs/harness/stagereq/recall/recall"]
+publish   = ["obs/harness/stageresp/#"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+
+[[stage]]
+name  = "recall"
+run   = "scripts/main"   # the serving code; covered by code_hash
+order = 25               # before recent-history (30): the correspondent first
+mode  = "resident"

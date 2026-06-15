@@ -24,6 +24,7 @@ cleanup() {
   [ -n "${LLM2_PID:-}" ] && kill -9 "$LLM2_PID" 2>/dev/null
   [ -n "${LLM3_PID:-}" ] && kill -9 "$LLM3_PID" 2>/dev/null
   [ -n "${LLM5_PID:-}" ] && kill -9 "$LLM5_PID" 2>/dev/null
+  [ -n "${LLM6_PID:-}" ] && kill -9 "$LLM6_PID" 2>/dev/null
   # Supervised actors are children of the daemon but survive its death;
   # crash-only in production (their bus connection dies), explicit here.
   pkill -9 -f "$TMP/packages/" 2>/dev/null
@@ -1257,6 +1258,72 @@ curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"nope"}' | grep -q '"ok": *
   && ok "unknown query kind rejected, not executed" || fail "unknown kind not rejected"
 [ -s "$TMP/run/pkg-phonebook/phonebook.db" ] \
   && ok "phonebook owns its store (scratch, not harness.db)" || fail "phonebook.db missing in scratch"
+
+echo "== 19. recall: the unified cross-channel frame (resolve-at-recall, provenance-gated) =="
+# A resident context stage: when a message arrives on one channel, pull the
+# whole conversation with that PERSON across every channel the phonebook knows
+# them by (docs/identity.md). Topics stay channel-faithful; unification is a
+# query-time join over the phonebook (HTTP) and the ledger. The correspondent
+# is taken ONLY from the broker-verified topic, never a body field, and never
+# from an event the agent emitted itself — so a prompt-injected agent cannot
+# pull another person's history. (Phonebook from section 18 is serving.)
+[ -f "$TMP/packages/recall/elanus.toml" ] || cp -R "$REPO/packages/recall" "$TMP/packages/"
+elanus approve recall >/dev/null 2>&1 || fail "approve recall"
+wait_for "recall daemon serving (parked -> approved)" "grep -q 'recall\] serving' '$TMP/run/pkg-recall/stderr.log'"
+# A body-capturing LLM (reused from section 14) so we can prove the unified
+# frame reaches the ACTUAL prompt, plus a profile that points at it.
+python3 "$TMP2/fake_llm2.py" "$TMP/llm3.port" "$TMP/cmd3.txt" "$TMP/llm3.body" &
+LLM6_PID=$!
+wait_for "recall fake LLM bound" "[ -s '$TMP/llm3.port' ]"
+printf 'true' > "$TMP/cmd3.txt"
+mkdir -p "$TMP/profiles/recalltest"
+cat > "$TMP/profiles/recalltest/profile.toml" <<EOF
+agent = "main"
+owner = "owner"
+[model]
+model = "claude-3-5-haiku-latest"
+max_turns = 4
+base_url = "http://127.0.0.1:$(cat "$TMP/llm3.port")"
+api_key_env = "FAKE_LLM_KEY"
+EOF
+# Cara is one person on two channels; record her and seed a message on each.
+elanus bus pub in/package/phonebook/identity '{"id":"cara","kind":"human","canonical":"Cara"}' --qos 1 >/dev/null || fail "pub cara"
+elanus bus pub in/package/phonebook/channel '{"channel_kind":"bluesky","address":"@cara","identity":"cara","confidence":1.0}' --qos 1 >/dev/null || fail "link cara bluesky"
+elanus bus pub in/package/phonebook/channel '{"channel_kind":"discord","address":"cara#7","identity":"cara","confidence":1.0}' --qos 1 >/dev/null || fail "link cara discord"
+elanus bus pub "in/dm/bluesky/@cara" '{"text":"hello from bluesky"}' --qos 1 >/dev/null || fail "ingress bluesky"
+elanus bus pub "in/dm/discord/cara%237" '{"text":"and from discord"}' --qos 1 >/dev/null || fail "ingress discord"
+wait_for "phonebook resolved the correspondent" \
+  "curl -s 'http://127.0.0.1:$PBPORT/query' -d '{\"kind\":\"resolve\",\"channel_kind\":\"bluesky\",\"address\":\"@cara\"}' | grep -q '\"id\": *\"cara\"'"
+# (a) Genuine ingress (verified sender is a bridge, not the agent): recall
+# unifies BOTH channels into the real prompt — proves the query-time join and
+# that the percent-encoded discord address actually matched the ledger.
+EVR=$(elanus emit obs/e2e/recall-anchor)
+printf '{"id":%s,"type":"in/dm/bluesky/@cara","sender":"bluesky-bridge","payload":{"prompt":"hi","profile":"recalltest","session":"recall1"}}' "$EVR" | \
+  HARNESS_EVENT_ID="$EVR" FAKE_LLM_KEY=dummy elanus handle-exec >/dev/null 2>&1
+grep -q "hello from bluesky" "$TMP/llm3.body" && grep -q "and from discord" "$TMP/llm3.body" \
+  && ok "recall unified BOTH channels into the prompt (resolve-at-recall; encoding matched)" \
+  || fail "recall did not unify both channels into the prompt"
+# (b) SECURITY: a self-forged dispatch (verified sender == the running agent)
+# must recall NOTHING — an injected agent cannot name a correspondent and pull
+# their confidential history into its own prompt.
+: > "$TMP/llm3.body"
+EVR2=$(elanus emit obs/e2e/recall-anchor2)
+printf '{"id":%s,"type":"in/dm/bluesky/@cara","sender":"main","payload":{"prompt":"hi","profile":"recalltest","session":"recall2"}}' "$EVR2" | \
+  HARNESS_EVENT_ID="$EVR2" FAKE_LLM_KEY=dummy elanus handle-exec >/dev/null 2>&1
+grep -q "hello from bluesky" "$TMP/llm3.body" \
+  && fail "recall leaked history on a self-forged (sender==agent) dispatch" \
+  || ok "self-forged dispatch recalls nothing (provenance gate holds)"
+# (c) DEGRADE: an unresolved channel (no phonebook link) still recalls its own
+# single thread — best-effort, never a failed run.
+elanus bus pub "in/dm/sms/%2B99" '{"text":"lone sms message"}' --qos 1 >/dev/null || fail "ingress sms"
+: > "$TMP/llm3.body"
+EVR3=$(elanus emit obs/e2e/recall-anchor3)
+printf '{"id":%s,"type":"in/dm/sms/%%2B99","sender":"sms-bridge","payload":{"prompt":"hi","profile":"recalltest","session":"recall3"}}' "$EVR3" | \
+  HARNESS_EVENT_ID="$EVR3" FAKE_LLM_KEY=dummy elanus handle-exec >/dev/null 2>&1
+grep -q "lone sms message" "$TMP/llm3.body" \
+  && ok "unresolved channel still recalls its own thread (degrade, not fail)" \
+  || fail "degrade path did not recall the single channel"
+kill -9 "$LLM6_PID" 2>/dev/null
 
 echo
 if [ "$FAILS" -eq 0 ]; then

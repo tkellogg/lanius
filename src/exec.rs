@@ -1339,12 +1339,18 @@ pub fn handle_exec(root: &Root) -> Result<()> {
     let profile = payload["profile"].as_str().unwrap_or("default").to_string();
     let resume = env.get("resume").filter(|r| !r.is_null());
     // The dispatching event rides into the context document verbatim
-    // (docs/context.md): stages see topic, payload, correlation.
+    // (docs/context.md): stages see topic, payload, correlation — and the
+    // broker-verified `sender` (docs/identity.md), so a stage can tell who the
+    // kernel holds responsible for this event rather than trusting a body
+    // field. Identity-bearing stages (e.g. recall) MUST key off this, never a
+    // self-claimed payload field. Set from the authenticated connection; absent
+    // ("unknown") on pre-sender rows or kernel-side execs without an envelope.
     let event = json!({
         "id": env["id"],
         "topic": env["type"],
         "payload": payload,
         "correlation_id": env["correlation_id"],
+        "sender": env["sender"],
     });
     let opts = if let Some(r) = resume {
         let ans = match &r["payload"]["answer"] {

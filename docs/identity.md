@@ -399,6 +399,20 @@ stage (the same shape as recent-history): hand it an identity, get back the
 merged timeline. The harness is never *required* to unify channels — the raw
 per-channel threads stay faithful and usable — it is simply made trivial to.
 
+A trust rule the recall stage must obey, because the correspondent decides
+*whose* history loads and is therefore authority-bearing: the correspondent is
+taken only from the broker-verified, kernel-stamped event topic
+(`in/dm/<kind>/<addr>`), never from a self-claimed body field, and never from an
+event the running agent emitted itself (its verified sender equals the agent).
+Otherwise a prompt-injected agent could name a correspondent — in a payload, or
+by forging its own dispatch — and pull another person's confidential messages
+into its own prompt. This is the same doctrine the phonebook follows for
+writes: provenance is the verified sender, never a field the writer chose. The
+residual to close as the agent-authorization work matures: an agent holding a
+broad publish grant could forge an `in/dm/...` event for *another* agent that
+is dispatched on the channel plane — the deeper fix is reserving the ingress
+prefix so only bridges, never agents, can publish `in/dm/...` (security ledger).
+
 ## Implementation notes (increment 1, as built)
 
 The verified-sender foundation is in. The broker derives the sender from the

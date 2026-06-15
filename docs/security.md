@@ -278,3 +278,32 @@ dict with bound parameters), never SQL passthrough, satisfying entry 10's
 second requirement. WRITES are not exposed here — they go over the
 authenticated bus, where the broker stamps the verified sender as provenance,
 so an agent can only ever propose as itself (verified end to end).
+
+## 15. [DECIDED 2026-06-14 / LATENT residual] Recall must key the correspondent on verified provenance
+
+The recall context stage (docs/identity.md) assembles another identity's
+cross-channel message *bodies* into the agent's prompt, keyed on who the
+"correspondent" is — so the correspondent is authority-bearing, the same class
+of data as entry 10. A review (verify-recall workflow) found the first cut
+derived the correspondent from agent-forgeable fields (the event topic *and* a
+`payload.channel`/`from` body field), so a prompt-injected agent could
+`emit_event` to its own mailbox with `payload.channel = {victim}` and make
+recall pull the victim's history into a run whose prompt it also wrote, then
+exfiltrate it (`publish` grant permitting). **Fixed (2026-06-14):** the
+broker-verified `sender` now rides into the context document's `event`
+(src/exec.rs); recall takes the correspondent ONLY from the kernel-stamped
+channel-faithful topic, NEVER a body field, and NEVER on an event whose
+verified sender is the running agent itself (a self-forged dispatch). This is
+the phonebook's doctrine applied to reads: identity comes from verified
+provenance, never a chosen field.
+
+**[LATENT] residual.** The topic of an `in/dm/...` event is trustworthy only
+because a caged agent should not be publishing one. Today an agent's publish
+grant can be broad (e.g. a `#` wildcard), so in principle one agent could forge
+an `in/dm/...` event that is dispatched to *another* agent on the channel plane
+(the self-sender guard only catches the agent forging its OWN dispatch). This
+is the same class as the over-broad-grant problem generally. The deeper fix is
+to reserve the ingress prefix — only ingress bridges, never agents, may publish
+`in/dm/...` — which belongs with the actor-authorization work (narrowing agent
+publish grants; bridges vs agents). Until then: keep agent publish grants
+scoped, and treat channel-plane agent dispatch as opt-in.

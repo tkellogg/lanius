@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""recall — resident context stage: the unified cross-channel frame (docs/identity.md).
+
+A person is one identity reachable through many channels. When a message
+arrives on one channel, this stage pulls the whole conversation with that
+person — across every channel the phonebook knows them by — into one linear
+frame, "as if it were a single chat." It is the made-easy payoff of the
+resolve-at-recall design: topics stay channel-faithful, and unification is a
+query-time join over the phonebook and the ledger, never baked into the topic.
+
+Trigger and TRUST (docs/identity.md — a correspondent is authority-bearing):
+the correspondent is taken ONLY from the broker-verified event topic
+(`in/dm/<channel_kind>/<address>`, percent-decoded — a kernel-stamped fact),
+and ONLY when the event was not emitted by the running agent itself (the
+verified `sender` differs from the agent). It is NEVER taken from a body field
+the writer chose. That is the whole point: a prompt-injected agent must not be
+able to name a correspondent — in a payload or by forging its own dispatch —
+and make recall pull another person's message bodies into its own prompt. With
+no trustworthy correspondent the stage is a no-op.
+
+Resolution (best-effort): ask the phonebook (its HTTP read plane, discovered
+from run/pkg-phonebook/http.json) to resolve the channel to an identity and
+list that identity's channels. If the phonebook is unavailable or the channel
+is unresolved, fall back to recalling just this one channel's thread — recall
+degrades, it does not fail the run for missing enrichment.
+
+Resident protocol (body-embedded addressing — the broker only fans out):
+  receive  obs/harness/stagereq/recall/recall
+           {"doc": <context document>, "response_topic": "...", "correlation": "..."}
+  answer   <response_topic>  {"correlation": ..., "doc": <transformed>}
+
+The ledger read is a warm READ-ONLY sqlite connection (mode=ro — a view must
+be physically unable to write the truth it reconstructs). Crash-only: bus
+trouble exits nonzero and the supervisor restarts us.
+"""
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+
+DB = os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("HARNESS_ROOT", "."), "harness.db")
+ROOT = os.environ.get("HARNESS_ROOT", ".")
+PKG = os.environ.get("ELANUS_PACKAGE", "recall")
+REQ_TOPIC = f"obs/harness/stagereq/{PKG}/recall"
+LIMIT = 14
+CLIP = 300
+_conn = None
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ---- topic segment encoding (mirrors src/topic.rs encode_segment) -----------
+
+def encode_segment(s):
+    out = []
+    for ch in s:
+        out.append({"%": "%25", "+": "%2B", "#": "%23", "/": "%2F"}.get(ch, ch))
+    return "".join(out)
+
+
+def decode_segment(s):
+    # %25 (the escape for '%') last, so a decoded '%' cannot re-trigger.
+    return s.replace("%2F", "/").replace("%23", "#").replace("%2B", "+").replace("%25", "%")
+
+
+def dm_topic(kind, address):
+    return f"in/dm/{encode_segment(kind)}/{encode_segment(address)}"
+
+
+def parse_correspondent(event):
+    """The (channel_kind, address) of the person this event is from, or None —
+    taken ONLY from the broker-verified, channel-faithful topic. A body field is
+    self-claimed and untrusted (module docstring), so it is never used to decide
+    whose history to load."""
+    topic = event.get("topic") or ""
+    parts = topic.split("/")
+    if len(parts) >= 4 and parts[0] == "in" and parts[1] == "dm":
+        return decode_segment(parts[2]), decode_segment("/".join(parts[3:]))
+    return None
+
+
+# ---- phonebook (best-effort HTTP read plane) --------------------------------
+
+def phonebook_base():
+    try:
+        j = json.load(open(os.path.join(ROOT, "run", "pkg-phonebook", "http.json")))
+        return f"http://127.0.0.1:{j['port']}" if j.get("port") else None
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def phonebook_query(base, q):
+    try:
+        req = urllib.request.Request(
+            base + "/query", data=json.dumps(q).encode(),
+            headers={"content-type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None  # the phonebook is best-effort; recall degrades, never crashes on it
+
+
+def resolve(kind, addr):
+    """Return (identity_or_None, channels) for the correspondent. Falls back to
+    the single sighted channel when the phonebook is down or the channel is
+    unresolved."""
+    base = phonebook_base()
+    if not base:
+        return None, [(kind, addr)]
+    # Every reply shape is treated defensively: a malformed/unexpected phonebook
+    # response must degrade to "unresolved", never raise out of this best-effort
+    # path (recall enrichment must not fail the agent's run).
+    r = phonebook_query(base, {"kind": "resolve", "channel_kind": kind, "address": addr})
+    if not isinstance(r, dict) or not r.get("resolved") or not isinstance(r.get("identity"), dict):
+        return None, [(kind, addr)]
+    ident = r["identity"]
+    if not ident.get("id"):
+        return None, [(kind, addr)]
+    full = phonebook_query(base, {"kind": "identity", "id": ident["id"]})
+    chans = []
+    if isinstance(full, dict) and isinstance(full.get("channels"), list):
+        for c in full["channels"]:
+            if isinstance(c, dict) and c.get("channel_kind") and c.get("address"):
+                chans.append((c["channel_kind"], c["address"]))
+    if (kind, addr) not in chans:
+        chans.append((kind, addr))
+    return ident, chans
+
+
+# ---- ledger (warm read-only) ------------------------------------------------
+
+def conn():
+    global _conn
+    if _conn is None:
+        _conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+    return _conn
+
+
+def gather(channels, exclude_id):
+    """Messages across all of an identity's channels, time-ordered, as a single
+    frame. The ledger event for channel (kind, addr) is topic in/dm/<kind>/<addr>
+    (percent-encoded)."""
+    topics = [dm_topic(k, a) for (k, a) in channels]
+    if not topics:
+        return []
+    qmarks = ",".join("?" * len(topics))
+    rows = conn().execute(
+        f"SELECT id, type, payload, created_at FROM events WHERE type IN ({qmarks}) ORDER BY id DESC LIMIT ?",
+        (*topics, LIMIT + 1),
+    ).fetchall()
+    lines = []
+    for eid, etype, payload, created in reversed(rows):
+        if exclude_id is not None and eid == exclude_id:
+            continue  # the dispatching message itself is the live turn; don't echo it
+        try:
+            p = json.loads(payload) if payload else {}
+        except ValueError:
+            p = {}
+        text = p.get("text") or p.get("prompt") or p.get("answer") or p.get("question") or ""
+        if not isinstance(text, str) or not text.strip():
+            continue
+        text = " ".join(text.split())
+        if len(text) > CLIP:
+            text = text[:CLIP] + "…"
+        lines.append(f"- [{created}] {channel_label(etype)}: {text}")
+    return lines[-LIMIT:]
+
+
+def channel_label(topic):
+    parts = topic.split("/")
+    if len(parts) >= 4 and parts[0] == "in" and parts[1] == "dm":
+        return f"{decode_segment(parts[2])}:{decode_segment('/'.join(parts[3:]))}"
+    return topic
+
+
+# ---- the stage transform ----------------------------------------------------
+
+def transform(doc):
+    if not isinstance(doc, dict):
+        return doc
+    event = doc.get("event")
+    if not isinstance(event, dict):
+        return doc  # a malformed doc is a clean no-op, not a failed run
+    # Provenance gate (docs/identity.md): never recall on an event the running
+    # agent emitted itself. That would be the agent naming its own
+    # correspondent — exactly how a prompt-injected agent would try to pull
+    # another person's history into its prompt. The verified `sender` is
+    # kernel-stamped; the agent cannot forge a different one.
+    meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+    sender = event.get("sender")
+    if sender is not None and sender == meta.get("agent"):
+        return doc
+    chan = parse_correspondent(event)
+    if not chan:
+        return doc  # no trustworthy correspondent; add nothing rather than guess
+    kind, addr = chan
+    ident, channels = resolve(kind, addr)
+    lines = gather(channels, event.get("id"))
+    if lines:
+        who = (ident or {}).get("canonical") or (ident or {}).get("id") or f"{kind}:{addr}"
+        doc.setdefault("system", []).append({
+            "name": "recall",
+            "text": f"## Conversation with {who} "
+                    f"(reconstructed across {len(channels)} channel(s) from the ledger; "
+                    f"sessions are fresh by design)\n" + "\n".join(lines),
+        })
+    return doc
+
+
+# ---- bus wire ---------------------------------------------------------------
+
+def respond(topic, body):
+    subprocess.run(["elanus", "bus", "pub", topic, json.dumps(body), "--qos", "1"], check=True, timeout=30)
+
+
+def stage_grant_approved():
+    try:
+        c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+        row = c.execute(
+            "SELECT state FROM grants WHERE package = ? AND kind = 'stage' ORDER BY id DESC LIMIT 1",
+            (PKG,),
+        ).fetchone()
+        c.close()
+        return row is not None and row[0] == "approved"
+    except sqlite3.Error:
+        return False
+
+
+def main():
+    if not os.path.exists(DB):
+        log(f"[recall] no ledger at {DB}; supervisor-given path missing is a real fault")
+        sys.exit(1)
+    waited = False
+    while not stage_grant_approved():
+        if not waited:
+            log("[recall] stage grant not approved yet; parking until `elanus approve recall` (this is not an error)")
+            waited = True
+        time.sleep(2)
+    proc = subprocess.Popen(["elanus", "bus", "sub", REQ_TOPIC], stdout=subprocess.PIPE, text=True)
+    log(f"[recall] serving {REQ_TOPIC} (db {DB}, read-only; phonebook over HTTP)")
+    for line in proc.stdout:
+        try:
+            req = json.loads(line).get("payload") or {}
+        except ValueError:
+            continue
+        rt = req.get("response_topic")
+        corr = req.get("correlation")
+        if not (isinstance(rt, str) and rt.startswith("obs/harness/stageresp/") and corr):
+            continue
+        try:
+            out = transform(req.get("doc") or {})
+            respond(rt, {"correlation": corr, "doc": out})
+        except subprocess.SubprocessError:
+            raise  # bus trouble is crash-only
+        except Exception as e:  # the kernel fails the run, attributed to this stage
+            respond(rt, {"correlation": corr, "error": str(e)})
+    log("[recall] bus subscription died -> exiting for restart")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
