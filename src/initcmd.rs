@@ -3,7 +3,7 @@ use crate::kit;
 use crate::manifest::ThrottleDecl;
 use crate::packages;
 use crate::paths::Root;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 struct PkgFile {
@@ -58,6 +58,14 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
     PkgFile { rel: "funnel/packages/funnel-scout/scripts/run", content: include_str!("../kits/funnel/packages/funnel-scout/scripts/run"), exec: true },
     PkgFile { rel: "funnel/profiles/scout/profile.toml", content: include_str!("../kits/funnel/profiles/scout/profile.toml"), exec: false },
     PkgFile { rel: "funnel/profiles/scout/blocks/00-scout.md", content: include_str!("../kits/funnel/profiles/scout/blocks/00-scout.md"), exec: false },
+    // stdlib: the protected, always-on kit (docs/config.md). Installed and
+    // auto-approved unconditionally in init(); history (the transcript view) is
+    // its first member, so the web UI's sessions tab always has something to read.
+    PkgFile { rel: "stdlib/README.md", content: include_str!("../kits/stdlib/README.md"), exec: false },
+    PkgFile { rel: "stdlib/kit.toml", content: include_str!("../kits/stdlib/kit.toml"), exec: false },
+    PkgFile { rel: "stdlib/packages/history/elanus.toml", content: include_str!("../kits/stdlib/packages/history/elanus.toml"), exec: false },
+    PkgFile { rel: "stdlib/packages/history/scripts/main", content: include_str!("../kits/stdlib/packages/history/scripts/main"), exec: true },
+    PkgFile { rel: "stdlib/packages/history/SKILL.md", content: include_str!("../kits/stdlib/packages/history/SKILL.md"), exec: false },
 ];
 
 const PROFILE_TOML: &str = include_str!("../templates/profile.toml");
@@ -134,6 +142,13 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     // stays the source and a local copy shadows it; --copy vendors. Either
     // way init is the human install gesture, provenance kit:<name>.
     let mode = if copy_kits { kit::Mode::Copy } else { kit::Mode::Link };
+    // Stdlib is installed and auto-approved in EVERY root (docs/config.md): the
+    // protected packages the product itself depends on — history's transcript
+    // view first, so the sessions tab is never a dead 503. Linked, not vendored
+    // (it stays kernel-managed); its packages are revoke-guarded
+    // (kit::protected_packages + `elanus revoke`).
+    let stdlib_dir = kit::resolve(&root, "stdlib").context("resolving the stdlib kit")?;
+    kit::install(&root, &conn, &stdlib_dir, kit::Mode::Link, true).context("installing stdlib")?;
     let mut readmes: Vec<(String, String)> = Vec::new();
     for (name, kit_dir) in kits.iter().zip(&kit_dirs) {
         if let Some(readme) = kit::install(&root, &conn, kit_dir, mode, true)? {

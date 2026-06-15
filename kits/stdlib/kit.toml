@@ -1,0 +1,5 @@
+# Kit metadata (docs/config.md). Optional for ordinary kits; stdlib uses it
+# to mark itself protected. A protected kit is installed and auto-approved at
+# init and its packages refuse to be revoked without --force.
+protected = true
+description = "the always-on essentials the product depends on"

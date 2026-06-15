@@ -117,23 +117,20 @@ const lateText = await new Promise(async (resolve) => {
 });
 lateText.includes('web-smoke') ? ok('late joiner got ring catch-up') : fail('no catch-up for late joiner');
 
-// 6. history view ABSENT: the explorer degrades to live-only, never breaks.
-// /api/history must answer with an honest 503 (no run/pkg-history/http.json
-// yet — the UI turns this into the "history package not running — live view
-// only" hint), not a hang or a 500.
-const noHist = await fetch(`${BASE}/api/history?kind=agents`);
-const noHistJ = await noHist.json().catch(() => null);
-noHist.status === 503 && noHistJ?.ok === false
-  ? ok('history absent → 503 live-only degradation')
-  : fail(`history absent gave ${noHist.status} ${JSON.stringify(noHistJ)}`);
+// 6. history view: a stdlib package, serving out of the box (docs/config.md).
+// No install dance — init auto-approves it — so /api/history answers 200, and
+// an unknown kind is still rejected (400) before any proxy. (The degraded 503
+// path is exercised in 7b after a --force revoke.)
+await waitFor('history serving out of the box (stdlib, approved at init)', async () => {
+  return (await fetch(`${BASE}/api/history?kind=agents`)).status === 200;
+}, 30000);
 const badKind = await fetch(`${BASE}/api/history?kind=drop_tables`);
 badKind.status === 400 ? ok('unknown history kind rejected (400)') : fail(`bad kind got ${badKind.status}`);
 
-// 7. install + approve the history package, seed a transcript, query it.
-// (Seed BEFORE the actor answers so the first successful query sees it.)
-fs.cpSync(path.join(REPO, 'packages/history'), path.join(TMP, 'packages/history'), { recursive: true });
-elanus('approve', 'history');
-/^history\s/m.test(elanus('packages')) ? ok('history package discovered') : fail('history package not discovered');
+// 7. seed a transcript and query it through the already-serving view. history
+// is a stdlib package (present + approved at init), so there is no cp/approve
+// step — just seed the ledger and ask.
+/^history\s/m.test(elanus('packages')) ? ok('history package present (stdlib)') : fail('history package missing');
 sql(`INSERT INTO events(type, payload, state, correlation_id)
      VALUES ('in/agent/main','{"prompt":"hi"}','done','web-hist-conv');
      INSERT INTO messages(session_id, role, content, event_id) VALUES
@@ -149,10 +146,14 @@ const hist = async (params) => {
 };
 // the supervisor boots the actor on its next tick (with backoff if it raced
 // the approval), so the first probe retries until the view answers
+// The actor booted at init; the seed above lands in the ledger after that, so
+// poll until the read-only view sees the seeded session (not merely until it
+// answers 200), to be robust to read-visibility timing.
 let agentsResp = null;
-await waitFor('history actor serving its negotiated endpoint', async () => {
+await waitFor('history actor serves the seeded session', async () => {
   const { status, body } = await hist({ kind: 'agents' });
-  if (status === 200 && body?.ok) { agentsResp = body; return true; }
+  const main = status === 200 && body?.ok && (body.agents ?? []).find((a) => a.agent === 'main');
+  if (main && main.sessions.includes('s-hist-test')) { agentsResp = body; return true; }
   return false;
 }, 30000);
 if (agentsResp) {
@@ -207,6 +208,21 @@ if (agentsResp) {
     ? ok('search DSL: role filter + tool_result truncation projection')
     : fail(`search DSL wrong: ${search.status} ${JSON.stringify(sj)}`);
 }
+
+// 7b. the server degrades honestly when the endpoint is unreachable: with the
+// discovery file gone, /api/history is the live-only 503 the UI shows as a hint
+// — never a hang or a 500 — and it heals the instant the file returns (the
+// server re-reads it per request; the actor itself never stopped).
+const histJson = path.join(TMP, 'run/pkg-history/http.json');
+const savedHist = fs.readFileSync(histJson, 'utf8');
+fs.rmSync(histJson);
+(await fetch(`${BASE}/api/history?kind=agents`)).status === 503
+  ? ok('history endpoint unreachable → 503 live-only degradation')
+  : fail('degraded path did not 503 with the discovery file removed');
+fs.writeFileSync(histJson, savedHist);
+(await fetch(`${BASE}/api/history?kind=agents`)).status === 200
+  ? ok('history heals immediately when the endpoint returns')
+  : fail('history did not heal after restoring the discovery file');
 
 // 8. admin = staging only (HANDOFF phase 5): the server composes pending
 // state via the CLI and edits profile files, but never commits a grant.

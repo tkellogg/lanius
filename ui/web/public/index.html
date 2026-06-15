@@ -19,7 +19,7 @@
     <span class="mast-sub">agent explorer // live</span>
   </button>
   <div class="mast-right">
-    <button id="signal-lamp" class="lamp" title="algedonic channel — click to acknowledge">
+    <button id="signal-lamp" class="lamp" title="urgent alerts — click to acknowledge">
       <span class="lamp-dot"></span><span id="signal-label">signal</span>
     </button>
     <span id="conn" class="conn conn-down"><span class="conn-dot"></span><span id="conn-text">connecting</span></span>
@@ -57,11 +57,11 @@
     <!-- welcome: the front door — orient, then route to the primary agent -->
     <div id="view-welcome" class="view" hidden>
       <div class="welcome-pane">
-        <p class="welcome-lead">talk to your agents, watch the bus, stage capabilities.</p>
+        <p class="welcome-lead">talk to your agents, watch what's happening, and add new capabilities.</p>
         <div id="welcome-agent" class="welcome-agent"></div>
         <div class="welcome-actions">
           <button id="welcome-new" class="ghost">＋ new agent</button>
-          <button id="welcome-kits" class="ghost">⚒ stage a kit</button>
+          <button id="welcome-kits" class="ghost">⚒ add a kit</button>
           <button id="welcome-signals" class="ghost">◮ live signals</button>
         </div>
         <p id="welcome-hint" class="dim-note"></p>
@@ -105,11 +105,11 @@
             <button id="cfg-save">save</button>
             <span id="cfg-note" class="dim-note"></span>
           </div>
-          <p class="dim-note">renaming changes the mailbox to <code>in/agent/&lt;name&gt;</code> going forward; history under the old name stays in the ledger.</p>
+          <p class="dim-note">renaming takes effect on the agent's next run; messages and history kept under the old name stay available.</p>
         </section>
         <section class="setup-block">
           <h3>kits &amp; capabilities</h3>
-          <p class="dim-note">kits and package grants are root-wide, not per-agent — manage them under <b>⚒ kits &amp; review</b>. this agent's view of them is filtered by its skill visibility:</p>
+          <p class="dim-note">capabilities are shared across all your agents, not set per-agent — manage them under <b>⚒ kits &amp; review</b>. this agent sees the ones its skill visibility allows:</p>
           <div class="cfg-grid">
             <label>skills include <input id="cfg-include" spellcheck="false" placeholder='# (everything)' /></label>
             <label>skills exclude <input id="cfg-exclude" spellcheck="false" placeholder="(nothing)" /></label>
@@ -131,9 +131,10 @@
     <!-- setup: stage kits, watch the pending queue, edit profiles -->
     <div id="view-setup" class="view" hidden>
       <div class="setup-pane">
+        <div id="setup-status" class="setup-status" role="status" aria-live="polite" hidden></div>
         <section class="setup-block">
           <h3>new agent</h3>
-          <p class="dim-note">an agent is a profile: a mailbox (<code>in/agent/&lt;name&gt;</code>), a model, an identity to edit. created instantly — no review needed, profiles are your files.</p>
+          <p class="dim-note">an agent has a name, a model, and an identity you can edit. created instantly — no review needed.</p>
           <div class="setup-row">
             <input id="na-name" placeholder="name (e.g. kestrel)" spellcheck="false" />
             <input id="na-model" placeholder="model (default: claude-sonnet-4-6)" spellcheck="false" list="model-suggestions" />
@@ -144,12 +145,12 @@
         </section>
         <section class="setup-block">
           <h3>kits</h3>
-          <p class="dim-note">starter packs of packages + profiles, shared by every agent on this root. drop new ones in <code>&lt;root&gt;/kits</code>. staging lands every grant as <em>pending</em>; commit below.</p>
+          <p class="dim-note">ready-made bundles of capabilities, shared by all your agents. adding one makes its capabilities available; review and confirm them below.</p>
           <div id="setup-kits"></div>
         </section>
         <section class="setup-block">
-          <h3>pending review</h3>
-          <p class="dim-note">requests are not grants until you commit them. approving here is the same gesture as the terminal (ledger trail: decided_by=ui) — the terminal command is shown too.</p>
+          <h3>review &amp; confirm</h3>
+          <p class="dim-note">nothing takes effect until you confirm it here. confirming is the same as doing it from the terminal — the matching command is shown too.</p>
           <div id="setup-pending"></div>
         </section>
       </div>
@@ -175,7 +176,7 @@
   <span id="stat-count">0 events</span>
   <span id="stat-broker"></span>
   <span class="strip-note">same authority as your terminal — because it is your terminal</span>
-  <span class="strip-right">everything you see arrived over plain MQTT</span>
+  <span class="strip-right">a live view of your agents</span>
 </footer>
 
 <script src="/app.js"></script>

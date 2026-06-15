@@ -268,7 +268,7 @@ const renamedAgent = 'falcon';
     const name = await row.$eval('.setup-kit-name', (el) => el.textContent).catch(() => '');
     if (!name.includes('dev')) continue;
     for (const btn of await row.$$('button:not(.ghost)')) {
-      if (/stage/i.test(await btn.textContent())) {
+      if (/\badd\b/i.test(await btn.textContent())) {
         await btn.click();
         stageClicked = true;
         break;
@@ -293,7 +293,7 @@ const renamedAgent = 'falcon';
     if (!btn) {
       // No more approve buttons — check if it's the "at rest" state.
       const text = await page.$eval('#setup-pending', (el) => el.textContent);
-      return /nothing pending|at rest/i.test(text);
+      return /nothing to confirm|all set/i.test(text);
     }
     firstApproved = true;
     await page.click('#setup-pending button');
@@ -340,9 +340,10 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
-// ── flow 7: degraded history hint ─────────────────────────────────────────────
-// Without the history package, sessions tab shows the live-only note and
-// the footer hint becomes visible after the probe settles.
+// ── flow 7: history works out of the box ──────────────────────────────────────
+// history is a stdlib package, approved at init, so the sessions tab is backed
+// by the real transcript view — NOT the "history package not running" note —
+// and the footer degradation hint stays hidden.
 {
   const page = await newPage();
   await page.goto('/');
@@ -352,12 +353,16 @@ const renamedAgent = 'falcon';
   await page.waitForSelector('#agent-tabs', { state: 'visible' });
   await page.click('[data-tab="sessions"]');
   await page.waitForSelector('#view-sessions:not([hidden])', { timeout: 5000 });
-  await waitFor('degraded history: live-only note visible', async () => {
-    return /live|history/i.test(await page.$eval('#sessions-pane', (el) => el.textContent));
-  }, 8000);
-  await waitFor('degraded history: footer hint visible', async () => {
-    return !(await page.$eval('#history-hint', (el) => el.hidden));
-  }, 10000);
+  // Resolves to a real (possibly empty) session list, not the live-only note.
+  await waitFor('history: sessions tab backed by the live view (not degraded)', async () => {
+    const t = await page.$eval('#sessions-pane', (el) => el.textContent);
+    return !/history package not running|live view only|asking the history view/i.test(t);
+  }, 12000);
+  // The footer hint shows only when history is absent; it heals to hidden once
+  // a query succeeds (the sessions probe above is one).
+  await waitFor('history: footer degradation hint hidden (history is on)', async () => {
+    return await page.$eval('#history-hint', (el) => el.hidden);
+  }, 12000);
   await page.close();
 }
 

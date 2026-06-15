@@ -310,6 +310,10 @@ body {
 #setup-profile { width: 100%; box-sizing: border-box; background: rgba(0,0,0,0.25); color: inherit; font: inherit; font-size: 12px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 10px; resize: vertical; }
 .setup-row { display: flex; align-items: center; gap: 12px; padding-top: 6px; }
 .setup-row .dim-note { padding: 0; }
+/* durable confirmation banner for stage/approve — survives the pane re-render */
+.setup-status { margin: 0 0 14px; padding: 10px 12px; border-radius: 6px; font-size: 13px; line-height: 1.4; border: 1px solid var(--panel-edge); background: rgba(0,0,0,0.25); color: var(--ink); }
+.setup-status.status-ok { border-color: rgba(109,184,166,0.5); color: var(--work); background: rgba(109,184,166,0.08); }
+.setup-status.status-err { border-color: rgba(227,140,120,0.6); color: #e3a08c; background: rgba(227,140,120,0.10); }
 
 /* ---------- configure (per-agent) ---------- */
 .cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 18px; padding: 4px 0 8px; }

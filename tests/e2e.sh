@@ -1008,7 +1008,8 @@ EOF
 # Every line is ledgered on arrival — dropped ones included; nothing silent.
 wait_for "all 3 lines ledgered as in/package/funnel/sift" \
   "[ \"\$(sql4 \"SELECT COUNT(*) FROM events WHERE type='in/package/funnel/sift'\")\" -ge 3 ]"
-[ ! -e "$TMP4/run/pkg-funnel-intake/inbox/feed.line" ] && ok "consumed file removed after PUBACK" || fail "intake file not consumed"
+wait_for "consumed file removed after PUBACK" \
+  "[ ! -e '$TMP4/run/pkg-funnel-intake/inbox/feed.line' ]"
 # Verified sender: events published by a token-authed daemon actor attribute
 # to that actor, not to "human".
 SIFTSND=$(sql4 "SELECT sender FROM events WHERE type='in/package/funnel/sift' ORDER BY id DESC LIMIT 1")
@@ -1162,22 +1163,20 @@ grep -q "stagereq" "$TMP5/trace.jsonl" \
   && fail "stage RPC leaked into the flight recorder" || ok "stage RPC never recorded (carve-out holds)"
 kill -9 "$LLM5_PID" 2>/dev/null
 
-echo "== 17. history over HTTP: negotiated port, granted serving, query DSL =="
-# The reconstruction view moved off the bus (HANDOFF phase 3): the daemon
-# assigns a loopback port (process.http), records it in run/pkg-history/
-# http.json (discovery from harness state, security.md entry 11), and the
-# package PARKS until the http grant is approved — transcripts are the
-# crown jewels (entry 10). The main root's daemon is still running.
-[ -f "$TMP/packages/history/elanus.toml" ] || cp -R "$REPO/packages/history" "$TMP/packages/"
+echo "== 17. history over HTTP: stdlib (auto-approved), negotiated port, query DSL =="
+# history is now a stdlib package (docs/config.md): installed and auto-approved
+# at init because the product depends on the transcript view, serving over a
+# negotiated loopback port (process.http; discovery in run/pkg-history/http.json,
+# security.md entry 11). The park-until-granted contract for http packages is
+# still exercised by phonebook below. The main root's daemon is still running.
 wait_for "http port negotiated (run/pkg-history/http.json)" "[ -s '$TMP/run/pkg-history/http.json' ]"
 HPORT=$(python3 -c "import json;print(json.load(open('$TMP/run/pkg-history/http.json'))['port'])")
-# Parked before approval: the port is reserved but nothing serves.
-curl -s -m 2 "http://127.0.0.1:$HPORT/healthz" >/dev/null 2>&1 \
-  && fail "history served before the http grant was approved" \
-  || ok "parked until approved (serving is a capability)"
-elanus approve history >/dev/null 2>&1 || fail "approve history"
-wait_for "history serving after approval (no restart dance)" \
+wait_for "history serving out of the box (stdlib, approved at init)" \
   "curl -s -m 2 'http://127.0.0.1:$HPORT/healthz' | grep -q '\"ok\": *true'"
+# Protected: a stdlib package the product depends on refuses revoke without --force.
+elanus revoke history >/dev/null 2>&1 \
+  && fail "protected history revoked without --force" \
+  || ok "history is protected (revoke refused without --force)"
 # A real query: sessions exist from the earlier sections.
 curl -s "http://127.0.0.1:$HPORT/query" -d '{"kind":"sessions"}' | grep -q '"sessions"' \
   && ok "sessions query answers" || fail "sessions query failed"

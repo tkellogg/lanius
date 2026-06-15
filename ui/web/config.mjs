@@ -2,7 +2,19 @@
 // own static files: <root>/bus.toml, root from --root or $HARNESS_ROOT,
 // all of it overridable with --url. (Same contract as ui/tui/config.js.)
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+
+/**
+ * The active harness root, mirroring src/paths.rs `resolve`/`default_root`
+ * exactly: explicit --root > $HARNESS_ROOT > ~/.elanus/root. The default is
+ * the same predictable place the daemon uses (and mints credentials in), so a
+ * surface started with no flags talks to the same root the daemon does — no
+ * --root needed when you're using the default. (Same contract as ui/tui.)
+ */
+export function resolveRoot({ root } = {}) {
+  return root ?? process.env.HARNESS_ROOT ?? path.join(os.homedir(), '.elanus', 'root');
+}
 
 /** Minimal parse of bus.toml: we only need `enabled` and `bind`. */
 export function parseBusToml(text) {
@@ -13,8 +25,7 @@ export function parseBusToml(text) {
 
 export function brokerUrl({ root, url } = {}) {
   if (url) return url;
-  const r = root ?? process.env.HARNESS_ROOT;
-  if (!r) throw new Error('no broker: pass --url, --root, or set HARNESS_ROOT');
+  const r = resolveRoot({ root });
   const file = path.join(r, 'bus.toml');
   let cfg = { enabled: true, bind: '127.0.0.1:1883' };
   if (fs.existsSync(file)) cfg = parseBusToml(fs.readFileSync(file, 'utf8'));

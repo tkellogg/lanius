@@ -231,6 +231,42 @@ pub fn list(root: &Root) -> Result<Vec<(String, PathBuf, String)>> {
     Ok(out)
 }
 
+/// A kit's optional `kit.toml` `protected` flag (absent = false). A protected
+/// kit is installed and auto-approved at init, and its packages refuse to be
+/// revoked without `--force` (docs/config.md, "Stdlib"). Metadata only — the
+/// grants ledger is still the authority for what is actually approved.
+fn kit_is_protected(kit_dir: &Path) -> bool {
+    std::fs::read_to_string(kit_dir.join("kit.toml"))
+        .ok()
+        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|d| d.get("protected").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
+/// The set of package names that belong to a protected kit, by directory-name
+/// membership — independent of how (or whether) the package was installed into
+/// this root, so the guard holds even for a package vendored or seeded loose.
+/// Resolution order mirrors list(); a protected kit anywhere on the path
+/// protects its packages. Best-effort: unreadable dirs are skipped.
+pub fn protected_packages(root: &Root) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for dir in search_dirs(root) {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.filter_map(|e| e.ok()) {
+            let kdir = e.path();
+            if !kdir.is_dir() || !kit_is_protected(&kdir) {
+                continue;
+            }
+            if let Ok(pkgs) = std::fs::read_dir(kdir.join("packages")) {
+                for p in pkgs.filter_map(|p| p.ok()).filter(|p| p.path().is_dir()) {
+                    out.insert(p.file_name().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Remove a kit's packages dir from the default profile's package_path.
 /// Grants are NOT revoked here — they're inert without discovery, and
 /// revocation is its own gesture (`elanus revoke <pkg>`); we say so.
@@ -381,6 +417,21 @@ mod tests {
         // The local one shadows; the kit must not have approved it.
         assert!(!packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/local").unwrap());
         assert!(!packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/go").unwrap());
+        std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn protected_packages_tracks_kit_toml() {
+        let (root, _kit) = scratch("protected");
+        let kits = root.dir.join("kits");
+        // A protected kit and an ordinary one, both under <root>/kits.
+        std::fs::create_dir_all(kits.join("guarded/packages/lockpkg")).unwrap();
+        std::fs::write(kits.join("guarded/kit.toml"), "protected = true\n").unwrap();
+        std::fs::create_dir_all(kits.join("loose/packages/freepkg")).unwrap();
+        // loose has no kit.toml → not protected.
+        let prot = protected_packages(&root);
+        assert!(prot.contains("lockpkg"), "a package in a protected kit must be protected");
+        assert!(!prot.contains("freepkg"), "a package in an unmarked kit must not be");
         std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
     }
 }

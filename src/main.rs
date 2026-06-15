@@ -153,6 +153,9 @@ enum Cmd {
         name: String,
         #[arg(long, default_value = "cli")]
         by: String,
+        /// Force-revoke a protected (stdlib) package the product depends on
+        #[arg(long)]
+        force: bool,
     },
     /// What's blocked on you?
     Inbox,
@@ -202,6 +205,12 @@ enum ProfileCmd {
         agent: Option<String>,
         #[arg(long)]
         model: Option<String>,
+    },
+    /// Check a candidate profile.toml would load (exits non-zero with the reason
+    /// if not) — the web UI's raw editor validates before it saves.
+    Validate {
+        /// path to the candidate profile.toml file
+        path: String,
     },
 }
 
@@ -509,12 +518,22 @@ fn run(cli: Cli) -> Result<()> {
             ProfileCmd::New { name, agent, model } => {
                 profilecli::new(&root, &name, agent.as_deref(), model.as_deref())?
             }
+            ProfileCmd::Validate { path } => profilecli::validate(&path)?,
         },
         Cmd::Approve { name, by } => {
             let conn = open(&root)?;
             packages::decide(&root, &conn, &name, true, &by)?;
         }
-        Cmd::Revoke { name, by } => {
+        Cmd::Revoke { name, by, force } => {
+            // Stdlib packages are protected: the product depends on them, so
+            // revoking one is a deliberate act, not a casual one (docs/config.md).
+            if !force && kit::protected_packages(&root).contains(&name) {
+                anyhow::bail!(
+                    "⚠ {name} is a protected stdlib package — the product depends on it \
+                     (docs/config.md). Revoking it breaks things (e.g. the web UI's \
+                     transcripts). Re-run with --force if you really mean it."
+                );
+            }
             let conn = open(&root)?;
             packages::decide(&root, &conn, &name, false, &by)?;
         }

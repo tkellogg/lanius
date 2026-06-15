@@ -194,7 +194,7 @@ function renderWelcome() {
 function selectSignals() {
   sel = { kind: 'signals' };
   $('#stage-title').textContent = 'signals';
-  $('#stage-note').textContent = 'the global rail — orange is algedonic, nothing else is';
+  $('#stage-note').textContent = 'a live view of everything happening — orange means something needs your attention';
   $('#agent-tabs').hidden = true;
   setFilter('signals');
   show('rail');
@@ -205,7 +205,7 @@ function selectSignals() {
 function selectSetup() {
   sel = { kind: 'setup' };
   $('#stage-title').textContent = 'kits & review';
-  $('#stage-note').textContent = 'kits & grants — stage, then approve (here or in your terminal)';
+  $('#stage-note').textContent = 'browse and add capabilities for your agents';
   $('#agent-tabs').hidden = true;
   show('setup');
   renderNav();
@@ -217,11 +217,22 @@ async function adminGet(p) {
   try { const r = await fetch(`/api/admin/${p}`); return await r.json(); } catch { return { ok: false }; }
 }
 
-async function loadSetup() {
+async function loadSetup(opts = {}) {
+  // A status line that SURVIVES the re-render below. Staging/approving reloads
+  // this whole pane, which otherwise wipes a button's transient 'staged ✓' the
+  // instant it appears — the "flash, then nothing" Tim saw. The banner is the
+  // durable confirmation; it lives outside #setup-kits/#setup-pending so the
+  // reload never touches it.
+  const statusBox = $('#setup-status');
+  if (statusBox) {
+    statusBox.textContent = opts.status ?? '';
+    statusBox.className = `setup-status${opts.statusKind ? ' status-' + opts.statusKind : ''}`;
+    statusBox.hidden = !opts.status;
+  }
   const kitsBox = $('#setup-kits');
   const pendBox = $('#setup-pending');
   kitsBox.textContent = 'resolving…';
-  pendBox.textContent = 'reading the ledger…';
+  pendBox.textContent = 'checking…';
 
   const [kits, pkgs] = await Promise.all([adminGet('kits'), adminGet('packages')]);
   await loadDiskAgents();
@@ -241,7 +252,7 @@ async function loadSetup() {
     head.appendChild(el('span', 'setup-kit-hook dim-note', k.hook || ''));
     if (provenance.has(k.name)) head.appendChild(el('span', 'badge', 'installed'));
     const readmeBtn = el('button', 'ghost', 'readme');
-    const stageBtn = el('button', '', provenance.has(k.name) ? 'stage again' : 'stage');
+    const stageBtn = el('button', '', provenance.has(k.name) ? 'add again' : 'add');
     head.appendChild(readmeBtn);
     head.appendChild(stageBtn);
     row.appendChild(head);
@@ -258,13 +269,17 @@ async function loadSetup() {
       pre.hidden = !pre.hidden;
     };
     stageBtn.onclick = async () => {
-      stageBtn.disabled = true; stageBtn.textContent = 'staging…';
+      stageBtn.disabled = true; stageBtn.textContent = 'adding…';
       const r = await fetch('/api/admin/kits/add', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ kit: k.name }),
-      }).then((x) => x.json()).catch(() => ({ ok: false }));
-      stageBtn.textContent = r.ok ? 'staged' : 'failed';
-      if (r.ok) loadSetup();
+      }).then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+      // loadSetup re-renders the kit rows (so the new pending grants appear and
+      // this button is recreated) — we pass a durable banner through it either
+      // way, so the outcome is never a flash that vanishes.
+      loadSetup(r.ok
+        ? { status: `✓ added ${k.name} — review and confirm its capabilities under “review & confirm” below.`, statusKind: 'ok' }
+        : { status: `✕ couldn't add ${k.name}: ${r.error ?? 'unknown error'}`, statusKind: 'err' });
     };
     kitsBox.appendChild(row);
   }
@@ -284,14 +299,16 @@ async function loadSetup() {
     card.appendChild(el('div', 'setup-kit-name', p.name));
     for (const g of reqs) card.appendChild(el('div', 'setup-grant', `${g.kind}  ${g.value}`));
     const row = el('div', 'setup-row');
-    const approveBtn = el('button', '', `approve ${p.name}`);
+    const approveBtn = el('button', '', `confirm ${p.name}`);
     approveBtn.onclick = async () => {
-      approveBtn.disabled = true; approveBtn.textContent = 'approving…';
+      approveBtn.disabled = true; approveBtn.textContent = 'confirming…';
       const r = await fetch('/api/admin/approve', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ package: p.name }),
-      }).then((x) => x.json()).catch(() => ({ ok: false }));
-      if (r.ok) loadSetup(); else { approveBtn.textContent = 'failed'; }
+      }).then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+      loadSetup(r.ok
+        ? { status: `✓ confirmed ${p.name}.`, statusKind: 'ok' }
+        : { status: `✕ couldn't confirm ${p.name}: ${r.error ?? 'unknown error'}`, statusKind: 'err' });
     };
     row.appendChild(approveBtn);
     const cmd = el('code', 'setup-cmd', `elanus approve ${p.name}`);
@@ -301,7 +318,7 @@ async function loadSetup() {
     card.appendChild(row);
     pendBox.appendChild(card);
   }
-  if (!pendingAny) pendBox.appendChild(el('div', 'dim-note', 'nothing pending — the ledger is at rest'));
+  if (!pendingAny) pendBox.appendChild(el('div', 'dim-note', 'nothing to confirm — you’re all set'));
 }
 
 function selectAgent(name, tab) {
@@ -317,7 +334,7 @@ function selectAgent(name, tab) {
     show('converse');
     $('#compose-input').focus();
   } else if (sel.tab === 'sessions') {
-    $('#stage-note').textContent = 'transcripts from the ledger, via the history view';
+    $('#stage-note').textContent = 'your agent’s past conversations';
     show('sessions');
     loadSessions(name);
   } else if (sel.tab === 'configure') {
@@ -334,16 +351,23 @@ function selectAgent(name, tab) {
 
 // ---------- configure (per-agent identity) ----------
 let cfgProfile = null; // the profile NAME backing the form
+// The fields + both save buttons are LOCKED while the pane populates.
+// loadConfigure does two round trips (profile fetch, then loadDiskAgents — ~1s)
+// and only fills the fields at the very end; left editable, anything typed in
+// that window is silently overwritten by the late resolve, i.e. invisible edit
+// loss. Disabling is both the guard and the "still loading" affordance.
+const CFG_LOCKABLE = ['#cfg-agent', '#cfg-model', '#cfg-turns', '#cfg-workdir', '#cfg-include', '#cfg-exclude', '#cfg-save', '#cfg-toml', '#cfg-toml-save'];
+function setConfigureLoading(on) {
+  for (const s of CFG_LOCKABLE) { const e = $(s); if (e) e.disabled = on; }
+}
 async function loadConfigure(agentName) {
   const p = profileOf(agentName);
   cfgProfile = p?.profile ?? agentName;
-  $('#cfg-note').textContent = '';
+  $('#cfg-note').textContent = 'loading…';
   $('#cfg-file').textContent = `profiles/${cfgProfile}/profile.toml`;
+  setConfigureLoading(true);
   const r = await fetch(`/api/admin/profile?name=${encodeURIComponent(cfgProfile)}`)
     .then((x) => x.json()).catch(() => ({ ok: false }));
-  if (!r.ok) {
-    $('#cfg-note').textContent = `no profile file for ${cfgProfile} — this agent only exists as traffic; create a profile to configure it`;
-  }
   $('#cfg-toml').value = r.ok ? r.toml : '';
   // The parsed view comes from profile list (same loader the kernel uses).
   await loadDiskAgents();
@@ -354,6 +378,12 @@ async function loadConfigure(agentName) {
   $('#cfg-workdir').value = d.workdir ?? '';
   $('#cfg-include').value = (d.skills?.include ?? []).join(', ');
   $('#cfg-exclude').value = (d.skills?.exclude ?? []).join(', ');
+  setConfigureLoading(false);
+  // Clear only our own 'loading…' — never stomp a message a caller set while we
+  // were awaiting (e.g. na-create's "created <name> — set its identity below").
+  if ($('#cfg-note').textContent === 'loading…') {
+    $('#cfg-note').textContent = r.ok ? '' : `no profile file for ${cfgProfile} — this agent only exists as traffic; create a profile to configure it`;
+  }
 }
 
 $('#cfg-save').onclick = async () => {
@@ -524,7 +554,7 @@ function convFailure(agent, env) {
   const { body } = convMsg(agent, 'agent failed', 'failed', '', corr);
   body.textContent = '';
   body.appendChild(el('div', 'fail-reason', p.error || 'the agent failed with no detail.'));
-  body.appendChild(el('div', 'fail-hint', 'check the agent: a model set (configure), the daemon running, grants approved.'));
+  body.appendChild(el('div', 'fail-hint', 'check the agent: a model set (configure), the background service running, and its capabilities allowed.'));
 }
 
 function routeHumanMail(env) {
@@ -807,7 +837,7 @@ function transcriptMsg(m) {
 
   if (c && typeof c === 'object' && c.truncated === true && c.preview != null) {
     const body = el('div', 'msg-body', c.preview);
-    body.appendChild(el('div', 'dim-sub', `(truncated — ${c.chars} chars in the ledger)`));
+    body.appendChild(el('div', 'dim-sub', `(truncated — ${c.chars} chars)`));
     wrap.appendChild(body);
     return wrap;
   }
@@ -845,8 +875,8 @@ es.onmessage = (e) => {
     }
     const c = $('#conn');
     c.className = `conn ${m.connected ? 'conn-up' : 'conn-down'}`;
-    $('#conn-text').textContent = m.connected ? 'bus connected' : 'bus down';
-    $('#stat-broker').textContent = m.broker ?? '';
+    $('#conn-text').textContent = m.connected ? 'connected' : 'disconnected';
+    $('#stat-broker').textContent = '';
   } else if (m.kind === 'message') {
     onMessage(m);
   }

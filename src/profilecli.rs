@@ -22,7 +22,17 @@ pub fn list(root: &Root) -> Result<()> {
     };
     names.sort();
     for name in names {
-        let (p, pdir) = profile::load(root, &name)?;
+        // One unloadable profile must NOT blank the whole list. A person editing
+        // the raw file of a single agent would otherwise lose sight of every
+        // agent, and the web UI treats a non-zero exit as total failure. Skip and
+        // warn on the broken one, keep listing the rest, and still exit 0.
+        let (p, pdir) = match profile::load(root, &name) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                eprintln!("skipping profile {name:?}: {e:#}");
+                continue;
+            }
+        };
         println!(
             "{}",
             json!({
@@ -106,6 +116,18 @@ pub fn set(root: &Root, name: &str, pairs: &[String]) -> Result<()> {
     toml::from_str::<profile::Profile>(&candidate)
         .with_context(|| "refusing to write: the result would not load as a profile")?;
     std::fs::write(&f, candidate)?;
+    Ok(())
+}
+
+/// Validate that a candidate `profile.toml` (read from `path`) would load as a
+/// Profile — the same serde check `set` runs before it writes. Prints nothing on
+/// success; exits non-zero with the reason otherwise. This lets an UNtrusted raw
+/// editor (the web UI's "edit the file" box) refuse to save a file that would
+/// silently break the agent, without the kernel having to trust the bytes.
+pub fn validate(path: &str) -> Result<()> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+    toml::from_str::<profile::Profile>(&raw)
+        .with_context(|| "the file would not load as a profile")?;
     Ok(())
 }
 

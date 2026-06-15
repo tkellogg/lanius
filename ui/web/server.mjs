@@ -20,24 +20,39 @@
 // rebinding), so every mutating route checks Origin/Host below, and
 // UI-driven decisions carry decided_by=ui in the ledger for the trail.
 //
-//   node server.mjs --root /tmp/elanus-live [--port 7180] [--agent main]
+//   node server.mjs [--root <harness root>] [--port 7180] [--agent main]
+// --root defaults to ~/.elanus/root — the same default the daemon uses — so
+// no flag is needed when you're on the default root.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
-import { brokerUrl, parseArgs } from './config.mjs';
+import os from 'node:os';
+import { brokerUrl, parseArgs, resolveRoot } from './config.mjs';
 
 const args = parseArgs(process.argv.slice(2));
 if (args.help) {
-  console.log('usage: node server.mjs [--root <harness root>] [--url mqtt://...] [--port 7180] [--agent main]');
+  console.log('usage: node server.mjs [--root <harness root>] [--url mqtt://...] [--port 7180] [--agent main]\n  --root defaults to ~/.elanus/root (the daemon default); pass it only to target another root');
   process.exit(0);
 }
 const BROKER = brokerUrl(args);
 const PORT = args.port ?? Number(process.env.ELANUS_WEB_PORT ?? 7180);
 const AGENT = args.agent ?? 'main';
 const PUB = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
-const ROOT = args.root ?? process.env.HARNESS_ROOT ?? null;
+const ROOT = resolveRoot(args); // --root > $HARNESS_ROOT > ~/.elanus/root, as the daemon resolves it
+
+// ---- observability --------------------------------------------------------
+// One cheap, greppable place to watch the surface from the backend (Tim:
+// "backend is cheaper to observe"). Lines go to stderr with a [web:<tag>] tag
+// and an ISO timestamp; set ELANUS_WEB_LOG=<file> to ALSO append there, so a
+// QA run can tail a file instead of scraping a terminal. Logging never throws.
+const LOG_FILE = process.env.ELANUS_WEB_LOG || null;
+function log(tag, msg) {
+  const line = `${new Date().toISOString()} [web:${tag}] ${msg}`;
+  console.error(line);
+  if (LOG_FILE) { try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch { /* observation must never break the server */ } }
+}
 
 // The web server is a trusted surface acting for the human (docs/identity.md):
 // it presents the owner identity from the fenced secret store, so the broker
@@ -78,23 +93,33 @@ const ring = [];
 let seq = 0;
 const sseClients = new Set();
 
+const cred = humanCredential();
+log('boot', `root=${ROOT} owner=${ownerName()} credential=${cred ? 'present' : 'MISSING — will be refused (deny-by-default); restart with the right --root/$HARNESS_ROOT'} broker=${BROKER} port=${PORT} agent=${AGENT}`);
 const client = mqtt.connect(BROKER, {
   protocolVersion: 5,
   clean: true,
   clientId: `el-web-${process.pid}`,
   reconnectPeriod: 2000,
-  ...(humanCredential() ?? {}),
+  ...(cred ?? {}),
 });
 let connected = false;
-client.on('connect', () => {
+client.on('connect', (connack) => {
   connected = true;
+  log('bus', `connected as ${cred?.username ?? 'ANONYMOUS'} (connack reason ${connack?.reasonCode ?? connack?.returnCode ?? 0}) — subscribing obs/# in/# signal/#`);
   client.subscribe({ 'obs/#': { qos: 0 }, 'in/#': { qos: 1 }, 'signal/#': { qos: 1 } });
   broadcast({ kind: 'status', connected: true, broker: BROKER });
 });
 client.on('close', () => {
+  if (connected) log('bus', 'connection closed');
   connected = false;
   broadcast({ kind: 'status', connected: false, broker: BROKER });
 });
+// Deny-by-default auth failures surface here (NotAuthorized connack); make the
+// refusal loud and actionable from the client side, not just the broker's.
+client.on('error', (err) => log('bus', `error: ${err?.code ?? ''} ${err?.message ?? err}${cred ? '' : ' — no credential found at this root'}`));
+client.on('reconnect', () => log('bus', `reconnecting to ${BROKER}…`));
+client.on('offline', () => log('bus', 'offline'));
+client.on('disconnect', (p) => log('bus', `broker disconnected us (reason ${p?.reasonCode ?? '?'})`));
 client.on('message', (topic, payload) => {
   let env;
   try {
@@ -167,9 +192,13 @@ try {
 }
 
 function cli(cliArgs) {
+  log('cli', `elanus ${cliArgs.join(' ')}`);
   return new Promise((resolve) => {
     execFile(ELANUS_BIN, cliArgs, { env: { ...process.env, ...(ROOT ? { HARNESS_ROOT: ROOT } : {}) }, timeout: 30000 },
-      (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr), error: err ? String(err.message ?? err) : undefined }));
+      (err, stdout, stderr) => {
+        if (err) log('cli', `elanus ${cliArgs.join(' ')} FAILED: ${(String(stderr).trim().split('\n').pop() || err.message || '').slice(0, 200)}`);
+        resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr), error: err ? String(err.message ?? err) : undefined });
+      });
   });
 }
 
@@ -179,6 +208,17 @@ function jsonLines(text) {
 
 function sendJson(res, code, body) {
   res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+}
+
+// The product calls them "agents"; the kernel calls them "profiles". Translate
+// the CLI's raw error text at this boundary (docs/layering.md) so a person sees
+// plain language, not an internal word or a bare "error:" prefix.
+const BAD_NAME_MSG = 'names can use letters, numbers, dashes and underscores — no spaces';
+function humanProfileError(raw) {
+  const s = String(raw ?? '').replace(/^error:\s*/i, '').trim();
+  if (!s) return 'that did not work';
+  if (/bad profile name/i.test(s)) return BAD_NAME_MSG;
+  return s.replace(/profiles/gi, 'agents').replace(/profile/gi, 'agent');
 }
 
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -226,19 +266,19 @@ async function handleAdmin(url, req, res, body) {
   }
   if (url.pathname === '/api/admin/agents' && req.method === 'POST') {
     const { name, agent, model } = body ?? {};
-    if (typeof name !== 'string' || !PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: 'bad profile name' });
+    if (typeof name !== 'string' || !PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: BAD_NAME_MSG });
     const args = ['profile', 'new', name];
     if (agent) args.push('--agent', String(agent));
     if (model) args.push('--model', String(model));
     const r = await cli(args);
-    return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
+    return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : humanProfileError(r.stderr || r.error) });
   }
   if (url.pathname === '/api/admin/agents/set' && req.method === 'POST') {
     // {name, set: {"agent": "kestrel", "model.max_turns": 12, ...}} →
     // elanus profile set <name> k=v... — the kernel owns the TOML edit
     // (comments survive, the result is validated before it lands).
     const { name, set } = body ?? {};
-    if (typeof name !== 'string' || !PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: 'bad profile name' });
+    if (typeof name !== 'string' || !PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: BAD_NAME_MSG });
     if (!set || typeof set !== 'object' || !Object.keys(set).length) return sendJson(res, 400, { ok: false, error: 'need {set}' });
     // Encode each JSON value as TOML value text for `profile set`: arrays
     // become real TOML arrays (a JSON string array IS one), strings get
@@ -250,7 +290,7 @@ async function handleAdmin(url, req, res, body) {
       : typeof v === 'string' ? JSON.stringify(v) : String(v);
     const pairs = Object.entries(set).map(([k, v]) => `${k}=${tomlValue(v)}`);
     const r = await cli(['profile', 'set', name, ...pairs]);
-    return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
+    return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : humanProfileError(r.stderr || r.error) });
   }
   if (url.pathname === '/api/admin/kits/readme' && req.method === 'GET') {
     const kit = url.searchParams.get('kit');
@@ -278,7 +318,7 @@ async function handleAdmin(url, req, res, body) {
   if (url.pathname === '/api/admin/profile' && (req.method === 'GET' || req.method === 'PUT')) {
     if (!ROOT) return sendJson(res, 503, { ok: false, error: 'no --root; profile editing needs the harness root' });
     const name = url.searchParams.get('name') ?? 'default';
-    if (!PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: 'bad profile name' });
+    if (!PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: BAD_NAME_MSG });
     const file = path.join(ROOT, 'profiles', name, 'profile.toml');
     if (req.method === 'GET') {
       try {
@@ -288,6 +328,15 @@ async function handleAdmin(url, req, res, body) {
       }
     }
     if (typeof body?.toml !== 'string') return sendJson(res, 400, { ok: false, error: 'need {toml}' });
+    // Validate BEFORE writing. A malformed file would otherwise save as "ok" and
+    // then make the agent silently vanish (the loader can't read it). Check the
+    // candidate through the same kernel loader `profile set` uses; only write if
+    // it would load. We never trust the bytes — the kernel validates them.
+    const tmp = path.join(os.tmpdir(), `el-profile-candidate-${process.pid}-${Date.now()}.toml`);
+    fs.writeFileSync(tmp, body.toml);
+    const v = await cli(['profile', 'validate', tmp]);
+    fs.rmSync(tmp, { force: true });
+    if (!v.ok) return sendJson(res, 400, { ok: false, error: humanProfileError(v.stderr || v.error) });
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, body.toml);
     return sendJson(res, 200, { ok: true, name });
@@ -305,6 +354,13 @@ const MIME = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
+  // Per-request line, except the SSE stream (which never "finishes" — logged
+  // on open/close below instead). This is the spine of backend observability:
+  // every admin/history/publish call shows up here with its status and timing.
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    if (url.pathname !== '/api/stream') log('http', `${req.method} ${url.pathname}${url.search} → ${res.statusCode} (${Date.now() - startedAt}ms)`);
+  });
   if (url.pathname === '/api/stream') {
     res.writeHead(200, {
       'content-type': 'text/event-stream',
@@ -315,7 +371,8 @@ const server = http.createServer((req, res) => {
     res.write(`data: ${JSON.stringify({ kind: 'status', connected, broker: BROKER, agent: AGENT })}\n\n`);
     for (const m of ring) res.write(`data: ${JSON.stringify(m)}\n\n`);
     sseClients.add(res);
-    req.on('close', () => sseClients.delete(res));
+    log('sse', `client connected (${sseClients.size} total)`);
+    req.on('close', () => { sseClients.delete(res); log('sse', `client disconnected (${sseClients.size} total)`); });
     return;
   }
   if (url.pathname.startsWith('/api/admin/')) {
@@ -377,6 +434,7 @@ const server = http.createServer((req, res) => {
       }
       const props = correlation ? { userProperties: { 'el-correlation': String(correlation) } } : undefined;
       client.publish(topic, JSON.stringify(payload ?? {}), { qos: 1, properties: props }, (err) => {
+        log('pub', `${topic}${correlation ? ` corr=${correlation}` : ''} → ${err ? 'ERR ' + (err.message ?? err) : 'ok'}`);
         if (err) res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: String(err.message ?? err) }));
         else res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true }));
       });
