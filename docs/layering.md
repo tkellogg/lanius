@@ -69,3 +69,15 @@ the agents, rather than a person, proposes a change. Then a human does need
 to see it and decide. The interface should present that as a plain request in
 ordinary language — for example, "the scout agent would like permission to
 send you messages" — and not as a queue of pending technical approvals.
+
+## How adding and proposing actually work
+
+This section states the principle; docs/config.md works it out in full. The
+short version: configuration is kept as files under version control, a person's
+or an agent's change is a proposal held aside until it is accepted, and
+acceptance is the single action above. How much an agent may have accepted on
+its behalf without asking is a comfort setting the person controls. And a small
+set of packages the product itself depends on — the transcript view is the
+first — live in a protected "stdlib" that is always present and refuses to be
+removed without a fight, so the product never depends on something a person has
+to discover and turn on.

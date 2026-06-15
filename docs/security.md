@@ -188,6 +188,17 @@ Also: the query DSL must never pass through to SQL — the package owns its
 schema precisely so the wire query is an interpreted structure, not a
 sublanguage of SQLite.
 
+**Stdlib exception (2026-06-15, docs/config.md).** `history` is now auto-approved
+at init as a member of the protected `stdlib` kit, rather than left pending for a
+human `approve`: the product (the web UI's sessions tab) depends on it, so
+"present but off, with no way to turn it on" was itself a defect. Compensating
+controls — the exposure is unchanged (still loopback-only, still the
+confused-deputy surface of entry 13, not widened), and the package is now
+*protected*: it cannot be silently revoked (`--force` required), so the auto-on
+state is deliberate and visible. The read-confidentiality concern above is
+unchanged and still wants the scoped, authenticated read plane; auto-approving
+does not make it worse.
+
 ## 11. [LATENT] Discovery via retained obs messages is spoofable
 
 If negotiated endpoints (MCP, history HTTP) are announced as retained
@@ -358,3 +369,24 @@ the package and their declared publish grants are actually the thing enforced.
 Until then, an emitting handler's `sender` should be read as the surface
 (owner/kernel), not the package, and bridges that must attribute correctly
 should be daemons.
+
+## 17. [LATENT, found 2026-06-15] Revoking a grant does not stop a running daemon actor
+
+Observed while building the stdlib protected kit (docs/config.md): after
+`elanus revoke history --force`, the history HTTP actor kept answering on its
+negotiated port — the web smoke polled `/api/history` for 30s expecting the
+honest 503 of a withdrawn capability and never saw one. So revocation flips the
+grant row to `revoked` in the ledger, but the supervisor does NOT tear down an
+already-running daemon actor: the withdrawn capability (here, serving the
+transcript crown jewels of entry 10) stays live until the actor is re-spawned or
+the daemon restarts. Revocation is effective at the next (re)spawn, not at once.
+
+In scope per the threat model: a human — or, soon, an autonomy rule — revoking a
+capability reasonably expects it to stop. Not a confirmed exploit path (revoke
+is rare; the actor is loopback), but "revoked" currently overstates what has
+happened. Fix when the supervisor/reload seam is touched (config model
+increments 2–4): on revoke, signal the supervisor to stop/restart the affected
+actor so the running process matches the ledger — the same
+`obs/config/changed` → restart path planned for config reload (HANDOFF D3).
+Until then, treat revoke as effective on the next daemon cycle; for an immediate
+stop, restart the daemon.

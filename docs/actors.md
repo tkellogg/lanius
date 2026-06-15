@@ -44,6 +44,26 @@ traffic. This matters for identity (see docs/identity.md): because every
 actor is addressable, every actor is also something the system can know the
 sender of.
 
+## Skills and actors are roles a package plays
+
+A package is not the same kind of thing as an actor, and it is worth being
+precise about the relationship, because one package can wear two hats at once.
+A package carries files, and two of those files give it its roles. A `SKILL.md`
+makes the package a **skill**: instructions and tools an agent can draw on while
+it is thinking. An `elanus.toml` makes it an **actor**: a participant the kernel
+can launch and that takes part on the bus. Many packages are only one of these.
+Some are both, and being both is often the point: the transcript package
+(`history`) runs as an actor that answers questions about the ledger over a
+local connection, and it carries a skill so an agent can ask those questions
+itself.
+
+This is why we do not speak of "services" as a separate kind of thing from
+skills. What looks like a service — something that runs on its own and feeds
+messages in — is just a package whose actor role is the prominent one. The unit
+you install is always a package; what it can do depends only on which of these
+files it carries. How packages are installed, configured, and turned on is the
+subject of docs/config.md.
+
 ## What is not an actor
 
 Everything that takes part is an actor, but the kernel's own machinery is
