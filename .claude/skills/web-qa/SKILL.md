@@ -39,7 +39,7 @@ with the *observable* a user (and an assertion) can trust.
 const TMP = fs.mkdtempSync('/tmp/elanus-qa-<suite>.');
 const BUS_PORT = 22000 + /* unique per suite */;   // never 1883 (user's live bus)
 const WEB_PORT = 9500 + /* unique per suite */;    // never 7180 (user's live web)
-const ENV = { ...process.env, HARNESS_ROOT: TMP,
+const ENV = { ...process.env, ELANUS_ROOT: TMP,
   PATH: `${REPO}/target/debug:${process.env.PATH}`,
   ELANUS_WEB_LOG: `${TMP}/web.log` };              // <-- capture the backend trace
 
@@ -51,7 +51,7 @@ const server = spawn('node', [`${REPO}/ui/web/server.mjs`, '--root', TMP, '--por
 // waitFor `${BASE}/` to answer, then chromium.launch({ headless: true }).
 ```
 
-The web server resolves root as `--root > $HARNESS_ROOT > ~/.elanus/root` and
+The web server resolves root as `--root > $ELANUS_ROOT > ~/.elanus/root` and
 presents the fenced owner credential, so it authenticates — no deny-by-default
 refusal. The boot line `[web:boot] ... credential=present` confirms it; if you
 ever see `credential=MISSING`, the root is wrong.

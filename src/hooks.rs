@@ -8,6 +8,7 @@
 //! fail-closed is a security decision. Every invocation echoes to
 //! obs/harness/hook/<point>/<outcome> on the flight recorder.
 
+use crate::envcompat::EnvDual;
 use crate::paths::Root;
 use crate::trace;
 use anyhow::Result;
@@ -114,9 +115,9 @@ fn invoke(root: &Root, h: &HookRow, subject: &Value) -> Invoked {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("HARNESS_ROOT", &root.dir)
-        .env("HARNESS_DB", root.db())
-        .env("HARNESS_TRACE", root.trace_file());
+        .env_dual("ROOT", &root.dir)
+        .env_dual("DB", root.db())
+        .env_dual("TRACE", root.trace_file());
     // Own process group so a timeout kills the whole tree, like run_shell.
     c.process_group(0);
     let mut child = match c.spawn() {

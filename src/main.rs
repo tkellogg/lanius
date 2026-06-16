@@ -1,10 +1,13 @@
 mod broker;
 mod bus;
 mod buscli;
+mod config_repo;
+mod configcli;
 mod context;
 mod db;
 mod dispatcher;
 mod dotenv;
+mod envcompat;
 mod events;
 mod exec;
 mod hooks;
@@ -34,7 +37,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "elanus", version, about = "elanus: a minimal event-driven agent harness")]
 struct Cli {
-    /// Harness root (default: $HARNESS_ROOT, or walk up from cwd to find harness.db)
+    /// Elanus root (default: $ELANUS_ROOT, else ~/.elanus/root)
     #[arg(short = 'C', long, global = true)]
     root: Option<PathBuf>,
     #[command(subcommand)]
@@ -81,6 +84,12 @@ enum Cmd {
     Profile {
         #[command(subcommand)]
         cmd: ProfileCmd,
+    },
+    /// Package configuration (docs/config.md): set / get / list. A `set` commits
+    /// the change on the config repo's `live` branch and records who accepted it.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
     },
     /// Run the dispatcher: poll events, fork handlers, record exits
     Daemon {
@@ -215,6 +224,34 @@ enum ProfileCmd {
 }
 
 #[derive(Subcommand)]
+enum ConfigCmd {
+    /// Set one key for a package: elanus config set watcher accounts '["a","b"]'
+    /// (creates the package's config if absent; value parses as TOML when it can)
+    Set {
+        /// package name
+        pkg: String,
+        /// dotted key path (e.g. accounts, or limits.max)
+        key: String,
+        /// the value (TOML when it parses — arrays, ints, bools — else a string).
+        /// Quote to force a string for tokens that look like TOML, e.g. an
+        /// account named "inf" or a date-shaped id: 'config set w h "2026-06-15"'
+        value: String,
+    },
+    /// Print one value
+    Get { pkg: String, key: String },
+    /// List a package's config (raw TOML), or every package that has config
+    List { pkg: Option<String> },
+    /// Pending agent proposals (docs/config.md): one JSON line each
+    Proposals,
+    /// Show a proposal's diff vs live config
+    Show { id: String },
+    /// Accept a proposal: merge it into live config
+    Accept { id: String },
+    /// Decline a proposal: drop it without applying
+    Decline { id: String },
+}
+
+#[derive(Subcommand)]
 enum KitCmd {
     /// Install a kit into this root: packages linked onto the package path
     /// (or --copy vendored), profiles copied if missing, packages granted
@@ -315,10 +352,10 @@ fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Init { ref dir, ref kit, copy } => {
             // Same resolution order as every other command: explicit arg >
-            // HARNESS_ROOT > ~/.elanus/root. Init once targeted cwd while
-            // the env var pointed elsewhere, littering template roots into
-            // repos and test directories.
-            let dir = match dir.clone().or_else(|| std::env::var("HARNESS_ROOT").ok().map(PathBuf::from)) {
+            // $ELANUS_ROOT (or legacy $HARNESS_ROOT) > ~/.elanus/root. Init once
+            // targeted cwd while the env var pointed elsewhere, littering
+            // template roots into repos and test directories.
+            let dir = match dir.clone().or_else(|| envcompat::read("ROOT").map(PathBuf::from)) {
                 Some(d) => d,
                 None => paths::default_root()?,
             };
@@ -519,6 +556,33 @@ fn run(cli: Cli) -> Result<()> {
                 profilecli::new(&root, &name, agent.as_deref(), model.as_deref())?
             }
             ProfileCmd::Validate { path } => profilecli::validate(&path)?,
+        },
+        Cmd::Config { cmd } => match cmd {
+            ConfigCmd::Set { pkg, key, value } => {
+                let conn = open(&root)?;
+                // The accepter is the current identity (the owner), not the
+                // literal "cli" used for grant decisions — config.md wants the
+                // ledger's decided_by to be a real identity.
+                let by = secrets::owner_name(&root);
+                configcli::set(&root, &conn, &pkg, &key, &value, &by)?;
+            }
+            ConfigCmd::Get { pkg, key } => configcli::get(&root, &pkg, &key)?,
+            ConfigCmd::List { pkg } => configcli::list(&root, pkg.as_deref())?,
+            ConfigCmd::Proposals => {
+                let conn = open(&root)?;
+                configcli::proposals(&root, &conn)?;
+            }
+            ConfigCmd::Show { id } => configcli::show(&root, &id)?,
+            ConfigCmd::Accept { id } => {
+                let conn = open(&root)?;
+                let by = secrets::owner_name(&root);
+                configcli::accept(&root, &conn, &id, &by)?;
+            }
+            ConfigCmd::Decline { id } => {
+                let conn = open(&root)?;
+                let by = secrets::owner_name(&root);
+                configcli::decline(&root, &conn, &id, &by)?;
+            }
         },
         Cmd::Approve { name, by } => {
             let conn = open(&root)?;

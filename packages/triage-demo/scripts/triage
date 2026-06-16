@@ -8,7 +8,7 @@ text=$(printf '%s' "$EVENT" | python3 -c '
 import json, sys
 print(json.load(sys.stdin).get("payload", {}).get("text", ""))')
 
-printf '%s\n' "$text" >> "$HARNESS_ROOT/triage.log"
+printf '%s\n' "$text" >> "${ELANUS_ROOT:-$HARNESS_ROOT}/triage.log"
 
 case "$text" in
   agent:*)

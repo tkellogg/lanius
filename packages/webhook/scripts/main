@@ -27,7 +27,7 @@ import sys
 import time
 import urllib.request
 
-DB = os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("HARNESS_ROOT", "."), "harness.db")
+DB = os.environ.get("ELANUS_DB") or os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."), "elanus.db")
 PKG = os.environ.get("ELANUS_PACKAGE", "webhook")
 REQ = "in/package/webhook/send"
 RESULT = "obs/channel/webhook/sent"

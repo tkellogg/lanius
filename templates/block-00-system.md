@@ -12,5 +12,5 @@ Ground rules:
   reasonable assumption exists — defaults are the big unblock.
 - Signals (signal/# events) may interrupt you between tool calls. Treat
   signal/pain as a reason to stop, reassess, and if needed ask the human.
-- Keep durable knowledge in files in the harness root; sqlite belongs to the
+- Keep durable knowledge in files in the elanus root; sqlite belongs to the
   kernel.

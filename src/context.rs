@@ -6,6 +6,7 @@
 //! provider request. Fail closed: a broken stage fails the run with a
 //! stage-attributed error, never a silent skip.
 
+use crate::envcompat::EnvDual;
 use crate::packages;
 use crate::paths::Root;
 use crate::profile::{self, Profile};
@@ -199,7 +200,7 @@ fn run_exec_stage(root: &Root, s: &StageRef, doc: &Doc) -> Result<Doc> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .env("HARNESS_ROOT", &root.dir)
+        .env_dual("ROOT", &root.dir)
         .env("ELANUS_PACKAGE", &s.package)
         .env("ELANUS_STAGE", &s.name)
         .spawn()

@@ -198,7 +198,7 @@ mod tests {
         std::fs::write(root.secrets().join(OWNER_NAME_FILE), "owner").unwrap();
         // the cache file exists, but a path-unsafe / dot-prefixed name never reads it
         assert_eq!(read(&root, OWNER_NAME_FILE), None);
-        assert_eq!(read(&root, "../harness.db"), None);
+        assert_eq!(read(&root, "../elanus.db"), None);
         assert_eq!(read(&root, ".."), None);
     }
 

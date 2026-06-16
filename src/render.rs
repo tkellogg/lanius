@@ -1,3 +1,4 @@
+use crate::envcompat::EnvDual;
 use crate::paths::Root;
 use crate::profile;
 use crate::packages;
@@ -123,10 +124,10 @@ fn run_provider(root: &Root, script: &std::path::Path, profile_name: &str, sessi
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .env("HARNESS_ROOT", &root.dir)
-        .env("HARNESS_DB", root.db())
-        .env("HARNESS_TRACE", root.trace_file())
-        .env("HARNESS_PROFILE", root.profile_dir(profile_name))
+        .env_dual("ROOT", &root.dir)
+        .env_dual("DB", root.db())
+        .env_dual("TRACE", root.trace_file())
+        .env_dual("PROFILE", root.profile_dir(profile_name))
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(

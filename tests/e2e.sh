@@ -9,7 +9,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 PATH="$REPO/target/debug:$PATH"
 export PATH
 TMP=$(mktemp -d /tmp/elanus-e2e.XXXXXX)
-export HARNESS_ROOT="$TMP"
+export ELANUS_ROOT="$TMP"
 DAEMON_PID=""
 FAILS=0
 
@@ -25,6 +25,8 @@ cleanup() {
   [ -n "${LLM3_PID:-}" ] && kill -9 "$LLM3_PID" 2>/dev/null
   [ -n "${LLM5_PID:-}" ] && kill -9 "$LLM5_PID" 2>/dev/null
   [ -n "${LLM6_PID:-}" ] && kill -9 "$LLM6_PID" 2>/dev/null
+  [ -n "${LLM_CFG_PID:-}" ] && kill -9 "$LLM_CFG_PID" 2>/dev/null
+  [ -n "${LLM_AUTO_PID:-}" ] && kill -9 "$LLM_AUTO_PID" 2>/dev/null
   [ -n "${WH_PID:-}" ] && kill -9 "$WH_PID" 2>/dev/null
   # Supervised actors are children of the daemon but survive its death;
   # crash-only in production (their bus connection dies), explicit here.
@@ -60,12 +62,12 @@ wait_for() {
 }
 
 sql() {
-  sqlite3 "$TMP/harness.db" "$1"
+  sqlite3 "$TMP/elanus.db" "$1"
 }
 
 echo "== init =="
 elanus init "$TMP" >/dev/null || fail "elanus init"
-[ -f "$TMP/harness.db" ] || fail "harness.db missing"
+[ -f "$TMP/elanus.db" ] || fail "elanus.db missing"
 [ -f "$TMP/trace.jsonl" ] || fail "trace.jsonl missing"
 [ -f "$TMP/recorder.toml" ] || fail "recorder.toml missing"
 [ -f "$TMP/bus.toml" ] || fail "bus.toml missing"
@@ -99,7 +101,7 @@ cat > "$TMP/packages/asker/scripts/run" <<'EOF'
 EVENT=$(cat)
 case "$EVENT" in
   *'"resume"'*)
-    printf '%s' "$EVENT" > "$HARNESS_ROOT/answered.json"
+    printf '%s' "$EVENT" > "$ELANUS_ROOT/answered.json"
     exit 0;;
   *)
     elanus emit in/human/owner --correlation "test-corr-1" --payload '{"question":"proceed with the thing?","options":["yes","no"]}' >/dev/null
@@ -123,7 +125,7 @@ cat > "$TMP/packages/asker2/scripts/run" <<'EOF'
 EVENT=$(cat)
 case "$EVENT" in
   *'"resume"'*)
-    printf '%s' "$EVENT" > "$HARNESS_ROOT/answered2.json"
+    printf '%s' "$EVENT" > "$ELANUS_ROOT/answered2.json"
     exit 0;;
   *)
     DL=$(date -u -v+2S +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u -d '+2 seconds' +"%Y-%m-%dT%H:%M:%S.000Z")
@@ -171,7 +173,7 @@ timeout_ms = 2000
 EOF
 cat > "$TMP/packages/guard/scripts/h" <<'EOF'
 #!/bin/sh
-cat > "$HARNESS_ROOT/denied-ran.txt"
+cat > "$ELANUS_ROOT/denied-ran.txt"
 EOF
 cat > "$TMP/packages/guard/scripts/gate" <<'EOF'
 #!/bin/sh
@@ -195,7 +197,7 @@ run  = "scripts/h"
 EOF
 cat > "$TMP/packages/gated/scripts/h" <<'EOF'
 #!/bin/sh
-cat > "$HARNESS_ROOT/gated-ran.txt"
+cat > "$ELANUS_ROOT/gated-ran.txt"
 EOF
 chmod +x "$TMP/packages/gated/scripts/h"
 
@@ -258,7 +260,7 @@ elanus packages | grep -q "^gated .*granted=[1-9]" && ok "unchanged value carrie
 # Script swap: a grant authorizes CODE, so editing the handler re-gates the
 # package even though its requests are byte-identical. The handler must not
 # run again until re-approved.
-printf '\necho swapped >> "$HARNESS_ROOT/gated-swapped.txt"\n' >> "$TMP/packages/gated/scripts/h"
+printf '\necho swapped >> "$ELANUS_ROOT/gated-swapped.txt"\n' >> "$TMP/packages/gated/scripts/h"
 elanus packages >/dev/null  # re-sync sees the new code_hash
 elanus packages | grep -q "^gated .*granted=0" && ok "script edit re-gated the package" || fail "script edit did not re-gate"
 EVG3=$(elanus emit in/package/test/gated)
@@ -470,7 +472,7 @@ run  = "scripts/h"
 EOF
 cat > "$TMP/packages/rtarget/scripts/h" <<'EOF'
 #!/bin/sh
-cat > "$HARNESS_ROOT/rtarget-ran.txt"
+cat > "$ELANUS_ROOT/rtarget-ran.txt"
 EOF
 chmod +x "$TMP/packages/rtarget/scripts/h"
 elanus approve rtarget >/dev/null || fail "approve rtarget"
@@ -521,7 +523,7 @@ class H(BaseHTTPRequestHandler):
             stop = "end_turn"
         else:
             content = [{"type": "tool_use", "id": "tc1", "name": "shell",
-                        "input": {"command": "echo ran >> \"$HARNESS_ROOT/tool-ran.txt\""}}]
+                        "input": {"command": "echo ran >> \"$ELANUS_ROOT/tool-ran.txt\""}}]
             stop = "tool_use"
         resp = json.dumps({"id": "msg_1", "type": "message", "role": "assistant",
                            "model": "claude-3-5-haiku-latest", "content": content,
@@ -627,12 +629,12 @@ echo "== 13. agent reply is mail to the human =="
 # cause_id is a real FK — anchor on an actual ledger row, as a dispatch would
 EV13=$(elanus emit obs/e2e/chat-anchor --correlation chat-corr-1)
 printf '{"id":%s,"correlation_id":"chat-corr-1","payload":{"prompt":"hi"}}' "$EV13" | \
-  HARNESS_EVENT_ID="$EV13" HARNESS_CORRELATION_ID=chat-corr-1 elanus handle-exec >/dev/null 2>&1
+  ELANUS_EVENT_ID="$EV13" ELANUS_CORRELATION_ID=chat-corr-1 elanus handle-exec >/dev/null 2>&1
 REPLY=$(sql "SELECT json_extract(payload,'\$.text') FROM events WHERE type='in/human/owner' AND correlation_id='chat-corr-1'")
 [ "$REPLY" = "task complete" ] \
   && ok "reply mailed to the human with the conversation correlation" \
   || fail "reply mail missing/wrong: '$REPLY'"
-# Provenance: the agent's reply attributes to the agent (HARNESS_ACTOR set
+# Provenance: the agent's reply attributes to the agent (ELANUS_ACTOR set
 # by exec from the profile), not to the kernel.
 RSND=$(sql "SELECT sender FROM events WHERE type='in/human/owner' AND correlation_id='chat-corr-1'")
 [ "$RSND" = "main" ] && ok "agent reply attributed to the agent (sender=main)" || fail "reply sender was '$RSND', expected main"
@@ -641,7 +643,7 @@ RSND=$(sql "SELECT sender FROM events WHERE type='in/human/owner' AND correlatio
 NTEXT=$(sql "SELECT COUNT(*) FROM events WHERE type='in/human/owner' AND json_extract(payload,'\$.text') IS NOT NULL")
 EV13B=$(elanus emit obs/e2e/chat-anchor2)
 printf '{"id":%s,"payload":{"prompt":"hi"}}' "$EV13B" | \
-  HARNESS_EVENT_ID="$EV13B" elanus handle-exec >/dev/null 2>&1
+  ELANUS_EVENT_ID="$EV13B" elanus handle-exec >/dev/null 2>&1
 NTEXT2=$(sql "SELECT COUNT(*) FROM events WHERE type='in/human/owner' AND json_extract(payload,'\$.text') IS NOT NULL")
 [ "$NTEXT2" = "$NTEXT" ] && ok "uncorrelated run stays out of the inbox" || fail "uncorrelated run mailed the human"
 
@@ -661,7 +663,7 @@ api_key_env = "FAKE_LLM_KEY"
 EOF
 EVF=$(elanus emit obs/e2e/fail-anchor --correlation fail-corr-1)
 printf '{"id":%s,"correlation_id":"fail-corr-1","payload":{"prompt":"hi","profile":"broken"}}' "$EVF" | \
-  FAKE_LLM_KEY=dummy HARNESS_EVENT_ID="$EVF" HARNESS_CORRELATION_ID=fail-corr-1 elanus handle-exec >/dev/null 2>&1
+  FAKE_LLM_KEY=dummy ELANUS_EVENT_ID="$EVF" ELANUS_CORRELATION_ID=fail-corr-1 elanus handle-exec >/dev/null 2>&1
 FAILED=$(sql "SELECT json_extract(payload,'\$.failed') FROM events WHERE type='in/human/owner' AND correlation_id='fail-corr-1'")
 [ "$FAILED" = "1" ] && ok "agent failure mailed to the human, labeled failed:true" || fail "failure mail missing (failed='$FAILED')"
 FERR=$(sql "SELECT json_extract(payload,'\$.error') FROM events WHERE type='in/human/owner' AND correlation_id='fail-corr-1'")
@@ -751,8 +753,8 @@ workdir = "$WS"
 EOF
 
 # (a) workdir: the shell tool's cwd is the profile's workdir, not the root.
-printf 'pwd -P > "$HARNESS_ROOT/pwd.out"' > "$TMP2/cmd.txt"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session kit1 > "$TMP2/exec1.out" 2>&1 || fail "exec (workdir pwd): $(cat "$TMP2/exec1.out")"
+printf 'pwd -P > "$ELANUS_ROOT/pwd.out"' > "$TMP2/cmd.txt"
+ELANUS_ROOT="$TMP2" elanus exec "go" --session kit1 > "$TMP2/exec1.out" 2>&1 || fail "exec (workdir pwd): $(cat "$TMP2/exec1.out")"
 WS_PHYS=$(cd "$WS" && pwd -P)
 [ "$(cat "$TMP2/pwd.out" 2>/dev/null)" = "$WS_PHYS" ] \
   && ok "shell tool ran in workdir ($WS_PHYS)" || fail "pwd was '$(cat "$TMP2/pwd.out" 2>/dev/null)', wanted $WS_PHYS"
@@ -760,8 +762,8 @@ WS_PHYS=$(cd "$WS" && pwd -P)
 # (b) a missing workdir fails the tool call loudly — never a silent fallback.
 sed "s,workdir = .*,workdir = \"$TMP2/no-such-dir\"," "$TMP2/profiles/default/profile.toml" > "$TMP2/p.tmp" \
   && mv "$TMP2/p.tmp" "$TMP2/profiles/default/profile.toml"
-printf 'pwd > "$HARNESS_ROOT/fallback.out"' > "$TMP2/cmd.txt"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session kit2 > "$TMP2/exec2.out" 2>&1 || fail "exec (missing workdir)"
+printf 'pwd > "$ELANUS_ROOT/fallback.out"' > "$TMP2/cmd.txt"
+ELANUS_ROOT="$TMP2" elanus exec "go" --session kit2 > "$TMP2/exec2.out" 2>&1 || fail "exec (missing workdir)"
 [ ! -f "$TMP2/fallback.out" ] && ok "missing workdir: command never ran" || fail "missing workdir fell back silently"
 grep '"kind":"obs/agent/main/kit2/tool/shell/result"' "$TMP2/trace.jsonl" | grep -q "does not exist" \
   && ok "missing workdir error is clear" || fail "missing-workdir error not surfaced"
@@ -771,8 +773,8 @@ sed "s,workdir = .*,workdir = \"$WS\"," "$TMP2/profiles/default/profile.toml" > 
 # (c) git-protect: a force push in a scratch repo is DENIED with the reason
 # echoed on obs/harness/hook, and the tool result carries the denial.
 git init -q "$WS/repo" || fail "git init scratch repo"
-printf 'cd "%s/repo" && git push --force origin main && echo pushed > "$HARNESS_ROOT/pushed.txt"' "$WS" > "$TMP2/cmd.txt"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session kit3 > "$TMP2/exec3.out" 2>&1 || fail "exec (git deny): $(cat "$TMP2/exec3.out")"
+printf 'cd "%s/repo" && git push --force origin main && echo pushed > "$ELANUS_ROOT/pushed.txt"' "$WS" > "$TMP2/cmd.txt"
+ELANUS_ROOT="$TMP2" elanus exec "go" --session kit3 > "$TMP2/exec3.out" 2>&1 || fail "exec (git deny): $(cat "$TMP2/exec3.out")"
 [ ! -f "$TMP2/pushed.txt" ] && ok "force push denied (command never ran)" || fail "force push ran despite git-protect"
 grep '"kind":"obs/harness/hook/pre_tool_call/deny"' "$TMP2/trace.jsonl" | grep -q '"hook":"git-protect:' \
   && ok "deny echoed on obs/harness/hook" || fail "no git-protect deny in trace"
@@ -782,8 +784,8 @@ grep '"kind":"obs/agent/main/kit3/tool/shell/result"' "$TMP2/trace.jsonl" | grep
   && ok "denial on the tool result (transcript-visible)" || fail "denial not on tool result"
 
 # (d) innocuous commands pass: ordinary git, and --force-with-lease.
-printf 'cd "%s/repo" && git status --short >/dev/null 2>&1; git push --force-with-lease origin main >/dev/null 2>&1; echo fine > "$HARNESS_ROOT/innocuous.txt"' "$WS" > "$TMP2/cmd.txt"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session kit4 > "$TMP2/exec4.out" 2>&1 || fail "exec (innocuous): $(cat "$TMP2/exec4.out")"
+printf 'cd "%s/repo" && git status --short >/dev/null 2>&1; git push --force-with-lease origin main >/dev/null 2>&1; echo fine > "$ELANUS_ROOT/innocuous.txt"' "$WS" > "$TMP2/cmd.txt"
+ELANUS_ROOT="$TMP2" elanus exec "go" --session kit4 > "$TMP2/exec4.out" 2>&1 || fail "exec (innocuous): $(cat "$TMP2/exec4.out")"
 [ -f "$TMP2/innocuous.txt" ] && ok "innocuous git (incl. --force-with-lease) allowed" || fail "innocuous command blocked"
 
 # (e) context pipeline (docs/context.md): a [[stage]] declaration is a
@@ -800,7 +802,7 @@ EOF
 cat > "$TMP2/packages/stagepkg/scripts/stage" <<'EOF'
 #!/usr/bin/env python3
 import json, os, sys
-if os.path.exists(os.path.join(os.environ["HARNESS_ROOT"], "stage-break")):
+if os.path.exists(os.path.join(os.environ["ELANUS_ROOT"], "stage-break")):
     sys.exit(1)
 doc = json.load(sys.stdin)
 doc["system"].append({"name": "marker", "text": "STAGEMARK-7c4f"})
@@ -809,15 +811,15 @@ EOF
 chmod +x "$TMP2/packages/stagepkg/scripts/stage"
 
 printf 'true' > "$TMP2/cmd.txt"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session kit5 > "$TMP2/exec5.out" 2>&1 || fail "exec (unapproved stage): $(cat "$TMP2/exec5.out")"
+ELANUS_ROOT="$TMP2" elanus exec "go" --session kit5 > "$TMP2/exec5.out" 2>&1 || fail "exec (unapproved stage): $(cat "$TMP2/exec5.out")"
 grep -q "STAGEMARK-7c4f" "$TMP2/llm.body" && fail "unapproved stage ran" || ok "requested stage is inert (discovery is not authority)"
 grep -q '"kind":"obs/agent/main/kit5/context/marker-skipped"' "$TMP2/trace.jsonl" \
   && ok "skip is loud on obs" || fail "no skipped-stage obs record"
 
-HARNESS_ROOT="$TMP2" elanus approve stagepkg >/dev/null 2>&1 || fail "approve stagepkg"
-HARNESS_ROOT="$TMP2" elanus stages | grep "stagepkg/marker" | grep -q "approved" \
+ELANUS_ROOT="$TMP2" elanus approve stagepkg >/dev/null 2>&1 || fail "approve stagepkg"
+ELANUS_ROOT="$TMP2" elanus stages | grep "stagepkg/marker" | grep -q "approved" \
   && ok "elanus stages prints the effective chain" || fail "stages listing wrong"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session kit6 > "$TMP2/exec6.out" 2>&1 || fail "exec (approved stage): $(cat "$TMP2/exec6.out")"
+ELANUS_ROOT="$TMP2" elanus exec "go" --session kit6 > "$TMP2/exec6.out" 2>&1 || fail "exec (approved stage): $(cat "$TMP2/exec6.out")"
 grep -q "STAGEMARK-7c4f" "$TMP2/llm.body" \
   && ok "approved stage's block reached the model" || fail "stage block missing from llm request"
 grep -q '"kind":"obs/agent/main/kit6/context/marker"' "$TMP2/trace.jsonl" \
@@ -827,7 +829,7 @@ grep -q '"kind":"obs/agent/main/kit6/context/marker"' "$TMP2/trace.jsonl" \
 # the error names the stage. (An EDITED script wouldn't even run: code_hash
 # pin de-approves it back to requested.)
 touch "$TMP2/stage-break"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session kit7 > "$TMP2/exec7.out" 2>&1 \
+ELANUS_ROOT="$TMP2" elanus exec "go" --session kit7 > "$TMP2/exec7.out" 2>&1 \
   && fail "broken stage did not fail the run" || ok "broken stage fails closed"
 grep -q "stagepkg/marker" "$TMP2/exec7.out" && ok "failure is stage-attributed" || fail "error not stage-attributed: $(cat "$TMP2/exec7.out")"
 rm -f "$TMP2/stage-break"
@@ -835,8 +837,8 @@ rm -f "$TMP2/stage-break"
 # (g) recent-history pending: the stock reconstruction stage ships inert —
 # nothing of it reaches the prompt until approved. (Its resident round trip
 # needs a broker; section 16 proves it against a live daemon.)
-HARNESS_ROOT="$TMP2" elanus emit in/human/owner --payload '{"text":"remember the blue key is under the mat"}' >/dev/null 2>&1
-HARNESS_ROOT="$TMP2" elanus exec "go" --session kit8 > "$TMP2/exec8.out" 2>&1 || fail "exec (recent-history pending): $(cat "$TMP2/exec8.out")"
+ELANUS_ROOT="$TMP2" elanus emit in/human/owner --payload '{"text":"remember the blue key is under the mat"}' >/dev/null 2>&1
+ELANUS_ROOT="$TMP2" elanus exec "go" --session kit8 > "$TMP2/exec8.out" 2>&1 || fail "exec (recent-history pending): $(cat "$TMP2/exec8.out")"
 grep -q "blue key" "$TMP2/llm.body" && fail "pending recent-history leaked into the prompt" \
   || ok "recent-history ships pending (inert until approved)"
 
@@ -881,12 +883,12 @@ EOF
 chmod +x "$TMP2/packages/adderpkg/scripts/server"
 
 printf 'true' > "$TMP2/cmd.txt"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session mcp1 > "$TMP2/execm1.out" 2>&1 || fail "exec (unapproved mcp): $(cat "$TMP2/execm1.out")"
+ELANUS_ROOT="$TMP2" elanus exec "go" --session mcp1 > "$TMP2/execm1.out" 2>&1 || fail "exec (unapproved mcp): $(cat "$TMP2/execm1.out")"
 grep -q "adder__add" "$TMP2/llm.body" && fail "unapproved mcp tools reached the model" \
   || ok "requested mcp server is inert"
-HARNESS_ROOT="$TMP2" elanus approve adderpkg >/dev/null 2>&1 || fail "approve adderpkg"
+ELANUS_ROOT="$TMP2" elanus approve adderpkg >/dev/null 2>&1 || fail "approve adderpkg"
 printf 'TOOL:{"name":"adder__add","input":{"a":19,"b":23}}' > "$TMP2/cmd.txt"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session mcp2 > "$TMP2/execm2.out" 2>&1 || fail "exec (mcp call): $(cat "$TMP2/execm2.out")"
+ELANUS_ROOT="$TMP2" elanus exec "go" --session mcp2 > "$TMP2/execm2.out" 2>&1 || fail "exec (mcp call): $(cat "$TMP2/execm2.out")"
 grep -q '"adder__add"' "$TMP2/llm.body" && ok "mcp tools in the model's tool array" || fail "adder__add not offered to the model"
 grep -q '"content":"42"' "$TMP2/llm.body" || grep -q '"content": *"42"' "$TMP2/llm.body" \
   && ok "mcp tool call round-tripped (19+23=42 in the tool_result)" || fail "tool_result 42 missing from llm request"
@@ -894,22 +896,22 @@ grep -q '"content":"42"' "$TMP2/llm.body" || grep -q '"content": *"42"' "$TMP2/l
 # Tool poisoning: change the description in place (same code_hash would be a
 # lie — so this edits the file, which ALSO re-gates the grant; prove the pin
 # alone by tampering the kv instead).
-sqlite3 "$TMP2/harness.db" "UPDATE kv SET value='tampered' WHERE key='mcp_tools:adderpkg:adder'"
+sqlite3 "$TMP2/elanus.db" "UPDATE kv SET value='tampered' WHERE key='mcp_tools:adderpkg:adder'"
 printf 'true' > "$TMP2/cmd.txt"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session mcp3 > "$TMP2/execm3.out" 2>&1 || fail "exec (pin mismatch): $(cat "$TMP2/execm3.out")"
+ELANUS_ROOT="$TMP2" elanus exec "go" --session mcp3 > "$TMP2/execm3.out" 2>&1 || fail "exec (pin mismatch): $(cat "$TMP2/execm3.out")"
 grep -q "adder__add" "$TMP2/llm.body" && fail "changed tools served despite pin mismatch" \
   || ok "pin mismatch refuses the server's tools"
 grep -q "TOOLS CHANGED" "$TMP2/execm3.out" && ok "refusal is loud and names the cure" || fail "no loud refusal"
-HARNESS_ROOT="$TMP2" elanus approve adderpkg >/dev/null 2>&1 || fail "re-approve adderpkg"
-HARNESS_ROOT="$TMP2" elanus exec "go" --session mcp4 > "$TMP2/execm4.out" 2>&1 || fail "exec (re-pinned): $(cat "$TMP2/execm4.out")"
+ELANUS_ROOT="$TMP2" elanus approve adderpkg >/dev/null 2>&1 || fail "re-approve adderpkg"
+ELANUS_ROOT="$TMP2" elanus exec "go" --session mcp4 > "$TMP2/execm4.out" 2>&1 || fail "exec (re-pinned): $(cat "$TMP2/execm4.out")"
 grep -q "adder__add" "$TMP2/llm.body" && ok "re-approval re-pins (tools restored)" || fail "tools not restored after re-approval"
 
 # (i) core kit: the harness teaching itself. Skill-only packages install
 # with nothing to approve (content, not capability); the architect profile
 # lands with its identity block; render proves both reach a prompt.
-HARNESS_ROOT="$TMP2" elanus kit add core > "$TMP2/kitcore.out" 2>&1 || fail "kit add core: $(cat "$TMP2/kitcore.out")"
+ELANUS_ROOT="$TMP2" elanus kit add core > "$TMP2/kitcore.out" 2>&1 || fail "kit add core: $(cat "$TMP2/kitcore.out")"
 [ -f "$TMP2/profiles/architect/profile.toml" ] && ok "architect profile installed" || fail "architect profile missing"
-HARNESS_ROOT="$TMP2" elanus render --profile architect --session corez > "$TMP2/render.out" 2>&1 || fail "render architect: $(cat "$TMP2/render.out")"
+ELANUS_ROOT="$TMP2" elanus render --profile architect --session corez > "$TMP2/render.out" 2>&1 || fail "render architect: $(cat "$TMP2/render.out")"
 grep -q "strongest rung" "$TMP2/render.out" && ok "architect identity block renders" || fail "architect block missing"
 grep -q "escalate" "$TMP2/render.out" && grep -q "harness-doctrine" "$TMP2/render.out" \
   && ok "core skills in the inventory (no grants needed — content, not capability)" \
@@ -926,7 +928,7 @@ elanus init "$TMP4" --kit "$REPO/kits/funnel" --copy > "$TMP4/init.out" 2>&1 || 
 [ -f "$TMP4/packages/funnel-sift/rules.txt" ] && ok "sift rules file shipped" || fail "rules.txt missing"
 [ -f "$TMP4/profiles/scout/profile.toml" ] && ok "scout profile copied" || fail "scout profile missing"
 for p in funnel-intake funnel-sift funnel-scout; do
-  HARNESS_ROOT="$TMP4" elanus packages | grep -q "^$p .*granted=[1-9]" \
+  ELANUS_ROOT="$TMP4" elanus packages | grep -q "^$p .*granted=[1-9]" \
     && ok "$p granted at init" || fail "$p not approved by init"
 done
 
@@ -990,13 +992,13 @@ EOF
 BUS_PORT2=$((BUS_PORT + 1))
 lsof -ti "tcp:$BUS_PORT2" 2>/dev/null | xargs kill -9 2>/dev/null
 printf 'enabled = true\nbind = "127.0.0.1:%s"\n' "$BUS_PORT2" > "$TMP4/bus.toml"
-HARNESS_ROOT="$TMP4" elanus daemon --interval-ms 200 >"$TMP4/daemon.log" 2>&1 &
+ELANUS_ROOT="$TMP4" elanus daemon --interval-ms 200 >"$TMP4/daemon.log" 2>&1 &
 DAEMON2_PID=$!
 sleep 1
 wait_for "funnel-intake alive (retained status)" \
-  "HARNESS_ROOT='$TMP4' elanus bus sub 'obs/package/funnel-intake/status' --count 1 --timeout 2 | grep -q '\"state\":\"alive\"'"
+  "ELANUS_ROOT='$TMP4' elanus bus sub 'obs/package/funnel-intake/status' --count 1 --timeout 2 | grep -q '\"state\":\"alive\"'"
 
-sql4() { sqlite3 "$TMP4/harness.db" "$1"; }
+sql4() { sqlite3 "$TMP4/elanus.db" "$1"; }
 # Three lines: one killed by a drop rule, one falls to the default drop,
 # one passes (matches the shipped `pass ...alert...` rule).
 mkdir -p "$TMP4/run/pkg-funnel-intake/inbox"
@@ -1046,18 +1048,18 @@ run  = "scripts/main"
 EOF
 cat > "$KITS5/linkkit/packages/linker/scripts/main" <<'EOF'
 #!/bin/sh
-echo ran-v1 >> "$HARNESS_ROOT/linker.out"
+echo ran-v1 >> "$ELANUS_ROOT/linker.out"
 EOF
 chmod +x "$KITS5/linkkit/packages/linker/scripts/main"
 printf '# link kit\n\nthe linking starter\n' > "$KITS5/linkkit/README.md"
 
 elanus init "$TMP5" >/dev/null 2>&1 || fail "init link root"
-HARNESS_ROOT="$TMP5" elanus kit add "$KITS5/linkkit" > "$TMP5/kitadd.out" 2>&1 \
+ELANUS_ROOT="$TMP5" elanus kit add "$KITS5/linkkit" > "$TMP5/kitadd.out" 2>&1 \
   || fail "kit add: $(cat "$TMP5/kitadd.out")"
 [ ! -e "$TMP5/packages/linker" ] && ok "linked, not copied" || fail "kit add copied despite link default"
 grep -q "$KITS5/linkkit/packages" "$TMP5/profiles/default/profile.toml" \
   && ok "package_path carries the link" || fail "package_path not updated"
-sql5() { sqlite3 "$TMP5/harness.db" "$1"; }
+sql5() { sqlite3 "$TMP5/elanus.db" "$1"; }
 [ "$(sql5 "SELECT decided_by FROM grants WHERE package='linker' AND state='approved' LIMIT 1")" = "kit:linkkit" ] \
   && ok "grant provenance is kit:linkkit" || fail "kit provenance missing on grants"
 grep -q "the linking starter" "$TMP5/kitadd.out" && ok "kit add prints the README" || fail "README not printed"
@@ -1070,20 +1072,20 @@ ELANUS_KIT_PATH="$KITS5" elanus kit show linkkit | grep -q "the linking starter"
 BUS_PORT3=$((BUS_PORT + 2))
 lsof -ti "tcp:$BUS_PORT3" 2>/dev/null | xargs kill -9 2>/dev/null
 printf 'enabled = true\nbind = "127.0.0.1:%s"\n' "$BUS_PORT3" > "$TMP5/bus.toml"
-HARNESS_ROOT="$TMP5" elanus daemon --interval-ms 200 >"$TMP5/daemon.log" 2>&1 &
+ELANUS_ROOT="$TMP5" elanus daemon --interval-ms 200 >"$TMP5/daemon.log" 2>&1 &
 DAEMON3_PID=$!
 sleep 1
-HARNESS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
+ELANUS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
 wait_for "linked handler dispatched" "grep -q ran-v1 '$TMP5/linker.out'"
 
 # Upstream edit under a RUNNING daemon: the grant is pinned to the bytes,
 # so the edited script must not run — not even in the same tick.
 cat > "$KITS5/linkkit/packages/linker/scripts/main" <<'EOF'
 #!/bin/sh
-echo ran-v2 >> "$HARNESS_ROOT/linker.out"
+echo ran-v2 >> "$ELANUS_ROOT/linker.out"
 EOF
 chmod +x "$KITS5/linkkit/packages/linker/scripts/main"
-HARNESS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
+ELANUS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
 wait_for "drift re-entered review (requested rows under new hash)" \
   "[ \"\$(sql5 \"SELECT COUNT(*) FROM grants WHERE package='linker' AND state='requested'\")\" -ge 1 ]"
 sleep 1
@@ -1091,8 +1093,8 @@ grep -q ran-v2 "$TMP5/linker.out" 2>/dev/null \
   && fail "edited linked script ran while stale" || ok "stale at dispatch: edited code did not run"
 
 # Re-approval heals: the same gesture as any package review.
-HARNESS_ROOT="$TMP5" elanus approve linker >/dev/null 2>&1 || fail "approve linker after edit"
-HARNESS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
+ELANUS_ROOT="$TMP5" elanus approve linker >/dev/null 2>&1 || fail "approve linker after edit"
+ELANUS_ROOT="$TMP5" elanus emit in/package/linker/go >/dev/null 2>&1
 wait_for "re-approved linked handler ran new code" "grep -q ran-v2 '$TMP5/linker.out'"
 
 # Staging (--pending, the phase-5 path): files land, requests register,
@@ -1105,17 +1107,17 @@ subscribe = ["in/package/stager/go"]
 mode = "exec"
 run  = "scripts/main"
 EOF
-printf '#!/bin/sh\necho staged-ran >> "$HARNESS_ROOT/stager.out"\n' > "$KITS5/stagekit/packages/stager/scripts/main"
+printf '#!/bin/sh\necho staged-ran >> "$ELANUS_ROOT/stager.out"\n' > "$KITS5/stagekit/packages/stager/scripts/main"
 chmod +x "$KITS5/stagekit/packages/stager/scripts/main"
-HARNESS_ROOT="$TMP5" elanus kit add "$KITS5/stagekit" --pending > "$TMP5/stage.out" 2>&1 \
+ELANUS_ROOT="$TMP5" elanus kit add "$KITS5/stagekit" --pending > "$TMP5/stage.out" 2>&1 \
   || fail "kit add --pending: $(cat "$TMP5/stage.out")"
 grep -q "staged stager" "$TMP5/stage.out" && ok "kit add --pending stages" || fail "no staging message"
 [ "$(sql5 "SELECT COUNT(*) FROM grants WHERE package='stager' AND state='approved'")" = "0" ] \
   && ok "staging granted nothing" || fail "staging approved grants"
-HARNESS_ROOT="$TMP5" elanus emit in/package/stager/go >/dev/null 2>&1
+ELANUS_ROOT="$TMP5" elanus emit in/package/stager/go >/dev/null 2>&1
 sleep 1
 [ ! -f "$TMP5/stager.out" ] && ok "staged package is inert" || fail "staged package handled an event"
-HARNESS_ROOT="$TMP5" elanus packages --json | python3 -c '
+ELANUS_ROOT="$TMP5" elanus packages --json | python3 -c '
 import json,sys
 for line in sys.stdin:
     p = json.loads(line)
@@ -1124,8 +1126,8 @@ for line in sys.stdin:
         break
 else: raise SystemExit(1)
 ' && ok "packages --json carries the pending queue" || fail "packages --json wrong"
-HARNESS_ROOT="$TMP5" elanus approve stager >/dev/null 2>&1 || fail "approve stager"
-HARNESS_ROOT="$TMP5" elanus emit in/package/stager/go >/dev/null 2>&1
+ELANUS_ROOT="$TMP5" elanus approve stager >/dev/null 2>&1 || fail "approve stager"
+ELANUS_ROOT="$TMP5" elanus emit in/package/stager/go >/dev/null 2>&1
 wait_for "approve committed the staged kit" "grep -q staged-ran '$TMP5/stager.out'"
 
 # Resident stage round trip: recent-history's daemon holds a warm read-only
@@ -1149,12 +1151,12 @@ base_url = "http://127.0.0.1:$(cat "$TMP5/llm.port")"
 api_key_env = "FAKE_LLM_KEY"
 EOF
 export FAKE_LLM_KEY=dummy
-HARNESS_ROOT="$TMP5" elanus emit in/human/owner --payload '{"text":"the launch code is petrichor-9"}' >/dev/null 2>&1
-HARNESS_ROOT="$TMP5" elanus approve recent-history >/dev/null 2>&1 || fail "approve recent-history"
+ELANUS_ROOT="$TMP5" elanus emit in/human/owner --payload '{"text":"the launch code is petrichor-9"}' >/dev/null 2>&1
+ELANUS_ROOT="$TMP5" elanus approve recent-history >/dev/null 2>&1 || fail "approve recent-history"
 wait_for "recent-history daemon serving (parked -> approved, no restart)" \
   "grep -q 'serving obs/harness/stagereq' '$TMP5/run/pkg-recent-history/stderr.log'"
 printf 'true' > "$TMP5/cmd.txt"
-HARNESS_ROOT="$TMP5" elanus exec "go" --session res1 > "$TMP5/execr.out" 2>&1 || fail "exec (resident stage): $(cat "$TMP5/execr.out")"
+ELANUS_ROOT="$TMP5" elanus exec "go" --session res1 > "$TMP5/execr.out" 2>&1 || fail "exec (resident stage): $(cat "$TMP5/execr.out")"
 grep -q "petrichor-9" "$TMP5/llm.body" \
   && ok "resident consult round-tripped (ledger mail in the prompt)" || fail "resident stage block missing from llm request"
 grep -q '"kind":"obs/agent/main/res1/context/recent-history"' "$TMP5/trace.jsonl" \
@@ -1192,7 +1194,7 @@ echo "== 18. phonebook: identity directory, HTTP reads + bus writes (verified pr
 # channel belongs to whom (docs/identity.md). Reads over HTTP like history;
 # WRITES over the authenticated bus so a link's provenance is the
 # broker-verified sender, never a payload field. The store is the phonebook's
-# OWN sqlite in its scratch, never harness.db. Ships PENDING; parks until
+# OWN sqlite in its scratch, never elanus.db. Ships PENDING; parks until
 # approved. The main root's daemon is still running and picks it up.
 [ -f "$TMP/packages/phonebook/elanus.toml" ] || cp -R "$REPO/packages/phonebook" "$TMP/packages/"
 wait_for "phonebook http port negotiated (run/pkg-phonebook/http.json)" "[ -s '$TMP/run/pkg-phonebook/http.json' ]"
@@ -1257,7 +1259,7 @@ curl -s -m 2 "http://127.0.0.1:$PBPORT/healthz" | grep -q '"ok": *true' \
 curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"nope"}' | grep -q '"ok": *false' \
   && ok "unknown query kind rejected, not executed" || fail "unknown kind not rejected"
 [ -s "$TMP/run/pkg-phonebook/phonebook.db" ] \
-  && ok "phonebook owns its store (scratch, not harness.db)" || fail "phonebook.db missing in scratch"
+  && ok "phonebook owns its store (scratch, not elanus.db)" || fail "phonebook.db missing in scratch"
 
 echo "== 19. recall: the unified cross-channel frame (resolve-at-recall, provenance-gated) =="
 # A resident context stage: when a message arrives on one channel, pull the
@@ -1299,7 +1301,7 @@ wait_for "phonebook resolved the correspondent" \
 # that the percent-encoded discord address actually matched the ledger.
 EVR=$(elanus emit obs/e2e/recall-anchor)
 printf '{"id":%s,"type":"in/dm/bluesky/@cara","sender":"bluesky-bridge","payload":{"prompt":"hi","profile":"recalltest","session":"recall1"}}' "$EVR" | \
-  HARNESS_EVENT_ID="$EVR" FAKE_LLM_KEY=dummy elanus handle-exec >/dev/null 2>&1
+  ELANUS_EVENT_ID="$EVR" FAKE_LLM_KEY=dummy elanus handle-exec >/dev/null 2>&1
 grep -q "hello from bluesky" "$TMP/llm3.body" && grep -q "and from discord" "$TMP/llm3.body" \
   && ok "recall unified BOTH channels into the prompt (resolve-at-recall; encoding matched)" \
   || fail "recall did not unify both channels into the prompt"
@@ -1309,7 +1311,7 @@ grep -q "hello from bluesky" "$TMP/llm3.body" && grep -q "and from discord" "$TM
 : > "$TMP/llm3.body"
 EVR2=$(elanus emit obs/e2e/recall-anchor2)
 printf '{"id":%s,"type":"in/dm/bluesky/@cara","sender":"main","payload":{"prompt":"hi","profile":"recalltest","session":"recall2"}}' "$EVR2" | \
-  HARNESS_EVENT_ID="$EVR2" FAKE_LLM_KEY=dummy elanus handle-exec >/dev/null 2>&1
+  ELANUS_EVENT_ID="$EVR2" FAKE_LLM_KEY=dummy elanus handle-exec >/dev/null 2>&1
 grep -q "hello from bluesky" "$TMP/llm3.body" \
   && fail "recall leaked history on a self-forged (sender==agent) dispatch" \
   || ok "self-forged dispatch recalls nothing (provenance gate holds)"
@@ -1319,7 +1321,7 @@ elanus bus pub "in/dm/sms/%2B99" '{"text":"lone sms message"}' --qos 1 >/dev/nul
 : > "$TMP/llm3.body"
 EVR3=$(elanus emit obs/e2e/recall-anchor3)
 printf '{"id":%s,"type":"in/dm/sms/%%2B99","sender":"sms-bridge","payload":{"prompt":"hi","profile":"recalltest","session":"recall3"}}' "$EVR3" | \
-  HARNESS_EVENT_ID="$EVR3" FAKE_LLM_KEY=dummy elanus handle-exec >/dev/null 2>&1
+  ELANUS_EVENT_ID="$EVR3" FAKE_LLM_KEY=dummy elanus handle-exec >/dev/null 2>&1
 grep -q "lone sms message" "$TMP/llm3.body" \
   && ok "unresolved channel still recalls its own thread (degrade, not fail)" \
   || fail "degrade path did not recall the single channel"
@@ -1368,6 +1370,250 @@ grep -q "wh-corr-1" "$TMP/wh.receipt" \
 [ -z "$(sql "SELECT id FROM events WHERE type LIKE 'out/%' LIMIT 1")" ] \
   && ok "no out/ plane anywhere (the egress asymmetry holds)" || fail "an out/ event exists"
 kill -9 "$WH_PID" 2>/dev/null
+
+echo "== 21. package config: live-branch write + daemon reload (docs/config.md) =="
+# A human-direct `config set` writes config/packages/<pkg>.toml, commits it on
+# the kernel-owned `live` branch, and records who accepted it in the ledger. A
+# running daemon whose config changed is restarted by the supervisor so it
+# re-reads (D3). The config repo itself is created at init.
+[ -d "$TMP/config/.git" ] && ok "init created the config repo" || fail "no config repo at init"
+[ "$(git -C "$TMP/config" branch --show-current)" = live ] \
+  && ok "config repo is on the live branch" || fail "config repo not on the live branch"
+
+elanus config set watcher accounts '["alice"]' >/dev/null || fail "config set"
+git -C "$TMP/config" log --oneline | grep -q "set watcher.accounts" \
+  && ok "the set committed on live" || fail "no commit on live for the set"
+[ "$(sql "SELECT sender FROM events WHERE type='obs/config/changed' ORDER BY id DESC LIMIT 1")" = owner ] \
+  && ok "the set recorded a ledger acceptance event (sender = the owner identity)" \
+  || fail "no ledger acceptance event attributed to the owner"
+
+# A tiny daemon consumer: read this package's config, record what it's watching,
+# then park. The supervisor restarts it on config change, so each (re)start
+# re-reads — proving package config is consumed AND live-reloaded.
+mkdir -p "$TMP/packages/watcher/scripts"
+cat > "$TMP/packages/watcher/elanus.toml" <<'EOF'
+[process]
+mode = "daemon"
+run  = "scripts/main"
+EOF
+cat > "$TMP/packages/watcher/scripts/main" <<'EOF'
+#!/bin/sh
+set -u
+cfg="$ELANUS_ROOT/config/packages/$ELANUS_PACKAGE.toml"
+line="(none)"
+if [ -f "$cfg" ]; then
+  v=$(grep -E '^[[:space:]]*accounts[[:space:]]*=' "$cfg" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//')
+  [ -n "$v" ] && line="$v"
+fi
+printf '%s\n' "$line" > "$ELANUS_SCRATCH/watching"
+while true; do sleep 5; done
+EOF
+chmod +x "$TMP/packages/watcher/scripts/main"
+
+wait_for "watcher daemon read its package config at boot (alice)" \
+  "grep -q alice '$TMP/run/pkg-watcher/watching'"
+if grep -q bob "$TMP/run/pkg-watcher/watching" 2>/dev/null; then
+  fail "watcher saw an account that was never configured"
+else
+  ok "and only what was configured (no bob yet)"
+fi
+
+# Change the config under the running daemon: it must restart the actor (D3).
+elanus config set watcher accounts '["alice","bob"]' >/dev/null || fail "config set (change)"
+wait_for "config change live-reloaded the daemon (re-read picks up bob)" \
+  "grep -q bob '$TMP/run/pkg-watcher/watching'"
+grep '"kind":"obs/package/watcher/status"' "$TMP/trace.jsonl" | grep -q '"state":"reloading"' \
+  && ok "the supervisor logged the config-driven reload" \
+  || fail "no reload observation in the trace"
+
+# Read paths (the JSON contract the web UI consumes).
+[ "$(elanus config get watcher accounts)" = '["alice","bob"]' ] \
+  && ok "config get returns the value" || fail "config get wrong: $(elanus config get watcher accounts)"
+if elanus config get watcher nonesuch >/dev/null 2>&1; then
+  fail "config get of a missing key should exit non-zero"
+else
+  ok "config get of a missing key exits non-zero"
+fi
+elanus config list | grep -q '"package":"watcher"' \
+  && ok "config list names packages that have config" || fail "config list missing watcher"
+elanus config list watcher | grep -q '"toml":' \
+  && ok "config list <pkg> returns the raw toml" || fail "config list watcher missing toml"
+
+# The acceptance event reaches the LIVE bus, not just the ledger (D3's
+# notification half): a real change announces obs/config/changed.
+( elanus bus sub 'obs/config/changed' --count 1 --timeout 6 > "$TMP/cfg-evt.out" 2>&1 ) &
+CFGSUB=$!
+sleep 0.5
+elanus config set watcher interval 60 >/dev/null || fail "config set (bus)"
+wait "$CFGSUB" 2>/dev/null
+grep -q '"package":"watcher"' "$TMP/cfg-evt.out" && grep -q '"key":"interval"' "$TMP/cfg-evt.out" \
+  && ok "the acceptance event reached a live bus subscriber" \
+  || fail "obs/config/changed not announced on the bus: $(cat "$TMP/cfg-evt.out" 2>/dev/null)"
+# An idempotent set records no new acceptance event (the ledger logs changes).
+BEFORE=$(sql "SELECT COUNT(*) FROM events WHERE type='obs/config/changed'")
+elanus config set watcher interval 60 >/dev/null || fail "config set (no-op)"
+AFTER=$(sql "SELECT COUNT(*) FROM events WHERE type='obs/config/changed'")
+[ "$BEFORE" = "$AFTER" ] && ok "a no-op set records no duplicate acceptance event" \
+  || fail "no-op set emitted a spurious event ($BEFORE -> $AFTER)"
+
+echo "== 22. naming: ELANUS_* canonical, HARNESS_* still works (back-compat) =="
+# The canonical names are ELANUS_*; the legacy HARNESS_* must keep resolving a
+# root so existing setups don't break. (Everything else in this file already
+# uses ELANUS_ROOT, so this is the one place the legacy path is exercised.)
+env -u ELANUS_ROOT HARNESS_ROOT="$TMP" elanus events --limit 1 >/dev/null 2>&1 \
+  && ok "legacy \$HARNESS_ROOT still resolves the root" \
+  || fail "legacy HARNESS_ROOT fallback is broken"
+# The ledger file is elanus.db (not harness.db).
+[ -f "$TMP/elanus.db" ] && ok "the ledger is elanus.db" || fail "no elanus.db at the root"
+# An old root with a harness.db migrates to elanus.db on first open.
+MIGT=$(mktemp -d /tmp/elanus-mig.XXXXXX)
+ELANUS_ROOT="$MIGT" elanus init >/dev/null 2>&1
+mv "$MIGT/elanus.db" "$MIGT/harness.db"   # simulate a pre-rename root
+ELANUS_ROOT="$MIGT" elanus events --limit 1 >/dev/null 2>&1   # any open migrates
+[ -f "$MIGT/elanus.db" ] && [ ! -f "$MIGT/harness.db" ] \
+  && ok "an old harness.db migrates to elanus.db on first open" \
+  || fail "db filename migration did not happen"
+rm -rf "$MIGT" 2>/dev/null
+
+echo "== 23. agent config proposal: clone -> commit -> reap (docs/config.md inc 3) =="
+# A proposal-capable agent (profile autonomy != "off") gets a disposable config
+# clone at $ELANUS_CONFIG_DIR; a proposal/<x> branch it commits there is
+# harvested at run end into a PENDING proposal (a refs/proposals ref + an
+# obs/config/proposed ledger event) — live is never touched by a mere proposal.
+cat > "$TMP/fake_llm_cfg.py" <<'PYEOF'
+import json, sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+# The agent's "edit", the way its shell would: branch proposal/p in its config
+# clone, change a watcher account, commit. Author identity is decoration.
+CMD = r'''cd "$ELANUS_CONFIG_DIR" && git checkout -q -b proposal/p && echo 'accounts = ["alice","bob"]' > packages/watcher.toml && git add -A && git -c user.name=a -c user.email=a@a commit -q -m propose'''
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length', 0)); body = self.rfile.read(n).decode()
+        if '"tool_result"' in body:
+            content = [{"type": "text", "text": "done"}]; stop = "end_turn"
+        else:
+            content = [{"type": "tool_use", "id": "tc1", "name": "shell", "input": {"command": CMD}}]; stop = "tool_use"
+        resp = json.dumps({"id": "m", "type": "message", "role": "assistant", "model": "x",
+                           "content": content, "stop_reason": stop,
+                           "usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+        self.send_response(200); self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(resp))); self.end_headers(); self.wfile.write(resp)
+    def log_message(self, *a): pass
+srv = HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(srv.server_address[1])); srv.serve_forever()
+PYEOF
+python3 "$TMP/fake_llm_cfg.py" "$TMP/llm_cfg.port" &
+LLM_CFG_PID=$!
+wait_for "config fake LLM bound" "[ -s '$TMP/llm_cfg.port' ]"
+LLM_CFG_PORT=$(cat "$TMP/llm_cfg.port")
+export FAKE_LLM_KEY=dummy
+mkdir -p "$TMP/profiles/proposer"
+cat > "$TMP/profiles/proposer/profile.toml" <<EOF
+agent = "proposer"
+owner = "owner"
+autonomy = "manual"
+
+[model]
+model = "claude-3-5-haiku-latest"
+max_turns = 6
+base_url = "http://127.0.0.1:$LLM_CFG_PORT"
+api_key_env = "FAKE_LLM_KEY"
+EOF
+elanus config set watcher accounts '["alice"]' >/dev/null || fail "seed config for proposal"
+elanus exec "propose a config change" --session cfgprop --profile proposer > "$TMP/exec-cfg.out" 2>&1 \
+  || fail "exec proposer: $(cat "$TMP/exec-cfg.out")"
+wait_for "agent proposal harvested (obs/config/proposed)" \
+  "[ -n \"\$(sql \"SELECT id FROM events WHERE type='obs/config/proposed'\")\" ]"
+PROP=$(elanus config proposals | head -1)
+echo "$PROP" | grep -q '"agent":"proposer"' \
+  && ok "the proposal is attributed to the proposing agent" || fail "proposal agent wrong: $PROP"
+echo "$PROP" | grep -q 'watcher.toml' \
+  && ok "the proposal names the changed file" || fail "proposal file missing: $PROP"
+PROP_ID=$(echo "$PROP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["proposal"])')
+elanus config show "$PROP_ID" | grep -q bob \
+  && ok "the proposal diff shows the proposed change" || fail "proposal diff wrong"
+[ "$(elanus config get watcher accounts)" = '["alice"]' ] \
+  && ok "live config is unchanged by a mere proposal" \
+  || fail "the proposal leaked into live: $(elanus config get watcher accounts)"
+kill -9 "$LLM_CFG_PID" 2>/dev/null; LLM_CFG_PID=""
+
+echo "== 24. proposal autonomy: assisted auto-applies, always-stop holds, human accepts (inc 4) =="
+# One fake LLM that issues whatever shell command sits in a file, so we can drive
+# several proposals through different per-agent autonomy levels.
+cat > "$TMP/fake_llm_auto.py" <<'PYEOF'
+import json, sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+CMDFILE = sys.argv[2]
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length', 0)); body = self.rfile.read(n).decode()
+        if '"tool_result"' in body:
+            content = [{"type": "text", "text": "done"}]; stop = "end_turn"
+        else:
+            cmd = open(CMDFILE).read()
+            content = [{"type": "tool_use", "id": "tc1", "name": "shell", "input": {"command": cmd}}]; stop = "tool_use"
+        resp = json.dumps({"id": "m", "type": "message", "role": "assistant", "model": "x",
+                           "content": content, "stop_reason": stop,
+                           "usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+        self.send_response(200); self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(resp))); self.end_headers(); self.wfile.write(resp)
+    def log_message(self, *a): pass
+srv = HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(srv.server_address[1])); srv.serve_forever()
+PYEOF
+python3 "$TMP/fake_llm_auto.py" "$TMP/llm_auto.port" "$TMP/agent_cmd.txt" &
+LLM_AUTO_PID=$!
+wait_for "autonomy fake LLM bound" "[ -s '$TMP/llm_auto.port' ]"
+LLM_AUTO_PORT=$(cat "$TMP/llm_auto.port")
+mkprofile() {  # name  level
+  mkdir -p "$TMP/profiles/$1"
+  cat > "$TMP/profiles/$1/profile.toml" <<EOF
+agent = "$1"
+owner = "owner"
+autonomy = "$2"
+
+[model]
+model = "claude-3-5-haiku-latest"
+max_turns = 6
+base_url = "http://127.0.0.1:$LLM_AUTO_PORT"
+api_key_env = "FAKE_LLM_KEY"
+EOF
+}
+# A config-target package that marks "accounts" agent-tunable (and nothing else).
+mkdir -p "$TMP/packages/tuner"
+cat > "$TMP/packages/tuner/elanus.toml" <<'EOF'
+[config]
+agent_tunable = ["accounts"]
+EOF
+
+# Case A — ASSISTED + an allowlisted key ("accounts") auto-applies.
+mkprofile asst assisted
+cat > "$TMP/agent_cmd.txt" <<'CMDEOF'
+cd "$ELANUS_CONFIG_DIR" && git checkout -q -b proposal/a && echo 'accounts = ["x","y"]' > packages/tuner.toml && git add -A && git -c user.name=a -c user.email=a@a commit -q -m a
+CMDEOF
+elanus exec go --session a1 --profile asst > "$TMP/exec-a.out" 2>&1 || fail "exec assisted: $(cat "$TMP/exec-a.out")"
+wait_for "assisted auto-applied an allowlisted change" "[ \"\$(elanus config get tuner accounts)\" = '[\"x\",\"y\"]' ]"
+
+# Case D — AUTONOMOUS + a PROTECTED (stdlib) package always stops.
+mkprofile autop autonomous
+cat > "$TMP/agent_cmd.txt" <<'CMDEOF'
+cd "$ELANUS_CONFIG_DIR" && git checkout -q -b proposal/h && echo 'level = "verbose"' > packages/history.toml && git add -A && git -c user.name=a -c user.email=a@a commit -q -m h
+CMDEOF
+elanus exec go --session h1 --profile autop > "$TMP/exec-h.out" 2>&1 || fail "exec autonomous: $(cat "$TMP/exec-h.out")"
+wait_for "the protected-package proposal was harvested" \
+  "elanus config proposals | grep -q history"
+elanus config get history level >/dev/null 2>&1 \
+  && fail "a protected-package change auto-applied at autonomous (must always stop)" \
+  || ok "autonomous holds a protected-package change (deterministic always-stop)"
+
+# Case E — a HUMAN accepts the held proposal (path-discipline OK; only auto was blocked).
+HID=$(elanus config proposals | grep history | python3 -c 'import json,sys;print(json.load(sys.stdin)["proposal"])')
+elanus config accept "$HID" >/dev/null || fail "human accept"
+[ "$(elanus config get history level)" = '"verbose"' ] \
+  && ok "a human can accept a held proposal (merge to live)" || fail "human accept did not merge"
+elanus config proposals | grep -q "$HID" \
+  && fail "accepted proposal still pending" || ok "the accepted proposal is no longer pending"
+kill -9 "$LLM_AUTO_PID" 2>/dev/null; LLM_AUTO_PID=""
 
 echo
 if [ "$FAILS" -eq 0 ]; then

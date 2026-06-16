@@ -1,4 +1,6 @@
+use crate::config_repo;
 use crate::db;
+use crate::envcompat::EnvDual;
 use crate::events::{self, EmitOpts};
 use crate::hooks;
 use crate::packages;
@@ -11,6 +13,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr as _;
@@ -35,6 +38,10 @@ struct Actor {
     name: String,
     child: Child,
     started: Instant,
+    /// Fingerprint of the package's config file at spawn (docs/config.md D3).
+    /// When the live config changes under a running daemon, this stops matching
+    /// and the supervisor restarts the actor so it re-reads.
+    config_fp: String,
 }
 
 #[derive(Default)]
@@ -57,6 +64,13 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
     // Before the first trace::write, or the publish path falls back to
     // mirroring at a listener that doesn't exist yet.
     crate::bus::init_daemon(root);
+    // Ensure the config repo exists (docs/config.md): idempotent, so a root
+    // created before the config model gains it on the next daemon start without
+    // a re-init. Best-effort — a git-less host degrades (config writes will
+    // fail) rather than taking the daemon down with it.
+    if let Err(e) = config_repo::init(root) {
+        eprintln!("[daemon] config repo unavailable (config writes disabled): {e:#}");
+    }
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
     merge_profile_throttles(root, &conn);
@@ -153,11 +167,17 @@ fn announce_ledger_events(root: &Root, conn: &Connection) -> Result<()> {
         r
     };
     for (id, etype, cause, corr, payload) in rows {
-        // Only in/# and signal/# ride the bus under their own topic; other
-        // ledger-emitted types (e.g. obs/channel receipts via `elanus emit`)
-        // keep their obs/harness/ledger/emit echo only. Mark the row either
-        // way so the sweep moves on.
-        if etype.starts_with("in/") || etype.starts_with("signal/") {
+        // in/# and signal/# ride the bus under their own topic, as does
+        // obs/config/# — a config acceptance is a live notification a dashboard
+        // wants (docs/config.md D3), and it is kernel-emitted so it would
+        // otherwise never reach a subscriber. Other obs/ types (e.g. obs/channel
+        // receipts via `elanus emit`) keep their obs/harness/ledger/emit echo
+        // only. A bus-origin event is already announced=1, so it never reaches
+        // this sweep — no double-publish. Mark the row either way so we move on.
+        if etype.starts_with("in/")
+            || etype.starts_with("signal/")
+            || etype.starts_with("obs/config/")
+        {
             let pv: Value = payload
                 .as_deref()
                 .map(|s| serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.into())))
@@ -211,6 +231,30 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
                 eprintln!("[daemon] actor wait error: {e}");
                 i += 1;
             }
+        }
+    }
+    // Config reload (docs/config.md D3): a running daemon whose package config
+    // changed is restarted so it re-reads. Kill it here; the boot loop below
+    // respawns it this same tick with the fresh fingerprint. This is an
+    // intentional restart, so it must NOT count as a crash — clear any strike
+    // and backoff so the reboot is immediate.
+    let mut i = 0;
+    while i < actors.running.len() {
+        let name = actors.running[i].name.clone();
+        if config_repo::fingerprint(root, &name) != actors.running[i].config_fp {
+            let mut a = actors.running.swap_remove(i);
+            // Kill the whole process group, not just the direct child: a shell
+            // daemon's descendants and the sandbox-exec wrapper would otherwise
+            // outlive the "reload" (the actor was spawned with process_group(0),
+            // so its pgid == its pid).
+            unsafe { libc::killpg(a.child.id() as i32, libc::SIGKILL) };
+            let _ = a.child.wait();
+            actors.strikes.remove(&name);
+            actors.backoff_until.remove(&name);
+            crate::bus::register_actor(&name, None);
+            status_event(root, &name, "reloading", json!({ "reason": "config changed" }));
+        } else {
+            i += 1;
         }
     }
     // Boot what's discovered and not running.
@@ -286,11 +330,21 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .unwrap_or_default();
-        cmd.current_dir(&pkg.dir)
+        // Own process group so a reload/stop can kill the whole tree, not just
+        // the direct child (the sandbox-exec wrapper or a shell daemon's
+        // descendants would otherwise survive) — same discipline as exec.rs.
+        cmd.process_group(0)
+            .current_dir(&pkg.dir)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err)
-            .env("HARNESS_ROOT", &root.dir)
+            .env_dual("ROOT", &root.dir)
+            // Read-actors (e.g. history) open the ledger directly; hand them the
+            // path rather than make them guess <root>/<dbname>. The cage allows
+            // db reads (write-fenced only). DB env was always "supervisor-given"
+            // by contract — only the fallback ever filled it, which broke when
+            // the file was renamed; now it is set for real.
+            .env_dual("DB", root.db())
             .env("ELANUS_PACKAGE", &pkg.name)
             .env("ELANUS_SCRATCH", &scratch)
             .env("ELANUS_BUS_ADDR", &addr)
@@ -304,7 +358,12 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
         match cmd.spawn() {
             Ok(child) => {
                 status_event(root, &pkg.name, "alive", json!({ "pid": child.id() }));
-                actors.running.push(Actor { name: pkg.name.clone(), child, started: Instant::now() });
+                actors.running.push(Actor {
+                    config_fp: config_repo::fingerprint(root, &pkg.name),
+                    name: pkg.name.clone(),
+                    child,
+                    started: Instant::now(),
+                });
             }
             Err(e) => {
                 crate::bus::register_actor(&pkg.name, None);
@@ -503,7 +562,7 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
     if dstate == "suspended" {
         // The suspend contract: before exiting 75 the handler emitted an ask
         // (in/human/<owner>). Match it by the emitting dispatch
-        // (HARNESS_DISPATCH_ID), so two handlers of the same event can each
+        // (ELANUS_DISPATCH_ID), so two handlers of the same event can each
         // park on their own ask without cross-wiring; fall back to cause for
         // emitters that lost env.
         //
@@ -826,21 +885,21 @@ fn spawn_handler(
         .stdin(Stdio::piped())
         .stdout(out_f)
         .stderr(err_f)
-        .env("HARNESS_EVENT_ID", event_id.to_string())
-        .env("HARNESS_DISPATCH_ID", dispatch_id.to_string())
-        .env("HARNESS_DB", root.db())
-        .env("HARNESS_TRACE", root.trace_file())
-        .env("HARNESS_ROOT", &root.dir)
-        .env("HARNESS_PROFILE", root.profile_dir("default"))
+        .env_dual("EVENT_ID", event_id.to_string())
+        .env_dual("DISPATCH_ID", dispatch_id.to_string())
+        .env_dual("DB", root.db())
+        .env_dual("TRACE", root.trace_file())
+        .env_dual("ROOT", &root.dir)
+        .env_dual("PROFILE", root.profile_dir("default"))
         .env("PATH", path_env);
     if let Some(c) = envelope["cause_id"].as_i64() {
-        cmd.env("HARNESS_CAUSE_ID", c.to_string());
+        cmd.env_dual("CAUSE_ID", c.to_string());
     }
     if let Some(c) = &correlation {
-        cmd.env("HARNESS_CORRELATION_ID", c);
+        cmd.env_dual("CORRELATION_ID", c);
     }
     if is_resume {
-        cmd.env("HARNESS_RESUME", "1");
+        cmd.env_dual("RESUME", "1");
     }
     match cmd.spawn() {
         Ok(mut child) => {

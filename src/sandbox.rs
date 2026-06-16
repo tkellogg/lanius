@@ -41,8 +41,10 @@ pub struct Cage {
 ///   write-denied.
 /// - `deny_write_trees`: the profiles directory — a profile confers authority
 ///   (writable prefixes, model, skill visibility) with no grant gate, so an
-///   agent editing one would escalate. The human edits profiles from an
-///   uncaged surface; caged actors are kept out.
+///   agent editing one would escalate — and the config repo (its `live` tree
+///   and `.git`), kernel-owned truth an agent must never rewrite directly; it
+///   proposes into its own clone instead. Both stay readable. The human edits
+///   them from an uncaged surface; caged actors are kept out.
 /// - `deny_all_trees`: the secret store — neither readable nor writable by
 ///   any actor.
 pub struct Protect {
@@ -52,12 +54,21 @@ pub struct Protect {
 }
 
 impl Protect {
+    // PRECONDITION: root.dir is canonical. macOS SBPL `subpath` matches the real
+    // (inode) path, so a deny rule given via a symlinked path component would not
+    // bind and the fence would silently not apply. paths::resolve() canonicalizes
+    // every root, and seatbelt_actually_cages exercises the config fence against
+    // a real cage to catch a regression of this invariant.
     pub fn for_root(root: &Root) -> Protect {
         let db = root.db();
         let wal = db.with_extension("db-wal");
         Protect {
             deny_write_files: vec![db, wal],
-            deny_write_trees: vec![root.profiles()],
+            // profiles confer authority; the config repo (live tree + .git) is
+            // kernel-owned truth an agent must not silently rewrite — both are
+            // readable but write-fenced (docs/config.md). The agent proposes
+            // into its own clone (increment 3), never the live tree directly.
+            deny_write_trees: vec![root.profiles(), root.config()],
             deny_all_trees: vec![root.secrets()],
         }
     }
@@ -276,7 +287,7 @@ mod tests {
     fn cage_for(root: &Root) -> Cage {
         Cage {
             write_roots: vec![root.dir.clone()],
-            exclude: vec!["run/".into(), "harness.db".into()],
+            exclude: vec!["run/".into(), "elanus.db".into()],
             sbpl: None,
         }
     }
@@ -311,7 +322,7 @@ mod tests {
         let cage = cage_for(&root);
         let before = snapshot(&cage);
         std::fs::write(root.dir.join("run/d1.out"), "noise").unwrap();
-        std::fs::write(root.dir.join("harness.db-wal"), "noise").unwrap();
+        std::fs::write(root.dir.join("elanus.db-wal"), "noise").unwrap();
         std::fs::write(root.dir.join("real.txt"), "signal").unwrap();
         let after = snapshot(&cage);
         let changes = diff(&before, &after);
@@ -322,8 +333,8 @@ mod tests {
     #[test]
     fn sbpl_contains_roots_and_denies_writes() {
         let protect = Protect {
-            deny_write_files: vec![PathBuf::from("/r/harness.db"), PathBuf::from("/r/harness.db-wal")],
-            deny_write_trees: vec![PathBuf::from("/r/profiles")],
+            deny_write_files: vec![PathBuf::from("/r/elanus.db"), PathBuf::from("/r/elanus.db-wal")],
+            deny_write_trees: vec![PathBuf::from("/r/profiles"), PathBuf::from("/r/config")],
             deny_all_trees: vec![PathBuf::from("/r/.secrets")],
         };
         let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect);
@@ -331,11 +342,14 @@ mod tests {
         assert!(p.contains("(subpath \"/tmp/ws\")"));
         assert!(p.contains("(subpath \"/dev\")"));
         // The ledger and its log are fenced; the -shm index is not.
-        assert!(p.contains("(deny file-write* (literal \"/r/harness.db\"))"));
-        assert!(p.contains("(deny file-write* (literal \"/r/harness.db-wal\"))"));
-        assert!(!p.contains("harness.db-shm"));
+        assert!(p.contains("(deny file-write* (literal \"/r/elanus.db\"))"));
+        assert!(p.contains("(deny file-write* (literal \"/r/elanus.db-wal\"))"));
+        assert!(!p.contains("elanus.db-shm"));
         // Profiles are write-fenced (a profile confers authority).
         assert!(p.contains("(deny file-write* (subpath \"/r/profiles\"))"));
+        // The config repo is write-fenced (kernel-owned truth); still readable.
+        assert!(p.contains("(deny file-write* (subpath \"/r/config\"))"));
+        assert!(!p.contains("(deny file-read* (subpath \"/r/config\"))"));
         // Secrets are fenced both ways.
         assert!(p.contains("(deny file-read* (subpath \"/r/.secrets\"))"));
         // The fence comes AFTER the allow block (last-match-wins).
@@ -411,5 +425,31 @@ mod tests {
             .output()
             .unwrap();
         assert!(!prof_write.status.success(), "editing a profile from the cage must fail");
+
+        // The config repo is kernel-owned truth: a caged actor must NOT be able
+        // to rewrite live config, but a daemon MUST be able to read its own
+        // config (docs/config.md). Write-fenced, read-allowed — the increment-2
+        // security property, asserted against the real seatbelt, not just the
+        // SBPL string.
+        std::fs::create_dir_all(root.config_packages()).unwrap();
+        let cfgfile = root.config_packages().join("watcher.toml");
+        std::fs::write(&cfgfile, "accounts = [\"alice\"]\n").unwrap(); // kernel-authored
+        let cfg_write = cage
+            .shell_command(&format!("echo x >> {}", cfgfile.display()))
+            .output()
+            .unwrap();
+        assert!(!cfg_write.status.success(), "writing live config from the cage must fail");
+        let cfg_read = cage
+            .shell_command(&format!("cat {} > /dev/null", cfgfile.display()))
+            .output()
+            .unwrap();
+        assert!(cfg_read.status.success(), "reading own config from the cage must succeed");
+        // ...and the repo's history (.git) is unwritable too.
+        std::fs::create_dir_all(root.config().join(".git")).unwrap();
+        let git_write = cage
+            .shell_command(&format!("echo x >> {}", root.config().join(".git/HEAD").display()))
+            .output()
+            .unwrap();
+        assert!(!git_write.status.success(), "writing config/.git from the cage must fail");
     }
 }

@@ -25,7 +25,7 @@ Two halves, by the transport doctrine (docs/actors.md):
            in/package/phonebook/split     {id}
          An agent can therefore only ever propose AS ITSELF; it cannot
          write a link stamped "human". Every write is also a ledgered
-         in/ event, so harness.db carries the audit trail of who claimed
+         in/ event, so elanus.db carries the audit trail of who claimed
          what. Results (and errors) fan out on obs/package/phonebook/result,
          echoing the request's correlation id so a caller can match them.
          Writes are AUTHENTICATED but not AUTHORIZED: any granted writer may
@@ -34,7 +34,7 @@ Two halves, by the transport doctrine (docs/actors.md):
          increment (HANDOFF increment 3).
 
 The store is the phonebook's OWN sqlite in its writable scratch — never
-the kernel-only-writable harness.db (the approvals ledger must not be
+the kernel-only-writable elanus.db (the approvals ledger must not be
 agent-writable; the phonebook must be, hence a separate store).
 
 Merge is non-destructive so split can undo it: an identity carries an
@@ -61,7 +61,7 @@ PKG = os.environ.get("ELANUS_PACKAGE", "phonebook")
 SCRATCH = os.environ.get("ELANUS_SCRATCH") or "."
 DB = os.path.join(SCRATCH, "phonebook.db")
 # The kernel ledger, read-only, only to check our own grant state.
-LEDGER = os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("HARNESS_ROOT", "."), "harness.db")
+LEDGER = os.environ.get("ELANUS_DB") or os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."), "elanus.db")
 
 REQ_FILTER = "in/package/phonebook/#"
 RESULT_TOPIC = "obs/package/phonebook/result"

@@ -20,7 +20,7 @@
 // rebinding), so every mutating route checks Origin/Host below, and
 // UI-driven decisions carry decided_by=ui in the ledger for the trail.
 //
-//   node server.mjs [--root <harness root>] [--port 7180] [--agent main]
+//   node server.mjs [--root <elanus root>] [--port 7180] [--agent main]
 // --root defaults to ~/.elanus/root — the same default the daemon uses — so
 // no flag is needed when you're on the default root.
 import fs from 'node:fs';
@@ -33,14 +33,14 @@ import { brokerUrl, parseArgs, resolveRoot } from './config.mjs';
 
 const args = parseArgs(process.argv.slice(2));
 if (args.help) {
-  console.log('usage: node server.mjs [--root <harness root>] [--url mqtt://...] [--port 7180] [--agent main]\n  --root defaults to ~/.elanus/root (the daemon default); pass it only to target another root');
+  console.log('usage: node server.mjs [--root <elanus root>] [--url mqtt://...] [--port 7180] [--agent main]\n  --root defaults to ~/.elanus/root (the daemon default); pass it only to target another root');
   process.exit(0);
 }
 const BROKER = brokerUrl(args);
 const PORT = args.port ?? Number(process.env.ELANUS_WEB_PORT ?? 7180);
 const AGENT = args.agent ?? 'main';
 const PUB = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
-const ROOT = resolveRoot(args); // --root > $HARNESS_ROOT > ~/.elanus/root, as the daemon resolves it
+const ROOT = resolveRoot(args); // --root > $ELANUS_ROOT > ~/.elanus/root, as the daemon resolves it
 
 // ---- observability --------------------------------------------------------
 // One cheap, greppable place to watch the surface from the backend (Tim:
@@ -94,7 +94,7 @@ let seq = 0;
 const sseClients = new Set();
 
 const cred = humanCredential();
-log('boot', `root=${ROOT} owner=${ownerName()} credential=${cred ? 'present' : 'MISSING — will be refused (deny-by-default); restart with the right --root/$HARNESS_ROOT'} broker=${BROKER} port=${PORT} agent=${AGENT}`);
+log('boot', `root=${ROOT} owner=${ownerName()} credential=${cred ? 'present' : 'MISSING — will be refused (deny-by-default); restart with the right --root/$ELANUS_ROOT'} broker=${BROKER} port=${PORT} agent=${AGENT}`);
 const client = mqtt.connect(BROKER, {
   protocolVersion: 5,
   clean: true,
@@ -114,9 +114,18 @@ client.on('close', () => {
   connected = false;
   broadcast({ kind: 'status', connected: false, broker: BROKER });
 });
-// Deny-by-default auth failures surface here (NotAuthorized connack); make the
-// refusal loud and actionable from the client side, not just the broker's.
-client.on('error', (err) => log('bus', `error: ${err?.code ?? ''} ${err?.message ?? err}${cred ? '' : ' — no credential found at this root'}`));
+// Transport failures and auth refusals both surface here; keep them distinct.
+// ECONNREFUSED means nothing is listening on this port (the daemon is down or
+// we're pointed at the wrong root) — that is NOT a credential problem, so don't
+// blame credentials for it. Only an actual auth-shaped failure with no cred in
+// hand warrants the deny-by-default hint.
+client.on('error', (err) => {
+  const code = err?.code ?? '';
+  const hint = code === 'ECONNREFUSED'
+    ? ` — nothing is listening at ${BROKER}; is the daemon running for this root (${ROOT})?`
+    : (cred ? '' : ' — no credential found at this root (deny-by-default will refuse us)');
+  log('bus', `error: ${code} ${err?.message ?? err}${hint}`);
+});
 client.on('reconnect', () => log('bus', `reconnecting to ${BROKER}…`));
 client.on('offline', () => log('bus', 'offline'));
 client.on('disconnect', (p) => log('bus', `broker disconnected us (reason ${p?.reasonCode ?? '?'})`));
@@ -194,7 +203,7 @@ try {
 function cli(cliArgs) {
   log('cli', `elanus ${cliArgs.join(' ')}`);
   return new Promise((resolve) => {
-    execFile(ELANUS_BIN, cliArgs, { env: { ...process.env, ...(ROOT ? { HARNESS_ROOT: ROOT } : {}) }, timeout: 30000 },
+    execFile(ELANUS_BIN, cliArgs, { env: { ...process.env, ...(ROOT ? { ELANUS_ROOT: ROOT } : {}) }, timeout: 30000 },
       (err, stdout, stderr) => {
         if (err) log('cli', `elanus ${cliArgs.join(' ')} FAILED: ${(String(stderr).trim().split('\n').pop() || err.message || '').slice(0, 200)}`);
         resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr), error: err ? String(err.message ?? err) : undefined });
@@ -316,7 +325,7 @@ async function handleAdmin(url, req, res, body) {
     return sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, packages: jsonLines(r.stdout) } : { ok: false, error: r.stderr || r.error });
   }
   if (url.pathname === '/api/admin/profile' && (req.method === 'GET' || req.method === 'PUT')) {
-    if (!ROOT) return sendJson(res, 503, { ok: false, error: 'no --root; profile editing needs the harness root' });
+    if (!ROOT) return sendJson(res, 503, { ok: false, error: 'no --root; profile editing needs the elanus root' });
     const name = url.searchParams.get('name') ?? 'default';
     if (!PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: BAD_NAME_MSG });
     const file = path.join(ROOT, 'profiles', name, 'profile.toml');

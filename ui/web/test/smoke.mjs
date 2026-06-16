@@ -15,7 +15,7 @@ const BIN = path.join(REPO, 'target/debug');
 const TMP = fs.mkdtempSync('/tmp/elanus-web-smoke.');
 const BUS_PORT = 18000 + (process.pid % 2000);
 const WEB_PORT = 7300 + (process.pid % 500);
-const ENV = { ...process.env, HARNESS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
+const ENV = { ...process.env, ELANUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
 
 let failures = 0;
 const ok = (m) => console.log(`  ok: ${m}`);
@@ -32,7 +32,7 @@ async function waitFor(desc, fn, timeoutMs = 15000) {
 }
 const elanus = (...a) => execFileSync(path.join(BIN, 'elanus'), a, { env: ENV, encoding: 'utf8' });
 // .timeout: the daemon holds the db in WAL; writers must wait, not fail
-const sql = (q) => execFileSync('sqlite3', ['-cmd', '.timeout 5000', path.join(TMP, 'harness.db'), q], { encoding: 'utf8' }).trim();
+const sql = (q) => execFileSync('sqlite3', ['-cmd', '.timeout 5000', path.join(TMP, 'elanus.db'), q], { encoding: 'utf8' }).trim();
 
 // -- daemon on a throwaway root --
 elanus('init');

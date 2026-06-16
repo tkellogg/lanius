@@ -3,11 +3,73 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 pub fn open(root: &Root) -> Result<Connection> {
+    migrate_db_filename(root);
     let conn = Connection::open(root.db())?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(conn)
+}
+
+/// One-time, no-brick rename of the ledger file from the legacy `harness.db` to
+/// `elanus.db` (the binary used to be `harness`). Runs at the single open
+/// chokepoint BEFORE the connection is made — otherwise sqlite would create a
+/// fresh empty elanus.db beside the old data. Moves the WAL/SHM siblings too so
+/// no committed-but-unflushed transactions are lost. Idempotent and best-effort:
+/// if the new name already exists, or there's nothing to move, it does nothing.
+fn migrate_db_filename(root: &Root) {
+    let new = root.db();
+    let old = root.legacy_db();
+    if new.exists() || !old.exists() {
+        return;
+    }
+    for (from, to) in [
+        (old.clone(), new.clone()),
+        (sibling(&old, "-wal"), sibling(&new, "-wal")),
+        (sibling(&old, "-shm"), sibling(&new, "-shm")),
+    ] {
+        if from.exists() {
+            if let Err(e) = std::fs::rename(&from, &to) {
+                eprintln!("[db] could not migrate {} -> {}: {e}", from.display(), to.display());
+            }
+        }
+    }
+}
+
+fn sibling(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = db.as_os_str().to_owned();
+    s.push(suffix);
+    std::path::PathBuf::from(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::Root;
+
+    #[test]
+    fn migrates_legacy_db_filename() {
+        let dir = std::env::temp_dir().join(format!("el-dbmig-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        // Seed an old-style harness.db with a row; no elanus.db present.
+        {
+            let conn = Connection::open(root.legacy_db()).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);").unwrap();
+        }
+        assert!(root.legacy_db().exists() && !root.db().exists());
+        // open() migrates the filename first, then opens the SAME data.
+        let conn = open(&root).unwrap();
+        assert!(root.db().exists(), "elanus.db must exist after migration");
+        assert!(!root.legacy_db().exists(), "harness.db must be gone after migration");
+        let x: i64 = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(x, 42, "data preserved across the rename");
+        // Idempotent: a second open is a no-op (already migrated).
+        drop(conn);
+        let _ = open(&root).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
@@ -21,7 +83,7 @@ CREATE TABLE IF NOT EXISTS events (
   payload         TEXT,
   state           TEXT NOT NULL DEFAULT 'pending',
                   -- pending | running | done | failed | waiting_on_human | expired | denied
-  -- Which handler invocation emitted this event (from HARNESS_DISPATCH_ID).
+  -- Which handler invocation emitted this event (from ELANUS_DISPATCH_ID).
   -- Scopes suspend/resume: an ask is matched to the dispatch that asked it.
   emitted_by_dispatch INTEGER,
   priority        INTEGER NOT NULL DEFAULT 0,

@@ -74,7 +74,7 @@ the recommendation below). Two directions:
 ## Corroborated fixes (earlier this session)
 
 - **Web server credential / deny-by-default** — server now resolves root as
-  `--root > $HARNESS_ROOT > ~/.elanus/root` and presents the fenced owner
+  `--root > $ELANUS_ROOT > ~/.elanus/root` and presents the fenced owner
   credential; suites connect cleanly (`[web:bus] connected as owner (connack
   reason 0)`), no refusals. Backend logging (`[web:boot|bus|http|cli|pub|sse]`,
   optional `ELANUS_WEB_LOG`) is the instrument that caught bug #1.

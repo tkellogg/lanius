@@ -41,8 +41,8 @@ import sys
 import time
 import urllib.request
 
-DB = os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("HARNESS_ROOT", "."), "harness.db")
-ROOT = os.environ.get("HARNESS_ROOT", ".")
+DB = os.environ.get("ELANUS_DB") or os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."), "elanus.db")
+ROOT = os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", ".")
 PKG = os.environ.get("ELANUS_PACKAGE", "recall")
 REQ_TOPIC = f"obs/harness/stagereq/{PKG}/recall"
 LIMIT = 14

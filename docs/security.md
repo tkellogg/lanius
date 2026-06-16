@@ -68,7 +68,7 @@ gap to close, not a hole in the promise.
 Three interlocking legs that must move together: bus authz default
 (unauthenticated must become deny, not "the human"), fs_read scoping (else
 the credential is just read off disk), exec-handler containment (uncaged,
-holds HARNESS_DB). Closing one alone closes nothing. Network-egress control
+holds ELANUS_DB). Closing one alone closes nothing. Network-egress control
 is the cleaner cut for leg 1.
 
 ## 2. [DESIGN DRAFTED] Identity model — see docs/identity.md
@@ -91,7 +91,7 @@ decisions on scope and sequencing are listed at the end of docs/identity.md.
 
 The write-cage exempts the harness root ("the harness must not cage itself
 out of its own ledger" — profile.rs SandboxCfg), and the root contains
-harness.db. So any caged process — the agent's own shell included — can edit
+elanus.db. So any caged process — the agent's own shell included — can edit
 the grants table with sqlite3, no `elanus approve` needed. The exemption is
 load-bearing for the recorder (the kernel must always reach its WAL); the
 fix is splitting "the kernel's write path" from "what children may write,"
@@ -158,7 +158,7 @@ resolved version in the grant.
   (2026-06-12): TOFU pin — sorted tools JSON hashed into kv on first load,
   mismatch refuses the tools until `elanus approve` re-pins. Two honest
   limits: the FIRST load is unreviewed (TOFU catches drift, not day-one
-  malice), and the pin lives in harness.db, which entry 3 says is writable
+  malice), and the pin lives in elanus.db, which entry 3 says is writable
   from inside every cage — so it is drift-detection, not a defense against
   a ledger-writing attacker. Pin-at-review (a sandboxed dry-run launch of
   the server during decide()) is the upgrade path; it was not built because
@@ -296,7 +296,7 @@ so an agent can only ever propose as itself (verified end to end).
 **[UPDATE 2026-06-14]** The HTTP read plane is not the only exposure: phonebook
 writes go over `in/package/phonebook/...`, which are ledgered events, so the
 who-is-who graph (identities, channel addresses, links) also lands in
-harness.db as event payloads — readable by any caged agent via a raw `sqlite3`
+elanus.db as event payloads — readable by any caged agent via a raw `sqlite3`
 read, the same cross-actor db-read gap that exposes transcripts and mail (the
 deferred read-confidentiality item; section 0 / Linux read-fence). So the fix
 "arrives with the authenticated read plane" only for the HTTP port; the raw-
@@ -363,7 +363,7 @@ webhook's receipt correctly carries `sender = webhook` (e2e section 20 asserts
 it). That is the right shape for any emitting/egress bridge and the documented
 recommendation (docs/actors.md). The general fix for the exec-handler path is
 part of the deferred exec-handler containment work (entry 1 / leg 3): spawn
-exec handlers token-authed as their package (and set `HARNESS_ACTOR` so the
+exec handlers token-authed as their package (and set `ELANUS_ACTOR` so the
 `elanus emit` path attributes correctly too), so their publishes attribute to
 the package and their declared publish grants are actually the thing enforced.
 Until then, an emitting handler's `sender` should be read as the surface
@@ -390,3 +390,73 @@ actor so the running process matches the ledger — the same
 `obs/config/changed` → restart path planned for config reload (HANDOFF D3).
 Until then, treat revoke as effective on the next daemon cycle; for an immediate
 stop, restart the daemon.
+
+## 18. [LATENT, found 2026-06-15] Git config-repo ops must neutralize filters/attrs before the increment-3 untrusted checkout
+
+Found by the adversarial review of config-model increment 2 (the config repo,
+docs/config.md). `src/config_repo.rs` is the first git integration; D2 promises
+every git op runs with "hooks AND filters OFF." The original `git()` builder
+set `core.hooksPath=/dev/null` and removed `GIT_DIR`/`GIT_WORK_TREE` (both
+verified load-bearing) but did NOT neutralize the operator's global/system
+gitconfig or attribute-driven clean/smudge filters. Reproduced under the exact
+kernel flags: a `[filter] smudge=…` in a hostile `~/.gitconfig`, and a repo-local
+`filter.*.smudge` + tracked `.gitattributes`, BOTH executed shell on
+`git checkout -- <file>`.
+
+Not exploitable in increment 2 as shipped: no code path checks out or fetches
+untrusted content (init/set_key/add/commit/status/rev-parse/read all touch
+kernel-authored content only). Mitigated now anyway — `git()` exports
+`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_ATTR_NOSYSTEM=1`
+(ambient config/aliases/filters can no longer fire; behavior is deterministic
+across machines), and the module doc states what is enforced.
+
+Becomes live in increment 3, whose design REUSES this builder to fetch + diff an
+UNTRUSTED agent clone. A `.gitattributes` travels in the fetched tree; if that
+path ever does a working-tree *checkout*, a smudge filter is code execution in
+uncaged kernel territory. Increment 3 MUST read fetched content via plumbing
+(`git cat-file`/`git diff`), never a checkout that runs smudge — or explicitly
+disable attribute filters for that op. Cite this entry in the increment-3 design.
+
+## 19. [FIXED 2026-06-16] Config-proposal acceptance: tree-mode + case-fold bypasses (found by the increment-3/4 adversarial workflows)
+
+The increment-3/4 review workflows (agent proposes config via an untrusted Git
+clone; autonomy auto-accepts) found a real, reproduced **arbitrary-file
+disclosure** and several siblings. All FIXED + regression-tested; recorded here
+because the class (judge a proposal by NAME, act on its CONTENT) will recur.
+
+- **[was CRITICAL] Symlink/gitlink/exec tree entry bypassed path-discipline.**
+  `proposal_packages` judged changed files by NAME only (`git diff --name-only`,
+  blind to the blob mode). A `packages/<pkg>.toml` committed as a symlink (git
+  mode 120000) passed, merged into kernel-owned `live`, and `read_package`
+  (`config list/get`, the web UI) followed it — returning the owner credential
+  or any file (`/etc/passwd`). Auto-accepted at autonomous AND assisted (the
+  symlink's target-path blob isn't valid TOML → empty changed-keys → Accept),
+  and it defeated human accept too. FIX: path-discipline now enumerates `git diff
+  --raw` and REFUSES any entry whose dst mode isn't `100644` (or `000000` =
+  deletion) — rejecting 120000/160000/100755 in the always-stop gate, before any
+  merge, for human and auto-accept alike. Defense in depth: `read_package`
+  refuses to follow a symlink (`symlink_metadata`).
+- **[was HIGH] Reap's clone `.git/config` neutralization followed an
+  agent-planted symlink** → arbitrary-file OVERWRITE in uncaged kernel context.
+  FIX: require `.git` to be a real dir (`symlink_metadata`), `remove_file` the
+  config first (deletes the link, not its target), then a CHECKED write; on any
+  failure, fail closed (don't read the clone).
+- **[was HIGH] Case-folded package name bypassed the protected-stdlib stop.**
+  `History.toml` ≠ `history` in the case-sensitive protected set, but collides on
+  a case-insensitive fs — an autonomous agent could auto-merge over a protected
+  package. FIX: `valid_pkg` now rejects non-lowercase names (one canonical
+  chokepoint), and the protected check compares case-insensitively.
+- **[was MEDIUM/LOW] DoS bounds.** A proposal's added objects are measured in the
+  clone and refused above `MAX_PROPOSAL_BYTES` (1 MiB) BEFORE the fetch copies
+  them into the live store; the changed-file count is capped (`MAX_PROPOSAL_FILES`).
+
+DEFERRED (LOW, noted not fixed): an `ask_human` suspend (`exit 75`) bypasses the
+reap, so a suspended run's proposal is harvested only when it finally terminates
+and its clone leaks until then (a UX edge, not a security hole).
+
+PROCESS NOTE: the adversarial workflow agents disregarded the "/tmp only" safety
+preamble and ran `elanus`/`git` in the repo itself — leaving 501 junk
+`proposal/*` branches, a stray junk commit, artifact files, and orphaned /tmp
+servers (one squatted an e2e port and caused a spurious §20 failure). All cleaned
++ `/config/` gitignored. Re-run such workflows with `isolation: "worktree"` per
+agent so their git side effects can't touch the main repo.

@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 
-DB = os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("HARNESS_ROOT", "."), "harness.db")
+DB = os.environ.get("ELANUS_DB") or os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."), "elanus.db")
 PKG = os.environ.get("ELANUS_PACKAGE", "recent-history")
 REQ_TOPIC = f"obs/harness/stagereq/{PKG}/recent-history"
 LIMIT = 12

@@ -1,19 +1,24 @@
 // Broker discovery — the server's one allowed filesystem touch beyond its
-// own static files: <root>/bus.toml, root from --root or $HARNESS_ROOT,
+// own static files: <root>/bus.toml, root from --root or $ELANUS_ROOT,
 // all of it overridable with --url. (Same contract as ui/tui/config.js.)
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 /**
- * The active harness root, mirroring src/paths.rs `resolve`/`default_root`
- * exactly: explicit --root > $HARNESS_ROOT > ~/.elanus/root. The default is
- * the same predictable place the daemon uses (and mints credentials in), so a
- * surface started with no flags talks to the same root the daemon does — no
- * --root needed when you're using the default. (Same contract as ui/tui.)
+ * The active elanus root, mirroring src/paths.rs `resolve`/`default_root`
+ * exactly: explicit --root > $ELANUS_ROOT (or legacy $HARNESS_ROOT) >
+ * ~/.elanus/root. The default is the same predictable place the daemon uses
+ * (and mints credentials in), so a surface started with no flags talks to the
+ * same root the daemon does — no --root needed when you're using the default.
  */
 export function resolveRoot({ root } = {}) {
-  return root ?? process.env.HARNESS_ROOT ?? path.join(os.homedir(), '.elanus', 'root');
+  return (
+    root ??
+    process.env.ELANUS_ROOT ??
+    process.env.HARNESS_ROOT ??
+    path.join(os.homedir(), '.elanus', 'root')
+  );
 }
 
 /** Minimal parse of bus.toml: we only need `enabled` and `bind`. */

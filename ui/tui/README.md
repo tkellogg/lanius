@@ -10,7 +10,7 @@ system through the bus alone.
 
 ```sh
 cd ui/tui && npm install
-node index.js --root /tmp/elanus-live     # or HARNESS_ROOT, or --url mqtt://127.0.0.1:18830
+node index.js --root /tmp/elanus-live     # or ELANUS_ROOT, or --url mqtt://127.0.0.1:18830
 ```
 
 The broker address comes from `<root>/bus.toml` (the one allowed filesystem

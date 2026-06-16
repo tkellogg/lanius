@@ -15,7 +15,7 @@ const TMP = fs.mkdtempSync('/tmp/elanus-ui-spec.');
 const BUS_PORT = 21000 + (process.pid % 2000);
 const WEB_PORT = 9300 + (process.pid % 500);
 const BASE = `http://127.0.0.1:${WEB_PORT}`;
-const ENV = { ...process.env, HARNESS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
+const ENV = { ...process.env, ELANUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
 
 let failures = 0;
 const ok = (m) => console.log(`  ok: ${m}`);

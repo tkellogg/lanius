@@ -387,7 +387,7 @@ A null `identity_id` on a channel is the unresolved state in (1); confidence
 and provenance are (2); the join is (3); re-pointing rather than deleting is
 (4). Because the phonebook must accept writes from agents but the approvals
 ledger must not, the phonebook is its own store, written by the phonebook
-service over the authenticated bus — never the kernel-only-writable harness.db.
+service over the authenticated bus — never the kernel-only-writable elanus.db.
 
 ## Recall: the unified frame, made easy but not forced
 
@@ -452,13 +452,13 @@ gap remains the deferred limitation in section 0).
 ## Implementation notes (increments 2, 4, 5, as built — 2026-06-14)
 
 - **Phonebook (increment 2)** — `packages/phonebook`, a daemon owning its own
-  sqlite in its scratch (never harness.db). Reads over HTTP (resolve / identity
+  sqlite in its scratch (never elanus.db). Reads over HTTP (resolve / identity
   / identities / channels / whois); writes over the authenticated bus
   (`in/package/phonebook/<op>`), so each link's provenance is the broker-
   verified sender — an agent proposes only as itself. Merge is non-destructive
   (a `merged_into` pointer), so split reverts; a channel can be recorded before
   it is resolved; resolution is a query-time join. The who-is-who graph also
-  lands in harness.db as the ledgered write events (security.md entry 14
+  lands in elanus.db as the ledgered write events (security.md entry 14
   update).
 - **Recall (increment 4)** — `packages/recall`, a resident context stage
   (order 25). Given an incoming channel, it assembles the conversation with

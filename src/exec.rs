@@ -1,5 +1,7 @@
+use crate::config_repo;
 use crate::context;
 use crate::db;
+use crate::envcompat::EnvDual;
 use crate::events::{self, EmitOpts};
 use crate::hooks;
 use crate::paths::Root;
@@ -52,11 +54,99 @@ pub fn run(root: &Root, opts: ExecOpts) -> Result<()> {
 async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
     let profile_name = opts.profile.clone();
     let session = opts.session.clone();
+    // docs/config.md increment 3: a proposal-capable agent gets a disposable
+    // clone of the config repo to edit. Set up before the turn, reap at the
+    // terminal boundary (an ask_human suspend exits the process before here, by
+    // design — that run harvests its proposal only when it finally terminates).
+    let config_clone = config_clone_setup(root, &profile_name);
     let result = run_turn(root, opts).await;
     if let Err(e) = &result {
         report_agent_failure(root, &profile_name, session.as_deref(), e);
     }
+    if let Some(clone) = &config_clone {
+        config_clone_reap(root, &profile_name, clone);
+    }
     result
+}
+
+/// docs/config.md increment 3 — set up the agent's config clone. A
+/// proposal-capable agent (profile `autonomy != "off"`) gets a disposable clone
+/// of the config repo in its run scratch (under `run/`, which is inside its cage
+/// and NOT the fenced `config/`), and `$ELANUS_CONFIG_DIR` points at it. Returns
+/// the clone path to reap, or None when the agent can't propose. Best-effort: a
+/// clone failure disables proposals for the run, never breaks the run.
+fn config_clone_setup(root: &Root, profile_name: &str) -> Option<std::path::PathBuf> {
+    let prof = profile::load(root, profile_name).ok()?.0;
+    if prof.autonomy == "off" {
+        return None;
+    }
+    let dest = root.run_dir().join(format!("exec-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest); // a crashed prior run may have left one
+    if let Err(e) = config_repo::clone_for_agent(root, &dest) {
+        eprintln!("[exec] config clone unavailable (proposals disabled this run): {e:#}");
+        return None;
+    }
+    std::env::set_var("ELANUS_CONFIG_DIR", &dest);
+    Some(dest)
+}
+
+/// docs/config.md increment 3 — reap the agent's clone at the terminal run
+/// boundary: harvest any `proposal/*` branch into a pending proposal (a
+/// `refs/proposals/<id>` ref + an `obs/config/proposed` ledger event attributed
+/// to the agent), then delete the clone. Increment 4 layers autonomy auto-accept
+/// on top of this.
+fn config_clone_reap(root: &Root, profile_name: &str, clone: &std::path::Path) {
+    let (agent, autonomy) = profile::load(root, profile_name)
+        .map(|(p, _)| (p.agent, p.autonomy))
+        .unwrap_or_default();
+    let proposals = config_repo::reap_proposals(root, clone, &agent).unwrap_or_default();
+    if !proposals.is_empty() {
+        if let Ok(conn) = db::open(root) {
+            for p in &proposals {
+                // The proposal happened — record it (provenance: the agent).
+                let _ = events::emit(
+                    root,
+                    &conn,
+                    EmitOpts {
+                        payload: Some(json!({
+                            "proposal": p.id,
+                            "agent": agent,
+                            "branch": p.branch,
+                            "files": p.files,
+                            "commit": p.commit,
+                        })),
+                        sender: Some(agent.clone()),
+                        ..EmitOpts::new("obs/config/proposed")
+                    },
+                );
+                // Autonomy (docs/config.md D4): auto-accept only what the agent's
+                // level allows; everything else waits for a person.
+                if let crate::configcli::Verdict::Accept =
+                    crate::configcli::classify(root, &p.id, &autonomy)
+                {
+                    if let Ok(sha) = config_repo::accept_proposal(root, &p.id) {
+                        let _ = events::emit(
+                            root,
+                            &conn,
+                            EmitOpts {
+                                payload: Some(json!({
+                                    "proposal": p.id,
+                                    "packages": p.files,
+                                    "commit": sha,
+                                    "decided_by": format!("autonomy:{autonomy}"),
+                                    "agent": agent,
+                                    "via": "autonomy",
+                                })),
+                                sender: Some(agent.clone()),
+                                ..EmitOpts::new("obs/config/changed")
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(clone);
 }
 
 /// Emit a labeled failure to the human mailbox for a dispatched, correlated
@@ -102,6 +192,9 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     // self-reported (the run writes the ledger directly) until the ledger
     // becomes kernel-only-writable; the broker-verified path is the
     // unforgeable one.
+    // Canonical name + legacy alias, so events::emit (and any child reading
+    // either) attributes to this agent.
+    std::env::set_var("ELANUS_ACTOR", &prof.agent);
     std::env::set_var("HARNESS_ACTOR", &prof.agent);
     let session = opts
         .session
@@ -535,7 +628,7 @@ fn obs_tool(agent: &str, session: &str, tool: &str, leaf: &str) -> String {
 /// Who holds leases acquired by this process: the enclosing dispatch when
 /// there is one (survives suspend/resume), else this pid.
 fn lease_holder() -> (Option<i64>, i64) {
-    let dispatch = std::env::var("HARNESS_DISPATCH_ID").ok().and_then(|v| v.parse().ok());
+    let dispatch = crate::envcompat::read("DISPATCH_ID").and_then(|v| v.parse().ok());
     (dispatch, std::process::id() as i64)
 }
 
@@ -1151,9 +1244,9 @@ fn run_shell(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("HARNESS_ROOT", &root.dir)
-        .env("HARNESS_DB", root.db())
-        .env("HARNESS_TRACE", root.trace_file());
+        .env_dual("ROOT", &root.dir)
+        .env_dual("DB", root.db())
+        .env_dual("TRACE", root.trace_file());
     // Own process group so a timeout can kill the whole tree, not just sh.
     c.process_group(0);
     let mut child = match c.spawn() {

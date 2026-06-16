@@ -14,7 +14,7 @@ const TMP = fs.mkdtempSync('/tmp/elanus-ui-walk.');
 const BUS_PORT = 23000 + (process.pid % 2000);
 const WEB_PORT = 9800 + (process.pid % 500);
 const BASE = `http://127.0.0.1:${WEB_PORT}`;
-const ENV = { ...process.env, HARNESS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
+const ENV = { ...process.env, ELANUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
 const SHOTS = '/tmp/elanus-ui-shots';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

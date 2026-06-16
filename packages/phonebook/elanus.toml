@@ -14,7 +14,7 @@
 #
 # The store is the phonebook's OWN sqlite in its writable scratch
 # ($ELANUS_SCRATCH/phonebook.db) — never the kernel-only-writable
-# harness.db, because the phonebook must accept agent writes and the
+# elanus.db, because the phonebook must accept agent writes and the
 # approvals ledger must not.
 #
 # Ships PENDING: it accepts writes and answers questions about people, so

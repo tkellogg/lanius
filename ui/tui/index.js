@@ -11,7 +11,7 @@ if (args.help) {
 
 usage: node ui/tui/index.js [--root <harness-root>] [--url mqtt://host:port] [--agent <noun>]
 
-broker discovery: --url wins; else <root>/bus.toml with root from --root or $HARNESS_ROOT.
+broker discovery: --url wins; else <root>/bus.toml with root from --root or $ELANUS_ROOT.
 keys: q quit · tab cycle panes · a/t/w/s stream filters · ↑/↓ + enter in asks pane`);
   process.exit(0);
 }
@@ -24,4 +24,4 @@ try {
   process.exit(1);
 }
 
-render(React.createElement(App, { url, agent: args.agent ?? 'main', root: args.root ?? process.env.HARNESS_ROOT ?? null }));
+render(React.createElement(App, { url, agent: args.agent ?? 'main', root: args.root ?? process.env.ELANUS_ROOT ?? process.env.HARNESS_ROOT ?? null }));

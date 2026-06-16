@@ -91,6 +91,10 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     // init — the human's surfaces can read them before any daemon is up, and
     // the daemon's own ensure() at startup is then idempotent.
     crate::secrets::ensure(&root)?;
+    // The configuration repository (docs/config.md): a kernel-owned git repo
+    // whose `live` branch holds package config. Created here so every root has
+    // it from the start; the cage fences it from agents (sandbox.rs Protect).
+    crate::config_repo::init(&root).context("initializing the config repo")?;
     // Seed <root>/kits with the stock kits FIRST so `init --kit core` (and
     // every later `kit add`) resolves without env vars or a repo checkout.
     for f in STOCK_KIT_FILES {
@@ -167,7 +171,7 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     println!("  elanus profile set default owner=<yourname>   # then restart the daemon");
     println!();
     println!("next steps:");
-    // The default root needs no env var; only point at HARNESS_ROOT when
+    // The default root needs no env var; only point at $ELANUS_ROOT when
     // this root actually requires it.
     let is_default = crate::paths::default_root()
         .ok()
@@ -175,7 +179,7 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
         .map(|d| d == root.dir)
         .unwrap_or(false);
     if !is_default {
-        println!("  export HARNESS_ROOT={}", root.dir.display());
+        println!("  export ELANUS_ROOT={}", root.dir.display());
     }
     println!("  elanus daemon &                     # the dispatcher");
     println!("  elanus exec --session hi \"hello\"    # chat (needs ANTHROPIC_API_KEY)");

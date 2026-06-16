@@ -372,12 +372,17 @@ packages/discord/
   scripts/...
 ```
 
-**[DECIDED]** `harness.toml` → `elanus.toml`. This supersedes v1's "generic
-role names" rule for this one file: an ecosystem-facing manifest wants the
-tool-named convention (`Cargo.toml`, `package.json`) for grep-ability and
-uniqueness. `HARNESS_*` env vars and `harness.db` keep their role names.
-Cron, provider, and throttle declarations carry over unchanged; v1
-`[[handler]]` declarations become subscription requests with `mode = "exec"`.
+**[DECIDED]** `harness.toml` → `elanus.toml`. An ecosystem-facing manifest wants
+the tool-named convention (`Cargo.toml`, `package.json`) for grep-ability and
+uniqueness. **[DECIDED 2026-06-16, supersedes the earlier "keep role names"
+carve-out]** the product is named `elanus` end to end: the ledger file is
+`elanus.db` (auto-migrated from `harness.db` at first open) and the canonical env
+vars are `ELANUS_*` (`ELANUS_ROOT`, `ELANUS_DB`, …). The old `HARNESS_*` names
+keep working — the kernel reads them as a fallback and sets them as legacy
+aliases on every child process (`src/envcompat.rs`) — so existing shells and
+custom package scripts don't break. Cron, provider, and throttle declarations
+carry over unchanged; v1 `[[handler]]` declarations become subscription requests
+with `mode = "exec"`.
 
 **[DECIDED]** Discovery via `package_path = [...]` in the profile
 (`ELANUS_PACKAGE_PATH` overrides), ordered, first-hit-wins name shadowing —
@@ -430,7 +435,7 @@ is].** What is actually enforced today:
 - **The OS cage bounds file *writes*** for daemon actors and the agent's
   shell tool — to scratch + approved `fs_write` (+ leases). Reads are open,
   network/loopback is open, and **exec-mode handlers are not caged at all and
-  receive `HARNESS_DB`** (they read/write the ledger directly — watchdog and
+  receive `ELANUS_DB`** (they read/write the ledger directly — watchdog and
   escalation are ledger-readers by design). So the cage is a write-fence on a
   subset of spawn paths, not a sandbox.
 - **The bus ACL is authentication-gated, and authentication is presently
@@ -456,7 +461,7 @@ legs that must move roughly together; closing one alone closes nothing:
    reads open the package simply reads the cookie and presents it. So leg 1 is
    load-bearing only *with* read scoping. (sandbox.md defers this.)
 3. **exec-handler containment** — this is a *separate door the bus does not
-   guard at all*: exec handlers run uncaged with `HARNESS_DB`, so a hostile
+   guard at all*: exec handlers run uncaged with `ELANUS_DB`, so a hostile
    exec package never touches the bus — it opens the ledger directly, inserts
    `work/agent/exec`, reads the transcripts table. Caging their writes and
    removing the raw DB handle collides with watchdog/escalation being

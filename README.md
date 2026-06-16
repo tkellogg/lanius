@@ -14,7 +14,7 @@ cargo build --release
 export PATH="$PWD/target/release:$PATH"
 
 elanus init ~/agent          # scaffolds db, trace, default profile, stock skills
-export HARNESS_ROOT=~/agent
+export ELANUS_ROOT=~/agent
 export ANTHROPIC_API_KEY=...  # any genai-supported provider works; see profile.toml
 ```
 
@@ -31,7 +31,7 @@ elanus inbox                                     # what's blocked on you?
 elanus answer 42 "yes, ship it"                  # answers route by correlation_id
 elanus events --limit 30                         # debug view of the log
 elanus render | less                             # inspect assembled context
-tail -f $HARNESS_ROOT/trace.jsonl | jq .          # the flight recorder
+tail -f $ELANUS_ROOT/trace.jsonl | jq .          # the flight recorder
 ```
 
 ## The milestone loop
@@ -48,7 +48,7 @@ vetoable.
 
 ## Skill packages
 
-A skill package is a directory in `$HARNESS_ROOT/skills/`, per the
+A skill package is a directory in `$ELANUS_ROOT/skills/`, per the
 [agentskills.io](https://agentskills.io) spec, optionally extended with a
 sibling `harness.toml` manifest:
 
@@ -82,9 +82,9 @@ failures — measured pain, not self-reported), `echo` (demo), `notes`
 ## Handler contract
 
 - Event JSON envelope on stdin (`{"resume": <answer event>}` added on resume).
-- Env: `HARNESS_EVENT_ID`, `HARNESS_CAUSE_ID`, `HARNESS_CORRELATION_ID`,
-  `HARNESS_DB`, `HARNESS_TRACE`, `HARNESS_ROOT`, `HARNESS_PROFILE`,
-  `HARNESS_RESUME=1` on resume.
+- Env: `ELANUS_EVENT_ID`, `ELANUS_CAUSE_ID`, `ELANUS_CORRELATION_ID`,
+  `ELANUS_DB`, `ELANUS_TRACE`, `ELANUS_ROOT`, `ELANUS_PROFILE`,
+  `ELANUS_RESUME=1` on resume.
 - Exit 0 done; exit 75 suspended (emit a `human/ask` with a correlation_id
   first — that's the resume key); anything else failed.
 - Emit follow-up events with `elanus emit`; `cause_id` threads automatically

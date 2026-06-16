@@ -16,7 +16,7 @@ judgement, with a confidence and a provenance, and to revise it later.
 Discover the port from harness state, then post a JSON body with a `kind`:
 
 ```sh
-PORT=$(python3 -c 'import json,os;print(json.load(open(os.environ["HARNESS_ROOT"]+"/run/pkg-phonebook/http.json"))["port"])')
+PORT=$(python3 -c 'import json,os;print(json.load(open((os.environ.get("ELANUS_ROOT") or os.environ["HARNESS_ROOT"])+"/run/pkg-phonebook/http.json"))["port"])')
 curl -s "http://127.0.0.1:$PORT/healthz"
 curl -s "http://127.0.0.1:$PORT/query" -d '{"kind":"resolve","channel_kind":"bluesky","address":"@tim.bsky"}'
 ```

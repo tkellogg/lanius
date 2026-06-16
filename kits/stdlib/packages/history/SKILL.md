@@ -5,7 +5,7 @@ description: The reconstruction view — answers read-only history queries (agen
 
 # history
 
-The ledger and transcripts in `harness.db` are the truth; the flight
+The ledger and transcripts in `elanus.db` are the truth; the flight
 recorder is a WAL, not a timeline. Anything that *reconstructs* reality from
 them — per-agent traces, conversation views, search — is userland
 (docs/bus.md, decided 2026-06-11). This package is the first such view: a
@@ -19,7 +19,7 @@ The harness assigns the port; read it from the run dir (never guess, never
 trust a bus message for this):
 
 ```sh
-PORT=$(python3 -c 'import json,os;print(json.load(open(os.environ["HARNESS_ROOT"]+"/run/pkg-history/http.json"))["port"])')
+PORT=$(python3 -c 'import json,os;print(json.load(open((os.environ.get("ELANUS_ROOT") or os.environ["HARNESS_ROOT"])+"/run/pkg-history/http.json"))["port"])')
 curl -s "http://127.0.0.1:$PORT/healthz"   # {"ok": true, "kinds": [...]}
 ```
 

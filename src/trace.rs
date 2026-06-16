@@ -15,9 +15,9 @@ pub struct Ids {
 impl Ids {
     pub fn from_env() -> Self {
         Ids {
-            event_id: std::env::var("HARNESS_EVENT_ID").ok().and_then(|v| v.parse().ok()),
-            cause_id: std::env::var("HARNESS_CAUSE_ID").ok().and_then(|v| v.parse().ok()),
-            correlation_id: std::env::var("HARNESS_CORRELATION_ID").ok().filter(|s| !s.is_empty()),
+            event_id: crate::envcompat::read("EVENT_ID").and_then(|v| v.parse().ok()),
+            cause_id: crate::envcompat::read("CAUSE_ID").and_then(|v| v.parse().ok()),
+            correlation_id: crate::envcompat::read("CORRELATION_ID").filter(|s| !s.is_empty()),
             session_id: None,
         }
     }

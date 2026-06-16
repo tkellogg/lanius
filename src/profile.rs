@@ -33,10 +33,23 @@ pub struct Profile {
     /// ELANUS_PACKAGE_PATH overrides.
     #[serde(default = "default_package_path")]
     pub package_path: Vec<String>,
+    /// How much of this agent's CONFIGURATION PROPOSALS auto-accept (docs/config.md
+    /// D4). "off" (default) = the agent gets no config-proposal machinery at all
+    /// (least privilege; most agents never manage config). The other levels give
+    /// it a config clone to edit and differ only in what merges without a human:
+    /// "manual" (every proposal waits), "assisted" (only diffs whose changed keys
+    /// the package marks agent-tunable), "autonomous" (any settings diff except a
+    /// protected/stdlib package). The agent only ever PROPOSES regardless.
+    #[serde(default = "default_autonomy")]
+    pub autonomy: String,
 }
 
 fn default_package_path() -> Vec<String> {
     vec!["packages".into()]
+}
+
+fn default_autonomy() -> String {
+    "off".into()
 }
 
 fn default_agent() -> String {
@@ -61,6 +74,7 @@ impl Default for Profile {
             sandbox: SandboxCfg::default(),
             vars: BTreeMap::new(),
             package_path: default_package_path(),
+            autonomy: default_autonomy(),
         }
     }
 }
@@ -135,8 +149,9 @@ pub struct SandboxCfg {
 }
 
 fn default_capture_exclude() -> Vec<String> {
-    // Kernel churn (db/wal/trace/run) would self-noise every diff.
-    ["harness.db", "trace.jsonl", "run/", ".env", ".git/", "target/", "node_modules/"]
+    // Kernel churn (db/wal/trace/run) would self-noise every diff. "elanus.db"
+    // prefix-excludes its -wal/-shm siblings too.
+    ["elanus.db", "trace.jsonl", "run/", ".env", ".git/", "target/", "node_modules/"]
         .iter()
         .map(|s| s.to_string())
         .collect()

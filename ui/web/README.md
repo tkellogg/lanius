@@ -43,7 +43,7 @@ UI-driven decisions carry `decided_by=ui` in the ledger:
 
 ```sh
 cd ui/web && npm install
-node server.mjs --root /tmp/elanus-live        # or HARNESS_ROOT / --url mqtt://...
+node server.mjs --root /tmp/elanus-live        # or $ELANUS_ROOT / --url mqtt://...
 # → http://127.0.0.1:7180   (--port to change)
 ```
 

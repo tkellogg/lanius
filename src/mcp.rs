@@ -26,6 +26,7 @@
 //!   missing tools degrade the agent, they don't corrupt meaning (stages
 //!   fail closed for the opposite reason).
 
+use crate::envcompat::EnvDual;
 use crate::packages;
 use crate::paths::Root;
 use crate::profile::{self, Profile};
@@ -202,7 +203,7 @@ impl Server {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .env("HARNESS_ROOT", &root.dir);
+            .env_dual("ROOT", &root.dir);
         let mut child = cmd.spawn().with_context(|| format!("spawning {}", script.display()))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();

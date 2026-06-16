@@ -32,6 +32,20 @@ pub struct Manifest {
     pub mcp: Vec<McpDecl>,
     #[serde(default)]
     pub throttle: BTreeMap<String, ThrottleDecl>,
+    #[serde(default)]
+    pub config: ConfigDecl,
+}
+
+/// A package's stance on its own configuration (docs/config.md D4). `agent_tunable`
+/// names the dotted config keys an agent may change WITHOUT a human confirming,
+/// at the "assisted" autonomy level — everything else still waits. Empty (the
+/// default) means nothing is agent-tunable, so an assisted agent's proposals all
+/// hold for the human.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigDecl {
+    #[serde(default)]
+    pub agent_tunable: Vec<String>,
 }
 
 /// What the package asks to be allowed to do. Every field is a request the

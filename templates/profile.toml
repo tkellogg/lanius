@@ -26,13 +26,13 @@ llm_tokens_per_hour = 400000
 [sandbox]
 # The whole-agent fs grant (docs/sandbox.md). fs_write prefixes (absolute or
 # root-relative) are the cage: the shell tool's whole process tree can only
-# write inside them, plus the harness root, system temp, and /dev. Empty or
+# write inside them, plus the elanus root, system temp, and /dev. Empty or
 # absent = no cage (camera still records obs/fs/ deltas of the root).
 # fs_write = ["workspace"]
-# capture_exclude = ["harness.db", "trace.jsonl", "run/", ".env", ".git/", "target/", "node_modules/"]
+# capture_exclude = ["elanus.db", "trace.jsonl", "run/", ".env", ".git/", "target/", "node_modules/"]
 # Where the shell tool runs (location, not authority — writes still flow
 # through the grant + leases). Absolute, ~ expands; must exist or the tool
-# call fails rather than silently falling back to the harness root.
+# call fails rather than silently falling back to the elanus root.
 # workdir = "~/code/myproject"
 
 [vars]

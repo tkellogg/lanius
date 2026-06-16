@@ -17,7 +17,7 @@ except (ValueError, TypeError):
     v = 20
 print(max(0, v))')
 CAP=3
-DB="$HARNESS_DB"
+DB="${ELANUS_DB:-$HARNESS_DB}"
 
 for ask_id in $(sqlite3 "$DB" "
   SELECT e.id FROM events e

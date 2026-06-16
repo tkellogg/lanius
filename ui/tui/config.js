@@ -1,5 +1,5 @@
 // Broker discovery — the TUI's one allowed filesystem touch: <root>/bus.toml,
-// root from --root or $HARNESS_ROOT, all of it overridable with --url.
+// root from --root or $ELANUS_ROOT (legacy $HARNESS_ROOT), overridable with --url.
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -12,8 +12,8 @@ export function parseBusToml(text) {
 
 export function brokerUrl({ root, url } = {}) {
   if (url) return url;
-  const r = root ?? process.env.HARNESS_ROOT;
-  if (!r) throw new Error('no broker: pass --url, --root, or set HARNESS_ROOT');
+  const r = root ?? process.env.ELANUS_ROOT ?? process.env.HARNESS_ROOT;
+  if (!r) throw new Error('no broker: pass --url, --root, or set ELANUS_ROOT');
   const file = path.join(r, 'bus.toml');
   let cfg = { enabled: true, bind: '127.0.0.1:1883' };
   if (fs.existsSync(file)) cfg = parseBusToml(fs.readFileSync(file, 'utf8'));

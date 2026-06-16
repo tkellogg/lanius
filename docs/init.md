@@ -142,13 +142,13 @@ How an individual handler executable is invoked (unchanged regardless of how it 
 registered — see Skill packages for registration):
 
 - Event JSON on stdin.
-- Env: `HARNESS_EVENT_ID`, `HARNESS_CAUSE_ID`, `HARNESS_CORRELATION_ID`,
-  `HARNESS_DB` (path), `HARNESS_TRACE` (path), `HARNESS_PROFILE` (path).
+- Env: `ELANUS_EVENT_ID`, `ELANUS_CAUSE_ID`, `ELANUS_CORRELATION_ID`,
+  `ELANUS_DB` (path), `ELANUS_TRACE` (path), `ELANUS_PROFILE` (path).
 - Exit 0 = done. Nonzero = failed (dispatcher records; retry policy per event type).
 - A distinguished exit code (e.g. 75, à la EX_TEMPFAIL) = **suspended** —
   handler checkpointed itself and exited; resume happens via correlation_id
   (see Human Actor section).
-- Handlers emit new events via `elanus emit`, which reads `HARNESS_EVENT_ID` from
+- Handlers emit new events via `elanus emit`, which reads `ELANUS_EVENT_ID` from
   env and threads `cause_id` automatically. Causality propagation must be
   zero-effort or it won't happen.
 

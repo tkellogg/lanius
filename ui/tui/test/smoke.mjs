@@ -17,7 +17,7 @@ const BIN = path.join(REPO, 'target/debug');
 const TMP = fs.mkdtempSync('/tmp/elanus-tui-smoke.');
 const PORT = 18000 + (process.pid % 2000);
 const URL = `mqtt://127.0.0.1:${PORT}`;
-const ENV = { ...process.env, HARNESS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
+const ENV = { ...process.env, ELANUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
 
 let failures = 0;
 const ok = (msg) => console.log(`  ok: ${msg}`);
