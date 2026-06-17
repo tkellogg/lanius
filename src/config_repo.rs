@@ -931,4 +931,47 @@ mod tests {
         assert!(valid_pkg("WATCHER").is_err());
         assert!(valid_pkg("watcher").is_ok());
     }
+
+    #[test]
+    fn exec_bit_proposal_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("execbit");
+        init(&root).unwrap();
+        set_key(&root, "watcher", "accounts", r#"["alice"]"#).unwrap();
+        let clone = root.dir.join("c");
+        clone_for_agent(&root, &clone).unwrap();
+        assert!(agent_git(&clone, &["checkout", "-b", "proposal/x", "--quiet"]));
+        let p = clone.join("packages/watcher.toml");
+        std::fs::write(&p, "accounts = [\"x\"]\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(agent_git(&clone, &["add", "-A"]));
+        assert!(agent_git(&clone, &["commit", "-m", "x", "--quiet"]));
+        let id = reap_proposals(&root, &clone, "scout").unwrap()[0].id.clone();
+        // An executable blob (mode 100755) is not a regular config file → refused.
+        assert!(proposal_packages(&root, &id).is_err(), "exec-bit (100755) is rejected");
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn reap_does_not_follow_a_gitconfig_symlink() {
+        let root = scratch("neutralize");
+        init(&root).unwrap();
+        let clone = root.dir.join("c");
+        clone_for_agent(&root, &clone).unwrap();
+        // A victim OUTSIDE the clone the hostile agent would target.
+        let victim = root.dir.join("victim.txt");
+        std::fs::write(&victim, "IMPORTANT\n").unwrap();
+        // Hostile: make the clone's .git/config a symlink to the victim. The
+        // neutralization must remove the link (not write through it).
+        let cfg = clone.join(".git").join("config");
+        std::fs::remove_file(&cfg).unwrap();
+        std::os::unix::fs::symlink(&victim, &cfg).unwrap();
+        let _ = reap_proposals(&root, &clone, "scout");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "IMPORTANT\n",
+            "the victim file must NOT be overwritten through the symlink"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
 }
