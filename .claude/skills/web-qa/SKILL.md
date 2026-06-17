@@ -1,6 +1,13 @@
 ---
 name: web-qa
-description: QA the elanus web dashboard (ui/web) by driving the real UI in a headless browser against an isolated live stack, asserting DURABLE state and reading the backend log. Use when changing ui/web (server.mjs, public/app.js, index.html, style.css), when a UI gesture "does nothing"/flashes/feels unconfirmed, before merging web-UI changes, or to add/run a configuration-flow regression. Catches the class of bug HTTP 200s hide: silent edit loss, feedback that flashes and vanishes, dead UI affordances.
+description: >-
+  QA the elanus web dashboard (ui/web) by driving the real UI in a headless
+  browser against an isolated live stack, asserting DURABLE state and reading
+  the backend log. Use when changing ui/web (server.mjs, public/app.js,
+  index.html, style.css), when a UI gesture "does nothing"/flashes/feels
+  unconfirmed, before merging web-UI changes, or to add/run a
+  configuration-flow regression. Catches the class of bug HTTP 200s hide:
+  silent edit loss, feedback that flashes and vanishes, dead UI affordances.
 ---
 
 # elanus web-qa
