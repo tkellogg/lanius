@@ -7,13 +7,14 @@
 //! stage-attributed error, never a silent skip.
 
 use crate::envcompat::EnvDual;
-use crate::packages;
 use crate::paths::Root;
 use crate::profile::{self, Profile};
+use crate::{config_repo, packages};
 use anyhow::{bail, Context as _, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -69,6 +70,8 @@ pub struct StageRef {
     pub order: u32,
     pub mode: String,
     pub timeout_ms: u64,
+    #[serde(skip_serializing)]
+    pub config_vars: BTreeMap<String, String>,
     pub approved: bool,
 }
 
@@ -110,12 +113,52 @@ pub fn chain(
                 timeout_ms: stage_override
                     .and_then(|o| o.timeout_ms)
                     .unwrap_or_else(|| if s.mode == "resident" { 15_000 } else { 10_000 }),
+                config_vars: stage_config_vars(root, &pkg.name, s)?,
                 approved,
             });
         }
     }
     out.sort_by(|a, b| (a.order, &a.package, &a.name).cmp(&(b.order, &b.package, &b.name)));
     Ok(out)
+}
+
+fn stage_config_vars(
+    root: &Root,
+    package: &str,
+    stage: &crate::manifest::StageDecl,
+) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for c in &stage.config {
+        if let Some(default) = &c.default {
+            out.insert(c.key.clone(), toml_value_to_var(default));
+        }
+        if let Some(raw) = config_repo::get_key(root, package, &c.key)? {
+            out.insert(c.key.clone(), toml_fragment_to_var(&raw));
+        }
+    }
+    Ok(out)
+}
+
+fn toml_fragment_to_var(raw: &str) -> String {
+    let wrapped = format!("value = {raw}");
+    wrapped
+        .parse::<toml::Value>()
+        .ok()
+        .and_then(|v| v.get("value").map(toml_value_to_var))
+        .unwrap_or_else(|| raw.trim().to_string())
+}
+
+fn toml_value_to_var(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Datetime(d) => d.to_string(),
+        toml::Value::Array(_) | toml::Value::Table(_) => {
+            serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +229,11 @@ pub fn assemble_detailed(
         event,
         meta,
     };
+    for s in stages {
+        for (k, v) in &s.config_vars {
+            doc.meta.vars.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
     validate(&doc).context("seed transcript invalid (kernel bug)")?;
     let mut summaries = Vec::new();
     for s in stages {
@@ -622,6 +670,75 @@ timeout_ms = 9000
             .collect();
         assert_eq!(got, vec![(5, "beta", "move"), (20, "alpha", "keep")]);
         assert_eq!(chain[0].timeout_ms, 9000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn declared_stage_config_seeds_meta_vars() {
+        let dir = std::env::temp_dir().join(format!("el-ctx-config-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let root = crate::paths::Root { dir: dir.clone() };
+        std::fs::create_dir_all(dir.join("profiles/default")).unwrap();
+        std::fs::create_dir_all(dir.join("packages/alpha/scripts")).unwrap();
+        std::fs::create_dir_all(dir.join("config/packages")).unwrap();
+        std::fs::write(
+            dir.join("packages/alpha/elanus.toml"),
+            r#"
+[[stage]]
+name = "window"
+run = "scripts/window"
+order = 20
+
+[[stage.config]]
+key = "rows"
+type = "number"
+default = 80
+
+[[stage.config]]
+key = "mode"
+type = "string"
+default = "compact"
+
+[[stage.config]]
+key = "flag"
+type = "boolean"
+default = false
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles/default/profile.toml"),
+            "agent = \"main\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config/packages/alpha.toml"),
+            "rows = 33\nflag = true\n",
+        )
+        .unwrap();
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let (prof, _) = crate::profile::load(&root, "default").unwrap();
+        let stages = chain(&root, &conn, "default", &prof).unwrap();
+        assert_eq!(stages[0].config_vars.get("rows").unwrap(), "33");
+        assert_eq!(stages[0].config_vars.get("mode").unwrap(), "compact");
+        assert_eq!(stages[0].config_vars.get("flag").unwrap(), "true");
+
+        let mut m = meta();
+        m.vars.insert("rows".into(), "50".into());
+        let assembly = assemble_detailed(
+            &root,
+            &[],
+            vec![json!({"role":"user","text":"hi"})],
+            Value::Null,
+            m,
+            &stages,
+            None,
+        )
+        .unwrap();
+        assert_eq!(assembly.doc.meta.vars.get("rows").unwrap(), "50");
+        assert_eq!(assembly.doc.meta.vars.get("mode").unwrap(), "compact");
+        assert_eq!(assembly.doc.meta.vars.get("flag").unwrap(), "true");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -204,6 +204,17 @@ const testAgentProfile = 'harrier';
     return /window\/window/.test(await page.$eval('#cfg-context-chain', (el) => el.textContent));
   }, 5000);
   await windowContextStage().locator('label', { hasText: 'timeout ms' }).locator('input').fill('9000');
+  await waitFor('configure: context stage declared setting renders in tile', async () => {
+    const text = await windowContextStage().textContent();
+    return /Window rows/.test(text)
+      && /context stage window/.test(text)
+      && /type:\s*number/.test(text);
+  }, 5000);
+  await windowContextStage()
+    .locator('.cfg-config-row', { hasText: 'Window rows' })
+    .locator('input[type="number"]')
+    .first()
+    .fill('60');
   const moveDown = windowContextStage().locator('button[aria-label="move window/window down"]').first();
   if (await moveDown.count() && !(await moveDown.isDisabled())) {
     await moveDown.click();
@@ -364,10 +375,10 @@ const testAgentProfile = 'harrier';
     : fail(`configure reload: context stage timeout wrong: "${contextWindowTimeout}"`);
   include.includes('#') ? ok('configure reload: skills.include persisted') : fail(`configure reload: include wrong: "${include}"`);
   exclude.includes('history') ? ok('configure reload: skills.exclude persisted') : fail(`configure reload: exclude wrong: "${exclude}"`);
-  varKey === 'window_rows' && varValue === '50'
+  varKey === 'window_rows' && varValue === '60'
     ? ok('configure reload: advanced context parameter persisted')
     : fail(`configure reload: context parameter wrong: "${varKey}"="${varValue}"`);
-  /\[vars\][\s\S]*window_rows\s*=\s*"50"/.test(rawToml)
+  /\[vars\][\s\S]*window_rows\s*=\s*"60"/.test(rawToml)
     ? ok('configure reload: raw [vars] persisted')
     : fail('configure reload: raw [vars] missing window_rows');
   /\[context\][\s\S]*max_total_ms\s*=\s*12000/.test(rawToml)

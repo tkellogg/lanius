@@ -62,12 +62,16 @@ recent-history context stage owns its window size, a recall context stage owns
 its retrieval policy, an event-prompt context stage owns event-to-message
 mapping knobs, and so on.
 
-Until that is built, `[vars]` remains as an advanced escape hatch:
+Typed `[[stage.config]]` declarations now give the product UI named controls,
+but the runtime wire stays simple: the kernel resolves stage defaults and
+package config into `meta.vars`, then lets profile `[vars]` override those
+values for one agent. `[vars]` remains the advanced escape hatch:
 
 - `meta.vars` gives context stages access to string parameters;
 - `{{name}}` template substitution can use the same values;
 - the UI should not present arbitrary key/value pairs as if they define an
-  agent. At most, show them as "advanced context parameters."
+  agent. It should prefer the context-stage tile controls and show raw key/value
+  rows only as "advanced context parameters."
 
 ## [DECIDED 2026-06-18] Packages ship context components, not identity
 
@@ -355,8 +359,8 @@ agent_tunable = true
   renames it; the design term is context stage.
 - Context-stage parameters are declared as typed `[[stage.config]]` entries.
   Product UI should present these named, documented knobs instead of arbitrary
-  `[vars]` maps. The current storage path is package config/defaults first;
-  per-agent override semantics are a later migration.
+  `[vars]` maps. Runtime resolution is defaults first, package config second,
+  and profile `[vars]` last so an agent-specific tile edit wins.
 
 **Fail closed.** A context stage that errors, times out, emits invalid JSON, or
 breaks a wire invariant fails the exec run with a context-stage-attributed

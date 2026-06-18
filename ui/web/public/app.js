@@ -440,6 +440,7 @@ let cfgKits = [];
 let cfgConfigPackages = new Set();
 let cfgContextChain = [];
 let cfgContextRemoved = new Set();
+let cfgContextVarEdits = new Map();
 const cfgKitDetails = new Map();
 const PARENT_PATH = '$parent';
 // The fields + both save buttons are LOCKED while the pane populates.
@@ -927,12 +928,28 @@ function contextStageDefs() {
     || a.name.localeCompare(b.name));
 }
 
+function contextStageConfigParams(stage) {
+  return (stage.config ?? [])
+    .filter((param) => param.key)
+    .map((param) => ({
+      key: param.key,
+      type: param.type ?? 'string',
+      label: param.label || param.key,
+      help: param.help || '',
+      default: param.default,
+      options: param.options ?? [],
+      agent_tunable: param.agent_tunable === true,
+      source: `context stage ${stage.name}`,
+    }));
+}
+
 function resetContextChain(context = {}) {
   const defs = contextStageDefs();
   const overrides = new Map((context.stages ?? []).map((s) => [contextStageKey(s), s]));
   cfgContextRemoved = new Set((context.stages ?? [])
     .filter((s) => s.enabled === false)
     .map(contextStageKey));
+  cfgContextVarEdits = new Map();
   cfgContextChain = [];
   for (const def of defs) {
     const ov = overrides.get(contextStageKey(def));
@@ -1064,6 +1081,39 @@ function renderContextChain() {
     timeout.appendChild(timeoutInput);
     controls.append(order, timeout);
     tile.append(head, controls);
+    const params = contextStageConfigParams(stage);
+    if (params.length) {
+      const settings = el('div', 'cfg-context-stage-config');
+      settings.appendChild(el('div', 'cfg-context-stage-subhead', 'settings'));
+      for (const param of params) {
+        const keyName = param.key;
+        const valueText = cfgParsed.vars?.[keyName] ?? '';
+        const row = el('div', 'cfg-config-row');
+        const label = el('label', '', param.label || keyName);
+        label.title = keyName;
+        const help = el('span', 'cfg-config-help');
+        help.textContent = [
+          param.source,
+          param.type ? `type: ${param.type}` : '',
+          param.agent_tunable ? 'agent-tunable' : '',
+          param.help,
+        ].filter(Boolean).join(' · ');
+        label.appendChild(help);
+        const input = typedConfigInput(param, cfgContextVarEdits.get(keyName) ?? valueText);
+        input.dataset.contextVar = keyName;
+        input.dataset.contextStage = contextStageKey(stage);
+        const markDirty = () => {
+          input.dataset.dirty = '1';
+          const value = typeof input.valueForSave === 'function' ? input.valueForSave() : input.value;
+          cfgContextVarEdits.set(keyName, value ?? '');
+        };
+        input.addEventListener('input', markDirty);
+        input.addEventListener('change', markDirty);
+        row.append(label, input, el('span'), el('span'));
+        settings.appendChild(row);
+      }
+      tile.appendChild(settings);
+    }
     box.appendChild(tile);
   });
 }
@@ -1097,6 +1147,17 @@ function contextStageOverridesForSave() {
     if (!chain.has(contextStageKey(def))) rows.push({ package: def.package, name: def.name, enabled: false });
   }
   return rows;
+}
+
+function contextStageVarsForSave() {
+  const out = new Map(cfgContextVarEdits);
+  for (const input of document.querySelectorAll('#cfg-context-chain [data-context-var][data-dirty="1"]')) {
+    const key = input.dataset.contextVar;
+    if (!key) continue;
+    const value = typeof input.valueForSave === 'function' ? input.valueForSave() : input.value;
+    out.set(key, value ?? '');
+  }
+  return out;
 }
 
 function packageConfigControls(p) {
@@ -1345,6 +1406,9 @@ $('#cfg-save').onclick = async () => {
     const k = row.querySelector('.cfg-var-key')?.value.trim();
     if (!k) continue;
     set[`vars.${k}`] = row.querySelector('.cfg-var-value')?.value ?? '';
+  }
+  for (const [k, v] of contextStageVarsForSave()) {
+    set[`vars.${k}`] = v;
   }
   for (const row of document.querySelectorAll('#cfg-throttle .cfg-throttle-row')) {
     const name = row.querySelector('.cfg-throttle-name')?.value.trim();

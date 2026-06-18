@@ -555,6 +555,13 @@ details[open] > summary .cfg-disclosure { transform: rotate(90deg); color: var(-
   min-width: 0; background: rgba(0,0,0,0.25); color: inherit; font: inherit; font-size: 13px;
   border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 7px 9px;
 }
+.cfg-context-stage-config {
+  margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.08);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.cfg-context-stage-subhead {
+  color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+}
 /* An action, not an agent — set it off from the agent list above. */
 .nav-new { color: var(--dim); border-top: 1px dashed var(--panel-edge); margin-top: 5px; padding-top: 7px; }
 .setup-row input { background: rgba(0,0,0,0.25); color: inherit; font: inherit; font-size: 13px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 7px 9px; }

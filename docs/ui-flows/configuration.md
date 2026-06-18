@@ -313,8 +313,9 @@ manifest `[[stage.config]]` declarations.
 
 **Observable expectation.** The row says it comes from `context stage window`,
 shows `type: number`, includes the manifest help text, and renders the numeric
-default `80`. Legacy `[vars]` remains available only through configure-7's raw
-advanced context parameters.
+default `80`. The same declared parameter is also available in the matching
+context-stage tile; legacy `[vars]` remains available only through configure-7's
+raw advanced context parameters.
 
 **How to verify.** Covered by `ui/web/test/ui.spec.mjs`.
 
@@ -331,13 +332,16 @@ the user edit raw TOML for the common fields.
 3. Set `max context ms` to `12000`.
 4. Inspect `#cfg-context-chain` and find the `window/window` context-stage tile.
 5. Change its `timeout ms` value to `9000`.
-6. Use the tile move controls when more than one context stage is visible.
-7. Click the main `#cfg-save` button.
+6. Change its declared `Window rows` setting to `60`.
+7. Use the tile move controls when more than one context stage is visible.
+8. Click the main `#cfg-save` button.
 
 **Observable expectation.** Save succeeds, reload preserves both controls, and
 the raw settings file contains `[context] max_total_ms = 12000` plus a
-`context.stage` array entry for `window/window` with `timeout_ms = 9000`. The UI
-presents context stages as an ordered chain, not as a singleton object.
+`context.stage` array entry for `window/window` with `timeout_ms = 9000`. The
+edited `Window rows` tile setting persists as `vars.window_rows = "60"` for this
+agent. The UI presents context stages as an ordered chain, not as a singleton
+object.
 
 **How to verify.** Covered by `ui/web/test/ui.spec.mjs`.
 
