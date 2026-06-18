@@ -384,8 +384,13 @@ custom package scripts don't break. Cron, provider, and throttle declarations
 carry over unchanged; v1 `[[handler]]` declarations become subscription requests
 with `mode = "exec"`.
 
-**[DECIDED]** Discovery via `package_path = [...]` in the profile
-(`ELANUS_PACKAGE_PATH` overrides), ordered, first-hit-wins name shadowing —
+**[DECIDED]** Discovery via per-agent `elanus_path = [...]`. Missing
+`elanus_path` inherits from the parent scope; `"$parent"` includes that scope at
+that point, e.g. `elanus_path = ["kits/dev", "$parent"]`. An agent inherits its
+parent profile, profiles without an explicit parent inherit `default`, and
+`default` inherits the built-in instance/global path. Each entry is either a
+package directory or a kit directory with a `packages/` child. The path is
+ordered, first-hit-wins name shadowing —
 systemd unit load path semantics (`/etc/systemd/system` > `/run` >
 `/usr/lib`, including override-by-shadowing).
 

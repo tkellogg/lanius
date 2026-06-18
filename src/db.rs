@@ -30,7 +30,11 @@ fn migrate_db_filename(root: &Root) {
     ] {
         if from.exists() {
             if let Err(e) = std::fs::rename(&from, &to) {
-                eprintln!("[db] could not migrate {} -> {}: {e}", from.display(), to.display());
+                eprintln!(
+                    "[db] could not migrate {} -> {}: {e}",
+                    from.display(),
+                    to.display()
+                );
             }
         }
     }
@@ -46,6 +50,11 @@ fn sibling(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use crate::paths::Root;
+    use sha2::{Digest, Sha256};
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
 
     #[test]
     fn migrates_legacy_db_filename() {
@@ -56,18 +65,70 @@ mod tests {
         // Seed an old-style harness.db with a row; no elanus.db present.
         {
             let conn = Connection::open(root.legacy_db()).unwrap();
-            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);").unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);")
+                .unwrap();
         }
         assert!(root.legacy_db().exists() && !root.db().exists());
         // open() migrates the filename first, then opens the SAME data.
         let conn = open(&root).unwrap();
         assert!(root.db().exists(), "elanus.db must exist after migration");
-        assert!(!root.legacy_db().exists(), "harness.db must be gone after migration");
+        assert!(
+            !root.legacy_db().exists(),
+            "harness.db must be gone after migration"
+        );
         let x: i64 = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(x, 42, "data preserved across the rename");
         // Idempotent: a second open is a no-op (already migrated).
         drop(conn);
         let _ = open(&root).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn context_and_subagent_substrate_schema_accepts_records() {
+        let dir = std::env::temp_dir().join(format!("el-dbctx-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = open(&root).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO context_blocks
+             (scope, owner, session_id, run_id, name, placement, priority, package, content, content_sha256, meta)
+             VALUES ('agent', 'main', NULL, NULL, 'identity', 'system', 10, 'core', 'hello', ?1, '{}')",
+            [sha256_hex(b"hello")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO context_build_log
+             (session_id, run_id, profile, agent, request_ordinal, component, action, block_name, after_sha256, summary, meta)
+             VALUES ('s1', 'run1', 'default', 'main', 1, 'seed', 'add', 'identity', ?1, 'seeded identity', '{}')",
+            [sha256_hex(b"hello")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO subagent_sessions
+             (parent_session_id, child_session_id, parent_agent, child_agent, child_profile, inherited_budget, context_program, grant_policy)
+             VALUES ('s1', 's1.child.1', 'main', 'scout', 'scout', 1, 'default', 'narrow')",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM context_build_log WHERE session_id='s1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let child: String = conn
+            .query_row(
+                "SELECT child_profile FROM subagent_sessions WHERE parent_session_id='s1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(child, "scout");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
@@ -220,15 +281,90 @@ CREATE TABLE IF NOT EXISTS llm_usage (
   output_tokens INTEGER NOT NULL DEFAULT 0,
   created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+-- Named, hashable context blocks. This is substrate only: the current prompt
+-- path still materializes context::Doc, but packages and future harness code
+-- need one durable place for block-shaped state.
+CREATE TABLE IF NOT EXISTS context_blocks (
+  id             INTEGER PRIMARY KEY,
+  scope          TEXT NOT NULL,   -- global | agent | session | run
+  owner          TEXT NOT NULL,   -- agent/human/package identity that owns the block
+  session_id     TEXT,
+  run_id         TEXT,
+  name           TEXT NOT NULL,
+  placement      TEXT NOT NULL,   -- system | before_messages | after_messages | user | scratch
+  priority       INTEGER NOT NULL DEFAULT 0,
+  package        TEXT,
+  content        TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  meta           TEXT,
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(scope, owner, session_id, run_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_context_blocks_owner ON context_blocks(owner, scope, name);
+CREATE INDEX IF NOT EXISTS idx_context_blocks_session ON context_blocks(session_id, name);
+
+-- Durable context build log: enough to reconstruct which component added,
+-- moved, rewrote, validated, or dropped blocks while building a provider
+-- request. Store summaries/hashes, not full prompt documents.
+CREATE TABLE IF NOT EXISTS context_build_log (
+  id             INTEGER PRIMARY KEY,
+  session_id     TEXT NOT NULL,
+  run_id         TEXT,
+  profile        TEXT NOT NULL,
+  agent          TEXT NOT NULL,
+  request_ordinal INTEGER,
+  component      TEXT NOT NULL,
+  action         TEXT NOT NULL,
+  block_name     TEXT,
+  before_sha256  TEXT,
+  after_sha256   TEXT,
+  summary        TEXT,
+  meta           TEXT,
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_context_build_log_session ON context_build_log(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_context_build_log_run ON context_build_log(run_id, id);
+
+-- Subagent lineage substrate. A subagent is an ordinary agent spawned by a
+-- parent run; the launcher will insert one row per child session/run so
+-- cancellation, budget attribution, and observability can follow the tree.
+CREATE TABLE IF NOT EXISTS subagent_sessions (
+  id                INTEGER PRIMARY KEY,
+  parent_session_id TEXT NOT NULL,
+  child_session_id  TEXT NOT NULL UNIQUE,
+  parent_event_id   INTEGER REFERENCES events(id),
+  parent_agent      TEXT NOT NULL,
+  child_agent       TEXT NOT NULL,
+  child_profile     TEXT NOT NULL,
+  inherited_budget  INTEGER NOT NULL DEFAULT 1,
+  context_program   TEXT,
+  grant_policy      TEXT NOT NULL DEFAULT 'narrow',
+  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  cancelled_at      TEXT,
+  finished_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_subagent_parent ON subagent_sessions(parent_session_id, id);
+CREATE INDEX IF NOT EXISTS idx_subagent_child ON subagent_sessions(child_session_id);
 "#,
     )?;
     // Migrations for databases created before a column existed; the error on
     // a duplicate column is expected and ignored.
-    let _ = conn.execute("ALTER TABLE events ADD COLUMN emitted_by_dispatch INTEGER", []);
-    let _ = conn.execute("ALTER TABLE grants ADD COLUMN code_hash TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute(
+        "ALTER TABLE events ADD COLUMN emitted_by_dispatch INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE grants ADD COLUMN code_hash TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     // DEFAULT 1: pre-existing rows count as already announced — upgrading
     // must not replay history onto the bus.
-    let _ = conn.execute("ALTER TABLE events ADD COLUMN announced INTEGER NOT NULL DEFAULT 1", []);
+    let _ = conn.execute(
+        "ALTER TABLE events ADD COLUMN announced INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE events ADD COLUMN sender TEXT", []);
     // Depends on the column above, so it lives after the migration, not in
     // the batch (a pre-`announced` DB would fail the whole batch otherwise).

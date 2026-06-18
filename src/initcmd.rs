@@ -16,21 +16,73 @@ struct PkgFile {
 /// packages/ dir; init materializes copies into the harness root so the root
 /// is self-contained and the user can edit/fork them freely.
 const PKG_FILES: &[PkgFile] = &[
-    PkgFile { rel: "chat/elanus.toml", content: include_str!("../packages/chat/elanus.toml"), exec: false },
-    PkgFile { rel: "chat/scripts/run", content: include_str!("../packages/chat/scripts/run"), exec: true },
-    PkgFile { rel: "echo/elanus.toml", content: include_str!("../packages/echo/elanus.toml"), exec: false },
-    PkgFile { rel: "echo/scripts/echo", content: include_str!("../packages/echo/scripts/echo"), exec: true },
-    PkgFile { rel: "notify/elanus.toml", content: include_str!("../packages/notify/elanus.toml"), exec: false },
-    PkgFile { rel: "notify/scripts/notify", content: include_str!("../packages/notify/scripts/notify"), exec: true },
-    PkgFile { rel: "watchdog/elanus.toml", content: include_str!("../packages/watchdog/elanus.toml"), exec: false },
-    PkgFile { rel: "watchdog/scripts/scan", content: include_str!("../packages/watchdog/scripts/scan"), exec: true },
-    PkgFile { rel: "notes/SKILL.md", content: include_str!("../packages/notes/SKILL.md"), exec: false },
+    PkgFile {
+        rel: "chat/elanus.toml",
+        content: include_str!("../packages/chat/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "chat/scripts/run",
+        content: include_str!("../packages/chat/scripts/run"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "echo/elanus.toml",
+        content: include_str!("../packages/echo/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "echo/scripts/echo",
+        content: include_str!("../packages/echo/scripts/echo"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "notify/elanus.toml",
+        content: include_str!("../packages/notify/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "notify/scripts/notify",
+        content: include_str!("../packages/notify/scripts/notify"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "watchdog/elanus.toml",
+        content: include_str!("../packages/watchdog/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "watchdog/scripts/scan",
+        content: include_str!("../packages/watchdog/scripts/scan"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "notes/SKILL.md",
+        content: include_str!("../packages/notes/SKILL.md"),
+        exec: false,
+    },
     // Ships pending, NOT auto-approved below: an approved stage shapes every
     // prompt; activating it is the human's call (elanus approve recent-history).
-    PkgFile { rel: "recent-history/elanus.toml", content: include_str!("../packages/recent-history/elanus.toml"), exec: false },
-    PkgFile { rel: "recent-history/scripts/main", content: include_str!("../packages/recent-history/scripts/main"), exec: true },
-    PkgFile { rel: "window/elanus.toml", content: include_str!("../packages/window/elanus.toml"), exec: false },
-    PkgFile { rel: "window/scripts/stage", content: include_str!("../packages/window/scripts/stage"), exec: true },
+    PkgFile {
+        rel: "recent-history/elanus.toml",
+        content: include_str!("../packages/recent-history/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "recent-history/scripts/main",
+        content: include_str!("../packages/recent-history/scripts/main"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "window/elanus.toml",
+        content: include_str!("../packages/window/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "window/scripts/stage",
+        content: include_str!("../packages/window/scripts/stage"),
+        exec: true,
+    },
 ];
 
 /// ALL stock kits, seeded into <root>/kits so every root has the
@@ -38,34 +90,134 @@ const PKG_FILES: &[PkgFile] = &[
 /// dir is the config; these are just its defaults (write_if_missing, so
 /// edits and deletions stick).
 const STOCK_KIT_FILES: &[PkgFile] = &[
-    PkgFile { rel: "core/README.md", content: include_str!("../kits/core/README.md"), exec: false },
-    PkgFile { rel: "core/packages/harness-doctrine/SKILL.md", content: include_str!("../kits/core/packages/harness-doctrine/SKILL.md"), exec: false },
-    PkgFile { rel: "core/packages/self-modify/SKILL.md", content: include_str!("../kits/core/packages/self-modify/SKILL.md"), exec: false },
-    PkgFile { rel: "core/packages/escalate/SKILL.md", content: include_str!("../kits/core/packages/escalate/SKILL.md"), exec: false },
-    PkgFile { rel: "core/profiles/architect/profile.toml", content: include_str!("../kits/core/profiles/architect/profile.toml"), exec: false },
-    PkgFile { rel: "core/profiles/architect/blocks/00-architect.md", content: include_str!("../kits/core/profiles/architect/blocks/00-architect.md"), exec: false },
-    PkgFile { rel: "dev/README.md", content: include_str!("../kits/dev/README.md"), exec: false },
-    PkgFile { rel: "dev/packages/git-protect/elanus.toml", content: include_str!("../kits/dev/packages/git-protect/elanus.toml"), exec: false },
-    PkgFile { rel: "dev/packages/git-protect/scripts/gate", content: include_str!("../kits/dev/packages/git-protect/scripts/gate"), exec: true },
-    PkgFile { rel: "dev/profiles/dev/profile.toml", content: include_str!("../kits/dev/profiles/dev/profile.toml"), exec: false },
-    PkgFile { rel: "funnel/README.md", content: include_str!("../kits/funnel/README.md"), exec: false },
-    PkgFile { rel: "funnel/packages/funnel-intake/elanus.toml", content: include_str!("../kits/funnel/packages/funnel-intake/elanus.toml"), exec: false },
-    PkgFile { rel: "funnel/packages/funnel-intake/scripts/main", content: include_str!("../kits/funnel/packages/funnel-intake/scripts/main"), exec: true },
-    PkgFile { rel: "funnel/packages/funnel-sift/elanus.toml", content: include_str!("../kits/funnel/packages/funnel-sift/elanus.toml"), exec: false },
-    PkgFile { rel: "funnel/packages/funnel-sift/rules.txt", content: include_str!("../kits/funnel/packages/funnel-sift/rules.txt"), exec: false },
-    PkgFile { rel: "funnel/packages/funnel-sift/scripts/sift", content: include_str!("../kits/funnel/packages/funnel-sift/scripts/sift"), exec: true },
-    PkgFile { rel: "funnel/packages/funnel-scout/elanus.toml", content: include_str!("../kits/funnel/packages/funnel-scout/elanus.toml"), exec: false },
-    PkgFile { rel: "funnel/packages/funnel-scout/scripts/run", content: include_str!("../kits/funnel/packages/funnel-scout/scripts/run"), exec: true },
-    PkgFile { rel: "funnel/profiles/scout/profile.toml", content: include_str!("../kits/funnel/profiles/scout/profile.toml"), exec: false },
-    PkgFile { rel: "funnel/profiles/scout/blocks/00-scout.md", content: include_str!("../kits/funnel/profiles/scout/blocks/00-scout.md"), exec: false },
+    PkgFile {
+        rel: "core/README.md",
+        content: include_str!("../kits/core/README.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/packages/harness-doctrine/SKILL.md",
+        content: include_str!("../kits/core/packages/harness-doctrine/SKILL.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/packages/self-modify/SKILL.md",
+        content: include_str!("../kits/core/packages/self-modify/SKILL.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/packages/escalate/SKILL.md",
+        content: include_str!("../kits/core/packages/escalate/SKILL.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/profiles/architect/profile.toml",
+        content: include_str!("../kits/core/profiles/architect/profile.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/profiles/architect/blocks/00-architect.md",
+        content: include_str!("../kits/core/profiles/architect/blocks/00-architect.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "dev/README.md",
+        content: include_str!("../kits/dev/README.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "dev/packages/git-protect/elanus.toml",
+        content: include_str!("../kits/dev/packages/git-protect/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "dev/packages/git-protect/scripts/gate",
+        content: include_str!("../kits/dev/packages/git-protect/scripts/gate"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "dev/profiles/dev/profile.toml",
+        content: include_str!("../kits/dev/profiles/dev/profile.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "funnel/README.md",
+        content: include_str!("../kits/funnel/README.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "funnel/packages/funnel-intake/elanus.toml",
+        content: include_str!("../kits/funnel/packages/funnel-intake/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "funnel/packages/funnel-intake/scripts/main",
+        content: include_str!("../kits/funnel/packages/funnel-intake/scripts/main"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "funnel/packages/funnel-sift/elanus.toml",
+        content: include_str!("../kits/funnel/packages/funnel-sift/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "funnel/packages/funnel-sift/rules.txt",
+        content: include_str!("../kits/funnel/packages/funnel-sift/rules.txt"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "funnel/packages/funnel-sift/scripts/sift",
+        content: include_str!("../kits/funnel/packages/funnel-sift/scripts/sift"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "funnel/packages/funnel-scout/elanus.toml",
+        content: include_str!("../kits/funnel/packages/funnel-scout/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "funnel/packages/funnel-scout/scripts/run",
+        content: include_str!("../kits/funnel/packages/funnel-scout/scripts/run"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "funnel/profiles/scout/profile.toml",
+        content: include_str!("../kits/funnel/profiles/scout/profile.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "funnel/profiles/scout/blocks/00-scout.md",
+        content: include_str!("../kits/funnel/profiles/scout/blocks/00-scout.md"),
+        exec: false,
+    },
     // stdlib: the protected, always-on kit (docs/config.md). Installed and
     // auto-approved unconditionally in init(); history (the transcript view) is
     // its first member, so the web UI's sessions tab always has something to read.
-    PkgFile { rel: "stdlib/README.md", content: include_str!("../kits/stdlib/README.md"), exec: false },
-    PkgFile { rel: "stdlib/kit.toml", content: include_str!("../kits/stdlib/kit.toml"), exec: false },
-    PkgFile { rel: "stdlib/packages/history/elanus.toml", content: include_str!("../kits/stdlib/packages/history/elanus.toml"), exec: false },
-    PkgFile { rel: "stdlib/packages/history/scripts/main", content: include_str!("../kits/stdlib/packages/history/scripts/main"), exec: true },
-    PkgFile { rel: "stdlib/packages/history/SKILL.md", content: include_str!("../kits/stdlib/packages/history/SKILL.md"), exec: false },
+    PkgFile {
+        rel: "stdlib/README.md",
+        content: include_str!("../kits/stdlib/README.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/kit.toml",
+        content: include_str!("../kits/stdlib/kit.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/history/elanus.toml",
+        content: include_str!("../kits/stdlib/packages/history/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/history/scripts/main",
+        content: include_str!("../kits/stdlib/packages/history/scripts/main"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "stdlib/packages/history/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/history/SKILL.md"),
+        exec: false,
+    },
 ];
 
 const PROFILE_TOML: &str = include_str!("../templates/profile.toml");
@@ -76,8 +228,15 @@ const BLOCK_CONTEXT: &str = include_str!("../templates/block-10-context.md");
 
 pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
-    let root = Root { dir: dir.canonicalize()? };
-    for d in [root.packages(), root.run_dir(), root.profile_dir("default").join("blocks"), root.secrets()] {
+    let root = Root {
+        dir: dir.canonicalize()?,
+    };
+    for d in [
+        root.packages(),
+        root.run_dir(),
+        root.profile_dir("default").join("blocks"),
+        root.secrets(),
+    ] {
         std::fs::create_dir_all(d)?;
     }
     // The secret store is the kernel's; keep it 0700 so even outside the cage
@@ -106,13 +265,30 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     }
     // Resolve every kit BEFORE installing anything: a typo'd kit name must
     // not leave a half-installed root behind.
-    let kit_dirs = kits.iter().map(|k| kit::resolve(&root, k)).collect::<Result<Vec<_>>>()?;
+    let kit_dirs = kits
+        .iter()
+        .map(|k| kit::resolve(&root, k))
+        .collect::<Result<Vec<_>>>()?;
 
     write_if_missing(&root.recorder_file(), RECORDER_TOML, false)?;
     write_if_missing(&root.bus_file(), BUS_TOML, false)?;
-    write_if_missing(&root.profile_dir("default").join("profile.toml"), PROFILE_TOML, false)?;
-    write_if_missing(&root.profile_dir("default").join("blocks/00-system.md"), BLOCK_SYSTEM, false)?;
-    write_if_missing(&root.profile_dir("default").join("blocks/10-context.md"), BLOCK_CONTEXT, false)?;
+    write_if_missing(
+        &root.profile_dir("default").join("profile.toml"),
+        PROFILE_TOML,
+        false,
+    )?;
+    write_if_missing(
+        &root.profile_dir("default").join("blocks/00-system.md"),
+        BLOCK_SYSTEM,
+        false,
+    )?;
+    write_if_missing(
+        &root.profile_dir("default").join("blocks/10-context.md"),
+        BLOCK_CONTEXT,
+        false,
+    )?;
+    let _ =
+        crate::config_repo::commit_agent(&root, "default", "config: seed default agent profile");
 
     for f in PKG_FILES {
         let path = root.packages().join(f.rel);
@@ -128,7 +304,10 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     packages::upsert_throttle(
         &conn,
         "signal/#",
-        &ThrottleDecl { coalesce: Some(false), ..Default::default() },
+        &ThrottleDecl {
+            coalesce: Some(false),
+            ..Default::default()
+        },
     )?;
     if !root.trace_file().exists() {
         std::fs::write(root.trace_file(), "")?;
@@ -145,7 +324,11 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     // Kits: starter packs (src/kit.rs). Linked by default — the kit dir
     // stays the source and a local copy shadows it; --copy vendors. Either
     // way init is the human install gesture, provenance kit:<name>.
-    let mode = if copy_kits { kit::Mode::Copy } else { kit::Mode::Link };
+    let mode = if copy_kits {
+        kit::Mode::Copy
+    } else {
+        kit::Mode::Link
+    };
     // Stdlib is installed and auto-approved in EVERY root (docs/config.md): the
     // protected packages the product itself depends on — history's transcript
     // view first, so the sessions tab is never a dead 503. Linked, not vendored
@@ -187,7 +370,9 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     println!("  elanus inbox / elanus answer <id> \"...\"");
     println!("  elanus packages                     # what's installed, what's pending");
     println!("  elanus approve history              # transcripts in the web UI (granted serving)");
-    println!("  elanus approve recent-history       # cross-run memory of recent mail (a context stage)");
+    println!(
+        "  elanus approve recent-history       # cross-run memory of recent mail (a context stage)"
+    );
     println!("  elanus bus sub 'obs/#'              # watch the live stream");
     println!("  tail -f {}", root.trace_file().display());
     for (name, readme) in &readmes {

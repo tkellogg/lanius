@@ -34,7 +34,10 @@ fn client(root: &Root, addr: SocketAddr, tag: &str) -> (AsyncClient, rumqttc::v5
     //    identity from the fenced store. A caged agent shell running the CLI
     //    cannot read that store, so it presents no credential — and is refused
     //    (deny-by-default), which is the point.
-    if let (Ok(pkg), Ok(token)) = (std::env::var("ELANUS_PACKAGE"), std::env::var("ELANUS_BUS_TOKEN")) {
+    if let (Ok(pkg), Ok(token)) = (
+        std::env::var("ELANUS_PACKAGE"),
+        std::env::var("ELANUS_BUS_TOKEN"),
+    ) {
         opts.set_credentials(pkg, token);
     } else {
         // The human's own command line: present the owner identity from the
@@ -57,7 +60,9 @@ fn addr(root: &Root) -> Result<SocketAddr> {
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
-    Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?)
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
 }
 
 /// Publish once. QoS 1 (default) returns only after the broker's PUBACK —
@@ -187,7 +192,9 @@ pub fn subscribe(
                     id: None,
                     user_properties,
                 };
-                client.subscribe_with_properties(filter, QoS::AtLeastOnce, props).await?;
+                client
+                    .subscribe_with_properties(filter, QoS::AtLeastOnce, props)
+                    .await?;
             }
             None => client.subscribe(filter, QoS::AtLeastOnce).await?,
         }
@@ -246,8 +253,10 @@ pub fn subscribe(
                     use std::io::Write as _;
                     std::io::stdout().flush().ok();
                     if let Some(verdict) = read_verdict() {
-                        let corr =
-                            p.properties.as_ref().and_then(|pr| pr.correlation_data.clone());
+                        let corr = p
+                            .properties
+                            .as_ref()
+                            .and_then(|pr| pr.correlation_data.clone());
                         let props = rumqttc::v5::mqttbytes::v5::PublishProperties {
                             correlation_data: corr,
                             ..Default::default()
@@ -263,9 +272,7 @@ pub fn subscribe(
                             .await?;
                         awaiting_ack += 1;
                     } else {
-                        eprintln!(
-                            "[bus sub] no verdict on stdin; broker timeout/default applies"
-                        );
+                        eprintln!("[bus sub] no verdict on stdin; broker timeout/default applies");
                     }
                 } else {
                     let payload: Value = serde_json::from_slice(&p.payload).unwrap_or_else(|_| {

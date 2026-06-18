@@ -51,21 +51,34 @@ impl Recorder {
     /// else hits trace.
     fn default_rules() -> Vec<Rule> {
         vec![
-            Rule { filter: "obs/fs/#".into(), sink: Sink::None },
-            Rule { filter: "#".into(), sink: Sink::Trace },
+            Rule {
+                filter: "obs/fs/#".into(),
+                sink: Sink::None,
+            },
+            Rule {
+                filter: "#".into(),
+                sink: Sink::Trace,
+            },
         ]
     }
 
     pub fn load(root: &Root) -> Recorder {
         let path = root.recorder_file();
         let Ok(s) = std::fs::read_to_string(&path) else {
-            return Recorder { rules: Self::default_rules() };
+            return Recorder {
+                rules: Self::default_rules(),
+            };
         };
         let parsed: RuleFile = match toml::from_str(&s) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[recorder] {} parse error, using defaults: {e}", path.display());
-                return Recorder { rules: Self::default_rules() };
+                eprintln!(
+                    "[recorder] {} parse error, using defaults: {e}",
+                    path.display()
+                );
+                return Recorder {
+                    rules: Self::default_rules(),
+                };
             }
         };
         let mut rules = Vec::new();
@@ -78,11 +91,17 @@ impl Recorder {
                 "trace" | "ledger" => Sink::Trace,
                 "none" => Sink::None,
                 other => {
-                    eprintln!("[recorder] unknown sink {other:?} for {:?}, treating as none", r.match_filter);
+                    eprintln!(
+                        "[recorder] unknown sink {other:?} for {:?}, treating as none",
+                        r.match_filter
+                    );
                     Sink::None
                 }
             };
-            rules.push(Rule { filter: r.match_filter, sink });
+            rules.push(Rule {
+                filter: r.match_filter,
+                sink,
+            });
         }
         if rules.is_empty() {
             rules = Self::default_rules();
@@ -120,7 +139,10 @@ mod tests {
         Recorder {
             rules: rules
                 .iter()
-                .map(|(f, s)| Rule { filter: f.to_string(), sink: *s })
+                .map(|(f, s)| Rule {
+                    filter: f.to_string(),
+                    sink: *s,
+                })
                 .collect(),
         }
     }
@@ -152,7 +174,9 @@ mod tests {
 
     #[test]
     fn default_silences_per_file_fs_keeps_summary() {
-        let r = Recorder { rules: Recorder::default_rules() };
+        let r = Recorder {
+            rules: Recorder::default_rules(),
+        };
         assert_eq!(r.sink_for("obs/fs/Users/tim/code/x.rs"), Sink::None);
         assert_eq!(r.sink_for("obs/agent/main/s1/fs/summary"), Sink::Trace);
         assert_eq!(r.sink_for("signal/pain"), Sink::Trace);

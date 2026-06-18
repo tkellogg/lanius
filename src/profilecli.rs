@@ -3,6 +3,7 @@
 //! lives in ONE place (toml_edit, comments preserved) instead of being
 //! reimplemented in node.
 
+use crate::config_repo;
 use crate::paths::Root;
 use crate::profile;
 use anyhow::{bail, Context, Result};
@@ -39,11 +40,27 @@ pub fn list(root: &Root) -> Result<()> {
                 "profile": name,
                 "agent": p.agent,
                 "owner": p.owner,
+                "parent": p.parent,
                 "model": p.model.model,
                 "max_turns": p.model.max_turns,
+                "base_url": p.model.base_url,
+                "api_key_env": p.model.api_key_env,
                 "workdir": p.sandbox.workdir,
                 "fs_write": p.sandbox.fs_write,
+                "capture_exclude": p.sandbox.capture_exclude,
                 "skills": { "include": p.skills.include, "exclude": p.skills.exclude },
+                "local_elanus_path": profile::local_elanus_path(root, &name).unwrap_or(None),
+                "elanus_path": p.elanus_path,
+                "package_path": p.elanus_path,
+                "autonomy": p.autonomy,
+                "context": {
+                    "program": p.context.program,
+                    "max_total_ms": p.context.max_total_ms,
+                    "stages": p.context.stages,
+                },
+                "subagents": p.subagents,
+                "vars": p.vars,
+                "throttle": p.throttle,
                 "dir": pdir,
             })
         );
@@ -63,13 +80,27 @@ pub fn get(root: &Root, name: &str) -> Result<()> {
             "profile": name,
             "agent": p.agent,
             "owner": p.owner,
+            "parent": p.parent,
             "model": p.model.model,
             "max_turns": p.model.max_turns,
             "base_url": p.model.base_url,
+            "api_key_env": p.model.api_key_env,
             "workdir": p.sandbox.workdir,
             "fs_write": p.sandbox.fs_write,
+            "capture_exclude": p.sandbox.capture_exclude,
             "skills": { "include": p.skills.include, "exclude": p.skills.exclude },
-            "package_path": p.package_path,
+            "local_elanus_path": profile::local_elanus_path(root, name).unwrap_or(None),
+            "elanus_path": p.elanus_path,
+            "package_path": p.elanus_path,
+            "autonomy": p.autonomy,
+            "context": {
+                "program": p.context.program,
+                "max_total_ms": p.context.max_total_ms,
+                "stages": p.context.stages,
+            },
+            "subagents": p.subagents,
+            "vars": p.vars,
+            "throttle": p.throttle,
             "toml": raw,
         })
     );
@@ -82,21 +113,31 @@ pub fn get(root: &Root, name: &str) -> Result<()> {
 /// strings) and treated as a bare string otherwise. Comments survive
 /// (toml_edit). The file is validated through the kernel loader BEFORE
 /// being written — a set that produces an unloadable profile never lands.
-pub fn set(root: &Root, name: &str, pairs: &[String]) -> Result<()> {
+pub fn set(root: &Root, name: &str, pairs: &[String]) -> Result<Option<String>> {
     valid_name(name)?;
+    config_repo::init(root)?;
     let pdir = root.profile_dir(name);
     let f = pdir.join("profile.toml");
     if !f.exists() {
         bail!("no profile {name:?} (create it with `elanus profile new {name}`)");
     }
     let raw = std::fs::read_to_string(&f)?;
-    let mut doc: toml_edit::DocumentMut =
-        raw.parse().with_context(|| format!("parsing {}", f.display()))?;
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .with_context(|| format!("parsing {}", f.display()))?;
     for pair in pairs {
         let Some((path, val)) = pair.split_once('=') else {
             bail!("expected key=value, got {pair:?}");
         };
         let value = parse_value(val);
+        let path = if path == "package_path" {
+            "elanus_path"
+        } else {
+            path
+        };
+        if path == "elanus_path" {
+            doc.remove("package_path");
+        }
         let segs: Vec<&str> = path.split('.').collect();
         if segs.iter().any(|s| s.is_empty()) {
             bail!("bad key path {path:?}");
@@ -113,10 +154,11 @@ pub fn set(root: &Root, name: &str, pairs: &[String]) -> Result<()> {
     }
     // Validate before writing: serde must accept what we produced.
     let candidate = doc.to_string();
-    toml::from_str::<profile::Profile>(&candidate)
+    let parsed: profile::Profile = toml::from_str(&candidate)
         .with_context(|| "refusing to write: the result would not load as a profile")?;
-    std::fs::write(&f, candidate)?;
-    Ok(())
+    profile::validate(&parsed)
+        .with_context(|| "refusing to write: the result would not load as a profile")?;
+    write_profile_and_commit(root, name, &f, &candidate, "config: update agent profile")
 }
 
 /// Validate that a candidate `profile.toml` (read from `path`) would load as a
@@ -126,16 +168,44 @@ pub fn set(root: &Root, name: &str, pairs: &[String]) -> Result<()> {
 /// silently break the agent, without the kernel having to trust the bytes.
 pub fn validate(path: &str) -> Result<()> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-    toml::from_str::<profile::Profile>(&raw)
-        .with_context(|| "the file would not load as a profile")?;
+    let parsed: profile::Profile =
+        toml::from_str(&raw).with_context(|| "the file would not load as a profile")?;
+    profile::validate(&parsed).with_context(|| "the file would not load as a profile")?;
     Ok(())
+}
+
+/// Replace a raw profile.toml from a candidate file. Used by the web raw editor
+/// so it never owns direct profile writes.
+pub fn put(root: &Root, name: &str, path: &str) -> Result<Option<String>> {
+    valid_name(name)?;
+    config_repo::init(root)?;
+    let candidate = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+    let parsed: profile::Profile =
+        toml::from_str(&candidate).with_context(|| "the file would not load as a profile")?;
+    profile::validate(&parsed).with_context(|| "the file would not load as a profile")?;
+    let pdir = root.profile_dir(name);
+    std::fs::create_dir_all(&pdir)?;
+    let f = pdir.join("profile.toml");
+    write_profile_and_commit(
+        root,
+        name,
+        &f,
+        &candidate,
+        "config: update raw agent profile",
+    )
 }
 
 /// Scaffold a profile: agent noun defaults to the profile name, blocks
 /// seeded from the default profile's (an agent should start with SOME
 /// identity to edit, not an empty prompt).
-pub fn new(root: &Root, name: &str, agent: Option<&str>, model: Option<&str>) -> Result<()> {
+pub fn new(
+    root: &Root,
+    name: &str,
+    agent: Option<&str>,
+    model: Option<&str>,
+) -> Result<Option<String>> {
     valid_name(name)?;
+    config_repo::init(root)?;
     let agent = agent.unwrap_or(name);
     if !crate::topic::valid_name(agent) || agent.contains('/') {
         bail!("agent {agent:?} must be one topic level (it becomes in/agent/{agent})");
@@ -166,8 +236,52 @@ pub fn new(root: &Root, name: &str, agent: Option<&str>, model: Option<&str>) ->
         }
     }
     println!("created profile {name} (agent {agent}, mailbox in/agent/{agent})");
-    println!("dispatch to it: elanus emit in/agent/{agent} --payload '{{\"prompt\":\"...\",\"profile\":\"{name}\"}}'");
-    Ok(())
+    println!(
+        "dispatch to it: elanus emit in/agent/{agent} --payload '{{\"prompt\":\"...\",\"profile\":\"{name}\"}}'"
+    );
+    match config_repo::commit_agent(root, name, "config: create agent profile") {
+        Ok((sha, changed)) => Ok(changed.then_some(sha)),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&pdir);
+            config_repo::reset_agent(root, name);
+            Err(e)
+        }
+    }
+}
+
+fn write_profile_and_commit(
+    root: &Root,
+    name: &str,
+    file: &std::path::Path,
+    candidate: &str,
+    msg: &str,
+) -> Result<Option<String>> {
+    let prior = std::fs::read_to_string(file).ok();
+    if prior.as_deref() == Some(candidate) {
+        return Ok(None);
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = file.with_extension("toml.tmp");
+    std::fs::write(&tmp, candidate)?;
+    std::fs::rename(&tmp, file)?;
+    match config_repo::commit_agent(root, name, msg) {
+        Ok((sha, true)) => Ok(Some(sha)),
+        Ok((_sha, false)) => Ok(None),
+        Err(e) => {
+            match prior {
+                Some(p) => {
+                    let _ = std::fs::write(file, p);
+                }
+                None => {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+            config_repo::reset_agent(root, name);
+            Err(e)
+        }
+    }
 }
 
 fn parse_value(raw: &str) -> toml_edit::Value {
@@ -184,7 +298,9 @@ fn parse_value(raw: &str) -> toml_edit::Value {
 fn valid_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 64
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         bail!("bad profile name {name:?} (alphanumeric, dash, underscore)");
     }
@@ -210,16 +326,55 @@ mod tests {
     #[test]
     fn set_preserves_comments_and_validates() {
         let root = scratch("set");
-        set(&root, "default", &["agent=kestrel".into(), "model.max_turns=7".into()]).unwrap();
-        let raw = std::fs::read_to_string(root.profile_dir("default").join("profile.toml")).unwrap();
+        config_repo::init(&root).unwrap();
+        set(
+            &root,
+            "default",
+            &[
+                "agent=kestrel".into(),
+                "model.max_turns=7".into(),
+                "context.max_total_ms=12000".into(),
+                "context.stage=[{package=\"window\",name=\"window\",enabled=true,order=10,timeout_ms=9000}]".into(),
+                "subagents.allow_profiles=[\"scout\"]".into(),
+                "subagents.max_depth=2".into(),
+            ],
+        )
+        .unwrap();
+        let raw =
+            std::fs::read_to_string(root.profile_dir("default").join("profile.toml")).unwrap();
         assert!(raw.contains("# keep me"));
         let (p, _) = profile::load(&root, "default").unwrap();
         assert_eq!(p.agent, "kestrel");
         assert_eq!(p.model.max_turns, 7);
+        assert_eq!(p.context.program, "default");
+        assert_eq!(p.context.max_total_ms, 12_000);
+        assert_eq!(p.context.stages.len(), 1);
+        assert_eq!(p.context.stages[0].package, "window");
+        assert_eq!(p.context.stages[0].timeout_ms, Some(9000));
+        assert_eq!(p.subagents.allow_profiles, vec!["scout".to_string()]);
+        assert_eq!(p.subagents.max_depth, 2);
         // An invalid set must not land.
         assert!(set(&root, "default", &["model.max_turns=\"lots\"".into()]).is_err());
+        assert!(set(&root, "default", &["context.program=\"custom\"".into()]).is_err());
+        assert!(set(
+            &root,
+            "default",
+            &["subagents.grant_policy=\"wide\"".into()]
+        )
+        .is_err());
         let (p, _) = profile::load(&root, "default").unwrap();
-        assert_eq!(p.model.max_turns, 7, "failed set must leave the file untouched");
+        assert_eq!(
+            p.model.max_turns, 7,
+            "failed set must leave the file untouched"
+        );
+        assert_eq!(
+            p.context.max_total_ms, 12_000,
+            "failed set must leave context config untouched"
+        );
+        assert_eq!(
+            p.subagents.max_depth, 2,
+            "failed set must leave subagent config untouched"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -228,12 +383,36 @@ mod tests {
         let root = scratch("new");
         std::fs::create_dir_all(root.profile_dir("default").join("blocks")).unwrap();
         std::fs::write(root.profile_dir("default").join("blocks/00-x.md"), "id").unwrap();
+        config_repo::init(&root).unwrap();
         new(&root, "scout2", None, Some("claude-haiku-4-5-20251001")).unwrap();
         let (p, _) = profile::load(&root, "scout2").unwrap();
         assert_eq!(p.agent, "scout2");
         assert_eq!(p.model.model, "claude-haiku-4-5-20251001");
         assert!(root.profile_dir("scout2").join("blocks/00-x.md").exists());
         assert!(new(&root, "scout2", None, None).is_err(), "no clobber");
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn set_migrates_package_path_alias() {
+        let root = scratch("path-alias");
+        config_repo::init(&root).unwrap();
+        let file = root.profile_dir("default").join("profile.toml");
+        std::fs::write(&file, "agent = \"main\"\npackage_path = [\"packages\"]\n").unwrap();
+        set(
+            &root,
+            "default",
+            &["elanus_path=[\"packages\", \"kits/demo\"]".into()],
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(file).unwrap();
+        assert!(raw.contains("elanus_path"));
+        assert!(!raw.contains("package_path"));
+        let (p, _) = profile::load(&root, "default").unwrap();
+        assert_eq!(
+            p.elanus_path,
+            vec!["packages".to_string(), "kits/demo".to_string()]
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 }

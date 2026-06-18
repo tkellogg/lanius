@@ -51,7 +51,10 @@ impl EmitOpts {
 /// zero-effort or it won't happen.
 pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
     if !crate::topic::valid_name(&o.etype) {
-        anyhow::bail!("invalid event type {:?}: must be a wildcard-free topic name", o.etype);
+        anyhow::bail!(
+            "invalid event type {:?}: must be a wildcard-free topic name",
+            o.etype
+        );
     }
     if o.cause.is_none() {
         o.cause = crate::envcompat::read("EVENT_ID").and_then(|v| v.parse().ok());
@@ -91,7 +94,11 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
         // Only reachable with an idempotency key: return the existing event.
         let key = o.idempotency.as_deref().unwrap_or_default();
         let existing: Option<i64> = conn
-            .query_row("SELECT id FROM events WHERE idempotency_key = ?1", [key], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM events WHERE idempotency_key = ?1",
+                [key],
+                |r| r.get(0),
+            )
             .optional()?;
         if let Some(id) = existing {
             return Ok(id);

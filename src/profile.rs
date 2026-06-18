@@ -1,13 +1,15 @@
 use crate::manifest::ThrottleDecl;
 use crate::paths::Root;
-use anyhow::{Context, Result};
-use serde::Deserialize;
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub const PARENT_PATH: &str = "$parent";
+
 /// profile.toml — one file, whole identity: skill visibility, throttles,
 /// sandbox policy, model selection, template vars.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Profile {
     /// The agent noun (docs/topics.md decided item 6): this profile's agent
@@ -18,6 +20,10 @@ pub struct Profile {
     /// The human owner's noun: asks address in/human/<owner>.
     #[serde(default = "default_owner")]
     pub owner: String,
+    /// Optional parent profile. A child profile inherits elanus_path from its
+    /// parent; profiles without an explicit parent inherit from "default".
+    #[serde(default)]
+    pub parent: Option<String>,
     #[serde(default)]
     pub model: ModelCfg,
     #[serde(default)]
@@ -28,11 +34,15 @@ pub struct Profile {
     pub sandbox: SandboxCfg,
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
-    /// Ordered package search path; relative entries resolve against the
-    /// root. First hit wins by name (systemd unit load path semantics).
-    /// ELANUS_PACKAGE_PATH overrides.
-    #[serde(default = "default_package_path")]
-    pub package_path: Vec<String>,
+    #[serde(default)]
+    pub context: ContextCfg,
+    #[serde(default)]
+    pub subagents: SubagentCfg,
+    /// Effective ordered package/kit search path. Relative entries resolve
+    /// against the root. If an entry has a packages/ child it is treated as a
+    /// kit, otherwise the entry itself is treated as a package directory.
+    #[serde(default = "default_elanus_path", alias = "package_path")]
+    pub elanus_path: Vec<String>,
     /// How much of this agent's CONFIGURATION PROPOSALS auto-accept (docs/config.md
     /// D4). "off" (default) = the agent gets no config-proposal machinery at all
     /// (least privilege; most agents never manage config). The other levels give
@@ -44,7 +54,7 @@ pub struct Profile {
     pub autonomy: String,
 }
 
-fn default_package_path() -> Vec<String> {
+fn default_elanus_path() -> Vec<String> {
     vec!["packages".into()]
 }
 
@@ -62,24 +72,27 @@ fn default_owner() -> String {
 
 // Manual Default so a missing profile.toml behaves exactly like an empty
 // one: derive(Default) would zero the serde field defaults (empty
-// package_path = no discovery at all).
+// elanus_path = no discovery at all).
 impl Default for Profile {
     fn default() -> Self {
         Profile {
             agent: default_agent(),
             owner: default_owner(),
+            parent: None,
             model: ModelCfg::default(),
             skills: SkillsCfg::default(),
             throttle: BTreeMap::new(),
             sandbox: SandboxCfg::default(),
             vars: BTreeMap::new(),
-            package_path: default_package_path(),
+            context: ContextCfg::default(),
+            subagents: SubagentCfg::default(),
+            elanus_path: default_elanus_path(),
             autonomy: default_autonomy(),
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ModelCfg {
     #[serde(default = "default_model")]
     pub model: String,
@@ -107,7 +120,7 @@ impl Default for ModelCfg {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SkillsCfg {
     #[serde(default = "default_include")]
     pub include: Vec<String>,
@@ -131,7 +144,7 @@ impl Default for SkillsCfg {
 /// diff → obs/fs/ events) runs either way, over root + fs_write.
 /// This lives in the profile until the grants ledger lands in migration
 /// step 5; it then hoists into the approval ledger with package grants.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct SandboxCfg {
     #[serde(default)]
     pub fs_write: Vec<String>, // absolute, or relative to the harness root
@@ -148,13 +161,105 @@ pub struct SandboxCfg {
     pub workdir: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ContextCfg {
+    /// Named context program recipe. "default" means the harness-owned
+    /// built-ins plus visible approved package context stages.
+    #[serde(default = "default_context_program")]
+    pub program: String,
+    /// Policy placeholder for a future total context assembly budget. The
+    /// current runner still enforces per-stage budgets.
+    #[serde(default = "default_context_max_total_ms")]
+    pub max_total_ms: u64,
+    /// Optional per-agent overrides for visible package context stages.
+    #[serde(rename = "stage", default)]
+    pub stages: Vec<ContextStageOverride>,
+}
+
+impl Default for ContextCfg {
+    fn default() -> Self {
+        ContextCfg {
+            program: default_context_program(),
+            max_total_ms: default_context_max_total_ms(),
+            stages: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(default)]
+pub struct ContextStageOverride {
+    pub package: String,
+    pub name: String,
+    pub enabled: Option<bool>,
+    pub order: Option<u32>,
+    pub timeout_ms: Option<u64>,
+}
+
+impl Default for ContextStageOverride {
+    fn default() -> Self {
+        ContextStageOverride {
+            package: String::new(),
+            name: String::new(),
+            enabled: None,
+            order: None,
+            timeout_ms: None,
+        }
+    }
+}
+
+fn default_context_program() -> String {
+    "default".into()
+}
+
+fn default_context_max_total_ms() -> u64 {
+    30_000
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SubagentCfg {
+    /// Profiles this agent may spawn as ordinary child agents. Empty means no
+    /// generic subagent spawn authority.
+    pub allow_profiles: Vec<String>,
+    pub inherit_budget: bool,
+    pub max_depth: u32,
+    /// Optional restriction on child context program. Defaults to the parent's
+    /// selected context program.
+    pub context_program: Option<String>,
+    /// "narrow" only for now: child grants must be equal or narrower than the
+    /// parent. Future modes can be added after the launcher exists.
+    pub grant_policy: String,
+}
+
+impl Default for SubagentCfg {
+    fn default() -> Self {
+        SubagentCfg {
+            allow_profiles: Vec::new(),
+            inherit_budget: true,
+            max_depth: 1,
+            context_program: None,
+            grant_policy: "narrow".into(),
+        }
+    }
+}
+
 fn default_capture_exclude() -> Vec<String> {
     // Kernel churn (db/wal/trace/run) would self-noise every diff. "elanus.db"
     // prefix-excludes its -wal/-shm siblings too.
-    ["elanus.db", "trace.jsonl", "run/", ".env", ".git/", "target/", "node_modules/"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    [
+        "elanus.db",
+        "trace.jsonl",
+        "run/",
+        ".env",
+        ".git/",
+        "target/",
+        "node_modules/",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 fn default_model() -> String {
@@ -171,15 +276,166 @@ fn default_include() -> Vec<String> {
     vec!["#".into()]
 }
 
+pub fn validate(p: &Profile) -> Result<()> {
+    if p.context.program.trim().is_empty() || p.context.program.contains(char::is_whitespace) {
+        bail!(
+            "context.program {:?} must be non-empty with no whitespace",
+            p.context.program
+        );
+    }
+    if p.context.program != "default" {
+        bail!(
+            "context.program {:?} is not supported yet (only \"default\")",
+            p.context.program
+        );
+    }
+    if p.context.max_total_ms == 0 {
+        bail!("context.max_total_ms must be greater than zero");
+    }
+    for s in &p.context.stages {
+        if !crate::topic::valid_name(&s.package) || s.package.contains('/') {
+            bail!(
+                "context stage override package {:?} must be one topic level",
+                s.package
+            );
+        }
+        if !crate::topic::valid_name(&s.name) || s.name.contains('/') {
+            bail!(
+                "context stage override name {:?} must be one topic level",
+                s.name
+            );
+        }
+        if s.timeout_ms == Some(0) {
+            bail!(
+                "context stage override {}/{} timeout_ms must be greater than zero",
+                s.package,
+                s.name
+            );
+        }
+    }
+    if p.subagents.max_depth == 0 {
+        bail!("subagents.max_depth must be greater than zero");
+    }
+    if p.subagents.grant_policy != "narrow" {
+        bail!(
+            "subagents.grant_policy {:?} is not supported yet (only \"narrow\")",
+            p.subagents.grant_policy
+        );
+    }
+    if let Some(program) = &p.subagents.context_program {
+        if program != "default" {
+            bail!(
+                "subagents.context_program {:?} is not supported yet (only \"default\")",
+                program
+            );
+        }
+    }
+    for child in &p.subagents.allow_profiles {
+        validate_profile_name(child)?;
+    }
+    Ok(())
+}
+
+fn validate_profile_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("bad subagent profile name {name:?} (alphanumeric, dash, underscore)");
+    }
+    Ok(())
+}
+
 pub fn load(root: &Root, name: &str) -> Result<(Profile, PathBuf)> {
     let dir = root.profile_dir(name);
     let f = dir.join("profile.toml");
     if !f.exists() {
-        return Ok((Profile::default(), dir));
+        let mut p = Profile::default();
+        p.elanus_path = effective_elanus_path(root, name)?;
+        return Ok((p, dir));
     }
     let s = std::fs::read_to_string(&f)?;
-    let p: Profile = toml::from_str(&s).with_context(|| format!("parsing {}", f.display()))?;
+    let mut p: Profile = toml::from_str(&s).with_context(|| format!("parsing {}", f.display()))?;
+    validate(&p).with_context(|| format!("validating {}", f.display()))?;
+    p.elanus_path = effective_elanus_path(root, name)?;
     Ok((p, dir))
+}
+
+/// The path as written directly in a profile, before parent expansion.
+pub fn local_elanus_path(root: &Root, name: &str) -> Result<Option<Vec<String>>> {
+    let f = root.profile_dir(name).join("profile.toml");
+    if !f.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&f)?;
+    let value: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", f.display()))?;
+    let item = value
+        .get("elanus_path")
+        .or_else(|| value.get("package_path"));
+    match item {
+        Some(toml::Value::Array(arr)) => arr
+            .iter()
+            .map(|v| {
+                v.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                    anyhow::anyhow!("elanus_path in {} must be an array of strings", f.display())
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        Some(_) => bail!("elanus_path in {} must be an array", f.display()),
+        None => Ok(None),
+    }
+}
+
+/// Expand an agent's path through the hierarchy:
+/// profile -> optional parent profile -> default profile -> built-in global.
+/// `"$parent"` inside `elanus_path` includes the parent scope at that point;
+/// omitting `elanus_path` is equivalent to pure inheritance.
+pub fn effective_elanus_path(root: &Root, name: &str) -> Result<Vec<String>> {
+    fn inner(root: &Root, name: &str, seen: &mut Vec<String>) -> Result<Vec<String>> {
+        if seen.iter().any(|s| s == name) {
+            bail!("cycle in profile parent chain: {}", seen.join(" -> "));
+        }
+        seen.push(name.to_string());
+        let f = root.profile_dir(name).join("profile.toml");
+        let raw = std::fs::read_to_string(&f).unwrap_or_default();
+        let value: toml::Value = raw
+            .parse()
+            .unwrap_or_else(|_| toml::Value::Table(Default::default()));
+        let parent_name = value
+            .get("parent")
+            .and_then(|v| v.as_str())
+            .filter(|p| !p.is_empty());
+        let parent_path = if name == "default" {
+            default_elanus_path()
+        } else {
+            inner(root, parent_name.unwrap_or("default"), seen)?
+        };
+        let local = local_elanus_path(root, name)?;
+        seen.pop();
+        let Some(local) = local else {
+            return Ok(parent_path);
+        };
+        let mut out = Vec::new();
+        let mut inherited = false;
+        for entry in local {
+            if entry == PARENT_PATH {
+                inherited = true;
+                out.extend(parent_path.clone());
+            } else {
+                out.push(entry);
+            }
+        }
+        if out.is_empty() && inherited {
+            Ok(parent_path)
+        } else {
+            Ok(out)
+        }
+    }
+    inner(root, name, &mut Vec::new())
 }
 
 /// Mailbox topics derived from the "default" profile, cached per process.

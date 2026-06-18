@@ -1,6 +1,6 @@
 //! The configuration repository — `<root>/config`, a kernel-owned Git repo
-//! whose `live` branch is the materialized truth for PACKAGE configuration
-//! (docs/config.md). Live config is a branch; a human-direct write is a commit
+//! whose `live` branch is the materialized truth for PACKAGE and AGENT
+//! configuration (docs/config.md). Live config is a branch; a human-direct write is a commit
 //! on `live`; acceptance provenance lives in the ledger, not the commit (the
 //! commit author is a fixed kernel identity — git holds content, the ledger
 //! holds "who accepted this").
@@ -47,9 +47,11 @@ const CONFIG_README: &str = "\
 
 This is a kernel-owned Git repository. Its `live` branch is the materialized
 truth: per-package settings live at `packages/<name>.toml`. Do not edit by hand
-while the daemon runs — use `elanus config set <package> <key> <value>`, which
-commits the change on `live` and records who accepted it in the ledger. The
-agent never writes here; it only proposes (a `proposal/<id>` branch).
+while the daemon runs — use `elanus config set <package> <key> <value>` or
+`elanus profile set <agent> <key=value>`, which commit changes on `live` and
+record who accepted them in the ledger. Package settings live at
+`packages/<name>.toml`; agent profiles live at `agents/<name>/profile.toml`.
+Agents never write live config; they only propose (a `proposal/<id>` branch).
 ";
 
 /// Apply the untrusted-input hardening every git invocation in this module
@@ -60,11 +62,16 @@ agent never writes here; it only proposes (a `proposal/<id>` branch).
 /// never prompt. Used for BOTH the live-repo ops and the clone of the untrusted
 /// agent tree — the clone round-trip is the reason this discipline exists.
 fn harden(c: &mut Command) {
-    c.arg("-c").arg("core.hooksPath=/dev/null")
-        .arg("-c").arg("core.fsmonitor=false")
-        .arg("-c").arg("commit.gpgsign=false")
-        .arg("-c").arg(format!("user.name={COMMITTER_NAME}"))
-        .arg("-c").arg(format!("user.email={COMMITTER_EMAIL}"))
+    c.arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .arg("-c")
+        .arg(format!("user.name={COMMITTER_NAME}"))
+        .arg("-c")
+        .arg(format!("user.email={COMMITTER_EMAIL}"))
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_ATTR_NOSYSTEM", "1")
@@ -121,7 +128,8 @@ fn git_ok(root: &Root, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Create the config repo if absent: `<root>/config` with a `packages/` dir and
+/// Create the config repo if absent: `<root>/config` with `packages/` and
+/// `agents/` dirs and
 /// an initial commit on the `live` branch. Idempotent — a root that already has
 /// the repo is left untouched. Called from `elanus init`.
 pub fn init(root: &Root) -> Result<()> {
@@ -132,10 +140,17 @@ pub fn init(root: &Root) -> Result<()> {
     // call that done forever. `git init` is idempotent, so re-entering here
     // safely completes a half-built repo. (-C a non-existent dir fails the
     // probe, which is exactly what we want on a truly fresh root.)
-    if git_ok(root, &["rev-parse", "--verify", "--quiet", "refs/heads/live"]) {
+    if git_ok(
+        root,
+        &["rev-parse", "--verify", "--quiet", "refs/heads/live"],
+    ) {
+        ensure_agent_store(root)?;
+        let _ = commit_path(root, "agents", "config: migrate agent profiles into live");
         return Ok(());
     }
     std::fs::create_dir_all(root.config_packages())?;
+    std::fs::create_dir_all(root.config_agents())?;
+    ensure_agent_store(root)?;
     // 0700: package config can name external accounts and endpoints; keep it
     // owner-only on disk even though the cage is the real fence (mirrors how
     // init treats the secret store).
@@ -151,6 +166,10 @@ pub fn init(root: &Root) -> Result<()> {
     if !keep.exists() {
         std::fs::write(&keep, "")?;
     }
+    let keep = root.config_agents().join(".gitkeep");
+    if !keep.exists() {
+        std::fs::write(&keep, "")?;
+    }
     let readme = dir.join("README.md");
     if !readme.exists() {
         std::fs::write(&readme, CONFIG_README)?;
@@ -159,7 +178,102 @@ pub fn init(root: &Root) -> Result<()> {
     // Only commit if there's something staged — re-entering a half-built repo
     // whose files were already committed must not error on an empty commit.
     if !git_ok(root, &["diff", "--cached", "--quiet"]) {
-        git_run(root, &["commit", "-m", "config: initial live branch"], "commit (init)")?;
+        git_run(
+            root,
+            &["commit", "-m", "config: initial live branch"],
+            "commit (init)",
+        )?;
+    }
+    Ok(())
+}
+
+/// Fold the old `<root>/profiles` tree into `config/agents` and keep the old
+/// path as a compatibility symlink on Unix. This lets existing scripts keep
+/// reading/writing `<root>/profiles/<name>/profile.toml` while Git tracks the
+/// canonical file under `config/agents/<name>/profile.toml`.
+fn ensure_agent_store(root: &Root) -> Result<()> {
+    std::fs::create_dir_all(root.config_agents())?;
+    let legacy = root.profiles();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        if std::fs::symlink_metadata(&legacy)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            let target = std::fs::read_link(&legacy)
+                .with_context(|| format!("reading {} symlink", legacy.display()))?;
+            let target_abs = if target.is_absolute() {
+                target
+            } else {
+                legacy
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(target)
+            };
+            if target_abs == root.config_agents() {
+                return Ok(());
+            }
+            bail!(
+                "{} is a symlink to {}, not config/agents",
+                legacy.display(),
+                target_abs.display()
+            );
+        }
+        if legacy.exists() {
+            copy_tree_checked(&legacy, &root.config_agents())?;
+            std::fs::remove_dir_all(&legacy).with_context(|| {
+                format!("replacing {} with config/agents symlink", legacy.display())
+            })?;
+        }
+        symlink(root.config_agents(), &legacy)
+            .with_context(|| format!("linking {} -> config/agents", legacy.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        if legacy.exists() {
+            copy_tree_checked(&legacy, &root.config_agents())?;
+        } else {
+            std::fs::create_dir_all(&legacy)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree_checked(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let src = e.path();
+        let dst = to.join(e.file_name());
+        let ft = e.file_type()?;
+        if ft.is_dir() {
+            copy_tree_checked(&src, &dst)?;
+        } else if ft.is_file() {
+            if dst.exists() {
+                let src_bytes =
+                    std::fs::read(&src).with_context(|| format!("reading {}", src.display()))?;
+                let dst_bytes =
+                    std::fs::read(&dst).with_context(|| format!("reading {}", dst.display()))?;
+                if src_bytes != dst_bytes {
+                    bail!(
+                        "profile migration conflict: {} and {} differ; resolve before starting",
+                        src.display(),
+                        dst.display()
+                    );
+                }
+            } else {
+                std::fs::copy(&src, &dst)
+                    .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+            }
+        } else {
+            bail!(
+                "profile migration refuses non-regular entry {}",
+                src.display()
+            );
+        }
     }
     Ok(())
 }
@@ -225,6 +339,23 @@ fn commit_path(root: &Root, rel: &str, msg: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Commit one agent profile subtree (`config/agents/<name>/...`) on `live`.
+/// Returns `(sha, changed)` so callers can emit a ledger event only for real
+/// changes. `name` is already profile-name validated by the caller.
+pub fn commit_agent(root: &Root, name: &str, msg: &str) -> Result<(String, bool)> {
+    let rel = format!("agents/{name}");
+    let changed = commit_path(root, &rel, msg)?;
+    Ok((current_sha(root)?, changed))
+}
+
+/// Drop any staged profile content for one agent. Used after a failed profile
+/// write rolls the working tree back, so the index cannot carry the rejected
+/// candidate into a later config commit.
+pub fn reset_agent(root: &Root, name: &str) {
+    let rel = format!("agents/{name}");
+    let _ = git_run(root, &["reset", "-q", "--", &rel], "reset agent");
+}
+
 /// Write a file atomically: a sibling temp + rename (atomic on the same
 /// filesystem), so a concurrent reader — the daemon's fingerprint sweep — sees
 /// either the whole old file or the whole new one, never a truncated one.
@@ -243,7 +374,10 @@ pub fn read_package(root: &Root, pkg: &str) -> Result<Option<String>> {
     // refuses a symlink proposal from ever merging, but a config read must not
     // become an arbitrary-file disclosure even if one reached the live tree
     // another way (e.g. a hand edit). A symlinked config file reads as absent.
-    if std::fs::symlink_metadata(&path).map(|m| m.is_symlink()).unwrap_or(false) {
+    if std::fs::symlink_metadata(&path)
+        .map(|m| m.is_symlink())
+        .unwrap_or(false)
+    {
         return Ok(None);
     }
     Ok(std::fs::read_to_string(path).ok())
@@ -361,7 +495,12 @@ pub fn reap_proposals(root: &Root, clone: &Path, by: &str) -> Result<Vec<Proposa
     // If neutralization fails, do NOT read from the clone (fail closed).
     let cfg = gitdir.join("config");
     let _ = std::fs::remove_file(&cfg);
-    if std::fs::write(&cfg, "[core]\n\trepositoryformatversion = 0\n\tbare = false\n").is_err() {
+    if std::fs::write(
+        &cfg,
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+    )
+    .is_err()
+    {
         return Ok(vec![]);
     }
     let mut lc = git_bare();
@@ -373,7 +512,9 @@ pub fn reap_proposals(root: &Root, clone: &Path, by: &str) -> Result<Vec<Proposa
     let listing = run_git(lc, "list proposal branches").unwrap_or_default();
     let mut out = Vec::new();
     for refname in listing.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        let Some(short) = refname.strip_prefix("refs/heads/") else { continue };
+        let Some(short) = refname.strip_prefix("refs/heads/") else {
+            continue;
+        };
         if !valid_proposal_branch(short) {
             continue;
         }
@@ -390,7 +531,9 @@ pub fn reap_proposals(root: &Root, clone: &Path, by: &str) -> Result<Vec<Proposa
         // + the one ref, no tags, no checkout, hooks/filters off (harden).
         let refspec = format!("+{short}:{dest_ref}");
         let mut f = git(root);
-        f.args(["fetch", "--no-tags", "--quiet", "--"]).arg(clone).arg(&refspec);
+        f.args(["fetch", "--no-tags", "--quiet", "--"])
+            .arg(clone)
+            .arg(&refspec);
         if run_git(f, "fetch proposal").is_err() {
             continue;
         }
@@ -412,7 +555,10 @@ pub fn reap_proposals(root: &Root, clone: &Path, by: &str) -> Result<Vec<Proposa
 /// contribution — three-dot, against the merge-base). Plumbing: no checkout, no
 /// textconv (a `.gitattributes` diff driver would otherwise be a code path).
 fn changed_files(root: &Root, tip: &str) -> Result<Vec<String>> {
-    Ok(changed_entries(root, tip)?.into_iter().map(|(_, p)| p).collect())
+    Ok(changed_entries(root, tip)?
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect())
 }
 
 /// Bytes of objects unique to `branch` (vs `live`) IN THE CLONE — measured
@@ -448,7 +594,9 @@ fn changed_entries(root: &Root, tip: &str) -> Result<Vec<(String, String)>> {
     let mut entries = Vec::new();
     for line in out.lines() {
         // ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\t<path>"
-        let Some((meta, path)) = line.split_once('\t') else { continue };
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
         let fields: Vec<&str> = meta.split_whitespace().collect();
         if fields.len() < 2 {
             continue;
@@ -474,7 +622,9 @@ pub fn list_proposals(root: &Root) -> Result<Vec<Proposal>> {
     .unwrap_or_default();
     let mut out = Vec::new();
     for refname in listing.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        let Some(id) = refname.strip_prefix("refs/proposals/") else { continue };
+        let Some(id) = refname.strip_prefix("refs/proposals/") else {
+            continue;
+        };
         let commit = git_run(root, &["rev-parse", refname], "rev-parse").unwrap_or_default();
         let files = changed_files(root, refname).unwrap_or_default();
         out.push(Proposal {
@@ -491,7 +641,11 @@ pub fn list_proposals(root: &Root) -> Result<Vec<Proposal>> {
 /// One proposal's unified diff vs `live` (plumbing, no checkout, no textconv).
 pub fn proposal_diff(root: &Root, id: &str) -> Result<String> {
     let dest_ref = proposal_ref(id)?;
-    git_run(root, &["diff", "--no-textconv", &format!("{LIVE}...{dest_ref}")], "proposal diff")
+    git_run(
+        root,
+        &["diff", "--no-textconv", &format!("{LIVE}...{dest_ref}")],
+        "proposal diff",
+    )
 }
 
 /// Validate a proposal id and return its full ref. Guards against ref injection
@@ -504,7 +658,12 @@ fn proposal_ref(id: &str) -> Result<String> {
 }
 
 fn new_proposal_id() -> String {
-    uuid::Uuid::new_v4().simple().to_string().chars().take(12).collect()
+    uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(12)
+        .collect()
 }
 
 /// A proposal branch is exactly "proposal/<seg>" with one safe segment.
@@ -558,7 +717,10 @@ pub fn proposal_packages(root: &Root, id: &str) -> Result<Vec<String>> {
                  config files are allowed (no symlinks, submodules, or exec bits)"
             );
         }
-        match f.strip_prefix("packages/").and_then(|r| r.strip_suffix(".toml")) {
+        match f
+            .strip_prefix("packages/")
+            .and_then(|r| r.strip_suffix(".toml"))
+        {
             Some(p) if valid_pkg(p).is_ok() => {
                 if !pkgs.contains(&p.to_string()) {
                     pkgs.push(p.to_string());
@@ -582,10 +744,18 @@ pub fn proposal_packages(root: &Root, id: &str) -> Result<Vec<String>> {
 pub fn proposal_changed_keys(root: &Root, id: &str, pkg: &str) -> Result<Vec<String>> {
     let dest_ref = proposal_ref(id)?;
     let rel = format!("packages/{pkg}.toml");
-    let live_toml =
-        git_run(root, &["cat-file", "-p", &format!("{LIVE}:{rel}")], "cat live").unwrap_or_default();
-    let prop_toml = git_run(root, &["cat-file", "-p", &format!("{dest_ref}:{rel}")], "cat proposal")
-        .unwrap_or_default();
+    let live_toml = git_run(
+        root,
+        &["cat-file", "-p", &format!("{LIVE}:{rel}")],
+        "cat live",
+    )
+    .unwrap_or_default();
+    let prop_toml = git_run(
+        root,
+        &["cat-file", "-p", &format!("{dest_ref}:{rel}")],
+        "cat proposal",
+    )
+    .unwrap_or_default();
     Ok(changed_dotted_keys(&live_toml, &prop_toml))
 }
 
@@ -608,7 +778,11 @@ pub fn accept_proposal(root: &Root, id: &str) -> Result<String> {
         bail!("proposal {id} conflicts with the current live config — resolve it manually");
     }
     let sha = current_sha(root)?;
-    let _ = git_run(root, &["update-ref", "-d", &dest_ref], "delete proposal ref");
+    let _ = git_run(
+        root,
+        &["update-ref", "-d", &dest_ref],
+        "delete proposal ref",
+    );
     Ok(sha)
 }
 
@@ -619,7 +793,11 @@ pub fn decline_proposal(root: &Root, id: &str) -> Result<()> {
     if !git_ok(root, &["rev-parse", "--verify", "--quiet", &dest_ref]) {
         bail!("no proposal {id:?}");
     }
-    git_run(root, &["update-ref", "-d", &dest_ref], "delete proposal ref")?;
+    git_run(
+        root,
+        &["update-ref", "-d", &dest_ref],
+        "delete proposal ref",
+    )?;
     Ok(())
 }
 
@@ -627,8 +805,10 @@ pub fn decline_proposal(root: &Root, id: &str) -> Result<()> {
 /// changed). Leaf granularity (an array or scalar is one key); a changed nested
 /// table reports its leaf paths.
 fn changed_dotted_keys(live: &str, prop: &str) -> Vec<String> {
-    let lv: toml::Value = toml::from_str(live).unwrap_or_else(|_| toml::Value::Table(Default::default()));
-    let pv: toml::Value = toml::from_str(prop).unwrap_or_else(|_| toml::Value::Table(Default::default()));
+    let lv: toml::Value =
+        toml::from_str(live).unwrap_or_else(|_| toml::Value::Table(Default::default()));
+    let pv: toml::Value =
+        toml::from_str(prop).unwrap_or_else(|_| toml::Value::Table(Default::default()));
     let mut lm = BTreeMap::new();
     let mut pm = BTreeMap::new();
     flatten_toml(&lv, "", &mut lm);
@@ -653,7 +833,11 @@ fn flatten_toml(v: &toml::Value, prefix: &str, out: &mut BTreeMap<String, String
     match v {
         toml::Value::Table(t) => {
             for (k, val) in t {
-                let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
                 flatten_toml(val, &key, out);
             }
         }
@@ -711,7 +895,9 @@ fn parse_value(raw: &str) -> toml_edit::Value {
 fn valid_pkg(pkg: &str) -> Result<()> {
     if pkg.is_empty()
         || pkg.len() > 64
-        || !pkg.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        || !pkg
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     {
         bail!("bad package name {pkg:?} (lowercase letters, digits, dash, underscore)");
     }
@@ -748,7 +934,11 @@ mod tests {
         let (sha2, changed2) = set_key(&root, "watcher", "accounts", r#"["alice"]"#).unwrap();
         assert!(changed2);
         assert_ne!(sha1, sha2, "a content change is a new commit");
-        assert_ne!(fp1, fingerprint(&root, "watcher"), "fingerprint tracks content");
+        assert_ne!(
+            fp1,
+            fingerprint(&root, "watcher"),
+            "fingerprint tracks content"
+        );
         // An idempotent set is a no-op: no commit, changed=false.
         let (sha3, changed3) = set_key(&root, "watcher", "accounts", r#"["alice"]"#).unwrap();
         assert_eq!(sha2, sha3, "no-op set must not create a commit");
@@ -757,9 +947,12 @@ mod tests {
         // check) — and that dirty file must NOT ride into a config commit.
         std::fs::write(root.config().join("README.md"), "tampered\n").unwrap();
         let (_, changed4) = set_key(&root, "watcher", "accounts", r#"["alice"]"#).unwrap();
-        assert!(!changed4, "unrelated dirt must not look like a config change");
+        assert!(
+            !changed4,
+            "unrelated dirt must not look like a config change"
+        );
         std::fs::write(root.config().join("README.md"), CONFIG_README).unwrap(); // restore
-        // Comments survive a later set (toml_edit).
+                                                                                 // Comments survive a later set (toml_edit).
         std::fs::write(
             root.config().join("packages/watcher.toml"),
             "# keep me\naccounts = [\"alice\"]\n",
@@ -789,7 +982,7 @@ mod tests {
         let root = scratch("descent");
         init(&root).unwrap();
         set_key(&root, "watcher", "poll", "30").unwrap(); // poll is a scalar
-        // Descending into the scalar must be a clean error, not a panic.
+                                                          // Descending into the scalar must be a clean error, not a panic.
         assert!(set_key(&root, "watcher", "poll.interval", "5").is_err());
         std::fs::remove_dir_all(&root.dir).ok();
     }
@@ -800,8 +993,15 @@ mod tests {
         init(&root).unwrap();
         let head1 = current_sha(&root).unwrap();
         init(&root).unwrap(); // second init on an existing root: clean no-op
-        assert_eq!(head1, current_sha(&root).unwrap(), "re-init must not rewrite history");
-        assert!(git_ok(&root, &["rev-parse", "--verify", "--quiet", "refs/heads/live"]));
+        assert_eq!(
+            head1,
+            current_sha(&root).unwrap(),
+            "re-init must not rewrite history"
+        );
+        assert!(git_ok(
+            &root,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/live"]
+        ));
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -809,8 +1009,12 @@ mod tests {
     // would, with its own (decoration-only) author identity.
     fn agent_git(clone: &std::path::Path, args: &[&str]) -> bool {
         Command::new("git")
-            .arg("-C").arg(clone)
-            .arg("-c").arg("user.name=agent").arg("-c").arg("user.email=agent@local")
+            .arg("-C")
+            .arg(clone)
+            .arg("-c")
+            .arg("user.name=agent")
+            .arg("-c")
+            .arg("user.email=agent@local")
             .args(args)
             .output()
             .map(|o| o.status.success())
@@ -825,11 +1029,21 @@ mod tests {
         // The agent gets a clone, branches, edits, and commits — never touching live.
         let clone = root.dir.join("agent-clone");
         clone_for_agent(&root, &clone).unwrap();
-        assert!(agent_git(&clone, &["checkout", "-b", "proposal/x", "--quiet"]));
-        std::fs::write(clone.join("packages/watcher.toml"), "accounts = [\"alice\",\"bob\"]\n").unwrap();
+        assert!(agent_git(
+            &clone,
+            &["checkout", "-b", "proposal/x", "--quiet"]
+        ));
+        std::fs::write(
+            clone.join("packages/watcher.toml"),
+            "accounts = [\"alice\",\"bob\"]\n",
+        )
+        .unwrap();
         // A non-proposal branch and stray edits must NOT become proposals.
         assert!(agent_git(&clone, &["add", "-A"]));
-        assert!(agent_git(&clone, &["commit", "-m", "propose bob", "--quiet"]));
+        assert!(agent_git(
+            &clone,
+            &["commit", "-m", "propose bob", "--quiet"]
+        ));
 
         let props = reap_proposals(&root, &clone, "scout").unwrap();
         assert_eq!(props.len(), 1, "exactly one proposal harvested");
@@ -858,21 +1072,39 @@ mod tests {
         set_key(&root, "watcher", "accounts", r#"["alice"]"#).unwrap();
         let clone = root.dir.join("c");
         clone_for_agent(&root, &clone).unwrap();
-        assert!(agent_git(&clone, &["checkout", "-b", "proposal/p", "--quiet"]));
-        std::fs::write(clone.join("packages/watcher.toml"), "accounts = [\"alice\",\"bob\"]\n").unwrap();
+        assert!(agent_git(
+            &clone,
+            &["checkout", "-b", "proposal/p", "--quiet"]
+        ));
+        std::fs::write(
+            clone.join("packages/watcher.toml"),
+            "accounts = [\"alice\",\"bob\"]\n",
+        )
+        .unwrap();
         assert!(agent_git(&clone, &["add", "-A"]));
         assert!(agent_git(&clone, &["commit", "-m", "x", "--quiet"]));
-        let id = reap_proposals(&root, &clone, "scout").unwrap()[0].id.clone();
+        let id = reap_proposals(&root, &clone, "scout").unwrap()[0]
+            .id
+            .clone();
         // Path-discipline passes; the only changed key is "accounts".
-        assert_eq!(proposal_packages(&root, &id).unwrap(), vec!["watcher".to_string()]);
-        assert_eq!(proposal_changed_keys(&root, &id, "watcher").unwrap(), vec!["accounts".to_string()]);
+        assert_eq!(
+            proposal_packages(&root, &id).unwrap(),
+            vec!["watcher".to_string()]
+        );
+        assert_eq!(
+            proposal_changed_keys(&root, &id, "watcher").unwrap(),
+            vec!["accounts".to_string()]
+        );
         // Accept merges into live and clears the pending ref.
         accept_proposal(&root, &id).unwrap();
         assert_eq!(
             get_key(&root, "watcher", "accounts").unwrap().as_deref(),
             Some(r#"["alice","bob"]"#)
         );
-        assert!(list_proposals(&root).unwrap().is_empty(), "accepted proposal is no longer pending");
+        assert!(
+            list_proposals(&root).unwrap().is_empty(),
+            "accepted proposal is no longer pending"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -882,16 +1114,27 @@ mod tests {
         init(&root).unwrap();
         let clone = root.dir.join("c");
         clone_for_agent(&root, &clone).unwrap();
-        assert!(agent_git(&clone, &["checkout", "-b", "proposal/evil", "--quiet"]));
+        assert!(agent_git(
+            &clone,
+            &["checkout", "-b", "proposal/evil", "--quiet"]
+        ));
         // A proposal that reaches outside the package-settings surface.
         std::fs::write(clone.join("evil.txt"), "x").unwrap();
         std::fs::write(clone.join(".gitattributes"), "* filter=evil\n").unwrap();
         assert!(agent_git(&clone, &["add", "-A"]));
         assert!(agent_git(&clone, &["commit", "-m", "escape", "--quiet"]));
-        let id = reap_proposals(&root, &clone, "scout").unwrap()[0].id.clone();
+        let id = reap_proposals(&root, &clone, "scout").unwrap()[0]
+            .id
+            .clone();
         // It is still harvested (visible) but can never be merged — by anyone.
-        assert!(proposal_packages(&root, &id).is_err(), "path-discipline refuses it");
-        assert!(accept_proposal(&root, &id).is_err(), "accept refuses it before any merge");
+        assert!(
+            proposal_packages(&root, &id).is_err(),
+            "path-discipline refuses it"
+        );
+        assert!(
+            accept_proposal(&root, &id).is_err(),
+            "accept refuses it before any merge"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -905,21 +1148,35 @@ mod tests {
         std::fs::write(&secret, "TOPSECRET\n").unwrap();
         let clone = root.dir.join("c");
         clone_for_agent(&root, &clone).unwrap();
-        assert!(agent_git(&clone, &["checkout", "-b", "proposal/x", "--quiet"]));
+        assert!(agent_git(
+            &clone,
+            &["checkout", "-b", "proposal/x", "--quiet"]
+        ));
         // Commit packages/leak.toml as a SYMLINK (git mode 120000) to the secret.
         std::os::unix::fs::symlink(&secret, clone.join("packages/leak.toml")).unwrap();
         assert!(agent_git(&clone, &["add", "-A"]));
         assert!(agent_git(&clone, &["commit", "-m", "leak", "--quiet"]));
-        let id = reap_proposals(&root, &clone, "scout").unwrap()[0].id.clone();
+        let id = reap_proposals(&root, &clone, "scout").unwrap()[0]
+            .id
+            .clone();
         // Path-discipline rejects the non-regular mode; accept refuses to merge.
-        assert!(proposal_packages(&root, &id).is_err(), "symlink mode is rejected");
-        assert!(accept_proposal(&root, &id).is_err(), "a symlink proposal never merges");
+        assert!(
+            proposal_packages(&root, &id).is_err(),
+            "symlink mode is rejected"
+        );
+        assert!(
+            accept_proposal(&root, &id).is_err(),
+            "a symlink proposal never merges"
+        );
         // And even if a symlink reached live, read_package won't follow it.
         std::fs::create_dir_all(root.config_packages()).ok();
         let planted = root.config_packages().join("planted.toml");
         let _ = std::fs::remove_file(&planted);
         std::os::unix::fs::symlink(&secret, &planted).unwrap();
-        assert!(read_package(&root, "planted").unwrap().is_none(), "read never follows a symlink");
+        assert!(
+            read_package(&root, "planted").unwrap().is_none(),
+            "read never follows a symlink"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -940,15 +1197,23 @@ mod tests {
         set_key(&root, "watcher", "accounts", r#"["alice"]"#).unwrap();
         let clone = root.dir.join("c");
         clone_for_agent(&root, &clone).unwrap();
-        assert!(agent_git(&clone, &["checkout", "-b", "proposal/x", "--quiet"]));
+        assert!(agent_git(
+            &clone,
+            &["checkout", "-b", "proposal/x", "--quiet"]
+        ));
         let p = clone.join("packages/watcher.toml");
         std::fs::write(&p, "accounts = [\"x\"]\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(agent_git(&clone, &["add", "-A"]));
         assert!(agent_git(&clone, &["commit", "-m", "x", "--quiet"]));
-        let id = reap_proposals(&root, &clone, "scout").unwrap()[0].id.clone();
+        let id = reap_proposals(&root, &clone, "scout").unwrap()[0]
+            .id
+            .clone();
         // An executable blob (mode 100755) is not a regular config file → refused.
-        assert!(proposal_packages(&root, &id).is_err(), "exec-bit (100755) is rejected");
+        assert!(
+            proposal_packages(&root, &id).is_err(),
+            "exec-bit (100755) is rejected"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 

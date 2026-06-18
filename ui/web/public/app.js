@@ -26,6 +26,7 @@ const convFeeds = new Map(); // agent -> persistent DOM feed
 const corrAgent = new Map(); // correlation -> agent (for routing in/human mail)
 const seenAsks = new Map(); // corr -> ask element refs
 const sentCorrs = new Set();
+const agentSessions = new Map(); // agent -> stable web chat session id
 
 // ---------- helpers ----------
 const timeOf = (env) => {
@@ -38,6 +39,7 @@ const summarize = (p, max = 110) => {
   const s = typeof p === 'string' ? p : JSON.stringify(p);
   return s.length > max ? s.slice(0, max - 1) + '…' : s;
 };
+const arr = (v) => String(v ?? '').split(',').map((x) => x.trim()).filter(Boolean);
 const atBottom = (box) => box.scrollHeight - box.scrollTop - box.clientHeight < 60;
 const stick = (box, was) => { if (was) box.scrollTop = box.scrollHeight; };
 const agentOf = (topic) => {
@@ -187,7 +189,7 @@ function renderWelcome() {
     box.appendChild(row);
   }
   $('#welcome-hint').textContent = historyOk === false
-    ? 'transcripts are off until you approve the history package (kits & review).'
+    ? 'transcripts are unavailable until the history view is on.'
     : '';
 }
 
@@ -204,15 +206,15 @@ function selectSignals() {
 
 function selectSetup() {
   sel = { kind: 'setup' };
-  $('#stage-title').textContent = 'kits & review';
-  $('#stage-note').textContent = 'browse and add capabilities for your agents';
+  $('#stage-title').textContent = 'add-ons';
+  $('#stage-note').textContent = 'add useful behavior and adjust its settings';
   $('#agent-tabs').hidden = true;
   show('setup');
   renderNav();
   loadSetup();
 }
 
-// ---------- setup (staging only — the CLI is the commit gesture) ----------
+// ---------- setup: add-ons, package settings, and agent requests ----------
 async function adminGet(p) {
   try { const r = await fetch(`/api/admin/${p}`); return await r.json(); } catch { return { ok: false }; }
 }
@@ -231,10 +233,12 @@ async function loadSetup(opts = {}) {
   }
   const kitsBox = $('#setup-kits');
   const pendBox = $('#setup-pending');
+  const configBox = $('#setup-configs');
   kitsBox.textContent = 'resolving…';
   pendBox.textContent = 'checking…';
+  configBox.textContent = 'checking…';
 
-  const [kits, pkgs] = await Promise.all([adminGet('kits'), adminGet('packages')]);
+  const [kits, pkgs, proposals] = await Promise.all([adminGet('kits'), adminGet('packages'), adminGet('proposals')]);
   await loadDiskAgents();
 
   // Which kits already touched this root? Provenance is the ledger's
@@ -251,7 +255,7 @@ async function loadSetup(opts = {}) {
     head.appendChild(el('span', 'setup-kit-name', k.name));
     head.appendChild(el('span', 'setup-kit-hook dim-note', k.hook || ''));
     if (provenance.has(k.name)) head.appendChild(el('span', 'badge', 'installed'));
-    const readmeBtn = el('button', 'ghost', 'readme');
+    const readmeBtn = el('button', 'ghost', 'details');
     const stageBtn = el('button', '', provenance.has(k.name) ? 'add again' : 'add');
     head.appendChild(readmeBtn);
     head.appendChild(stageBtn);
@@ -269,56 +273,135 @@ async function loadSetup(opts = {}) {
       pre.hidden = !pre.hidden;
     };
     stageBtn.onclick = async () => {
-      stageBtn.disabled = true; stageBtn.textContent = 'adding…';
+      stageBtn.disabled = true; stageBtn.textContent = 'adding...';
       const r = await fetch('/api/admin/kits/add', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ kit: k.name }),
       }).then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
-      // loadSetup re-renders the kit rows (so the new pending grants appear and
-      // this button is recreated) — we pass a durable banner through it either
-      // way, so the outcome is never a flash that vanishes.
       loadSetup(r.ok
-        ? { status: `✓ added ${k.name} — review and confirm its capabilities under “review & confirm” below.`, statusKind: 'ok' }
+        ? { status: `added ${k.name}.`, statusKind: 'ok' }
         : { status: `✕ couldn't add ${k.name}: ${r.error ?? 'unknown error'}`, statusKind: 'err' });
     };
     kitsBox.appendChild(row);
   }
   if (!(kits.kits ?? []).length) {
     kitsBox.appendChild(el('div', 'dim-note', kits.ok === false
-      ? `kit list failed: ${kits.error ?? 'unknown - is the elanus binary on the server PATH current?'}`
-      : 'no kits resolvable — drop one in <root>/kits'));
+      ? `add-ons could not load: ${kits.error ?? 'unknown - is the elanus binary on the server PATH current?'}`
+      : 'no add-ons found'));
   }
 
-  pendBox.textContent = '';
-  let pendingAny = false;
-  for (const p of pkgs.packages ?? []) {
-    const reqs = (p.grants ?? []).filter((g) => g.state === 'requested');
-    if (!reqs.length) continue;
-    pendingAny = true;
+  configBox.textContent = '';
+  if (pkgs.ok === false) {
+    configBox.appendChild(el('div', 'dim-note', `could not load installed add-ons: ${pkgs.error ?? 'unknown error'}`));
+  }
+  let pkgAny = false;
+  for (const p of pkgs.ok === false ? [] : (pkgs.packages ?? [])) {
+    const active = (p.grants ?? []).some((g) => g.state === 'approved');
+    pkgAny = true;
     const card = el('div', 'setup-pending-pkg');
-    card.appendChild(el('div', 'setup-kit-name', p.name));
-    for (const g of reqs) card.appendChild(el('div', 'setup-grant', `${g.kind}  ${g.value}`));
-    const row = el('div', 'setup-row');
-    const approveBtn = el('button', '', `confirm ${p.name}`);
-    approveBtn.onclick = async () => {
-      approveBtn.disabled = true; approveBtn.textContent = 'confirming…';
-      const r = await fetch('/api/admin/approve', {
+    const head = el('div', 'setup-kit-head');
+    head.appendChild(el('span', 'setup-kit-name', p.name));
+    head.appendChild(el('span', active ? 'badge' : 'badge badge-wait', active ? 'on' : 'off'));
+    card.appendChild(head);
+
+    const form = el('div', 'setup-row');
+    const key = el('input');
+    key.placeholder = 'setting';
+    key.spellcheck = false;
+    const value = el('input');
+    value.placeholder = 'value, using TOML for arrays or numbers';
+    value.spellcheck = false;
+    const save = el('button', '', 'save setting');
+    const note = el('span', 'dim-note');
+    save.onclick = async () => {
+      if (!key.value.trim()) { note.textContent = 'name the setting first'; return; }
+      save.disabled = true; save.textContent = 'saving...'; note.textContent = '';
+      const r = await fetch('/api/admin/configs/set', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ package: p.name }),
+        body: JSON.stringify({ package: p.name, key: key.value.trim(), value: value.value }),
+      }).then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+      save.disabled = false; save.textContent = 'save setting';
+      if (!r.ok) {
+        note.textContent = r.error ?? 'save failed';
+        return;
+      }
+      const loaded = await loadPackageConfig(p.name, raw);
+      note.textContent = loaded && loaded.includes(key.value.trim()) ? 'saved' : 'saved, but could not verify the reload';
+    };
+    form.append(key, value, save, note);
+    card.appendChild(form);
+    const details = document.createElement('details');
+    const summary = el('summary', 'dim-note', 'current settings');
+    const raw = el('pre', 'setup-readme');
+    raw.textContent = 'not loaded';
+    details.append(summary, raw);
+    details.addEventListener('toggle', () => { if (details.open) loadPackageConfig(p.name, raw); });
+    card.appendChild(details);
+    configBox.appendChild(card);
+  }
+  if (!pkgAny && pkgs.ok !== false) configBox.appendChild(el('div', 'dim-note', 'nothing added yet'));
+
+  pendBox.textContent = '';
+  if (proposals.ok === false) {
+    pendBox.appendChild(el('div', 'dim-note', `could not load agent requests: ${proposals.error ?? 'unknown error'}`));
+  }
+  let requestAny = false;
+  for (const p of proposals.ok === false ? [] : (proposals.proposals ?? [])) {
+    requestAny = true;
+    const card = el('div', 'setup-pending-pkg');
+    const who = p.agent && typeof p.agent === 'string' ? p.agent : 'an agent';
+    card.appendChild(el('div', 'setup-kit-name', `${who} wants to change settings`));
+    card.appendChild(el('div', 'dim-note', (p.files ?? []).join(', ') || 'settings change'));
+    const diff = el('pre', 'setup-readme');
+    diff.hidden = true;
+    const row = el('div', 'setup-row');
+    const showBtn = el('button', 'ghost', 'show change');
+    showBtn.onclick = async () => {
+      if (diff.hidden && !diff.textContent) {
+        diff.textContent = 'loading...';
+        const r = await fetch(`/api/admin/proposals/show?id=${encodeURIComponent(p.proposal)}`)
+          .then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+        diff.textContent = r.ok ? r.diff : (r.error ?? 'could not load the change');
+      }
+      diff.hidden = !diff.hidden;
+    };
+    const acceptBtn = el('button', '', 'accept');
+    acceptBtn.onclick = async () => {
+      acceptBtn.disabled = true; acceptBtn.textContent = 'accepting...';
+      const r = await fetch('/api/admin/proposals/accept', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: p.proposal }),
       }).then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
       loadSetup(r.ok
-        ? { status: `✓ confirmed ${p.name}.`, statusKind: 'ok' }
-        : { status: `✕ couldn't confirm ${p.name}: ${r.error ?? 'unknown error'}`, statusKind: 'err' });
+        ? { status: 'accepted the change.', statusKind: 'ok' }
+        : { status: `✕ couldn't accept it: ${r.error ?? 'unknown error'}`, statusKind: 'err' });
     };
-    row.appendChild(approveBtn);
-    const cmd = el('code', 'setup-cmd', `elanus approve ${p.name}`);
-    cmd.title = 'the same gesture from a terminal — click to copy';
-    cmd.onclick = () => navigator.clipboard?.writeText(`elanus approve ${p.name}`);
-    row.appendChild(cmd);
+    const declineBtn = el('button', 'ghost', 'decline');
+    declineBtn.onclick = async () => {
+      declineBtn.disabled = true; declineBtn.textContent = 'declining...';
+      const r = await fetch('/api/admin/proposals/decline', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: p.proposal }),
+      }).then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+      loadSetup(r.ok
+        ? { status: 'declined the change.', statusKind: 'ok' }
+        : { status: `✕ couldn't decline it: ${r.error ?? 'unknown error'}`, statusKind: 'err' });
+    };
+    row.append(showBtn, acceptBtn, declineBtn);
     card.appendChild(row);
+    card.appendChild(diff);
     pendBox.appendChild(card);
   }
-  if (!pendingAny) pendBox.appendChild(el('div', 'dim-note', 'nothing to confirm — you’re all set'));
+  if (!requestAny && proposals.ok !== false) pendBox.appendChild(el('div', 'dim-note', 'no agent requests'));
+}
+
+async function loadPackageConfig(pkg, raw) {
+  raw.textContent = 'loading...';
+  const r = await fetch(`/api/admin/configs?package=${encodeURIComponent(pkg)}`)
+    .then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+  const text = r.ok ? (r.config?.toml || 'no settings yet') : null;
+  raw.textContent = text ?? (r.error ?? 'could not load settings');
+  return text;
 }
 
 function selectAgent(name, tab) {
@@ -351,38 +434,880 @@ function selectAgent(name, tab) {
 
 // ---------- configure (per-agent identity) ----------
 let cfgProfile = null; // the profile NAME backing the form
+let cfgParsed = {};
+let cfgPackages = [];
+let cfgKits = [];
+let cfgConfigPackages = new Set();
+let cfgContextChain = [];
+let cfgContextRemoved = new Set();
+const cfgKitDetails = new Map();
+const PARENT_PATH = '$parent';
 // The fields + both save buttons are LOCKED while the pane populates.
 // loadConfigure does two round trips (profile fetch, then loadDiskAgents — ~1s)
 // and only fills the fields at the very end; left editable, anything typed in
 // that window is silently overwritten by the late resolve, i.e. invisible edit
 // loss. Disabling is both the guard and the "still loading" affordance.
-const CFG_LOCKABLE = ['#cfg-agent', '#cfg-model', '#cfg-turns', '#cfg-workdir', '#cfg-include', '#cfg-exclude', '#cfg-save', '#cfg-toml', '#cfg-toml-save'];
 function setConfigureLoading(on) {
-  for (const s of CFG_LOCKABLE) { const e = $(s); if (e) e.disabled = on; }
+  document.querySelectorAll('#view-configure input, #view-configure textarea, #view-configure select, #view-configure button')
+    .forEach((e) => { e.disabled = on; });
 }
+
+function csv(values) {
+  return Array.isArray(values) ? values.join(', ') : '';
+}
+
+function iconButton(symbol, title, cls = 'icon-btn') {
+  const b = el('button', cls, symbol);
+  b.type = 'button';
+  b.title = title;
+  b.setAttribute('aria-label', title);
+  return b;
+}
+
+function topicFilterMatches(filterText, value) {
+  const f = String(filterText ?? '');
+  if (f === '#') return true;
+  const fp = f.split('/');
+  const vp = String(value ?? '').split('/');
+  for (let i = 0, j = 0; i < fp.length; i++, j++) {
+    if (fp[i] === '#') return true;
+    if (j >= vp.length) return false;
+    if (fp[i] !== '+' && fp[i] !== vp[j]) return false;
+  }
+  return fp.length === vp.length;
+}
+
+function skillVisible(pkg) {
+  const include = arr($('#cfg-include').value);
+  const exclude = arr($('#cfg-exclude').value);
+  const inc = include.length ? include : ['#'];
+  return inc.some((p) => topicFilterMatches(p, pkg.name))
+    && !exclude.some((p) => topicFilterMatches(p, pkg.name));
+}
+
+function skillIncluded(pkg) {
+  const include = arr($('#cfg-include').value);
+  const inc = include.length ? include : ['#'];
+  return inc.some((p) => topicFilterMatches(p, pkg.name));
+}
+
+function skillExcluded(pkg) {
+  return arr($('#cfg-exclude').value).some((p) => topicFilterMatches(p, pkg.name));
+}
+
+function setSkillExcluded(pkgName, excluded) {
+  const next = arr($('#cfg-exclude').value).filter((p) => p !== pkgName);
+  if (excluded) next.push(pkgName);
+  $('#cfg-exclude').value = next.join(', ');
+  renderPackageConfigTree();
+  reconcileContextChainWithVisibility();
+  renderContextChain();
+}
+
+function setKitPackagesExcluded(pkgs, excluded) {
+  const names = new Set(pkgs.map((p) => p.name));
+  const next = arr($('#cfg-exclude').value).filter((p) => !names.has(p));
+  if (excluded) next.push(...[...names].sort());
+  $('#cfg-exclude').value = next.join(', ');
+  renderPackageConfigTree();
+  reconcileContextChainWithVisibility();
+  renderContextChain();
+}
+
+function currentLocalElanusPath() {
+  const entries = arr($('#cfg-package-path').value);
+  if ($('#cfg-path-inherit').checked) entries.push(PARENT_PATH);
+  return entries;
+}
+
+async function saveAgentPath(entries) {
+  const r = await fetch('/api/admin/agents/set', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: cfgProfile, set: prunedSet({ parent: $('#cfg-parent').value.trim(), elanus_path: entries }) }),
+  }).then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+  return r;
+}
+
+function kitNameFor(pkg) {
+  const parts = String(pkg.dir ?? '').split(/[\\/]/);
+  const kits = parts.lastIndexOf('kits');
+  if (kits >= 0 && parts[kits + 1]) return parts[kits + 1];
+  const source = packageSource(pkg);
+  return source.kind === 'copied' ? 'instance' : source.label;
+}
+
+function packageSource(pkg) {
+  const parts = String(pkg.dir ?? '').split(/[\\/]/);
+  const kits = parts.lastIndexOf('kits');
+  if (kits >= 0 && parts[kits + 1]) return { kind: 'linked', label: parts[kits + 1], icon: '↗' };
+  const packages = parts.lastIndexOf('packages');
+  if (packages >= 0) return { kind: 'copied', label: 'instance', icon: '⬚' };
+  return { kind: 'path', label: 'path entry', icon: '•' };
+}
+
+function packageBadges(pkg) {
+  const badges = [];
+  if (pkg.skill) badges.push({ cls: 'badge', text: 'skill' });
+  const manifest = pkg.manifest ?? {};
+  if (manifest.process?.mode) badges.push({ cls: 'badge badge-wait', text: manifest.process.mode === 'daemon' ? 'actor' : manifest.process.mode });
+  if (manifest.process?.http) badges.push({ cls: 'badge badge-wait', text: 'http' });
+  if (manifest.hooks) badges.push({ cls: 'badge badge-wait', text: 'hook' });
+  if (manifest.cron) badges.push({ cls: 'badge badge-wait', text: 'cron' });
+  if (manifest.providers) badges.push({ cls: 'badge badge-wait', text: 'provider' });
+  if ((manifest.stages ?? []).length) badges.push({ cls: 'badge badge-wait', text: 'stage' });
+  if ((manifest.mcp ?? []).length) badges.push({ cls: 'badge badge-wait', text: 'mcp' });
+  return badges;
+}
+
+function packageDescription(pkg) {
+  const manifest = pkg.manifest ?? {};
+  if (manifest.description) return firstSentence(manifest.description);
+  if (pkg.skill?.description) return pkg.skill.description;
+  if (manifest.process?.mode === 'daemon') return 'resident actor on the bus';
+  if (manifest.process?.mode === 'exec') return 'per-event script actor';
+  if (manifest.hooks) return 'policy hook package';
+  if ((manifest.stages ?? []).length) return 'context stage package';
+  if ((manifest.mcp ?? []).length) return 'MCP tool server package';
+  return 'package';
+}
+
+function firstSentence(text) {
+  const compact = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!compact) return '';
+  const sentence = compact.match(/^(.{20,220}?[.!?])\s/)?.[1] ?? compact;
+  return sentence.length > 180 ? `${sentence.slice(0, 177)}...` : sentence;
+}
+
+function shortList(values, max = 2) {
+  const list = (values ?? []).filter(Boolean);
+  if (!list.length) return '';
+  const shown = list.slice(0, max).join(', ');
+  return list.length > max ? `${shown}, +${list.length - max}` : shown;
+}
+
+function actorDetail(pkg) {
+  const manifest = pkg.manifest ?? {};
+  const bits = [];
+  const process = manifest.process;
+  if (process?.mode === 'daemon') {
+    bits.push(`runs ${process.run ?? 'its script'} as a resident actor`);
+  } else if (process?.mode === 'exec') {
+    bits.push(`runs ${process.run ?? 'its script'} for each matching event`);
+  }
+  const request = manifest.request ?? {};
+  const subscribes = shortList(request.subscribe);
+  if (subscribes) bits.push(`listens on ${subscribes}`);
+  const publishes = shortList(request.publish);
+  if (publishes) bits.push(`can emit ${publishes}`);
+  const blocking = shortList(request.blocking);
+  if (blocking) bits.push(`can block ${blocking}`);
+  if (process?.http) bits.push('serves an approved local HTTP endpoint');
+  if (manifest.hooks) bits.push(`declares ${manifest.hooks} hook${manifest.hooks === 1 ? '' : 's'}`);
+  if ((manifest.stages ?? []).length) bits.push(`contributes ${manifest.stages.length} context stage${manifest.stages.length === 1 ? '' : 's'}`);
+  if ((manifest.mcp ?? []).length) bits.push(`exposes ${manifest.mcp.length} MCP server${manifest.mcp.length === 1 ? '' : 's'}`);
+  if (manifest.cron) bits.push(`schedules ${manifest.cron} recurring event${manifest.cron === 1 ? '' : 's'}`);
+  const summary = bits.length ? `${bits.join('; ')}.` : packageDescription(pkg);
+  const desc = manifest.description && firstSentence(manifest.description) !== manifest.description
+    ? manifest.description
+    : '';
+  return desc ? `${summary} ${desc}` : summary;
+}
+
+function normalizedPreviewPackage(pkg) {
+  const manifest = pkg.manifest ?? {};
+  if (manifest.process || !manifest.mode) return pkg;
+  return {
+    ...pkg,
+    manifest: {
+      ...manifest,
+      process: { mode: manifest.mode, run: manifest.run, http: manifest.http },
+    },
+  };
+}
+
+function tomlDisplayValue(value, type = 'string') {
+  if (value === undefined || value === null) return '';
+  if (type === 'array') return JSON.stringify(value);
+  if (type === 'boolean') return value ? 'true' : 'false';
+  if (type === 'number') return String(value);
+  return String(value);
+}
+
+function declaredConfigParams(pkg) {
+  const byKey = new Map();
+  for (const key of pkg.manifest?.config?.agent_tunable ?? []) {
+    if (!key) continue;
+    byKey.set(key, {
+      key,
+      type: 'string',
+      label: key,
+      help: 'Package setting declared agent-tunable by the package manifest.',
+      agent_tunable: true,
+      source: 'package',
+    });
+  }
+  for (const stage of pkg.manifest?.stages ?? []) {
+    for (const param of stage.config ?? []) {
+      if (!param.key) continue;
+      byKey.set(param.key, {
+        key: param.key,
+        type: param.type ?? 'string',
+        label: param.label || param.key,
+        help: param.help || '',
+        default: param.default,
+        options: param.options ?? [],
+        agent_tunable: param.agent_tunable === true,
+        source: `context stage ${stage.name}`,
+      });
+    }
+  }
+  return [...byKey.values()].sort((a, b) => a.key.localeCompare(b.key));
+}
+
+function typedConfigInput(param, valueText) {
+  if (param.type === 'boolean') {
+    const label = el('label', 'cfg-check');
+    const input = el('input');
+    input.type = 'checkbox';
+    input.checked = /^(true|1)$/i.test(String(valueText || tomlDisplayValue(param.default, param.type)));
+    label.append(input, document.createTextNode(' enabled'));
+    label.dataset.valueInput = '1';
+    label.valueForSave = () => input.checked ? 'true' : 'false';
+    return label;
+  }
+  if (param.type === 'enum' && (param.options ?? []).length) {
+    const input = el('select');
+    for (const option of param.options) input.appendChild(el('option', '', option));
+    input.value = String(valueText || tomlDisplayValue(param.default, param.type) || param.options[0]);
+    input.valueForSave = () => input.value;
+    return input;
+  }
+  const input = el('input');
+  input.spellcheck = false;
+  if (param.type === 'number') input.type = 'number';
+  input.value = valueText || tomlDisplayValue(param.default, param.type);
+  input.placeholder = param.default === undefined || param.default === null
+    ? 'value'
+    : `default ${tomlDisplayValue(param.default, param.type)}`;
+  input.valueForSave = () => input.value;
+  return input;
+}
+
+function parseConfigRows(raw = '') {
+  const rows = [];
+  for (const line of String(raw).split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('[')) continue;
+    const m = trimmed.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.*)$/);
+    if (!m) continue;
+    rows.push({ key: m[1], value: m[2] });
+  }
+  return rows;
+}
+
+function kitIsInstalled(k, detail = null) {
+  const kitDir = String(k?.dir ?? '');
+  const packageDir = `${kitDir.replace(/[\\/]$/, '')}${kitDir ? '/' : ''}packages`;
+  if (kitDir && arr($('#cfg-effective-path').value).some((p) => p === kitDir || p === packageDir)) return true;
+  const names = new Set((detail?.packages ?? []).map((p) => p.name));
+  return names.size > 0 && cfgPackages.some((p) => names.has(p.name));
+}
+
+async function loadKitDetail(k) {
+  if (cfgKitDetails.has(k.name)) return cfgKitDetails.get(k.name);
+  const r = await fetch(`/api/admin/kits/packages?kit=${encodeURIComponent(k.name)}`)
+    .then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+  const detail = r.ok ? r.kit : { ...k, packages: [], error: r.error ?? 'could not load kit' };
+  cfgKitDetails.set(k.name, detail);
+  return detail;
+}
+
+function focusPackageConfigs(kitName) {
+  const target = document.querySelector(`#cfg-package-configs details[data-kit="${CSS.escape(kitName)}"]`);
+  if (target) target.open = true;
+  location.hash = 'cfg-section-packages';
+  document.querySelector('#cfg-section-packages')?.scrollIntoView({ block: 'start' });
+}
+
+async function installKitForAgent(k, mode, note, controls = []) {
+  if (!cfgProfile) return;
+  const buttons = Array.isArray(controls) ? controls : [controls];
+  buttons.forEach((button) => { if (button) button.disabled = true; });
+  note.textContent = mode === 'copy' ? 'copying...' : 'linking...';
+  if (mode === 'copy') {
+    const r = await fetch('/api/admin/kits/add', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kit: k.name, copy: true }),
+    }).then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+    note.textContent = r.ok ? `copied ${k.name}` : (r.error ?? 'copy failed');
+    buttons.forEach((button) => { if (button) button.disabled = false; });
+    if (r.ok) await loadConfigure(sel.agent ?? cfgParsed.agent ?? cfgProfile);
+    return;
+  }
+  const entries = currentLocalElanusPath().filter((p) => p !== k.dir);
+  const insertAt = entries.indexOf(PARENT_PATH);
+  if (insertAt >= 0) entries.splice(insertAt, 0, k.dir);
+  else entries.unshift(k.dir);
+  const r = await saveAgentPath(entries);
+  note.textContent = r.ok ? `linked ${k.name}` : (r.error ?? 'link failed');
+  buttons.forEach((button) => { if (button) button.disabled = false; });
+  if (r.ok) await loadConfigure(sel.agent ?? cfgParsed.agent ?? cfgProfile);
+}
+
+async function renderKitAddList() {
+  const box = $('#cfg-kit-add-list');
+  box.textContent = '';
+  if (!cfgKits.length) {
+    box.appendChild(el('div', 'dim-note', 'no kits found'));
+    return;
+  }
+  for (const k of cfgKits) {
+    const details = document.createElement('details');
+    details.className = 'cfg-add-kit';
+    const summary = el('summary', 'cfg-kit-summary cfg-kit-head');
+    summary.appendChild(el('span', '', k.name));
+    summary.appendChild(el('span', 'cfg-pkg-desc', k.hook || ''));
+    const actions = el('span', 'cfg-kit-actions');
+    const install = el('span', 'cfg-split-action');
+    const primary = el('button', 'cfg-split-primary cfg-kit-add-btn', 'link');
+    primary.type = 'button';
+    primary.title = `link ${k.name}`;
+    primary.setAttribute('aria-label', `link ${k.name}`);
+    const menuToggle = iconButton('⌄', `more add actions for ${k.name}`, 'cfg-split-caret');
+    const menu = el('div', 'cfg-action-menu');
+    menu.hidden = true;
+    for (const action of ['link', 'copy']) {
+      const item = el('button', '', action);
+      item.type = 'button';
+      item.setAttribute('aria-label', `${action} ${k.name}`);
+      item.onclick = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        menu.hidden = true;
+        await installKitForAgent(k, action, note, [primary, menuToggle, ...menu.querySelectorAll('button')]);
+      };
+      menu.appendChild(item);
+    }
+    install.append(primary, menuToggle, menu);
+    const gear = iconButton('⚙', `configure ${k.name}`, 'cfg-icon-btn cfg-kit-gear');
+    const badge = el('span', 'badge', 'installed');
+    badge.hidden = true;
+    gear.hidden = true;
+    actions.append(install, badge, gear);
+    summary.appendChild(actions);
+    details.appendChild(summary);
+    const skillsBox = el('div', 'cfg-skill-table');
+    skillsBox.appendChild(el('div', 'dim-note', 'expand to load packages'));
+    const note = el('div', 'dim-note');
+    details.append(skillsBox, note);
+    const refreshInstallState = (detail) => {
+      const installed = kitIsInstalled(k, detail);
+      badge.hidden = !installed;
+      gear.hidden = !installed;
+      install.hidden = installed;
+    };
+    refreshInstallState(null);
+    details.addEventListener('toggle', async () => {
+      if (!details.open || details.dataset.loaded) return;
+      skillsBox.textContent = 'loading...';
+      const detail = await loadKitDetail(k);
+      details.dataset.loaded = '1';
+      skillsBox.textContent = '';
+      const packages = detail.packages ?? [];
+      if (!packages.length) {
+        skillsBox.appendChild(el('div', 'dim-note', detail.error ?? 'no packages in this kit'));
+      } else {
+        for (const p of packages) {
+          const row = el('div', 'cfg-skill-row cfg-kit-preview-row');
+          const previewPkg = normalizedPreviewPackage(p);
+          const name = el('span', 'cfg-pkg-name', p.name);
+          const badges = el('span', 'cfg-preview-badges');
+          if (p.skill) badges.appendChild(el('span', 'badge', 'skill'));
+          if (p.manifest?.actor) badges.appendChild(el('span', 'badge badge-wait', p.manifest.actor));
+          name.appendChild(badges);
+          row.appendChild(name);
+          row.appendChild(el('span', 'cfg-pkg-desc', actorDetail(previewPkg)));
+          row.appendChild(el('span', 'cfg-skill-actions', ''));
+          skillsBox.appendChild(row);
+        }
+      }
+      refreshInstallState(detail);
+    });
+    primary.onclick = async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      await installKitForAgent(k, 'link', note, [primary, menuToggle, ...menu.querySelectorAll('button')]);
+    };
+    menuToggle.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      menu.hidden = !menu.hidden;
+    };
+    gear.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      focusPackageConfigs(k.name);
+    };
+    box.appendChild(details);
+  }
+}
+
+function groupByKit(packages) {
+  const groups = new Map();
+  for (const p of packages) {
+    const kit = kitNameFor(p);
+    if (!groups.has(kit)) groups.set(kit, []);
+    groups.get(kit).push(p);
+  }
+  return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b));
+}
+
+function varRow(key = '', value = '') {
+  const row = el('div', 'cfg-var-row');
+  row.innerHTML = '<input class="cfg-var-key" placeholder="name" spellcheck="false" />'
+    + '<input class="cfg-var-value" placeholder="value" spellcheck="false" />';
+  row.querySelector('.cfg-var-key').value = key;
+  row.querySelector('.cfg-var-value').value = value ?? '';
+  return row;
+}
+
+function renderVars(vars = {}) {
+  const box = $('#cfg-vars');
+  box.textContent = '';
+  for (const [k, v] of Object.entries(vars ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+    box.appendChild(varRow(k, v));
+  }
+  if (!box.children.length) box.appendChild(varRow());
+}
+
+function throttleRow(name = '', t = {}) {
+  const row = el('div', 'cfg-throttle-row');
+  row.innerHTML = '<input class="cfg-throttle-name" placeholder="name" spellcheck="false" />'
+    + '<input class="cfg-throttle-max" type="number" placeholder="max concurrent" />'
+    + '<input class="cfg-throttle-rate" type="number" placeholder="rate/min" />'
+    + '<input class="cfg-throttle-tokens" type="number" placeholder="tokens/hour" />'
+    + '<label class="cfg-check"><input class="cfg-throttle-coalesce" type="checkbox" /> coalesce</label>';
+  row.querySelector('.cfg-throttle-name').value = name;
+  row.querySelector('.cfg-throttle-max').value = t?.max_concurrent ?? '';
+  row.querySelector('.cfg-throttle-rate').value = t?.rate_per_min ?? '';
+  row.querySelector('.cfg-throttle-tokens').value = t?.llm_tokens_per_hour ?? '';
+  row.querySelector('.cfg-throttle-coalesce').checked = t?.coalesce === true;
+  return row;
+}
+
+function renderThrottle(throttle = {}) {
+  const box = $('#cfg-throttle');
+  box.textContent = '';
+  for (const [k, v] of Object.entries(throttle ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+    box.appendChild(throttleRow(k, v));
+  }
+  if (!box.children.length) box.appendChild(throttleRow());
+}
+
+function contextStageKey(s) {
+  return `${s.package}/${s.name}`;
+}
+
+function contextStageDefs() {
+  const defs = [];
+  for (const p of cfgPackages.filter(skillVisible)) {
+    for (const stage of p.manifest?.stages ?? []) {
+      defs.push({
+        package: p.name,
+        name: stage.name,
+        mode: stage.mode ?? 'exec',
+        order: Number(stage.order ?? 50),
+        timeout_ms: stage.mode === 'resident' ? 15000 : 10000,
+        config: stage.config ?? [],
+      });
+    }
+  }
+  return defs.sort((a, b) => (a.order - b.order)
+    || a.package.localeCompare(b.package)
+    || a.name.localeCompare(b.name));
+}
+
+function resetContextChain(context = {}) {
+  const defs = contextStageDefs();
+  const overrides = new Map((context.stages ?? []).map((s) => [contextStageKey(s), s]));
+  cfgContextRemoved = new Set((context.stages ?? [])
+    .filter((s) => s.enabled === false)
+    .map(contextStageKey));
+  cfgContextChain = [];
+  for (const def of defs) {
+    const ov = overrides.get(contextStageKey(def));
+    if (ov?.enabled === false) continue;
+    cfgContextChain.push({
+      ...def,
+      enabled: true,
+      order: Number(ov?.order ?? def.order),
+      timeout_ms: Number(ov?.timeout_ms ?? def.timeout_ms),
+    });
+  }
+  cfgContextChain.sort((a, b) => (a.order - b.order)
+    || a.package.localeCompare(b.package)
+    || a.name.localeCompare(b.name));
+}
+
+function reconcileContextChainWithVisibility() {
+  const defs = contextStageDefs();
+  const defsByKey = new Map(defs.map((s) => [contextStageKey(s), s]));
+  const disabledFromProfile = new Set((cfgParsed.context?.stages ?? [])
+    .filter((s) => s.enabled === false)
+    .map(contextStageKey));
+  const seen = new Set();
+  cfgContextChain = cfgContextChain
+    .filter((stage) => defsByKey.has(contextStageKey(stage)))
+    .map((stage) => {
+      const def = defsByKey.get(contextStageKey(stage));
+      seen.add(contextStageKey(stage));
+      return { ...def, ...stage, enabled: true };
+    });
+  for (const def of defs) {
+    const key = contextStageKey(def);
+    if (!seen.has(key) && !disabledFromProfile.has(key) && !cfgContextRemoved.has(key)) {
+      cfgContextChain.push({ ...def, enabled: true });
+    }
+  }
+  cfgContextChain.sort((a, b) => (Number(a.order ?? 50) - Number(b.order ?? 50))
+    || a.package.localeCompare(b.package)
+    || a.name.localeCompare(b.name));
+}
+
+function renumberContextChain() {
+  cfgContextChain.forEach((s, i) => { s.order = (i + 1) * 10; });
+}
+
+function moveContextStage(index, dir) {
+  const next = index + dir;
+  if (next < 0 || next >= cfgContextChain.length) return;
+  const tmp = cfgContextChain[index];
+  cfgContextChain[index] = cfgContextChain[next];
+  cfgContextChain[next] = tmp;
+  renumberContextChain();
+  renderContextChain();
+}
+
+function removeContextStage(index) {
+  const [removed] = cfgContextChain.splice(index, 1);
+  if (removed) cfgContextRemoved.add(contextStageKey(removed));
+  renumberContextChain();
+  renderContextChain();
+}
+
+function addContextStage(key) {
+  const def = contextStageDefs().find((s) => contextStageKey(s) === key);
+  if (!def || cfgContextChain.some((s) => contextStageKey(s) === key)) return;
+  cfgContextRemoved.delete(key);
+  cfgContextChain.push({ ...def, enabled: true, order: (cfgContextChain.length + 1) * 10 });
+  renderContextChain();
+}
+
+function renderContextChain() {
+  const box = $('#cfg-context-chain');
+  const addSelect = $('#cfg-context-add-stage');
+  if (!box || !addSelect) return;
+  const defs = contextStageDefs();
+  const inChain = new Set(cfgContextChain.map(contextStageKey));
+  const available = defs.filter((s) => !inChain.has(contextStageKey(s)));
+  addSelect.textContent = '';
+  for (const s of available) {
+    const opt = el('option', '', `${s.package}/${s.name}`);
+    opt.value = contextStageKey(s);
+    addSelect.appendChild(opt);
+  }
+  addSelect.disabled = !available.length;
+  $('#cfg-context-add').disabled = !available.length;
+
+  box.textContent = '';
+  if (!defs.length) {
+    box.appendChild(el('div', 'dim-note', 'no visible package context stages'));
+    return;
+  }
+  if (!cfgContextChain.length) {
+    box.appendChild(el('div', 'dim-note', 'all visible context stages are removed for this agent'));
+  }
+  cfgContextChain.forEach((stage, index) => {
+    const tile = el('div', 'cfg-context-stage');
+    tile.dataset.stage = contextStageKey(stage);
+    const head = el('div', 'cfg-context-stage-head');
+    const title = el('div', 'cfg-context-stage-title');
+    title.appendChild(el('strong', '', `${stage.package}/${stage.name}`));
+    title.appendChild(el('span', 'cfg-config-help', `mode: ${stage.mode} · ${stage.config.length} declared setting${stage.config.length === 1 ? '' : 's'}`));
+    const actions = el('div', 'cfg-context-stage-actions');
+    const up = iconButton('↑', `move ${stage.package}/${stage.name} up`, 'cfg-icon-btn');
+    const down = iconButton('↓', `move ${stage.package}/${stage.name} down`, 'cfg-icon-btn');
+    const remove = iconButton('×', `remove ${stage.package}/${stage.name}`, 'cfg-icon-btn');
+    up.disabled = index === 0;
+    down.disabled = index === cfgContextChain.length - 1;
+    up.onclick = () => moveContextStage(index, -1);
+    down.onclick = () => moveContextStage(index, 1);
+    remove.onclick = () => removeContextStage(index);
+    actions.append(up, down, remove);
+    head.append(title, actions);
+    const controls = el('div', 'cfg-context-stage-grid');
+    const order = el('label', '', 'order');
+    const orderInput = el('input');
+    orderInput.type = 'number';
+    orderInput.min = '1';
+    orderInput.dataset.contextField = 'order';
+    orderInput.value = stage.order;
+    orderInput.oninput = () => { stage.order = Number(orderInput.value || stage.order); };
+    order.appendChild(orderInput);
+    const timeout = el('label', '', 'timeout ms');
+    const timeoutInput = el('input');
+    timeoutInput.type = 'number';
+    timeoutInput.min = '1';
+    timeoutInput.dataset.contextField = 'timeout_ms';
+    timeoutInput.value = stage.timeout_ms;
+    timeoutInput.oninput = () => { stage.timeout_ms = Number(timeoutInput.value || stage.timeout_ms); };
+    timeout.appendChild(timeoutInput);
+    controls.append(order, timeout);
+    tile.append(head, controls);
+    box.appendChild(tile);
+  });
+}
+
+function syncContextChainFromDom() {
+  const byKey = new Map(cfgContextChain.map((s) => [contextStageKey(s), s]));
+  for (const tile of document.querySelectorAll('#cfg-context-chain .cfg-context-stage')) {
+    const stage = byKey.get(tile.dataset.stage);
+    if (!stage) continue;
+    const order = Number(tile.querySelector('[data-context-field="order"]')?.value);
+    const timeout = Number(tile.querySelector('[data-context-field="timeout_ms"]')?.value);
+    if (Number.isFinite(order) && order > 0) stage.order = order;
+    if (Number.isFinite(timeout) && timeout > 0) stage.timeout_ms = timeout;
+  }
+}
+
+function contextStageOverridesForSave() {
+  syncContextChainFromDom();
+  const chain = new Map(cfgContextChain.map((s) => [contextStageKey(s), s]));
+  const rows = [];
+  for (const current of cfgContextChain) {
+    rows.push({
+      package: current.package,
+      name: current.name,
+      enabled: true,
+      order: Number(current.order || 50),
+      timeout_ms: Number(current.timeout_ms || (current.mode === 'resident' ? 15000 : 10000)),
+    });
+  }
+  for (const def of contextStageDefs()) {
+    if (!chain.has(contextStageKey(def))) rows.push({ package: def.package, name: def.name, enabled: false });
+  }
+  return rows;
+}
+
+function packageConfigControls(p) {
+  const card = document.createElement('details');
+  card.className = 'cfg-package-card';
+  card.dataset.package = p.name;
+  const disabled = skillExcluded(p);
+  card.classList.toggle('is-disabled', disabled);
+  const head = el('summary', 'cfg-package-head');
+  head.appendChild(el('span', 'cfg-disclosure', '▸'));
+  const source = packageSource(p);
+  const sourceIcon = el('span', `cfg-source-icon source-${source.kind}`, source.icon);
+  sourceIcon.title = `${source.kind}: ${source.label}`;
+  head.appendChild(sourceIcon);
+  const title = el('span', 'cfg-package-title');
+  title.appendChild(el('span', 'setup-kit-name', p.name));
+  title.appendChild(el('span', 'cfg-pkg-desc', packageDescription(p)));
+  head.appendChild(title);
+  card.appendChild(head);
+
+  const body = el('div', 'cfg-package-body');
+  body.appendChild(el('div', 'cfg-package-detail', actorDetail(p)));
+  const meta = el('div', 'cfg-package-meta');
+  for (const b of packageBadges(p)) meta.appendChild(el('span', b.cls, b.text));
+  if (meta.children.length) body.appendChild(meta);
+  const declared = declaredConfigParams(p);
+  const canConfigure = declared.length > 0 || cfgConfigPackages.has(p.name);
+  const controls = el('div', 'cfg-package-controls');
+  const visibility = el('span', 'dim-note', disabled ? 'disabled for this agent' : 'enabled for this agent');
+  const toggle = el('button', disabled ? 'ghost cfg-package-disable' : 'cfg-package-disable', disabled ? 'enable' : 'disable');
+  toggle.title = disabled ? `remove ${p.name} from skills.exclude` : `add ${p.name} to skills.exclude`;
+  const configure = el('button', 'ghost cfg-package-config-toggle', 'settings');
+  configure.hidden = !canConfigure;
+  controls.append(visibility, toggle, configure);
+  body.appendChild(controls);
+  const panel = el('div', 'cfg-package-config-panel');
+  panel.hidden = true;
+  panel.textContent = 'loading...';
+  body.appendChild(panel);
+  card.appendChild(body);
+  const toggleConfigPanel = async () => {
+    card.open = true;
+    panel.hidden = !panel.hidden;
+    if (panel.hidden || panel.dataset.loaded) return;
+    const r = await fetch(`/api/admin/configs?package=${encodeURIComponent(p.name)}`)
+      .then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+    const raw = r.ok ? (r.config?.toml || '') : '';
+    const current = parseConfigRows(raw);
+    const byKey = new Map(current.map((row) => [row.key, row.value]));
+    const params = new Map(declared.map((param) => [param.key, param]));
+    for (const param of declared) if (!byKey.has(param.key)) byKey.set(param.key, '');
+    for (const key of byKey.keys()) {
+      if (!params.has(key)) params.set(key, {
+        key,
+        type: 'string',
+        label: key,
+        help: 'Existing package setting not declared in the manifest.',
+        source: 'current settings',
+      });
+    }
+    panel.textContent = '';
+    if (!byKey.size) {
+      panel.appendChild(el('div', 'dim-note', r.ok ? 'no configurable settings declared' : (r.error ?? 'could not load settings')));
+      panel.dataset.loaded = '1';
+      return;
+    }
+    for (const param of [...params.values()].sort((a, b) => a.key.localeCompare(b.key))) {
+      const keyName = param.key;
+      const valueText = byKey.get(keyName) ?? '';
+      const row = el('div', 'cfg-config-row');
+      const label = el('label', '', param.label || keyName);
+      label.title = keyName;
+      const help = el('span', 'cfg-config-help');
+      help.textContent = [
+        param.source,
+        param.type ? `type: ${param.type}` : '',
+        param.agent_tunable ? 'agent-tunable' : '',
+        param.help,
+      ].filter(Boolean).join(' · ');
+      label.appendChild(help);
+      const input = typedConfigInput(param, valueText);
+      const save = iconButton('✓', `save ${p.name}.${keyName}`, 'cfg-icon-btn');
+      const note = el('span', 'dim-note');
+      save.onclick = async () => {
+        save.disabled = true;
+        note.textContent = 'saving...';
+        const value = typeof input.valueForSave === 'function' ? input.valueForSave() : input.value;
+        const write = await fetch('/api/admin/configs/set', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ package: p.name, key: keyName, value }),
+        }).then((x) => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
+        save.disabled = false;
+        note.textContent = write.ok ? 'saved' : (write.error ?? 'save failed');
+        if (write.ok) cfgConfigPackages.add(p.name);
+      };
+      row.append(label, input, save, note);
+      panel.appendChild(row);
+    }
+    panel.dataset.loaded = '1';
+  };
+  configure.onclick = async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    await toggleConfigPanel();
+  };
+  toggle.onclick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setSkillExcluded(p.name, !disabled);
+  };
+  return card;
+}
+
+function renderPackageConfigTree() {
+  const box = $('#cfg-package-configs');
+  box.textContent = '';
+  const packages = cfgPackages.filter(skillIncluded);
+  if (!packages.length) {
+    box.appendChild(el('div', 'dim-note', 'no packages found'));
+    return;
+  }
+  for (const [kit, pkgs] of groupByKit(packages)) {
+    const details = document.createElement('details');
+    details.className = 'cfg-package-group';
+    details.dataset.kit = kit;
+    details.open = true;
+    const disabledCount = pkgs.filter((p) => skillExcluded(p)).length;
+    const kitHead = el('summary', 'cfg-kit-summary cfg-kit-head');
+    kitHead.appendChild(el('span', 'cfg-disclosure', '▸'));
+    kitHead.appendChild(el('span', 'cfg-kit-name', kit));
+    kitHead.appendChild(el('span', 'cfg-pkg-desc', `${pkgs.length} package${pkgs.length === 1 ? '' : 's'}`));
+    const kitToggle = iconButton(
+      disabledCount === pkgs.length ? '✓' : '⊘',
+      disabledCount === pkgs.length
+        ? `enable all ${kit} packages`
+        : `disable all ${kit} packages`,
+      disabledCount === pkgs.length ? 'ghost cfg-icon-btn cfg-kit-toggle' : 'cfg-icon-btn cfg-kit-toggle',
+    );
+    kitToggle.title = disabledCount === pkgs.length
+      ? `remove all ${kit} packages from skills.exclude`
+      : `add all ${kit} packages to skills.exclude`;
+    kitToggle.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setKitPackagesExcluded(pkgs, disabledCount !== pkgs.length);
+    };
+    kitHead.appendChild(kitToggle);
+    details.appendChild(kitHead);
+    const table = el('div', 'cfg-package-table');
+    for (const p of [...pkgs].sort((a, b) => a.name.localeCompare(b.name))) {
+      table.appendChild(packageConfigControls(p));
+    }
+    details.appendChild(table);
+    box.appendChild(details);
+  }
+}
+
 async function loadConfigure(agentName) {
   const p = profileOf(agentName);
   cfgProfile = p?.profile ?? agentName;
+  cfgParsed = {};
   $('#cfg-note').textContent = 'loading…';
-  $('#cfg-file').textContent = `profiles/${cfgProfile}/profile.toml`;
+  $('#cfg-file').textContent = `${cfgProfile} settings`;
   setConfigureLoading(true);
-  const r = await fetch(`/api/admin/profile?name=${encodeURIComponent(cfgProfile)}`)
-    .then((x) => x.json()).catch(() => ({ ok: false }));
+  const [r, pkgs, kits, configs] = await Promise.all([
+    fetch(`/api/admin/profile?name=${encodeURIComponent(cfgProfile)}`)
+      .then((x) => x.json()).catch(() => ({ ok: false })),
+    fetch(`/api/admin/packages?profile=${encodeURIComponent(cfgProfile)}`)
+      .then((x) => x.json()).catch(() => ({ ok: false })),
+    adminGet('kits'),
+    adminGet('configs'),
+  ]);
+  cfgPackages = pkgs.ok === false ? [] : (pkgs.packages ?? []);
+  cfgKits = kits.ok === false ? [] : (kits.kits ?? []);
+  cfgConfigPackages = new Set((configs.ok === false ? [] : (configs.configs ?? [])).map((c) => c.package).filter(Boolean));
   $('#cfg-toml').value = r.ok ? r.toml : '';
   // The parsed view comes from profile list (same loader the kernel uses).
   await loadDiskAgents();
-  const d = profileOf(agentName) ?? {};
+  const d = r.profile ?? profileOf(agentName) ?? {};
+  cfgParsed = d;
   $('#cfg-agent').value = d.agent ?? agentName;
+  $('#cfg-owner').value = d.owner ?? 'owner';
+  $('#cfg-parent').value = d.parent ?? '';
+  $('#cfg-autonomy').value = d.autonomy ?? 'off';
+  const localPath = d.local_elanus_path ?? null;
+  const localEntries = Array.isArray(localPath) ? localPath.filter((x) => x !== PARENT_PATH) : [];
+  $('#cfg-package-path').value = csv(localEntries);
+  $('#cfg-path-inherit').checked = !Array.isArray(localPath) || localPath.includes(PARENT_PATH);
+  $('#cfg-effective-path').value = csv(d.elanus_path ?? d.package_path ?? ['packages']);
   $('#cfg-model').value = d.model ?? '';
   $('#cfg-turns').value = d.max_turns ?? '';
+  $('#cfg-base-url').value = d.base_url ?? '';
+  $('#cfg-api-key-env').value = d.api_key_env ?? '';
+  $('#cfg-context-program').value = d.context?.program ?? 'default';
+  $('#cfg-context-max-ms').value = d.context?.max_total_ms ?? 30000;
+  resetContextChain(d.context ?? {});
   $('#cfg-workdir').value = d.workdir ?? '';
-  $('#cfg-include').value = (d.skills?.include ?? []).join(', ');
-  $('#cfg-exclude').value = (d.skills?.exclude ?? []).join(', ');
+  $('#cfg-fs-write').value = csv(d.fs_write ?? []);
+  $('#cfg-capture-exclude').value = csv(d.capture_exclude ?? []);
+  $('#cfg-include').value = csv(d.skills?.include ?? ['#']);
+  $('#cfg-exclude').value = csv(d.skills?.exclude ?? []);
+  renderVars(d.vars ?? {});
+  renderThrottle(d.throttle ?? {});
+  renderKitAddList();
+  renderContextChain();
+  renderPackageConfigTree();
   setConfigureLoading(false);
   // Clear only our own 'loading…' — never stomp a message a caller set while we
   // were awaiting (e.g. na-create's "created <name> — set its identity below").
   if ($('#cfg-note').textContent === 'loading…') {
-    $('#cfg-note').textContent = r.ok ? '' : `no profile file for ${cfgProfile} — this agent only exists as traffic; create a profile to configure it`;
+    $('#cfg-note').textContent = r.ok ? '' : `no settings file for ${cfgProfile} — this agent only exists as traffic; create an agent here to configure it`;
   }
 }
 
@@ -393,10 +1318,22 @@ $('#cfg-save').onclick = async () => {
   const set = {};
   const newAgent = $('#cfg-agent').value.trim();
   if (newAgent) set['agent'] = newAgent;
+  if ($('#cfg-owner').value.trim()) set['owner'] = $('#cfg-owner').value.trim();
+  set['parent'] = $('#cfg-parent').value.trim();
+  set['autonomy'] = $('#cfg-autonomy').value;
+  const localPath = arr($('#cfg-package-path').value);
+  if ($('#cfg-path-inherit').checked) localPath.push(PARENT_PATH);
+  set['elanus_path'] = localPath;
   if ($('#cfg-model').value.trim()) set['model.model'] = $('#cfg-model').value.trim();
   if ($('#cfg-turns').value) set['model.max_turns'] = Number($('#cfg-turns').value);
+  if ($('#cfg-base-url').value.trim()) set['model.base_url'] = $('#cfg-base-url').value.trim();
+  if ($('#cfg-api-key-env').value.trim()) set['model.api_key_env'] = $('#cfg-api-key-env').value.trim();
+  if ($('#cfg-context-program').value.trim()) set['context.program'] = $('#cfg-context-program').value.trim();
+  if ($('#cfg-context-max-ms').value) set['context.max_total_ms'] = Number($('#cfg-context-max-ms').value);
+  set['context.stage'] = contextStageOverridesForSave();
   set['sandbox.workdir'] = $('#cfg-workdir').value.trim();
-  const arr = (v) => v.split(',').map((x) => x.trim()).filter(Boolean);
+  set['sandbox.fs_write'] = arr($('#cfg-fs-write').value);
+  set['sandbox.capture_exclude'] = arr($('#cfg-capture-exclude').value);
   // Send as a real JS array — server's tomlValue sees Array.isArray and
   // encodes it as a TOML array. Sending a JSON-stringified string here was
   // the regression: it arrived as the string '["#"]' and the kernel refused.
@@ -404,6 +1341,23 @@ $('#cfg-save').onclick = async () => {
   // Always sent: an EMPTY exclude list is a meaningful save (clearing it),
   // and an omitted key would silently keep the old value.
   set['skills.exclude'] = arr($('#cfg-exclude').value);
+  for (const row of document.querySelectorAll('#cfg-vars .cfg-var-row')) {
+    const k = row.querySelector('.cfg-var-key')?.value.trim();
+    if (!k) continue;
+    set[`vars.${k}`] = row.querySelector('.cfg-var-value')?.value ?? '';
+  }
+  for (const row of document.querySelectorAll('#cfg-throttle .cfg-throttle-row')) {
+    const name = row.querySelector('.cfg-throttle-name')?.value.trim();
+    if (!name) continue;
+    const max = row.querySelector('.cfg-throttle-max')?.value;
+    const rate = row.querySelector('.cfg-throttle-rate')?.value;
+    const tokens = row.querySelector('.cfg-throttle-tokens')?.value;
+    const coalesce = row.querySelector('.cfg-throttle-coalesce')?.checked === true;
+    if (max) set[`throttle.${name}.max_concurrent`] = Number(max);
+    if (rate) set[`throttle.${name}.rate_per_min`] = Number(rate);
+    if (tokens) set[`throttle.${name}.llm_tokens_per_hour`] = Number(tokens);
+    if (coalesce || cfgParsed.throttle?.[name]?.coalesce != null) set[`throttle.${name}.coalesce`] = coalesce;
+  }
   const r = await fetch('/api/admin/agents/set', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ name: cfgProfile, set: prunedSet(set) }),
@@ -418,7 +1372,7 @@ $('#cfg-save').onclick = async () => {
 function prunedSet(set) {
   const out = {};
   for (const [k, v] of Object.entries(set)) {
-    if (v === '' && k !== 'sandbox.workdir') continue;
+    if (v === '' && k !== 'sandbox.workdir' && k !== 'parent') continue;
     out[k] = v;
   }
   return out;
@@ -439,6 +1393,21 @@ $('#cfg-toml-save').onclick = async () => {
 for (const b of document.querySelectorAll('#agent-tabs button')) {
   b.onclick = () => { if (sel.kind === 'agent') selectAgent(sel.agent, b.dataset.tab); };
 }
+
+$('#cfg-include').addEventListener('input', () => { renderPackageConfigTree(); reconcileContextChainWithVisibility(); renderContextChain(); });
+$('#cfg-exclude').addEventListener('input', () => { renderPackageConfigTree(); reconcileContextChainWithVisibility(); renderContextChain(); });
+$('#cfg-context-add').onclick = () => addContextStage($('#cfg-context-add-stage').value);
+$('#cfg-kit-add-toggle').onclick = () => {
+  renderKitAddList();
+  const modal = $('#cfg-kit-add-modal');
+  if (modal?.showModal) modal.showModal();
+};
+$('#cfg-kit-add-close').onclick = () => $('#cfg-kit-add-modal')?.close();
+$('#cfg-kit-add-modal').addEventListener('click', (e) => {
+  if (e.target === $('#cfg-kit-add-modal')) $('#cfg-kit-add-modal').close();
+});
+$('#cfg-var-add').onclick = () => $('#cfg-vars').appendChild(varRow());
+$('#cfg-throttle-add').onclick = () => $('#cfg-throttle').appendChild(throttleRow());
 
 // ---------- rail (telemetry & signals) ----------
 const teleFeed = $('#tele-feed');
@@ -554,7 +1523,7 @@ function convFailure(agent, env) {
   const { body } = convMsg(agent, 'agent failed', 'failed', '', corr);
   body.textContent = '';
   body.appendChild(el('div', 'fail-reason', p.error || 'the agent failed with no detail.'));
-  body.appendChild(el('div', 'fail-hint', 'check the agent: a model set (configure), the background service running, and its capabilities allowed.'));
+  body.appendChild(el('div', 'fail-hint', 'check the agent: a model set, the background service running, and the add-on turned on.'));
 }
 
 function routeHumanMail(env) {
@@ -694,12 +1663,14 @@ $('#compose').addEventListener('submit', async (e) => {
   const text = input.value.trim();
   if (!text) return;
   const conv = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const session = agentSessions.get(agent) ?? `web-${agent}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  agentSessions.set(agent, session);
   sentCorrs.add(conv);
   corrAgent.set(conv, agent);
   convMsg(agent, 'you', 'you', text, conv);
   input.value = '';
   const btn = $('#compose-send');
-  const ok = await publish(`in/agent/${agent}`, { prompt: text }, conv);
+  const ok = await publish(`in/agent/${agent}`, { prompt: text, session }, conv);
   btn.textContent = ok ? 'accepted ✓' : 'failed ✕';
   btn.classList.toggle('sent', ok);
   setTimeout(() => { btn.textContent = 'transmit'; btn.classList.remove('sent'); }, 1400);
@@ -736,7 +1707,7 @@ const sessionsPane = $('#sessions-pane');
 
 function liveOnlyNote(extra) {
   const d = el('div', 'dim-note');
-  d.appendChild(el('div', '', 'history package not running — live view only.'));
+  d.appendChild(el('div', '', 'transcripts unavailable — live view only.'));
   if (extra) d.appendChild(el('div', 'dim-sub', extra));
   return d;
 }
@@ -748,7 +1719,7 @@ async function loadSessions(agent) {
   if (sel.kind !== 'agent' || sel.agent !== agent || sel.tab !== 'sessions') return;
   sessionsPane.textContent = '';
   if (!j?.ok) {
-    sessionsPane.appendChild(liveOnlyNote('approve the history package under “kits & review” to browse transcripts.'));
+    sessionsPane.appendChild(liveOnlyNote('turn on the history view under add-ons to browse transcripts.'));
     return;
   }
   const list = j.sessions ?? [];

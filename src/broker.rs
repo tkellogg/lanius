@@ -209,7 +209,9 @@ impl Broker {
     /// consult path then fails fast toward allow — broker down means
     /// resident hooks don't exist, per the degradation order).
     fn refresh_hooks_kv(&self) {
-        let Some(conn) = self.conn.as_ref() else { return };
+        let Some(conn) = self.conn.as_ref() else {
+            return;
+        };
         let mut points: Vec<String> = self
             .sessions
             .borrow()
@@ -236,12 +238,16 @@ impl Broker {
         if topic::matches(&floor, topic_name) {
             return true;
         }
-        let Some(conn) = self.conn.as_ref() else { return false };
+        let Some(conn) = self.conn.as_ref() else {
+            return false;
+        };
         crate::packages::may(conn, pkg, "publish", topic_name).unwrap_or(false)
     }
 
     fn actor_may_subscribe(&self, pkg: &str, filter: &str) -> bool {
-        let Some(conn) = self.conn.as_ref() else { return false };
+        let Some(conn) = self.conn.as_ref() else {
+            return false;
+        };
         crate::packages::approved(conn, pkg, "subscribe")
             .map(|fs| fs.iter().any(|f| f == filter))
             .unwrap_or(false)
@@ -274,7 +280,9 @@ fn drop_session(st: &Rc<Broker>, key: u64, clean: bool) {
                     if w.payload.is_empty() {
                         st.retained.borrow_mut().remove(&w.topic);
                     } else {
-                        st.retained.borrow_mut().insert(w.topic.clone(), w.payload.clone());
+                        st.retained
+                            .borrow_mut()
+                            .insert(w.topic.clone(), w.payload.clone());
                     }
                 }
                 fan_out(st, &w.topic, &w.payload);
@@ -327,30 +335,36 @@ fn run_system(
                         let st = st_h.clone();
                         async move { handshake(st, h).await }
                     })
-                    .control(fn_factory_with_config(move |session: Session<BusSession>| {
-                        let st = st_c.clone();
-                        async move {
-                            Ok::<_, ServerError>(fn_service(move |control| {
-                                control_msg(st.clone(), session.clone(), control)
-                            }))
-                        }
-                    }))
-                    .protocol(fn_factory_with_config(move |session: Session<BusSession>| {
-                        let st = st_p.clone();
-                        async move {
-                            Ok::<_, ServerError>(fn_service(move |msg| {
-                                protocol_msg(st.clone(), session.clone(), msg)
-                            }))
-                        }
-                    }))
-                    .publish(fn_factory_with_config(move |session: Session<BusSession>| {
-                        let st = st_pub.clone();
-                        async move {
-                            Ok::<_, ServerError>(fn_service(move |req| {
-                                inbound(st.clone(), session.clone(), req)
-                            }))
-                        }
-                    }))
+                    .control(fn_factory_with_config(
+                        move |session: Session<BusSession>| {
+                            let st = st_c.clone();
+                            async move {
+                                Ok::<_, ServerError>(fn_service(move |control| {
+                                    control_msg(st.clone(), session.clone(), control)
+                                }))
+                            }
+                        },
+                    ))
+                    .protocol(fn_factory_with_config(
+                        move |session: Session<BusSession>| {
+                            let st = st_p.clone();
+                            async move {
+                                Ok::<_, ServerError>(fn_service(move |msg| {
+                                    protocol_msg(st.clone(), session.clone(), msg)
+                                }))
+                            }
+                        },
+                    ))
+                    .publish(fn_factory_with_config(
+                        move |session: Session<BusSession>| {
+                            let st = st_pub.clone();
+                            async move {
+                                Ok::<_, ServerError>(fn_service(move |req| {
+                                    inbound(st.clone(), session.clone(), req)
+                                }))
+                            }
+                        },
+                    ))
                 }
             }
         });
@@ -378,7 +392,10 @@ fn run_system(
     }
 }
 
-async fn handshake(st: Rc<Broker>, h: v5::Handshake) -> Result<v5::HandshakeAck<BusSession>, ServerError> {
+async fn handshake(
+    st: Rc<Broker>,
+    h: v5::Handshake,
+) -> Result<v5::HandshakeAck<BusSession>, ServerError> {
     let pkt = h.packet();
     // Identity (docs/identity.md). Username+password is one of:
     //   <name> + a fenced secret (`.secrets/<name>`)  -> a full-authority
@@ -451,7 +468,14 @@ async fn handshake(st: Rc<Broker>, h: v5::Handshake) -> Result<v5::HandshakeAck<
     let sink = h.sink();
     st.sessions.borrow_mut().insert(
         key,
-        SessionRec { sink: sink.clone(), subs: Vec::new(), actor, sender, will, blocking: Vec::new() },
+        SessionRec {
+            sink: sink.clone(),
+            subs: Vec::new(),
+            actor,
+            sender,
+            will,
+            blocking: Vec::new(),
+        },
     );
     Ok(h.ack(BusSession { key, sink }))
 }
@@ -489,8 +513,11 @@ async fn protocol_msg(
 ) -> Result<v5::ProtocolMessageAck, ServerError> {
     match msg {
         v5::ProtocolMessage::Subscribe(mut s) => {
-            let actor: Option<String> =
-                st.sessions.borrow().get(&session.key).and_then(|r| r.actor.clone());
+            let actor: Option<String> = st
+                .sessions
+                .borrow()
+                .get(&session.key)
+                .and_then(|r| r.actor.clone());
             // SUBSCRIBE user properties (§3.8.2.1) are packet-level; they
             // apply to every filter in the packet (the CLI sends one).
             let props: HashMap<String, String> = s
@@ -602,7 +629,10 @@ async fn protocol_msg(
                         .map(|(t, p)| (t.clone(), p.clone()))
                         .collect();
                     for (t, p) in matching {
-                        let _ = session.sink.publish(t).send_at_most_once(p.into_bytes().into());
+                        let _ = session
+                            .sink
+                            .publish(t)
+                            .send_at_most_once(p.into_bytes().into());
                     }
                 }
             }
@@ -650,7 +680,11 @@ async fn inbound(
             .iter()
             .any(|(k, _)| k.as_str() == MIRROR_PROP);
         // Response Topic (§4.10): only meaningful on hook requests.
-        let resp_to = pkt.properties.response_topic.as_ref().map(|t| t.to_string());
+        let resp_to = pkt
+            .properties
+            .response_topic
+            .as_ref()
+            .map(|t| t.to_string());
         // el-correlation: how an external client attaches the ENVELOPE
         // correlation (flow/trace id) to a publish. Deliberately a user
         // property, not MQTT Correlation Data — the taxonomy in topics.md
@@ -719,8 +753,8 @@ async fn inbound(
             }
         }
         if let Some(tx) = st.pending_verdicts.borrow_mut().remove(id) {
-            let v: Value = serde_json::from_str(&String::from_utf8_lossy(&payload))
-                .unwrap_or(Value::Null);
+            let v: Value =
+                serde_json::from_str(&String::from_utf8_lossy(&payload)).unwrap_or(Value::Null);
             let _ = tx.send(v);
         }
         // No pending entry = a verdict after timeout; dropped, the chain
@@ -826,7 +860,9 @@ async fn inbound(
         if payload.is_empty() {
             st.retained.borrow_mut().remove(&topic);
         } else {
-            st.retained.borrow_mut().insert(topic.clone(), out_line.clone());
+            st.retained
+                .borrow_mut()
+                .insert(topic.clone(), out_line.clone());
         }
     }
     fan_out(&st, &topic, &out_line);
@@ -875,7 +911,9 @@ fn handle_hook_request(st: &Rc<Broker>, topic_name: &str, text: &str, resp_to: O
                 let granted = st
                     .conn
                     .as_ref()
-                    .map(|c| crate::packages::is_approved(c, pkg, "blocking", &point).unwrap_or(false))
+                    .map(|c| {
+                        crate::packages::is_approved(c, pkg, "blocking", &point).unwrap_or(false)
+                    })
                     .unwrap_or(false);
                 if !granted {
                     continue;
@@ -894,8 +932,8 @@ fn handle_hook_request(st: &Rc<Broker>, topic_name: &str, text: &str, resp_to: O
     invs.sort_by_key(|i| (i.order, i.seq));
     // Only answer requesters who minted their response topic in the
     // reserved prefix — anything else is a misdirected publish, not an RPC.
-    let resp_to = resp_to
-        .filter(|t| topic::valid_name(t) && t.starts_with("obs/harness/hookresp/"));
+    let resp_to =
+        resp_to.filter(|t| topic::valid_name(t) && t.starts_with("obs/harness/hookresp/"));
     let st = st.clone();
     let topic_name = topic_name.to_string();
     ntex::rt::spawn(async move {
@@ -925,8 +963,7 @@ fn handle_hook_request(st: &Rc<Broker>, topic_name: &str, text: &str, resp_to: O
                 .publish(topic_name.clone())
                 .properties(|p| {
                     p.response_topic = Some(hook_resp.clone().into());
-                    p.correlation_data =
-                        Some(ntex::util::Bytes::from(id.clone().into_bytes()));
+                    p.correlation_data = Some(ntex::util::Bytes::from(id.clone().into_bytes()));
                 })
                 .send_at_most_once(out.into_bytes().into());
             let verdict: Option<Value> = if sent.is_err() {
@@ -975,7 +1012,10 @@ fn handle_hook_request(st: &Rc<Broker>, topic_name: &str, text: &str, resp_to: O
             };
             trace::write(
                 &st.root,
-                &format!("obs/harness/hook/{point}/{}", if effect { "allow" } else { "deny" }),
+                &format!(
+                    "obs/harness/hook/{point}/{}",
+                    if effect { "allow" } else { "deny" }
+                ),
                 &ids,
                 json!({ "hook": inv.who, "matched": matched, "ms": ms, "detail": detail }),
             );
@@ -1010,7 +1050,9 @@ async fn pump(st: Rc<Broker>, mut rx: UnboundedReceiver<BusMsg>) {
                     if p.line.is_empty() {
                         st.retained.borrow_mut().remove(&p.topic);
                     } else {
-                        st.retained.borrow_mut().insert(p.topic.clone(), p.line.clone());
+                        st.retained
+                            .borrow_mut()
+                            .insert(p.topic.clone(), p.line.clone());
                     }
                 }
                 fan_out(&st, &p.topic, &p.line);
@@ -1047,7 +1089,9 @@ fn try_register_blocking(
     }
     let point = segs[3].to_string();
     if !crate::manifest::HOOK_POINTS.contains(&point.as_str()) {
-        return Err(format!("unknown or wildcard hook point {point:?} (must be literal)"));
+        return Err(format!(
+            "unknown or wildcard hook point {point:?} (must be literal)"
+        ));
     }
     let Some(conn) = st.conn.as_ref() else {
         return Err("broker has no db; cannot check the blocking grant".into());
@@ -1055,7 +1099,10 @@ fn try_register_blocking(
     if !crate::packages::is_approved(conn, pkg, "blocking", &point).unwrap_or(false) {
         return Err(format!("no approved blocking grant for point {point:?}"));
     }
-    let on_timeout = props.get("on_timeout").map(|s| s.as_str()).unwrap_or("deny");
+    let on_timeout = props
+        .get("on_timeout")
+        .map(|s| s.as_str())
+        .unwrap_or("deny");
     if on_timeout != "allow" && on_timeout != "deny" {
         return Err("on_timeout must be allow|deny".into());
     }
@@ -1064,8 +1111,14 @@ fn try_register_blocking(
     let reg = BlockingReg {
         filter: filter.to_string(),
         point,
-        order: props.get("order").and_then(|s| s.parse().ok()).unwrap_or(50),
-        timeout_ms: props.get("timeout_ms").and_then(|s| s.parse().ok()).unwrap_or(500),
+        order: props
+            .get("order")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50),
+        timeout_ms: props
+            .get("timeout_ms")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500),
         allow_on_timeout: on_timeout == "allow",
         seq,
     };
@@ -1117,7 +1170,9 @@ fn fan_out(st: &Rc<Broker>, topic_name: &str, line: &str) {
             for sub in &rec.subs {
                 if sub.group.is_none() && topic::matches(&sub.inner, topic_name) {
                     best = Some(match (best, sub.qos) {
-                        (Some(v5::QoS::AtLeastOnce), _) | (_, v5::QoS::AtLeastOnce) => v5::QoS::AtLeastOnce,
+                        (Some(v5::QoS::AtLeastOnce), _) | (_, v5::QoS::AtLeastOnce) => {
+                            v5::QoS::AtLeastOnce
+                        }
                         _ => v5::QoS::AtMostOnce,
                     });
                 }

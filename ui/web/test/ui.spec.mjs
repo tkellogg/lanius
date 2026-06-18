@@ -31,6 +31,18 @@ async function waitFor(desc, fn, timeoutMs = 15000) {
   return false;
 }
 const elanus = (...a) => execFileSync(path.join(BIN, 'elanus'), a, { env: ENV, encoding: 'utf8' });
+function createConfigProposal(id, pkg, toml) {
+  const cfg = path.join(TMP, 'config');
+  const branch = `tmp-${id}`;
+  execFileSync('git', ['-C', cfg, 'checkout', '-q', '-b', branch, 'live'], { encoding: 'utf8' });
+  fs.writeFileSync(path.join(cfg, 'packages', `${pkg}.toml`), toml);
+  execFileSync('git', ['-C', cfg, 'add', `packages/${pkg}.toml`], { encoding: 'utf8' });
+  execFileSync('git', ['-C', cfg, '-c', 'user.name=qa', '-c', 'user.email=qa@local', 'commit', '-q', '-m', `proposal ${id}`], { encoding: 'utf8' });
+  const sha = execFileSync('git', ['-C', cfg, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  execFileSync('git', ['-C', cfg, 'update-ref', `refs/proposals/${id}`, sha], { encoding: 'utf8' });
+  execFileSync('git', ['-C', cfg, 'checkout', '-q', 'live'], { encoding: 'utf8' });
+  execFileSync('git', ['-C', cfg, 'branch', '-D', branch], { encoding: 'utf8' });
+}
 
 // -- stack setup (mirrors smoke.mjs) --
 elanus('init');
@@ -140,7 +152,7 @@ const testAgentProfile = 'harrier';
 
 // ── flow 3: configure save + reload ──────────────────────────────────────────
 // The exact layer that broke: form→server encoding of skills.include as array.
-// Set model, max turns 7, include '#', exclude 'notes', save, assert note,
+// Set model, max run steps 7, include '#', exclude 'notes', save, assert note,
 // reload page, assert values persisted.
 {
   const page = await newPage();
@@ -161,8 +173,154 @@ const testAgentProfile = 'harrier';
   await waitForConfigureLoaded(page);
   await page.fill('#cfg-model', 'claude-haiku-4-5-20251001');
   await page.fill('#cfg-turns', '7');
-  await page.fill('#cfg-include', '#');
-  await page.fill('#cfg-exclude', 'notes');
+  await page.fill('#cfg-context-program', 'default');
+  await page.fill('#cfg-context-max-ms', '12000');
+  await waitFor('configure: run budget label is not conversation turns', async () => {
+    const text = await page.$eval('#cfg-section-model', (el) => el.textContent);
+    return /max run steps/i.test(text)
+      && /activation's model\/tool loop/i.test(text)
+      && !/max turns/i.test(text);
+  }, 5000);
+  await waitFor('configure: context program is first-class agent config', async () => {
+    const text = await page.$eval('#cfg-section-context', (el) => el.textContent);
+    return /context program/i.test(text)
+      && /max context ms/i.test(text)
+      && /context stage chain/i.test(text)
+      && /raw TOML stores this as the context\.stage array/i.test(text);
+  }, 5000);
+  const windowContextStage = () => page.locator('#cfg-context-chain .cfg-context-stage[data-stage="window/window"]').first();
+  await waitFor('configure: context stage chain renders as tiles', async () => {
+    const text = await page.$eval('#cfg-context-chain', (el) => el.textContent);
+    return /window\/window/.test(text) && /timeout ms/i.test(text);
+  }, 8000);
+  await windowContextStage().locator('button[aria-label="remove window/window"]').click();
+  await waitFor('configure: context stage remove updates add menu', async () => {
+    const chainText = await page.$eval('#cfg-context-chain', (el) => el.textContent);
+    const option = await page.$eval('#cfg-context-add-stage', (el) => el.value).catch(() => '');
+    return !/window\/window/.test(chainText) && option === 'window/window';
+  }, 5000);
+  await page.click('#cfg-context-add');
+  await waitFor('configure: context stage add restores tile', async () => {
+    return /window\/window/.test(await page.$eval('#cfg-context-chain', (el) => el.textContent));
+  }, 5000);
+  await windowContextStage().locator('label', { hasText: 'timeout ms' }).locator('input').fill('9000');
+  const moveDown = windowContextStage().locator('button[aria-label="move window/window down"]').first();
+  if (await moveDown.count() && !(await moveDown.isDisabled())) {
+    await moveDown.click();
+    ok('configure: context stage reorder control is usable');
+  }
+  await page.$eval('#cfg-include', (el) => el.value = '#');
+  await waitFor('configure: package tree shows matched packages', async () => {
+    return /history|harness-doctrine|self-modify/.test(await page.$eval('#cfg-package-configs', (el) => el.textContent));
+  }, 8000);
+  await waitFor('configure: only the packages section renders skill/package controls', async () => {
+    const hasSkillsSection = await page.$('#cfg-section-skills');
+    const indexText = await page.$eval('.cfg-index', (el) => el.textContent);
+    return !hasSkillsSection && !/\bskills\b/i.test(indexText);
+  }, 5000);
+  await waitFor('configure: vars are raw advanced context parameters', async () => {
+    const hasVarsSection = await page.$('#cfg-section-vars');
+    const indexText = await page.$eval('.cfg-index', (el) => el.textContent);
+    const rawText = await page.$eval('#cfg-section-raw', (el) => el.textContent);
+    return !hasVarsSection
+      && !/\bvars\b/i.test(indexText)
+      && /advanced context parameters/i.test(rawText)
+      && /legacy\s+\[vars\]/i.test(rawText);
+  }, 5000);
+  await page.click('text=advanced context parameters');
+  await page.fill('#cfg-vars .cfg-var-key', 'window_rows');
+  await page.fill('#cfg-vars .cfg-var-value', '50');
+  await waitFor('configure: packages render as kit groups and package rows', async () => {
+    const text = await page.$eval('#cfg-package-configs', (el) => el.textContent);
+    const sections = await page.$$eval('#cfg-package-configs > details.cfg-package-group > summary', (els) => els.map((el) => el.textContent?.trim().toLowerCase()));
+    return /chat/.test(text)
+      && !sections.includes('core')
+      && !sections.includes('local')
+      && sections.some((s) => /stdlib|instance/.test(s))
+      && !/current settings|TOML value/.test(text);
+  }, 8000);
+  const windowPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="window"]').first();
+  await waitFor('configure: window context-stage package row exists', async () => {
+    return await windowPackage().count() > 0;
+  }, 8000);
+  await windowPackage().locator('summary').click();
+  await windowPackage().locator('.cfg-package-config-toggle').click();
+  await waitFor('configure: typed context-stage setting renders from manifest', async () => {
+    const text = await windowPackage().textContent();
+    return /Window rows/.test(text)
+      && /context stage window/.test(text)
+      && /type:\s*number/.test(text)
+      && /Maximum transcript rows/.test(text);
+  }, 8000);
+  const windowRows = await windowPackage()
+    .locator('.cfg-config-row', { hasText: 'Window rows' })
+    .locator('input[type="number"]')
+    .first()
+    .inputValue();
+  windowRows === '80'
+    ? ok('configure: typed context-stage default value rendered')
+    : fail(`configure: window_rows default wrong: "${windowRows}"`);
+  await waitFor('configure: skill filters are not text boxes', async () => {
+    const types = await page.$$eval('#cfg-include, #cfg-exclude', (els) => els.map((el) => el.type));
+    return types.every((t) => t === 'hidden');
+  }, 5000);
+  await page.click('#cfg-kit-add-toggle');
+  await waitFor('configure: kit add modal opens', async () => {
+    return await page.$eval('#cfg-kit-add-modal', (el) => el.open);
+  }, 5000);
+  await waitFor('configure: kit add list loads in modal', async () => {
+    return /core|dev|stdlib/.test(await page.$eval('#cfg-kit-add-list', (el) => el.textContent));
+  }, 8000);
+  const devKit = page.locator('#cfg-kit-add-list details', { hasText: 'dev' }).first();
+  await devKit.locator('summary').click();
+  await waitFor('configure: kit modal previews package actors', async () => {
+    const text = await devKit.textContent();
+    return /git-protect/.test(text) && /hook/.test(text);
+  }, 8000);
+  await page.click('#cfg-kit-add-list .cfg-split-caret');
+  await waitFor('configure: kit add split menu exposes actions', async () => {
+    const hasNativeModeSelect = await page.$('#cfg-kit-add-list select');
+    const menuText = await page.$eval('#cfg-kit-add-list .cfg-action-menu:not([hidden])', (el) => el.textContent).catch(() => '');
+    return !hasNativeModeSelect && /link/.test(menuText) && /copy/.test(menuText);
+  }, 5000);
+  await page.click('#cfg-kit-add-close');
+  const historyPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="history"]').first();
+  await historyPackage().locator('summary').click();
+  const packageToggle = () => historyPackage().locator('.cfg-package-disable').first();
+  if (await packageToggle().count()) {
+    await packageToggle().click();
+    await waitFor('configure: disable package writes exclude', async () => {
+      return (await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('history');
+    }, 5000);
+    await historyPackage().locator('summary').click();
+    await packageToggle().click();
+    await waitFor('configure: enable package removes exclude', async () => {
+      return !(await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('history');
+    }, 5000);
+  } else {
+    fail('configure: history package toggle not found');
+  }
+  const historyKit = page.locator('#cfg-package-configs details.cfg-package-group', { has: page.locator('.cfg-package-card[data-package="history"]') }).first();
+  const kitToggle = historyKit.locator('.cfg-kit-toggle[aria-label^="disable all"]');
+  if (await kitToggle.count()) {
+    await kitToggle.click();
+    await waitFor('configure: disable package group writes excludes', async () => {
+      const excluded = (await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim());
+      return excluded.includes('history');
+    }, 5000);
+    await historyKit.locator('.cfg-kit-toggle[aria-label^="enable all"]').click();
+    await waitFor('configure: enable package group removes excludes', async () => {
+      const excluded = (await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim());
+      return !excluded.includes('history');
+    }, 5000);
+  } else {
+    fail('configure: package group toggle not found');
+  }
+  await historyPackage().locator('summary').click();
+  await packageToggle().click();
+  await waitFor('configure: disable package persists through save', async () => {
+    return (await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('history');
+  }, 5000);
   await page.click('#cfg-save');
   await waitFor('configure: saved note visible', async () => {
     return /saved/i.test(await page.$eval('#cfg-note', (el) => el.textContent));
@@ -183,12 +341,41 @@ const testAgentProfile = 'harrier';
   await waitForConfigureLoaded(page);
   const model = await page.$eval('#cfg-model', (el) => el.value);
   const turns = await page.$eval('#cfg-turns', (el) => el.value);
+  const contextProgram = await page.$eval('#cfg-context-program', (el) => el.value);
+  const contextMaxMs = await page.$eval('#cfg-context-max-ms', (el) => el.value);
+  const contextWindowTimeout = await page.locator('#cfg-context-chain .cfg-context-stage[data-stage="window/window"]')
+    .locator('label', { hasText: 'timeout ms' })
+    .locator('input')
+    .first()
+    .inputValue();
   const include = await page.$eval('#cfg-include', (el) => el.value);
   const exclude = await page.$eval('#cfg-exclude', (el) => el.value);
+  await page.click('text=advanced context parameters');
+  const varKey = await page.$eval('#cfg-vars .cfg-var-key', (el) => el.value);
+  const varValue = await page.$eval('#cfg-vars .cfg-var-value', (el) => el.value);
+  const rawToml = await page.$eval('#cfg-toml', (el) => el.value);
   model.includes('haiku') ? ok('configure reload: model persisted') : fail(`configure reload: model wrong: "${model}"`);
   turns === '7' ? ok('configure reload: max_turns persisted') : fail(`configure reload: turns wrong: "${turns}"`);
+  contextProgram === 'default' && contextMaxMs === '12000'
+    ? ok('configure reload: context program policy persisted')
+    : fail(`configure reload: context policy wrong: "${contextProgram}" ${contextMaxMs}`);
+  contextWindowTimeout === '9000'
+    ? ok('configure reload: context stage timeout persisted')
+    : fail(`configure reload: context stage timeout wrong: "${contextWindowTimeout}"`);
   include.includes('#') ? ok('configure reload: skills.include persisted') : fail(`configure reload: include wrong: "${include}"`);
-  exclude.includes('notes') ? ok('configure reload: skills.exclude persisted') : fail(`configure reload: exclude wrong: "${exclude}"`);
+  exclude.includes('history') ? ok('configure reload: skills.exclude persisted') : fail(`configure reload: exclude wrong: "${exclude}"`);
+  varKey === 'window_rows' && varValue === '50'
+    ? ok('configure reload: advanced context parameter persisted')
+    : fail(`configure reload: context parameter wrong: "${varKey}"="${varValue}"`);
+  /\[vars\][\s\S]*window_rows\s*=\s*"50"/.test(rawToml)
+    ? ok('configure reload: raw [vars] persisted')
+    : fail('configure reload: raw [vars] missing window_rows');
+  /\[context\][\s\S]*max_total_ms\s*=\s*12000/.test(rawToml)
+    ? ok('configure reload: raw [context] persisted')
+    : fail('configure reload: raw [context] missing max_total_ms');
+  /\[context\][\s\S]*stage\s*=\s*\[[\s\S]*package\s*=\s*"window"[\s\S]*timeout_ms\s*=\s*9000/.test(rawToml)
+    ? ok('configure reload: raw context.stage array persisted')
+    : fail('configure reload: raw context.stage array missing window timeout');
   await page.close();
 }
 
@@ -233,9 +420,8 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
-// ── flow 5: kits & review ────────────────────────────────────────────────────
-// Catalog lists seeded kits, readme expands, stage → pending fills,
-// approve → queue drains.
+// ── flow 5: add-ons ───────────────────────────────────────────────────────────
+// Catalog lists seeded add-ons, details expand, add takes effect, settings save.
 {
   const page = await newPage();
   await page.goto('/');
@@ -260,49 +446,80 @@ const renamedAgent = 'falcon';
     }
     return false;
   }, 8000);
-  // Stage the dev kit by clicking the stage button in the dev kit row.
-  // The page reloads (#setup-kits) after staging, so capture the button
+  // Add the dev kit by clicking the add button in the dev row.
+  // The page reloads (#setup-kits) after add, so capture the button
   // text we want before clicking and don't hold a reference past the click.
-  let stageClicked = false;
+  let addClicked = false;
   for (const row of await page.$$('.setup-kit')) {
     const name = await row.$eval('.setup-kit-name', (el) => el.textContent).catch(() => '');
     if (!name.includes('dev')) continue;
     for (const btn of await row.$$('button:not(.ghost)')) {
       if (/\badd\b/i.test(await btn.textContent())) {
         await btn.click();
-        stageClicked = true;
+        addClicked = true;
         break;
       }
     }
     break;
   }
-  stageClicked ? ok('kits: staged dev kit') : fail('kits: stage button not found');
-  // The click handler calls loadSetup() on success, which re-renders.
-  await waitFor('kits: pending queue populated', async () => {
-    return /git-protect|approve/i.test(await page.$eval('#setup-pending', (el) => el.textContent));
+  addClicked ? ok('add-ons: added dev kit') : fail('add-ons: add button not found');
+  await waitFor('add-ons: durable add banner', async () => {
+    return /added dev/i.test(await page.$eval('#setup-status', (el) => el.textContent));
   }, 10000);
-  ok('kits: pending queue shows staged requests');
-  // Approve — use page.click() rather than holding an element ref across
-  // async boundaries; loadSetup re-renders the DOM so any captured handle
-  // goes stale. page.click finds a fresh element at call time.
-  // Approve all pending packages (the dev kit may stage multiple: git-protect,
-  // recent-history, window). Each click triggers loadSetup() which re-renders.
-  let firstApproved = false;
-  await waitFor('kits: approve all pending packages', async () => {
-    const btn = await page.$('#setup-pending button');
-    if (!btn) {
-      // No more approve buttons — check if it's the "at rest" state.
-      const text = await page.$eval('#setup-pending', (el) => el.textContent);
-      return /nothing to confirm|all set/i.test(text);
+  await sleep(1900);
+  /added dev/i.test(await page.$eval('#setup-status', (el) => el.textContent))
+    ? ok('add-ons: add banner persists')
+    : fail('add-ons: add banner vanished');
+  await waitFor('add-ons: installed list includes git-protect', async () => {
+    return /git-protect/.test(await page.$eval('#setup-configs', (el) => el.textContent));
+  }, 10000);
+  let saved = false;
+  let savedCard = null;
+  for (const card of await page.$$('#setup-configs .setup-pending-pkg')) {
+    const text = await card.textContent();
+    if (!/git-protect/.test(text)) continue;
+    const inputs = await card.$$('input');
+    if (inputs.length >= 2) {
+      await inputs[0].fill('mode');
+      await inputs[1].fill('"watch"');
+      const btn = await card.$('button');
+      if (btn) {
+        await btn.click();
+        saved = true;
+        savedCard = card;
+      }
     }
-    firstApproved = true;
-    await page.click('#setup-pending button');
-    // Brief pause for loadSetup() to start re-rendering before we re-query.
-    await sleep(500);
-    return false; // keep looping until all approved
-  }, 30000);
-  if (firstApproved) ok('kits: all pending packages approved, queue at rest');
-  else fail('kits: no approve buttons found after staging');
+    break;
+  }
+  saved ? ok('add-ons: package setting saved from UI') : fail('add-ons: setting form not found');
+  await waitFor('add-ons: package setting save confirmed by readback', async () => {
+    if (!savedCard) return false;
+    const text = await savedCard.textContent();
+    return /saved/.test(text);
+  }, 10000);
+  await savedCard.$eval('details', (el) => { if (!el.open) el.querySelector('summary')?.click(); });
+  await waitFor('add-ons: package setting visible in current settings', async () => {
+    return /mode = "watch"/.test(await savedCard.$eval('pre', (el) => el.textContent).catch(() => ''));
+  }, 10000);
+  await waitFor('add-ons: agent requests resting state', async () => {
+    return /no agent requests/i.test(await page.$eval('#setup-pending', (el) => el.textContent));
+  }, 10000);
+  createConfigProposal('webui', 'git-protect', 'mode = "browser-proposed"\n');
+  await page.click('.nav-setup');
+  await waitFor('add-ons: proposal request appears', async () => {
+    return /wants to change settings/i.test(await page.$eval('#setup-pending', (el) => el.textContent));
+  }, 10000);
+  await page.click('#setup-pending button.ghost');
+  await waitFor('add-ons: proposal diff visible', async () => {
+    return /browser-proposed/.test(await page.$eval('#setup-pending pre', (el) => el.textContent).catch(() => ''));
+  }, 10000);
+  const buttons = await page.$$('#setup-pending button');
+  for (const btn of buttons) {
+    if (/^accept$/i.test(await btn.textContent())) { await btn.click(); break; }
+  }
+  await waitFor('add-ons: proposal accepted through UI', async () => {
+    return /accepted the change/i.test(await page.$eval('#setup-status', (el) => el.textContent));
+  }, 10000);
   await page.close();
 }
 
@@ -319,6 +536,11 @@ const renamedAgent = 'falcon';
     return false;
   });
   await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  const publishes = [];
+  page.on('request', (req) => {
+    if (!req.url().endsWith('/api/publish') || req.method() !== 'POST') return;
+    try { publishes.push(JSON.parse(req.postData() || '{}')); } catch {}
+  });
   const msg = `hello-${Date.now()}`;
   await page.fill('#compose-input', msg);
   await page.click('#compose-send');
@@ -327,6 +549,22 @@ const renamedAgent = 'falcon';
   await waitFor('converse: message in feed', async () => {
     return (await page.$eval('#conv-holder', (el) => el.textContent)).includes(msg);
   }, 8000);
+  const msg2 = `${msg}-again`;
+  await page.fill('#compose-input', msg2);
+  await page.click('#compose-send');
+  await waitFor('converse: second message in same visible feed', async () => {
+    const t = await page.$eval('#conv-holder', (el) => el.textContent);
+    return t.includes(msg) && t.includes(msg2);
+  }, 8000);
+  await waitFor('converse: browser publishes one stable session id', async () => {
+    if (publishes.length < 2) return false;
+    const [a, b] = publishes;
+    return a.payload?.session
+      && a.payload.session === b.payload?.session
+      && a.correlation
+      && b.correlation
+      && a.correlation !== b.correlation;
+  }, 5000);
   // A labeled failure (harness emits these when an agent run breaks) renders
   // as an explicit error bubble in the thread, not silence. Inject one with
   // the correlation of the message we just sent so it threads here.
@@ -341,8 +579,8 @@ const renamedAgent = 'falcon';
 }
 
 // ── flow 7: history works out of the box ──────────────────────────────────────
-// history is a stdlib package, approved at init, so the sessions tab is backed
-// by the real transcript view — NOT the "history package not running" note —
+// history is stdlib, on at init, so the sessions tab is backed
+// by the real transcript view — NOT the unavailable-transcripts note —
 // and the footer degradation hint stays hidden.
 {
   const page = await newPage();
@@ -356,7 +594,7 @@ const renamedAgent = 'falcon';
   // Resolves to a real (possibly empty) session list, not the live-only note.
   await waitFor('history: sessions tab backed by the live view (not degraded)', async () => {
     const t = await page.$eval('#sessions-pane', (el) => el.textContent);
-    return !/history package not running|live view only|asking the history view/i.test(t);
+    return !/transcripts unavailable|live view only|asking the history view/i.test(t);
   }, 12000);
   // The footer hint shows only when history is absent; it heals to hidden once
   // a query succeeds (the sessions probe above is one).

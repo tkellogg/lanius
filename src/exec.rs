@@ -10,7 +10,9 @@ use crate::render;
 use crate::sandbox;
 use crate::trace;
 use anyhow::{anyhow, bail, Context, Result};
-use genai::chat::{ChatMessage, ChatRequest, ContentPart, MessageContent, Tool, ToolCall, ToolResponse};
+use genai::chat::{
+    ChatMessage, ChatRequest, ContentPart, MessageContent, Tool, ToolCall, ToolResponse,
+};
 use genai::Client;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -25,6 +27,12 @@ pub struct ExecOpts {
     /// The dispatching event for the context document's `event` field
     /// ({topic, payload, correlation_id}); None for CLI-direct runs.
     pub event: Option<Value>,
+}
+
+pub struct ContextRenderOpts {
+    pub profile: String,
+    pub session: String,
+    pub event: Option<String>,
 }
 
 /// What a tool invocation produced. Model-caused errors (bad args, unknown
@@ -43,6 +51,128 @@ enum ToolOutcome {
 pub fn run(root: &Root, opts: ExecOpts) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(root, opts))
+}
+
+/// Developer inspection for the context program. This is intentionally
+/// read-only with respect to the transcript: it reuses the same seed/chain
+/// assembly as exec, but does not append an incoming event prompt to sqlite.
+pub fn render_context(root: &Root, opts: ContextRenderOpts) -> Result<Value> {
+    let conn = db::open(root)?;
+    db::init_schema(&conn)?;
+    let (prof, _) = profile::load(root, &opts.profile)?;
+    let (event_doc, event_prompt, event_source) =
+        context_render_event(&conn, opts.event.as_deref())?;
+    let system_seed = render::render_parts(root, &conn, &opts.profile, &opts.session)?;
+    let stages = context::chain(root, &conn, &opts.profile, &prof)?;
+    let mut messages = transcript_rows(&conn, &opts.session)?;
+    if let Some(prompt) = event_prompt {
+        if !event_already_in_transcript(&conn, &opts.session, &event_doc)? {
+            messages.push(json!({ "role": "user", "text": prompt }));
+        }
+    }
+    let assembly = context::assemble_detailed(
+        root,
+        &system_seed,
+        messages,
+        event_doc,
+        context::Meta {
+            profile: opts.profile.clone(),
+            agent: prof.agent.clone(),
+            session: opts.session.clone(),
+            turn: 1,
+            model: prof.model.model.clone(),
+            vars: prof.vars.clone(),
+        },
+        &stages,
+        None,
+    )?;
+    Ok(json!({
+        "profile": opts.profile,
+        "session": opts.session,
+        "event_source": event_source,
+        "seed": {
+            "system_blocks": system_seed.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
+            "message_count": assembly.doc.messages.len(),
+        },
+        "resolved_stages": stages,
+        "stage_summaries": assembly.stages,
+        "document": assembly.doc,
+    }))
+}
+
+fn context_render_event(
+    conn: &Connection,
+    arg: Option<&str>,
+) -> Result<(Value, Option<String>, Value)> {
+    let Some(raw) = arg else {
+        return Ok((Value::Null, None, json!({ "kind": "none" })));
+    };
+    if let Ok(id) = raw.parse::<i64>() {
+        let env = events::envelope(conn, id).with_context(|| format!("event {id} not found"))?;
+        let prompt = event_prompt_from_payload(&env["payload"]);
+        return Ok((
+            envelope_to_context_event(&env),
+            prompt,
+            json!({ "kind": "event_id", "id": id }),
+        ));
+    }
+    let value: Value =
+        serde_json::from_str(raw).with_context(|| "--event must be an event id or JSON")?;
+    if value.get("type").is_some() {
+        let prompt = event_prompt_from_payload(&value["payload"]);
+        return Ok((
+            envelope_to_context_event(&value),
+            prompt,
+            json!({ "kind": "event_json", "shape": "envelope" }),
+        ));
+    }
+    if value.get("topic").is_some() {
+        let prompt = event_prompt_from_payload(&value["payload"]);
+        return Ok((
+            value,
+            prompt,
+            json!({ "kind": "event_json", "shape": "context_event" }),
+        ));
+    }
+    let prompt = event_prompt_from_payload(&value);
+    Ok((
+        json!({ "payload": value }),
+        prompt,
+        json!({ "kind": "event_json", "shape": "payload" }),
+    ))
+}
+
+fn envelope_to_context_event(env: &Value) -> Value {
+    json!({
+        "id": env["id"],
+        "topic": env["type"],
+        "payload": env["payload"],
+        "correlation_id": env["correlation_id"],
+        "sender": env["sender"],
+    })
+}
+
+fn event_prompt_from_payload(payload: &Value) -> Option<String> {
+    payload["prompt"]
+        .as_str()
+        .or_else(|| payload["text"].as_str())
+        .map(ToString::to_string)
+}
+
+fn event_already_in_transcript(
+    conn: &Connection,
+    session: &str,
+    event_doc: &Value,
+) -> Result<bool> {
+    let Some(id) = event_doc["id"].as_i64() else {
+        return Ok(false);
+    };
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE session_id=?1 AND event_id=?2",
+        params![session, id],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// Wrap the turn so ANY failure of a correlated, dispatched run is reported
@@ -80,7 +210,9 @@ fn config_clone_setup(root: &Root, profile_name: &str) -> Option<std::path::Path
     if prof.autonomy == "off" {
         return None;
     }
-    let dest = root.run_dir().join(format!("exec-config-{}", std::process::id()));
+    let dest = root
+        .run_dir()
+        .join(format!("exec-config-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dest); // a crashed prior run may have left one
     if let Err(e) = config_repo::clone_for_agent(root, &dest) {
         eprintln!("[exec] config clone unavailable (proposals disabled this run): {e:#}");
@@ -121,25 +253,31 @@ fn config_clone_reap(root: &Root, profile_name: &str, clone: &std::path::Path) {
                 );
                 // Autonomy (docs/config.md D4): auto-accept only what the agent's
                 // level allows; everything else waits for a person.
-                if let crate::configcli::Verdict::Accept =
-                    crate::configcli::classify(root, &p.id, &autonomy)
-                {
-                    if let Ok(sha) = config_repo::accept_proposal(root, &p.id) {
-                        let _ = events::emit(
-                            root,
-                            &conn,
-                            EmitOpts {
-                                payload: Some(json!({
-                                    "proposal": p.id,
-                                    "packages": p.files,
-                                    "commit": sha,
-                                    "decided_by": format!("autonomy:{autonomy}"),
-                                    "agent": agent,
-                                    "via": "autonomy",
-                                })),
-                                sender: Some(agent.clone()),
-                                ..EmitOpts::new("obs/config/changed")
-                            },
+                match crate::configcli::classify(root, &p.id, &autonomy) {
+                    crate::configcli::Verdict::Accept => {
+                        if let Ok(sha) = config_repo::accept_proposal(root, &p.id) {
+                            let _ = events::emit(
+                                root,
+                                &conn,
+                                EmitOpts {
+                                    payload: Some(json!({
+                                        "proposal": p.id,
+                                        "packages": p.files,
+                                        "commit": sha,
+                                        "decided_by": format!("autonomy:{autonomy}"),
+                                        "agent": agent,
+                                        "via": "autonomy",
+                                    })),
+                                    sender: Some(agent.clone()),
+                                    ..EmitOpts::new("obs/config/changed")
+                                },
+                            );
+                        }
+                    }
+                    crate::configcli::Verdict::Hold(reason) => {
+                        eprintln!(
+                            "[config] proposal {} held under autonomy {autonomy}: {reason}",
+                            p.id
                         );
                     }
                 }
@@ -154,7 +292,12 @@ fn config_clone_reap(root: &Root, profile_name: &str, clone: &std::path::Path) {
 /// correlation and dedups against the run that produced it. CLI-direct runs
 /// (no event/correlation) are skipped — their error already hit the
 /// terminal.
-fn report_agent_failure(root: &Root, profile_name: &str, session: Option<&str>, err: &anyhow::Error) {
+fn report_agent_failure(
+    root: &Root,
+    profile_name: &str,
+    session: Option<&str>,
+    err: &anyhow::Error,
+) {
     let ids = trace::Ids::from_env();
     let (Some(event_id), Some(corr)) = (ids.event_id, ids.correlation_id.clone()) else {
         return;
@@ -266,7 +409,12 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
 
     if opts.resume.is_none() {
         if let Some(p) = &prompt {
-            store_msg(&conn, &session, event_id, &json!({ "role": "user", "text": p }))?;
+            store_msg(
+                &conn,
+                &session,
+                event_id,
+                &json!({ "role": "user", "text": p }),
+            )?;
         } else {
             bail!("nothing to do: provide a prompt, '-' for stdin, or --resume");
         }
@@ -277,7 +425,7 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     // semantics, providers don't re-spawn per call); the chain runs before
     // every LLM call over the freshly re-read transcript.
     let system_seed = render::render_parts(root, &conn, &opts.profile, &session)?;
-    let stages = context::chain(root, &conn, &prof)?;
+    let stages = context::chain(root, &conn, &opts.profile, &prof)?;
     let event_doc = opts.event.clone().unwrap_or(Value::Null);
     // The cage is built once per exec from the profile's [sandbox] grant;
     // every shell tool call spawns inside it and gets boundary-diffed.
@@ -287,7 +435,7 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     // MCP servers (border protocol, src/mcp.rs): approved third-party tool
     // servers spawn inside the agent's cage for the run; their tools join
     // the array as <server>__<tool>. Failures degrade loudly, never fatal.
-    let mcp_pool = crate::mcp::Pool::load(root, &conn, &prof, &cage);
+    let mcp_pool = crate::mcp::Pool::load(root, &conn, &opts.profile, &prof, &cage);
     let mut tools = tool_defs();
     tools.extend(mcp_pool.tool_defs());
     let root_type = match event_id {
@@ -319,7 +467,10 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
                     ..EmitOpts::new("signal/pain")
                 },
             )?;
-            bail!("max_turns ({}) reached for session {session}", prof.model.max_turns);
+            bail!(
+                "max_turns ({}) reached for session {session}",
+                prof.model.max_turns
+            );
         }
         check_token_budget(root, &conn, &root_type, event_id)?;
 
@@ -340,7 +491,12 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
             &ids,
         )?;
         let chat_req = build_request(&doc, &tools)?;
-        trace::write(root, &obs(&prof.agent, &session, "llm/request"), &ids, json!({ "model": model, "turn": turns }));
+        trace::write(
+            root,
+            &obs(&prof.agent, &session, "llm/request"),
+            &ids,
+            json!({ "model": model, "turn": turns }),
+        );
         let res = client
             .exec_chat(model.as_str(), chat_req, None)
             .await
@@ -438,7 +594,14 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
                 &ids,
             )?;
             let pre = if pre.allow {
-                crate::resident::consult(root, &conn, "pre_tool_call", &call.fn_name, pre.subject, &ids)
+                crate::resident::consult(
+                    root,
+                    &conn,
+                    "pre_tool_call",
+                    &call.fn_name,
+                    pre.subject,
+                    &ids,
+                )
             } else {
                 pre
             };
@@ -485,7 +648,18 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
                 )?;
                 continue;
             }
-            match run_tool(root, &conn, &cage, &prof, &session, event_id, in_handler, &eff, &mut self_emitted, &mcp_pool) {
+            match run_tool(
+                root,
+                &conn,
+                &cage,
+                &prof,
+                &session,
+                event_id,
+                in_handler,
+                &eff,
+                &mut self_emitted,
+                &mcp_pool,
+            ) {
                 ToolOutcome::Output(result) => {
                     // Hook plane, post_tool_call: may scrub/rewrite the result
                     // or veto it (the model then sees the denial, not the data).
@@ -501,7 +675,14 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
                         &ids,
                     )?;
                     let post = if post.allow {
-                        crate::resident::consult(root, &conn, "post_tool_call", &eff.fn_name, post.subject, &ids)
+                        crate::resident::consult(
+                            root,
+                            &conn,
+                            "post_tool_call",
+                            &eff.fn_name,
+                            post.subject,
+                            &ids,
+                        )
                     } else {
                         post
                     };
@@ -547,7 +728,8 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
             // the transcript replays cleanly on resume; only the ask itself
             // stays open (its response arrives with the answer).
             let interrupted =
-                json!({ "error": "interrupted: run suspended while waiting on the human" }).to_string();
+                json!({ "error": "interrupted: run suspended while waiting on the human" })
+                    .to_string();
             for call in &tool_calls[i + 1..] {
                 trace::write(
                     root,
@@ -579,19 +761,29 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
                 "SELECT id, type, payload FROM events WHERE type LIKE 'signal/%' AND id > ?1 ORDER BY id",
             )?;
             let r = stmt
-                .query_map([signal_watermark], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .query_map([signal_watermark], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             r
         };
         signal_watermark = sigs.iter().map(|s| s.0).max().unwrap_or(signal_watermark);
-        let sigs: Vec<_> = sigs.into_iter().filter(|(id, _, _)| !self_emitted.contains(id)).collect();
+        let sigs: Vec<_> = sigs
+            .into_iter()
+            .filter(|(id, _, _)| !self_emitted.contains(id))
+            .collect();
         if !sigs.is_empty() {
             let note = sigs
                 .iter()
                 .map(|(id, t, p)| format!("[signal #{id}] {t} {}", p.as_deref().unwrap_or("{}")))
                 .collect::<Vec<_>>()
                 .join("\n");
-            trace::write(root, &obs(&prof.agent, &session, "signal/injected"), &ids, json!({ "injected": sigs.len() }));
+            trace::write(
+                root,
+                &obs(&prof.agent, &session, "signal/injected"),
+                &ids,
+                json!({ "injected": sigs.len() }),
+            );
             store_msg(
                 &conn,
                 &session,
@@ -617,7 +809,11 @@ fn obs(agent: &str, session: &str, rest: &str) -> String {
 
 /// Tool-scoped observation topic: obs/agent/<agent>/<session>/tool/<name>/<leaf>.
 fn obs_tool(agent: &str, session: &str, tool: &str, leaf: &str) -> String {
-    obs(agent, session, &format!("tool/{}/{leaf}", crate::topic::encode_segment(tool)))
+    obs(
+        agent,
+        session,
+        &format!("tool/{}/{leaf}", crate::topic::encode_segment(tool)),
+    )
 }
 
 // ── Leases: &mut on subtrees, the kernel as borrow checker ─────────────────
@@ -632,7 +828,12 @@ fn lease_holder() -> (Option<i64>, i64) {
     (dispatch, std::process::id() as i64)
 }
 
-fn same_holder(dispatch: Option<i64>, pid: i64, row_dispatch: Option<i64>, row_pid: Option<i64>) -> bool {
+fn same_holder(
+    dispatch: Option<i64>,
+    pid: i64,
+    row_dispatch: Option<i64>,
+    row_pid: Option<i64>,
+) -> bool {
     match (dispatch, row_dispatch) {
         (Some(a), Some(b)) => a == b,
         _ => row_pid == Some(pid),
@@ -648,7 +849,11 @@ fn acquire_lease(
     path: &str,
 ) -> anyhow::Result<String> {
     let p = std::path::Path::new(path);
-    let p = if p.is_absolute() { p.to_path_buf() } else { root.dir.join(p) };
+    let p = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.dir.join(p)
+    };
     let canon = p
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("{} is not an existing directory: {e}", p.display()))?;
@@ -660,7 +865,10 @@ fn acquire_lease(
         anyhow::bail!(
             "{} is outside the granted write roots {:?}",
             canon.display(),
-            cage.write_roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>()
+            cage.write_roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
         );
     }
     let (dispatch, pid) = lease_holder();
@@ -673,8 +881,8 @@ fn acquire_lease(
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let outcome = (|| -> anyhow::Result<()> {
         let active: Vec<(String, Option<i64>, Option<i64>)> = {
-            let mut stmt =
-                conn.prepare("SELECT path, dispatch_id, pid FROM leases WHERE released_at IS NULL")?;
+            let mut stmt = conn
+                .prepare("SELECT path, dispatch_id, pid FROM leases WHERE released_at IS NULL")?;
             let r = stmt
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -708,7 +916,10 @@ fn acquire_lease(
     trace::write(
         root,
         &obs(agent, session, "lease/acquire"),
-        &trace::Ids { session_id: Some(session.into()), ..Default::default() },
+        &trace::Ids {
+            session_id: Some(session.into()),
+            ..Default::default()
+        },
         json!({ "path": canon.display().to_string(), "dispatch_id": dispatch, "pid": pid }),
     );
     Ok(canon.display().to_string())
@@ -737,14 +948,23 @@ fn held_leases(conn: &Connection) -> anyhow::Result<Vec<String>> {
 /// Ok(None) = no leases held, use the base grant cage. Err = the lease
 /// table could not be read; the caller fails the tool closed rather than
 /// run with the un-narrowed grant.
-fn narrowed_cage(root: &Root, conn: &Connection, base: &sandbox::Cage) -> anyhow::Result<Option<sandbox::Cage>> {
+fn narrowed_cage(
+    root: &Root,
+    conn: &Connection,
+    base: &sandbox::Cage,
+) -> anyhow::Result<Option<sandbox::Cage>> {
     let held = held_leases(conn)?;
     if held.is_empty() {
         return Ok(None);
     }
     let mut roots = vec![root.dir.clone()];
     roots.extend(held.into_iter().map(std::path::PathBuf::from));
-    Ok(Some(sandbox::Cage::from_roots(roots, base.exclude.clone(), true, &sandbox::Protect::for_root(root))))
+    Ok(Some(sandbox::Cage::from_roots(
+        roots,
+        base.exclude.clone(),
+        true,
+        &sandbox::Protect::for_root(root),
+    )))
 }
 
 /// Resolve the profile's `[sandbox] workdir`: tilde-expanded, must be an
@@ -752,7 +972,9 @@ fn narrowed_cage(root: &Root, conn: &Connection, base: &sandbox::Cage) -> anyhow
 /// as ever. This is *location*, not authority — writes still flow through
 /// the whole-agent grant + leases; the cage is unchanged by it.
 fn resolve_workdir(cfg: &profile::SandboxCfg) -> anyhow::Result<Option<std::path::PathBuf>> {
-    let Some(w) = &cfg.workdir else { return Ok(None) };
+    let Some(w) = &cfg.workdir else {
+        return Ok(None);
+    };
     let expanded = expand_tilde(w);
     let p = std::path::PathBuf::from(&expanded);
     if !p.is_absolute() {
@@ -804,7 +1026,9 @@ fn build_client(prof: &profile::Profile) -> Client {
     use genai::ServiceTarget;
 
     let profile_url = prof.model.base_url.clone();
-    let env_url = std::env::var("ANTHROPIC_BASE_URL").ok().filter(|s| !s.is_empty());
+    let env_url = std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
     let api_key_env = prof.model.api_key_env.clone();
     if profile_url.is_none() && env_url.is_none() && api_key_env.is_none() {
         return Client::default();
@@ -812,9 +1036,11 @@ fn build_client(prof: &profile::Profile) -> Client {
     let resolver = ServiceTargetResolver::from_resolver_fn(
         move |mut target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
             let adapter = target.model.adapter_kind;
-            let url = profile_url
-                .clone()
-                .or_else(|| (adapter == AdapterKind::Anthropic).then(|| env_url.clone()).flatten());
+            let url = profile_url.clone().or_else(|| {
+                (adapter == AdapterKind::Anthropic)
+                    .then(|| env_url.clone())
+                    .flatten()
+            });
             if let Some(url) = url {
                 target.endpoint = Endpoint::from_owned(normalize_base_url(&url, adapter));
             }
@@ -824,7 +1050,9 @@ fn build_client(prof: &profile::Profile) -> Client {
             Ok(target)
         },
     );
-    Client::builder().with_service_target_resolver(resolver).build()
+    Client::builder()
+        .with_service_target_resolver(resolver)
+        .build()
 }
 
 /// genai appends e.g. "messages" directly to the endpoint, while SDK-style
@@ -872,7 +1100,10 @@ fn repair_transcript(conn: &Connection, session: &str) -> Result<usize> {
             _ => {}
         }
     }
-    let dangling: Vec<_> = calls.into_iter().filter(|(id, _)| !responded.contains(id)).collect();
+    let dangling: Vec<_> = calls
+        .into_iter()
+        .filter(|(id, _)| !responded.contains(id))
+        .collect();
     if dangling.is_empty() {
         return Ok(0);
     }
@@ -893,7 +1124,10 @@ fn repair_transcript(conn: &Connection, session: &str) -> Result<usize> {
     let key = pending_ask_key(session);
     if let Some(pend) = db::kv_get(conn, &key)? {
         let pend: Value = serde_json::from_str(&pend).unwrap_or(Value::Null);
-        if dangling.iter().any(|(id, _)| Some(id.as_str()) == pend["call_id"].as_str()) {
+        if dangling
+            .iter()
+            .any(|(id, _)| Some(id.as_str()) == pend["call_id"].as_str())
+        {
             db::kv_del(conn, &key)?;
         }
     }
@@ -1070,7 +1304,11 @@ fn run_tool(
             // tool closed rather than run with the un-narrowed grant.
             let narrowed = match narrowed_cage(root, conn, cage) {
                 Ok(n) => n,
-                Err(e) => return err(format!("shell: cannot read active leases, refusing to run: {e:#}")),
+                Err(e) => {
+                    return err(format!(
+                        "shell: cannot read active leases, refusing to run: {e:#}"
+                    ))
+                }
             };
             let cage = narrowed.as_ref().unwrap_or(cage);
             // Workdir is location, not authority: resolved fresh per call so
@@ -1085,7 +1323,15 @@ fn run_tool(
             let before = sandbox::snapshot(cage);
             let out = run_shell(root, cage, cmd, timeout, workdir.as_deref());
             let after = sandbox::snapshot(cage);
-            emit_fs_delta(root, &prof.agent, session, &call.call_id, cage, &before, &after);
+            emit_fs_delta(
+                root,
+                &prof.agent,
+                session,
+                &call.call_id,
+                cage,
+                &before,
+                &after,
+            );
             ToolOutcome::Output(out)
         }
         "fs_lease" => {
@@ -1094,7 +1340,8 @@ fn run_tool(
             };
             match acquire_lease(root, conn, cage, &prof.agent, session, path) {
                 Ok(leased) => ToolOutcome::Output(
-                    json!({ "leased": leased, "held": held_leases(conn).unwrap_or_default() }).to_string(),
+                    json!({ "leased": leased, "held": held_leases(conn).unwrap_or_default() })
+                        .to_string(),
                 ),
                 Err(e) => err(format!("fs_lease: {e:#}")),
             }
@@ -1126,7 +1373,11 @@ fn run_tool(
             };
             let options: Vec<String> = args["options"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|o| o.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|o| o.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             if !in_handler {
                 // Interactive: short-circuit through the terminal.
@@ -1163,7 +1414,8 @@ fn run_tool(
             if let Err(e) = db::kv_set(
                 conn,
                 &pending_ask_key(session),
-                &json!({ "call_id": call.call_id, "correlation": corr, "ask_id": ask_id }).to_string(),
+                &json!({ "call_id": call.call_id, "correlation": corr, "ask_id": ask_id })
+                    .to_string(),
             ) {
                 return err(format!("checkpoint failed: {e:#}"));
             }
@@ -1286,8 +1538,12 @@ fn run_shell(
             }
         }
     };
-    let stdout = out_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
-    let stderr = err_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    let stdout = out_h
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = err_h
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
     match status {
         Some(s) => json!({
             "exit_code": s.code().unwrap_or(-1),
@@ -1309,7 +1565,10 @@ fn run_shell(
 fn ask_tty(question: &str, options: &[String]) -> Option<String> {
     use std::io::{BufRead, BufReader, Write};
     let tty_in = std::fs::File::open("/dev/tty").ok()?;
-    let mut tty_out = std::fs::OpenOptions::new().write(true).open("/dev/tty").ok()?;
+    let mut tty_out = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
     let _ = writeln!(tty_out, "\n[ask_human] {question}");
     if !options.is_empty() {
         let _ = writeln!(tty_out, "  options: {}", options.join(" | "));
@@ -1323,7 +1582,12 @@ fn ask_tty(question: &str, options: &[String]) -> Option<String> {
 
 /// Hourly token ceiling, keyed by the root cause's event type — agent-initiated
 /// and human-initiated work get different budgets via throttle globs.
-fn check_token_budget(root: &Root, conn: &Connection, root_type: &str, event_id: Option<i64>) -> Result<()> {
+fn check_token_budget(
+    root: &Root,
+    conn: &Connection,
+    root_type: &str,
+    event_id: Option<i64>,
+) -> Result<()> {
     let rows: Vec<(String, i64)> = {
         let mut stmt = conn.prepare(
             "SELECT event_type, llm_tokens_per_hour FROM throttles WHERE llm_tokens_per_hour IS NOT NULL",
@@ -1366,7 +1630,12 @@ fn check_token_budget(root: &Root, conn: &Connection, root_type: &str, event_id:
 fn store_msg(conn: &Connection, session: &str, event_id: Option<i64>, msg: &Value) -> Result<()> {
     conn.execute(
         "INSERT INTO messages(session_id, role, content, event_id) VALUES (?1, ?2, ?3, ?4)",
-        params![session, msg["role"].as_str().unwrap_or("?"), msg.to_string(), event_id],
+        params![
+            session,
+            msg["role"].as_str().unwrap_or("?"),
+            msg.to_string(),
+            event_id
+        ],
     )?;
     Ok(())
 }
@@ -1377,7 +1646,10 @@ mod tests {
     use crate::profile::SandboxCfg;
 
     fn cfg(workdir: Option<&str>) -> SandboxCfg {
-        SandboxCfg { workdir: workdir.map(String::from), ..Default::default() }
+        SandboxCfg {
+            workdir: workdir.map(String::from),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1402,7 +1674,9 @@ mod tests {
     fn existing_workdir_resolves() {
         let p = std::env::temp_dir().join(format!("elanus-wd-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
-        let got = resolve_workdir(&cfg(Some(&p.display().to_string()))).unwrap().unwrap();
+        let got = resolve_workdir(&cfg(Some(&p.display().to_string())))
+            .unwrap()
+            .unwrap();
         assert_eq!(got, p);
         std::fs::remove_dir_all(&p).ok();
     }
@@ -1451,9 +1725,17 @@ pub fn handle_exec(root: &Root) -> Result<()> {
             Value::Null => "(no answer; deadline expired with no default)".to_string(),
             v => v.to_string(),
         };
-        ExecOpts { session: Some(session), profile, prompt: None, resume: Some(ans), event: Some(event) }
+        ExecOpts {
+            session: Some(session),
+            profile,
+            prompt: None,
+            resume: Some(ans),
+            event: Some(event),
+        }
     } else {
-        let prompt = payload["prompt"].as_str().or_else(|| payload["text"].as_str());
+        let prompt = payload["prompt"]
+            .as_str()
+            .or_else(|| payload["text"].as_str());
         let Some(prompt) = prompt else {
             if !payload["answer"].is_null() {
                 // An answer addressed to the agent mailbox (in/agent/<noun>)
@@ -1461,13 +1743,21 @@ pub fn handle_exec(root: &Root) -> Result<()> {
                 // dispatcher's resume machinery already delivers it to the
                 // suspended session by correlation, so this fresh dispatch of
                 // the answer event itself is a no-op, not an error.
-                eprintln!("[handle-exec] answer event; resume is correlation-driven, nothing to do");
+                eprintln!(
+                    "[handle-exec] answer event; resume is correlation-driven, nothing to do"
+                );
                 return Ok(());
             }
             bail!("agent mailbox (in/agent/<noun>) payload needs a 'prompt' (or 'text') field");
         };
         let prompt = prompt.to_string();
-        ExecOpts { session: Some(session), profile, prompt: Some(prompt), resume: None, event: Some(event) }
+        ExecOpts {
+            session: Some(session),
+            profile,
+            prompt: Some(prompt),
+            resume: None,
+            event: Some(event),
+        }
     };
     run(root, opts)
 }

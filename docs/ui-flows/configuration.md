@@ -15,14 +15,15 @@ reverts after 1.4s, a note cleared by the next selection).
 
 Two durability facts to keep in mind throughout:
 
-- **`#setup-status`** (`.status-ok` / `.status-err`) is the NEW durable banner in
-  the kits/review pane. `loadSetup()` re-renders `#setup-kits` and
-  `#setup-pending` on every stage/approve, which would wipe a button's transient
-  `staged ✓`. The banner lives *outside* those two containers, so it is the
-  confirmation that survives the re-render. Assert on it, not on button labels.
+- **`#setup-status`** (`.status-ok` / `.status-err`) is the durable banner in
+  the add-ons pane. `loadSetup()` re-renders `#setup-kits`, `#setup-configs`,
+  and `#setup-pending` after add, save, accept, or decline actions, which would
+  wipe a button's transient label. The banner lives *outside* those containers,
+  so it is the confirmation that survives the re-render. Assert on it, not on
+  button labels.
 - **`#cfg-note`** (configure) and **`#na-note`** (new agent) are transient. The
   truth of a config write is the **reloaded form value** and the **raw
-  profile.toml**, not the note. Tests assert the note for liveness but verify
+  settings file**, not the note. Tests assert the note for liveness but verify
   persistence by reloading.
 
 Selectors are taken verbatim from `ui/web/public/index.html` and the behavior
@@ -97,8 +98,8 @@ await expect(page.locator('#view-setup')).toBeVisible(); // no navigation
 
 ### configure-1 — Edit identity via the form, then verify by reload
 
-**Goal.** Set model / max turns / working dir / skills include / skills exclude
-through the structured form and confirm every field stuck.
+**Goal.** Set model / max run steps / working dir / package visibility through
+the structured form and confirm every field stuck.
 
 **Preconditions.** A profile-backed agent exists (e.g. `harrier`). Open it, then
 the configure tab.
@@ -116,14 +117,17 @@ the configure tab.
 **Observable expectation.**
 - *Liveness (transient):* `#cfg-note` goes `saving…` → `saved — applies on the
   next run`.
-- *Durable truth:* the values survive a full page reload. `skills.include` /
+- *Durable truth:* the values survive a full page reload. The visible
+  `#cfg-turns` label is "max run steps" because this caps one activation's
+  model/tool loop, not a conversation lifetime; until the agent-config
+  migration, the saved key remains `model.max_turns`. `skills.include` /
   `skills.exclude` are sent as real arrays (comma-split, trimmed,
   empties dropped); an empty include is coerced to `['#']` (everything), and an
   empty exclude is *always sent* so clearing it actually clears. Re-opening
   configure after reload shows the same `#cfg-model` / `#cfg-turns` /
   `#cfg-include` / `#cfg-exclude`.
-- The header `#cfg-file` shows `profiles/<profile>/profile.toml` — the file the
-  edit lands in (comments survive).
+- The header `#cfg-file` names the agent settings file the edit lands in
+  (comments survive).
 
 **How to verify.** Save, then reload and re-read the fields — never trust the
 note alone:
@@ -170,20 +174,20 @@ await page.reload(); /* re-open configure, waitForConfigureLoaded */
 await expect(page.locator('#cfg-workdir')).toHaveValue('');
 ```
 
-### configure-3 — No-profile agent shows a guard, not a broken form
+### configure-3 — Traffic-only agent shows a guard, not a broken form
 
-**Goal.** Confirm an agent that exists only as bus traffic (no profile file)
+**Goal.** Confirm an agent that exists only as bus traffic (no settings file)
 tells the user so instead of silently failing to save.
 
-**Preconditions.** Select an agent that has no `profile.toml` (traffic-only),
+**Preconditions.** Select an agent that has no settings file (traffic-only),
 open configure.
 
 **Steps.**
 1. Select the traffic-only agent → `[data-tab="configure"]`.
 
-**Observable expectation.** `#cfg-note` reads `no profile file for <name> — this
-agent only exists as traffic; create a profile to configure it`. `#cfg-toml` is
-empty. This is the durable state of the pane until a profile exists.
+**Observable expectation.** `#cfg-note` reads `no settings file for <name> —
+this agent only exists as traffic; create an agent here to configure it`.
+`#cfg-toml` is empty. This is the durable state of the pane until settings exist.
 
 **How to verify.**
 ```js
@@ -197,7 +201,7 @@ await expect(page.locator('#cfg-toml')).toHaveValue('');
 **Goal.** Rename via `#cfg-agent` and confirm the new mailbox name is reflected
 in the nav and the selection.
 
-**Preconditions.** A profile-backed agent (e.g. `harrier`), configure loaded.
+**Preconditions.** A settings-backed agent (e.g. `harrier`), configure loaded.
 
 **Steps.**
 1. Edit `#cfg-agent` to the new name (e.g. `falcon`).
@@ -223,12 +227,12 @@ await expect(page.locator('#nav-agents .nav-item')).toContainText('falcon');
 //  note timing is fragile — the nav/title is the user-facing durable proof.)
 ```
 
-### configure-5 — Raw profile.toml edit (the escape hatch) + reload-back verify
+### configure-5 — Raw settings-file edit (the escape hatch) + reload-back verify
 
 **Goal.** Edit the literal TOML and confirm it is written and re-read.
 
-**Preconditions.** A profile-backed agent, configure loaded. Expand the
-`<details>` whose summary reads `the raw profile.toml`.
+**Preconditions.** A settings-backed agent, configure loaded. Expand the
+`<details>` whose summary reads `the raw settings file`.
 
 **Steps.**
 1. Open the raw details; `#cfg-toml` holds the current file text.
@@ -244,7 +248,7 @@ proof is a page reload: `#cfg-toml` re-loads the saved bytes.
 
 **How to verify.**
 ```js
-await page.click('text=the raw profile.toml');           // expand <details>
+await page.click('text=the raw settings file');          // expand <details>
 const toml = await page.inputValue('#cfg-toml');
 await page.fill('#cfg-toml', toml + '\n# qa-marker\n');
 await page.click('#cfg-toml-save');
@@ -254,224 +258,270 @@ await page.reload(); /* re-open configure + raw details */
 await expect(page.locator('#cfg-toml')).toContainText('# qa-marker');
 ```
 
-### configure-6 — Skills include/exclude live in configure but are root-managed
+### configure-6 — Package visibility lives in configure; add-ons are shared
 
-**Goal.** Document that per-agent `#cfg-include` / `#cfg-exclude` set this
-agent's *visibility* of root-wide kits/grants, and where to actually manage the
-kits.
+**Goal.** Document that the package list gives each agent a labeled
+enable/disable control backed by `#cfg-exclude`, while add-ons themselves are
+managed from the shared add-ons view.
 
 **Preconditions.** Configure loaded.
 
 **Steps.**
-1. Read the `kits & capabilities` block note: kits/grants are root-wide, managed
-   under `⚒ kits & review`; this agent's view is filtered by skill visibility.
-2. Set `#cfg-include` (placeholder `# (everything)`) / `#cfg-exclude`
-   (placeholder `(nothing)`), click `#cfg-save`.
+1. Expand a package row under `#cfg-package-configs`.
+2. Click its `disable` button and confirm `#cfg-exclude` includes the package
+   name.
+3. Click its `enable` button and confirm `#cfg-exclude` no longer includes the
+   package name.
 
 **Observable expectation.** Same durable proof as configure-1: the
 comma-separated lists round-trip through reload (`include` defaults to `#` when
-emptied; `exclude` clears when emptied). The note steers the user to
-`.nav-setup` for the actual capability grants.
+emptied; `exclude` clears when emptied).
 
 **How to verify.** Covered by the configure-1 reload assertions for `#cfg-include`
 / `#cfg-exclude`.
 
+### configure-7 — Advanced context parameters stay out of the default path
+
+**Goal.** Keep legacy `[vars]` editable without presenting arbitrary key/value
+pairs as normal agent configuration.
+
+**Preconditions.** Configure loaded.
+
+**Steps.**
+1. Confirm the configure index has no `vars` entry and there is no standalone
+   `#cfg-section-vars`.
+2. Open `#cfg-section-raw` → `advanced context parameters`.
+3. Add a key/value row in `#cfg-vars`.
+4. Click the main `#cfg-save` button.
+
+**Observable expectation.** The controls are labeled as legacy context-stage /
+template parameters, not agent identity. Save succeeds through the normal form
+save, reload preserves the row, and the raw settings file contains the matching
+`[vars]` entry.
+
+### configure-8 — Package settings include typed context-stage parameters
+
+**Goal.** Package rows expose typed, documented context-stage parameters from
+manifest `[[stage.config]]` declarations.
+
+**Preconditions.** Configure loaded, package tree rendered.
+
+**Steps.**
+1. Expand the `window` package row under `#cfg-package-configs`.
+2. Click its `settings` button.
+3. Inspect the `Window rows` control.
+
+**Observable expectation.** The row says it comes from `context stage window`,
+shows `type: number`, includes the manifest help text, and renders the numeric
+default `80`. Legacy `[vars]` remains available only through configure-7's raw
+advanced context parameters.
+
+**How to verify.** Covered by `ui/web/test/ui.spec.mjs`.
+
+### configure-9 — Context program policy is an agent setting
+
+**Goal.** Configure exposes the agent's context-program policy without making
+the user edit raw TOML for the common fields.
+
+**Preconditions.** Configure loaded.
+
+**Steps.**
+1. Inspect `#cfg-section-context`.
+2. Set `program` to `default`.
+3. Set `max context ms` to `12000`.
+4. Inspect `#cfg-context-chain` and find the `window/window` context-stage tile.
+5. Change its `timeout ms` value to `9000`.
+6. Use the tile move controls when more than one context stage is visible.
+7. Click the main `#cfg-save` button.
+
+**Observable expectation.** Save succeeds, reload preserves both controls, and
+the raw settings file contains `[context] max_total_ms = 12000` plus a
+`context.stage` array entry for `window/window` with `timeout_ms = 9000`. The UI
+presents context stages as an ordered chain, not as a singleton object.
+
+**How to verify.** Covered by `ui/web/test/ui.spec.mjs`.
+
+**How to verify.**
+```js
+await expect(page.locator('.cfg-index')).not.toContainText(/\bvars\b/i);
+await expect(page.locator('#cfg-section-vars')).toHaveCount(0);
+await page.click('text=advanced context parameters');
+await page.fill('#cfg-vars .cfg-var-key', 'window_rows');
+await page.fill('#cfg-vars .cfg-var-value', '50');
+await page.click('#cfg-save');
+await expect(page.locator('#cfg-note')).toContainText('saved');
+await page.reload(); /* re-open configure + advanced context parameters */
+await expect(page.locator('#cfg-vars .cfg-var-key')).toHaveValue('window_rows');
+await expect(page.locator('#cfg-vars .cfg-var-value')).toHaveValue('50');
+await expect(page.locator('#cfg-toml')).toContainText('[vars]');
+```
+
 ---
 
-## kits
+## add-ons
 
-### kits-1 — Browse the kit catalog and expand a readme
+### add-ons-1 — Browse the catalog and expand details
 
-**Goal.** See the available kits and read what one would do before staging.
+**Goal.** See the available add-ons and read what one would do before adding it.
 
-**Preconditions.** `#view-setup` open; at least one kit resolvable under
+**Preconditions.** `#view-setup` open; at least one add-on resolvable under
 `<root>/kits` (seeded: dev / core / funnel).
 
 **Steps.**
 1. Click `.nav-setup`.
 2. In `#setup-kits`, find a `.setup-kit` whose `.setup-kit-name` matches (e.g.
    `dev`).
-3. Click that kit's readme button (`button.ghost` in the row).
+3. Click that row's details button (`button.ghost`).
 
-**Observable expectation.** `#setup-kits` lists each kit with name + hook; an
-already-applied kit carries a `.badge` reading `installed` and its stage button
-reads `stage again`. Clicking readme toggles a `.setup-readme <pre>` from hidden
-to shown, lazily fetching the text (shows `fetching…` then content). Empty
-catalog shows a dim note explaining why.
+**Observable expectation.** `#setup-kits` lists each add-on with name + hook; an
+already-added row carries a `.badge` reading `installed` and its action button
+reads `add again`. Clicking details toggles a `.setup-readme <pre>` from hidden
+to shown, lazily fetching the text (shows `fetching...` then content). Empty
+catalog shows a dim product-language note.
 
 **How to verify.**
 ```js
 await page.click('.nav-setup');
 await page.waitForSelector('#view-setup:not([hidden])');
 await expect(page.locator('#setup-kits')).toContainText(/dev|core|funnel/);
-// expand the dev readme
 const devRow = page.locator('.setup-kit', { hasText: 'dev' });
 await devRow.locator('button.ghost').click();
 await expect(devRow.locator('.setup-readme')).toBeVisible();
 await expect(devRow.locator('.setup-readme')).not.toBeEmpty();
 ```
 
-### kits-2 — Stage a kit; verify by the durable banner + pending queue
+### add-ons-2 — Add once; verify by durable banner + installed settings
 
-**Goal.** Stage a kit's grants as *pending* and confirm it took, without relying
+**Goal.** Add an add-on as one human action and confirm it took without relying
 on a button label that the re-render destroys.
 
 **Preconditions.** `#view-setup` open, target `.setup-kit` visible.
 
 **Steps.**
-1. In the target `.setup-kit`, click its stage button (`button:not(.ghost)`,
-   labeled `stage` or `stage again`).
-2. The button shows `staging…` and disables, then `loadSetup()` re-renders the
+1. In the target `.setup-kit`, click its add button (`button:not(.ghost)`,
+   labeled `add` or `add again`).
+2. The button shows `adding...` and disables, then `loadSetup()` re-renders the
    whole pane.
 
-**Observable expectation (durable-vs-flash is the whole point).** The stage
-button's `staging…` is destroyed by the re-render — do NOT assert on it.
-The durable confirmation is **`#setup-status`** going `.status-ok` with text
-`✓ staged <kit> — its grants are in "pending review" below; approve to commit.`
-(or `.status-err` `✕ couldn't stage …` on failure). Simultaneously
-`#setup-pending` fills with `.setup-pending-pkg` cards, one per package, each
-listing `.setup-grant` lines and an approve button. The banner persists across
-subsequent re-renders because it lives outside `#setup-kits` / `#setup-pending`.
+**Observable expectation.** The transient button label is destroyed by the
+re-render. The durable confirmation is **`#setup-status`** going `.status-ok`
+with text `added <name>.` (or `.status-err` on failure). Simultaneously
+`#setup-configs` shows the installed add-ons, including settings controls for
+each package surfaced through `/api/admin/configs`. The banner persists because
+it lives outside the re-rendered lists.
 
-**How to verify.** Assert the durable banner AND the populated queue:
+**How to verify.**
 ```js
 const devRow = page.locator('.setup-kit', { hasText: 'dev' });
 await devRow.locator('button:not(.ghost)').click();
 await expect(page.locator('#setup-status')).toBeVisible();
 await expect(page.locator('#setup-status')).toHaveClass(/status-ok/);
-await expect(page.locator('#setup-status')).toContainText('staged');
-await expect(page.locator('#setup-pending')).toContainText(/approve|git-protect/i);
+await expect(page.locator('#setup-status')).toContainText('added dev');
+await expect(page.locator('#setup-configs')).toContainText(/git-protect|window|recent-history/i);
+```
+
+### add-ons-3 — Save package settings and read them back
+
+**Goal.** Give package configuration a visible home and prove writes survive a
+reload.
+
+**Preconditions.** An add-on is installed and visible in `#setup-configs`.
+
+**Steps.**
+1. In the installed add-on card, fill the setting name input and value input.
+2. Click `save setting`.
+3. Expand `current settings`.
+
+**Observable expectation.** The inline note reads `saved`; expanding current
+settings fetches the raw TOML from `elanus config list <package>` and shows the
+saved key/value. The backend log shows `elanus config set ...`, and the change
+is committed on `config/live`.
+
+**How to verify.**
+```js
+const card = page.locator('#setup-configs .setup-pending-pkg', { hasText: 'git-protect' });
+await card.locator('input').nth(0).fill('mode');
+await card.locator('input').nth(1).fill('"watch"');
+await card.locator('button', { hasText: 'save setting' }).click();
+await expect(card).toContainText('saved');
+await card.locator('summary', { hasText: 'current settings' }).click();
+await expect(card.locator('pre')).toContainText('mode = "watch"');
 ```
 
 ---
 
-## grants
+## agent requests
 
-### grants-1 — Approve a pending package; verify by the durable banner + drain
+### requests-1 — Resting state
 
-**Goal.** Commit a staged grant (decided_by=ui) and confirm it left the queue.
+**Goal.** Confirm there is no intimidating technical queue when no agent has
+asked for a settings change.
 
-**Preconditions.** At least one `.setup-pending-pkg` in `#setup-pending` (run
-kits-2 first).
+**Observable expectation.** `#setup-pending` reads `no agent requests`.
+
+### requests-2 — Accept or decline an agent settings change
+
+**Goal.** Show an agent-started config proposal as a plain request.
+
+**Preconditions.** `elanus config proposals` returns at least one proposal.
 
 **Steps.**
-1. In a pending card, click the approve button (`#setup-pending button`, labeled
-   `approve <pkg>`).
-2. It shows `approving…` then `loadSetup()` re-renders.
+1. Open `.nav-setup`.
+2. In `#setup-pending`, read the request card: `<agent> wants to change settings`.
+3. Optionally click `show change` to reveal the diff.
+4. Click `accept` or `decline`.
 
-**Observable expectation.** Like staging, the button's transient label is wiped
-by the re-render; the durable proof is **`#setup-status`** → `.status-ok`
-`✓ approved <pkg> — grant committed (decided_by=ui).` (or `.status-err`). The
-approved package's card disappears from `#setup-pending`; once the last one is
-approved, `#setup-pending` shows the dim resting note
-`nothing pending — the ledger is at rest`. The decision is the same gesture as
-the terminal — each card shows a copyable `.setup-cmd` `elanus approve <pkg>`
-(click copies to clipboard).
+**Observable expectation.** Accept calls `elanus config accept <id>` and shows
+`accepted the change.`; decline calls `elanus config decline <id>` and shows
+`declined the change.` The card disappears after the re-render.
 
 **How to verify.**
 ```js
-const card = page.locator('.setup-pending-pkg').first();
-const pkg = await card.locator('.setup-kit-name').textContent();
-await card.locator('button').click();                 // approve
-await expect(page.locator('#setup-status')).toHaveClass(/status-ok/);
-await expect(page.locator('#setup-status')).toContainText('approved');
-// durable drain: that package's card is gone
-await expect(page.locator('.setup-pending-pkg', { hasText: pkg })).toHaveCount(0);
-```
-
-### grants-2 — Drain the whole pending queue to the resting state
-
-**Goal.** Approve every pending package and confirm the queue reaches its
-empty/resting marker (a staged kit may produce several packages).
-
-**Preconditions.** One or more pending cards.
-
-**Steps.**
-1. Repeatedly: query `#setup-pending button`; if present, click it and let
-   `loadSetup()` re-render; if absent, read `#setup-pending` text.
-
-**Observable expectation.** Each approval re-renders the pane and drops one card;
-when none remain, `#setup-pending` reads `nothing pending — the ledger is at
-rest`. Always query a fresh `#setup-pending button` per iteration — handles go
-stale across the re-render (this is why the spec uses `page.click` not a held
-element ref).
-
-**How to verify.**
-```js
-for (;;) {
-  const btn = page.locator('#setup-pending button').first();
-  if (!(await btn.count())) break;
-  await btn.click();
-  await page.waitForTimeout(400); // let loadSetup re-render
-}
-await expect(page.locator('#setup-pending')).toContainText(/nothing pending|at rest/i);
-```
-
-### grants-3 — The terminal-equivalence affordance (copyable command)
-
-**Goal.** Confirm the UI advertises that approving is identical to the CLI and
-offers the exact command.
-
-**Preconditions.** A pending card present.
-
-**Steps.**
-1. Read the pending-review block note: `approving here is the same gesture as the
-   terminal (ledger trail: decided_by=ui)`.
-2. Click the `.setup-cmd` `<code>` in a card.
-
-**Observable expectation.** `.setup-cmd` reads `elanus approve <pkg>`, has the
-title `the same gesture from a terminal — click to copy`, and clicking writes it
-to the clipboard. (Clipboard read may be unavailable headless — assert the text
-and title rather than the paste.)
-
-**How to verify.**
-```js
-const cmd = page.locator('.setup-cmd').first();
-await expect(cmd).toHaveText(/^elanus approve /);
-await expect(cmd).toHaveAttribute('title', /click to copy/);
+const card = page.locator('#setup-pending .setup-pending-pkg').first();
+await expect(card).toContainText(/wants to change settings/);
+await card.locator('button', { hasText: 'show change' }).click();
+await expect(card.locator('pre')).toContainText(/diff --git/);
+await card.locator('button', { hasText: 'accept' }).click();
+await expect(page.locator('#setup-status')).toContainText('accepted the change');
 ```
 
 ---
 
 ## history
 
-### history-1 — History package drives the sessions view (degraded state)
+### history-1 — Transcript view degraded state
 
-**Goal.** Confirm that whether transcripts are browsable is an *observable*
-consequence of the history package being approved/running, and that its absence
-is surfaced — not silent.
+**Goal.** Confirm that whether transcripts are browsable is observable, and that
+the unavailable state is surfaced instead of silently breaking.
 
-**Preconditions.** History package NOT running (fresh root, before the package is
-approved).
+**Preconditions.** History view NOT running.
 
 **Steps.**
 1. Select an agent → tab `[data-tab="sessions"]` (`#view-sessions`).
 2. Observe `#sessions-pane`; observe footer `#history-hint`.
 
-**Observable expectation.** `#sessions-pane` shows the live-only note (`history
-package not running — live view only.` plus `approve the history package under
-"kits & review" to browse transcripts.`). After the probe settles,
+**Observable expectation.** `#sessions-pane` shows the live-only note
+(`transcripts unavailable — live view only.` plus the add-ons hint). After the probe settles,
 `#history-hint` becomes visible (its `hidden` flips off via `setHistoryOk(false)`
-on a 503/504 from `/api/history`). The welcome `#welcome-hint` likewise reads
-`transcripts are off until you approve the history package`. This is the durable
+on a 503/504 from `/api/history`). The welcome `#welcome-hint` likewise says
+transcripts are unavailable until the history view is on. This is the durable
 degraded state.
 
 **How to verify.**
 ```js
 await page.click('[data-tab="sessions"]');
 await page.waitForSelector('#view-sessions:not([hidden])');
-await expect(page.locator('#sessions-pane')).toContainText(/live view only|history/i);
+await expect(page.locator('#sessions-pane')).toContainText(/transcripts unavailable|live view only/i);
 await expect(page.locator('#history-hint')).toBeVisible(); // hidden flipped off
 ```
 
-### history-2 — Sessions view populates once history is running (healed state)
+### history-2 — Sessions view populates once transcripts are running (healed state)
 
-**Goal.** Confirm that after approving/running the history package, the sessions
-view lists recorded sessions for the agent — the verification that the config
-(grant) took effect end-to-end.
+**Goal.** Confirm that after the transcript view is running, the sessions view
+lists recorded sessions for the agent.
 
-**Preconditions.** History package approved (grants flows) and the package
-serving `/api/history`; the agent has at least one recorded session.
+**Preconditions.** The history view is serving `/api/history`; the agent has at
+least one recorded session.
 
 **Steps.**
 1. Select the agent → `[data-tab="sessions"]`.
@@ -481,8 +531,7 @@ serving `/api/history`; the agent has at least one recorded session.
 
 **Observable expectation.** The live-only note is GONE; `#sessions-pane` holds a
 `.sess-list` with rows (or `no recorded sessions for this agent yet.` if the
-agent truly has none). `#history-hint` is hidden (`setHistoryOk(true)`). This
-healed state is the cross-package proof that the grant approval took — the same
+agent truly has none). `#history-hint` is hidden (`setHistoryOk(true)`). The same
 selectors that showed the degraded note in history-1 now show data.
 
 **How to verify.**

@@ -42,7 +42,10 @@ pub struct BusConfig {
 
 impl Default for BusConfig {
     fn default() -> Self {
-        BusConfig { enabled: true, bind: "127.0.0.1:1883".into() }
+        BusConfig {
+            enabled: true,
+            bind: "127.0.0.1:1883".into(),
+        }
     }
 }
 
@@ -89,9 +92,14 @@ pub enum BusMsg {
     /// The supervisor minted a connection token for a package actor it is
     /// about to spawn; the broker uses it to authenticate CONNECT and to
     /// scope that session's ACL to the package's approved capabilities.
-    RegisterActor { name: String, token: String },
+    RegisterActor {
+        name: String,
+        token: String,
+    },
     /// Actor exited; its token dies with it.
-    UnregisterActor { name: String },
+    UnregisterActor {
+        name: String,
+    },
 }
 
 enum Handle {
@@ -181,8 +189,13 @@ pub fn publish_with(root: &Root, topic: &str, line: &str, retain: bool) {
 pub fn register_actor(name: &str, token: Option<&str>) {
     if let Some(Handle::Local(tx)) = HANDLE.get() {
         let msg = match token {
-            Some(t) => BusMsg::RegisterActor { name: name.to_string(), token: t.to_string() },
-            None => BusMsg::UnregisterActor { name: name.to_string() },
+            Some(t) => BusMsg::RegisterActor {
+                name: name.to_string(),
+                token: t.to_string(),
+            },
+            None => BusMsg::UnregisterActor {
+                name: name.to_string(),
+            },
         };
         let _ = tx.send(msg);
     }
@@ -198,10 +211,14 @@ pub fn register_actor(name: &str, token: Option<&str>) {
 /// connects anonymously and is refused once deny-by-default is live — which
 /// is fine, its obs are still on disk via the WAL.
 fn mirror_creds(root: &Root) -> Option<(String, String)> {
-    if let (Ok(pkg), Ok(token)) = (std::env::var("ELANUS_PACKAGE"), std::env::var("ELANUS_BUS_TOKEN")) {
+    if let (Ok(pkg), Ok(token)) = (
+        std::env::var("ELANUS_PACKAGE"),
+        std::env::var("ELANUS_BUS_TOKEN"),
+    ) {
         return Some((pkg, token));
     }
-    crate::secrets::read(root, crate::secrets::KERNEL).map(|s| (crate::secrets::KERNEL.to_string(), s))
+    crate::secrets::read(root, crate::secrets::KERNEL)
+        .map(|s| (crate::secrets::KERNEL.to_string(), s))
 }
 
 struct Mirror {
@@ -213,7 +230,12 @@ struct Mirror {
 
 impl Mirror {
     fn new(addr: SocketAddr, creds: Option<(String, String)>) -> Mirror {
-        Mirror { addr, conn: None, retry_after: None, creds }
+        Mirror {
+            addr,
+            conn: None,
+            retry_after: None,
+            creds,
+        }
     }
 
     fn publish(&mut self, topic: &str, payload: &[u8]) {
@@ -245,7 +267,10 @@ fn connect(addr: SocketAddr, creds: Option<&(String, String)>) -> std::io::Resul
     s.set_nodelay(true)?;
     s.set_read_timeout(Some(IO_TIMEOUT))?;
     s.set_write_timeout(Some(IO_TIMEOUT))?;
-    s.write_all(&encode_connect(&format!("el-mirror-{}", std::process::id()), creds))?;
+    s.write_all(&encode_connect(
+        &format!("el-mirror-{}", std::process::id()),
+        creds,
+    ))?;
     read_connack(&mut s)?;
     Ok(s)
 }
@@ -282,8 +307,8 @@ fn encode_connect(client_id: &str, creds: Option<&(String, String)>) -> Vec<u8> 
     let mut body = Vec::new();
     utf8("MQTT", &mut body);
     body.push(0x05); // protocol version 5
-    // Clean start (0x02); set the username (0x80) and password (0x40) flags
-    // when we have a credential to present.
+                     // Clean start (0x02); set the username (0x80) and password (0x40) flags
+                     // when we have a credential to present.
     let flags = 0x02 | if creds.is_some() { 0xC0 } else { 0x00 };
     body.push(flags);
     body.extend_from_slice(&[0, 0]); // keep alive disabled
@@ -364,7 +389,7 @@ mod tests {
     fn publish_frame_shape() {
         let f = encode_publish("a/b", b"x");
         assert_eq!(f[0], 0x30); // PUBLISH, QoS 0
-        // remaining length = topic(2+3) + props(1 varint + 1+2+9+2+1) + payload(1)
+                                // remaining length = topic(2+3) + props(1 varint + 1+2+9+2+1) + payload(1)
         let props_len = 1 + 2 + MIRROR_PROP.len() + 2 + 1;
         assert_eq!(f[1] as usize, 5 + 1 + props_len + 1);
         assert_eq!(&f[2..4], &[0x00, 0x03]); // topic length
@@ -388,7 +413,7 @@ mod tests {
         let f = encode_connect("me", Some(&("kernel".into(), "s3cr3t".into())));
         assert_eq!(f[0], 0x10);
         assert_eq!(f[9], 0x02 | 0xC0); // clean start + username + password flags
-        // username and password bytes ride at the end of the payload.
+                                       // username and password bytes ride at the end of the payload.
         let tail = String::from_utf8_lossy(&f);
         assert!(tail.contains("kernel"));
         assert!(tail.contains("s3cr3t"));
@@ -396,7 +421,10 @@ mod tests {
 
     #[test]
     fn connect_addr_resolution() {
-        let cfg = |bind: &str| BusConfig { enabled: true, bind: bind.into() };
+        let cfg = |bind: &str| BusConfig {
+            enabled: true,
+            bind: bind.into(),
+        };
         assert_eq!(
             connect_addr(&cfg("127.0.0.1:1883")).unwrap().to_string(),
             "127.0.0.1:1883"

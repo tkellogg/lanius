@@ -32,13 +32,13 @@
     <div class="panel-head"><h2>instruments</h2></div>
     <div id="nav-list" class="nav-list">
       <button class="nav-item nav-signals" data-sel="signals"><span class="nav-sigil">◮</span> signals</button>
-      <button class="nav-item nav-setup" data-sel="setup"><span class="nav-sigil">⚒</span> kits &amp; review</button>
+      <button class="nav-item nav-setup" data-sel="setup"><span class="nav-sigil">⚒</span> add-ons</button>
       <div class="nav-label">agents</div>
       <div id="nav-agents"></div>
       <div id="nav-empty" class="nav-hint">no agents yet — create one below</div>
       <button id="nav-new-agent" class="nav-item nav-new"><span class="nav-sigil">＋</span> new agent</button>
     </div>
-    <div id="history-hint" class="nav-hint nav-foot" hidden>history package not running — live view only</div>
+      <div id="history-hint" class="nav-hint nav-foot" hidden>transcripts unavailable — live view only</div>
   </nav>
 
   <!-- ============ stage ============ -->
@@ -57,11 +57,11 @@
     <!-- welcome: the front door — orient, then route to the primary agent -->
     <div id="view-welcome" class="view" hidden>
       <div class="welcome-pane">
-        <p class="welcome-lead">talk to your agents, watch what's happening, and add new capabilities.</p>
+        <p class="welcome-lead">talk to your agents, watch what's happening, and add useful behavior.</p>
         <div id="welcome-agent" class="welcome-agent"></div>
         <div class="welcome-actions">
           <button id="welcome-new" class="ghost">＋ new agent</button>
-          <button id="welcome-kits" class="ghost">⚒ add a kit</button>
+          <button id="welcome-kits" class="ghost">⚒ add-ons</button>
           <button id="welcome-signals" class="ghost">◮ live signals</button>
         </div>
         <p id="welcome-hint" class="dim-note"></p>
@@ -85,50 +85,135 @@
 
     <!-- configure: this agent's identity, as a form -->
     <div id="view-configure" class="view" hidden>
-      <div class="setup-pane">
-        <section class="setup-block">
-          <h3>identity</h3>
-          <p class="dim-note">edits land in <code id="cfg-file">profile.toml</code> (comments survive) and apply on the agent's next run.</p>
-          <div class="cfg-grid">
-            <label>agent name <input id="cfg-agent" spellcheck="false" /></label>
-            <label>model <input id="cfg-model" spellcheck="false" list="model-suggestions" /></label>
-            <label>max turns <input id="cfg-turns" type="number" min="1" max="200" /></label>
-            <label>working directory <input id="cfg-workdir" spellcheck="false" placeholder="(elanus root)" /></label>
-          </div>
-          <datalist id="model-suggestions">
-            <option value="claude-fable-5"></option>
-            <option value="claude-sonnet-4-6"></option>
-            <option value="claude-haiku-4-5-20251001"></option>
-            <option value="anthropic::deepseek-chat"></option>
-          </datalist>
-          <div class="setup-row">
-            <button id="cfg-save">save</button>
-            <span id="cfg-note" class="dim-note"></span>
-          </div>
-          <p class="dim-note">renaming takes effect on the agent's next run; messages and history kept under the old name stay available.</p>
-        </section>
-        <section class="setup-block">
-          <h3>kits &amp; capabilities</h3>
-          <p class="dim-note">capabilities are shared across all your agents, not set per-agent — manage them under <b>⚒ kits &amp; review</b>. this agent sees the ones its skill visibility allows:</p>
-          <div class="cfg-grid">
-            <label>skills include <input id="cfg-include" spellcheck="false" placeholder='# (everything)' /></label>
-            <label>skills exclude <input id="cfg-exclude" spellcheck="false" placeholder="(nothing)" /></label>
-          </div>
-        </section>
-        <section class="setup-block">
-          <details>
-            <summary class="dim-note">the raw profile.toml</summary>
-            <textarea id="cfg-toml" spellcheck="false" rows="14"></textarea>
-            <div class="setup-row">
-              <button id="cfg-toml-save">save raw file</button>
-              <span id="cfg-toml-note" class="dim-note"></span>
+      <div class="setup-pane cfg-pane">
+        <aside class="cfg-index" aria-label="configure sections">
+          <a href="#cfg-section-agent">agent</a>
+          <a href="#cfg-section-model">model</a>
+          <a href="#cfg-section-context">context</a>
+          <a href="#cfg-section-sandbox">sandbox</a>
+          <a href="#cfg-section-packages">packages</a>
+          <a href="#cfg-section-throttle">throttle</a>
+          <a href="#cfg-section-raw">raw</a>
+        </aside>
+        <div class="cfg-sections">
+          <section class="setup-block" id="cfg-section-agent">
+            <h3>agent</h3>
+            <p class="dim-note">edits land in <code id="cfg-file">this agent's settings file</code> and apply on the agent's next run.</p>
+            <div class="cfg-grid">
+              <label>agent <input id="cfg-agent" spellcheck="false" /></label>
+              <label>owner <input id="cfg-owner" spellcheck="false" /></label>
+              <label>autonomy
+                <select id="cfg-autonomy">
+                  <option value="off">off</option>
+                  <option value="manual">manual</option>
+                  <option value="assisted">assisted</option>
+                  <option value="autonomous">autonomous</option>
+                </select>
+              </label>
+              <label>parent <input id="cfg-parent" spellcheck="false" placeholder="default" /></label>
+              <label>prepend path <input id="cfg-package-path" spellcheck="false" placeholder="kits/dev, /opt/elanus/packages" /></label>
+              <label class="cfg-check"><input id="cfg-path-inherit" type="checkbox" /> include inherited path</label>
+              <label>effective path <input id="cfg-effective-path" spellcheck="false" readonly /></label>
             </div>
-          </details>
-        </section>
+            <div class="setup-row">
+              <button id="cfg-save">save</button>
+              <span id="cfg-note" class="dim-note"></span>
+            </div>
+            <p class="dim-note">renaming changes the mailbox for future runs; old messages and history stay under the old name.</p>
+          </section>
+
+          <section class="setup-block" id="cfg-section-model">
+            <h3>model</h3>
+            <div class="cfg-grid">
+              <label>model <input id="cfg-model" spellcheck="false" list="model-suggestions" /></label>
+              <label>max run steps <input id="cfg-turns" type="number" min="1" max="200" /></label>
+              <label>base URL <input id="cfg-base-url" spellcheck="false" placeholder="provider default" /></label>
+              <label>API key env <input id="cfg-api-key-env" spellcheck="false" placeholder="adapter default" /></label>
+            </div>
+            <p class="dim-note">caps one activation's model/tool loop, not the lifetime of the conversation.</p>
+            <datalist id="model-suggestions">
+              <option value="claude-fable-5"></option>
+              <option value="claude-sonnet-4-6"></option>
+              <option value="claude-haiku-4-5-20251001"></option>
+              <option value="anthropic::deepseek-chat"></option>
+            </datalist>
+          </section>
+
+          <section class="setup-block" id="cfg-section-context">
+            <h3>context program</h3>
+            <div class="cfg-grid">
+              <label>program <input id="cfg-context-program" spellcheck="false" /></label>
+              <label>max context ms <input id="cfg-context-max-ms" type="number" min="1" /></label>
+            </div>
+            <div class="cfg-context-head">
+              <h4>context stage chain</h4>
+              <div class="cfg-context-add">
+                <select id="cfg-context-add-stage"></select>
+                <button id="cfg-context-add" class="ghost" type="button">add</button>
+              </div>
+            </div>
+            <div id="cfg-context-chain" class="cfg-context-chain"></div>
+            <p class="dim-note">Stages run top to bottom after the built-in seed. Reorder or remove stages here; raw TOML stores this as the <code>context.stage</code> array.</p>
+          </section>
+
+          <section class="setup-block" id="cfg-section-sandbox">
+            <h3>sandbox</h3>
+            <div class="cfg-grid">
+              <label>working directory <input id="cfg-workdir" spellcheck="false" placeholder="(elanus root)" /></label>
+              <label>writable prefixes <input id="cfg-fs-write" spellcheck="false" placeholder="comma separated" /></label>
+              <label>capture exclude <input id="cfg-capture-exclude" spellcheck="false" placeholder="comma separated" /></label>
+            </div>
+          </section>
+
+          <section class="setup-block" id="cfg-section-throttle">
+            <h3>throttle</h3>
+            <div id="cfg-throttle" class="cfg-table"></div>
+            <button id="cfg-throttle-add" class="ghost" type="button">add throttle</button>
+          </section>
+
+          <section class="setup-block" id="cfg-section-packages">
+            <h3>packages</h3>
+            <input id="cfg-include" type="hidden" />
+            <input id="cfg-exclude" type="hidden" />
+            <div class="setup-row cfg-package-toolbar">
+              <button id="cfg-kit-add-toggle" type="button">add</button>
+              <span class="dim-note">copy or link kits to change available packages</span>
+            </div>
+            <div id="cfg-package-configs" class="cfg-tree"></div>
+          </section>
+
+          <section class="setup-block" id="cfg-section-raw">
+            <details>
+              <summary class="dim-note">advanced context parameters</summary>
+              <p class="dim-note">legacy <code>[vars]</code> values for context stages and templates; prefer package/context-stage settings when available. Saved by the main save button above.</p>
+              <div id="cfg-vars" class="cfg-table"></div>
+              <button id="cfg-var-add" class="ghost" type="button">add context parameter</button>
+            </details>
+            <details>
+              <summary class="dim-note">the raw settings file</summary>
+              <textarea id="cfg-toml" spellcheck="false" rows="14"></textarea>
+              <div class="setup-row">
+                <button id="cfg-toml-save">save raw file</button>
+                <span id="cfg-toml-note" class="dim-note"></span>
+              </div>
+            </details>
+          </section>
+        </div>
       </div>
     </div>
 
-    <!-- setup: stage kits, watch the pending queue, edit profiles -->
+    <dialog id="cfg-kit-add-modal" class="cfg-modal">
+      <div class="cfg-modal-head">
+        <div>
+          <h3>add kit</h3>
+          <p class="dim-note">kits expand into packages for this agent.</p>
+        </div>
+        <button id="cfg-kit-add-close" class="cfg-icon-btn" type="button" aria-label="close add kit">×</button>
+      </div>
+      <div id="cfg-kit-add-list" class="cfg-tree cfg-kit-add-list"></div>
+    </dialog>
+
+    <!-- setup: add-ons, settings, and agent requests -->
     <div id="view-setup" class="view" hidden>
       <div class="setup-pane">
         <div id="setup-status" class="setup-status" role="status" aria-live="polite" hidden></div>
@@ -144,13 +229,18 @@
           <p id="models-hint" class="dim-note" hidden></p>
         </section>
         <section class="setup-block">
-          <h3>kits</h3>
-          <p class="dim-note">ready-made bundles of capabilities, shared by all your agents. adding one makes its capabilities available; review and confirm them below.</p>
+          <h3>available add-ons</h3>
+          <p class="dim-note">ready-made behavior shared by all your agents. adding one takes effect right away.</p>
           <div id="setup-kits"></div>
         </section>
         <section class="setup-block">
-          <h3>review &amp; confirm</h3>
-          <p class="dim-note">nothing takes effect until you confirm it here. confirming is the same as doing it from the terminal — the matching command is shown too.</p>
+          <h3>installed add-ons</h3>
+          <p class="dim-note">adjust settings for the things you have added.</p>
+          <div id="setup-configs"></div>
+        </section>
+        <section class="setup-block">
+          <h3>agent requests</h3>
+          <p class="dim-note">when an agent suggests a settings change, accept or decline it here.</p>
           <div id="setup-pending"></div>
         </section>
       </div>

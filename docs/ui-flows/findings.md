@@ -40,36 +40,14 @@ disabled while the pane populates (`setConfigureLoading`), which is both the
 guard and the missing "still loading" affordance. A caller-set note (e.g.
 na-create's "created …") is preserved across the load.
 
-### 2. Kit "installed" badge / "stage again" label are unreachable from the UI — *medium*
+### 2. Add-on `installed` badge is reachable — *fixed 2026-06-16*
 
-`loadSetup()` computes kit provenance via `g.decided_by?.startsWith('kit:')`
-(`app.js:245`), and only that drives the `installed` badge (`app.js:253`) and the
-`stage again` label (`app.js:255`). But the UI staging path never records that
-provenance:
-
-- The UI always stages with `elanus kit add <name> --pending`
-  (`ui/web/server.mjs`), i.e. `kit::install(..., grant=false)`.
-- In `src/kit.rs`, the `kit:<name>` provenance string is only consumed by
-  `packages::decide(..., &by)` in the **`grant=true`** branch; the `--pending`
-  branch leaves `decided_by = null`.
-- A later UI approval writes `decided_by = "ui"` (`app.js`), never `kit:<name>`.
-
-So the provenance `Set` is always empty in the UI workflow and the badge/label
-are dead code. Verified out-of-band: `elanus packages --json` shows
-`decided_by:null` after a UI stage and `decided_by:"ui"` after a UI approve —
-never `kit:<name>`.
-
-**Status: OPEN — needs a decision** (touches ledger provenance semantics; see
-the recommendation below). Two directions:
-- **(a) Kernel:** carry `kit:<name>` provenance on the `--pending` path too —
-  arguably more correct (the kit *is* the provenance of the request, regardless
-  of approval), but it changes recorded ledger data.
-- **(b) Frontend:** compute "installed" from a different signal (e.g. a kit's
-  packages being present in the ledger at all) rather than `decided_by`.
-
-> Note: this means staging a kit a second time *looks* identical to the first
-> time — plausibly part of the "nothing happened" feeling, on top of the (now
-> fixed) banner flash.
+The old web flow ran `elanus kit add <name> --pending`, then approved requests
+with `decided_by = "ui"`, so `loadSetup()` never saw the `kit:<name>` provenance
+it used for the `installed` badge. Increment 5 removed that split: the web add
+button now runs `elanus kit add <name>` as the one human action, so the kit
+provenance is present immediately and the badge/`add again` state can render.
+Agent-started changes moved to the separate request cards.
 
 ## Corroborated fixes (earlier this session)
 
@@ -107,7 +85,7 @@ Worth promoting into the permanent suite (`ui/web/test/ui.spec.mjs` or a new
 
 1. `#setup-status .status-ok` persists >1.5 s after staging a kit (text + class
    byte-identical when re-read past the old flash window); same after approve.
-2. Configure persistence by reload: save model/turns/workdir/include/exclude,
+2. Configure persistence by reload: save model/run steps/workdir/include/exclude,
    `page.reload()`, re-open configure (wait for settle), assert each via
    `toHaveValue` — never trust `#cfg-note`.
 3. Empty-workdir clear persists (guards `prunedSet()`'s keep-when-empty contract

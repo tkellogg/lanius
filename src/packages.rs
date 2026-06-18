@@ -24,17 +24,22 @@ pub struct Package {
     pub meta: Option<SkillMeta>,
 }
 
-/// Ordered package search path: ELANUS_PACKAGE_PATH (colon-separated)
-/// overrides the default profile's `package_path`, which defaults to
-/// ["packages"]. Relative entries resolve against the root. First hit wins
-/// by name — systemd unit load path semantics, shadowing included.
+/// Ordered elanus path from the instance profile. Each entry may be a kit dir
+/// (contains packages/) or a package dir directly. Relative entries resolve
+/// against the root. First hit wins by name — systemd unit load path semantics,
+/// shadowing included.
 pub fn package_path(root: &Root) -> Vec<PathBuf> {
-    let entries: Vec<String> = match std::env::var("ELANUS_PACKAGE_PATH") {
-        Ok(s) if !s.is_empty() => s.split(':').map(|s| s.to_string()).collect(),
-        _ => profile::load(root, "default")
-            .map(|(p, _)| p.package_path)
-            .unwrap_or_else(|_| vec!["packages".into()]),
-    };
+    package_path_for_profile(root, "default")
+}
+
+/// Ordered elanus path for a profile after parent expansion.
+pub fn package_path_for_profile(root: &Root, profile_name: &str) -> Vec<PathBuf> {
+    let entries: Vec<String> = profile::effective_elanus_path(root, profile_name)
+        .unwrap_or_else(|_| vec!["packages".into()]);
+    paths_from_entries(root, entries)
+}
+
+fn paths_from_entries(root: &Root, entries: Vec<String>) -> Vec<PathBuf> {
     entries
         .into_iter()
         .map(|e| {
@@ -45,6 +50,14 @@ pub fn package_path(root: &Root) -> Vec<PathBuf> {
                 root.dir.join(p)
             }
         })
+        .map(|p| {
+            let kit_packages = p.join("packages");
+            if kit_packages.is_dir() {
+                kit_packages
+            } else {
+                p
+            }
+        })
         .collect()
 }
 
@@ -52,9 +65,19 @@ pub fn package_path(root: &Root) -> Vec<PathBuf> {
 /// parse makes the package visible-but-inert (loudly): a broken request
 /// must not be a silent disappearance.
 pub fn discover(root: &Root) -> Result<Vec<Package>> {
+    discover_from_paths(package_path(root))
+}
+
+pub fn discover_for_profile(root: &Root, profile_name: &str) -> Result<Vec<Package>> {
+    discover_from_paths(package_path_for_profile(root, profile_name))
+}
+
+fn discover_from_paths(paths: Vec<PathBuf>) -> Result<Vec<Package>> {
     let mut by_name: BTreeMap<String, Package> = BTreeMap::new();
-    for dir in package_path(root) {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+    for dir in paths {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
@@ -84,7 +107,12 @@ pub fn discover(root: &Root) -> Result<Vec<Package>> {
             };
             by_name.insert(
                 name.clone(),
-                Package { manifest, meta: manifest::skill_md(&p), name, dir: p },
+                Package {
+                    manifest,
+                    meta: manifest::skill_md(&p),
+                    name,
+                    dir: p,
+                },
             );
         }
     }
@@ -140,7 +168,10 @@ pub fn sync(root: &Root, conn: &Connection) -> Result<()> {
         }
         for (kind, value) in requests {
             if matches!(kind, "subscribe" | "publish") && !crate::topic::valid_filter(value) {
-                eprintln!("[packages] {}: invalid {kind} filter {value:?}, skipped", pkg.name);
+                eprintln!(
+                    "[packages] {}: invalid {kind} filter {value:?}, skipped",
+                    pkg.name
+                );
                 continue;
             }
             // Already have a row under this hash? Leave its state alone.
@@ -198,15 +229,24 @@ fn sync_wiring(conn: &Connection, pkg: &Package, lm: &LoadedManifest) -> Result<
     conn.execute("DELETE FROM hooks WHERE skill = ?1", [&pkg.name])?;
     for h in &m.hook {
         if !manifest::HOOK_POINTS.contains(&h.point.as_str()) {
-            eprintln!("[packages] {}: unknown hook point {:?}, skipped", pkg.name, h.point);
+            eprintln!(
+                "[packages] {}: unknown hook point {:?}, skipped",
+                pkg.name, h.point
+            );
             continue;
         }
         if h.on_timeout != "allow" && h.on_timeout != "deny" {
-            eprintln!("[packages] {}: hook on_timeout must be allow|deny, skipped", pkg.name);
+            eprintln!(
+                "[packages] {}: hook on_timeout must be allow|deny, skipped",
+                pkg.name
+            );
             continue;
         }
         if !crate::topic::valid_filter(&h.match_filter) {
-            eprintln!("[packages] {}: invalid hook match filter, skipped", pkg.name);
+            eprintln!(
+                "[packages] {}: invalid hook match filter, skipped",
+                pkg.name
+            );
             continue;
         }
         if !is_approved(conn, &pkg.name, "blocking", &h.point)? {
@@ -214,7 +254,11 @@ fn sync_wiring(conn: &Connection, pkg: &Package, lm: &LoadedManifest) -> Result<
         }
         let script = pkg.dir.join(&h.run);
         if !script.exists() {
-            eprintln!("[packages] {}: hook script {} missing, skipped", pkg.name, script.display());
+            eprintln!(
+                "[packages] {}: hook script {} missing, skipped",
+                pkg.name,
+                script.display()
+            );
             continue;
         }
         make_executable(&script).ok();
@@ -237,10 +281,16 @@ fn sync_wiring(conn: &Connection, pkg: &Package, lm: &LoadedManifest) -> Result<
     use std::str::FromStr as _;
     for c in &m.cron {
         if croner::Cron::from_str(&c.schedule).is_err() {
-            eprintln!("[packages] {}: bad cron schedule {:?}, skipped", pkg.name, c.schedule);
+            eprintln!(
+                "[packages] {}: bad cron schedule {:?}, skipped",
+                pkg.name, c.schedule
+            );
             continue;
         }
-        let payload = c.payload.as_ref().map(|v| manifest::toml_to_json(v).to_string());
+        let payload = c
+            .payload
+            .as_ref()
+            .map(|v| manifest::toml_to_json(v).to_string());
         conn.execute(
             "INSERT INTO crons(skill, schedule, emit_type, payload) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(skill, emit_type, schedule) DO UPDATE SET payload = ?4",
@@ -248,7 +298,11 @@ fn sync_wiring(conn: &Connection, pkg: &Package, lm: &LoadedManifest) -> Result<
         )?;
     }
     // Drop cron rows the manifest no longer declares.
-    let declared: Vec<String> = m.cron.iter().map(|c| format!("{}\u{1}{}", c.emit, c.schedule)).collect();
+    let declared: Vec<String> = m
+        .cron
+        .iter()
+        .map(|c| format!("{}\u{1}{}", c.emit, c.schedule))
+        .collect();
     let existing: Vec<(i64, String, String)> = {
         let mut stmt = conn.prepare("SELECT id, emit_type, schedule FROM crons WHERE skill=?1")?;
         let r = stmt
@@ -385,7 +439,9 @@ pub fn matching_exec_handlers(
     let mut out: Vec<(u32, String, PathBuf)> = Vec::new();
     for pkg in discover(root)? {
         let Some(lm) = &pkg.manifest else { continue };
-        let Some(proc_) = &lm.manifest.process else { continue };
+        let Some(proc_) = &lm.manifest.process else {
+            continue;
+        };
         if proc_.mode != "exec" {
             continue;
         }
@@ -448,29 +504,48 @@ mod tests {
     #[test]
     fn requests_are_not_grants() {
         let root = scratch_root("req");
-        write_pkg(&root, "p1", "[request]\nsubscribe = [\"in/package/p1/x\"]\n[process]\nmode=\"exec\"\nrun=\"r\"\n");
+        write_pkg(
+            &root,
+            "p1",
+            "[request]\nsubscribe = [\"in/package/p1/x\"]\n[process]\nmode=\"exec\"\nrun=\"r\"\n",
+        );
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
         sync(&root, &conn).unwrap();
         // Discovered and requested, but no capability until approved.
         assert!(!is_approved(&conn, "p1", "subscribe", "in/package/p1/x").unwrap());
-        assert!(matching_exec_handlers(&root, &conn, "in/package/p1/x").unwrap().is_empty());
+        assert!(matching_exec_handlers(&root, &conn, "in/package/p1/x")
+            .unwrap()
+            .is_empty());
         decide(&root, &conn, "p1", true, "test").unwrap();
         assert!(is_approved(&conn, "p1", "subscribe", "in/package/p1/x").unwrap());
-        assert_eq!(matching_exec_handlers(&root, &conn, "in/package/p1/x").unwrap().len(), 1);
+        assert_eq!(
+            matching_exec_handlers(&root, &conn, "in/package/p1/x")
+                .unwrap()
+                .len(),
+            1
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
     #[test]
     fn manifest_edit_detaches_delta_carries_rest() {
         let root = scratch_root("delta");
-        write_pkg(&root, "p2", "[request]\nsubscribe = [\"in/package/demo/a\"]\n");
+        write_pkg(
+            &root,
+            "p2",
+            "[request]\nsubscribe = [\"in/package/demo/a\"]\n",
+        );
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
         sync(&root, &conn).unwrap();
         decide(&root, &conn, "p2", true, "test").unwrap();
         // Edit: keep in/package/demo/a, add in/package/demo/b. a carries, b pends.
-        write_pkg(&root, "p2", "[request]\nsubscribe = [\"in/package/demo/a\", \"in/package/demo/b\"]\n");
+        write_pkg(
+            &root,
+            "p2",
+            "[request]\nsubscribe = [\"in/package/demo/a\", \"in/package/demo/b\"]\n",
+        );
         sync(&root, &conn).unwrap();
         assert!(is_approved(&conn, "p2", "subscribe", "in/package/demo/a").unwrap());
         assert!(!is_approved(&conn, "p2", "subscribe", "in/package/demo/b").unwrap());
@@ -505,7 +580,11 @@ mod tests {
     #[test]
     fn revoked_does_not_carry() {
         let root = scratch_root("revoke");
-        write_pkg(&root, "p3", "[request]\nsubscribe = [\"in/package/demo/a\"]\n");
+        write_pkg(
+            &root,
+            "p3",
+            "[request]\nsubscribe = [\"in/package/demo/a\"]\n",
+        );
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
         sync(&root, &conn).unwrap();
@@ -513,7 +592,11 @@ mod tests {
         decide(&root, &conn, "p3", false, "test").unwrap();
         assert!(!is_approved(&conn, "p3", "subscribe", "in/package/demo/a").unwrap());
         // New hash: the revoked value re-asks, it does not carry.
-        write_pkg(&root, "p3", "[request]\nsubscribe = [\"in/package/demo/a\"]\n# new\n");
+        write_pkg(
+            &root,
+            "p3",
+            "[request]\nsubscribe = [\"in/package/demo/a\"]\n# new\n",
+        );
         sync(&root, &conn).unwrap();
         assert!(!is_approved(&conn, "p3", "subscribe", "in/package/demo/a").unwrap());
         std::fs::remove_dir_all(&root.dir).ok();
@@ -522,18 +605,108 @@ mod tests {
     #[test]
     fn shadowing_first_hit_wins() {
         let root = scratch_root("shadow");
-        write_pkg(&root, "p4", "[request]\nsubscribe = [\"in/package/demo/base\"]\n");
+        write_pkg(
+            &root,
+            "p4",
+            "[request]\nsubscribe = [\"in/package/demo/base\"]\n",
+        );
         let d = root.dir.join("override/p4");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("elanus.toml"), "[request]\nsubscribe = [\"in/package/demo/over\"]\n").unwrap();
+        std::fs::write(
+            d.join("elanus.toml"),
+            "[request]\nsubscribe = [\"in/package/demo/over\"]\n",
+        )
+        .unwrap();
         // Path order via the profile (the env override is process-global and
         // would race parallel tests).
         let prof_dir = root.dir.join("profiles/default");
         std::fs::create_dir_all(&prof_dir).unwrap();
-        std::fs::write(prof_dir.join("profile.toml"), "package_path = [\"override\", \"packages\"]\n").unwrap();
+        std::fs::write(
+            prof_dir.join("profile.toml"),
+            "package_path = [\"override\", \"packages\"]\n",
+        )
+        .unwrap();
         let pkgs = discover(&root).unwrap();
         let p4 = pkgs.iter().find(|p| p.name == "p4").unwrap();
-        assert_eq!(p4.manifest.as_ref().unwrap().manifest.request.subscribe, vec!["in/package/demo/over"]);
+        assert_eq!(
+            p4.manifest.as_ref().unwrap().manifest.request.subscribe,
+            vec!["in/package/demo/over"]
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn elanus_path_entries_can_be_kits_or_package_dirs() {
+        let root = scratch_root("elanus-path");
+        write_pkg(
+            &root,
+            "base",
+            "[request]\nsubscribe = [\"in/package/base\"]\n",
+        );
+        let kit_pkg = root.dir.join("kits/demo/packages/kp");
+        std::fs::create_dir_all(&kit_pkg).unwrap();
+        std::fs::write(
+            kit_pkg.join("elanus.toml"),
+            "[request]\nsubscribe = [\"in/package/kp\"]\n",
+        )
+        .unwrap();
+        let prof_dir = root.dir.join("profiles/default");
+        std::fs::create_dir_all(&prof_dir).unwrap();
+        std::fs::write(
+            prof_dir.join("profile.toml"),
+            "elanus_path = [\"kits/demo\", \"packages\"]\n",
+        )
+        .unwrap();
+        let names: Vec<String> = discover(&root)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(names.contains(&"kp".to_string()));
+        assert!(names.contains(&"base".to_string()));
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn profile_elanus_path_can_prepend_parent_scope() {
+        let root = scratch_root("profile-el-path");
+        write_pkg(
+            &root,
+            "base",
+            "[request]\nsubscribe = [\"in/package/base\"]\n",
+        );
+        let override_pkg = root.dir.join("override/extra");
+        std::fs::create_dir_all(&override_pkg).unwrap();
+        std::fs::write(
+            override_pkg.join("elanus.toml"),
+            "[request]\nsubscribe = [\"in/package/extra\"]\n",
+        )
+        .unwrap();
+        let default_dir = root.dir.join("profiles/default");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        std::fs::write(
+            default_dir.join("profile.toml"),
+            "elanus_path = [\"packages\"]\n",
+        )
+        .unwrap();
+        let child_dir = root.dir.join("profiles/child");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(
+            child_dir.join("profile.toml"),
+            "elanus_path = [\"override\", \"$parent\"]\n",
+        )
+        .unwrap();
+        let names: Vec<String> = discover_for_profile(&root, "child")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(
+            profile::effective_elanus_path(&root, "child").unwrap(),
+            vec!["override", "packages"]
+        );
+        assert!(names.contains(&"extra".to_string()));
+        assert!(names.contains(&"base".to_string()));
         std::fs::remove_dir_all(&root.dir).ok();
     }
 }

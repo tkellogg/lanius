@@ -108,8 +108,14 @@ mod tests {
     fn multi_level() {
         // §4.7.1.2 examples
         assert!(matches("sport/tennis/player1/#", "sport/tennis/player1"));
-        assert!(matches("sport/tennis/player1/#", "sport/tennis/player1/ranking"));
-        assert!(matches("sport/tennis/player1/#", "sport/tennis/player1/score/wimbledon"));
+        assert!(matches(
+            "sport/tennis/player1/#",
+            "sport/tennis/player1/ranking"
+        ));
+        assert!(matches(
+            "sport/tennis/player1/#",
+            "sport/tennis/player1/score/wimbledon"
+        ));
         assert!(matches("sport/#", "sport")); // parent level included
         assert!(matches("#", "a/b/c"));
         assert!(!matches("sport/#", "other"));
@@ -142,8 +148,8 @@ mod tests {
         assert!(valid_filter("obs/+/llm/#"));
         assert!(!valid_filter(""));
         assert!(!valid_filter("a/#/b")); // # not last
-        assert!(!valid_filter("a#"));    // # not a whole level
-        assert!(!valid_filter("a/b+"));  // + not a whole level
+        assert!(!valid_filter("a#")); // # not a whole level
+        assert!(!valid_filter("a/b+")); // + not a whole level
         assert!(valid_name("in/agent/main"));
         assert!(!valid_name("in/+/main"));
         assert!(!valid_name(""));
@@ -159,7 +165,10 @@ mod tests {
             encode_path(Path::new("/notes/#1 draft.md")),
             "notes/%231 draft.md"
         );
-        assert!(matches("obs/fs/Users/tim/#", &format!("obs/fs/{}", encode_path(Path::new("/Users/tim/a/b.txt")))));
+        assert!(matches(
+            "obs/fs/Users/tim/#",
+            &format!("obs/fs/{}", encode_path(Path::new("/Users/tim/a/b.txt")))
+        ));
     }
 
     #[test]

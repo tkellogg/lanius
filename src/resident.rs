@@ -72,7 +72,12 @@ struct State {
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
 fn state() -> &'static Mutex<State> {
-    STATE.get_or_init(|| Mutex::new(State { line: None, retry_after: None }))
+    STATE.get_or_init(|| {
+        Mutex::new(State {
+            line: None,
+            retry_after: None,
+        })
+    })
 }
 
 /// Is any resident hook registered for `point`? One indexed kv read; errors
@@ -119,7 +124,11 @@ fn connect(root: &Root) -> Option<Line> {
         .name("elanus-hookline".into())
         .spawn(move || drive(connection, tx, resub, resub_topic))
         .ok()?;
-    Some(Line { client, rx, resp_topic })
+    Some(Line {
+        client,
+        rx,
+        resp_topic,
+    })
 }
 
 /// Drive the sync connection on its own thread; forward verdict publishes.
@@ -131,7 +140,13 @@ fn drive(mut connection: Connection, tx: Sender<Msg>, client: Client, resp_topic
         match connection.recv() {
             Ok(Ok(Event::Incoming(Packet::Publish(p)))) => {
                 let topic = String::from_utf8_lossy(&p.topic).into_owned();
-                if tx.send(Msg::Pub { topic, payload: p.payload.to_vec() }).is_err() {
+                if tx
+                    .send(Msg::Pub {
+                        topic,
+                        payload: p.payload.to_vec(),
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -178,7 +193,12 @@ pub const MAX_PACKET: u32 = 64 * 1024 * 1024;
 static STAGE_STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
 fn stage_state() -> &'static Mutex<State> {
-    STAGE_STATE.get_or_init(|| Mutex::new(State { line: None, retry_after: None }))
+    STAGE_STATE.get_or_init(|| {
+        Mutex::new(State {
+            line: None,
+            retry_after: None,
+        })
+    })
 }
 
 fn stage_connect(root: &Root) -> Option<Line> {
@@ -212,7 +232,11 @@ fn stage_connect(root: &Root) -> Option<Line> {
         .name("elanus-stageline".into())
         .spawn(move || drive(connection, tx, resub, resub_topic))
         .ok()?;
-    Some(Line { client, rx, resp_topic })
+    Some(Line {
+        client,
+        rx,
+        resp_topic,
+    })
 }
 
 /// Consult a resident stage: publish the document, wait for the transformed
@@ -227,7 +251,9 @@ pub fn stage_consult(
     doc: &Value,
 ) -> anyhow::Result<Value> {
     use anyhow::{bail, Context as _};
-    let mut st = stage_state().lock().map_err(|_| anyhow::anyhow!("stage line poisoned"))?;
+    let mut st = stage_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("stage line poisoned"))?;
     if st.line.is_none() {
         st.line = stage_connect(root);
     }
@@ -259,12 +285,13 @@ pub fn stage_consult(
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            bail!("no response after {STAGE_CAP:?} — is the {package} daemon running and approved?");
+            bail!(
+                "no response after {STAGE_CAP:?} — is the {package} daemon running and approved?"
+            );
         }
         match line.rx.recv_timeout(left) {
             Ok(Msg::Pub { topic, payload }) if topic == line.resp_topic => {
-                let v: Value =
-                    serde_json::from_slice(&payload).context("response was not JSON")?;
+                let v: Value = serde_json::from_slice(&payload).context("response was not JSON")?;
                 if v["correlation"] != correlation.as_str() {
                     continue; // stale response from an abandoned consult
                 }
@@ -306,7 +333,12 @@ pub fn consult(
     subject: Value,
     ids: &trace::Ids,
 ) -> Decision {
-    let pass = |subject: Value| Decision { allow: true, subject, denied_by: None, reason: None };
+    let pass = |subject: Value| Decision {
+        allow: true,
+        subject,
+        denied_by: None,
+        reason: None,
+    };
     if !point_active(conn, point) {
         return pass(subject);
     }

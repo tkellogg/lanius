@@ -74,6 +74,8 @@ elanus init "$TMP" >/dev/null || fail "elanus init"
 [ -f "$TMP/packages/echo/elanus.toml" ] || fail "echo package not materialized"
 [ -d "$TMP/skills" ] && fail "skills/ should not exist (retired in v2 step 5)"
 [ -d "$TMP/handlers.d" ] && fail "handlers.d/ should not exist (retired in v2 step 5)"
+[ "$(sql "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('context_blocks','context_build_log','subagent_sessions')")" = "3" ] \
+  && ok "context/subagent substrate tables exist" || fail "context/subagent substrate tables missing"
 elanus packages | grep -q "^echo .*granted=[1-9]" || fail "stock echo not approved by init"
 # Per-run port so parallel runs and a real daemon on 1883 never collide.
 BUS_PORT=$((18000 + $$ % 2000))
@@ -824,6 +826,58 @@ grep -q "STAGEMARK-7c4f" "$TMP2/llm.body" \
   && ok "approved stage's block reached the model" || fail "stage block missing from llm request"
 grep -q '"kind":"obs/agent/main/kit6/context/marker"' "$TMP2/trace.jsonl" \
   && ok "per-stage delta on obs (camera doctrine)" || fail "no stage delta in trace"
+ELANUS_ROOT="$TMP2" elanus context render --profile default --session kit6 > "$TMP2/context-render.json" 2>&1 \
+  || fail "context render: $(cat "$TMP2/context-render.json")"
+grep -q '"document"' "$TMP2/context-render.json" && grep -q "STAGEMARK-7c4f" "$TMP2/context-render.json" \
+  && ok "context render prints the transformed document" || fail "context render missing transformed doc"
+grep -q '"stage": "marker"' "$TMP2/context-render.json" && grep -q '"skipped": false' "$TMP2/context-render.json" \
+  && ok "context render includes context-stage summary" || fail "context render missing stage summary"
+ELANUS_ROOT="$TMP2" elanus packages --json | python3 -c '
+import json,sys
+for line in sys.stdin:
+    p = json.loads(line)
+    if p["name"] == "window":
+        stages = p.get("manifest", {}).get("stages", [])
+        params = [c for s in stages for c in s.get("config", [])]
+        assert any(c.get("key") == "window_rows" and c.get("type") == "number" and c.get("default") == 80 for c in params), params
+        break
+else:
+    raise SystemExit(1)
+' && ok "packages --json exposes typed context-stage parameters" || fail "missing typed stage config in packages --json"
+ELANUS_ROOT="$TMP2" elanus profile new ctxoff >/dev/null 2>&1 || fail "profile new ctxoff"
+cat >> "$TMP2/profiles/ctxoff/profile.toml" <<'EOF'
+
+[context]
+program = "default"
+max_total_ms = 12000
+
+[[context.stage]]
+package = "stagepkg"
+name = "marker"
+enabled = false
+timeout_ms = 9000
+EOF
+ELANUS_ROOT="$TMP2" elanus profile set ctxoff 'subagents.allow_profiles=["scout"]' subagents.max_depth=2 >/dev/null 2>&1 \
+  || fail "profile set ctxoff subagents"
+ELANUS_ROOT="$TMP2" elanus profile get ctxoff | python3 -c '
+import json,sys
+p=json.load(sys.stdin)
+ctx=p.get("context",{})
+assert ctx.get("program")=="default", ctx
+assert ctx.get("max_total_ms")==12000, ctx
+assert ctx.get("stage") is None, "wire key should be stages in JSON"
+assert ctx.get("stages") and ctx["stages"][0].get("enabled") is False, ctx
+assert ctx["stages"][0].get("timeout_ms")==9000, ctx
+sub=p.get("subagents",{})
+assert sub.get("allow_profiles")==["scout"], sub
+assert sub.get("max_depth")==2, sub
+assert sub.get("grant_policy")=="narrow", sub
+' && ok "profile JSON exposes context/subagent policy" || fail "profile context/subagent policy missing"
+ELANUS_ROOT="$TMP2" elanus stages --profile ctxoff > "$TMP2/stages-ctxoff.out" 2>&1 \
+  || fail "stages ctxoff: $(cat "$TMP2/stages-ctxoff.out")"
+grep -q "stagepkg/marker" "$TMP2/stages-ctxoff.out" \
+  && fail "disabled context-stage override still appeared in chain" \
+  || ok "context-stage override disables a visible stage"
 
 # (f) fail-closed: same approved bytes, runtime error -> the run fails and
 # the error names the stage. (An EDITED script wouldn't even run: code_hash
@@ -1032,7 +1086,7 @@ NMAIL=$(sql4 "SELECT COUNT(*) FROM events WHERE type='in/human/owner'")
 
 echo "== 16. kit linking: elanus kit add, stale-at-dispatch, list/show =="
 # A kit installed by LINK (the default): packages stay in the kit dir,
-# discovery rides the default profile's package_path, and the hash pin
+# discovery rides the default profile's elanus_path, and the hash pin
 # means an upstream edit re-enters review in the linking root — enforced
 # AT DISPATCH (fresh-hash check), so there is no window between the edit
 # and the next sync (docs/security.md entry 9).
@@ -1057,8 +1111,9 @@ elanus init "$TMP5" >/dev/null 2>&1 || fail "init link root"
 ELANUS_ROOT="$TMP5" elanus kit add "$KITS5/linkkit" > "$TMP5/kitadd.out" 2>&1 \
   || fail "kit add: $(cat "$TMP5/kitadd.out")"
 [ ! -e "$TMP5/packages/linker" ] && ok "linked, not copied" || fail "kit add copied despite link default"
-grep -q "$KITS5/linkkit/packages" "$TMP5/profiles/default/profile.toml" \
-  && ok "package_path carries the link" || fail "package_path not updated"
+grep -q "$KITS5/linkkit" "$TMP5/profiles/default/profile.toml" \
+  && grep -q "elanus_path" "$TMP5/profiles/default/profile.toml" \
+  && ok "elanus_path carries the link" || fail "elanus_path not updated"
 sql5() { sqlite3 "$TMP5/elanus.db" "$1"; }
 [ "$(sql5 "SELECT decided_by FROM grants WHERE package='linker' AND state='approved' LIMIT 1")" = "kit:linkkit" ] \
   && ok "grant provenance is kit:linkkit" || fail "kit provenance missing on grants"

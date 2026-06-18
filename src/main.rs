@@ -34,8 +34,40 @@ use clap::{Parser, Subcommand};
 use serde_json::Value;
 use std::path::PathBuf;
 
+fn leading_comment_summary(raw: &str) -> String {
+    let mut lines = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !lines.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let Some(comment) = trimmed.strip_prefix('#') else {
+            break;
+        };
+        lines.push(comment.trim().to_string());
+    }
+    lines
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn package_manifest_description(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("elanus.toml"))
+        .map(|raw| leading_comment_summary(&raw))
+        .unwrap_or_default()
+}
+
 #[derive(Parser)]
-#[command(name = "elanus", version, about = "elanus: a minimal event-driven agent harness")]
+#[command(
+    name = "elanus",
+    version,
+    about = "elanus: a minimal event-driven agent harness"
+)]
 struct Cli {
     /// Elanus root (default: $ELANUS_ROOT, else ~/.elanus/root)
     #[arg(short = 'C', long, global = true)]
@@ -67,6 +99,11 @@ enum Cmd {
     Stages {
         #[arg(long, default_value = "default")]
         profile: String,
+    },
+    /// Context program inspection (render the current context document)
+    Context {
+        #[command(subcommand)]
+        cmd: ContextCmd,
     },
     /// Kits: starter packs of packages + profiles (add / list / show)
     Kit {
@@ -149,6 +186,9 @@ enum Cmd {
         /// pending/approved grant row (the UI's pending-review queue)
         #[arg(long)]
         json: bool,
+        /// Resolve packages through this profile's effective elanus_path.
+        #[arg(long, default_value = "default")]
+        profile: String,
     },
     /// Approve a package's requested capabilities (prints each one)
     Approve {
@@ -221,6 +261,13 @@ enum ProfileCmd {
         /// path to the candidate profile.toml file
         path: String,
     },
+    /// Replace a profile.toml from a validated candidate file, then commit it
+    /// on the config repo's live branch.
+    Put {
+        name: String,
+        /// path to the candidate profile.toml file
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -249,6 +296,21 @@ enum ConfigCmd {
     Accept { id: String },
     /// Decline a proposal: drop it without applying
     Decline { id: String },
+}
+
+#[derive(Subcommand)]
+enum ContextCmd {
+    /// Render the transformed context document without calling the provider.
+    /// `--event` accepts an event id, a full event JSON envelope, an already
+    /// normalized context event, or a payload JSON object.
+    Render {
+        #[arg(long, default_value = "default")]
+        profile: String,
+        #[arg(long, default_value = "render-preview")]
+        session: String,
+        #[arg(long)]
+        event: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -350,12 +412,19 @@ fn run(cli: Cli) -> Result<()> {
     // .env once resolved. Real environment always wins over both.
     dotenv::load(std::path::Path::new(".env"));
     match cli.cmd {
-        Cmd::Init { ref dir, ref kit, copy } => {
+        Cmd::Init {
+            ref dir,
+            ref kit,
+            copy,
+        } => {
             // Same resolution order as every other command: explicit arg >
             // $ELANUS_ROOT (or legacy $HARNESS_ROOT) > ~/.elanus/root. Init once
             // targeted cwd while the env var pointed elsewhere, littering
             // template roots into repos and test directories.
-            let dir = match dir.clone().or_else(|| envcompat::read("ROOT").map(PathBuf::from)) {
+            let dir = match dir
+                .clone()
+                .or_else(|| envcompat::read("ROOT").map(PathBuf::from))
+            {
                 Some(d) => d,
                 None => paths::default_root()?,
             };
@@ -404,8 +473,22 @@ fn run(cli: Cli) -> Result<()> {
                 parse_json_opt(payload.as_deref())?.unwrap_or(Value::Null),
             );
         }
-        Cmd::Exec { prompt, session, profile, resume } => {
-            let result = exec::run(&root, exec::ExecOpts { session, profile, prompt, resume, event: None });
+        Cmd::Exec {
+            prompt,
+            session,
+            profile,
+            resume,
+        } => {
+            let result = exec::run(
+                &root,
+                exec::ExecOpts {
+                    session,
+                    profile,
+                    prompt,
+                    resume,
+                    event: None,
+                },
+            );
             if let Ok(conn) = open(&root) {
                 exec::release_own_leases(&conn);
             }
@@ -416,12 +499,33 @@ fn run(cli: Cli) -> Result<()> {
             let conn = open(&root)?;
             println!("{}", render::render(&root, &conn, &profile, &session)?);
         }
-        Cmd::Packages { json } => {
+        Cmd::Context { cmd } => match cmd {
+            ContextCmd::Render {
+                profile,
+                session,
+                event,
+            } => {
+                let out = exec::render_context(
+                    &root,
+                    exec::ContextRenderOpts {
+                        profile,
+                        session,
+                        event,
+                    },
+                )?;
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            }
+        },
+        Cmd::Packages { json, profile } => {
             let conn = open(&root)?;
             packages::sync(&root, &conn)?;
-            for p in packages::discover(&root)? {
+            for p in packages::discover_for_profile(&root, &profile)? {
                 if json {
-                    let hash = p.manifest.as_ref().map(|lm| lm.hash.clone()).unwrap_or_default();
+                    let hash = p
+                        .manifest
+                        .as_ref()
+                        .map(|lm| lm.hash.clone())
+                        .unwrap_or_default();
                     let grants: Vec<Value> = if hash.is_empty() {
                         vec![]
                     } else {
@@ -446,6 +550,44 @@ fn run(cli: Cli) -> Result<()> {
                         serde_json::json!({
                             "name": p.name,
                             "dir": p.dir,
+                            "manifest": p.manifest.as_ref().map(|lm| serde_json::json!({
+                                "description": package_manifest_description(&p.dir),
+                                "request": {
+                                    "subscribe": lm.manifest.request.subscribe,
+                                    "publish": lm.manifest.request.publish,
+                                    "blocking": lm.manifest.request.blocking,
+                                    "fs_write": lm.manifest.request.fs_write,
+                                },
+                                "process": lm.manifest.process.as_ref().map(|pr| serde_json::json!({
+                                    "mode": pr.mode,
+                                    "run": pr.run,
+                                    "http": pr.http,
+                                })),
+                                "hooks": lm.manifest.hook.len(),
+                                "cron": lm.manifest.cron.len(),
+                                "providers": lm.manifest.provider.len(),
+                                "stages": lm.manifest.stage.iter().map(|s| serde_json::json!({
+                                    "name": s.name,
+                                    "mode": s.mode,
+                                    "order": s.order,
+                                    "config": s.config.iter().map(|c| serde_json::json!({
+                                        "key": c.key,
+                                        "type": c.kind,
+                                        "default": c.default.as_ref().map(manifest::toml_to_json),
+                                        "label": c.label,
+                                        "help": c.help,
+                                        "agent_tunable": c.agent_tunable,
+                                        "options": c.options,
+                                    })).collect::<Vec<_>>(),
+                                })).collect::<Vec<_>>(),
+                                "mcp": lm.manifest.mcp.iter().map(|s| serde_json::json!({
+                                    "name": s.name,
+                                    "transport": s.transport,
+                                })).collect::<Vec<_>>(),
+                                "config": {
+                                    "agent_tunable": lm.manifest.config.agent_tunable,
+                                },
+                            })),
                             "mode": p.manifest.as_ref()
                                 .and_then(|lm| lm.manifest.process.as_ref().map(|pr| pr.mode.clone())),
                             "skill": p.meta.as_ref().map(|m| serde_json::json!({
@@ -489,7 +631,11 @@ fn run(cli: Cli) -> Result<()> {
                     (None, Some(_)) => "skill",
                     (None, None) => "empty",
                 };
-                let desc = p.meta.as_ref().map(|m| m.description.clone()).unwrap_or_default();
+                let desc = p
+                    .meta
+                    .as_ref()
+                    .map(|m| m.description.clone())
+                    .unwrap_or_default();
                 println!(
                     "{:<12} {:<12} mode={:<7} pending={:<3} granted={:<3} {}",
                     p.name, kind, mode, counts.0, counts.1, desc
@@ -499,30 +645,47 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Stages { profile: pname } => {
             let conn = open(&root)?;
             let (prof, _) = profile::load(&root, &pname)?;
+            println!(
+                "context program: {} (max_total_ms={} policy)",
+                prof.context.program, prof.context.max_total_ms
+            );
             println!("seed (built-in, once per run): blocks -> providers -> skills-inventory");
-            let chain = context::chain(&root, &conn, &prof)?;
+            let chain = context::chain(&root, &conn, &pname, &prof)?;
             if chain.is_empty() {
                 println!("chain: (no package stages declared)");
             } else {
                 println!("chain (per LLM call, order/package/stage):");
                 for s in &chain {
                     println!(
-                        "  {:>5}  {}/{}  mode={}  {}  [{}]",
+                        "  {:>5}  {}/{}  mode={}  timeout_ms={}  {}  [{}]",
                         s.order,
                         s.package,
                         s.name,
                         s.mode,
-                        if s.approved { "approved" } else { "REQUESTED (inert until approved)" },
+                        s.timeout_ms,
+                        if s.approved {
+                            "approved"
+                        } else {
+                            "REQUESTED (inert until approved)"
+                        },
                         s.script.display()
                     );
                 }
             }
         }
         Cmd::Kit { cmd } => match cmd {
-            KitCmd::Add { kit: kref, copy, pending } => {
+            KitCmd::Add {
+                kit: kref,
+                copy,
+                pending,
+            } => {
                 let dir = kit::resolve(&root, &kref)?;
                 let conn = open(&root)?;
-                let mode = if copy { kit::Mode::Copy } else { kit::Mode::Link };
+                let mode = if copy {
+                    kit::Mode::Copy
+                } else {
+                    kit::Mode::Link
+                };
                 let readme = kit::install(&root, &conn, &dir, mode, !pending)?;
                 println!("installed kit from {}", dir.display());
                 if let Some(r) = readme {
@@ -533,7 +696,10 @@ fn run(cli: Cli) -> Result<()> {
             KitCmd::List { json } => {
                 for (name, dir, hook) in kit::list(&root)? {
                     if json {
-                        println!("{}", serde_json::json!({ "name": name, "dir": dir, "hook": hook }));
+                        println!(
+                            "{}",
+                            serde_json::json!({ "name": name, "dir": dir, "hook": hook })
+                        );
                     } else {
                         println!("{name:<16} {hook}  [{}]", dir.display());
                     }
@@ -547,15 +713,26 @@ fn run(cli: Cli) -> Result<()> {
                 kit::unlink(&root, &dir)?;
             }
         },
-        Cmd::Models { profile: pname, json } => models::list(&root, &pname, json)?,
+        Cmd::Models {
+            profile: pname,
+            json,
+        } => models::list(&root, &pname, json)?,
         Cmd::Profile { cmd } => match cmd {
             ProfileCmd::List => profilecli::list(&root)?,
             ProfileCmd::Get { name } => profilecli::get(&root, &name)?,
-            ProfileCmd::Set { name, pairs } => profilecli::set(&root, &name, &pairs)?,
+            ProfileCmd::Set { name, pairs } => {
+                let sha = profilecli::set(&root, &name, &pairs)?;
+                emit_agent_config_changed(&root, &name, sha.as_deref())?;
+            }
             ProfileCmd::New { name, agent, model } => {
-                profilecli::new(&root, &name, agent.as_deref(), model.as_deref())?
+                let sha = profilecli::new(&root, &name, agent.as_deref(), model.as_deref())?;
+                emit_agent_config_changed(&root, &name, sha.as_deref())?;
             }
             ProfileCmd::Validate { path } => profilecli::validate(&path)?,
+            ProfileCmd::Put { name, path } => {
+                let sha = profilecli::put(&root, &name, &path)?;
+                emit_agent_config_changed(&root, &name, sha.as_deref())?;
+            }
         },
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Set { pkg, key, value } => {
@@ -609,15 +786,50 @@ fn run(cli: Cli) -> Result<()> {
             let conn = open(&root)?;
             human::answer(&root, &conn, ask_id, &text)?;
         }
-        Cmd::Ask { question, options, deadline_minutes, default } => {
+        Cmd::Ask {
+            question,
+            options,
+            deadline_minutes,
+            default,
+        } => {
             let conn = open(&root)?;
-            human::ask(&root, &conn, &question, options.as_deref(), deadline_minutes, default.as_deref())?;
+            human::ask(
+                &root,
+                &conn,
+                &question,
+                options.as_deref(),
+                deadline_minutes,
+                default.as_deref(),
+            )?;
         }
         Cmd::Bus { cmd } => match cmd {
-            BusCmd::Pub { topic, payload, qos, retain, correlation } => {
-                buscli::publish(&root, &topic, payload.as_deref(), qos, retain, correlation.as_deref())?;
+            BusCmd::Pub {
+                topic,
+                payload,
+                qos,
+                retain,
+                correlation,
+            } => {
+                buscli::publish(
+                    &root,
+                    &topic,
+                    payload.as_deref(),
+                    qos,
+                    retain,
+                    correlation.as_deref(),
+                )?;
             }
-            BusCmd::Sub { filter, count, timeout, blocking, order, timeout_ms, on_timeout, phase, point } => {
+            BusCmd::Sub {
+                filter,
+                count,
+                timeout,
+                blocking,
+                order,
+                timeout_ms,
+                on_timeout,
+                phase,
+                point,
+            } => {
                 let b = blocking.then_some(buscli::BlockingOpts {
                     order,
                     timeout_ms,
@@ -634,9 +846,25 @@ fn run(cli: Cli) -> Result<()> {
                 "SELECT id, type, state, cause_id, correlation_id, substr(COALESCE(payload,''),1,60), created_at
                  FROM events ORDER BY id DESC LIMIT ?1",
             )?;
-            let rows: Vec<(i64, String, String, Option<i64>, Option<String>, String, String)> = stmt
+            let rows: Vec<(
+                i64,
+                String,
+                String,
+                Option<i64>,
+                Option<String>,
+                String,
+                String,
+            )> = stmt
                 .query_map([limit], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for (id, t, state, cause, corr, payload, created) in rows.into_iter().rev() {
@@ -657,11 +885,33 @@ fn open(root: &paths::Root) -> Result<rusqlite::Connection> {
     Ok(conn)
 }
 
+fn emit_agent_config_changed(root: &paths::Root, name: &str, sha: Option<&str>) -> Result<()> {
+    let Some(sha) = sha else {
+        return Ok(());
+    };
+    let conn = open(root)?;
+    let by = secrets::owner_name(root);
+    events::emit(
+        root,
+        &conn,
+        events::EmitOpts {
+            payload: Some(serde_json::json!({
+                "agent": name,
+                "commit": sha,
+                "decided_by": by,
+            })),
+            sender: Some(by),
+            ..events::EmitOpts::new("obs/config/changed")
+        },
+    )?;
+    Ok(())
+}
+
 fn parse_json_opt(s: Option<&str>) -> Result<Option<Value>> {
     match s {
         None => Ok(None),
-        Some(s) => Ok(Some(serde_json::from_str(s).map_err(|e| {
-            anyhow::anyhow!("invalid JSON {s:?}: {e}")
-        })?)),
+        Some(s) => Ok(Some(
+            serde_json::from_str(s).map_err(|e| anyhow::anyhow!("invalid JSON {s:?}: {e}"))?,
+        )),
     }
 }

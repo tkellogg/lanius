@@ -92,7 +92,10 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
          AND EXISTS (SELECT 1 FROM dispatches d WHERE d.event_id = events.id AND d.state='suspended')",
         [],
     )?;
-    conn.execute("UPDATE events SET state='pending' WHERE state='running'", [])?;
+    conn.execute(
+        "UPDATE events SET state='pending' WHERE state='running'",
+        [],
+    )?;
     // Stale leases from dead holders: release anything whose dispatch is no
     // longer running and whose pid is gone. Crash-only, same as everything.
     release_dead_leases(&conn)?;
@@ -115,7 +118,12 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
     }
 }
 
-fn tick(root: &Root, conn: &Connection, running: &mut Vec<Running>, actors: &mut Actors) -> Result<()> {
+fn tick(
+    root: &Root,
+    conn: &Connection,
+    running: &mut Vec<Running>,
+    actors: &mut Actors,
+) -> Result<()> {
     // Linked packages can change on disk under a running daemon; drift
     // detection re-enters review within a tick (reads only when steady).
     if let Err(e) = packages::sync_if_drifted(root, conn) {
@@ -222,7 +230,9 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
                 let delay = BACKOFF_BASE
                     .saturating_mul(2u32.saturating_pow(strikes.min(8)))
                     .min(BACKOFF_CAP);
-                actors.backoff_until.insert(a.name.clone(), Instant::now() + delay);
+                actors
+                    .backoff_until
+                    .insert(a.name.clone(), Instant::now() + delay);
                 crate::bus::register_actor(&a.name, None);
                 status_event(root, &a.name, "dead", json!({ "exit_code": status.code() }));
             }
@@ -252,7 +262,12 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
             actors.strikes.remove(&name);
             actors.backoff_until.remove(&name);
             crate::bus::register_actor(&name, None);
-            status_event(root, &name, "reloading", json!({ "reason": "config changed" }));
+            status_event(
+                root,
+                &name,
+                "reloading",
+                json!({ "reason": "config changed" }),
+            );
         } else {
             i += 1;
         }
@@ -260,7 +275,9 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
     // Boot what's discovered and not running.
     for pkg in packages::discover(root)? {
         let Some(lm) = &pkg.manifest else { continue };
-        let Some(proc_) = &lm.manifest.process else { continue };
+        let Some(proc_) = &lm.manifest.process else {
+            continue;
+        };
         if proc_.mode != "daemon" {
             continue;
         }
@@ -294,7 +311,12 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
                 write_roots.push(c);
             }
         }
-        let cage = sandbox::Cage::from_roots(write_roots, Vec::new(), true, &sandbox::Protect::for_root(root));
+        let cage = sandbox::Cage::from_roots(
+            write_roots,
+            Vec::new(),
+            true,
+            &sandbox::Protect::for_root(root),
+        );
         let token = uuid::Uuid::new_v4().to_string();
         crate::bus::register_actor(&pkg.name, Some(&token));
         let bus_cfg = crate::bus::config(root);
@@ -349,11 +371,21 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
             .env("ELANUS_SCRATCH", &scratch)
             .env("ELANUS_BUS_ADDR", &addr)
             .env("ELANUS_BUS_TOKEN", &token)
-            .env("ELANUS_SESSION_EXPIRY_S", proc_.session_expiry_s.to_string())
-            .env("ELANUS_HTTP_PORT", http_port.map(|p| p.to_string()).unwrap_or_default())
+            .env(
+                "ELANUS_SESSION_EXPIRY_S",
+                proc_.session_expiry_s.to_string(),
+            )
+            .env(
+                "ELANUS_HTTP_PORT",
+                http_port.map(|p| p.to_string()).unwrap_or_default(),
+            )
             .env(
                 "PATH",
-                format!("{}:{}", exe_dir.display(), std::env::var("PATH").unwrap_or_default()),
+                format!(
+                    "{}:{}",
+                    exe_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
             );
         match cmd.spawn() {
             Ok(child) => {
@@ -367,11 +399,19 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
             }
             Err(e) => {
                 crate::bus::register_actor(&pkg.name, None);
-                actors.strikes.insert(pkg.name.clone(), actors.strikes.get(&pkg.name).unwrap_or(&0) + 1);
+                actors.strikes.insert(
+                    pkg.name.clone(),
+                    actors.strikes.get(&pkg.name).unwrap_or(&0) + 1,
+                );
                 actors
                     .backoff_until
                     .insert(pkg.name.clone(), Instant::now() + BACKOFF_BASE);
-                status_event(root, &pkg.name, "dead", json!({ "spawn_error": e.to_string() }));
+                status_event(
+                    root,
+                    &pkg.name,
+                    "dead",
+                    json!({ "spawn_error": e.to_string() }),
+                );
             }
         }
     }
@@ -431,7 +471,8 @@ fn release_dead_leases(conn: &Connection) -> Result<()> {
 
 fn tick_crons(root: &Root, conn: &Connection) -> Result<()> {
     let rows: Vec<(i64, String, String, Option<String>, Option<String>)> = {
-        let mut stmt = conn.prepare("SELECT id, schedule, emit_type, payload, last_fired FROM crons")?;
+        let mut stmt =
+            conn.prepare("SELECT id, schedule, emit_type, payload, last_fired FROM crons")?;
         let r = stmt
             .query_map([], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
@@ -455,7 +496,10 @@ fn tick_crons(root: &Root, conn: &Connection) -> Result<()> {
         match last_fired {
             None => {
                 // Arm on first sight; don't fire for the past.
-                conn.execute("UPDATE crons SET last_fired = ?1 WHERE id = ?2", params![trace::now_iso(), id])?;
+                conn.execute(
+                    "UPDATE crons SET last_fired = ?1 WHERE id = ?2",
+                    params![trace::now_iso(), id],
+                )?;
             }
             Some(lf) => {
                 let Ok(lf_dt) = DateTime::parse_from_rfc3339(&lf) else {
@@ -468,13 +512,18 @@ fn tick_crons(root: &Root, conn: &Connection) -> Result<()> {
                             root,
                             conn,
                             EmitOpts {
-                                payload: payload.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+                                payload: payload
+                                    .as_deref()
+                                    .and_then(|s| serde_json::from_str(s).ok()),
                                 // Dedupes the same scheduled firing across daemon restarts.
                                 idempotency: Some(format!("cron:{}:{}", id, next.to_rfc3339())),
                                 ..EmitOpts::new(&emit_type)
                             },
                         )?;
-                        conn.execute("UPDATE crons SET last_fired = ?1 WHERE id = ?2", params![trace::now_iso(), id])?;
+                        conn.execute(
+                            "UPDATE crons SET last_fired = ?1 WHERE id = ?2",
+                            params![trace::now_iso(), id],
+                        )?;
                     }
                 }
             }
@@ -498,7 +547,9 @@ fn expire_deadlines(root: &Root, conn: &Connection) -> Result<()> {
                                WHERE a.type = ?2 AND a.correlation_id = e.correlation_id)",
         )?;
         let r = stmt
-            .query_map([&mb.human, &mb.agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map([&mb.human, &mb.agent], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         r
     };
@@ -524,7 +575,11 @@ fn expire_deadlines(root: &Root, conn: &Connection) -> Result<()> {
         trace::write(
             root,
             "obs/harness/ledger/expire",
-            &trace::Ids { event_id: Some(ask_id), correlation_id: Some(corr), ..Default::default() },
+            &trace::Ids {
+                event_id: Some(ask_id),
+                correlation_id: Some(corr),
+                ..Default::default()
+            },
             json!({ "assumed_default": default }),
         );
     }
@@ -574,8 +629,7 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
         // then respawn it every tick forever. Excluding answered asks turns
         // that into the honest "nothing to wake it -> failed" below.
         let mb = profile::mailboxes(root);
-        const UNANSWERED: &str =
-            "AND NOT EXISTS (SELECT 1 FROM events ans
+        const UNANSWERED: &str = "AND NOT EXISTS (SELECT 1 FROM events ans
                              WHERE ans.type = ?3
                                AND ans.correlation_id = events.correlation_id)";
         resume_correlation = conn
@@ -637,8 +691,12 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
 }
 
 fn handler_name(_out: &PathBuf, conn: &Connection, dispatch_id: i64) -> String {
-    conn.query_row("SELECT handler FROM dispatches WHERE id=?1", [dispatch_id], |r| r.get(0))
-        .unwrap_or_else(|_| "?".into())
+    conn.query_row(
+        "SELECT handler FROM dispatches WHERE id=?1",
+        [dispatch_id],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|_| "?".into())
 }
 
 fn recompute_event_state(conn: &Connection, event_id: i64) -> Result<()> {
@@ -800,8 +858,8 @@ fn dispatch_pending(root: &Root, conn: &Connection, running: &mut Vec<Running>) 
 
 fn is_throttled(conn: &Connection, etype: &str, running: &[Running]) -> Result<bool> {
     let rows: Vec<(String, Option<i64>, Option<i64>, i64)> = {
-        let mut stmt =
-            conn.prepare("SELECT event_type, max_concurrent, rate_per_min, coalesce FROM throttles")?;
+        let mut stmt = conn
+            .prepare("SELECT event_type, max_concurrent, rate_per_min, coalesce FROM throttles")?;
         let r = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -817,7 +875,10 @@ fn is_throttled(conn: &Connection, etype: &str, running: &[Running]) -> Result<b
             return Ok(false);
         }
         if let Some(maxc) = max_concurrent {
-            let n = running.iter().filter(|r| crate::topic::matches(&pat, &r.etype)).count() as i64;
+            let n = running
+                .iter()
+                .filter(|r| crate::topic::matches(&pat, &r.etype))
+                .count() as i64;
             if n >= maxc {
                 blocked = true;
             }
@@ -833,7 +894,12 @@ fn is_throttled(conn: &Connection, etype: &str, running: &[Running]) -> Result<b
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 r
             };
-            if types.iter().filter(|t| crate::topic::matches(&pat, t)).count() as i64 >= rate {
+            if types
+                .iter()
+                .filter(|t| crate::topic::matches(&pat, t))
+                .count() as i64
+                >= rate
+            {
                 blocked = true;
             }
         }
@@ -879,7 +945,10 @@ fn spawn_handler(
     );
 
     let etype = envelope["type"].as_str().unwrap_or("?").to_string();
-    let is_resume = envelope.get("resume").map(|v| !v.is_null()).unwrap_or(false);
+    let is_resume = envelope
+        .get("resume")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
     let mut cmd = Command::new(&handler);
     cmd.current_dir(&root.dir)
         .stdin(Stdio::piped())
@@ -943,7 +1012,10 @@ fn spawn_handler(
             trace::write(
                 root,
                 "obs/harness/dispatch/exit",
-                &trace::Ids { event_id: Some(event_id), ..Default::default() },
+                &trace::Ids {
+                    event_id: Some(event_id),
+                    ..Default::default()
+                },
                 json!({ "handler": handler.display().to_string(), "spawn_error": e.to_string(), "state": "failed" }),
             );
             recompute_event_state(conn, event_id)?;
@@ -960,7 +1032,9 @@ fn read_clipped(p: &PathBuf) -> String {
 
 /// Profile [throttle.*] sections merge into the throttle table at daemon start.
 fn merge_profile_throttles(root: &Root, conn: &Connection) {
-    let Ok(entries) = std::fs::read_dir(root.profiles()) else { return };
+    let Ok(entries) = std::fs::read_dir(root.profiles()) else {
+        return;
+    };
     for e in entries.filter_map(|e| e.ok()) {
         let name = e.file_name().to_string_lossy().to_string();
         if let Ok((prof, _)) = profile::load(root, &name) {

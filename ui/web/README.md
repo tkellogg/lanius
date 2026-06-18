@@ -28,13 +28,12 @@ UI-driven decisions carry `decided_by=ui` in the ledger:
   under the old noun stays). Every form save goes through
   `elanus profile set`: comments survive, and a set that wouldn't load is
   refused before it lands.
-- **Kits stage, then you commit — here or in the terminal.** *kits &
-  review* lists resolvable kits (`<root>/kits` is seeded with `core` at
-  init; drop more in, or `~/.elanus/kits`) with README previews and an
-  `installed` badge from grant provenance; staging runs
-  `elanus kit add --pending`, and the pending queue renders each request
-  with an approve button (ledger trail `decided_by=ui`) alongside the
-  equivalent terminal command.
+- **Add-ons install in one human action.** *add-ons* lists resolvable kits
+  (`<root>/kits` is seeded with `core` at init; drop more in, or
+  `~/.elanus/kits`) with detail previews and an `installed` badge from
+  provenance. Adding runs `elanus kit add`; installed add-ons then expose
+  package settings through `elanus config`. Agent-started settings proposals
+  appear separately as plain requests to accept or decline.
 - **The model picker asks the provider.** `/api/admin/models` proxies
   `elanus models` (GET /v1/models with the configured base_url/key);
   compat layers without the endpoint degrade to static suggestions.
@@ -97,11 +96,11 @@ passes the query DSL through verbatim (kind `search`: filter × projection ×
 pagination — see packages/history/SKILL.md). UI reads never become ledger
 events: nothing here touches the bus at all.
 
-**Graceful degradation**: if the history package isn't running or approved,
+**Graceful degradation**: if the transcript view is unavailable,
 `/api/history` answers 503 and the explorer shows a dim
-"history package not running — live view only" hint instead of breaking;
-converse and telemetry keep working from live traffic. The probe re-runs, so
-approving the package later heals the page without a reload.
+"transcripts unavailable — live view only" hint instead of breaking; converse
+and telemetry keep working from live traffic. The probe re-runs, so turning the
+history view on later heals the page without a reload.
 
 ## Test
 

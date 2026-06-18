@@ -1,7 +1,7 @@
 //! Kits — starter packs of packages + profiles (kits/README.md).
 //!
 //! Two install modes. LINK (the default): the kit's packages/ dir is
-//! appended to the default profile's `package_path`, so the packages stay
+//! appended to the default profile's `elanus_path`, so the packages stay
 //! where the kit lives — shared dirs can be managed in one place, and a
 //! copy into the root's packages/ shadows the link (first-hit-wins,
 //! fork-to-customize). COPY (--copy): packages are vendored into the
@@ -17,6 +17,8 @@
 use crate::packages;
 use crate::paths::Root;
 use anyhow::{bail, Context, Result};
+use rusqlite::Connection;
+use serde_json::json;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -45,7 +47,11 @@ pub fn resolve(root: &Root, kit: &str) -> Result<PathBuf> {
     }
     bail!(
         "kit {kit:?} not found (tried: {}); drop it in <root>/kits or pass a path",
-        if tried.is_empty() { "nothing".into() } else { tried.join(", ") }
+        if tried.is_empty() {
+            "nothing".into()
+        } else {
+            tried.join(", ")
+        }
     )
 }
 
@@ -96,6 +102,7 @@ pub fn install(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "kit".into());
     let by = format!("kit:{name}");
+    crate::config_repo::init(root)?;
 
     let mut names: Vec<String> = Vec::new();
     // Canonical from the start: discovery returns canonicalized dirs (and
@@ -113,7 +120,15 @@ pub fn install(
                 }
             }
             Mode::Link => {
-                link_package_path(root, &pkgs)?;
+                link_elanus_path(root, kit_dir)?;
+                let (sha, changed) = crate::config_repo::commit_agent(
+                    root,
+                    "default",
+                    "config: update default agent package path",
+                )?;
+                if changed {
+                    emit_agent_change(root, conn, "default", &sha, &by)?;
+                }
                 for e in sorted_dirs(&pkgs)? {
                     names.push(e.file_name().unwrap().to_string_lossy().to_string());
                 }
@@ -126,7 +141,20 @@ pub fn install(
         // a profile is the human's to edit, so the root owns its copy.
         for e in sorted_dirs(&profs)? {
             let pname = e.file_name().unwrap().to_string_lossy().to_string();
-            copy_tree_if_missing(&e, &root.profile_dir(&pname))?;
+            valid_profile_name(&pname)?;
+            let dst = root.profile_dir(&pname);
+            let existed = dst.join("profile.toml").exists();
+            copy_tree_if_missing(&e, &dst)?;
+            if !existed {
+                let (sha, changed) = crate::config_repo::commit_agent(
+                    root,
+                    &pname,
+                    "config: add kit agent profile",
+                )?;
+                if changed {
+                    emit_agent_change(root, conn, &pname, &sha, &by)?;
+                }
+            }
         }
     }
     if !names.is_empty() {
@@ -165,27 +193,70 @@ pub fn install(
     Ok(None)
 }
 
-/// Append a kit's packages dir to the default profile's `package_path`,
+fn emit_agent_change(
+    root: &Root,
+    conn: &Connection,
+    name: &str,
+    sha: &str,
+    by: &str,
+) -> Result<()> {
+    crate::events::emit(
+        root,
+        conn,
+        crate::events::EmitOpts {
+            payload: Some(json!({
+                "agent": name,
+                "commit": sha,
+                "decided_by": by,
+            })),
+            sender: Some(by.to_string()),
+            ..crate::events::EmitOpts::new("obs/config/changed")
+        },
+    )?;
+    Ok(())
+}
+
+fn valid_profile_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("bad kit profile name {name:?} (alphanumeric, dash, underscore)");
+    }
+    Ok(())
+}
+
+/// Append a kit dir to the default profile's `elanus_path`,
 /// preserving comments and any existing entries. "packages" stays first so
 /// a local copy always shadows the link (fork-to-customize).
-fn link_package_path(root: &Root, pkgs_dir: &Path) -> Result<()> {
-    let entry = pkgs_dir.canonicalize()?.display().to_string();
+fn link_elanus_path(root: &Root, kit_dir: &Path) -> Result<()> {
+    let entry = kit_dir.canonicalize()?.display().to_string();
     let pdir = root.profile_dir("default");
     std::fs::create_dir_all(&pdir)?;
     let f = pdir.join("profile.toml");
     let raw = std::fs::read_to_string(&f).unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut =
-        raw.parse().with_context(|| format!("parsing {}", f.display()))?;
-    if doc.get("package_path").is_none() {
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .with_context(|| format!("parsing {}", f.display()))?;
+    if doc.get("elanus_path").is_none() {
+        if let Some(old) = doc.remove("package_path") {
+            doc.insert("elanus_path", old);
+        }
+    } else {
+        doc.remove("package_path");
+    }
+    if doc.get("elanus_path").is_none() {
         // The serde default is ["packages"]; making it explicit before
         // appending keeps the link from accidentally erasing local discovery.
         let mut arr = toml_edit::Array::new();
         arr.push("packages");
-        doc.insert("package_path", toml_edit::value(arr));
+        doc.insert("elanus_path", toml_edit::value(arr));
     }
-    let arr = doc["package_path"]
+    let arr = doc["elanus_path"]
         .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("package_path in {} is not an array", f.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("elanus_path in {} is not an array", f.display()))?;
     if arr.iter().any(|v| v.as_str() == Some(entry.as_str())) {
         return Ok(()); // already linked
     }
@@ -199,7 +270,9 @@ fn link_package_path(root: &Root, pkgs_dir: &Path) -> Result<()> {
 pub fn list(root: &Root) -> Result<Vec<(String, PathBuf, String)>> {
     let mut out: Vec<(String, PathBuf, String)> = Vec::new();
     for dir in search_dirs(root) {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
         entries.sort();
         for p in entries {
@@ -251,7 +324,9 @@ fn kit_is_protected(kit_dir: &Path) -> bool {
 pub fn protected_packages(root: &Root) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for dir in search_dirs(root) {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.filter_map(|e| e.ok()) {
             let kdir = e.path();
             if !kdir.is_dir() || !kit_is_protected(&kdir) {
@@ -267,26 +342,44 @@ pub fn protected_packages(root: &Root) -> std::collections::HashSet<String> {
     out
 }
 
-/// Remove a kit's packages dir from the default profile's package_path.
+/// Remove a kit dir from the default profile's elanus_path.
 /// Grants are NOT revoked here — they're inert without discovery, and
 /// revocation is its own gesture (`elanus revoke <pkg>`); we say so.
 pub fn unlink(root: &Root, kit_dir: &Path) -> Result<()> {
-    let entry = kit_dir.join("packages").canonicalize().unwrap_or(kit_dir.join("packages"));
-    let entry = entry.display().to_string();
+    let kit_entry = kit_dir
+        .canonicalize()
+        .unwrap_or_else(|_| kit_dir.to_path_buf());
+    let package_entry = kit_entry.join("packages");
+    let entries = [
+        kit_entry.display().to_string(),
+        package_entry.display().to_string(),
+    ];
     let f = root.profile_dir("default").join("profile.toml");
     let raw = std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?;
     let mut doc: toml_edit::DocumentMut = raw.parse()?;
-    let Some(arr) = doc.get_mut("package_path").and_then(|i| i.as_array_mut()) else {
-        bail!("nothing linked (no package_path in the default profile)");
+    if doc.get("elanus_path").is_none() {
+        if let Some(old) = doc.remove("package_path") {
+            doc.insert("elanus_path", old);
+        }
+    } else {
+        doc.remove("package_path");
+    }
+    let Some(arr) = doc.get_mut("elanus_path").and_then(|i| i.as_array_mut()) else {
+        bail!("nothing linked (no elanus_path in the default profile)");
     };
     let before = arr.len();
-    arr.retain(|v| v.as_str() != Some(entry.as_str()));
+    arr.retain(|v| {
+        let Some(s) = v.as_str() else { return true };
+        !entries.iter().any(|entry| entry == s)
+    });
     if arr.len() == before {
-        bail!("{entry} is not on the package path");
+        bail!("{} is not on the elanus path", entries[0]);
     }
     std::fs::write(&f, doc.to_string())?;
-    println!("unlinked {entry}");
-    println!("grants for its packages remain in the ledger (inert without discovery); `elanus revoke <pkg>` to retire them");
+    println!("unlinked {}", entries[0]);
+    println!(
+        "grants for its packages remain in the ledger (inert without discovery); `elanus revoke <pkg>` to retire them"
+    );
     Ok(())
 }
 
@@ -335,7 +428,9 @@ mod tests {
     fn scratch(tag: &str) -> (Root, PathBuf) {
         let base = std::env::temp_dir().join(format!("el-kit-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&base).ok();
-        let root = Root { dir: base.join("root") };
+        let root = Root {
+            dir: base.join("root"),
+        };
         std::fs::create_dir_all(root.dir.join("packages")).unwrap();
         std::fs::create_dir_all(root.dir.join("profiles/default")).unwrap();
         // A kit with one package and one profile.
@@ -346,7 +441,11 @@ mod tests {
             "[request]\nsubscribe=[\"in/package/kpkg/go\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n",
         )
         .unwrap();
-        std::fs::write(kit.join("packages/kpkg/scripts/main"), "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(
+            kit.join("packages/kpkg/scripts/main"),
+            "#!/bin/sh\necho hi\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(kit.join("profiles/kprof")).unwrap();
         std::fs::write(kit.join("profiles/kprof/profile.toml"), "agent = \"k\"\n").unwrap();
         std::fs::write(kit.join("README.md"), "# my kit\n\ndirections\n").unwrap();
@@ -358,7 +457,7 @@ mod tests {
         let (root, kit) = scratch("link");
         std::fs::write(
             root.profile_dir("default").join("profile.toml"),
-            "# a comment that must survive\nagent = \"main\"\n",
+            "# a comment that must survive\nagent = \"main\"\npackage_path = [\"packages\"]\n",
         )
         .unwrap();
         let conn = db::open(&root).unwrap();
@@ -368,7 +467,9 @@ mod tests {
         // Not copied — discovered through the linked path.
         assert!(!root.packages().join("kpkg").exists());
         let found = packages::find(&root, "kpkg").unwrap();
-        assert!(found.dir.starts_with(kit.join("packages").canonicalize().unwrap()));
+        assert!(found
+            .dir
+            .starts_with(kit.join("packages").canonicalize().unwrap()));
         assert!(packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/go").unwrap());
         let by: String = conn
             .query_row(
@@ -382,12 +483,18 @@ mod tests {
         assert!(root.profile_dir("kprof").join("profile.toml").exists());
         let p = std::fs::read_to_string(root.profile_dir("default").join("profile.toml")).unwrap();
         assert!(p.contains("a comment that must survive"));
+        assert!(p.contains("elanus_path"));
+        assert!(!p.contains("package_path"));
         let (prof, _) = crate::profile::load(&root, "default").unwrap();
-        assert_eq!(prof.package_path[0], "packages");
+        assert_eq!(prof.elanus_path[0], "packages");
+        assert_eq!(
+            prof.elanus_path[1],
+            kit.canonicalize().unwrap().display().to_string()
+        );
         // Idempotent: re-link adds no second entry.
         install(&root, &conn, &kit, Mode::Link, true).unwrap();
         let (prof, _) = crate::profile::load(&root, "default").unwrap();
-        assert_eq!(prof.package_path.len(), 2);
+        assert_eq!(prof.elanus_path.len(), 2);
         std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
     }
 
@@ -400,7 +507,7 @@ mod tests {
         assert!(root.packages().join("kpkg/elanus.toml").exists());
         assert!(packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/go").unwrap());
         let (prof, _) = crate::profile::load(&root, "default").unwrap();
-        assert_eq!(prof.package_path, vec!["packages".to_string()]);
+        assert_eq!(prof.elanus_path, vec!["packages".to_string()]);
         std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
     }
 
@@ -410,12 +517,18 @@ mod tests {
         // A local package with the same name exists BEFORE the link.
         let local = root.packages().join("kpkg");
         std::fs::create_dir_all(&local).unwrap();
-        std::fs::write(local.join("elanus.toml"), "[request]\nsubscribe=[\"in/package/kpkg/local\"]\n").unwrap();
+        std::fs::write(
+            local.join("elanus.toml"),
+            "[request]\nsubscribe=[\"in/package/kpkg/local\"]\n",
+        )
+        .unwrap();
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
         install(&root, &conn, &kit, Mode::Link, true).unwrap();
         // The local one shadows; the kit must not have approved it.
-        assert!(!packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/local").unwrap());
+        assert!(
+            !packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/local").unwrap()
+        );
         assert!(!packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/go").unwrap());
         std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
     }
@@ -430,8 +543,14 @@ mod tests {
         std::fs::create_dir_all(kits.join("loose/packages/freepkg")).unwrap();
         // loose has no kit.toml → not protected.
         let prot = protected_packages(&root);
-        assert!(prot.contains("lockpkg"), "a package in a protected kit must be protected");
-        assert!(!prot.contains("freepkg"), "a package in an unmarked kit must not be");
+        assert!(
+            prot.contains("lockpkg"),
+            "a package in a protected kit must be protected"
+        );
+        assert!(
+            !prot.contains("freepkg"),
+            "a package in an unmarked kit must not be"
+        );
         std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
     }
 }

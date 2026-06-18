@@ -90,7 +90,12 @@ impl Cage {
         }
         // The whole-agent grant cage only enforces when fs_write is declared:
         // an empty declaration means "no cage", v1 behavior preserved.
-        Cage::from_roots(roots, cfg.exclude_or_default(), !cfg.fs_write.is_empty(), &Protect::for_root(root))
+        Cage::from_roots(
+            roots,
+            cfg.exclude_or_default(),
+            !cfg.fs_write.is_empty(),
+            &Protect::for_root(root),
+        )
     }
 
     /// A cage over an explicit write set — what leases and package actors
@@ -98,7 +103,12 @@ impl Cage {
     /// one the cage is camera-scope only (warned, never silent). `protect`
     /// fences the ledger and the secret store from the actor even though they
     /// sit inside a write root (docs/identity.md).
-    pub fn from_roots(roots: Vec<PathBuf>, exclude: Vec<String>, enforce: bool, protect: &Protect) -> Cage {
+    pub fn from_roots(
+        roots: Vec<PathBuf>,
+        exclude: Vec<String>,
+        enforce: bool,
+        protect: &Protect,
+    ) -> Cage {
         let mut roots = roots;
         roots.sort();
         roots.dedup();
@@ -112,10 +122,16 @@ impl Cage {
         let can_enforce =
             enforce && cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists();
         if enforce && !can_enforce {
-            eprintln!("[sandbox] enforcement requested but no mechanism on this platform; camera only");
+            eprintln!(
+                "[sandbox] enforcement requested but no mechanism on this platform; camera only"
+            );
         }
         let sbpl = can_enforce.then(|| sbpl(&top, protect));
-        Cage { write_roots: top, exclude, sbpl }
+        Cage {
+            write_roots: top,
+            exclude,
+            sbpl,
+        }
     }
 
     /// Wrap an arbitrary program (a package actor's `run`) in the cage.
@@ -164,7 +180,10 @@ impl SandboxCfg {
 fn sbpl(write_roots: &[PathBuf], protect: &Protect) -> String {
     let mut allow = String::new();
     for r in write_roots {
-        allow.push_str(&format!("  (subpath \"{}\")\n", sbpl_escape(&r.display().to_string())));
+        allow.push_str(&format!(
+            "  (subpath \"{}\")\n",
+            sbpl_escape(&r.display().to_string())
+        ));
     }
     // Fence the ledger, the profiles tree, and the secrets even though they
     // live inside a write root. SBPL is last-match-wins, so these denials come
@@ -172,10 +191,16 @@ fn sbpl(write_roots: &[PathBuf], protect: &Protect) -> String {
     // uncaged and are unaffected.
     let mut fence = String::new();
     for p in &protect.deny_write_files {
-        fence.push_str(&format!("(deny file-write* (literal \"{}\"))\n", sbpl_escape(&p.display().to_string())));
+        fence.push_str(&format!(
+            "(deny file-write* (literal \"{}\"))\n",
+            sbpl_escape(&p.display().to_string())
+        ));
     }
     for p in &protect.deny_write_trees {
-        fence.push_str(&format!("(deny file-write* (subpath \"{}\"))\n", sbpl_escape(&p.display().to_string())));
+        fence.push_str(&format!(
+            "(deny file-write* (subpath \"{}\"))\n",
+            sbpl_escape(&p.display().to_string())
+        ));
     }
     for p in &protect.deny_all_trees {
         // Deny both directions: unreadable and unwritable.
@@ -227,7 +252,9 @@ fn walk(
     if *capped {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.filter_map(|e| e.ok()) {
         if out.len() >= WALK_CAP {
             *capped = true;
@@ -236,15 +263,18 @@ fn walk(
         let p = e.path();
         if let Ok(rel) = p.strip_prefix(rel_root) {
             let rel_s = rel.to_string_lossy();
-            if exclude.iter().any(|x| {
-                rel_s.starts_with(x.as_str()) || rel_s == x.trim_end_matches('/')
-            }) {
+            if exclude
+                .iter()
+                .any(|x| rel_s.starts_with(x.as_str()) || rel_s == x.trim_end_matches('/'))
+            {
                 continue;
             }
         }
         // symlink_metadata: never follow links — a link's target may be
         // outside the roots, and following would both lie and loop.
-        let Ok(md) = std::fs::symlink_metadata(&p) else { continue };
+        let Ok(md) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
         if md.is_dir() {
             walk(&p, rel_root, exclude, out, capped);
         } else {
@@ -258,16 +288,26 @@ pub fn diff(before: &Snapshot, after: &Snapshot) -> Vec<Change> {
     let mut out = Vec::new();
     for (p, stamp) in &after.files {
         match before.files.get(p) {
-            None => out.push(Change { op: "create", path: p.clone(), size: stamp.1 }),
-            Some(b) if b != stamp => {
-                out.push(Change { op: "modify", path: p.clone(), size: stamp.1 })
-            }
+            None => out.push(Change {
+                op: "create",
+                path: p.clone(),
+                size: stamp.1,
+            }),
+            Some(b) if b != stamp => out.push(Change {
+                op: "modify",
+                path: p.clone(),
+                size: stamp.1,
+            }),
             _ => {}
         }
     }
     for (p, stamp) in &before.files {
         if !after.files.contains_key(p) {
-            out.push(Change { op: "unlink", path: p.clone(), size: stamp.1 });
+            out.push(Change {
+                op: "unlink",
+                path: p.clone(),
+                size: stamp.1,
+            });
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -281,7 +321,9 @@ mod tests {
     fn tmp_root() -> Root {
         let dir = std::env::temp_dir().join(format!("elanus-sbx-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        Root { dir: dir.canonicalize().unwrap() }
+        Root {
+            dir: dir.canonicalize().unwrap(),
+        }
     }
 
     fn cage_for(root: &Root) -> Cage {
@@ -307,7 +349,12 @@ mod tests {
         let changes = diff(&before, &after);
         let ops: Vec<(&str, String)> = changes
             .iter()
-            .map(|c| (c.op, c.path.file_name().unwrap().to_string_lossy().to_string()))
+            .map(|c| {
+                (
+                    c.op,
+                    c.path.file_name().unwrap().to_string_lossy().to_string(),
+                )
+            })
             .collect();
         assert!(ops.contains(&("create", "new.txt".into())), "{ops:?}");
         assert!(ops.contains(&("modify", "changed.txt".into())), "{ops:?}");
@@ -333,7 +380,10 @@ mod tests {
     #[test]
     fn sbpl_contains_roots_and_denies_writes() {
         let protect = Protect {
-            deny_write_files: vec![PathBuf::from("/r/elanus.db"), PathBuf::from("/r/elanus.db-wal")],
+            deny_write_files: vec![
+                PathBuf::from("/r/elanus.db"),
+                PathBuf::from("/r/elanus.db-wal"),
+            ],
             deny_write_trees: vec![PathBuf::from("/r/profiles"), PathBuf::from("/r/config")],
             deny_all_trees: vec![PathBuf::from("/r/.secrets")],
         };
@@ -377,11 +427,17 @@ mod tests {
             .shell_command(&format!("echo hi > {}/in.txt", root.dir.display()))
             .output()
             .unwrap();
-        assert!(ok.status.success(), "write inside roots must succeed: {ok:?}");
+        assert!(
+            ok.status.success(),
+            "write inside roots must succeed: {ok:?}"
+        );
         // Outside (home dir): denied. Process tree inheritance included.
         let target = std::env::temp_dir().join(format!("elanus-escape-{}", uuid::Uuid::new_v4()));
         // NB: temp is an allowed hole; use a path that is definitely outside:
-        let home_target = format!("{}/elanus-cage-escape-test.txt", std::env::var("HOME").unwrap());
+        let home_target = format!(
+            "{}/elanus-cage-escape-test.txt",
+            std::env::var("HOME").unwrap()
+        );
         let denied = cage
             .shell_command(&format!("sh -c 'echo escape > {home_target}'"))
             .output()
@@ -399,12 +455,18 @@ mod tests {
             .shell_command(&format!("echo x >> {}", db.display()))
             .output()
             .unwrap();
-        assert!(!db_write.status.success(), "writing the ledger from the cage must fail");
+        assert!(
+            !db_write.status.success(),
+            "writing the ledger from the cage must fail"
+        );
         let db_read = cage
             .shell_command(&format!("cat {} > /dev/null", db.display()))
             .output()
             .unwrap();
-        assert!(db_read.status.success(), "reading the ledger from the cage must succeed");
+        assert!(
+            db_read.status.success(),
+            "reading the ledger from the cage must succeed"
+        );
 
         // The secret store is unreadable from the cage.
         std::fs::create_dir_all(root.secrets()).unwrap();
@@ -414,17 +476,26 @@ mod tests {
             .shell_command(&format!("cat {}", tok.display()))
             .output()
             .unwrap();
-        assert!(!sec_read.status.success(), "reading a secret from the cage must fail");
+        assert!(
+            !sec_read.status.success(),
+            "reading a secret from the cage must fail"
+        );
 
         // Profiles confer authority; a caged actor cannot write them.
         std::fs::create_dir_all(root.profiles()).unwrap();
         let prof = root.profiles().join("default");
         std::fs::create_dir_all(&prof).unwrap();
         let prof_write = cage
-            .shell_command(&format!("echo 'fs_write=[\"/\"]' >> {}", prof.join("profile.toml").display()))
+            .shell_command(&format!(
+                "echo 'fs_write=[\"/\"]' >> {}",
+                prof.join("profile.toml").display()
+            ))
             .output()
             .unwrap();
-        assert!(!prof_write.status.success(), "editing a profile from the cage must fail");
+        assert!(
+            !prof_write.status.success(),
+            "editing a profile from the cage must fail"
+        );
 
         // The config repo is kernel-owned truth: a caged actor must NOT be able
         // to rewrite live config, but a daemon MUST be able to read its own
@@ -438,18 +509,30 @@ mod tests {
             .shell_command(&format!("echo x >> {}", cfgfile.display()))
             .output()
             .unwrap();
-        assert!(!cfg_write.status.success(), "writing live config from the cage must fail");
+        assert!(
+            !cfg_write.status.success(),
+            "writing live config from the cage must fail"
+        );
         let cfg_read = cage
             .shell_command(&format!("cat {} > /dev/null", cfgfile.display()))
             .output()
             .unwrap();
-        assert!(cfg_read.status.success(), "reading own config from the cage must succeed");
+        assert!(
+            cfg_read.status.success(),
+            "reading own config from the cage must succeed"
+        );
         // ...and the repo's history (.git) is unwritable too.
         std::fs::create_dir_all(root.config().join(".git")).unwrap();
         let git_write = cage
-            .shell_command(&format!("echo x >> {}", root.config().join(".git/HEAD").display()))
+            .shell_command(&format!(
+                "echo x >> {}",
+                root.config().join(".git/HEAD").display()
+            ))
             .output()
             .unwrap();
-        assert!(!git_write.status.success(), "writing config/.git from the cage must fail");
+        assert!(
+            !git_write.status.success(),
+            "writing config/.git from the cage must fail"
+        );
     }
 }

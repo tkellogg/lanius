@@ -101,6 +101,12 @@ These are starting points, not a closed list. The interface is free to call
 the language-model ones "agents", because that is the word people expect,
 while the kernel keeps the more honest word "actor".
 
+For an agent, the central configurable behavior is not a single prompt. It is
+the **context program** described in docs/context.md: the program that turns an
+incoming event, the current session transcript, memory, tools, skills, and
+policy into the provider request. Prompt text is an output of that program, not
+the actor's definition.
+
 ## How much thinking: zero or one language model
 
 An actor uses either no language model, or exactly one. There is no actor

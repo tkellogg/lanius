@@ -1,8 +1,8 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-/// An elanus root: the directory holding elanus.db, trace.jsonl, skills/,
-/// handlers.d/, profiles/, run/. Identity is the path; there is no registry.
+/// An elanus root: the directory holding elanus.db, trace.jsonl, packages/,
+/// config/, run/. Identity is the path; there is no registry.
 #[derive(Clone, Debug)]
 pub struct Root {
     pub dir: PathBuf,
@@ -33,7 +33,12 @@ impl Root {
         self.dir.join("profiles")
     }
     pub fn profile_dir(&self, name: &str) -> PathBuf {
-        self.profiles().join(name)
+        let agents = self.config_agents();
+        if agents.exists() || self.profiles().is_symlink() {
+            agents.join(name)
+        } else {
+            self.profiles().join(name)
+        }
     }
     pub fn run_dir(&self) -> PathBuf {
         self.dir.join("run")
@@ -57,6 +62,13 @@ impl Root {
     pub fn config_packages(&self) -> PathBuf {
         self.config().join("packages")
     }
+    /// Per-agent profile files live here on the config repo's `live` branch.
+    /// `<root>/profiles` is kept as a compatibility symlink on Unix so older
+    /// scripts and tests still use the familiar path while the tracked truth is
+    /// `config/agents/<name>/profile.toml`.
+    pub fn config_agents(&self) -> PathBuf {
+        self.config().join("agents")
+    }
 }
 
 /// The default harness root: ~/.elanus/root. One predictable place, no
@@ -75,7 +87,9 @@ pub fn resolve(cli: Option<PathBuf>) -> Result<Root> {
         return Ok(Root { dir: canon(dir)? });
     }
     if let Some(dir) = crate::envcompat::read("ROOT") {
-        return Ok(Root { dir: canon(PathBuf::from(dir))? });
+        return Ok(Root {
+            dir: canon(PathBuf::from(dir))?,
+        });
     }
     let def = default_root()?;
     // Either the current db name or the legacy one marks an existing root (an

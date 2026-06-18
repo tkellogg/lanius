@@ -224,8 +224,7 @@ fs.writeFileSync(histJson, savedHist);
   ? ok('history heals immediately when the endpoint returns')
   : fail('history did not heal after restoring the discovery file');
 
-// 8. admin = staging only (HANDOFF phase 5): the server composes pending
-// state via the CLI and edits profile files, but never commits a grant.
+// 8. admin: one-action add, package settings, and git-backed agent profiles.
 const kitsResp = await (await fetch(`${BASE}/api/admin/kits`)).json();
 (kitsResp.ok && kitsResp.kits.some((k) => k.name === 'dev'))
   ? ok('admin: kit list (dev kit resolvable)')
@@ -234,25 +233,60 @@ const kitsResp = await (await fetch(`${BASE}/api/admin/kits`)).json();
 const add = await (await fetch(`${BASE}/api/admin/kits/add`, {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ kit: 'dev' }),
 })).json();
-add.ok && add.staged ? ok('admin: kit add stages') : fail(`kit add wrong: ${JSON.stringify(add)}`);
-sql(`SELECT COUNT(*) FROM grants WHERE package='git-protect' AND state='approved'`) === '0'
-  ? ok('admin: staging granted nothing')
-  : fail('admin kit add approved grants');
+add.ok ? ok('admin: add-on install succeeds') : fail(`kit add wrong: ${JSON.stringify(add)}`);
+sql(`SELECT COUNT(*) FROM grants WHERE package='git-protect' AND state='approved'`) !== '0'
+  ? ok('admin: add-on is on immediately')
+  : fail('admin kit add did not turn on git-protect');
 
 const pkgs = await (await fetch(`${BASE}/api/admin/packages`)).json();
 const gp = (pkgs.packages ?? []).find((p) => p.name === 'git-protect');
-gp && gp.grants.some((g) => g.state === 'requested')
-  ? ok('admin: pending queue shows the staged requests')
+gp && gp.grants.some((g) => g.state === 'approved')
+  ? ok('admin: installed add-on appears on')
   : fail(`admin packages wrong: ${JSON.stringify(gp)}`);
+
+const cfgSet = await (await fetch(`${BASE}/api/admin/configs/set`, {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ package: 'git-protect', key: 'level', value: '"strict"' }),
+})).json();
+cfgSet.ok ? ok('admin: package setting saved') : fail(`config set failed: ${JSON.stringify(cfgSet)}`);
+const cfgGet = await (await fetch(`${BASE}/api/admin/configs?package=git-protect`)).json();
+cfgGet.ok && /level = "strict"/.test(cfgGet.config?.toml ?? '')
+  ? ok('admin: package setting reads back')
+  : fail(`config read wrong: ${JSON.stringify(cfgGet)}`);
+
+const cfgDir = path.join(TMP, 'config');
+execFileSync('git', ['-C', cfgDir, 'checkout', '-q', '-b', 'proposalweb'], { encoding: 'utf8' });
+fs.writeFileSync(path.join(cfgDir, 'packages', 'git-protect.toml'), 'level = "proposed"\n');
+execFileSync('git', ['-C', cfgDir, 'add', 'packages/git-protect.toml'], { encoding: 'utf8' });
+execFileSync('git', ['-C', cfgDir, '-c', 'user.name=qa', '-c', 'user.email=qa@local', 'commit', '-q', '-m', 'proposal'], { encoding: 'utf8' });
+const propSha = execFileSync('git', ['-C', cfgDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+execFileSync('git', ['-C', cfgDir, 'update-ref', 'refs/proposals/webtest', propSha], { encoding: 'utf8' });
+execFileSync('git', ['-C', cfgDir, 'checkout', '-q', 'live'], { encoding: 'utf8' });
+const props = await (await fetch(`${BASE}/api/admin/proposals`)).json();
+props.ok && props.proposals.some((p) => p.proposal === 'webtest') ? ok('admin: agent requests endpoint answers') : fail(`proposals wrong: ${JSON.stringify(props)}`);
+const propDiff = await (await fetch(`${BASE}/api/admin/proposals/show?id=webtest`)).json();
+propDiff.ok && /proposed/.test(propDiff.diff) ? ok('admin: agent request diff loads') : fail(`proposal diff wrong: ${JSON.stringify(propDiff)}`);
+const propAccept = await (await fetch(`${BASE}/api/admin/proposals/accept`, {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'webtest' }),
+})).json();
+propAccept.ok ? ok('admin: agent request accept applies') : fail(`proposal accept failed: ${JSON.stringify(propAccept)}`);
+const cfgAfterProposal = await (await fetch(`${BASE}/api/admin/configs?package=git-protect`)).json();
+/level = "proposed"/.test(cfgAfterProposal.config?.toml ?? '') ? ok('admin: accepted request changed live settings') : fail(`accepted proposal did not apply: ${JSON.stringify(cfgAfterProposal)}`);
 
 const prof0 = await (await fetch(`${BASE}/api/admin/profile?name=default`)).json();
 prof0.ok && /agent/.test(prof0.toml) ? ok('admin: profile read') : fail(`profile read wrong: ${JSON.stringify(prof0)}`);
+const profileHead0 = execFileSync('git', ['-C', cfgDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 await fetch(`${BASE}/api/admin/profile?name=default`, {
   method: 'PUT', headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ toml: prof0.toml + '\n# edited-by-ui\n' }),
 });
 const prof1 = await (await fetch(`${BASE}/api/admin/profile?name=default`)).json();
 /edited-by-ui/.test(prof1.toml) ? ok('admin: profile write round-trips') : fail('profile write lost');
+const profileHead1 = execFileSync('git', ['-C', cfgDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+const committedProfile = execFileSync('git', ['-C', cfgDir, 'show', 'HEAD:agents/default/profile.toml'], { encoding: 'utf8' });
+profileHead1 !== profileHead0 && /edited-by-ui/.test(committedProfile)
+  ? ok('admin: profile write committed edited content on config live')
+  : fail('profile write was not committed under config/agents');
 const trav = await fetch(`${BASE}/api/admin/profile?name=../evil`);
 trav.status === 400 ? ok('admin: profile name traversal rejected') : fail(`traversal got ${trav.status}`);
 
@@ -298,26 +332,17 @@ badset.status === 400 ? ok('admin: invalid set refused before it lands') : fail(
 const rdme = await (await fetch(`${BASE}/api/admin/kits/readme?kit=dev`)).json();
 rdme.ok && /git|workdir/i.test(rdme.readme) ? ok('admin: kit readme preview') : fail(`readme wrong: ${JSON.stringify(rdme)}`);
 
-// 10. commits from the UI (Tim's call: same authority as the terminal,
-// because it shells out to it) — guarded against the browser-only threats.
-const appr = await (await fetch(`${BASE}/api/admin/approve`, {
-  method: 'POST', headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ package: 'git-protect' }),
-})).json();
-appr.ok ? ok('admin: approve commits from the UI') : fail(`approve failed: ${JSON.stringify(appr)}`);
-sql(`SELECT COUNT(*) FROM grants WHERE package='git-protect' AND state='approved' AND decided_by='ui'`) !== '0'
-  ? ok('admin: ledger trail says decided_by=ui')
-  : fail('no decided_by=ui rows after UI approve');
-const csrf = await fetch(`${BASE}/api/admin/approve`, {
+// 10. mutating routes are guarded against browser-only threats.
+const csrf = await fetch(`${BASE}/api/admin/configs/set`, {
   method: 'POST',
   headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
-  body: JSON.stringify({ package: 'git-protect' }),
+  body: JSON.stringify({ package: 'git-protect', key: 'level', value: '"loose"' }),
 });
-csrf.status === 403 ? ok('admin: hostile-origin mutation refused (CSRF guard)') : fail(`cross-origin approve got ${csrf.status}`);
+csrf.status === 403 ? ok('admin: hostile-origin mutation refused (CSRF guard)') : fail(`cross-origin mutation got ${csrf.status}`);
 // fetch/undici refuses to forge Host; curl doesn't.
 const rebindCode = execFileSync('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}',
   '-X', 'POST', '-H', 'Host: attacker.example', '-H', 'content-type: application/json',
-  '-d', '{"package":"git-protect"}', `${BASE}/api/admin/approve`], { encoding: 'utf8' });
+  '-d', '{"package":"git-protect","key":"level","value":"\\"loose\\""}', `${BASE}/api/admin/configs/set`], { encoding: 'utf8' });
 rebindCode === '403' ? ok('admin: non-local Host refused (DNS-rebinding guard)') : fail(`rebound host got ${rebindCode}`);
 const models = await (await fetch(`${BASE}/api/admin/models`)).json();
 models.ok && Array.isArray(models.models)

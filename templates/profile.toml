@@ -19,6 +19,30 @@ max_turns = 24
 include = ["#"]
 exclude = []
 
+[context]
+# The harness-owned context program: seed built-ins, then visible approved
+# package context stages. Other program names are reserved for future recipes.
+program = "default"
+# Future total assembly budget policy; current runner still enforces per-stage
+# budgets. Kept here so per-agent context policy has a stable home.
+max_total_ms = 30000
+# Per-agent stage overrides use arrays of tables:
+# [[context.stage]]
+# package = "window"
+# name = "window"
+# enabled = false
+# order = 25
+# timeout_ms = 9000
+
+[subagents]
+# Generic subagent spawning is off by default. Allow specific child profiles
+# here when the spawn launcher lands.
+allow_profiles = []
+inherit_budget = true
+max_depth = 1
+grant_policy = "narrow"
+# context_program = "default"
+
 [throttle."in/agent/#"]
 max_concurrent = 2
 llm_tokens_per_hour = 400000

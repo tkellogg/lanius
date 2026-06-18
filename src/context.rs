@@ -52,17 +52,23 @@ pub struct Doc {
 
 impl Doc {
     pub fn system_text(&self) -> String {
-        self.system.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\n\n")
+        self.system
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
 /// One resolved stage in the effective chain.
+#[derive(Debug, Clone, Serialize)]
 pub struct StageRef {
     pub package: String,
     pub name: String,
     pub script: PathBuf,
     pub order: u32,
     pub mode: String,
+    pub timeout_ms: u64,
     pub approved: bool,
 }
 
@@ -70,14 +76,28 @@ pub struct StageRef {
 /// package, in the deterministic total order (order, package, stage name).
 /// Approval is checked under the FRESHLY loaded manifest hash — the bytes
 /// about to run — same pin as exec handlers (docs/security.md entry 9).
-pub fn chain(root: &Root, conn: &Connection, prof: &Profile) -> Result<Vec<StageRef>> {
+pub fn chain(
+    root: &Root,
+    conn: &Connection,
+    profile_name: &str,
+    prof: &Profile,
+) -> Result<Vec<StageRef>> {
     let mut out: Vec<StageRef> = Vec::new();
-    for pkg in packages::discover(root)? {
+    for pkg in packages::discover_for_profile(root, profile_name)? {
         if !profile::skill_visible(prof, &pkg.name) {
             continue;
         }
         let Some(lm) = &pkg.manifest else { continue };
         for s in &lm.manifest.stage {
+            let stage_override = prof
+                .context
+                .stages
+                .iter()
+                .rev()
+                .find(|o| o.package == pkg.name && o.name == s.name);
+            if stage_override.and_then(|o| o.enabled) == Some(false) {
+                continue;
+            }
             let approved = packages::approved_under(conn, &pkg.name, &lm.hash, "stage")?
                 .iter()
                 .any(|v| v == &s.name);
@@ -85,16 +105,44 @@ pub fn chain(root: &Root, conn: &Connection, prof: &Profile) -> Result<Vec<Stage
                 package: pkg.name.clone(),
                 name: s.name.clone(),
                 script: pkg.dir.join(&s.run),
-                order: s.order,
+                order: stage_override.and_then(|o| o.order).unwrap_or(s.order),
                 mode: s.mode.clone(),
+                timeout_ms: stage_override
+                    .and_then(|o| o.timeout_ms)
+                    .unwrap_or_else(|| if s.mode == "resident" { 15_000 } else { 10_000 }),
                 approved,
             });
         }
     }
-    out.sort_by(|a, b| {
-        (a.order, &a.package, &a.name).cmp(&(b.order, &b.package, &b.name))
-    });
+    out.sort_by(|a, b| (a.order, &a.package, &a.name).cmp(&(b.order, &b.package, &b.name)));
     Ok(out)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StageSummary {
+    pub package: String,
+    pub stage: String,
+    pub mode: String,
+    pub timeout_ms: u64,
+    pub approved: bool,
+    pub skipped: bool,
+    pub reason: Option<String>,
+    pub system_blocks: CountDelta,
+    pub messages: CountDelta,
+    pub bytes: CountDelta,
+    pub block_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CountDelta {
+    pub before: usize,
+    pub after: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Assembly {
+    pub doc: Doc,
+    pub stages: Vec<StageSummary>,
 }
 
 /// Seed the document and run the chain. `system_seed` is computed once per
@@ -110,54 +158,134 @@ pub fn assemble(
     stages: &[StageRef],
     ids: &crate::trace::Ids,
 ) -> Result<Doc> {
+    Ok(assemble_detailed(root, system_seed, messages, event, meta, stages, Some(ids))?.doc)
+}
+
+/// Same assembly path as `assemble`, but returns context-stage summaries.
+/// Passing `ids = None` suppresses harness trace writes, which is useful for
+/// developer inspection commands that should not add observation noise.
+pub fn assemble_detailed(
+    root: &Root,
+    system_seed: &[(String, String)],
+    messages: Vec<Value>,
+    event: Value,
+    meta: Meta,
+    stages: &[StageRef],
+    ids: Option<&crate::trace::Ids>,
+) -> Result<Assembly> {
     let mut doc = Doc {
         v: 1,
         system: system_seed
             .iter()
-            .map(|(name, text)| Block { name: name.clone(), text: text.clone() })
+            .map(|(name, text)| Block {
+                name: name.clone(),
+                text: text.clone(),
+            })
             .collect(),
         messages,
         event,
         meta,
     };
     validate(&doc).context("seed transcript invalid (kernel bug)")?;
+    let mut summaries = Vec::new();
     for s in stages {
+        let before = (doc.system.len(), doc.messages.len(), doc_bytes(&doc));
         if !s.approved {
             // Fail-closed would brick the agent on every newly-linked kit;
             // an unapproved stage is a REQUEST, and requests are inert by
             // doctrine (discovery is not authority). Loud, observable skip.
-            eprintln!("[context] stage {}/{} requested but not approved — skipped", s.package, s.name);
-            crate::trace::write(
-                root,
-                &obs_topic(&doc.meta, &format!("{}-skipped", s.name)),
-                ids,
-                json!({ "package": s.package, "stage": s.name, "reason": "not approved" }),
-            );
+            if let Some(ids) = ids {
+                eprintln!(
+                    "[context] stage {}/{} requested but not approved — skipped",
+                    s.package, s.name
+                );
+                crate::trace::write(
+                    root,
+                    &obs_topic(&doc.meta, &format!("{}-skipped", s.name)),
+                    ids,
+                    json!({ "package": s.package, "stage": s.name, "reason": "not approved" }),
+                );
+            }
+            summaries.push(StageSummary {
+                package: s.package.clone(),
+                stage: s.name.clone(),
+                mode: s.mode.clone(),
+                timeout_ms: s.timeout_ms,
+                approved: false,
+                skipped: true,
+                reason: Some("not approved".into()),
+                system_blocks: CountDelta {
+                    before: before.0,
+                    after: doc.system.len(),
+                },
+                messages: CountDelta {
+                    before: before.1,
+                    after: doc.messages.len(),
+                },
+                bytes: CountDelta {
+                    before: before.2,
+                    after: doc_bytes(&doc),
+                },
+                block_names: doc.system.iter().map(|b| b.name.clone()).collect(),
+            });
             continue;
         }
-        let before = (doc.system.len(), doc.messages.len(), doc_bytes(&doc));
         doc = run_stage(root, s, &doc)
             .with_context(|| format!("stage {}/{} failed", s.package, s.name))?;
         if doc.v != 1 {
-            bail!("stage {}/{}: unsupported document version {}", s.package, s.name, doc.v);
+            bail!(
+                "stage {}/{}: unsupported document version {}",
+                s.package,
+                s.name,
+                doc.v
+            );
         }
         validate(&doc)
             .with_context(|| format!("stage {}/{} broke a wire invariant", s.package, s.name))?;
+        let after = (doc.system.len(), doc.messages.len(), doc_bytes(&doc));
+        let summary = StageSummary {
+            package: s.package.clone(),
+            stage: s.name.clone(),
+            mode: s.mode.clone(),
+            timeout_ms: s.timeout_ms,
+            approved: true,
+            skipped: false,
+            reason: None,
+            system_blocks: CountDelta {
+                before: before.0,
+                after: after.0,
+            },
+            messages: CountDelta {
+                before: before.1,
+                after: after.1,
+            },
+            bytes: CountDelta {
+                before: before.2,
+                after: after.2,
+            },
+            block_names: doc.system.iter().map(|b| b.name.clone()).collect(),
+        };
         // The camera doctrine on context assembly: deltas, never the doc.
-        crate::trace::write(
-            root,
-            &obs_topic(&doc.meta, &s.name),
-            ids,
-            json!({
-                "package": s.package,
-                "system_blocks": { "before": before.0, "after": doc.system.len() },
-                "messages": { "before": before.1, "after": doc.messages.len() },
-                "bytes": { "before": before.2, "after": doc_bytes(&doc) },
-                "block_names": doc.system.iter().map(|b| b.name.clone()).collect::<Vec<_>>(),
-            }),
-        );
+        if let Some(ids) = ids {
+            crate::trace::write(
+                root,
+                &obs_topic(&doc.meta, &s.name),
+                ids,
+                json!({
+                    "package": s.package,
+                    "system_blocks": { "before": summary.system_blocks.before, "after": summary.system_blocks.after },
+                    "messages": { "before": summary.messages.before, "after": summary.messages.after },
+                    "bytes": { "before": summary.bytes.before, "after": summary.bytes.after },
+                    "block_names": summary.block_names,
+                }),
+            );
+        }
+        summaries.push(summary);
     }
-    Ok(doc)
+    Ok(Assembly {
+        doc,
+        stages: summaries,
+    })
 }
 
 fn obs_topic(meta: &Meta, stage: &str) -> String {
@@ -218,11 +346,13 @@ fn run_exec_stage(root: &Root, s: &StageRef, doc: &Doc) -> Result<Doc> {
             b
         })
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_millis(s.timeout_ms);
     loop {
         if let Some(status) = child.try_wait()? {
             let _ = w.join();
-            let out = out_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+            let out = out_h
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
             if !status.success() {
                 bail!("exited {:?}", status.code());
             }
@@ -231,7 +361,7 @@ fn run_exec_stage(root: &Root, s: &StageRef, doc: &Doc) -> Result<Doc> {
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("timed out after 10s");
+            bail!("timed out after {}ms", s.timeout_ms);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -261,7 +391,9 @@ pub fn validate(doc: &Doc) -> Result<()> {
             }
             "assistant" => {
                 if !pending.is_empty() {
-                    bail!("message {i}: assistant turn while tool calls {pending:?} are unanswered");
+                    bail!(
+                        "message {i}: assistant turn while tool calls {pending:?} are unanswered"
+                    );
                 }
                 if let Some(calls) = m["tool_calls"].as_array() {
                     for c in calls {
@@ -294,11 +426,24 @@ mod tests {
     use super::*;
 
     fn meta() -> Meta {
-        Meta { profile: "default".into(), agent: "main".into(), session: "s".into(), turn: 1, model: "m".into(), vars: Default::default() }
+        Meta {
+            profile: "default".into(),
+            agent: "main".into(),
+            session: "s".into(),
+            turn: 1,
+            model: "m".into(),
+            vars: Default::default(),
+        }
     }
 
     fn doc(messages: Vec<Value>) -> Doc {
-        Doc { v: 1, system: vec![], messages, event: Value::Null, meta: meta() }
+        Doc {
+            v: 1,
+            system: vec![],
+            messages,
+            event: Value::Null,
+            meta: meta(),
+        }
     }
 
     #[test]
@@ -363,7 +508,11 @@ mod tests {
             "You are {{profile}} in {{root}}.",
         )
         .unwrap();
-        std::fs::write(dir.join("profiles/default/blocks/10-ctx.md"), "Second block.").unwrap();
+        std::fs::write(
+            dir.join("profiles/default/blocks/10-ctx.md"),
+            "Second block.",
+        )
+        .unwrap();
         let pkg = dir.join("packages/notesy");
         std::fs::create_dir_all(&pkg).unwrap();
         std::fs::write(
@@ -379,20 +528,100 @@ mod tests {
             json!({"role":"user","text":"hi"}),
             json!({"role":"assistant","text":"hello"}),
         ];
-        let doc = assemble(&root, &parts, rows.clone(), Value::Null, meta(), &[], &crate::trace::Ids::default())
-            .unwrap();
+        let doc = assemble(
+            &root,
+            &parts,
+            rows.clone(),
+            Value::Null,
+            meta(),
+            &[],
+            &crate::trace::Ids::default(),
+        )
+        .unwrap();
 
         // Messages pass through untouched.
         assert_eq!(doc.messages, rows);
         // System is byte-frozen (root path normalized for portability).
         let canon = dir.canonicalize().unwrap_or(dir.clone());
-        let got = doc.system_text()
+        let got = doc
+            .system_text()
             .replace(&canon.display().to_string(), "<ROOT>")
             .replace(&dir.display().to_string(), "<ROOT>");
         let want = "You are default in <ROOT>.\n\nSecond block.\n\n\
                     ## Skills\n- **notesy** — takes notes (read <ROOT>/packages/notesy/SKILL.md before first use)\n\n\
                     Use the shell tool to read a SKILL.md and to run any scripts it describes.";
-        assert_eq!(got, want, "default-chain output changed — every agent's prompt just changed");
+        assert_eq!(
+            got, want,
+            "default-chain output changed — every agent's prompt just changed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn context_stage_overrides_disable_and_reorder_visible_stages() {
+        let dir = std::env::temp_dir().join(format!("el-ctx-override-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let root = crate::paths::Root { dir: dir.clone() };
+        std::fs::create_dir_all(dir.join("profiles/default")).unwrap();
+        std::fs::create_dir_all(dir.join("packages/alpha/scripts")).unwrap();
+        std::fs::create_dir_all(dir.join("packages/beta/scripts")).unwrap();
+        std::fs::write(
+            dir.join("packages/alpha/elanus.toml"),
+            r#"
+[[stage]]
+name = "keep"
+run = "scripts/keep"
+order = 20
+
+[[stage]]
+name = "drop"
+run = "scripts/drop"
+order = 10
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("packages/beta/elanus.toml"),
+            r#"
+[[stage]]
+name = "move"
+run = "scripts/move"
+order = 50
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles/default/profile.toml"),
+            r#"
+agent = "main"
+
+[context]
+program = "default"
+max_total_ms = 30000
+
+[[context.stage]]
+package = "alpha"
+name = "drop"
+enabled = false
+
+[[context.stage]]
+package = "beta"
+name = "move"
+order = 5
+timeout_ms = 9000
+"#,
+        )
+        .unwrap();
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let (prof, _) = crate::profile::load(&root, "default").unwrap();
+        let chain = chain(&root, &conn, "default", &prof).unwrap();
+        let got: Vec<_> = chain
+            .iter()
+            .map(|s| (s.order, s.package.as_str(), s.name.as_str()))
+            .collect();
+        assert_eq!(got, vec![(5, "beta", "move"), (20, "alpha", "keep")]);
+        assert_eq!(chain[0].timeout_ms, 9000);
         std::fs::remove_dir_all(&dir).ok();
     }
 

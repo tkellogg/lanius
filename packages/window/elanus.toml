@@ -3,11 +3,18 @@
 # tool loop inside one run: when the transcript exceeds a row budget it
 # drops complete LEADING turns (permission c — never cutting between a
 # tool call and its result) so a 24-turn shell marathon can't grow the
-# prompt without bound. Configure per profile with [vars] window_rows
-# (default 80). Ships pending like every stage: approve to activate.
+# prompt without bound. Ships pending like every stage: approve to activate.
 
 [[stage]]
 name  = "window"
 run   = "scripts/stage"
 order = 20
 mode  = "exec"
+
+[[stage.config]]
+key = "window_rows"
+type = "number"
+default = 80
+label = "Window rows"
+help = "Maximum transcript rows kept by the within-run windowing context stage."
+agent_tunable = true

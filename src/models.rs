@@ -17,7 +17,11 @@ pub fn list(root: &Root, profile_name: &str, json: bool) -> Result<()> {
         .model
         .base_url
         .clone()
-        .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("ANTHROPIC_BASE_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| "https://api.anthropic.com".into());
     let base = base.trim_end_matches('/');
     // Compat layers put /models in different places: Anthropic serves
@@ -33,7 +37,11 @@ pub fn list(root: &Root, profile_name: &str, json: bool) -> Result<()> {
     }
     if let Ok(u) = reqwest::Url::parse(base) {
         if let Some(host) = u.host_str() {
-            let origin = format!("{}://{host}{}", u.scheme(), u.port().map(|p| format!(":{p}")).unwrap_or_default());
+            let origin = format!(
+                "{}://{host}{}",
+                u.scheme(),
+                u.port().map(|p| format!(":{p}")).unwrap_or_default()
+            );
             for c in [format!("{origin}/models"), format!("{origin}/v1/models")] {
                 if !candidates.contains(&c) {
                     candidates.push(c);
@@ -41,7 +49,11 @@ pub fn list(root: &Root, profile_name: &str, json: bool) -> Result<()> {
             }
         }
     }
-    let key_env = prof.model.api_key_env.clone().unwrap_or_else(|| "ANTHROPIC_API_KEY".into());
+    let key_env = prof
+        .model
+        .api_key_env
+        .clone()
+        .unwrap_or_else(|| "ANTHROPIC_API_KEY".into());
     let key = std::env::var(&key_env)
         .ok()
         .filter(|s| !s.is_empty())

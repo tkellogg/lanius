@@ -75,7 +75,10 @@ pub fn run_chain(
         let (effect, detail, rewrite) = settle(&h, outcome);
         trace::write(
             root,
-            &format!("obs/harness/hook/{point}/{}", if effect { "allow" } else { "deny" }),
+            &format!(
+                "obs/harness/hook/{point}/{}",
+                if effect { "allow" } else { "deny" }
+            ),
             ids,
             json!({
                 "hook": format!("{}:{}", h.skill, h.run),
@@ -96,7 +99,12 @@ pub fn run_chain(
             subject = v;
         }
     }
-    Ok(Decision { allow: true, subject, denied_by: None, reason: None })
+    Ok(Decision {
+        allow: true,
+        subject,
+        denied_by: None,
+        reason: None,
+    })
 }
 
 enum Invoked {
@@ -160,8 +168,12 @@ fn invoke(root: &Root, h: &HookRow, subject: &Value) -> Invoked {
             }
         }
     };
-    let stdout = out_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
-    let stderr = err_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    let stdout = out_h
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = err_h
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
     match status {
         None => Invoked::Timeout,
         Some(s) if s.success() => Invoked::Allowed(stdout),
@@ -272,7 +284,15 @@ mod tests {
     #[test]
     fn empty_chain_allows() {
         let (root, conn) = setup();
-        let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({"a":1}), &trace::Ids::default()).unwrap();
+        let d = run_chain(
+            &root,
+            &conn,
+            "pre_tool_call",
+            "shell",
+            json!({"a":1}),
+            &trace::Ids::default(),
+        )
+        .unwrap();
         assert!(d.allow);
         assert_eq!(d.subject, json!({"a":1}));
     }
@@ -284,7 +304,15 @@ mod tests {
         let h2 = write_hook(&root, "never.sh", "echo '{\"x\":2}'");
         register(&conn, "pre_tool_call", &h1, 10, 10_000, "deny", "#");
         register(&conn, "pre_tool_call", &h2, 20, 10_000, "deny", "#");
-        let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({"x":1}), &trace::Ids::default()).unwrap();
+        let d = run_chain(
+            &root,
+            &conn,
+            "pre_tool_call",
+            "shell",
+            json!({"x":1}),
+            &trace::Ids::default(),
+        )
+        .unwrap();
         assert!(!d.allow);
         assert_eq!(d.denied_by.as_deref(), Some(&*format!("test:{h1}")));
         assert!(d.reason.unwrap().contains("policy says no"));
@@ -296,14 +324,18 @@ mod tests {
         let (root, conn) = setup();
         // First hook rewrites x to 2; second asserts it sees the rewrite.
         let h1 = write_hook(&root, "rw.sh", "cat >/dev/null; echo '{\"x\":2}'");
-        let h2 = write_hook(
-            &root,
-            "check.sh",
-            "grep -q '\"x\":2' || exit 1",
-        );
+        let h2 = write_hook(&root, "check.sh", "grep -q '\"x\":2' || exit 1");
         register(&conn, "pre_tool_call", &h1, 10, 10_000, "deny", "#");
         register(&conn, "pre_tool_call", &h2, 20, 10_000, "deny", "#");
-        let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({"x":1}), &trace::Ids::default()).unwrap();
+        let d = run_chain(
+            &root,
+            &conn,
+            "pre_tool_call",
+            "shell",
+            json!({"x":1}),
+            &trace::Ids::default(),
+        )
+        .unwrap();
         assert!(d.allow);
         assert_eq!(d.subject, json!({"x":2}));
     }
@@ -313,21 +345,53 @@ mod tests {
         let (root, conn) = setup();
         let slow = write_hook(&root, "slow.sh", "sleep 5");
         register(&conn, "pre_tool_call", &slow, 10, 100, "deny", "#");
-        let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({}), &trace::Ids::default()).unwrap();
+        let d = run_chain(
+            &root,
+            &conn,
+            "pre_tool_call",
+            "shell",
+            json!({}),
+            &trace::Ids::default(),
+        )
+        .unwrap();
         assert!(!d.allow, "on_timeout=deny must deny");
 
         let (root2, conn2) = setup();
         let slow2 = write_hook(&root2, "slow.sh", "sleep 5");
         register(&conn2, "pre_tool_call", &slow2, 10, 100, "allow", "#");
-        let d = run_chain(&root2, &conn2, "pre_tool_call", "shell", json!({}), &trace::Ids::default()).unwrap();
+        let d = run_chain(
+            &root2,
+            &conn2,
+            "pre_tool_call",
+            "shell",
+            json!({}),
+            &trace::Ids::default(),
+        )
+        .unwrap();
         assert!(d.allow, "on_timeout=allow must allow");
     }
 
     #[test]
     fn spawn_error_respects_declaration() {
         let (root, conn) = setup();
-        register(&conn, "pre_tool_call", "does/not/exist", 10, 10_000, "deny", "#");
-        let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({}), &trace::Ids::default()).unwrap();
+        register(
+            &conn,
+            "pre_tool_call",
+            "does/not/exist",
+            10,
+            10_000,
+            "deny",
+            "#",
+        );
+        let d = run_chain(
+            &root,
+            &conn,
+            "pre_tool_call",
+            "shell",
+            json!({}),
+            &trace::Ids::default(),
+        )
+        .unwrap();
         assert!(!d.allow);
     }
 
@@ -336,9 +400,25 @@ mod tests {
         let (root, conn) = setup();
         let deny = write_hook(&root, "deny.sh", "exit 1");
         register(&conn, "pre_tool_call", &deny, 10, 10_000, "deny", "shell");
-        let d = run_chain(&root, &conn, "pre_tool_call", "emit_event", json!({}), &trace::Ids::default()).unwrap();
+        let d = run_chain(
+            &root,
+            &conn,
+            "pre_tool_call",
+            "emit_event",
+            json!({}),
+            &trace::Ids::default(),
+        )
+        .unwrap();
         assert!(d.allow, "filter 'shell' must not match tool 'emit_event'");
-        let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({}), &trace::Ids::default()).unwrap();
+        let d = run_chain(
+            &root,
+            &conn,
+            "pre_tool_call",
+            "shell",
+            json!({}),
+            &trace::Ids::default(),
+        )
+        .unwrap();
         assert!(!d.allow);
     }
 
@@ -347,7 +427,15 @@ mod tests {
         let (root, conn) = setup();
         let noisy = write_hook(&root, "noisy.sh", "echo 'just logging something'");
         register(&conn, "pre_tool_call", &noisy, 10, 10_000, "deny", "#");
-        let d = run_chain(&root, &conn, "pre_tool_call", "shell", json!({"k":"v"}), &trace::Ids::default()).unwrap();
+        let d = run_chain(
+            &root,
+            &conn,
+            "pre_tool_call",
+            "shell",
+            json!({"k":"v"}),
+            &trace::Ids::default(),
+        )
+        .unwrap();
         assert!(d.allow);
         assert_eq!(d.subject, json!({"k":"v"}));
     }

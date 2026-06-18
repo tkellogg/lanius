@@ -76,6 +76,108 @@ function ownerName() {
     return 'owner';
   }
 }
+
+function skillMetaFromMarkdown(raw) {
+  const meta = {};
+  const m = raw.match(/^---\n([\s\S]*?)\n---/);
+  if (!m) return meta;
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!kv) continue;
+    meta[kv[1]] = kv[2].replace(/^['"]|['"]$/g, '').trim();
+  }
+  return meta;
+}
+
+function leadingCommentSummary(raw) {
+  const lines = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) {
+      if (lines.length) break;
+      continue;
+    }
+    if (!line.trim().startsWith('#')) break;
+    lines.push(line.replace(/^\s*#\s?/, '').trim());
+  }
+  return lines.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function arrayValues(raw, key) {
+  const m = raw.match(new RegExp(`^\\s*${key}\\s*=\\s*\\[([^\\]]*)\\]`, 'm'));
+  if (!m) return [];
+  return [...m[1].matchAll(/"([^"]+)"/g)].map((v) => v[1]);
+}
+
+function manifestSummary(raw) {
+  if (!raw) return null;
+  const mode = raw.match(/^\s*mode\s*=\s*"([^"]+)"/m)?.[1] ?? null;
+  const run = raw.match(/^\s*run\s*=\s*"([^"]+)"/m)?.[1] ?? null;
+  const http = /^\s*http\s*=\s*true\s*$/m.test(raw);
+  const hooks = [...raw.matchAll(/^\s*\[\[hook\]\]/gm)].length;
+  const stages = [...raw.matchAll(/^\s*\[\[stage\]\]/gm)].length;
+  const mcps = [...raw.matchAll(/^\s*\[\[mcp\]\]/gm)].length;
+  const comment = leadingCommentSummary(raw);
+  const labels = [];
+  if (mode) labels.push(mode === 'daemon' ? 'actor daemon' : `${mode} actor`);
+  if (http) labels.push('http service');
+  if (hooks) labels.push(`${hooks} hook${hooks === 1 ? '' : 's'}`);
+  if (stages) labels.push(`${stages} stage${stages === 1 ? '' : 's'}`);
+  if (mcps) labels.push(`${mcps} mcp server${mcps === 1 ? '' : 's'}`);
+  const actor = labels.length ? labels.join(', ') : null;
+  const fallback = run ? `Runs ${run}${mode ? ` as ${mode}` : ''}.` : '';
+  return {
+    actor,
+    mode,
+    run,
+    http,
+    request: {
+      subscribe: arrayValues(raw, 'subscribe'),
+      publish: arrayValues(raw, 'publish'),
+      blocking: arrayValues(raw, 'blocking'),
+      fs_write: arrayValues(raw, 'fs_write'),
+    },
+    description: comment || fallback,
+  };
+}
+
+async function listedKit(name) {
+  const r = await cli(['kit', 'list', '--json']);
+  if (!r.ok) return null;
+  return jsonLines(r.stdout).find((k) => k.name === name) ?? null;
+}
+
+async function kitPackages(name) {
+  const kit = await listedKit(name);
+  if (!kit?.dir) return null;
+  const packagesDir = path.join(kit.dir, 'packages');
+  const out = [];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(packagesDir, { withFileTypes: true });
+  } catch {
+    return { ...kit, packages: out };
+  }
+  for (const ent of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!ent.isDirectory()) continue;
+    const dir = path.join(packagesDir, ent.name);
+    const skillPath = path.join(dir, 'SKILL.md');
+    let skill = null;
+    try {
+      const raw = fs.readFileSync(skillPath, 'utf8');
+      const meta = skillMetaFromMarkdown(raw);
+      skill = {
+        name: meta.name || ent.name,
+        description: meta.description || '',
+      };
+    } catch { /* package is not a skill */ }
+    let manifest = null;
+    try {
+      manifest = manifestSummary(fs.readFileSync(path.join(dir, 'elanus.toml'), 'utf8'));
+    } catch { /* package has no manifest */ }
+    out.push({ name: ent.name, dir, skill, manifest });
+  }
+  return { ...kit, packages: out };
+}
 function humanCredential() {
   if (!ROOT) return null;
   try {
@@ -183,11 +285,10 @@ async function handleHistory(query, res) {
   }
 }
 
-// ---- admin: staging only ----------------------------------------------------
+// ---- admin: local human gestures -------------------------------------------
 // Privileged gestures shell out to the elanus CLI — one code path for every
-// human gesture, and this server adds no authority of its own. Kit installs
-// are ALWAYS staged (--pending); profile files are edited directly (the
-// same trust as the human's text editor — profiles are not ledger state).
+// human gesture, and this server adds no authority of its own. Human kit adds
+// are a single accepted action; agent proposals remain reviewable requests.
 import { execFile, execFileSync } from 'node:child_process';
 // Which elanus answers admin calls matters (a stale install on PATH fails
 // silently): prefer an explicit ELANUS_BIN, then the sibling dev build
@@ -232,6 +333,12 @@ function humanProfileError(raw) {
 
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const PKG_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+function profileTomlPath(name) {
+  const canonical = path.join(ROOT, 'config', 'agents', name, 'profile.toml');
+  if (fs.existsSync(canonical)) return canonical;
+  return path.join(ROOT, 'profiles', name, 'profile.toml');
+}
 
 // Browser-borne threats are the ones a terminal doesn't have: a hostile
 // webpage POSTing to localhost (CSRF — browsers send these cross-origin
@@ -294,9 +401,13 @@ async function handleAdmin(url, req, res, body) {
     // quoted, numbers/bools pass bare. Mis-encoding here is how
     // include = "[\"#\"]" once reached a profile (it was refused by the
     // kernel's validate-before-write, but the save still failed).
-    const tomlValue = (v) => Array.isArray(v)
-      ? `[${v.map((x) => JSON.stringify(String(x))).join(', ')}]`
-      : typeof v === 'string' ? JSON.stringify(v) : String(v);
+    const tomlValue = (v) => {
+      if (Array.isArray(v)) return `[${v.map((x) => tomlValue(x)).join(', ')}]`;
+      if (v && typeof v === 'object') {
+        return `{ ${Object.entries(v).map(([k, val]) => `${k} = ${tomlValue(val)}`).join(', ')} }`;
+      }
+      return typeof v === 'string' ? JSON.stringify(v) : String(v);
+    };
     const pairs = Object.entries(set).map(([k, v]) => `${k}=${tomlValue(v)}`);
     const r = await cli(['profile', 'set', name, ...pairs]);
     return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : humanProfileError(r.stderr || r.error) });
@@ -307,6 +418,12 @@ async function handleAdmin(url, req, res, body) {
     const r = await cli(['kit', 'show', kit]);
     return sendJson(res, r.ok ? 200 : 404, r.ok ? { ok: true, readme: r.stdout } : { ok: false, error: r.stderr || r.error });
   }
+  if (url.pathname === '/api/admin/kits/packages' && req.method === 'GET') {
+    const kit = url.searchParams.get('kit');
+    if (!kit || !PKG_NAME_RE.test(kit)) return sendJson(res, 400, { ok: false, error: 'bad kit' });
+    const summary = await kitPackages(kit);
+    return sendJson(res, summary ? 200 : 404, summary ? { ok: true, kit: summary } : { ok: false, error: 'kit not found' });
+  }
   if (url.pathname === '/api/admin/kits' && req.method === 'GET') {
     const r = await cli(['kit', 'list', '--json']);
     return sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, kits: jsonLines(r.stdout) } : { ok: false, error: r.stderr || r.error });
@@ -314,41 +431,85 @@ async function handleAdmin(url, req, res, body) {
   if (url.pathname === '/api/admin/kits/add' && req.method === 'POST') {
     const { kit, copy } = body ?? {};
     if (typeof kit !== 'string' || !kit.length) return sendJson(res, 400, { ok: false, error: 'need {kit}' });
-    // Staged, always: the UI composes; the CLI commits.
-    const args = ['kit', 'add', kit, '--pending'];
+    const args = ['kit', 'add', kit];
     if (copy) args.push('--copy');
     const r = await cli(args);
-    return sendJson(res, r.ok ? 200 : 500, { ok: r.ok, staged: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
+    return sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
   }
   if (url.pathname === '/api/admin/packages' && req.method === 'GET') {
-    const r = await cli(['packages', '--json']);
+    const profile = url.searchParams.get('profile') ?? 'default';
+    if (!PROFILE_NAME_RE.test(profile)) return sendJson(res, 400, { ok: false, error: BAD_NAME_MSG });
+    const r = await cli(['packages', '--json', '--profile', profile]);
     return sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, packages: jsonLines(r.stdout) } : { ok: false, error: r.stderr || r.error });
+  }
+  if (url.pathname === '/api/admin/configs' && req.method === 'GET') {
+    const pkg = url.searchParams.get('package');
+    const args = pkg ? ['config', 'list', pkg] : ['config', 'list'];
+    const r = await cli(args);
+    if (!r.ok) return sendJson(res, 500, { ok: false, error: r.stderr || r.error });
+    return sendJson(res, 200, pkg
+      ? { ok: true, config: jsonLines(r.stdout)[0] ?? { package: pkg, toml: '' } }
+      : { ok: true, configs: jsonLines(r.stdout) });
+  }
+  if (url.pathname === '/api/admin/configs/set' && req.method === 'POST') {
+    const { package: pkg, key, value } = body ?? {};
+    if (typeof pkg !== 'string' || !PKG_NAME_RE.test(pkg)) return sendJson(res, 400, { ok: false, error: 'need {package}' });
+    if (typeof key !== 'string' || !key.trim()) return sendJson(res, 400, { ok: false, error: 'need {key}' });
+    if (typeof value !== 'string') return sendJson(res, 400, { ok: false, error: 'need {value}' });
+    const r = await cli(['config', 'set', pkg, key.trim(), value]);
+    return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
+  }
+  if (url.pathname === '/api/admin/proposals' && req.method === 'GET') {
+    const r = await cli(['config', 'proposals']);
+    return sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, proposals: jsonLines(r.stdout) } : { ok: false, error: r.stderr || r.error });
+  }
+  if (url.pathname === '/api/admin/proposals/show' && req.method === 'GET') {
+    const id = url.searchParams.get('id') ?? '';
+    if (!/^[A-Za-z0-9]{1,40}$/.test(id)) return sendJson(res, 400, { ok: false, error: 'bad request id' });
+    const r = await cli(['config', 'show', id]);
+    return sendJson(res, r.ok ? 200 : 404, r.ok ? { ok: true, diff: r.stdout } : { ok: false, error: r.stderr || r.error });
+  }
+  if (url.pathname === '/api/admin/proposals/accept' && req.method === 'POST') {
+    const id = body?.id;
+    if (typeof id !== 'string' || !/^[A-Za-z0-9]{1,40}$/.test(id)) return sendJson(res, 400, { ok: false, error: 'bad request id' });
+    const r = await cli(['config', 'accept', id]);
+    return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
+  }
+  if (url.pathname === '/api/admin/proposals/decline' && req.method === 'POST') {
+    const id = body?.id;
+    if (typeof id !== 'string' || !/^[A-Za-z0-9]{1,40}$/.test(id)) return sendJson(res, 400, { ok: false, error: 'bad request id' });
+    const r = await cli(['config', 'decline', id]);
+    return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
   }
   if (url.pathname === '/api/admin/profile' && (req.method === 'GET' || req.method === 'PUT')) {
     if (!ROOT) return sendJson(res, 503, { ok: false, error: 'no --root; profile editing needs the elanus root' });
     const name = url.searchParams.get('name') ?? 'default';
     if (!PROFILE_NAME_RE.test(name)) return sendJson(res, 400, { ok: false, error: BAD_NAME_MSG });
-    const file = path.join(ROOT, 'profiles', name, 'profile.toml');
+    const file = profileTomlPath(name);
     if (req.method === 'GET') {
       try {
-        return sendJson(res, 200, { ok: true, name, toml: fs.readFileSync(file, 'utf8') });
+        const toml = fs.readFileSync(file, 'utf8');
+        const parsed = await cli(['profile', 'get', name]);
+        return sendJson(res, 200, {
+          ok: true,
+          name,
+          toml,
+          profile: parsed.ok ? (jsonLines(parsed.stdout)[0] ?? null) : null,
+          profile_error: parsed.ok ? undefined : humanProfileError(parsed.stderr || parsed.error),
+        });
       } catch {
         return sendJson(res, 404, { ok: false, error: `no profile.toml for ${name}` });
       }
     }
     if (typeof body?.toml !== 'string') return sendJson(res, 400, { ok: false, error: 'need {toml}' });
-    // Validate BEFORE writing. A malformed file would otherwise save as "ok" and
-    // then make the agent silently vanish (the loader can't read it). Check the
-    // candidate through the same kernel loader `profile set` uses; only write if
-    // it would load. We never trust the bytes — the kernel validates them.
+    // Validate and write through the CLI. A malformed file would otherwise save
+    // as "ok" and then make the agent silently vanish; the CLI validates,
+    // writes, commits to config/live, and records the acceptance event.
     const tmp = path.join(os.tmpdir(), `el-profile-candidate-${process.pid}-${Date.now()}.toml`);
     fs.writeFileSync(tmp, body.toml);
-    const v = await cli(['profile', 'validate', tmp]);
+    const v = await cli(['profile', 'put', name, tmp]);
     fs.rmSync(tmp, { force: true });
-    if (!v.ok) return sendJson(res, 400, { ok: false, error: humanProfileError(v.stderr || v.error) });
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, body.toml);
-    return sendJson(res, 200, { ok: true, name });
+    return sendJson(res, v.ok ? 200 : 400, v.ok ? { ok: true, name } : { ok: false, error: humanProfileError(v.stderr || v.error) });
   }
   sendJson(res, 404, { ok: false, error: 'unknown admin endpoint' });
 }

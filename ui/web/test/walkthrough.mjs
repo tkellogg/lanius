@@ -107,7 +107,7 @@ const ctx = await browser.newContext({ baseURL: BASE, viewport: { width: 1280, h
   await page.close();
 }
 
-// ── 4. kits & review — catalog ───────────────────────────────────────────────
+// ── 4. add-ons — catalog ─────────────────────────────────────────────────────
 {
   const page = await ctx.newPage();
   await page.goto('/');
@@ -128,38 +128,25 @@ const ctx = await browser.newContext({ baseURL: BASE, viewport: { width: 1280, h
     }
   }
   await shot(page, '06-kits-readme-expanded');
-  // Stage the dev kit.
+  // Add the dev kit.
   for (const row of await page.$$('.setup-kit')) {
     const name = await row.$eval('.setup-kit-name', (el) => el.textContent).catch(() => '');
     if (name.includes('dev')) {
       const btns = await row.$$('button:not(.ghost)');
       for (const btn of btns) {
-        if (/stage/i.test(await btn.textContent())) { await btn.click(); break; }
+        if (/\badd\b/i.test(await btn.textContent())) { await btn.click(); break; }
       }
       break;
     }
   }
-  // Wait for pending queue to populate.
+  // Wait for the installed list to populate.
   await waitFor(async () => {
-    const text = await page.$eval('#setup-pending', (el) => el.textContent);
-    return /git-protect|approve/i.test(text);
+    const text = await page.$eval('#setup-configs', (el) => el.textContent);
+    return /git-protect/i.test(text);
   }, 10000);
-  await shot(page, '07-pending-queue-staged');
-  // Approve all pending packages (dev kit may stage several).
-  let approved = false;
-  await waitFor(async () => {
-    const btn = await page.$('#setup-pending button');
-    if (!btn) {
-      const text = await page.$eval('#setup-pending', (el) => el.textContent);
-      if (/nothing pending|at rest/i.test(text)) return true;
-      return false;
-    }
-    approved = true;
-    await page.click('#setup-pending button');
-    await sleep(600); // let loadSetup() re-render
-    return false;
-  }, 30000);
-  await shot(page, '08-pending-queue-approved');
+  await shot(page, '07-add-ons-installed');
+  await waitFor(async () => /no agent requests/i.test(await page.$eval('#setup-pending', (el) => el.textContent)), 10000);
+  await shot(page, '08-agent-requests-empty');
   await page.close();
 }
 

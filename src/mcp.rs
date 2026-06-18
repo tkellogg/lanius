@@ -46,8 +46,8 @@ const CALL_BUDGET: Duration = Duration::from_secs(60);
 const PROTOCOL: &str = "2025-03-26";
 
 pub struct ToolDef {
-    pub name: String,        // wire name on the server ("add")
-    pub full_name: String,   // what the model sees ("adder__add")
+    pub name: String,      // wire name on the server ("add")
+    pub full_name: String, // what the model sees ("adder__add")
     pub description: String,
     pub schema: Value,
 }
@@ -89,9 +89,15 @@ impl Pool {
     /// Spawn every approved, profile-visible [[mcp]] server and collect its
     /// tools. Approval is checked under the FRESH manifest hash (the same
     /// dispatch-time pin as exec handlers and stages).
-    pub fn load(root: &Root, conn: &Connection, prof: &Profile, cage: &sandbox::Cage) -> Pool {
+    pub fn load(
+        root: &Root,
+        conn: &Connection,
+        profile_name: &str,
+        prof: &Profile,
+        cage: &sandbox::Cage,
+    ) -> Pool {
         let mut pool = Pool::default();
-        let pkgs = match packages::discover(root) {
+        let pkgs = match packages::discover_for_profile(root, profile_name) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[mcp] discovery failed: {e:#}");
@@ -108,7 +114,10 @@ impl Pool {
                     .map(|v| v.iter().any(|n| n == &decl.name))
                     .unwrap_or(false);
                 if !approved {
-                    eprintln!("[mcp] {}/{} requested but not approved — tools absent", pkg.name, decl.name);
+                    eprintln!(
+                        "[mcp] {}/{} requested but not approved — tools absent",
+                        pkg.name, decl.name
+                    );
                     continue;
                 }
                 let script = pkg.dir.join(&decl.run);
@@ -122,7 +131,10 @@ impl Pool {
                             .map(|t| json!({ "name": t.name, "description": t.description, "schema": t.schema }))
                             .collect();
                         blob.sort_by_key(|v| v["name"].as_str().unwrap_or("").to_string());
-                        let hash = format!("{:x}", Sha256::digest(serde_json::to_string(&blob).unwrap_or_default()));
+                        let hash = format!(
+                            "{:x}",
+                            Sha256::digest(serde_json::to_string(&blob).unwrap_or_default())
+                        );
                         let key = kv_pin_key(&pkg.name, &decl.name);
                         match crate::db::kv_get(conn, &key) {
                             Ok(None) => {
@@ -139,7 +151,10 @@ impl Pool {
                                 continue;
                             }
                             Err(e) => {
-                                eprintln!("[mcp] {}/{}: pin read failed ({e}); refusing tools", pkg.name, decl.name);
+                                eprintln!(
+                                    "[mcp] {}/{}: pin read failed ({e}); refusing tools",
+                                    pkg.name, decl.name
+                                );
                                 srv.shutdown();
                                 continue;
                             }
@@ -147,7 +162,10 @@ impl Pool {
                         pool.servers.push(srv);
                     }
                     Err(e) => {
-                        eprintln!("[mcp] {}/{} failed to start: {e:#} — tools absent", pkg.name, decl.name);
+                        eprintln!(
+                            "[mcp] {}/{} failed to start: {e:#} — tools absent",
+                            pkg.name, decl.name
+                        );
                     }
                 }
             }
@@ -174,14 +192,9 @@ impl Pool {
         srv.tools.iter().find(|t| t.name == tool)?;
         Some(match srv.call_tool(tool, args) {
             Ok(text) => text,
-            Err(e) => json!({ "error": format!("mcp {}/{tool}: {e:#}", srv.name) }).to_string(),
+            Err(e) => json!({ "error": format!("mcp {}/{}/{tool}: {e:#}", srv.package, srv.name) })
+                .to_string(),
         })
-    }
-
-    pub fn shutdown(&mut self) {
-        for s in &mut self.servers {
-            s.shutdown();
-        }
     }
 }
 
@@ -204,7 +217,9 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .env_dual("ROOT", &root.dir);
-        let mut child = cmd.spawn().with_context(|| format!("spawning {}", script.display()))?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawning {}", script.display()))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -222,7 +237,12 @@ impl Server {
             package: package.to_string(),
             name: name.to_string(),
             tools: Vec::new(),
-            io: Mutex::new(Io { child, stdin, rx, next_id: 0 }),
+            io: Mutex::new(Io {
+                child,
+                stdin,
+                rx,
+                next_id: 0,
+            }),
         };
         let deadline = Instant::now() + INIT_BUDGET;
         srv.request(
@@ -238,7 +258,9 @@ impl Server {
         let listed = srv.request("tools/list", json!({}), deadline)?;
         let tools = listed["tools"].as_array().cloned().unwrap_or_default();
         for t in tools {
-            let Some(tname) = t["name"].as_str() else { continue };
+            let Some(tname) = t["name"].as_str() else {
+                continue;
+            };
             if !crate::topic::valid_name(tname) {
                 eprintln!("[mcp] {name}: skipping tool with unusable name {tname:?}");
                 continue;
@@ -247,7 +269,10 @@ impl Server {
                 name: tname.to_string(),
                 full_name: format!("{name}__{tname}"),
                 description: t["description"].as_str().unwrap_or("").to_string(),
-                schema: t.get("inputSchema").cloned().unwrap_or(json!({ "type": "object" })),
+                schema: t
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or(json!({ "type": "object" })),
             });
         }
         Ok(srv)
@@ -261,7 +286,11 @@ impl Server {
         )?;
         // Concatenate text parts; non-text content is reported, not dropped.
         let mut out = String::new();
-        for part in res["content"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        for part in res["content"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+        {
             match part["type"].as_str() {
                 Some("text") => {
                     if !out.is_empty() {
@@ -284,7 +313,10 @@ impl Server {
     /// One JSON-RPC round trip. Out-of-order responses are tolerated only
     /// in the trivial sense (other ids are discarded) — calls are serial.
     fn request(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
-        let mut io = self.io.lock().map_err(|_| anyhow::anyhow!("client poisoned"))?;
+        let mut io = self
+            .io
+            .lock()
+            .map_err(|_| anyhow::anyhow!("client poisoned"))?;
         io.next_id += 1;
         let id = io.next_id;
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
@@ -316,7 +348,10 @@ impl Server {
     }
 
     fn notify(&self, method: &str) -> Result<()> {
-        let mut io = self.io.lock().map_err(|_| anyhow::anyhow!("client poisoned"))?;
+        let mut io = self
+            .io
+            .lock()
+            .map_err(|_| anyhow::anyhow!("client poisoned"))?;
         let msg = json!({ "jsonrpc": "2.0", "method": method });
         writeln!(io.stdin, "{msg}").context("server stdin closed")?;
         io.stdin.flush().ok();

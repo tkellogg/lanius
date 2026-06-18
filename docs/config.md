@@ -28,9 +28,12 @@ accept-a-change process instead of a person.
 
 ## What configuration is
 
-An agent has configuration: which model it thinks with, how many turns it may
-take, which skills it is allowed to see. That kind already has a home in the
-interface today — it is the "configure" view, backed by the agent's profile.
+An agent has configuration: which model it thinks with, how many run steps one
+activation may take before yielding, which context program builds its provider
+request, and which packages it is allowed to see. That kind already has a home
+in the interface today — it is the "configure" view, backed by the agent's
+profile. The current storage key for the run-step budget is still
+`model.max_turns`; that is a compatibility name, not the product model.
 
 A package has configuration too, and this is the part with no home today:
 which accounts a watcher should follow, how often it should poll, whose inbox

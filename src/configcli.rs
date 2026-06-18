@@ -19,7 +19,14 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 /// `elanus config set <pkg> <key> <value>`: write + commit on `live` + ledger event.
-pub fn set(root: &Root, conn: &Connection, pkg: &str, key: &str, value: &str, by: &str) -> Result<()> {
+pub fn set(
+    root: &Root,
+    conn: &Connection,
+    pkg: &str,
+    key: &str,
+    value: &str,
+    by: &str,
+) -> Result<()> {
     let (sha, changed) = config_repo::set_key(root, pkg, key, value)?;
     // An idempotent set changed nothing: no commit, and so no acceptance event —
     // the ledger records changes that were actually accepted, not re-runs.
@@ -47,7 +54,10 @@ pub fn set(root: &Root, conn: &Connection, pkg: &str, key: &str, value: &str, by
             ..EmitOpts::new("obs/config/changed")
         },
     )?;
-    println!("set {pkg}.{key} — committed {} on live, accepted by {by}", short(&sha));
+    println!(
+        "set {pkg}.{key} — committed {} on live, accepted by {by}",
+        short(&sha)
+    );
     Ok(())
 }
 
@@ -121,7 +131,10 @@ pub fn accept(root: &Root, conn: &Connection, id: &str, by: &str) -> Result<()> 
             ..EmitOpts::new("obs/config/changed")
         },
     )?;
-    println!("accepted proposal {id} — merged {} into live by {by}", short(&sha));
+    println!(
+        "accepted proposal {id} — merged {} into live by {by}",
+        short(&sha)
+    );
     Ok(())
 }
 
@@ -178,7 +191,9 @@ pub fn classify(root: &Root, id: &str, autonomy: &str) -> Verdict {
                 let allow = agent_tunable(root, pkg);
                 for k in config_repo::proposal_changed_keys(root, id, pkg).unwrap_or_default() {
                     // An allowlist entry E covers key K when K == E or K is under E.
-                    let ok = allow.iter().any(|a| k == *a || k.starts_with(&format!("{a}.")));
+                    let ok = allow
+                        .iter()
+                        .any(|a| k == *a || k.starts_with(&format!("{a}.")));
                     if !ok {
                         return Verdict::Hold(format!(
                             "changes {pkg}.{k}, which {pkg} does not mark agent-tunable"
