@@ -26,8 +26,8 @@ Two durability facts to keep in mind throughout:
   settings file**, not the note. Tests assert the note for liveness but verify
   persistence by reloading.
 
-Selectors are taken verbatim from `ui/web/public/index.html` and the behavior
-from `ui/web/public/app.js`; existing working flows are in
+Selectors are kept stable in `ui/web/src/App.tsx`, with admin/history behavior
+behind `ui/web/server.mjs`; existing working flows are in
 `ui/web/test/ui.spec.mjs`.
 
 ---

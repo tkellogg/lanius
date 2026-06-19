@@ -1,0 +1,4 @@
+interface:
+  display_name: "Docs Disclosure Indexer"
+  short_description: "Maintain progressive docs indexes"
+  default_prompt: "Use $docs-disclosure-indexer to refresh repo docs indexes and code references."

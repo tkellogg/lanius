@@ -2,6 +2,7 @@
 // Same stack pattern as smoke.mjs — throwaway root, unique ports from pid.
 // Page errors and console errors are test failures; that is the main value
 // of this layer over the HTTP smoke.
+// Catalog of record: docs/ui-flows/configuration.md.
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';

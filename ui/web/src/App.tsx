@@ -3,6 +3,9 @@ import { adminGet, adminPost, adminPut, history, publish } from './api';
 import { openLiveStream } from './live';
 import { Button, IconButton } from './components/primitives';
 
+// Product setup language is guided by docs/journeys/README.md and
+// docs/layering.md. Durable browser-flow expectations live in
+// docs/ui-flows/README.md and docs/ui-flows/configuration.md.
 const BUFFER_CAP = 2000;
 const PARENT_PATH = '$parent';
 

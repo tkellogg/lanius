@@ -3,8 +3,8 @@ name: web-qa
 description: >-
   QA the elanus web dashboard (ui/web) by driving the real UI in a headless
   browser against an isolated live stack, asserting DURABLE state and reading
-  the backend log. Use when changing ui/web (server.mjs, public/app.js,
-  index.html, style.css), when a UI gesture "does nothing"/flashes/feels
+  the backend log. Use when changing ui/web (server.mjs, src/App.tsx,
+  src/api.ts, src/styles.css), when a UI gesture "does nothing"/flashes/feels
   unconfirmed, before merging web-UI changes, or to add/run a
   configuration-flow regression. Catches the class of bug HTTP 200s hide:
   silent edit loss, feedback that flashes and vanishes, dead UI affordances.
@@ -24,6 +24,7 @@ stack** and treats the **backend log** as the forensic instrument.
 with the *observable* a user (and an assertion) can trust.
 **Latest findings:** [`docs/ui-flows/findings.md`](../../../docs/ui-flows/findings.md).
 **Working reference harness:** `ui/web/test/ui.spec.mjs` (copy its boilerplate).
+**Main UI source:** `ui/web/src/App.tsx`.
 
 ## The core discipline
 

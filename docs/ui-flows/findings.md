@@ -22,7 +22,7 @@ new bugs** and a set of UX gaps.
 
 ### 1. Configure form silently discards edits made during the load race — *medium*
 
-`loadConfigure()` (`ui/web/public/app.js`) leaves the form editable while its two
+`loadConfigure()` (`ui/web/src/App.tsx`) leaves the form editable while its two
 round trips (profile fetch, then a trailing `await loadDiskAgents()`, ~1–1.3 s)
 are in flight, then fills every field from on-disk values at the end. Anything
 typed in that window is overwritten with **no lockout, no "loading…", no
