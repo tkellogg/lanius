@@ -199,12 +199,21 @@ pub fn reap_orphans(root: &Root) -> Vec<String> {
 }
 
 /// Signal 0 is an existence probe with no effect — exactly how the daemon's
-/// lease reaper (dispatcher::release_dead_leases) tests a holder pid.
+/// lease reaper (dispatcher::release_dead_leases) tests a holder pid. A `0`
+/// return means the process exists and is signalable. A `-1` return must
+/// distinguish `ESRCH` (no such process → dead) from `EPERM` (the process
+/// exists but is owned by another uid → ALIVE): treat anything other than
+/// `ESRCH` as alive, so a live cross-uid launcher's session token is never
+/// wrongly reaped (fail-safe toward keeping a live session, not toward
+/// dropping authority).
 fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn write_0600(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -283,6 +292,20 @@ mod tests {
         // a full-authority name is never resolved as a session token
         assert!(read(&root, "owner").is_none());
         assert!(read(&root, "code-../../owner").is_none());
+    }
+
+    #[test]
+    fn pid_alive_treats_eperm_as_alive() {
+        // pid 1 (init/launchd) exists but is owned by root; from a non-root
+        // process `kill(1, 0)` returns EPERM, not ESRCH — it must read as ALIVE
+        // so a live session owned by a different uid is never wrongly reaped.
+        // (If the suite runs as root, kill(1,0) returns 0 — still alive.)
+        assert!(pid_alive(1));
+        // A pid that almost certainly does not exist reads as dead (ESRCH), and
+        // non-positive pids are dead by definition.
+        assert!(!pid_alive(0x7fff_fffe));
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-5));
     }
 
     #[test]
