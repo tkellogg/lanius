@@ -228,7 +228,18 @@ impl Broker {
     /// May this actor publish here? The zero-cage floor (its own status
     /// subtree) is always allowed; everything else needs an approved
     /// publish grant under the current manifest hash.
+    ///
+    /// A coding-session actor (code-<session>) is scoped STRUCTURALLY, not by
+    /// grant rows: it has no manifest, only the structural scope recorded in its
+    /// token (its own obs subtree). Resolve it through codesession so a leaked
+    /// or replayed session token can publish ONLY its own telemetry — never the
+    /// owner mailbox, work plane, or another agent's topics.
     fn actor_may_publish(&self, pkg: &str, topic_name: &str) -> bool {
+        if crate::codesession::is_session_principal(pkg) {
+            return crate::codesession::read(&self.root, pkg)
+                .map(|t| t.may_publish(topic_name))
+                .unwrap_or(false);
+        }
         // Encode the name into the floor filter exactly as status_event()
         // encodes it when publishing — otherwise a package literally named
         // "+" would yield the floor `obs/package/+/#`, a valid wildcard that
@@ -245,6 +256,11 @@ impl Broker {
     }
 
     fn actor_may_subscribe(&self, pkg: &str, filter: &str) -> bool {
+        if crate::codesession::is_session_principal(pkg) {
+            return crate::codesession::read(&self.root, pkg)
+                .map(|t| t.may_subscribe(filter))
+                .unwrap_or(false);
+        }
         let Some(conn) = self.conn.as_ref() else {
             return false;
         };
@@ -412,13 +428,30 @@ async fn handshake(
     let (actor, sender) = match (&pkt.username, &pkt.password) {
         (Some(u), Some(p)) => {
             let name = u.to_string();
-            // A fenced secret named for this principal is full authority — the
-            // owner, the kernel, or another human. `secrets::read` rejects
-            // path-unsafe and dot-prefixed names, so a crafted username cannot
-            // traverse the store or read the config file. The store is
-            // cage-fenced, so only the human/kernel can place such a secret;
-            // an agent cannot mint itself a full-authority identity.
-            if let Some(secret) = crate::secrets::read(&st.root, &name) {
+            // A coding-session principal (code-<session>) is a GRANT-SCOPED
+            // actor, never full authority (docs/security.md entry 16). Its token
+            // lives in the fenced code-sessions store (only the uncaged launcher
+            // can place it, so a caged agent cannot forge a session identity),
+            // but it resolves as `actor = Some(code-<session>)` so every bus ACL
+            // gate runs — scoped structurally to its own obs subtree
+            // (src/codesession.rs). Checked BEFORE the fenced-secret path so a
+            // code-* name can never resolve as the owner-equivalent identity that
+            // skips the ACL.
+            if crate::codesession::is_session_principal(&name) {
+                match crate::codesession::read(&st.root, &name) {
+                    Some(tok) if tok.secret.as_bytes() == p.as_ref() => (Some(name.clone()), name),
+                    _ => {
+                        eprintln!("[bus] CONNECT refused: bad/unknown session token {name:?}");
+                        return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
+                    }
+                }
+            } else if let Some(secret) = crate::secrets::read(&st.root, &name) {
+                // A fenced secret named for this principal is full authority — the
+                // owner, the kernel, or another human. `secrets::read` rejects
+                // path-unsafe and dot-prefixed names, so a crafted username cannot
+                // traverse the store or read the config file. The store is
+                // cage-fenced, so only the human/kernel can place such a secret;
+                // an agent cannot mint itself a full-authority identity.
                 if secret.as_bytes() != p.as_ref() {
                     eprintln!("[bus] CONNECT refused: bad credential for identity {name:?}");
                     return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
@@ -1272,7 +1305,65 @@ fn delivery_complete(st: &Rc<Broker>, topic_name: &str, line: &str, subscribers:
 
 #[cfg(test)]
 mod tests {
-    use super::parse_share;
+    use super::{parse_share, Broker};
+    use crate::paths::Root;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn tmp_root() -> Root {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "elanus-brokertest-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Root { dir }
+    }
+
+    /// The authority test the prior suite lacked: a coding-session actor token
+    /// resolves as a GRANT-SCOPED actor (actor=Some), and the broker's ACL gates
+    /// hold it to its own obs subtree — it CANNOT publish to the owner mailbox,
+    /// the work plane, or another agent's topics, and CANNOT subscribe anywhere.
+    /// This is the regression guard for the high-severity entry-16 authority gap
+    /// (a session credential that resolved as owner-equivalent / actor=None).
+    #[test]
+    fn session_actor_is_scoped_by_the_broker_acl() {
+        let root = tmp_root();
+        // Mint a real scoped session token (the launcher's path).
+        crate::codesession::mint(&root, "code-deadbeef", "claude-code", 999_999).unwrap();
+        let b = Broker::new(root);
+        let actor = "code-deadbeef";
+
+        // PUBLISH: its own obs subtree is allowed …
+        assert!(b.actor_may_publish(actor, "obs/agent/claude-code/code-deadbeef/session/start"));
+        assert!(b.actor_may_publish(actor, "obs/agent/claude-code/code-deadbeef/tool/Bash/result"));
+        // … and the exact attacks the verifier proved must now FAIL:
+        assert!(!b.actor_may_publish(actor, "in/human/owner")); // human mailbox
+        assert!(!b.actor_may_publish(actor, "work/agent/exec")); // work plane
+        assert!(!b.actor_may_publish(actor, "in/agent/kestrel/c1")); // another agent's mailbox
+        assert!(!b.actor_may_publish(actor, "obs/agent/claude-code/code-other/x")); // another session
+        assert!(!b.actor_may_publish(actor, "signal/anything")); // signals
+        // The status floor that real package actors get is NOT extended to a
+        // session actor — it has no package status subtree to own.
+        assert!(!b.actor_may_publish(actor, "obs/package/code-deadbeef/status"));
+
+        // SUBSCRIBE: nothing — not even its own obs (it emits, it doesn't read).
+        assert!(!b.actor_may_subscribe(actor, "obs/#"));
+        assert!(!b.actor_may_subscribe(actor, "obs/agent/claude-code/code-deadbeef/#"));
+        assert!(!b.actor_may_subscribe(actor, "in/human/owner"));
+    }
+
+    /// A code-* name with NO minted token (e.g. a retired/reaped session, or a
+    /// guessed name) authorizes nothing — the broker fails closed.
+    #[test]
+    fn unminted_session_actor_authorizes_nothing() {
+        let root = tmp_root();
+        let b = Broker::new(root);
+        let ghost = "code-00000000";
+        assert!(!b.actor_may_publish(ghost, "obs/agent/claude-code/code-00000000/session/start"));
+        assert!(!b.actor_may_publish(ghost, "in/human/owner"));
+        assert!(!b.actor_may_subscribe(ghost, "obs/#"));
+    }
 
     #[test]
     fn share_parsing() {

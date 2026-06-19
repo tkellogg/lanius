@@ -460,3 +460,35 @@ preamble and ran `elanus`/`git` in the repo itself — leaving 501 junk
 servers (one squatted an e2e port and caused a spurious §20 failure). All cleaned
 + `/config/` gitignored. Re-run such workflows with `isolation: "worktree"` per
 agent so their git side effects can't touch the main repo.
+
+## 20. [FIXED 2026-06-19] Coding-session credential was a full-authority principal (entry-16 sibling, found by the coding-agents verifier)
+
+The first coding-agents slice (`elanus code launch claude`, branch
+`coding-agents`) minted each session's credential as a **plain fenced secret**
+named `code-<session>` in `Root::secrets()`. The broker resolves a fenced secret as
+a **full-authority principal** (`actor = None`), and every bus ACL gate is
+`if let Some(pkg) = &actor` — so for a session credential **no gate ran**. A minted
+`code-<session>` token (verifier proved it live) could publish to `in/human/owner`,
+`work/agent/exec`, and other agents' mailboxes, and subscribe `obs/#` (read every
+agent's telemetry). Attribution was correct and forge-resistant (`sender =
+code-<session>`, the egress lesson of entry 16 was honored), but **authority was
+owner-equivalent** — exactly the inverse of entry 16's other half: there an emitter
+mis-attributes; here it attributes correctly but over-authorizes. A SIGKILL also
+leaked the live full-authority credential (no reaper).
+
+FIX (grant-scoped session token, src/codesession.rs + src/broker.rs): the session
+credential moves to a fenced sub-store (`Root::secrets()/code-sessions/`, still
+cage-fenced — the forge asymmetry is unchanged), and the broker resolves a `code-*`
+principal **before** the fenced-secret path as a **grant-scoped actor** (`actor =
+Some`), so the ACL gates run. The scope is **structural** (a session has no
+manifest): publish ONLY the session's own `obs/agent/<agent>/<session>/#`, subscribe
+nothing. This copies the webhook daemon's grant-scoped shape (entry 16's prescribed
+fix) rather than inventing identity. The leaked-on-crash hazard is closed by a reaper
+(`codesession::reap_orphans`, run at daemon + launcher boot, signal-0 pid probe like
+the lease reaper). Proven live: the four publish attacks + the `obs/#` subscribe now
+`NotAuthorized`; the session's own obs still publishes (stamped `sender =
+code-<session>`); a reaped orphan is refused at CONNECT. Regression-tested at the
+**authority** level (broker ACL denies a session actor outside scope), the gap the
+prior shape-only suite missed. RESIDUAL: this fixes the bus-authority gap only; M0's
+complete-cage criteria (read/egress denial onto the elanus OS cage) stay deferred per
+the handoff sandbox stance — the tool keeps its own OS sandbox for now.

@@ -2,6 +2,7 @@ mod broker;
 mod bus;
 mod buscli;
 mod codeagent;
+mod codesession;
 mod config_repo;
 mod configcli;
 mod context;
@@ -245,33 +246,21 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BusCmd,
     },
-    /// Launch and observe an external coding agent (Claude Code today)
-    Code {
-        #[command(subcommand)]
-        cmd: CodeCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum CodeCmd {
-    /// Launch the real coding agent in this directory, observed on the bus.
-    /// `tool` selects the adapter (currently: claude). Everything after it is
-    /// passed through to the tool unchanged.
+    /// Launch and observe an external coding agent (Claude Code today).
+    ///
+    /// `elanus code <tool> [args...]` launches the real coding agent in this
+    /// directory, observed on the bus (`tool` selects the adapter — currently
+    /// `claude`; everything after it is passed through unchanged). The reserved
+    /// first word `hook` is the internal hook bridge the generated hooks invoke
+    /// (`elanus code hook <Event>`) — not meant to be run by hand.
     #[command(disable_help_flag = true)]
-    Launch {
-        /// Which coding agent: claude (codex next).
+    Code {
+        /// The adapter (claude, codex next), or the reserved word `hook`.
         tool: String,
-        /// Arguments passed straight through to the tool.
+        /// Arguments passed straight through to the tool (or, for `hook`, the
+        /// single hook event name).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
-    },
-    /// Internal: the hook bridge. Claude Code's generated hooks invoke this with
-    /// the event name; it reads the hook JSON on stdin and publishes one ordered
-    /// observation as the session's identity. Not meant to be run by hand.
-    #[command(hide = true)]
-    Hook {
-        /// The Claude Code hook event name (SessionStart, PreToolUse, …).
-        event: String,
     },
 }
 
@@ -887,10 +876,16 @@ fn run(cli: Cli) -> Result<()> {
                 buscli::subscribe(&root, &filter, count, timeout, b)?;
             }
         },
-        Cmd::Code { cmd } => match cmd {
-            CodeCmd::Launch { tool, args } => codeagent::launch(&root, &tool, &args)?,
-            CodeCmd::Hook { event } => codeagent::hook(&root, &event)?,
-        },
+        Cmd::Code { tool, args } => {
+            // `hook` is the reserved internal bridge: `elanus code hook <Event>`.
+            // Any other first word is a coding-tool adapter to launch.
+            if tool == "hook" {
+                let event = args.first().map(String::as_str).unwrap_or("");
+                codeagent::hook(&root, event)?;
+            } else {
+                codeagent::launch(&root, &tool, &args)?;
+            }
+        }
         Cmd::Events { limit } => {
             let conn = open(&root)?;
             let mut stmt = conn.prepare(

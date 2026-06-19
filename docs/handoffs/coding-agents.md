@@ -514,28 +514,28 @@ these are version-dependent.
   tool-specific surface (binary name, settings shape, hook-event map) is
   adapter-local. A hidden sibling `elanus code hook <Event>` is the bridge the
   generated hooks invoke; not meant to be run by hand. CLI wired in `src/main.rs`
-  (`Cmd::Code` → `CodeCmd::{Launch,Hook}`); module `src/codeagent.rs`.
+  as a flat `Cmd::Code { tool, args }` — `elanus code <tool> [args...]` launches;
+  the reserved first word `hook` (`elanus code hook <Event>`) is the bridge. (The
+  fix pass flattened an earlier `code launch <tool>` subcommand to this documented
+  `code <tool>` form so the CLI and the docs agree.) Module `src/codeagent.rs`.
 
-- **Per-session identity minting path — a per-session fenced secret.** Each launch
-  mints session id `code-<8hex>` and writes a fresh 0600 fenced secret named for
-  the session principal (`code-<session>`) into `Root::secrets()` — the SAME store
-  the kernel/owner secrets live in, which the cage fences from agents
-  (src/secrets.rs / src/sandbox.rs `Protect`). The launcher is uncaged (the human
-  ran it) so it can place the secret; a caged agent cannot, so it can never forge a
-  session identity. The launcher passes `ELANUS_PACKAGE=<principal>` +
-  `ELANUS_BUS_TOKEN=<secret>` (the creds `elanus bus pub` authenticates with) to
-  the child, so every observation the bridge publishes is **broker-verified and
-  stamped `sender = code-<session>` — never the owner** (docs/actors.md egress
-  lesson / security entry 16). VERIFIED LIVE: every obs in a real run carried
-  `"sender":"code-2af51b7e"`; an unauthenticated publish to the same topic was
-  refused `NotAuthorized` (deny-by-default), proving the identity is load-bearing.
-  The secret is retired (file deleted) when the session ends, so a dead session's
-  identity can't be re-presented. NOTE: a fenced-secret principal resolves as
-  **full authority** in the broker (broker.rs:421-426), not grant-scoped — accepted
-  for this increment (a human-launched real tool), but the tighter end state is a
-  grant-scoped per-session actor token minted by the daemon via
-  `bus::register_actor` (which is daemon-only today, so an out-of-process launcher
-  can't use it yet). Recorded as a follow-up, not faked.
+- **Per-session identity minting path — a GRANT-SCOPED session token** (revised in
+  the fix pass; see the entry below). Each launch mints session id `code-<8hex>` and
+  writes a 0600 **scoped token** into the fenced store at
+  `Root::secrets()/code-sessions/<session>.json` (src/codesession.rs). The launcher
+  is uncaged (the human ran it) so it can place it; a caged agent cannot read the
+  fenced store, so it can never forge a session identity — the same asymmetry as
+  before. The launcher passes `ELANUS_PACKAGE=<principal>` +
+  `ELANUS_BUS_TOKEN=<secret>` to the child, so every observation the bridge
+  publishes is **broker-verified and stamped `sender = code-<session>` — never the
+  owner** (docs/actors.md egress lesson / security entry 16). The token is retired
+  when the session ends and reaped at launcher/daemon boot if a SIGKILL leaked it.
+  **Crucially, the broker resolves a `code-*` principal as a grant-scoped actor
+  (`actor = Some`), NOT a full-authority fenced secret (`actor = None`)** — so the
+  bus ACL gates run and the session is held to its own `obs/agent/<agent>/<session>/#`
+  subtree. (The original slice minted a plain fenced secret here, which resolved as
+  full authority and skipped every ACL gate — the high-severity gap the fix pass
+  closed.)
 
 - **Hook JSON payloads (Claude Code, confirmed live, CC 2.1.183).** Hook stdin
   carries `session_id`, `cwd`, `permission_mode`, `hook_event_name`, plus
@@ -559,7 +559,13 @@ these are version-dependent.
   config file under `~/.claude` was modified; the generated scratch + session secret
   were cleaned up. (`--bare` was NOT used — it skips hooks entirely; the
   `--settings` + empty `--setting-sources` combo is the correct no-pollution way to
-  run ONLY generated hooks.)
+  run ONLY generated hooks.) **Scope of the no-pollution claim:** it is about
+  *config/hooks* — the user's `~/.claude` settings, hooks, and CLAUDE.md
+  auto-discovery are untouched. Claude Code still writes its own per-session
+  **transcripts** under `~/.claude/projects/…` (its normal session history); that is
+  the tool's own state, not elanus config, and is deliberately left alone. So the
+  guarantee is "elanus changes no user config," not "the tool writes nothing to its
+  home" (the latter would mean rewriting the tool).
 
 - **Sandbox stance for this increment — the tool keeps its OWN sandbox active; NO
   bypass onto today's write-only cage (deliberate sequencing, recorded per the
@@ -580,12 +586,68 @@ these are version-dependent.
   coding-agent process tree / PTY / network: NOT verified, because the cage is not
   in the launch path yet (by the decision above).**
 
-- **Tests + verification.** `cargo test` green (86 passing; 10 new in
-  `src/codeagent.rs` covering tool parse, obs-topic grammar/encoding, hook-event
-  mapping for every modeled event, settings shape, secret roundtrip/retire). Live
-  end-to-end run through the worktree dev stack (root `~/.elanus/wt-coding-agents`,
-  broker `:1893`) drove a real headless `claude -p` and captured the full ordered,
-  correctly-attributed record on `obs/agent/claude-code/#`.
+- **Tests + verification.** `cargo test` green (86 passing at the M0+M1 commit).
+  Live end-to-end run through the worktree dev stack (root
+  `~/.elanus/wt-coding-agents`, broker `:1893`) drove a real headless `claude -p`
+  and captured the full ordered, correctly-attributed record on
+  `obs/agent/claude-code/#`. (Superseded by the fix-pass numbers below.)
+
+### 2026-06-19 — Fix pass: grant-scoped session token + reaper + CLI/adapter cleanup
+
+An adversarial verifier confirmed a **high-severity authority gap** in the M0+M1
+slice: the per-session `code-<session>` credential was a plain fenced secret, which
+the broker resolves as a **full-authority principal** (`actor = None`) — and every
+bus ACL gate is `if let Some(pkg) = &actor`, so *none* of them ran. A minted
+session token could publish to `in/human/owner`, `work/agent/exec`, and other
+agents' mailboxes, and subscribe `obs/#` (read every agent's telemetry). Attribution
+was correct (`sender = code-<session>`, forge-resistant) but authority was
+owner-equivalent, and a SIGKILL leaked the live credential. This pass closed it.
+
+- **(HIGH, FIXED) Grant-scoped per-session actor token.** New module
+  `src/codesession.rs` owns the session credential. It is minted into a fenced
+  sub-store `Root::secrets()/code-sessions/<session>.json` (still cage-fenced — the
+  forge-resistance asymmetry is unchanged: only the uncaged launcher can place it).
+  The broker (`src/broker.rs` `handshake`) resolves a `code-*` principal **before**
+  the fenced-secret path and as a **grant-scoped actor** (`actor = Some`), so every
+  ACL gate runs. The scope is **structural**, not grant-table rows (a session has no
+  manifest): `actor_may_publish`/`actor_may_subscribe` route `code-*` actors through
+  `codesession`, which permits publish ONLY to the session's own
+  `obs/agent/<agent>/<session>/#` and subscribe to nothing. No daemon-side
+  `register_actor` RPC was needed — the structural scope rides the fenced token the
+  launcher already writes, which the broker reads at CONNECT. This copies the webhook
+  daemon's grant-scoped shape (own token, narrow filter) rather than inventing a new
+  identity mechanism. **Proven live** (worktree stack, broker `:1893`) with a real
+  `code-<session>` token: publish to `in/human/owner`, `work/agent/exec`, another
+  agent's mailbox, and another session's obs all now PUBACK `NotAuthorized`;
+  subscribe `obs/#` SUBACKs `NotAuthorized`; the session's own
+  `obs/agent/claude-code/<session>/...` publish still succeeds and lands stamped
+  `sender = code-<session>`. A real headless `claude -p` run produced the full
+  ordered record unchanged.
+
+- **(MED, FIXED) Reap orphaned `code-*` credentials.** `codesession::reap_orphans`
+  removes any session token whose owning launcher pid is dead (signal-0 probe, same
+  as the lease reaper). Run at **daemon boot** (`dispatcher::run`) and **launcher
+  boot** (`codeagent::launch`, before anything else). **Proven live:** an orphaned
+  token (dead owner pid) authorized its own obs before the sweep; after the launcher
+  reaped it, the credential is refused at CONNECT (`bad/unknown session token` →
+  `NotAuthorized`). A SIGKILL can no longer leave a usable credential.
+
+- **(LOW, FIXED) CLI/doc consistency.** Flattened `elanus code launch <tool>` to the
+  documented `elanus code <tool>` form (`src/main.rs` `Cmd::Code { tool, args }`);
+  `hook` is the reserved first word for the bridge. CLI, handoff, and module docs now
+  agree.
+
+- **(LOW, DONE) Adapter factoring before Codex.** Settings generation and
+  event-mapping route through the `Tool` enum (`Tool::settings`, `Tool::map_event`,
+  `Tool::from_agent_noun`); the Claude generators are `claude_settings` /
+  `claude_map_event`, with a `generic_event` fallback. The Codex adapter slots in by
+  adding enum arms, without restructuring `launch()`/`hook()`.
+
+- **Tests.** `cargo test` green, **93 passing** (was 86): +5 in `codesession`
+  (scope/roundtrip/reap), +2 **authority** tests in `broker` (the gap the prior
+  suite missed — they assert the broker ACL DENIES a session actor outside its
+  scope, not just shape), with the codeagent secret-roundtrip test replaced by a
+  scoped-token regression guard.
 
 ### Still TODO (next increments)
 
@@ -597,5 +659,9 @@ these are version-dependent.
 - Context-injection placement per tool + measured cache behavior (M3, the
   `UserPromptSubmit` `additionalContext` system-reminder seam).
 - Inbound-delivery mechanism (M2 inbox: interactive pull vs headless `--resume`).
-- Grant-scoped per-session actor token (vs the full-authority fenced secret used
-  now) — needs daemon-side per-session minting.
+  Note: when M2 grants a session *read* authority (its inbox), extend its
+  `subscribe` scope in `codesession` (today it is empty — emit-only).
+- ~~Grant-scoped per-session actor token~~ — **DONE** in the fix pass (structural
+  scope on the broker, no daemon RPC; see the fix-pass Log above). M0's complete-cage
+  criteria (read/egress denial) remain deferred per the sandbox stance above — the
+  authority gap is closed, the OS-cage bypass is still gated on the end-state cage.

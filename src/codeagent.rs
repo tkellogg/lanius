@@ -9,13 +9,17 @@
 //!
 //! What this increment delivers (M0 launcher scaffolding + M1 hook→bus bridge):
 //!
-//! - **Per-session identity.** Each launch mints a fresh elanus session id and a
-//!   per-session principal (a fenced secret in `Root::secrets()`, named
-//!   `code-<session>`), so everything the session publishes to the bus is stamped
-//!   `sender = code-<session>` by the broker — never the owner (docs/actors.md /
-//!   docs/security.md entry 16: a bridge carries its own identity). The launcher
-//!   is uncaged (the human ran it) so it can place the fenced secret; a caged
-//!   agent cannot, which is exactly the asymmetry that makes this provenance real.
+//! - **Per-session identity (grant-scoped).** Each launch mints a fresh elanus
+//!   session id and a **grant-scoped** session token (src/codesession.rs), so
+//!   everything the session publishes is stamped `sender = code-<session>` by the
+//!   broker — never the owner (docs/actors.md / docs/security.md entry 16: a
+//!   bridge carries its own identity) — AND the session is held to a narrow
+//!   structural scope (publish only its own `obs/agent/<agent>/<session>/#`,
+//!   subscribe nothing), copying the webhook daemon's grant-scoped shape rather
+//!   than the full-authority fenced-secret shape. The token lives in the fenced
+//!   store, so the launcher (uncaged) can place it but a caged agent cannot —
+//!   the asymmetry that makes the provenance real — and even if the token leaks,
+//!   it carries no authority beyond the session's own telemetry.
 //!
 //! - **Scoped hook config, no home pollution.** A generated CC `--settings` file
 //!   in the session's run scratch routes the documented hook events through
@@ -41,8 +45,8 @@
 //! tool-sandbox bypass + posture reconstruction is a LATER milestone gated on it.
 
 use crate::buscli;
+use crate::codesession;
 use crate::paths::Root;
-use crate::secrets;
 use crate::topic;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -76,27 +80,67 @@ impl Tool {
             Tool::ClaudeCode => "claude-code",
         }
     }
+    /// Recover the adapter from the agent noun the launcher recorded in the
+    /// session env — so the hook bridge routes event-mapping through the right
+    /// adapter without re-parsing the tool name. None for an unknown noun (a
+    /// future adapter whose launcher set a noun this binary doesn't know).
+    fn from_agent_noun(noun: &str) -> Option<Tool> {
+        match noun {
+            "claude-code" => Some(Tool::ClaudeCode),
+            _ => None,
+        }
+    }
     /// The real binary to launch.
     fn binary(self) -> &'static str {
         match self {
             Tool::ClaudeCode => "claude",
         }
     }
+    /// The generated tool config that routes this adapter's hook events through
+    /// `elanus code hook <Event>` to the bus. Dispatches to the adapter-specific
+    /// generator so the Codex adapter slots in by adding an arm here.
+    fn settings(self, self_exe: &Path, root: &Root) -> Value {
+        match self {
+            Tool::ClaudeCode => claude_settings(self_exe, root),
+        }
+    }
+    /// Map one of this adapter's hook events + its payload to an obs/ topic leaf
+    /// and a trimmed body. Adapter-specific (the hook event names and payload
+    /// shapes differ per tool); the Codex adapter adds its own arm.
+    fn map_event(self, event: &str, payload: &Value) -> (String, Value) {
+        match self {
+            Tool::ClaudeCode => claude_map_event(event, payload),
+        }
+    }
 }
 
 /// `elanus code <tool> [args...]` — launch the real coding agent, observed.
 pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
+    // Reap any session tokens a prior SIGKILL'd launcher leaked, before anything
+    // else — a crash must never leave a usable credential lying around
+    // (docs/security.md). Done first (even before tool parsing) so a launch is
+    // an opportunity to heal orphans regardless of how it turns out. Daemon boot
+    // does the same sweep; doing it here too means a launcher heals orphans even
+    // against a never-restarted daemon.
+    for orphan in codesession::reap_orphans(root) {
+        eprintln!("[code] reaped orphaned session credential {orphan}");
+    }
+
     let tool = Tool::parse(tool)?;
     let session = format!("code-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let agent = tool.agent_noun().to_string();
 
-    // Per-session identity: a fenced secret principal. The launcher is uncaged
-    // (the human ran it), so it can place the secret; that is what lets the
-    // session's hook bridge authenticate as ITSELF and the broker stamp the
-    // session — not the owner — as the sender (docs/actors.md egress lesson).
+    // Per-session identity: a GRANT-SCOPED session token (NOT a full-authority
+    // fenced secret — docs/security.md entry 16). The launcher is uncaged (the
+    // human ran it), so it can place the token in the fenced store; that is what
+    // lets the session's hook bridge authenticate as ITSELF and the broker stamp
+    // the session — not the owner — as the sender, while holding it to its own
+    // obs subtree. We record this launcher's pid as the token owner so the reaper
+    // can distinguish a live session from a SIGKILL orphan.
     let principal = session.clone();
-    let bus_token = mint_session_secret(root, &principal)
+    let token = codesession::mint(root, &principal, &agent, std::process::id() as i32)
         .with_context(|| format!("minting the session credential for {principal}"))?;
+    let bus_token = token.secret.clone();
 
     // Generated hook config in the session's run scratch — never ~/.claude.
     let scratch = root.run_dir().join(&session);
@@ -106,7 +150,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
 
     let self_exe = std::env::current_exe().context("locating the elanus binary for hook commands")?;
     let result = (|| -> Result<std::process::ExitStatus> {
-        let settings = claude_settings(&self_exe, root);
+        let settings = tool.settings(&self_exe, root);
         std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
             .with_context(|| format!("writing {}", settings_path.display()))?;
 
@@ -163,11 +207,12 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     );
 
     // No home-state pollution and no lingering credential: drop the generated
-    // config and retire the session's fenced secret (best-effort; a crash leaves
-    // them, but the secret is scoped to one session and the broker only ever
-    // accepts it for this dead session's traffic).
+    // config and retire the session's scoped token (best-effort; a SIGKILL leaves
+    // it, but it is reaped at the next launcher/daemon boot, and even unreaped it
+    // can only ever publish this dead session's own obs subtree — never the
+    // owner, work, or another agent).
     let _ = std::fs::remove_dir_all(&scratch);
-    retire_session_secret(root, &principal);
+    codesession::retire(root, &principal);
 
     let status = result?;
     if !status.success() {
@@ -197,7 +242,13 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
         return Ok(());
     };
 
-    let (leaf, body) = map_event(event, &payload);
+    // Route event-mapping through the adapter the launcher recorded as the
+    // session's agent noun. An unknown noun (a future adapter this binary
+    // predates) still files the event generically rather than dropping it.
+    let (leaf, body) = match Tool::from_agent_noun(&agent) {
+        Some(tool) => tool.map_event(event, &payload),
+        None => generic_event(event, &payload),
+    };
     publish_obs(
         root,
         &principal,
@@ -212,8 +263,9 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
 /// trimmed body. The grammar matches src/exec.rs:
 /// `tool/<name>/{call,result}` for the tool loop, plus session/turn leaves.
 /// The hook stdin payload includes `session_id`, `cwd`, `permission_mode`,
-/// `hook_event_name`, plus event-specific fields (Appendix A).
-fn map_event(event: &str, payload: &Value) -> (String, Value) {
+/// `hook_event_name`, plus event-specific fields (Appendix A). The Codex adapter
+/// adds a sibling `codex_map_event` and an arm in `Tool::map_event`.
+fn claude_map_event(event: &str, payload: &Value) -> (String, Value) {
     let ts = json!(now_iso());
     let cc_session = payload.get("session_id").cloned().unwrap_or(Value::Null);
     let cwd = payload.get("cwd").cloned().unwrap_or(Value::Null);
@@ -259,11 +311,22 @@ fn map_event(event: &str, payload: &Value) -> (String, Value) {
         ),
         // Anything else we did not explicitly model still lands on the bus,
         // tagged by its event name, so nothing is silently dropped.
-        other => (
-            format!("event/{}", topic::encode_segment(other)),
-            common(json!({ "event": other })),
-        ),
+        other => {
+            let (leaf, body) = generic_event(other, payload);
+            (leaf, common(body))
+        }
     }
+}
+
+/// Fallback mapping for an event no adapter explicitly modeled (or whose adapter
+/// this binary predates): file it under `event/<name>` so nothing is silently
+/// dropped. Carries no adapter-specific common fields — the caller adds those if
+/// it has them.
+fn generic_event(event: &str, _payload: &Value) -> (String, Value) {
+    (
+        format!("event/{}", topic::encode_segment(event)),
+        json!({ "event": event, "ts": now_iso() }),
+    )
 }
 
 /// Generate the Claude Code `--settings` object: only hooks, each routing to
@@ -302,49 +365,6 @@ fn claude_settings(self_exe: &Path, root: &Root) -> Value {
             "SessionEnd": [cmd("SessionEnd")],
         }
     })
-}
-
-// ── identity ───────────────────────────────────────────────────────────────
-
-/// Mint a per-session credential: a fresh fenced secret named for the principal.
-/// A fenced secret IS what names a full-authority principal (docs/identity.md);
-/// the broker stamps `sender = <principal>` on everything it publishes. We mint
-/// it in the same store the kernel uses (`Root::secrets()`); only the uncaged
-/// launcher/kernel can write there, so an agent can never forge a session
-/// identity. Returns the secret to hand the child as ELANUS_BUS_TOKEN.
-fn mint_session_secret(root: &Root, principal: &str) -> Result<String> {
-    if !secrets::valid_principal(principal) {
-        bail!("session principal {principal:?} is not a valid identity name");
-    }
-    std::fs::create_dir_all(root.secrets())?;
-    let secret = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-    let path = root.secrets().join(principal);
-    write_0600(&path, &secret)?;
-    Ok(secret)
-}
-
-/// Retire a session's fenced secret when the session ends — the credential dies
-/// with the session, so a dead session's identity can never be re-presented.
-fn retire_session_secret(root: &Root, principal: &str) {
-    if secrets::valid_principal(principal) {
-        let _ = std::fs::remove_file(root.secrets().join(principal));
-    }
-}
-
-fn write_0600(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)?.write_all(contents.as_bytes())
 }
 
 // ── bus publish ──────────────────────────────────────────────────────────────
@@ -457,7 +477,7 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": { "command": "ls -la" },
         });
-        let (leaf, body) = map_event("PreToolUse", &payload);
+        let (leaf, body) = Tool::ClaudeCode.map_event("PreToolUse", &payload);
         assert_eq!(leaf, "tool/Bash/call");
         assert_eq!(body["tool"], "Bash");
         assert_eq!(body["cc_session"], "cc-123");
@@ -475,7 +495,7 @@ mod tests {
             "tool_input": { "file_path": "/x" },
             "tool_response": "permission denied",
         });
-        let (leaf, body) = map_event("PostToolUseFailure", &payload);
+        let (leaf, body) = Tool::ClaudeCode.map_event("PostToolUseFailure", &payload);
         assert_eq!(leaf, "tool/Write/result");
         assert_eq!(body["failed"], true);
         assert!(body["response"].as_str().unwrap().contains("permission denied"));
@@ -483,20 +503,20 @@ mod tests {
 
     #[test]
     fn map_user_prompt_and_stop() {
-        let (leaf, body) = map_event(
+        let (leaf, body) = Tool::ClaudeCode.map_event(
             "UserPromptSubmit",
             &json!({ "prompt": "fix the bug", "session_id": "cc" }),
         );
         assert_eq!(leaf, "user/message");
         assert_eq!(body["prompt"], "fix the bug");
 
-        let (leaf, _) = map_event("Stop", &json!({ "session_id": "cc" }));
+        let (leaf, _) = Tool::ClaudeCode.map_event("Stop", &json!({ "session_id": "cc" }));
         assert_eq!(leaf, "session/idle");
     }
 
     #[test]
     fn unknown_event_still_lands() {
-        let (leaf, body) = map_event("PreCompact", &json!({ "session_id": "cc" }));
+        let (leaf, body) = Tool::ClaudeCode.map_event("PreCompact", &json!({ "session_id": "cc" }));
         assert_eq!(leaf, "event/PreCompact");
         assert_eq!(body["event"], "PreCompact");
     }
@@ -532,16 +552,29 @@ mod tests {
     }
 
     #[test]
-    fn session_secret_roundtrip_and_retire() {
+    fn session_token_is_scoped_not_full_authority() {
+        // The launch path must mint a GRANT-SCOPED session token, NOT a
+        // full-authority fenced secret. Concretely: the principal must NOT
+        // resolve via secrets::read (the path that yields actor=None / owner-
+        // equivalent authority in the broker), and its scope must be only its
+        // own obs subtree. This is the regression guard for the entry-16 gap.
         let dir = std::env::temp_dir().join(format!("elanus-codetest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root { dir: dir.clone() };
         let principal = "code-deadbeef";
-        let secret = mint_session_secret(&root, principal).unwrap();
-        // The broker reads it via secrets::read; the principal authenticates.
-        assert_eq!(secrets::read(&root, principal).as_deref(), Some(secret.as_str()));
-        retire_session_secret(&root, principal);
-        assert_eq!(secrets::read(&root, principal), None);
+        let token = codesession::mint(&root, principal, "claude-code", std::process::id() as i32)
+            .unwrap();
+        // It does NOT resolve as a full-authority fenced secret — the broker's
+        // owner-equivalent path (crate::secrets::read) must return None for it.
+        assert_eq!(crate::secrets::read(&root, principal), None);
+        // It is scoped to exactly its own obs subtree.
+        assert!(token.may_publish("obs/agent/claude-code/code-deadbeef/session/start"));
+        assert!(!token.may_publish("in/human/owner"));
+        assert!(!token.may_publish("work/agent/exec"));
+        assert!(!token.may_subscribe("obs/#"));
+        // Retire kills it.
+        codesession::retire(&root, principal);
+        assert!(codesession::read(&root, principal).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

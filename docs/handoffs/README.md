@@ -15,7 +15,10 @@ context for the pass currently in flight.
   Code under elanus as one envelope, two adapters: cage, hook→bus record,
   mailbox delivery, memory/context via the prompt hook, and the planner/worker
   orchestration loop. **M0 launcher + M1 hook→bus bridge landed for the Claude
-  Code adapter** (2026-06-19, `elanus code`, [../../src/codeagent.rs](../../src/codeagent.rs));
+  Code adapter** (2026-06-19, `elanus code`, [../../src/codeagent.rs](../../src/codeagent.rs)),
+  with a fix pass closing the session-identity authority gap via a **grant-scoped
+  per-session token** ([../../src/codesession.rs](../../src/codesession.rs)) — the
+  broker resolves `code-*` as a scoped actor, not full authority.
   M2–M5 and the Codex adapter remain — see the handoff Log for as-built decisions.
   Backed by the one coding-agents journey
   [../journeys/02-claude-code.md](../journeys/02-claude-code.md) (the why); the

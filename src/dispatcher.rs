@@ -99,6 +99,13 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
     // Stale leases from dead holders: release anything whose dispatch is no
     // longer running and whose pid is gone. Crash-only, same as everything.
     release_dead_leases(&conn)?;
+    // Orphaned coding-session credentials: a launcher SIGKILL'd mid-session
+    // leaks its scoped token (the best-effort retire never ran). Reap any whose
+    // owning launcher pid is gone so a dead session's credential stops
+    // authenticating (docs/security.md). Crash-only, like the lease reaper.
+    for orphan in crate::codesession::reap_orphans(root) {
+        eprintln!("[daemon] reaped orphaned coding-session credential {orphan}");
+    }
     // Register what's on the package path; requests only, never grants.
     if let Err(e) = packages::sync(root, &conn) {
         eprintln!("[daemon] package sync: {e:#}");
