@@ -144,16 +144,51 @@ grammar).
   only, today (Appendix B). `--dangerously-bypass-hook-trust` is only acceptable
   for elanus-generated hooks.
 
-### Scoped config, no pollution; the cage is the authority
+### Scoped config, no pollution
 
-Launch the real binary inside the elanus cage. The coding agent's own sandbox is
-either bypassed (`codex --dangerously-bypass-approvals-and-sandbox`,
-`claude --dangerously-skip-permissions`) **only because the elanus cage is the
-real wall**, or mirrored — prefer elanus as the single authority (Appendix B).
-Generated config lives in a temp/isolated location, never the user's home state.
-Confirm the cage actually covers the whole process tree, PTY, spawned commands,
-temp files, and network (Appendix B open question; this is the property the whole
-safety story rests on).
+Launch the real binary in a resolved workdir, with generated config (hooks,
+sandbox/permission settings) in a temp/isolated location — never the user's
+`~/.codex` / `~/.claude` home state.
+
+### Sandboxing: one cage, not two
+
+Both coding agents sandbox, and so does elanus — and on the platforms that matter
+they use the **same primitive**: macOS Seatbelt (`sandbox-exec` — docs/sandbox.md
+notes this is exactly what Claude Code's own sandbox uses), Linux bubblewrap +
+Landlock. So "two layers" is not two technologies; it is the same mechanism
+applied twice. That settles the shape:
+
+- **Do not run two independent OS sandboxes** (the naive "both"). Nesting the same
+  primitive is fragile and only ever *intersects*: an inner Seatbelt/bubblewrap can
+  fail to initialize inside the outer one (nested user namespaces especially), or
+  it forbids something the outer cage meant to allow — confusing EPERMs — and it is
+  two policy sources to keep aligned. Bad default.
+- **Layer by concern instead (the good "both").** elanus owns the OS **cage** over
+  the whole process tree (fail-closed, inherited across fork/exec, so everything the
+  agent spawns is covered — docs/sandbox.md). The tool keeps its **approval policy**
+  (permission prompts / on-request / untrusted) as a cooperative *inner UX* layer —
+  approval is separate from the sandbox in both Codex and CC, so you keep the
+  familiar prompts without a second OS wall.
+- **Single authority = reconstruct the posture in the cage (preferred).** Bypass the
+  tool's redundant OS sandbox (`--dangerously-bypass-approvals-and-sandbox` /
+  `--dangerously-skip-permissions`) and make the elanus cage the one wall, mapping
+  the tool's posture modes onto cage settings: Codex `read-only` / `workspace-write`
+  / `danger-full-access` (and CC permission modes / allowed-tools) ↔ the cage's write
+  set, read scope, and network policy. Replicate enough of the tool's expected
+  semantics that it still behaves (workspace writes succeed, `/tmp` writable, network
+  limited-not-absent where the mode expects it).
+
+**The prerequisite — a complete cage, built not staged.** This works only when the
+elanus cage actually does what the tool's sandbox did: restrict **reads and
+network**, not just writes. Today the cage is a write-fence (reads/network open);
+docs/sandbox.md [DECIDED 2026-06-19] promotes read scoping + egress from "deferred"
+to the single-cage **end state**, precisely because this envelope needs them and
+the project is pre-release (no migration reason to stage). So treat the complete
+cage (write + read + egress) as a **core-elanus prerequisite** of the bypass: build
+it, reconstruct the full tool posture onto it, and only then bypass the tool's own
+sandbox. Do not ship a staged half-measure that bypasses onto a write-only fence;
+if the cage's read/egress work isn't done yet, that's a blocking dependency to
+close in core, not a reason to keep the tool's sandbox as a permanent crutch.
 
 ### Provenance: the session carries its own identity
 
@@ -209,12 +244,20 @@ Shape:
   injection, no inbound delivery yet.
 - Generated config goes to an isolated location; the user's `~/.codex` / `~/.claude`
   is untouched.
+- **Sandbox posture: the single cage.** Bypass the tool's own sandbox onto the
+  elanus cage, which does write + read + egress scoping (the end state in
+  docs/sandbox.md), and reconstruct the tool's posture modes onto it. That complete
+  cage is a core-elanus prerequisite of this milestone — build it, don't stage
+  around it with the tool's own sandbox.
 
 Acceptance criteria:
 - Running the launcher in a project starts a normal, fully usable coding session
   (real TUI for the interactive mode).
 - A write outside the workdir/approved prefixes is denied by the cage (prove it —
   attempt a write to a path outside and show it fails).
+- A read of a sensitive path outside the agent's read scope is denied by the cage,
+  and network egress outside policy is blocked — reads and network are contained,
+  matching what the tool's own sandbox would have done (prove both, not just writes).
 - A new elanus session id exists for the run; the user's coding-agent home state is
   unchanged after exit (diff it).
 
@@ -321,10 +364,13 @@ Acceptance criteria:
 - **One envelope, two adapters.** Shared launch/cage/record/mailbox/context core;
   Codex- and CC-specific surfaces isolated to thin adapters.
 - **Don't reimplement or fake the tool.** The launched thing is the real coding
-  agent. No fake web UI around it (journey 05).
-- **elanus is the authority boundary.** Bypass flags are valid only inside the
-  cage; confirm the cage covers the full process tree/PTY/network before relying on
-  it. Fail closed where a missing boundary would leak.
+  agent. No fake web UI around it (journey 02).
+- **One OS cage, and a complete one.** The elanus cage must restrict writes, reads,
+  and network (docs/sandbox.md end state) before it replaces the tool's own sandbox —
+  bypassing onto a write-only fence is a containment regression, so the complete cage
+  is a prerequisite, not an afterthought. One OS cage, never two; keep the tool's
+  *approval* UX as a cooperative inner layer. Fail closed where a missing boundary
+  would leak.
 - **No home-state pollution.** Generated config/hooks live in isolated locations;
   the user's `~/.codex` / `~/.claude` is never edited.
 - **Provenance is real.** Per-session minted identity; the broker stamps the
@@ -458,6 +504,9 @@ these are version-dependent.
 
 - Launcher surface chosen (`elanus code` vs per-tool) and why: _TODO_
 - Cage coverage of the coding-agent process tree / PTY / network — verified?: _TODO_
+- Posture-mode → cage mapping (Codex read-only/workspace-write/full ↔ cage write +
+  read + egress) and confirmation the complete cage (incl. read scoping) is in place
+  before bypass: _TODO_
 - Exact hook JSON payloads (Codex; CC event-specific fields): _TODO_
 - Context-injection placement per tool + measured cache behavior (prefer the
   out-of-band system-reminder/developer channel; confirm Codex placement): _TODO_

@@ -52,7 +52,8 @@ that layer.
 - [mcp.md](mcp.md) - MCP as a border protocol for third-party tool servers, not
   first-party elanus mechanisms.
 - [sandbox.md](sandbox.md) - cage/camera split, grants, leases, fs event
-  doctrine, and platform notes.
+  doctrine, read scoping + egress as the single-cage end state, the read camera
+  (events on file access), and platform notes.
 - [security.md](security.md) - index of known security issues and doctrine. Read
   this before claiming a security property or adding a privileged surface.
 - [topics.md](topics.md) - v3 verb-first topic grammar, mailbox model,

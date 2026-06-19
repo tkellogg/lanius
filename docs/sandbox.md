@@ -95,6 +95,20 @@ egress — fs-write scoping without egress control is half a threat model: the
 camera sees staging, exfil is a network event. Both get their own design
 pass.
 
+**[DECIDED 2026-06-19] Promoted from deferred to target.** Read scoping and
+egress control are now part of the single-cage **end state**, not a later pass.
+Two forces converged: the coding-agent envelope
+(docs/handoffs/coding-agents.md) must replace each coding tool's *own* sandbox —
+which restricts reads and network — so a write-only cage would be a containment
+*regression*; and the project is pre-release, so there is no migration reason to
+stage. Build the complete cage (write + read + egress) and reconstruct the tool
+posture onto it, rather than shipping a write-only interim. The hard part remains
+*policy*, not the primitive: the read envelope is a different shape from the write
+envelope — deny-by-default writes are natural, but a usable agent must still read
+interpreters, system libraries, and its repo, so the read grant needs a broad
+sensible baseline with deny-listed sensitive regions (secrets, credential stores,
+other agents' state), not the tight allowlist the write side uses.
+
 **[Note — security review 2026-06-11].** These two deferred passes turned out
 to be load-bearing for *bus* security too, not just fs exfil. The
 per-connection bus ACL (bus.md, Packages) cannot contain a malicious local
@@ -159,6 +173,71 @@ capture-exclusion patterns (.gitignore-shaped: `target/`, `node_modules/`,
 
 Later option: retain the last event per file topic — "who last wrote this
 file" becomes a subscribe, not a query.
+
+## The read camera: events on file access
+
+**[OPEN — leaning, 2026-06-19]** Reads should be observable the way writes are: an
+event on the bus when a caged process opens a file, so "what did this agent read"
+(injection-payload provenance, the other half of the threat model) is a
+subscription, not a guess. This is **core functionality** — every caged spawn, not
+just coding agents — so it belongs to the cage subsystem, not any one package.
+
+But reads cannot reuse the write camera's mechanism. The write camera is a
+**boundary diff**; reads leave no durable trace to diff, so observation must come
+from **live interception** at the syscall boundary — and the cage primitives
+(Seatbelt, Landlock) are *enforce-only*: they allow or deny, they emit nothing. The
+read camera is therefore a genuinely different mechanism from both the cage and the
+write camera. Shape of the decision:
+
+- **Granularity is per-open, not per-read.** One `cat` is a single `openat` and
+  many `read`s; a build issues millions of reads. The meaningful access event is the
+  open; firing per `read()` is unusable volume.
+- **Volume is opt-in, like the write camera.** A read flavor on the `obs/fs` noun
+  defaults to recorder `none`; you subscribe the subtree you care about. Even
+  per-open, an unscoped firehose drowns everything.
+- **Allow-and-notify, not allow-or-veto, to start.** The ask is a read *camera*:
+  allow the read, emit the event. The same interception point could later host a
+  blocking read *hook* (veto a read of a secret) — the camera/hook split mirrored on
+  the read side. Start with the camera.
+- **Mechanism, by platform — this is the cost.** The candidates are exactly the ones
+  "Platform notes" calls *not* the write-camera baseline, because the read camera is
+  where they become necessary:
+  - **Linux, unprivileged:** seccomp user-notification (`SECCOMP_USER_NOTIF`) — a
+    supervisor fd receives `openat` notifications with the path, allows, and emits
+    the event. No root. Cost: the open blocks on a userspace round-trip, so it is
+    intercept-shaped (synchronous), not free fire-and-forget.
+  - **Linux, privileged:** `fanotify` notify/permission events, or an eBPF
+    tracepoint on `openat` — lower per-event cost and asynchronous, but need
+    `CAP_SYS_ADMIN`.
+  - **macOS:** Endpoint Security (`ES_EVENT_TYPE_NOTIFY_OPEN`) is the clean stream,
+    but needs the endpoint-security entitlement (signed app) — heavier than
+    Seatbelt. Seatbelt will *enforce* read denies but does not emit allowed reads. So
+    macOS is the hard platform: read *enforcement* is free with the cage; read
+    *observation* needs ES (or root `dtrace`/`fs_usage`).
+- **Lean.** Build the read camera on seccomp user-notification on Linux first
+  (unprivileged, matches the no-root baseline stance), and treat macOS observation
+  as ES-or-accepted-gap initially — read *enforcement* lands on both platforms via
+  the cage regardless.
+
+**Optional, with honest availability.** Availability is platform- and
+privilege-dependent — unprivileged on Linux (seccomp-unotify, at a synchronous
+per-open cost), entitlement/root on macOS (Endpoint Security), undefined on Windows
+until the cage is — so the read camera is **opt-in**, and three states must be
+legible: *available and on*, *available and off*, and *unavailable here*. Two
+requirements follow:
+
+- **Readable config + status.** Whether the read camera is enabled, and whether it
+  is even available on this platform/privilege, must be plainly readable — in config
+  and on the system-status / trust surface (the same place that already reports
+  root, credential, broker). Not buried.
+- **Fast-fail subscribe.** Subscribing to the read-camera topics when it is off or
+  unavailable must **fail fast and loud** — a clear SUBACK failure / error event
+  (the bus already does per-filter SUBACK 0x87, bus.md), never a silently-empty
+  subscription that reads as "no file reads happened." This is the history-503
+  lesson: never let a consumer wait forever on something that cannot deliver.
+
+Read *enforcement* (the scope) is independent of all this — it rides the cage and is
+always on; only the *camera* is optional.
 
 ## Platform notes
 
