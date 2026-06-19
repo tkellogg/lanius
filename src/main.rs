@@ -5,6 +5,7 @@ mod config_repo;
 mod configcli;
 mod context;
 mod db;
+mod dev;
 mod dispatcher;
 mod dotenv;
 mod envcompat;
@@ -132,6 +133,18 @@ enum Cmd {
     Daemon {
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
+    },
+    /// Run the local dev stack: daemon + web relay + Vite UI, supervised
+    Dev {
+        /// Dispatcher poll interval for the daemon child.
+        #[arg(long, default_value_t = 200)]
+        interval_ms: u64,
+        /// Port for the web relay backend.
+        #[arg(long, default_value_t = 7180)]
+        web_port: u16,
+        /// Port for the Vite dev server.
+        #[arg(long, default_value_t = 5173)]
+        vite_port: u16,
     },
     /// Emit an event — the universal entry point
     Emit {
@@ -437,6 +450,11 @@ fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Init { .. } => unreachable!(),
         Cmd::Daemon { interval_ms } => dispatcher::run(&root, interval_ms)?,
+        Cmd::Dev {
+            interval_ms,
+            web_port,
+            vite_port,
+        } => dev::run(&root, interval_ms, web_port, vite_port)?,
         Cmd::Emit {
             r#type,
             payload,

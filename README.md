@@ -34,6 +34,19 @@ elanus render | less                             # inspect assembled context
 tail -f $ELANUS_ROOT/trace.jsonl | jq .          # the flight recorder
 ```
 
+For web development, one supervised command starts the dispatcher, the web
+relay, and Vite:
+
+```sh
+cargo run -- dev
+# -> daemon: restarted on Rust source changes
+# -> web relay: http://127.0.0.1:7180, node --watch for backend files
+# -> Vite UI:   http://127.0.0.1:5173
+```
+
+If any child exits, the supervisor restarts it. `Ctrl-C` shuts down all child
+process groups, including Node/Vite descendants.
+
 ## The milestone loop
 
 A cron tick wakes the agent → it works → hits a question → emits `human/ask`

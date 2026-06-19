@@ -42,11 +42,23 @@ UI-driven decisions carry `decided_by=ui` in the ledger:
 
 ```sh
 cd ui/web && npm install
-npm run dev                                   # Vite + React dev server
+cargo run --manifest-path ../../Cargo.toml -- dev
+# -> daemon + web relay + Vite dev server
 # -> http://127.0.0.1:5173, proxies /api to http://127.0.0.1:7180
 ```
 
-Run the backend relay separately while developing:
+From the repo root, the same command is:
+
+```sh
+cargo run -- dev
+```
+
+The dev supervisor restarts crashed children, restarts the daemon when Rust
+sources change, lets Node/Vite watch their own files, and shuts down the whole
+stack on `Ctrl-C`.
+
+Run the backend relay separately only when you need to debug it outside the
+supervisor:
 
 ```sh
 npm run dev:relay                              # watches server.mjs/config.mjs
