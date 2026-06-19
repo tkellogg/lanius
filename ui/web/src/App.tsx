@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { adminGet, adminPost, adminPut, history, publish } from './api';
+import { adminGet, adminPost, adminPut, history, publish, status as fetchStatus } from './api';
 import { openLiveStream } from './live';
 import { Button, IconButton } from './components/primitives';
 
@@ -117,6 +117,60 @@ function packageBadges(pkg: any) {
   return badges;
 }
 
+function grantState(pkg: any) {
+  const grants = pkg.grants ?? [];
+  if (!grants.length) return 'no grants';
+  if (grants.some((g: any) => g.state === 'requested')) return 'pending approval';
+  if (grants.some((g: any) => g.state === 'approved')) return 'approved';
+  return grants[0]?.state ?? 'unknown';
+}
+
+function riskBadges(pkg: any) {
+  const manifest = pkg.manifest ?? {};
+  const request = manifest.request ?? {};
+  const badges: string[] = [];
+  if ((request.fs_write ?? []).length) badges.push('writes files');
+  if (manifest.process?.mode === 'daemon') badges.push('daemon');
+  if (manifest.process?.http) badges.push('local http');
+  if (manifest.hooks) badges.push('hook');
+  if ((manifest.mcp ?? []).length) badges.push('mcp');
+  if ((manifest.stages ?? []).length) badges.push('prompt context');
+  if ((manifest.config?.agent_tunable ?? []).length) badges.push('agent-tunable');
+  if ((request.publish ?? []).some((v: string) => v === '#' || v.endsWith('/#'))) badges.push('broad publish');
+  const state = grantState(pkg);
+  if (state === 'pending approval') badges.unshift('pending approval');
+  else if (state === 'approved') badges.unshift('approved');
+  return badges.length ? badges : ['low surface'];
+}
+
+function capabilityOutcome(kit: any) {
+  const hook = String(kit.hook ?? '').trim();
+  if (hook) return hook;
+  if (/core/i.test(kit.name)) return 'core agent behaviors and skills';
+  if (/dev/i.test(kit.name)) return 'developer safety and coding-workflow helpers';
+  if (/funnel/i.test(kit.name)) return 'turn incoming work into structured agent tasks';
+  return 'adds reusable behavior to your agents';
+}
+
+function costSummary(profile: any, fallbackModel = '') {
+  const model = profile?.model ?? fallbackModel;
+  const turns = profile?.max_turns;
+  const autonomy = profile?.autonomy ?? 'off';
+  const hardCaps = [];
+  if (turns) hardCaps.push(`${turns} run steps`);
+  const throttle = profile?.throttle ?? {};
+  for (const [name, t] of Object.entries(throttle) as any) {
+    if (t?.llm_tokens_per_hour) hardCaps.push(`${name}: ${t.llm_tokens_per_hour} tokens/hour`);
+    if (t?.max_concurrent) hardCaps.push(`${name}: ${t.max_concurrent} concurrent`);
+  }
+  return {
+    model: model || 'provider default',
+    autonomy,
+    hardCaps,
+    label: hardCaps.length ? 'hard caps configured' : 'no hard cap visible yet',
+  };
+}
+
 function declaredConfigParams(pkg: any) {
   const byKey = new Map();
   for (const key of pkg.manifest?.config?.agent_tunable ?? []) {
@@ -208,8 +262,9 @@ export function App() {
   const [modelOptions, setModelOptions] = useState<any[]>([]);
   const [modelsHint, setModelsHint] = useState('');
 
+  const [systemStatus, setSystemStatus] = useState<any>(null);
   const [setup, setSetup] = useState<any>({ status: '', statusKind: '', kits: null, packages: null, proposals: null, loading: false });
-  const [newAgent, setNewAgent] = useState({ name: '', model: '' });
+  const [newAgent, setNewAgent] = useState({ name: '', purpose: '', workdir: '', model: '', turns: '24', autonomy: 'off', capability: '' });
   const [newAgentNote, setNewAgentNote] = useState('');
 
   const [cfgProfile, setCfgProfile] = useState<string | null>(null);
@@ -263,6 +318,11 @@ export function App() {
     for (const p of j.profiles ?? []) touchAgent(p.agent, { profile: p.profile });
   };
 
+  const loadSystemStatus = async () => {
+    const j = await fetchStatus();
+    setSystemStatus(j);
+  };
+
   const setHistoryState = (v: boolean) => setHistoryOk((prev) => prev === v ? prev : v);
 
   const refreshAgents = async () => {
@@ -274,10 +334,12 @@ export function App() {
   };
 
   useEffect(() => {
+    void loadSystemStatus();
     void loadDiskAgents();
     void refreshAgents();
     const iv = setInterval(refreshAgents, 15000);
-    return () => clearInterval(iv);
+    const statusIv = setInterval(loadSystemStatus, 10000);
+    return () => { clearInterval(iv); clearInterval(statusIv); };
   }, []);
 
   useEffect(() => {
@@ -287,6 +349,7 @@ export function App() {
           setDefaultAgent(m.agent);
           touchAgent(m.agent);
         }
+        setSystemStatus((prev: any) => prev ? { ...prev, broker_connected: !!m.connected, broker: m.broker ?? prev.broker, agent: m.agent ?? prev.agent } : prev);
         setConn({ connected: !!m.connected, text: m.connected ? 'connected' : 'disconnected' });
         return;
       }
@@ -335,11 +398,11 @@ export function App() {
 
   const stageTitle = sel.kind === 'welcome' ? 'welcome'
     : sel.kind === 'signals' ? 'signals'
-      : sel.kind === 'setup' ? 'add-ons'
+      : sel.kind === 'setup' ? 'setup'
         : sel.agent;
   const stageNote = sel.kind === 'welcome' ? 'orient, then dive in'
     : sel.kind === 'signals' ? 'a live view of everything happening — orange means something needs your attention'
-      : sel.kind === 'setup' ? 'add useful behavior and adjust its settings'
+      : sel.kind === 'setup' ? 'first-run health, agent setup, capabilities, and trust'
         : sel.tab === 'converse' ? `in/agent/${sel.agent} ⇄ in/human — the mailbox view`
           : sel.tab === 'sessions' ? 'your agent’s past conversations'
             : sel.tab === 'configure' ? 'who this agent is — model, mailbox, visibility'
@@ -347,7 +410,8 @@ export function App() {
 
   const loadSetup = async (opts: any = {}) => {
     setSetup((s: any) => ({ ...s, loading: true, status: opts.status ?? s.status, statusKind: opts.statusKind ?? s.statusKind }));
-    const [kits, packages, proposals] = await Promise.all([adminGet('kits'), adminGet('packages'), adminGet('proposals')]);
+    const [status, kits, packages, proposals] = await Promise.all([fetchStatus(), adminGet('kits'), adminGet('packages'), adminGet('proposals')]);
+    setSystemStatus(status);
     await loadDiskAgents();
     setSetup({ loading: false, status: opts.status ?? '', statusKind: opts.statusKind ?? '', kits, packages, proposals });
   };
@@ -355,14 +419,37 @@ export function App() {
   const createAgent = async () => {
     const name = newAgent.name.trim();
     const model = newAgent.model.trim();
+    const purpose = newAgent.purpose.trim();
+    const workdir = newAgent.workdir.trim();
+    const turns = Number(newAgent.turns || 0);
     if (!name) { setNewAgentNote('name it first'); return; }
     setNewAgentNote('creating…');
     const r = await adminPost('agents', { name, ...(model ? { model } : {}) });
     if (!r.ok) { setNewAgentNote(r.error ?? 'failed'); return; }
-    setNewAgent({ name: '', model: '' });
+    const set: Record<string, any> = { autonomy: newAgent.autonomy };
+    if (model) set['model.model'] = model;
+    if (turns > 0) set['model.max_turns'] = turns;
+    if (workdir) set['sandbox.workdir'] = workdir;
+    if (purpose) set['vars.purpose'] = purpose;
+    const save = await adminPost('agents/set', { name, set: prunedSet(set) });
+    if (!save.ok) {
+      setNewAgentNote(`created ${name}, but setup details did not save: ${save.error ?? 'unknown error'}`);
+      await loadDiskAgents();
+      selectAgent(name, 'configure');
+      return;
+    }
+    if (newAgent.capability) {
+      const kit = newAgent.capability;
+      const add = await adminPost('kits/add', { kit });
+      if (!add.ok) {
+        setNewAgentNote(`created ${name}; capability ${kit} did not add: ${add.error ?? 'unknown error'}`);
+      }
+    }
+    setNewAgent({ name: '', purpose: '', workdir: '', model: '', turns: '24', autonomy: 'off', capability: '' });
     setNewAgentNote('');
     await loadDiskAgents();
-    postConfigureNote.current = `created ${name} — set its identity below, then converse`;
+    await loadSetup({ status: `created ${name}. Next: send a message or tune advanced settings.`, statusKind: 'ok' });
+    postConfigureNote.current = `created ${name} — setup choices saved; advanced settings are below`;
     selectAgent(name, 'configure');
   };
 
@@ -804,7 +891,7 @@ export function App() {
             <span id="stage-note" className="panel-note">{stageNote}</span>
           </div>
 
-          <WelcomeView hidden={sel.kind !== 'welcome'} primary={primaryAgent()} historyOk={historyOk} selectAgent={selectAgent} selectSetup={selectSetup} selectSignals={selectSignals} />
+          <WelcomeView hidden={sel.kind !== 'welcome'} primary={primaryAgent()} historyOk={historyOk} systemStatus={systemStatus} selectAgent={selectAgent} selectSetup={selectSetup} selectSignals={selectSignals} />
           <ConverseView hidden={!(sel.kind === 'agent' && sel.tab === 'converse')} agent={sel.agent} messages={conv.get(sel.agent) ?? []} submitCompose={submitCompose} answerAsk={answerAsk} />
           <SessionsView hidden={!(sel.kind === 'agent' && sel.tab === 'sessions')} state={sessionsState} agent={sel.agent} openTranscript={openTranscript} loadSessions={loadSessions} />
           <ConfigureView
@@ -843,13 +930,16 @@ export function App() {
           <SetupView
             hidden={sel.kind !== 'setup'}
             setup={setup}
+            systemStatus={systemStatus}
             provenance={provenance}
+            profiles={diskProfiles}
             newAgent={newAgent}
             setNewAgent={setNewAgent}
             newAgentNote={newAgentNote}
             createAgent={createAgent}
             modelsHint={modelsHint}
             loadSetup={loadSetup}
+            selectAgent={selectAgent}
           />
           <RailView hidden={!(sel.kind === 'signals' || (sel.kind === 'agent' && sel.tab === 'telemetry'))} filter={filter} setFilter={setFilter} paused={paused} setPaused={setPaused} rows={filteredRail} />
 
@@ -871,7 +961,7 @@ export function App() {
         <span id="stat-count">{count} event{count === 1 ? '' : 's'}</span>
         <span id="stat-broker" />
         <span className="strip-note">same authority as your terminal — because it is your terminal</span>
-        <span className="strip-right">a live view of your agents</span>
+        <span className="strip-right">setup first, cockpit when needed</span>
       </footer>
     </div>
   );
@@ -892,7 +982,7 @@ function Nav({ agents, sel, historyOk, selectAgent, selectSignals, selectSetup }
       <div className="panel-head"><h2>instruments</h2></div>
       <div id="nav-list" className="nav-list" onKeyDown={onKey}>
         <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" onClick={selectSignals}><span className="nav-sigil">◮</span> signals</button>
-        <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> add-ons</button>
+        <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
         <div className="nav-label">agents</div>
         <div id="nav-agents">
           {items.map((name) => {
@@ -917,11 +1007,16 @@ function Nav({ agents, sel, historyOk, selectAgent, selectSignals, selectSetup }
   );
 }
 
-function WelcomeView({ hidden, primary, historyOk, selectAgent, selectSetup, selectSignals }: any) {
+function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, selectSetup, selectSignals }: any) {
+  const healthy = systemStatus?.credential === 'present' && (systemStatus?.broker_connected || false);
   return (
     <div id="view-welcome" className="view" hidden={hidden}>
       <div className="welcome-pane">
-        <p className="welcome-lead">talk to your agents, watch what's happening, and add useful behavior.</p>
+        <p className="welcome-lead">set up a useful agent, see whether the local stack is healthy, then open the cockpit when you need the real machinery.</p>
+        <div className={`welcome-health ${healthy ? 'ok' : 'warn'}`}>
+          <span>{healthy ? 'local stack looks ready' : 'setup needs attention'}</span>
+          <span>{systemStatus?.root ?? 'checking root...'}</span>
+        </div>
         <div id="welcome-agent" className="welcome-agent">
           {!primary ? <div className="dim-note">no agents yet — create your first one.</div> : (
             <>
@@ -935,8 +1030,8 @@ function WelcomeView({ hidden, primary, historyOk, selectAgent, selectSetup, sel
           )}
         </div>
         <div className="welcome-actions">
-          <button id="welcome-new" className="ghost" onClick={() => selectSetup()}>＋ new agent</button>
-          <button id="welcome-kits" className="ghost" onClick={() => selectSetup()}>⚒ add-ons</button>
+          <button id="welcome-new" className="ghost" onClick={() => selectSetup()}>＋ guided setup</button>
+          <button id="welcome-kits" className="ghost" onClick={() => selectSetup()}>⚒ capabilities</button>
           <button id="welcome-signals" className="ghost" onClick={selectSignals}>◮ live signals</button>
         </div>
         <p id="welcome-hint" className="dim-note">{historyOk === false ? 'transcripts are unavailable until the history view is on.' : ''}</p>
@@ -945,42 +1040,110 @@ function WelcomeView({ hidden, primary, historyOk, selectAgent, selectSetup, sel
   );
 }
 
-function SetupView({ hidden, setup, provenance, newAgent, setNewAgent, newAgentNote, createAgent, modelsHint, loadSetup }: any) {
+function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent, setNewAgent, newAgentNote, createAgent, modelsHint, loadSetup, selectAgent }: any) {
   const kits = setup.kits;
   const pkgs = setup.packages;
   const proposals = setup.proposals;
+  const packages = pkgs?.packages ?? [];
+  const primaryProfile = profiles?.find((p: any) => p.profile === 'default') ?? profiles?.[0] ?? null;
+  const cost = costSummary(primaryProfile, newAgent.model);
+  const capabilityOptions = (kits?.kits ?? []).filter((k: any) => !provenance.has(k.name));
+  const health = [
+    { label: 'root', value: systemStatus?.root ?? 'checking...', state: systemStatus?.root_exists === false ? 'bad' : 'ok' },
+    { label: 'owner credential', value: systemStatus?.credential ?? 'checking...', state: systemStatus?.credential === 'present' ? 'ok' : 'bad' },
+    { label: 'broker', value: systemStatus?.broker_connected ? 'connected' : 'not connected', state: systemStatus?.broker_connected ? 'ok' : 'bad' },
+    { label: 'history', value: systemStatus?.history?.available ? 'available' : 'live-only', state: systemStatus?.history?.available ? 'ok' : 'warn' },
+  ];
   return (
     <div id="view-setup" className="view" hidden={hidden}>
       <div className="setup-pane">
         <div id="setup-status" className={`setup-status${setup.statusKind ? ` status-${setup.statusKind}` : ''}`} role="status" aria-live="polite" hidden={!setup.status}>{setup.status}</div>
-        <section className="setup-block">
-          <h3>new agent</h3>
-          <p className="dim-note">an agent has a name, a model, and an identity you can edit. created instantly — no review needed.</p>
+
+        <section className="setup-block setup-home">
+          <div>
+            <h3>setup home</h3>
+            <p className="dim-note">First success starts here: local health, one useful agent, capabilities, cost limits, and risk signals.</p>
+          </div>
+          <div className="setup-health-grid">
+            {health.map((item) => <div key={item.label} className={`setup-health-card is-${item.state}`}><span>{item.label}</span><strong>{item.value}</strong></div>)}
+          </div>
+          <div className="setup-next">
+            <strong>recommended next step</strong>
+            {!profiles?.length ? <span>Create your first agent, then send it one message.</span>
+              : !packages.length ? <span>Add a capability so the agent can do useful work.</span>
+                : <span>Use the cockpit when you need transcript, telemetry, or advanced config.</span>}
+          </div>
+        </section>
+
+        <section className="setup-block setup-wizard">
+          <h3>guided new agent</h3>
+          <p className="dim-note">Name it, give it a purpose, choose where it works, and put a visible run budget on day one.</p>
+          <div className="wizard-grid">
+            <label><span>1. name</span><input id="na-name" placeholder="kestrel" spellCheck={false} value={newAgent.name} onChange={(e) => setNewAgent({ ...newAgent, name: e.target.value })} /></label>
+            <label><span>2. purpose</span><input id="na-purpose" placeholder="watch launches, draft briefs, triage issues..." spellCheck={false} value={newAgent.purpose} onChange={(e) => setNewAgent({ ...newAgent, purpose: e.target.value })} /></label>
+            <label><span>3. home / workdir</span><input id="na-workdir" placeholder="optional path where tools should run" spellCheck={false} value={newAgent.workdir} onChange={(e) => setNewAgent({ ...newAgent, workdir: e.target.value })} /></label>
+            <label><span>4. model</span><input id="na-model" placeholder="model (default: claude-sonnet-4-6)" spellCheck={false} list="model-suggestions" value={newAgent.model} onChange={(e) => setNewAgent({ ...newAgent, model: e.target.value })} /></label>
+            <label><span>5. run-step cap</span><input id="na-turns" type="number" min="1" max="200" value={newAgent.turns} onChange={(e) => setNewAgent({ ...newAgent, turns: e.target.value })} /></label>
+            <label><span>6. autonomy</span><select id="na-autonomy" value={newAgent.autonomy} onChange={(e) => setNewAgent({ ...newAgent, autonomy: e.target.value })}>{['off', 'manual', 'assisted', 'autonomous'].map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
+            <label><span>starting capability</span><select id="na-capability" value={newAgent.capability} onChange={(e) => setNewAgent({ ...newAgent, capability: e.target.value })}><option value="">none yet</option>{capabilityOptions.map((k: any) => <option key={k.name} value={k.name}>{k.name}</option>)}</select></label>
+          </div>
           <div className="setup-row">
-            <input id="na-name" placeholder="name (e.g. kestrel)" spellCheck={false} value={newAgent.name} onChange={(e) => setNewAgent({ ...newAgent, name: e.target.value })} />
-            <input id="na-model" placeholder="model (default: claude-sonnet-4-6)" spellCheck={false} list="model-suggestions" value={newAgent.model} onChange={(e) => setNewAgent({ ...newAgent, model: e.target.value })} />
             <button id="na-create" onClick={createAgent}>create agent</button>
-            <span id="na-note" className="dim-note">{newAgentNote}</span>
+            <span id="na-note" className="dim-note">{newAgentNote || 'Creates a normal profile; advanced settings remain inspectable.'}</span>
           </div>
           <p id="models-hint" className="dim-note" hidden={!modelsHint}>{modelsHint}</p>
         </section>
+
+        <section className="setup-block setup-cost">
+          <h3>cost visibility</h3>
+          <div className="cost-grid">
+            <div><span>model</span><strong>{cost.model}</strong></div>
+            <div><span>autonomy</span><strong>{cost.autonomy}</strong></div>
+            <div><span>limits</span><strong>{cost.label}</strong></div>
+          </div>
+          <p className="dim-note">Run-step caps are hard activation limits. Dollar estimates are not shown until provider pricing is known; unknown is better than fake precision.</p>
+          {!!cost.hardCaps.length && <div className="risk-badges">{cost.hardCaps.map((cap: string) => <span key={cap} className="badge">{cap}</span>)}</div>}
+        </section>
+
         <section className="setup-block">
-          <h3>available add-ons</h3>
-          <p className="dim-note">ready-made behavior shared by all your agents. adding one takes effect right away.</p>
+          <h3>capability catalog</h3>
+          <p className="dim-note">Ready-made outcomes backed by kits/packages. Expand a card to inspect the underlying mechanics.</p>
           <div id="setup-kits">
-            {setup.loading || !kits ? 'resolving…' : kits.ok === false ? <div className="dim-note">add-ons could not load: {kits.error ?? 'unknown - is the elanus binary on the server PATH current?'}</div>
-              : !(kits.kits ?? []).length ? <div className="dim-note">no add-ons found</div>
+            {setup.loading || !kits ? 'resolving…' : kits.ok === false ? <div className="dim-note">capabilities could not load: {kits.error ?? 'unknown - is the elanus binary on the server PATH current?'}</div>
+              : !(kits.kits ?? []).length ? <div className="dim-note">no capabilities found</div>
                 : kits.kits.map((k: any) => <SetupKit key={k.name} kit={k} installed={provenance.has(k.name)} loadSetup={loadSetup} />)}
           </div>
         </section>
         <section className="setup-block">
-          <h3>installed add-ons</h3>
-          <p className="dim-note">adjust settings for the things you have added.</p>
+          <h3>installed capabilities</h3>
+          <p className="dim-note">Installed is not the same as approved/running. Use the badges to see current trust state.</p>
           <div id="setup-configs">
-            {setup.loading || !pkgs ? 'checking…' : pkgs.ok === false ? <div className="dim-note">could not load installed add-ons: {pkgs.error ?? 'unknown error'}</div>
+            {setup.loading || !pkgs ? 'checking…' : pkgs.ok === false ? <div className="dim-note">could not load installed capabilities: {pkgs.error ?? 'unknown error'}</div>
               : !(pkgs.packages ?? []).length ? <div className="dim-note">nothing added yet</div>
                 : pkgs.packages.map((p: any) => <SetupPackageConfig key={p.name} pkg={p} />)}
           </div>
+        </section>
+        <section className="setup-block setup-trust">
+          <h3>trust and footprint</h3>
+          <p className="dim-note">A cheap security summary for Ganesh: what is local, where data lives, and which capabilities create risk.</p>
+          <div className="trust-grid">
+            <div><span>active principal</span><strong>{systemStatus?.owner ?? 'owner'}</strong></div>
+            <div><span>web relay</span><strong>127.0.0.1:{systemStatus?.web?.port ?? '7180'}</strong></div>
+            <div><span>database</span><strong>{systemStatus?.paths?.database?.path ?? 'unknown'}</strong></div>
+            <div><span>config repo</span><strong>{systemStatus?.paths?.config?.path ?? 'unknown'}</strong></div>
+          </div>
+          <details>
+            <summary className="dim-note">copyable security summary</summary>
+            <pre className="setup-readme">{[
+              `root: ${systemStatus?.root ?? 'unknown'}`,
+              `principal: ${systemStatus?.owner ?? 'unknown'}`,
+              `broker: ${systemStatus?.broker ?? 'unknown'} (${systemStatus?.broker_connected ? 'connected' : 'not connected'})`,
+              `credential: ${systemStatus?.credential ?? 'unknown'}`,
+              `history: ${systemStatus?.history?.available ? systemStatus.history.endpoint : 'live-only/unavailable'}`,
+              `database: ${systemStatus?.paths?.database?.path ?? 'unknown'}`,
+              `config: ${systemStatus?.paths?.config?.path ?? 'unknown'}`,
+            ].join('\n')}</pre>
+          </details>
         </section>
         <section className="setup-block">
           <h3>agent requests</h3>
@@ -1017,10 +1180,15 @@ function SetupKit({ kit, installed, loadSetup }: any) {
     <div className="setup-kit">
       <div className="setup-kit-head">
         <span className="setup-kit-name">{kit.name}</span>
-        <span className="setup-kit-hook dim-note">{kit.hook || ''}</span>
+        <span className="setup-kit-hook dim-note">{capabilityOutcome(kit)}</span>
         {installed && <span className="badge">installed</span>}
         <button className="ghost" onClick={toggle}>details</button>
         <button onClick={add} disabled={busy}>{busy ? 'adding...' : installed ? 'add again' : 'add'}</button>
+      </div>
+      <div className="capability-meta">
+        <span>for: useful behavior shared across agents</span>
+        <span>needs: review details before adding unfamiliar kits</span>
+        <span>state: {installed ? 'installed' : 'available'}</span>
       </div>
       <pre className="setup-readme" hidden={!open}>{readme}</pre>
     </div>
@@ -1049,7 +1217,9 @@ function SetupPackageConfig({ pkg }: any) {
   };
   return (
     <div className="setup-pending-pkg">
-      <div className="setup-kit-head"><span className="setup-kit-name">{pkg.name}</span><span className={active ? 'badge' : 'badge badge-wait'}>{active ? 'on' : 'off'}</span></div>
+      <div className="setup-kit-head"><span className="setup-kit-name">{pkg.name}</span><span className={active ? 'badge' : 'badge badge-wait'}>{active ? 'on' : 'off'}</span><span className="dim-note">{grantState(pkg)}</span></div>
+      <div className="cfg-package-detail">{packageDescription(pkg)}</div>
+      <div className="risk-badges">{riskBadges(pkg).map((b) => <span key={b} className={`badge${/pending|broad|writes|daemon|http|hook|mcp|prompt/.test(b) ? ' badge-wait' : ''}`}>{b}</span>)}</div>
       <div className="setup-row">
         <input placeholder="setting" spellCheck={false} value={key} onChange={(e) => setKey(e.target.value)} />
         <input placeholder="value, using TOML for arrays or numbers" spellCheck={false} value={value} onChange={(e) => setValue(e.target.value)} />
@@ -1270,7 +1440,7 @@ function PackageCard({ pkg, disabled, canConfigure, toggle }: any) {
   return (
     <details className={`cfg-package-card${disabled ? ' is-disabled' : ''}`} data-package={pkg.name}>
       <summary className="cfg-package-head"><span className="cfg-disclosure">▸</span><span className={`cfg-source-icon source-${source.kind}`} title={`${source.kind}: ${source.label}`}>{source.icon}</span><span className="cfg-package-title"><span className="setup-kit-name">{pkg.name}</span><span className="cfg-pkg-desc">{packageDescription(pkg)}</span></span></summary>
-      <div className="cfg-package-body"><div className="cfg-package-detail">{actorDetail(pkg)}</div><div className="cfg-package-meta">{packageBadges(pkg).map((b) => <span key={b.text} className={b.cls}>{b.text}</span>)}</div><div className="cfg-package-controls"><span className="dim-note">{disabled ? 'disabled for this agent' : 'enabled for this agent'}</span><button className={disabled ? 'ghost cfg-package-disable' : 'cfg-package-disable'} title={disabled ? `remove ${pkg.name} from skills.exclude` : `add ${pkg.name} to skills.exclude`} onClick={(e) => { e.preventDefault(); toggle(); }}>{disabled ? 'enable' : 'disable'}</button><button className="ghost cfg-package-config-toggle" hidden={!canConfigure} onClick={(e) => { e.preventDefault(); load(); }}>settings</button></div>
+      <div className="cfg-package-body"><div className="cfg-package-detail">{actorDetail(pkg)}</div><div className="cfg-package-meta">{packageBadges(pkg).map((b) => <span key={b.text} className={b.cls}>{b.text}</span>)}{riskBadges(pkg).map((b) => <span key={`risk-${b}`} className="badge badge-wait">{b}</span>)}</div><div className="cfg-package-controls"><span className="dim-note">{disabled ? 'disabled for this agent' : 'enabled for this agent'} · {grantState(pkg)}</span><button className={disabled ? 'ghost cfg-package-disable' : 'cfg-package-disable'} title={disabled ? `remove ${pkg.name} from skills.exclude` : `add ${pkg.name} to skills.exclude`} onClick={(e) => { e.preventDefault(); toggle(); }}>{disabled ? 'enable' : 'disable'}</button><button className="ghost cfg-package-config-toggle" hidden={!canConfigure} onClick={(e) => { e.preventDefault(); load(); }}>settings</button></div>
         <div className="cfg-package-config-panel" hidden={!panelOpen}>{rows === null ? 'loading...' : !rows.length ? <div className="dim-note">no configurable settings declared</div> : rows.map((row, idx) => <ConfigInputRow key={row.param.key} param={row.param} value={row.value} setValue={(v: string) => setRows(rows.map((r, i) => i === idx ? { ...r, value: v } : r))} save={<><IconButton label={`save ${pkg.name}.${row.param.key}`} onClick={() => saveRow(idx)}>✓</IconButton><span className="dim-note">{row.note}</span></>} />)}</div>
       </div>
     </details>

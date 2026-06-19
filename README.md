@@ -42,10 +42,12 @@ cargo run -- dev
 # -> daemon: restarted on Rust source changes
 # -> web relay: http://127.0.0.1:7180, node --watch for backend files
 # -> Vite UI:   http://127.0.0.1:5173
+# -> log:       target/elanus-dev.log
 ```
 
 If any child exits, the supervisor restarts it. `Ctrl-C` shuts down all child
-process groups, including Node/Vite descendants.
+process groups, including Node/Vite descendants. The log file is overwritten on
+each start and lives under the gitignored `target/` directory.
 
 ## The milestone loop
 

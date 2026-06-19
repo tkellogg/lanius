@@ -322,6 +322,47 @@ function sendJson(res, code, body) {
   res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(body));
 }
 
+function existsKind(file) {
+  try {
+    const st = fs.statSync(file);
+    if (st.isDirectory()) return 'dir';
+    if (st.isFile()) return 'file';
+    return 'other';
+  } catch {
+    return null;
+  }
+}
+
+function systemStatus() {
+  const history = historyEndpoint();
+  const rootExists = ROOT ? existsKind(ROOT) === 'dir' : false;
+  const busFile = ROOT ? path.join(ROOT, 'bus.toml') : null;
+  const dbFile = ROOT ? path.join(ROOT, 'elanus.db') : null;
+  const traceFile = ROOT ? path.join(ROOT, 'trace.jsonl') : null;
+  const configDir = ROOT ? path.join(ROOT, 'config') : null;
+  const runDir = ROOT ? path.join(ROOT, 'run') : null;
+  return {
+    ok: true,
+    root: ROOT,
+    root_exists: rootExists,
+    owner: ownerName(),
+    credential: cred ? 'present' : 'missing',
+    broker: BROKER,
+    broker_connected: connected,
+    web: { port: PORT, static_dir: PUB, dist_present: fs.existsSync(path.join(DIST, 'index.html')) },
+    agent: AGENT,
+    binary: ELANUS_BIN,
+    history: { available: !!history, endpoint: history },
+    paths: {
+      bus: busFile ? { path: busFile, exists: !!existsKind(busFile) } : null,
+      database: dbFile ? { path: dbFile, exists: !!existsKind(dbFile) } : null,
+      trace: traceFile ? { path: traceFile, exists: !!existsKind(traceFile) } : null,
+      config: configDir ? { path: configDir, exists: existsKind(configDir) === 'dir' } : null,
+      run: runDir ? { path: runDir, exists: existsKind(runDir) === 'dir' } : null,
+    },
+  };
+}
+
 // The product calls them "agents"; the kernel calls them "profiles". Translate
 // the CLI's raw error text at this boundary (docs/layering.md) so a person sees
 // plain language, not an internal word or a bare "error:" prefix.
@@ -545,6 +586,10 @@ const server = http.createServer((req, res) => {
     sseClients.add(res);
     log('sse', `client connected (${sseClients.size} total)`);
     req.on('close', () => { sseClients.delete(res); log('sse', `client disconnected (${sseClients.size} total)`); });
+    return;
+  }
+  if (url.pathname === '/api/status' && req.method === 'GET') {
+    sendJson(res, 200, systemStatus());
     return;
   }
   if (url.pathname.startsWith('/api/admin/')) {

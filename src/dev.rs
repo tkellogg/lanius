@@ -2,9 +2,12 @@ use crate::paths::Root;
 use anyhow::{Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -22,6 +25,8 @@ pub fn run(root: &Root, interval_ms: u64, web_port: u16, vite_port: u16) -> Resu
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("cargo"));
     let target_debug = repo.join("target/debug");
+    let log_path = repo.join("target/elanus-dev.log");
+    let log = Log::create(&log_path)?;
     let path = prepend_path(&target_debug)?;
     let root_s = root.dir.display().to_string();
     let web_port_s = web_port.to_string();
@@ -69,41 +74,45 @@ pub fn run(root: &Root, interval_ms: u64, web_port: u16, vite_port: u16) -> Resu
         ),
     ];
 
-    eprintln!("[dev] root={}", root.dir.display());
-    eprintln!("[dev] web relay: http://127.0.0.1:{web_port}");
-    eprintln!("[dev] vite UI:   http://127.0.0.1:{vite_port}");
-    eprintln!("[dev] ctrl-c stops the whole stack");
+    log.line(format!("[dev] root={}", root.dir.display()));
+    log.line(format!("[dev] log={}", log_path.display()));
+    log.line(format!("[dev] web relay: http://127.0.0.1:{web_port}"));
+    log.line(format!("[dev] vite UI:   http://127.0.0.1:{vite_port}"));
+    log.line("[dev] ctrl-c stops the whole stack");
 
     for service in &mut services {
-        service.start()?;
+        service.start(&log)?;
     }
 
     while !SHUTDOWN.load(Ordering::SeqCst) {
         let now = Instant::now();
         for service in &mut services {
             if service.watch_changed()? {
-                eprintln!("[dev] {} inputs changed; restarting", service.name);
+                log.line(format!("[dev] {} inputs changed; restarting", service.name));
                 service.stop(Duration::from_secs(3));
                 service.next_start = Some(Instant::now() + Duration::from_millis(250));
             }
 
             if let Some(status) = service.try_wait()? {
-                eprintln!("[dev] {} exited ({status}); restarting", service.name);
+                log.line(format!(
+                    "[dev] {} exited ({status}); restarting",
+                    service.name
+                ));
                 service.next_start = Some(Instant::now() + service.restart_delay(status));
             }
 
             if service.child.is_none() && service.next_start.is_some_and(|t| now >= t) {
-                service.start()?;
+                service.start(&log)?;
             }
         }
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    eprintln!("[dev] shutting down");
+    log.line("[dev] shutting down");
     for service in services.iter_mut().rev() {
         service.stop(Duration::from_secs(3));
     }
-    cleanup_root_processes(root);
+    cleanup_root_processes(root, &log);
     Ok(())
 }
 
@@ -152,26 +161,62 @@ impl CommandSpec {
         self
     }
 
-    fn spawn(&self, name: &str) -> Result<Child> {
+    fn spawn(&self, name: &str, log: &Log) -> Result<RunningChild> {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args)
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
         set_process_group(&mut cmd);
-        cmd.spawn()
-            .with_context(|| format!("starting {name}: {}", render_command(self)))
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("starting {name}: {}", render_command(self)))?;
+        let mut threads = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            threads.push(tee_stream(stdout, StreamKind::Stdout, log.clone()));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            threads.push(tee_stream(stderr, StreamKind::Stderr, log.clone()));
+        }
+        Ok(RunningChild { child, threads })
+    }
+}
+
+struct RunningChild {
+    child: Child,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl RunningChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn wait(mut self) -> std::io::Result<ExitStatus> {
+        let status = self.child.wait();
+        self.join_threads();
+        status
+    }
+
+    fn join_threads(&mut self) {
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
     }
 }
 
 struct Service {
     name: &'static str,
     command: CommandSpec,
-    child: Option<Child>,
+    child: Option<RunningChild>,
     started_at: Option<Instant>,
     next_start: Option<Instant>,
     watch: Option<RustInputs>,
@@ -194,9 +239,9 @@ impl Service {
         self
     }
 
-    fn start(&mut self) -> Result<()> {
-        eprintln!("[dev] starting {}", self.name);
-        self.child = Some(self.command.spawn(self.name)?);
+    fn start(&mut self, log: &Log) -> Result<()> {
+        log.line(format!("[dev] starting {}", self.name));
+        self.child = Some(self.command.spawn(self.name, log)?);
         self.started_at = Some(Instant::now());
         self.next_start = None;
         Ok(())
@@ -208,6 +253,7 @@ impl Service {
         };
         match child.try_wait()? {
             Some(status) => {
+                child.join_threads();
                 self.child = None;
                 Ok(Some(status))
             }
@@ -237,19 +283,23 @@ impl Service {
     }
 
     fn stop(&mut self, grace: Duration) {
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.take() else {
             return;
         };
-        terminate_child_group(&mut child);
+        let mut child = child;
+        terminate_child_group(&child);
         let deadline = Instant::now() + grace;
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => {
+                    child.join_threads();
+                    return;
+                }
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Ok(None) => {
-                    kill_child_group(&mut child);
+                    kill_child_group(&child);
                     let _ = child.wait();
                     return;
                 }
@@ -337,8 +387,81 @@ fn render_command(spec: &CommandSpec) -> String {
     parts.join(" ")
 }
 
+#[derive(Clone)]
+struct Log {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl Log {
+    fn create(path: &Path) -> Result<Log> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        Ok(Log {
+            file: Arc::new(Mutex::new(file)),
+        })
+    }
+
+    fn line(&self, msg: impl AsRef<str>) {
+        let line = msg.as_ref();
+        eprintln!("{line}");
+        self.write_bytes(line.as_bytes());
+        self.write_bytes(b"\n");
+    }
+
+    fn write_bytes(&self, bytes: &[u8]) {
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.write_all(bytes);
+            let _ = file.flush();
+        }
+    }
+}
+
+enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+fn tee_stream<R>(mut stream: R, kind: StreamKind, log: Log) -> JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 8192];
+        loop {
+            let Ok(n) = stream.read(&mut buf) else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            let bytes = &buf[..n];
+            match kind {
+                StreamKind::Stdout => {
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(bytes);
+                    let _ = out.flush();
+                }
+                StreamKind::Stderr => {
+                    let mut err = std::io::stderr().lock();
+                    let _ = err.write_all(bytes);
+                    let _ = err.flush();
+                }
+            }
+            log.write_bytes(bytes);
+        }
+    })
+}
+
 #[cfg(unix)]
-fn cleanup_root_processes(root: &Root) {
+fn cleanup_root_processes(root: &Root, log: &Log) {
     let needle = root.dir.to_string_lossy();
     if needle.is_empty() {
         return;
@@ -347,10 +470,10 @@ fn cleanup_root_processes(root: &Root) {
     if pids.is_empty() {
         return;
     }
-    eprintln!(
+    log.line(format!(
         "[dev] stopping {} root-scoped child process(es)",
         pids.len()
-    );
+    ));
     signal_pids(&pids, libc::SIGTERM);
     std::thread::sleep(Duration::from_secs(1));
     let remaining = root_processes(&needle);
@@ -360,7 +483,7 @@ fn cleanup_root_processes(root: &Root) {
 }
 
 #[cfg(not(unix))]
-fn cleanup_root_processes(_: &Root) {}
+fn cleanup_root_processes(_: &Root, _: &Log) {}
 
 #[cfg(unix)]
 fn root_processes(needle: &str) -> Vec<i32> {
@@ -411,25 +534,29 @@ fn set_process_group(cmd: &mut Command) {
 fn set_process_group(_: &mut Command) {}
 
 #[cfg(unix)]
-fn terminate_child_group(child: &mut Child) {
+fn terminate_child_group(child: &RunningChild) {
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGTERM);
     }
 }
 
 #[cfg(not(unix))]
-fn terminate_child_group(child: &mut Child) {
-    let _ = child.kill();
+fn terminate_child_group(child: &RunningChild) {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
 }
 
 #[cfg(unix)]
-fn kill_child_group(child: &mut Child) {
+fn kill_child_group(child: &RunningChild) {
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
 }
 
 #[cfg(not(unix))]
-fn kill_child_group(child: &mut Child) {
-    let _ = child.kill();
+fn kill_child_group(child: &RunningChild) {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGKILL);
+    }
 }

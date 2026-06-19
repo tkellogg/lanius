@@ -138,8 +138,26 @@ const testAgentProfile = 'harrier';
   await page.waitForSelector('.nav-setup');
   await page.click('.nav-setup');
   await page.waitForSelector('#na-name', { state: 'visible' });
+  await waitFor('setup: health home shows root, credential, broker and history', async () => {
+    const text = await page.$eval('.setup-home', (el) => el.textContent);
+    return /root/i.test(text) && /owner credential/i.test(text) && /broker/i.test(text) && /history/i.test(text);
+  }, 8000);
+  await waitFor('setup: guided agent wizard exposes purpose, workdir, cost cap and autonomy', async () => {
+    const text = await page.$eval('.setup-wizard', (el) => el.textContent);
+    return /purpose/i.test(text) && /home \/ workdir/i.test(text) && /run-step cap/i.test(text) && /autonomy/i.test(text);
+  }, 8000);
+  await waitFor('setup: cost visibility separates hard caps from estimates', async () => {
+    const text = await page.$eval('.setup-cost', (el) => el.textContent);
+    return /cost visibility/i.test(text) && /hard activation limits/i.test(text) && /fake precision/i.test(text);
+  }, 8000);
+  await waitFor('setup: trust footprint exposes local root/data surface', async () => {
+    const text = await page.$eval('.setup-trust', (el) => el.textContent);
+    return /active principal/i.test(text) && /web relay/i.test(text) && /database/i.test(text) && /config repo/i.test(text);
+  }, 8000);
   await page.fill('#na-name', testAgentProfile);
+  await page.fill('#na-purpose', 'qa regression agent');
   await page.fill('#na-model', 'claude-haiku-4-5-20251001');
+  await page.fill('#na-turns', '11');
   await page.click('#na-create');
   await waitFor('new agent: configure tab opens', async () => {
     return !(await page.$eval('#view-configure', (el) => el.hidden));
@@ -363,8 +381,10 @@ const testAgentProfile = 'harrier';
   const include = await page.$eval('#cfg-include', (el) => el.value);
   const exclude = await page.$eval('#cfg-exclude', (el) => el.value);
   await page.click('text=advanced context parameters');
-  const varKey = await page.$eval('#cfg-vars .cfg-var-key', (el) => el.value);
-  const varValue = await page.$eval('#cfg-vars .cfg-var-value', (el) => el.value);
+  const varRows = await page.$$eval('#cfg-vars .cfg-var-row', (rows) => rows.map((row) => ({
+    key: row.querySelector('.cfg-var-key')?.value,
+    value: row.querySelector('.cfg-var-value')?.value,
+  })));
   const rawToml = await page.$eval('#cfg-toml', (el) => el.value);
   model.includes('haiku') ? ok('configure reload: model persisted') : fail(`configure reload: model wrong: "${model}"`);
   turns === '7' ? ok('configure reload: max_turns persisted') : fail(`configure reload: turns wrong: "${turns}"`);
@@ -376,9 +396,9 @@ const testAgentProfile = 'harrier';
     : fail(`configure reload: context stage timeout wrong: "${contextWindowTimeout}"`);
   include.includes('#') ? ok('configure reload: skills.include persisted') : fail(`configure reload: include wrong: "${include}"`);
   exclude.includes('history') ? ok('configure reload: skills.exclude persisted') : fail(`configure reload: exclude wrong: "${exclude}"`);
-  varKey === 'window_rows' && varValue === '60'
+  varRows.some((row) => row.key === 'window_rows' && row.value === '60')
     ? ok('configure reload: advanced context parameter persisted')
-    : fail(`configure reload: context parameter wrong: "${varKey}"="${varValue}"`);
+    : fail(`configure reload: context parameter wrong: ${JSON.stringify(varRows)}`);
   /\[vars\][\s\S]*window_rows\s*=\s*"60"/.test(rawToml)
     ? ok('configure reload: raw [vars] persisted')
     : fail('configure reload: raw [vars] missing window_rows');
@@ -442,6 +462,10 @@ const renamedAgent = 'falcon';
   await waitFor('kits: catalog visible', async () => {
     return /dev|core|funnel/.test(await page.$eval('#setup-kits', (el) => el.textContent));
   }, 10000);
+  await waitFor('capabilities: catalog uses outcome language and installed state', async () => {
+    const text = await page.$eval('#setup-kits', (el) => el.textContent);
+    return /capability|available|installed|useful behavior/i.test(text);
+  }, 10000);
   // Expand the dev kit readme.
   await waitFor('kits: dev kit readme button', async () => {
     for (const row of await page.$$('.setup-kit')) {
@@ -484,6 +508,10 @@ const renamedAgent = 'falcon';
     : fail('add-ons: add banner vanished');
   await waitFor('add-ons: installed list includes git-protect', async () => {
     return /git-protect/.test(await page.$eval('#setup-configs', (el) => el.textContent));
+  }, 10000);
+  await waitFor('risk: installed capabilities show approval/risk badges', async () => {
+    const text = await page.$eval('#setup-configs', (el) => el.textContent);
+    return /approved|pending approval|hook|daemon|local http|broad publish|low surface/i.test(text);
   }, 10000);
   let saved = false;
   let savedCard = null;

@@ -45,6 +45,7 @@ cd ui/web && npm install
 cargo run --manifest-path ../../Cargo.toml -- dev
 # -> daemon + web relay + Vite dev server
 # -> http://127.0.0.1:5173, proxies /api to http://127.0.0.1:7180
+# -> log: ../../target/elanus-dev.log
 ```
 
 From the repo root, the same command is:
@@ -55,7 +56,8 @@ cargo run -- dev
 
 The dev supervisor restarts crashed children, restarts the daemon when Rust
 sources change, lets Node/Vite watch their own files, and shuts down the whole
-stack on `Ctrl-C`.
+stack on `Ctrl-C`. It tees terminal output into `target/elanus-dev.log`,
+overwriting that gitignored file on each start.
 
 Run the backend relay separately only when you need to debug it outside the
 supervisor:

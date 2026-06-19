@@ -26,6 +26,10 @@ export function adminPut<T = ApiResult>(path: string, body: unknown): Promise<T>
   }).catch(() => ({ ok: false, error: 'server unreachable' }) as T);
 }
 
+export function status<T = ApiResult>(): Promise<T> {
+  return json<T>('/api/status').catch(() => ({ ok: false, error: 'server unreachable' }) as T);
+}
+
 export function publish(topic: string, payload: unknown, correlation?: string): Promise<boolean> {
   return json<{ ok?: boolean }>('/api/publish', {
     method: 'POST',
