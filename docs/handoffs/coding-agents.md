@@ -1,7 +1,10 @@
 # Handoff: coding-agent support (Codex & Claude Code)
 
-Status: planned, not started. Intended implementer: Codex (with Tim, and possibly
-a planner agent, in the loop).
+Status: **M0 launcher scaffolding + M1 hook→bus bridge landed for the Claude Code
+adapter** (2026-06-19, branch `coding-agents`). Verified end to end against the
+live worktree stack. M2–M5 and the Codex adapter are not started. Intended
+implementer for the rest: Codex (with Tim, and possibly a planner agent, in the
+loop). See the Log at the bottom for the as-built decisions.
 
 This handoff asks elanus to **launch and supervise external coding agents** — the
 Codex CLI/TUI and Claude Code — and bridge their lifecycle, tools, and context
@@ -502,14 +505,97 @@ these are version-dependent.
 
 ## Log (fill in as you build)
 
-- Launcher surface chosen (`elanus code` vs per-tool) and why: _TODO_
-- Cage coverage of the coding-agent process tree / PTY / network — verified?: _TODO_
+### 2026-06-19 — M0 launcher + M1 hook→bus bridge, Claude Code adapter (branch `coding-agents`)
+
+- **Launcher surface chosen — `elanus code <tool> [args...]`, not per-tool.**
+  Rationale: "one envelope, two adapters" (the guardrail). The `<tool>` positional
+  selects the adapter (`claude` today; `codex` errors with "next increment"); a
+  shared launch/identity/record core lives in `src/codeagent.rs`, only the
+  tool-specific surface (binary name, settings shape, hook-event map) is
+  adapter-local. A hidden sibling `elanus code hook <Event>` is the bridge the
+  generated hooks invoke; not meant to be run by hand. CLI wired in `src/main.rs`
+  (`Cmd::Code` → `CodeCmd::{Launch,Hook}`); module `src/codeagent.rs`.
+
+- **Per-session identity minting path — a per-session fenced secret.** Each launch
+  mints session id `code-<8hex>` and writes a fresh 0600 fenced secret named for
+  the session principal (`code-<session>`) into `Root::secrets()` — the SAME store
+  the kernel/owner secrets live in, which the cage fences from agents
+  (src/secrets.rs / src/sandbox.rs `Protect`). The launcher is uncaged (the human
+  ran it) so it can place the secret; a caged agent cannot, so it can never forge a
+  session identity. The launcher passes `ELANUS_PACKAGE=<principal>` +
+  `ELANUS_BUS_TOKEN=<secret>` (the creds `elanus bus pub` authenticates with) to
+  the child, so every observation the bridge publishes is **broker-verified and
+  stamped `sender = code-<session>` — never the owner** (docs/actors.md egress
+  lesson / security entry 16). VERIFIED LIVE: every obs in a real run carried
+  `"sender":"code-2af51b7e"`; an unauthenticated publish to the same topic was
+  refused `NotAuthorized` (deny-by-default), proving the identity is load-bearing.
+  The secret is retired (file deleted) when the session ends, so a dead session's
+  identity can't be re-presented. NOTE: a fenced-secret principal resolves as
+  **full authority** in the broker (broker.rs:421-426), not grant-scoped — accepted
+  for this increment (a human-launched real tool), but the tighter end state is a
+  grant-scoped per-session actor token minted by the daemon via
+  `bus::register_actor` (which is daemon-only today, so an out-of-process launcher
+  can't use it yet). Recorded as a follow-up, not faked.
+
+- **Hook JSON payloads (Claude Code, confirmed live, CC 2.1.183).** Hook stdin
+  carries `session_id`, `cwd`, `permission_mode`, `hook_event_name`, plus
+  event-specific fields. Confirmed shapes: `PreToolUse` → `tool_name` + `tool_input`
+  (object); `PostToolUse` → `tool_name` + `tool_input` + `tool_response` (object,
+  e.g. `{stdout,stderr,interrupted,...}`); `UserPromptSubmit` → `prompt`;
+  `SessionStart` → `source` ("startup"); `SessionEnd` → `reason` ("other").
+  `map_event` in src/codeagent.rs maps these to obs leaves matching the exec.rs
+  grammar: `session/{start,started,idle,stop}`, `user/message`,
+  `tool/<name>/{call,result}`. A real headless run produced the full ordered
+  record: session/start → session/started → user/message → tool/Bash/call →
+  tool/Bash/result(failed:false) → session/idle(Stop) → session/idle(SessionEnd)
+  → session/stop(exit_code:0). Sufficient to reconstruct the session.
+
+- **Scoped config, no `~/.claude` pollution — VERIFIED.** Generated settings (hooks
+  only, every command routing to `elanus -C <root> code hook <Event>`) live in
+  `<root>/run/<session>/settings.json`. Launched with `--settings <file>` +
+  `--setting-sources ''` (empty = load NO user/project/local settings, so the user's
+  `~/.claude` hooks/CLAUDE.md auto-discovery are untouched; only the generated hooks
+  run). After a real run, `~/.claude/settings.json` mtime was unchanged and no
+  config file under `~/.claude` was modified; the generated scratch + session secret
+  were cleaned up. (`--bare` was NOT used — it skips hooks entirely; the
+  `--settings` + empty `--setting-sources` combo is the correct no-pollution way to
+  run ONLY generated hooks.)
+
+- **Sandbox stance for this increment — the tool keeps its OWN sandbox active; NO
+  bypass onto today's write-only cage (deliberate sequencing, recorded per the
+  handoff guardrail).** Today's elanus cage (src/sandbox.rs) (a) enforces **writes
+  only** on macOS Seatbelt — reads and network are open — and (b) is built for
+  one-shot captured `sh -c` calls (stdin null, stdout piped, timeout-killed), NOT an
+  interactive long-lived TUI with inherited stdio. Bypassing Claude Code's own
+  sandbox onto that would be a containment regression (M0's read-denied/
+  network-blocked acceptance criteria need the COMPLETE cage that docs/sandbox.md
+  [DECIDED 2026-06-19] promotes to the end state but which is NOT built yet). So for
+  now the launcher does NOT pass `--dangerously-skip-permissions`-style bypass by
+  default; the tool's sandbox + approval UX stay active (reads/network contained),
+  and elanus owns the workdir + observation + identity. The single complete cage
+  (write + read + egress + the read camera) is a **core-elanus prerequisite**; the
+  tool-sandbox bypass + posture reconstruction (M0's "single cage" criteria) is a
+  LATER milestone gated on it. This is implementation sequencing, not product
+  staging — and the honest blocker the handoff flagged. **Cage coverage of the
+  coding-agent process tree / PTY / network: NOT verified, because the cage is not
+  in the launch path yet (by the decision above).**
+
+- **Tests + verification.** `cargo test` green (86 passing; 10 new in
+  `src/codeagent.rs` covering tool parse, obs-topic grammar/encoding, hook-event
+  mapping for every modeled event, settings shape, secret roundtrip/retire). Live
+  end-to-end run through the worktree dev stack (root `~/.elanus/wt-coding-agents`,
+  broker `:1893`) drove a real headless `claude -p` and captured the full ordered,
+  correctly-attributed record on `obs/agent/claude-code/#`.
+
+### Still TODO (next increments)
+
 - Posture-mode → cage mapping (Codex read-only/workspace-write/full ↔ cage write +
-  read + egress) and confirmation the complete cage (incl. read scoping) is in place
-  before bypass: _TODO_
-- Exact hook JSON payloads (Codex; CC event-specific fields): _TODO_
-- Context-injection placement per tool + measured cache behavior (prefer the
-  out-of-band system-reminder/developer channel; confirm Codex placement): _TODO_
-- Inbound-delivery mechanism actually used (headless resume vs SDK vs stream-json):
-  _TODO_
-- Per-session identity minting path: _TODO_
+  read + egress) and the complete cage (incl. read scoping) before bypass: BLOCKED
+  on the docs/sandbox.md end-state cage; deferred per the stance above.
+- Codex adapter (hook JSON payloads; `--dangerously-bypass-hook-trust` scoping;
+  context-injection placement developer/system vs user).
+- Context-injection placement per tool + measured cache behavior (M3, the
+  `UserPromptSubmit` `additionalContext` system-reminder seam).
+- Inbound-delivery mechanism (M2 inbox: interactive pull vs headless `--resume`).
+- Grant-scoped per-session actor token (vs the full-authority fenced secret used
+  now) — needs daemon-side per-session minting.

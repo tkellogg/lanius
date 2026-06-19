@@ -1,6 +1,7 @@
 mod broker;
 mod bus;
 mod buscli;
+mod codeagent;
 mod config_repo;
 mod configcli;
 mod context;
@@ -243,6 +244,34 @@ enum Cmd {
     Bus {
         #[command(subcommand)]
         cmd: BusCmd,
+    },
+    /// Launch and observe an external coding agent (Claude Code today)
+    Code {
+        #[command(subcommand)]
+        cmd: CodeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CodeCmd {
+    /// Launch the real coding agent in this directory, observed on the bus.
+    /// `tool` selects the adapter (currently: claude). Everything after it is
+    /// passed through to the tool unchanged.
+    #[command(disable_help_flag = true)]
+    Launch {
+        /// Which coding agent: claude (codex next).
+        tool: String,
+        /// Arguments passed straight through to the tool.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Internal: the hook bridge. Claude Code's generated hooks invoke this with
+    /// the event name; it reads the hook JSON on stdin and publishes one ordered
+    /// observation as the session's identity. Not meant to be run by hand.
+    #[command(hide = true)]
+    Hook {
+        /// The Claude Code hook event name (SessionStart, PreToolUse, …).
+        event: String,
     },
 }
 
@@ -857,6 +886,10 @@ fn run(cli: Cli) -> Result<()> {
                 });
                 buscli::subscribe(&root, &filter, count, timeout, b)?;
             }
+        },
+        Cmd::Code { cmd } => match cmd {
+            CodeCmd::Launch { tool, args } => codeagent::launch(&root, &tool, &args)?,
+            CodeCmd::Hook { event } => codeagent::hook(&root, &event)?,
         },
         Cmd::Events { limit } => {
             let conn = open(&root)?;

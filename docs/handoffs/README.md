@@ -14,7 +14,10 @@ context for the pass currently in flight.
 - [coding-agents.md](coding-agents.md) - launch and supervise Codex and Claude
   Code under elanus as one envelope, two adapters: cage, hook→bus record,
   mailbox delivery, memory/context via the prompt hook, and the planner/worker
-  orchestration loop. Backed by the one coding-agents journey
+  orchestration loop. **M0 launcher + M1 hook→bus bridge landed for the Claude
+  Code adapter** (2026-06-19, `elanus code`, [../../src/codeagent.rs](../../src/codeagent.rs));
+  M2–M5 and the Codex adapter remain — see the handoff Log for as-built decisions.
+  Backed by the one coding-agents journey
   [../journeys/02-claude-code.md](../journeys/02-claude-code.md) (the why); the
   Codex and Claude Code adapter references are Appendices A and B of the handoff.
 - [configuration-ux.md](configuration-ux.md) - the configuration-UX altitude and
