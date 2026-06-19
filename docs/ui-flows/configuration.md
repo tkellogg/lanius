@@ -294,15 +294,15 @@ pairs as normal agent configuration.
 3. Add a key/value row in `#cfg-vars`.
 4. Click the main `#cfg-save` button.
 
-**Observable expectation.** The controls are labeled as legacy context-stage /
+**Observable expectation.** The controls are labeled as advanced context /
 template parameters, not agent identity. Save succeeds through the normal form
 save, reload preserves the row, and the raw settings file contains the matching
-`[vars]` entry.
+stored value.
 
-### configure-8 — Package settings include typed context-stage parameters
+### configure-8 — Package settings declare scope and effective value
 
-**Goal.** Package rows expose typed, documented context-stage parameters from
-manifest `[[stage.config]]` declarations.
+**Goal.** Package rows expose typed, documented add-on context parameters
+without hiding whether a save changes one agent or every agent.
 
 **Preconditions.** Configure loaded, package tree rendered.
 
@@ -310,12 +310,24 @@ manifest `[[stage.config]]` declarations.
 1. Expand the `window` package row under `#cfg-package-configs`.
 2. Click its `settings` button.
 3. Inspect the `Window rows` control.
+4. Save `70` with the `every agent` button.
+5. Save `60` with the `this agent` button for the selected agent.
 
-**Observable expectation.** The row says it comes from `context stage window`,
-shows `type: number`, includes the manifest help text, and renders the numeric
-default `80`. The same declared parameter is also available in the matching
-context-stage tile; legacy `[vars]` remains available only through configure-7's
-raw advanced context parameters.
+**Observable expectation.** Before expanding the package row, its summary says
+settings can be saved for every agent or for the selected agent only. The
+opened setting row says it comes from `agent context window`, shows
+`type: number`, includes the manifest help text, and renders the numeric default
+`80`. It also says the edited value is the shared default for every agent and
+shows `effective here` plus the source (`from the package default`, `from the
+shared default`, or `overridden here for <agent>`). The `every agent` button
+calls `POST /api/admin/configs/set` and backend logs show `elanus config set`.
+The `this agent` button calls `POST /api/admin/agents/set` and backend logs show
+`elanus profile set <profile> vars.<key>=...`. After reload, the selected agent
+shows the one-agent override, while a second agent with the package sees the
+shared value. The same declared parameter is also available in the matching
+context-step tile, but that tile says it applies to the selected agent only;
+legacy raw values remain available only through configure-7's advanced context
+parameters.
 
 **How to verify.** Covered by `ui/web/test/ui.spec.mjs`.
 
@@ -330,18 +342,18 @@ the user edit raw TOML for the common fields.
 1. Inspect `#cfg-section-context`.
 2. Set `program` to `default`.
 3. Set `max context ms` to `12000`.
-4. Inspect `#cfg-context-chain` and find the `window/window` context-stage tile.
+4. Inspect `#cfg-context-chain` and find the `window/window` context-step tile.
 5. Change its `timeout ms` value to `9000`.
 6. Change its declared `Window rows` setting to `60`.
-7. Use the tile move controls when more than one context stage is visible.
+7. Use the tile move controls when more than one context step is visible.
 8. Click the main `#cfg-save` button.
 
 **Observable expectation.** Save succeeds, reload preserves both controls, and
 the raw settings file contains `[context] max_total_ms = 12000` plus a
 `context.stage` array entry for `window/window` with `timeout_ms = 9000`. The
-edited `Window rows` tile setting persists as `vars.window_rows = "60"` for this
-agent. The UI presents context stages as an ordered chain, not as a singleton
-object.
+edited `Window rows` tile setting is labeled as applying to this agent only and
+persists as `vars.window_rows = "60"` for this agent. The UI presents context
+steps as an ordered chain, not as a singleton object.
 
 **How to verify.** Covered by `ui/web/test/ui.spec.mjs`.
 
@@ -426,8 +438,8 @@ await expect(page.locator('#setup-configs')).toContainText(/git-protect|window|r
 
 ### add-ons-3 — Save package settings and read them back
 
-**Goal.** Give package configuration a visible home and prove writes survive a
-reload.
+**Goal.** Give shared package configuration a visible home and prove writes
+survive a reload.
 
 **Preconditions.** An add-on is installed and visible in `#setup-configs`.
 
@@ -436,10 +448,11 @@ reload.
 2. Click `save setting`.
 3. Expand `current settings`.
 
-**Observable expectation.** The inline note reads `saved`; expanding current
-settings fetches the raw TOML from `elanus config list <package>` and shows the
-saved key/value. The backend log shows `elanus config set ...`, and the change
-is committed on `config/live`.
+**Observable expectation.** The card says these settings apply to every agent
+that uses the add-on. The inline note reads `saved`; expanding current settings
+fetches the raw TOML from `elanus config list <package>` and shows the saved
+key/value. The backend log shows `elanus config set ...`, and the change is
+committed on `config/live`.
 
 **How to verify.**
 ```js

@@ -16,7 +16,8 @@ const TMP = fs.mkdtempSync('/tmp/elanus-ui-spec.');
 const BUS_PORT = 21000 + (process.pid % 2000);
 const WEB_PORT = 9300 + (process.pid % 500);
 const BASE = `http://127.0.0.1:${WEB_PORT}`;
-const ENV = { ...process.env, ELANUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
+const WEB_LOG = path.join(TMP, 'web.log');
+const ENV = { ...process.env, ELANUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}`, ELANUS_WEB_LOG: WEB_LOG };
 
 let failures = 0;
 const ok = (m) => console.log(`  ok: ${m}`);
@@ -204,7 +205,7 @@ const testAgentProfile = 'harrier';
     const text = await page.$eval('#cfg-section-context', (el) => el.textContent);
     return /context program/i.test(text)
       && /max context ms/i.test(text)
-      && /context stage chain/i.test(text)
+      && /context steps/i.test(text)
       && /raw TOML stores this as the context\.stage array/i.test(text);
   }, 5000);
   const windowContextStage = () => page.locator('#cfg-context-chain .cfg-context-stage[data-stage="window/window"]').first();
@@ -226,7 +227,7 @@ const testAgentProfile = 'harrier';
   await waitFor('configure: context stage declared setting renders in tile', async () => {
     const text = await windowContextStage().textContent();
     return /Window rows/.test(text)
-      && /context stage window/.test(text)
+      && /agent context window/.test(text)
       && /type:\s*number/.test(text);
   }, 5000);
   await windowContextStage()
@@ -255,7 +256,7 @@ const testAgentProfile = 'harrier';
     return !hasVarsSection
       && !/\bvars\b/i.test(indexText)
       && /advanced context parameters/i.test(rawText)
-      && /legacy\s+\[vars\]/i.test(rawText);
+      && /Advanced values for context and templates/i.test(rawText);
   }, 5000);
   await page.click('text=advanced context parameters');
   await page.fill('#cfg-vars .cfg-var-key', 'window_rows');
@@ -273,12 +274,16 @@ const testAgentProfile = 'harrier';
   await waitFor('configure: window context-stage package row exists', async () => {
     return await windowPackage().count() > 0;
   }, 8000);
+  await waitFor('configure: package row declares setting scope before expansion', async () => {
+    const text = await windowPackage().locator('summary').textContent();
+    return /settings can be saved for every agent or for harrier only/i.test(text);
+  }, 5000);
   await windowPackage().locator('summary').click();
   await windowPackage().locator('.cfg-package-config-toggle').click();
   await waitFor('configure: typed context-stage setting renders from manifest', async () => {
     const text = await windowPackage().textContent();
     return /Window rows/.test(text)
-      && /context stage window/.test(text)
+      && /agent context window/.test(text)
       && /type:\s*number/.test(text)
       && /Maximum transcript rows/.test(text);
   }, 8000);
@@ -290,6 +295,41 @@ const testAgentProfile = 'harrier';
   windowRows === '80'
     ? ok('configure: typed context-stage default value rendered')
     : fail(`configure: window_rows default wrong: "${windowRows}"`);
+  await waitFor('configure: package setting declares shared scope and effective source', async () => {
+    const text = await windowPackage().locator('.cfg-config-row', { hasText: 'Window rows' }).textContent();
+    return /shared default for every agent/i.test(text)
+      && /effective here:\s*80/i.test(text)
+      && /from the package default/i.test(text);
+  }, 5000);
+  const windowRowsRow = windowPackage().locator('.cfg-config-row', { hasText: 'Window rows' });
+  await windowRowsRow.locator('input[type="number"]').first().fill('70');
+  await windowRowsRow.locator('button[aria-label="save window.window_rows for every agent"]').click();
+  await waitFor('configure: shared package setting save is labeled for every agent', async () => {
+    const text = await windowRowsRow.textContent();
+    return /saved for every agent/i.test(text)
+      && /effective here:\s*70/i.test(text)
+      && /from the shared default/i.test(text);
+  }, 8000);
+  await windowRowsRow.locator('input[type="number"]').first().fill('60');
+  await windowRowsRow.locator('button[aria-label^="save window.window_rows for harrier"]').click();
+  await waitFor('configure: per-agent package setting save is labeled for this agent', async () => {
+    const text = await windowRowsRow.textContent();
+    return /saved for harrier/i.test(text)
+      && /effective here:\s*60/i.test(text)
+      && /overridden here for harrier/i.test(text);
+  }, 8000);
+  await windowRowsRow.locator('input[type="number"]').first().fill('70');
+  await windowRowsRow.locator('button[aria-label="save window.window_rows for every agent"]').click();
+  await waitFor('configure: shared save preserves selected agent override source', async () => {
+    const text = await windowRowsRow.textContent();
+    return /saved for every agent/i.test(text)
+      && /effective here:\s*60/i.test(text)
+      && /overridden here for harrier/i.test(text);
+  }, 8000);
+  await waitFor('configure: context tile declares agent-only scope', async () => {
+    const text = await windowContextStage().locator('.cfg-config-row', { hasText: 'Window rows' }).textContent();
+    return /applies to harrier only/i.test(text);
+  }, 5000);
   await waitFor('configure: skill filters are not text boxes', async () => {
     const types = await page.$$eval('#cfg-include, #cfg-exclude', (els) => els.map((el) => el.type));
     return types.every((t) => t === 'hidden');
@@ -408,6 +448,50 @@ const testAgentProfile = 'harrier';
   /\[context\][\s\S]*stage\s*=\s*\[[\s\S]*package\s*=\s*"window"[\s\S]*timeout_ms\s*=\s*9000/.test(rawToml)
     ? ok('configure reload: raw context.stage array persisted')
     : fail('configure reload: raw context.stage array missing window timeout');
+  const reloadedWindowPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="window"]').first();
+  await reloadedWindowPackage().evaluate((el) => { if (!el.open) el.querySelector('summary')?.click(); });
+  await reloadedWindowPackage().locator('.cfg-package-config-toggle').click();
+  await waitFor('configure reload: selected agent shows its package override source', async () => {
+    const text = await reloadedWindowPackage().locator('.cfg-config-row', { hasText: 'Window rows' }).textContent();
+    return /effective here:\s*60/i.test(text) && /overridden here for harrier/i.test(text);
+  }, 8000);
+  await waitFor('configure reload: selected agent context tile shows its override source', async () => {
+    const text = await page.locator('#cfg-context-chain .cfg-context-stage[data-stage="window/window"]')
+      .locator('.cfg-config-row', { hasText: 'Window rows' })
+      .textContent();
+    return /effective here:\s*60/i.test(text) && /overridden here for harrier/i.test(text);
+  }, 8000);
+  await waitFor('configure reload: second agent in nav', async () => {
+    const items = await page.$$('#nav-agents .nav-item');
+    for (const item of items) {
+      const text = await item.textContent();
+      if (/\bmain\b/.test(text)) { await item.click(); return true; }
+    }
+    return false;
+  });
+  await page.click('[data-tab="configure"]');
+  await page.waitForSelector('#view-configure:not([hidden])');
+  await waitForConfigureLoaded(page);
+  const mainWindowPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="window"]').first();
+  await mainWindowPackage().evaluate((el) => { if (!el.open) el.querySelector('summary')?.click(); });
+  await mainWindowPackage().locator('.cfg-package-config-toggle').click();
+  await waitFor('configure reload: second agent sees shared package setting', async () => {
+    const text = await mainWindowPackage().locator('.cfg-config-row', { hasText: 'Window rows' }).textContent();
+    return /effective here:\s*70/i.test(text) && /from the shared default/i.test(text);
+  }, 8000);
+  await waitFor('configure reload: second agent context tile sees shared setting', async () => {
+    const text = await page.locator('#cfg-context-chain .cfg-context-stage[data-stage="window/window"]')
+      .locator('.cfg-config-row', { hasText: 'Window rows' })
+      .textContent();
+    return /effective here:\s*70/i.test(text) && /from the shared default/i.test(text);
+  }, 8000);
+  const webLog = fs.existsSync(WEB_LOG) ? fs.readFileSync(WEB_LOG, 'utf8') : '';
+  /web:cli.*elanus config set window window_rows 70/.test(webLog)
+    ? ok('configure scope: backend log recorded shared config write')
+    : fail('configure scope: backend log missing shared config write');
+  /web:cli.*elanus profile set harrier .*vars\.window_rows="60"/.test(webLog)
+    ? ok('configure scope: backend log recorded per-agent profile write')
+    : fail('configure scope: backend log missing per-agent profile write');
   await page.close();
 }
 

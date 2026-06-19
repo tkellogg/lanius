@@ -75,7 +75,7 @@ function packageDescription(pkg: any) {
   if (manifest.process?.mode === 'daemon') return 'resident actor on the bus';
   if (manifest.process?.mode === 'exec') return 'per-event script actor';
   if (manifest.hooks) return 'policy hook package';
-  if ((manifest.stages ?? []).length) return 'context stage package';
+  if ((manifest.stages ?? []).length) return 'context helper package';
   if ((manifest.mcp ?? []).length) return 'MCP tool server package';
   return 'package';
 }
@@ -95,7 +95,7 @@ function actorDetail(pkg: any) {
   if (blocking) bits.push(`can block ${blocking}`);
   if (process?.http) bits.push('serves an approved local HTTP endpoint');
   if (manifest.hooks) bits.push(`declares ${manifest.hooks} hook${manifest.hooks === 1 ? '' : 's'}`);
-  if ((manifest.stages ?? []).length) bits.push(`contributes ${manifest.stages.length} context stage${manifest.stages.length === 1 ? '' : 's'}`);
+  if ((manifest.stages ?? []).length) bits.push(`adds ${manifest.stages.length} context helper${manifest.stages.length === 1 ? '' : 's'}`);
   if ((manifest.mcp ?? []).length) bits.push(`exposes ${manifest.mcp.length} MCP server${manifest.mcp.length === 1 ? '' : 's'}`);
   if (manifest.cron) bits.push(`schedules ${manifest.cron} recurring event${manifest.cron === 1 ? '' : 's'}`);
   const summary = bits.length ? `${bits.join('; ')}.` : packageDescription(pkg);
@@ -175,7 +175,7 @@ function declaredConfigParams(pkg: any) {
   const byKey = new Map();
   for (const key of pkg.manifest?.config?.agent_tunable ?? []) {
     if (!key) continue;
-    byKey.set(key, { key, type: 'string', label: key, help: 'Package setting declared agent-tunable by the package manifest.', agent_tunable: true, source: 'package' });
+    byKey.set(key, { key, type: 'string', label: key, help: 'This add-on allows an agent-specific value.', agent_tunable: true, agentScoped: true, source: 'add-on setting' });
   }
   for (const stage of pkg.manifest?.stages ?? []) {
     for (const param of stage.config ?? []) {
@@ -188,11 +188,16 @@ function declaredConfigParams(pkg: any) {
         default: param.default,
         options: param.options ?? [],
         agent_tunable: param.agent_tunable === true,
-        source: `context stage ${stage.name}`,
+        agentScoped: true,
+        source: `agent context ${stage.name}`,
       });
     }
   }
   return [...byKey.values()].sort((a, b) => a.key.localeCompare(b.key));
+}
+
+function packageHasAgentScopedSettings(pkg: any) {
+  return declaredConfigParams(pkg).some((param: any) => param.agentScoped);
 }
 
 function tomlDisplayValue(value: any, type = 'string') {
@@ -211,6 +216,44 @@ function parseConfigRows(raw = '') {
     if (m) rows.push({ key: m[1], value: m[2] });
   }
   return rows;
+}
+
+function configRowMap(raw = ''): Map<string, string> {
+  return new Map(parseConfigRows(raw).map((row) => [row.key, row.value] as [string, string]));
+}
+
+function displayConfigValue(raw: any, type = 'string') {
+  if (raw === undefined || raw === null || raw === '') return '';
+  const s = String(raw).trim();
+  if (type === 'string') {
+    try {
+      const parsed = JSON.parse(s);
+      if (typeof parsed === 'string') return parsed;
+    } catch {}
+  }
+  return s;
+}
+
+function valueSourceLabel(source: string, agentName: string) {
+  if (source === 'agent') return `overridden here for ${agentName || 'this agent'}`;
+  if (source === 'shared') return 'from the shared default';
+  if (source === 'package') return 'from the package default';
+  return 'not set yet';
+}
+
+function effectiveConfigValue(param: any, sharedRows: Map<string, string>, profileVars: any = {}, agentName = '') {
+  const key = param.key;
+  const agentValue = profileVars?.[key];
+  if (agentValue !== undefined && agentValue !== null) {
+    return { value: String(agentValue), source: 'agent', label: valueSourceLabel('agent', agentName) };
+  }
+  const sharedValue = sharedRows.get(key);
+  if (sharedValue !== undefined && String(sharedValue).trim() !== '') {
+    return { value: displayConfigValue(sharedValue, param.type), source: 'shared', label: valueSourceLabel('shared', agentName) };
+  }
+  const defaultValue = tomlDisplayValue(param.default, param.type);
+  if (defaultValue !== '') return { value: defaultValue, source: 'package', label: valueSourceLabel('package', agentName) };
+  return { value: '', source: 'unset', label: valueSourceLabel('unset', agentName) };
 }
 
 function prunedSet(set: Record<string, any>) {
@@ -277,6 +320,7 @@ export function App() {
   const [cfgPackages, setCfgPackages] = useState<any[]>([]);
   const [cfgKits, setCfgKits] = useState<any[]>([]);
   const [cfgConfigPackages, setCfgConfigPackages] = useState(new Set());
+  const [cfgSharedConfigRows, setCfgSharedConfigRows] = useState(new Map());
   const [cfgKitDetails, setCfgKitDetails] = useState(new Map());
   const [cfgContextChain, setCfgContextChain] = useState<any[]>([]);
   const [cfgContextRemoved, setCfgContextRemoved] = useState(new Set());
@@ -567,9 +611,19 @@ export function App() {
     };
     if (!nextForm.varsRows.length) nextForm.varsRows = [{ id: uid(), key: '', value: '' }];
     if (!nextForm.throttleRows.length) nextForm.throttleRows = [{ id: uid(), name: '', max: '', rate: '', tokens: '', coalesce: false }];
+    const configPackageNames = (configs.ok === false ? [] : (configs.configs ?? [])).map((c: any) => c.package).filter(Boolean);
+    const sharedConfigNames = new Set([
+      ...configPackageNames,
+      ...packages.filter((pkg: any) => declaredConfigParams(pkg).length > 0).map((pkg: any) => pkg.name),
+    ]);
+    const sharedEntries = await Promise.all([...sharedConfigNames].map(async (name) => {
+      const raw = await adminGet(`configs?package=${encodeURIComponent(name)}`);
+      return [name, raw.ok ? configRowMap(raw.config?.toml || '') : new Map<string, string>()] as [string, Map<string, string>];
+    }));
     setCfgPackages(packages);
     setCfgKits(kits.ok === false ? [] : (kits.kits ?? []));
-    setCfgConfigPackages(new Set((configs.ok === false ? [] : (configs.configs ?? [])).map((c: any) => c.package).filter(Boolean)));
+    setCfgConfigPackages(new Set(configPackageNames));
+    setCfgSharedConfigRows(new Map<string, Map<string, string>>(sharedEntries));
     setCfgToml(r.ok ? r.toml : '');
     await loadDiskAgents();
     setCfgParsed(d);
@@ -912,6 +966,8 @@ export function App() {
             cfgPackages={cfgPackages}
             cfgKits={cfgKits}
             cfgConfigPackages={cfgConfigPackages}
+            cfgSharedConfigRows={cfgSharedConfigRows}
+            setCfgSharedConfigRows={setCfgSharedConfigRows}
             cfgContextChain={cfgContextChain}
             setCfgContextChain={setCfgContextChain}
             cfgContextVarEdits={cfgContextVarEdits}
@@ -1220,6 +1276,7 @@ function SetupPackageConfig({ pkg }: any) {
       <div className="setup-kit-head"><span className="setup-kit-name">{pkg.name}</span><span className={active ? 'badge' : 'badge badge-wait'}>{active ? 'on' : 'off'}</span><span className="dim-note">{grantState(pkg)}</span></div>
       <div className="cfg-package-detail">{packageDescription(pkg)}</div>
       <div className="risk-badges">{riskBadges(pkg).map((b) => <span key={b} className={`badge${/pending|broad|writes|daemon|http|hook|mcp|prompt/.test(b) ? ' badge-wait' : ''}`}>{b}</span>)}</div>
+      <p className="dim-note">These settings apply to every agent that uses this add-on. Use an agent's configure tab when only one agent should change.</p>
       <div className="setup-row">
         <input placeholder="setting" spellCheck={false} value={key} onChange={(e) => setKey(e.target.value)} />
         <input placeholder="value, using TOML for arrays or numbers" spellCheck={false} value={value} onChange={(e) => setValue(e.target.value)} />
@@ -1265,7 +1322,7 @@ function ProposalCard({ proposal, loadSetup }: any) {
 }
 
 function ConfigureView(props: any) {
-  const { hidden, modelOptions, form, setForm, cfgProfile, cfgParsed, cfgLoading, cfgNote, cfgToml, setCfgToml, cfgTomlNote, saveConfigure, saveRawToml, cfgPackages, cfgKits, cfgConfigPackages, cfgContextChain, setCfgContextChain, cfgContextVarEdits, setCfgContextVarEdits, contextDefs, availableContextStages, moveContextStage, removeContextStage, addContextStage, skillIncluded, skillExcluded, setSkillExcluded, setKitPackagesExcluded, openKitModal } = props;
+  const { hidden, modelOptions, form, setForm, cfgProfile, cfgParsed, cfgLoading, cfgNote, cfgToml, setCfgToml, cfgTomlNote, saveConfigure, saveRawToml, cfgPackages, cfgKits, cfgConfigPackages, cfgSharedConfigRows, setCfgSharedConfigRows, cfgContextChain, setCfgContextChain, cfgContextVarEdits, setCfgContextVarEdits, contextDefs, availableContextStages, moveContextStage, removeContextStage, addContextStage, skillIncluded, skillExcluded, setSkillExcluded, setKitPackagesExcluded, openKitModal } = props;
   const [selectedContextStage, setSelectedContextStage] = useState('');
   const addStageValue = selectedContextStage || (availableContextStages[0] ? `${availableContextStages[0].package}/${availableContextStages[0].name}` : '');
   const disabled = cfgLoading;
@@ -1296,6 +1353,7 @@ function ConfigureView(props: any) {
 
           <section className="setup-block" id="cfg-section-model">
             <h3>model</h3>
+            <p className="dim-note">These settings apply to {form.agent || cfgParsed.agent || cfgProfile || 'this agent'} only.</p>
             <div className="cfg-grid">
               <label>model <input id="cfg-model" disabled={disabled} spellCheck={false} list="model-suggestions" value={form.model} onChange={(e) => setForm({ model: e.target.value })} /></label>
               <label>max run steps <input id="cfg-turns" disabled={disabled} type="number" min="1" max="200" value={form.turns} onChange={(e) => setForm({ turns: e.target.value })} /></label>
@@ -1312,14 +1370,15 @@ function ConfigureView(props: any) {
 
           <section className="setup-block" id="cfg-section-context">
             <h3>context program</h3>
+            <p className="dim-note">These settings apply to {form.agent || cfgParsed.agent || cfgProfile || 'this agent'} only.</p>
             <div className="cfg-grid">
               <label>program <input id="cfg-context-program" disabled={disabled} spellCheck={false} value={form.contextProgram} onChange={(e) => setForm({ contextProgram: e.target.value })} /></label>
               <label>max context ms <input id="cfg-context-max-ms" disabled={disabled} type="number" min="1" value={form.contextMaxMs} onChange={(e) => setForm({ contextMaxMs: e.target.value })} /></label>
             </div>
-            <div className="cfg-context-head"><h4>context stage chain</h4><div className="cfg-context-add"><select id="cfg-context-add-stage" disabled={disabled || !availableContextStages.length} value={addStageValue} onChange={(e) => setSelectedContextStage(e.target.value)}>{availableContextStages.map((s: any) => <option key={`${s.package}/${s.name}`} value={`${s.package}/${s.name}`}>{s.package}/{s.name}</option>)}</select><button id="cfg-context-add" className="ghost" disabled={disabled || !availableContextStages.length} type="button" onClick={() => addContextStage(addStageValue)}>add</button></div></div>
+            <div className="cfg-context-head"><h4>context steps</h4><div className="cfg-context-add"><select id="cfg-context-add-stage" disabled={disabled || !availableContextStages.length} value={addStageValue} onChange={(e) => setSelectedContextStage(e.target.value)}>{availableContextStages.map((s: any) => <option key={`${s.package}/${s.name}`} value={`${s.package}/${s.name}`}>{s.package}/{s.name}</option>)}</select><button id="cfg-context-add" className="ghost" disabled={disabled || !availableContextStages.length} type="button" onClick={() => addContextStage(addStageValue)}>add</button></div></div>
             <div id="cfg-context-chain" className="cfg-context-chain">
-              {!contextDefs.length ? <div className="dim-note">no visible package context stages</div> : !cfgContextChain.length ? <div className="dim-note">all visible context stages are removed for this agent</div> : cfgContextChain.map((stage: any, index: number) => (
-                <ContextStageTile key={`${stage.package}/${stage.name}`} stage={stage} index={index} chainLength={cfgContextChain.length} disabled={disabled} move={moveContextStage} remove={removeContextStage} setChain={setCfgContextChain} cfgParsed={cfgParsed} cfgContextVarEdits={cfgContextVarEdits} setCfgContextVarEdits={setCfgContextVarEdits} />
+              {!contextDefs.length ? <div className="dim-note">no visible add-on context steps</div> : !cfgContextChain.length ? <div className="dim-note">all visible context steps are removed for this agent</div> : cfgContextChain.map((stage: any, index: number) => (
+                <ContextStageTile key={`${stage.package}/${stage.name}`} stage={stage} index={index} chainLength={cfgContextChain.length} disabled={disabled} move={moveContextStage} remove={removeContextStage} setChain={setCfgContextChain} cfgParsed={cfgParsed} cfgProfile={cfgProfile} sharedRows={cfgSharedConfigRows.get(stage.package) ?? new Map()} cfgContextVarEdits={cfgContextVarEdits} setCfgContextVarEdits={setCfgContextVarEdits} />
               ))}
             </div>
             <p className="dim-note">Stages run top to bottom after the built-in seed. Reorder or remove stages here; raw TOML stores this as the <code>context.stage</code> array.</p>
@@ -1327,6 +1386,7 @@ function ConfigureView(props: any) {
 
           <section className="setup-block" id="cfg-section-sandbox">
             <h3>sandbox</h3>
+            <p className="dim-note">These settings apply to {form.agent || cfgParsed.agent || cfgProfile || 'this agent'} only.</p>
             <div className="cfg-grid">
               <label>working directory <input id="cfg-workdir" disabled={disabled} spellCheck={false} placeholder="(elanus root)" value={form.workdir} onChange={(e) => setForm({ workdir: e.target.value })} /></label>
               <label>writable prefixes <input id="cfg-fs-write" disabled={disabled} spellCheck={false} placeholder="comma separated" value={form.fsWrite} onChange={(e) => setForm({ fsWrite: e.target.value })} /></label>
@@ -1336,6 +1396,7 @@ function ConfigureView(props: any) {
 
           <section className="setup-block" id="cfg-section-throttle">
             <h3>throttle</h3>
+            <p className="dim-note">These settings apply to {form.agent || cfgParsed.agent || cfgProfile || 'this agent'} only.</p>
             <div id="cfg-throttle" className="cfg-table">
               {form.throttleRows.map((r: any) => <div key={r.id} className="cfg-throttle-row"><input className="cfg-throttle-name" disabled={disabled} placeholder="name" spellCheck={false} value={r.name} onChange={(e) => updateThrottle(r.id, { name: e.target.value })} /><input className="cfg-throttle-max" disabled={disabled} type="number" placeholder="max concurrent" value={r.max} onChange={(e) => updateThrottle(r.id, { max: e.target.value })} /><input className="cfg-throttle-rate" disabled={disabled} type="number" placeholder="rate/min" value={r.rate} onChange={(e) => updateThrottle(r.id, { rate: e.target.value })} /><input className="cfg-throttle-tokens" disabled={disabled} type="number" placeholder="tokens/hour" value={r.tokens} onChange={(e) => updateThrottle(r.id, { tokens: e.target.value })} /><label className="cfg-check"><input className="cfg-throttle-coalesce" disabled={disabled} type="checkbox" checked={r.coalesce} onChange={(e) => updateThrottle(r.id, { coalesce: e.target.checked })} /> coalesce</label></div>)}
             </div>
@@ -1348,12 +1409,13 @@ function ConfigureView(props: any) {
             <input id="cfg-exclude" type="hidden" value={form.exclude} readOnly />
             <div className="setup-row cfg-package-toolbar"><button id="cfg-kit-add-toggle" type="button" disabled={disabled} onClick={openKitModal}>add</button><span className="dim-note">copy or link kits to change available packages</span></div>
             <div id="cfg-package-configs" className="cfg-tree">
-              <PackageTree packages={cfgPackages.filter((p: any) => skillIncluded(p))} skillExcluded={skillExcluded} setSkillExcluded={setSkillExcluded} setKitPackagesExcluded={setKitPackagesExcluded} cfgConfigPackages={cfgConfigPackages} />
+              <PackageTree packages={cfgPackages.filter((p: any) => skillIncluded(p))} skillExcluded={skillExcluded} setSkillExcluded={setSkillExcluded} setKitPackagesExcluded={setKitPackagesExcluded} cfgConfigPackages={cfgConfigPackages} cfgSharedConfigRows={cfgSharedConfigRows} setCfgSharedConfigRows={setCfgSharedConfigRows} cfgProfile={cfgProfile} cfgParsed={cfgParsed} setCfgContextVarEdits={setCfgContextVarEdits} />
             </div>
           </section>
 
           <section className="setup-block" id="cfg-section-raw">
-            <details><summary className="dim-note">advanced context parameters</summary><p className="dim-note">legacy <code>[vars]</code> values for context stages and templates; prefer package/context-stage settings when available. Saved by the main save button above.</p><div id="cfg-vars" className="cfg-table">{form.varsRows.map((r: any) => <div key={r.id} className="cfg-var-row"><input className="cfg-var-key" disabled={disabled} placeholder="name" spellCheck={false} value={r.key} onChange={(e) => updateVar(r.id, { key: e.target.value })} /><input className="cfg-var-value" disabled={disabled} placeholder="value" spellCheck={false} value={r.value} onChange={(e) => updateVar(r.id, { value: e.target.value })} /></div>)}</div><button id="cfg-var-add" className="ghost" type="button" disabled={disabled} onClick={() => setForm({ varsRows: [...form.varsRows, { id: uid(), key: '', value: '' }] })}>add context parameter</button></details>
+            <p className="dim-note">These advanced settings apply to {form.agent || cfgParsed.agent || cfgProfile || 'this agent'} only.</p>
+            <details><summary className="dim-note">advanced context parameters</summary><p className="dim-note">Advanced values for context and templates; prefer add-on settings when available. Saved by the main save button above.</p><div id="cfg-vars" className="cfg-table">{form.varsRows.map((r: any) => <div key={r.id} className="cfg-var-row"><input className="cfg-var-key" disabled={disabled} placeholder="name" spellCheck={false} value={r.key} onChange={(e) => updateVar(r.id, { key: e.target.value })} /><input className="cfg-var-value" disabled={disabled} placeholder="value" spellCheck={false} value={r.value} onChange={(e) => updateVar(r.id, { value: e.target.value })} /></div>)}</div><button id="cfg-var-add" className="ghost" type="button" disabled={disabled} onClick={() => setForm({ varsRows: [...form.varsRows, { id: uid(), key: '', value: '' }] })}>add context parameter</button></details>
             <details><summary className="dim-note">the raw settings file</summary><textarea id="cfg-toml" disabled={disabled} spellCheck={false} rows={14} value={cfgToml} onChange={(e) => setCfgToml(e.target.value)} /><div className="setup-row"><button id="cfg-toml-save" disabled={disabled} onClick={saveRawToml}>save raw file</button><span id="cfg-toml-note" className="dim-note">{cfgTomlNote}</span></div></details>
           </section>
         </div>
@@ -1362,37 +1424,42 @@ function ConfigureView(props: any) {
   );
 }
 
-function ContextStageTile({ stage, index, chainLength, disabled, move, remove, setChain, cfgParsed, cfgContextVarEdits, setCfgContextVarEdits }: any) {
+function ContextStageTile({ stage, index, chainLength, disabled, move, remove, setChain, cfgParsed, cfgProfile, sharedRows, cfgContextVarEdits, setCfgContextVarEdits }: any) {
   const key = `${stage.package}/${stage.name}`;
-  const params = (stage.config ?? []).filter((p: any) => p.key).map((p: any) => ({ key: p.key, type: p.type ?? 'string', label: p.label || p.key, help: p.help || '', default: p.default, options: p.options ?? [], agent_tunable: p.agent_tunable === true, source: `context stage ${stage.name}` }));
+  const params = (stage.config ?? []).filter((p: any) => p.key).map((p: any) => ({ key: p.key, type: p.type ?? 'string', label: p.label || p.key, help: p.help || '', default: p.default, options: p.options ?? [], agent_tunable: p.agent_tunable === true, agentScoped: true, source: `agent context ${stage.name}` }));
   const updateStage = (patch: any) => setChain((prev: any[]) => prev.map((s) => `${s.package}/${s.name}` === key ? { ...s, ...patch } : s));
   return (
     <div className="cfg-context-stage" data-stage={key}>
       <div className="cfg-context-stage-head"><div className="cfg-context-stage-title"><strong>{key}</strong><span className="cfg-config-help">mode: {stage.mode} · {params.length} declared setting{params.length === 1 ? '' : 's'}</span></div><div className="cfg-context-stage-actions"><IconButton label={`move ${key} up`} disabled={disabled || index === 0} onClick={() => move(index, -1)}>↑</IconButton><IconButton label={`move ${key} down`} disabled={disabled || index === chainLength - 1} onClick={() => move(index, 1)}>↓</IconButton><IconButton label={`remove ${key}`} disabled={disabled} onClick={() => remove(index)}>×</IconButton></div></div>
       <div className="cfg-context-stage-grid"><label>order<input type="number" min="1" data-context-field="order" disabled={disabled} value={stage.order} onChange={(e) => updateStage({ order: Number(e.target.value || stage.order) })} /></label><label>timeout ms<input type="number" min="1" data-context-field="timeout_ms" disabled={disabled} value={stage.timeout_ms} onChange={(e) => updateStage({ timeout_ms: Number(e.target.value || stage.timeout_ms) })} /></label></div>
-      {!!params.length && <div className="cfg-context-stage-config"><div className="cfg-context-stage-subhead">settings</div>{params.map((param: any) => {
+      {!!params.length && <div className="cfg-context-stage-config"><div className="cfg-context-stage-subhead">settings for {cfgParsed.agent || cfgProfile || 'this agent'} only</div>{params.map((param: any) => {
         const value = cfgContextVarEdits.get(param.key) ?? cfgParsed.vars?.[param.key] ?? tomlDisplayValue(param.default, param.type);
         const setValue = (v: string) => setCfgContextVarEdits((old: Map<string, string>) => new Map(old).set(param.key, v));
-        return <ConfigInputRow key={param.key} param={param} value={value} setValue={setValue} contextVar={param.key} contextStage={key} />;
+        const agentName = cfgParsed.agent || cfgProfile || 'this agent';
+        const pendingVars = Object.fromEntries(cfgContextVarEdits);
+        const effective = effectiveConfigValue(param, sharedRows ?? new Map(), { ...(cfgParsed.vars ?? {}), ...pendingVars }, agentName);
+        return <ConfigInputRow key={param.key} param={{ ...param, scope: `applies to ${agentName} only`, effective }} value={value} setValue={setValue} contextVar={param.key} contextStage={key} />;
       })}</div>}
     </div>
   );
 }
 
-function ConfigInputRow({ param, value, setValue, contextVar, contextStage, save }: any) {
+function ConfigInputRow({ param, value, setValue, contextVar, contextStage, save, secondarySave }: any) {
+  const scope = param.scope || '';
+  const effective = param.effective;
   return (
     <div className="cfg-config-row">
-      <label title={param.key}>{param.label || param.key}<span className="cfg-config-help">{[param.source, param.type ? `type: ${param.type}` : '', param.agent_tunable ? 'agent-tunable' : '', param.help].filter(Boolean).join(' · ')}</span></label>
+      <label title={param.key}>{param.label || param.key}<span className="cfg-config-help">{[param.source, param.type ? `type: ${param.type}` : '', scope, param.help].filter(Boolean).join(' · ')}</span></label>
       {param.type === 'boolean' ? <label className="cfg-check" data-value-input="1"><input type="checkbox" checked={/^(true|1)$/i.test(String(value))} data-context-var={contextVar} data-context-stage={contextStage} data-dirty="1" onChange={(e) => setValue(e.target.checked ? 'true' : 'false')} /> enabled</label>
         : param.type === 'enum' && (param.options ?? []).length ? <select value={value || param.options[0]} data-context-var={contextVar} data-context-stage={contextStage} data-dirty="1" onChange={(e) => setValue(e.target.value)}>{param.options.map((o: string) => <option key={o} value={o}>{o}</option>)}</select>
           : <input type={param.type === 'number' ? 'number' : 'text'} spellCheck={false} value={value ?? ''} placeholder={param.default == null ? 'value' : `default ${tomlDisplayValue(param.default, param.type)}`} data-context-var={contextVar} data-context-stage={contextStage} data-dirty="1" onChange={(e) => setValue(e.target.value)} />}
-      {save ?? <span />}
-      <span />
+      <div className="cfg-config-actions">{save ?? <span />}{secondarySave ?? null}</div>
+      <span className="cfg-effective">{effective ? `effective here: ${effective.value || '(empty)'} · ${effective.label}` : ''}</span>
     </div>
   );
 }
 
-function PackageTree({ packages, skillExcluded, setSkillExcluded, setKitPackagesExcluded, cfgConfigPackages }: any) {
+function PackageTree({ packages, skillExcluded, setSkillExcluded, setKitPackagesExcluded, cfgConfigPackages, cfgSharedConfigRows, setCfgSharedConfigRows, cfgProfile, cfgParsed, setCfgContextVarEdits }: any) {
   if (!packages.length) return <div className="dim-note">no packages found</div>;
   const groups = new Map();
   for (const p of packages) {
@@ -1407,41 +1474,90 @@ function PackageTree({ packages, skillExcluded, setSkillExcluded, setKitPackages
         <summary className="cfg-kit-summary cfg-kit-head"><span className="cfg-disclosure">▸</span><span className="cfg-kit-name">{kit}</span><span className="cfg-pkg-desc">{pkgs.length} package{pkgs.length === 1 ? '' : 's'}</span><IconButton label={disabledCount === pkgs.length ? `enable all ${kit} packages` : `disable all ${kit} packages`} className={disabledCount === pkgs.length ? 'ghost cfg-icon-btn cfg-kit-toggle' : 'cfg-icon-btn cfg-kit-toggle'} onClick={(e) => { e.preventDefault(); setKitPackagesExcluded(pkgs, disabledCount !== pkgs.length); }}>{disabledCount === pkgs.length ? '✓' : '⊘'}</IconButton></summary>
         <div className="cfg-package-table">{[...pkgs].sort((a, b) => a.name.localeCompare(b.name)).map((p) => {
           const disabled = skillExcluded(p);
-          return <PackageCard key={`${p.name}-${disabled ? 'disabled' : 'enabled'}`} pkg={p} disabled={disabled} canConfigure={declaredConfigParams(p).length > 0 || cfgConfigPackages.has(p.name)} toggle={() => setSkillExcluded(p.name, !disabled)} />;
+          return <PackageCard key={`${cfgProfile || cfgParsed.agent || 'agent'}-${p.name}-${disabled ? 'disabled' : 'enabled'}`} pkg={p} disabled={disabled} canConfigure={declaredConfigParams(p).length > 0 || cfgConfigPackages.has(p.name)} toggle={() => setSkillExcluded(p.name, !disabled)} sharedRows={cfgSharedConfigRows.get(p.name) ?? new Map()} setCfgSharedConfigRows={setCfgSharedConfigRows} setCfgContextVarEdits={setCfgContextVarEdits} cfgProfile={cfgProfile} cfgParsed={cfgParsed} />;
         })}</div>
       </details>
     );
   });
 }
 
-function PackageCard({ pkg, disabled, canConfigure, toggle }: any) {
+function PackageCard({ pkg, disabled, canConfigure, toggle, sharedRows, setCfgSharedConfigRows, setCfgContextVarEdits, cfgProfile, cfgParsed }: any) {
   const [panelOpen, setPanelOpen] = useState(false);
   const [rows, setRows] = useState<any[] | null>(null);
   const source = packageSource(pkg);
   const declared = declaredConfigParams(pkg);
+  useEffect(() => {
+    setPanelOpen(false);
+    setRows(null);
+  }, [cfgProfile, cfgParsed.agent, pkg.name]);
   const load = async () => {
     setPanelOpen((v) => !v);
     if (rows) return;
     const r = await adminGet(`configs?package=${encodeURIComponent(pkg.name)}`);
     const raw = r.ok ? (r.config?.toml || '') : '';
     const current = parseConfigRows(raw);
-    const byKey = new Map(current.map((row) => [row.key, row.value]));
+    const byKey: Map<string, string> = current.length
+      ? new Map(current.map((row) => [row.key, row.value] as [string, string]))
+      : new Map<string, string>(sharedRows ?? []);
     const params = new Map(declared.map((param: any) => [param.key, param]));
     for (const param of declared) if (!byKey.has(param.key)) byKey.set(param.key, '');
     for (const key of byKey.keys()) if (!params.has(key)) params.set(key, { key, type: 'string', label: key, help: 'Existing package setting not declared in the manifest.', source: 'current settings' });
-    setRows([...params.values()].sort((a: any, b: any) => a.key.localeCompare(b.key)).map((param: any) => ({ param, value: byKey.get(param.key) || tomlDisplayValue(param.default, param.type), note: '' })));
+    setRows([...params.values()].sort((a: any, b: any) => a.key.localeCompare(b.key)).map((param: any) => {
+      const agentName = cfgParsed.agent || cfgProfile || 'this agent';
+      return {
+        param: {
+          ...param,
+          scope: 'shared default for every agent',
+          effective: effectiveConfigValue(param, byKey, cfgParsed.vars ?? {}, agentName),
+        },
+        value: byKey.get(param.key) || tomlDisplayValue(param.default, param.type),
+        note: '',
+        agentNote: '',
+      };
+    }));
   };
   const saveRow = async (idx: number) => {
     const row = rows![idx];
     setRows(rows!.map((r, i) => i === idx ? { ...r, note: 'saving...' } : r));
     const write = await adminPost('configs/set', { package: pkg.name, key: row.param.key, value: row.value });
-    setRows((old) => old!.map((r, i) => i === idx ? { ...r, note: write.ok ? 'saved' : (write.error ?? 'save failed') } : r));
+    const agentName = cfgParsed.agent || cfgProfile || 'this agent';
+    const nextShared = new Map<string, string>(sharedRows ?? []);
+    nextShared.set(row.param.key, row.value);
+    if (write.ok) setCfgSharedConfigRows((old: Map<string, Map<string, string>>) => {
+      const next = new Map(old);
+      next.set(pkg.name, nextShared);
+      return next;
+    });
+    setRows((old) => old!.map((r, i) => i === idx ? {
+      ...r,
+      note: write.ok ? 'saved for every agent' : (write.error ?? 'save failed'),
+      param: {
+        ...r.param,
+        effective: write.ok ? effectiveConfigValue(row.param, nextShared, row.param.effective?.source === 'agent' ? { [row.param.key]: row.param.effective.value } : (cfgParsed.vars ?? {}), agentName) : r.param.effective,
+      },
+    } : r));
+  };
+  const saveAgentRow = async (idx: number) => {
+    if (!cfgProfile) return;
+    const row = rows![idx];
+    const agentName = cfgParsed.agent || cfgProfile;
+    setRows(rows!.map((r, i) => i === idx ? { ...r, agentNote: 'saving...' } : r));
+    const write = await adminPost('agents/set', { name: cfgProfile, set: { [`vars.${row.param.key}`]: row.value } });
+    if (write.ok) setCfgContextVarEdits((old: Map<string, string>) => new Map(old).set(row.param.key, row.value));
+    setRows((old) => old!.map((r, i) => i === idx ? {
+      ...r,
+      agentNote: write.ok ? `saved for ${agentName}` : (write.error ?? 'save failed'),
+      param: {
+        ...r.param,
+        effective: write.ok ? { value: row.value, source: 'agent', label: valueSourceLabel('agent', agentName) } : r.param.effective,
+      },
+    } : r));
   };
   return (
     <details className={`cfg-package-card${disabled ? ' is-disabled' : ''}`} data-package={pkg.name}>
-      <summary className="cfg-package-head"><span className="cfg-disclosure">▸</span><span className={`cfg-source-icon source-${source.kind}`} title={`${source.kind}: ${source.label}`}>{source.icon}</span><span className="cfg-package-title"><span className="setup-kit-name">{pkg.name}</span><span className="cfg-pkg-desc">{packageDescription(pkg)}</span></span></summary>
+      <summary className="cfg-package-head"><span className="cfg-disclosure">▸</span><span className={`cfg-source-icon source-${source.kind}`} title={`${source.kind}: ${source.label}`}>{source.icon}</span><span className="cfg-package-title"><span className="setup-kit-name">{pkg.name}</span><span className="cfg-pkg-desc">{packageDescription(pkg)}</span>{canConfigure && <span className="cfg-pkg-desc">{packageHasAgentScopedSettings(pkg) ? `settings can be saved for every agent or for ${cfgParsed.agent || cfgProfile || 'this agent'} only` : 'settings save for every agent'}</span>}</span></summary>
       <div className="cfg-package-body"><div className="cfg-package-detail">{actorDetail(pkg)}</div><div className="cfg-package-meta">{packageBadges(pkg).map((b) => <span key={b.text} className={b.cls}>{b.text}</span>)}{riskBadges(pkg).map((b) => <span key={`risk-${b}`} className="badge badge-wait">{b}</span>)}</div><div className="cfg-package-controls"><span className="dim-note">{disabled ? 'disabled for this agent' : 'enabled for this agent'} · {grantState(pkg)}</span><button className={disabled ? 'ghost cfg-package-disable' : 'cfg-package-disable'} title={disabled ? `remove ${pkg.name} from skills.exclude` : `add ${pkg.name} to skills.exclude`} onClick={(e) => { e.preventDefault(); toggle(); }}>{disabled ? 'enable' : 'disable'}</button><button className="ghost cfg-package-config-toggle" hidden={!canConfigure} onClick={(e) => { e.preventDefault(); load(); }}>settings</button></div>
-        <div className="cfg-package-config-panel" hidden={!panelOpen}>{rows === null ? 'loading...' : !rows.length ? <div className="dim-note">no configurable settings declared</div> : rows.map((row, idx) => <ConfigInputRow key={row.param.key} param={row.param} value={row.value} setValue={(v: string) => setRows(rows.map((r, i) => i === idx ? { ...r, value: v } : r))} save={<><IconButton label={`save ${pkg.name}.${row.param.key}`} onClick={() => saveRow(idx)}>✓</IconButton><span className="dim-note">{row.note}</span></>} />)}</div>
+        <div className="cfg-package-config-panel" hidden={!panelOpen}>{rows === null ? 'loading...' : !rows.length ? <div className="dim-note">no configurable settings declared</div> : rows.map((row, idx) => <ConfigInputRow key={row.param.key} param={row.param} value={row.value} setValue={(v: string) => setRows(rows.map((r, i) => i === idx ? { ...r, value: v } : r))} save={<><IconButton label={`save ${pkg.name}.${row.param.key} for every agent`} onClick={() => saveRow(idx)}>every agent</IconButton><span className="dim-note">{row.note}</span></>} secondarySave={row.param.agentScoped ? <><IconButton label={`save ${pkg.name}.${row.param.key} for ${cfgParsed.agent || cfgProfile || 'this agent'}`} onClick={() => saveAgentRow(idx)}>this agent</IconButton><span className="dim-note">{row.agentNote}</span></> : null} />)}</div>
       </div>
     </details>
   );
