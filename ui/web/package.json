@@ -6,15 +6,37 @@
   "private": true,
   "main": "server.mjs",
   "scripts": {
+    "dev": "vite",
+    "dev:relay": "node --watch --watch-path=server.mjs --watch-path=config.mjs server.mjs",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "preview": "vite preview --host 127.0.0.1",
     "start": "node server.mjs",
-    "test": "node test/smoke.mjs",
-    "test:ui": "node test/ui.spec.mjs",
-    "walkthrough": "node test/walkthrough.mjs"
+    "test": "npm run build && node test/smoke.mjs",
+    "test:ui": "npm run build && node test/ui.spec.mjs",
+    "walkthrough": "npm run build && node test/walkthrough.mjs"
   },
   "dependencies": {
-    "mqtt": "^5.15.1"
+    "@hookform/resolvers": "^5.4.0",
+    "@radix-ui/react-dialog": "^1.1.17",
+    "@radix-ui/react-popover": "^1.1.17",
+    "@radix-ui/react-select": "^2.3.1",
+    "@radix-ui/react-tabs": "^1.1.15",
+    "@radix-ui/react-toast": "^1.2.17",
+    "@radix-ui/react-tooltip": "^1.2.10",
+    "lucide-react": "^1.21.0",
+    "mqtt": "^5.15.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-hook-form": "^7.79.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "playwright": "^1.50.0"
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "playwright": "^1.50.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16"
   }
 }

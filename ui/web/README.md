@@ -3,11 +3,11 @@
 A local web UI over the bus. The **pure-MQTT-client constraint** from ui/tui
 carries over one hop: browsers can't speak raw TCP MQTT, so `server.mjs` is
 the ordinary anonymous loopback MQTT 5 client, and the browser talks to *it*
-— bus messages relayed over SSE, publishes accepted over POST, history
-queries brokered as request/response pairs on the bus. No sqlite, no
-trace.jsonl beyond the admin seam below. The filesystem touches: this
-directory's static files, `<root>/bus.toml` for broker discovery, profile
-files, and the run/ dir for the history endpoint.
+— bus messages relayed over SSE, publishes accepted over POST, and history
+queries proxied to the approved history package's HTTP view. No sqlite, no
+trace.jsonl beyond the history/admin seams below. The filesystem touches:
+this directory's built static files, `<root>/bus.toml` for broker discovery,
+profile files, and the run/ dir for the history endpoint.
 
 **Authority: the same as your terminal — because it shells out to it.**
 The admin seam (`/api/admin/*`) runs the `elanus` CLI, so this server adds
@@ -42,17 +42,29 @@ UI-driven decisions carry `decided_by=ui` in the ledger:
 
 ```sh
 cd ui/web && npm install
-node server.mjs --root /tmp/elanus-live        # or $ELANUS_ROOT / --url mqtt://...
-# → http://127.0.0.1:7180   (--port to change)
+npm run dev                                   # Vite + React dev server
+# -> http://127.0.0.1:5173, proxies /api to http://127.0.0.1:7180
 ```
 
-For the historical views, also install + approve the history package on the
-same root (the explorer works live-only without it — see degradation below):
+Run the backend relay separately while developing:
 
 ```sh
-cp -R packages/history <root>/packages/history
-elanus approve history          # the daemon supervises it from there
+npm run dev:relay                              # watches server.mjs/config.mjs
+# or: node server.mjs --root /tmp/elanus-live  # $ELANUS_ROOT / --url mqtt://...
+# -> http://127.0.0.1:7180   (--port to change)
 ```
+
+For production-style static serving, build first. `server.mjs` serves the Vite
+`dist/` output:
+
+```sh
+npm run build
+node server.mjs --root /tmp/elanus-live
+```
+
+Historical views work out of the box on initialized roots because history is a
+stdlib package. If the endpoint is absent or not yet serving, the explorer
+degrades to live-only and heals on the next successful probe.
 
 ## What you're looking at
 
@@ -89,8 +101,7 @@ subscribers). `/api/history` proxies to `packages/history`'s HTTP endpoint
 on a harness-negotiated loopback port, discovered from
 `<root>/run/pkg-history/http.json` (harness state, never retained bus
 messages — docs/security.md entry 11); the package reads the sqlite truth
-strictly read-only and serving is a granted capability (`elanus approve
-history`). `GET /api/history?kind=…` maps query params onto the flat kinds
+strictly read-only. `GET /api/history?kind=…` maps query params onto the flat kinds
 (`agents`, `sessions`, `transcript`, `conversation`); `POST /api/history`
 passes the query DSL through verbatim (kind `search`: filter × projection ×
 pagination — see packages/history/SKILL.md). UI reads never become ledger

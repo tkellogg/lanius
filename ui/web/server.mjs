@@ -39,7 +39,9 @@ if (args.help) {
 const BROKER = brokerUrl(args);
 const PORT = args.port ?? Number(process.env.ELANUS_WEB_PORT ?? 7180);
 const AGENT = args.agent ?? 'main';
-const PUB = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DIST = path.join(HERE, 'dist');
+const PUB = DIST;
 const ROOT = resolveRoot(args); // --root > $ELANUS_ROOT > ~/.elanus/root, as the daemon resolves it
 
 // ---- observability --------------------------------------------------------
@@ -520,7 +522,7 @@ function broadcast(obj) {
 }
 
 // ---- http side ------------------------------------------------------------
-const MIME = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript', '.svg': 'image/svg+xml', '.woff2': 'font/woff2' };
+const MIME = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript', '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.ico': 'image/x-icon' };
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');

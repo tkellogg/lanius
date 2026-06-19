@@ -15,4 +15,5 @@ spike/*/target
 trace.jsonl
 ui/tui/node_modules/
 ui/web/node_modules/
+ui/web/dist/
 /config/
