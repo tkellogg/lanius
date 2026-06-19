@@ -9,12 +9,17 @@ the UI.
 
 - Need the audience lens: read [characters.md](characters.md) first.
 - Changing first-run setup or "create agent": read [01-setup.md](01-setup.md).
-- Adding or explaining Claude Code: read [02-claude-code.md](02-claude-code.md).
+- Adding or explaining coding agents (Codex or Claude Code): read
+  [02-claude-code.md](02-claude-code.md), then the work plan at
+  [../handoffs/coding-agents.md](../handoffs/coding-agents.md).
 - Showing model, usage, budgets, limits, or pricing uncertainty: read
   [03-cost-visibility.md](03-cost-visibility.md).
 - Showing installed/running/approved capability risk: read
   [04-risk-and-trust.md](04-risk-and-trust.md).
-- Designing future Codex support: read [05-codex-integration.md](05-codex-integration.md).
+- Codex/Claude Code sandbox, hook, and launch adapter details: see Appendices A
+  and B of [../handoffs/coding-agents.md](../handoffs/coding-agents.md).
+- Changing the configure tab, instance/package settings, autonomy, or the
+  setup-to-config landing: read [06-configuration.md](06-configuration.md).
 
 ## Contents
 
@@ -22,16 +27,18 @@ the UI.
   vocabulary and motivation map.
 - [01-setup.md](01-setup.md) - installation expectations and first-agent /
   Claude Code setup pressure.
-- [02-claude-code.md](02-claude-code.md) - current open questions and acceptance
-  criteria for a Claude Code setup path. It deliberately does not pretend the
-  integration is specified.
+- [02-claude-code.md](02-claude-code.md) - the unified coding-agents journey
+  (Codex and Claude Code): the operating envelope and the planner/worker
+  orchestration. Tim and Daniel primary. Work plan in
+  [../handoffs/coding-agents.md](../handoffs/coding-agents.md).
 - [03-cost-visibility.md](03-cost-visibility.md) - honest cost and limit
   language: hard cap, soft limit, estimate, unknown, provider unavailable.
 - [04-risk-and-trust.md](04-risk-and-trust.md) - cheap first-pass risk surfaces
   for installed, approved, running, local HTTP, fs write, and data-location
   questions.
-- [05-codex-integration.md](05-codex-integration.md) - later design sketch for
-  launching the real Codex TUI inside the elanus operating envelope.
+- [06-configuration.md](06-configuration.md) - why each character opens
+  configuration, what they expect, and where instance config and agent config
+  blur together (shared-vs-per-agent scope, altitude, the off switch).
 
 ## Implementation Anchors
 
@@ -46,7 +53,8 @@ the UI.
 
 ## Skip Unless
 
-- Do not read [05-codex-integration.md](05-codex-integration.md) for ordinary
-  setup UI work; it is future integration research.
 - Do not treat persona text as an implementation contract. Use it to choose
   language, priority, and what a person needs to observe.
+- For coding-agent *implementation* detail (sandbox flags, hook payloads, launch
+  shape), read [../handoffs/coding-agents.md](../handoffs/coding-agents.md), not
+  the journey — the journey is the user experience, the handoff is the work plan.

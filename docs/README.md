@@ -58,8 +58,11 @@ that layer.
 - [topics.md](topics.md) - v3 verb-first topic grammar, mailbox model,
   correlation taxonomy, and v2-to-v3 mapping.
 - [journeys/](journeys/README.md) - personas and product journeys for setup,
-  Claude Code, costs, risk/trust, and future Codex integration.
+  coding agents (Codex and Claude Code), costs, risk/trust, and configuration.
 - [ui-flows/](ui-flows/README.md) - executable web-flow catalog and QA findings.
+- [handoffs/](handoffs/README.md) - forward-looking implementation handoffs
+  (work plans with milestones and acceptance criteria): the coding-agents
+  envelope (Codex & Claude Code) and the configuration-UX altitude/scope pass.
 
 ## Implementation Anchors
 
