@@ -232,6 +232,9 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
         if let Err(e) = tick(root, &conn, &mut running, &mut actors, &mut code) {
             eprintln!("[daemon] tick error: {e:#}");
         }
+        // Keep the coding-session projection (obs/trace -> sqlite) fresh each
+        // tick; best-effort so a projection error never stalls the daemon.
+        let _ = crate::code_projection::project_trace(root);
         std::thread::sleep(Duration::from_millis(interval_ms));
     }
 }

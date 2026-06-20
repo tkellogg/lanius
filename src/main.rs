@@ -1,6 +1,7 @@
 mod broker;
 mod bus;
 mod buscli;
+mod code_projection;
 mod codeagent;
 mod codesession;
 mod config_repo;
