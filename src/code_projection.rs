@@ -10,8 +10,9 @@
 
 use crate::paths::Root;
 use anyhow::Result;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -62,6 +63,48 @@ CREATE TABLE IF NOT EXISTS code_projection_cursor (
 );
 "#,
     )
+}
+
+/// One row from the coding-session projection, plus fields derived for readers.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionStat {
+    pub elanus_session: String,
+    pub tool: Option<String>,
+    pub agent_noun: Option<String>,
+    pub native_session: Option<String>,
+    pub workdir: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub parent: Option<String>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub exit_code: Option<i64>,
+    pub last_status: Option<String>,
+    pub resume_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub updated_at: Option<String>,
+    pub duration_ms: Option<i64>,
+}
+
+/// One compact timeline entry for a coding session detail view.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionEvent {
+    pub id: i64,
+    pub elanus_session: String,
+    pub ts: Option<String>,
+    pub kind: Option<String>,
+    pub summary: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// Detail payload for one coding session: stats, timeline, resume hint, children.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionDetail {
+    pub session: SessionStat,
+    pub events: Vec<SessionEvent>,
+    pub resume_command: String,
+    pub children: Vec<SessionStat>,
 }
 
 fn parsed_topic(topic: &str) -> Option<(&str, &str, &str)> {
@@ -372,6 +415,129 @@ pub fn project_trace(root: &Root) -> Result<usize> {
     save_cursor(&tx, i64::try_from(new_offset).unwrap_or(i64::MAX))?;
     tx.commit()?;
     Ok(applied)
+}
+
+// ── Read API: queries over the projection (for the CLI + web relay) ───────────
+
+/// The `code_session_stats` columns, in the order `row_to_stat` expects. Shared by
+/// the list, detail, and children queries so the projection→struct mapping stays
+/// in one place.
+const STATS_COLUMNS: &str = "elanus_session, tool, agent_noun, native_session, workdir, model, \
+effort, parent, started_at, ended_at, exit_code, last_status, resume_count, input_tokens, \
+output_tokens, updated_at";
+
+/// Milliseconds between two RFC3339 timestamps, or None if either fails to parse.
+fn duration_ms_between(start: &str, end: &str) -> Option<i64> {
+    let s = DateTime::parse_from_rfc3339(start).ok()?;
+    let e = DateTime::parse_from_rfc3339(end).ok()?;
+    Some((e - s).num_milliseconds())
+}
+
+/// Ordering rank: active sessions (running/idle) first, finished next, unknown
+/// last. Within a rank the caller sorts by `started_at` descending (newest first).
+fn status_rank(status: Option<&str>) -> u8 {
+    match status {
+        Some("running") | Some("idle") => 0,
+        Some("done") => 1,
+        _ => 2,
+    }
+}
+
+/// Map a `code_session_stats` row (selected via `STATS_COLUMNS`) to a `SessionStat`,
+/// deriving `duration_ms` from the start/end timestamps when both are present.
+fn row_to_stat(row: &rusqlite::Row) -> rusqlite::Result<SessionStat> {
+    let started_at: Option<String> = row.get(8)?;
+    let ended_at: Option<String> = row.get(9)?;
+    let duration_ms = match (started_at.as_deref(), ended_at.as_deref()) {
+        (Some(s), Some(e)) => duration_ms_between(s, e),
+        _ => None,
+    };
+    Ok(SessionStat {
+        elanus_session: row.get(0)?,
+        tool: row.get(1)?,
+        agent_noun: row.get(2)?,
+        native_session: row.get(3)?,
+        workdir: row.get(4)?,
+        model: row.get(5)?,
+        effort: row.get(6)?,
+        parent: row.get(7)?,
+        started_at,
+        ended_at,
+        exit_code: row.get(10)?,
+        last_status: row.get(11)?,
+        resume_count: row.get(12)?,
+        input_tokens: row.get(13)?,
+        output_tokens: row.get(14)?,
+        updated_at: row.get(15)?,
+        duration_ms,
+    })
+}
+
+/// List every coding session in the projection, active-first then newest-started.
+/// Robust to the projection tables not existing yet (returns an empty list rather
+/// than erroring), so the CLI/UI works before the daemon has ever projected.
+pub fn list_sessions(root: &Root) -> Result<Vec<SessionStat>> {
+    let conn = crate::db::open(root)?;
+    let sql = format!("SELECT {STATS_COLUMNS} FROM code_session_stats");
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return Ok(Vec::new()), // projection table not created yet
+    };
+    let mut out: Vec<SessionStat> =
+        stmt.query_map([], row_to_stat)?.filter_map(Result::ok).collect();
+    out.sort_by(|a, b| {
+        status_rank(a.last_status.as_deref())
+            .cmp(&status_rank(b.last_status.as_deref()))
+            .then_with(|| b.started_at.cmp(&a.started_at))
+    });
+    Ok(out)
+}
+
+/// One session's detail: its stats, event timeline, a paste-able resume command,
+/// and its direct children (sessions whose `parent` is this session). None when
+/// the id is not in the projection (or no projection exists yet).
+pub fn session_detail(root: &Root, id: &str) -> Result<Option<SessionDetail>> {
+    let conn = crate::db::open(root)?;
+    let sql = format!("SELECT {STATS_COLUMNS} FROM code_session_stats WHERE elanus_session = ?1");
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return Ok(None), // projection table not created yet
+    };
+    let Some(session) = stmt.query_row(params![id], row_to_stat).optional()? else {
+        return Ok(None);
+    };
+
+    let mut ev_stmt = conn.prepare(
+        "SELECT id, elanus_session, ts, kind, summary, created_at \
+         FROM code_session_events WHERE elanus_session = ?1 ORDER BY id",
+    )?;
+    let events: Vec<SessionEvent> = ev_stmt
+        .query_map(params![id], |row| {
+            Ok(SessionEvent {
+                id: row.get(0)?,
+                elanus_session: row.get(1)?,
+                ts: row.get(2)?,
+                kind: row.get(3)?,
+                summary: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?
+        .filter_map(Result::ok)
+        .collect();
+
+    let child_sql = format!("SELECT {STATS_COLUMNS} FROM code_session_stats WHERE parent = ?1");
+    let mut child_stmt = conn.prepare(&child_sql)?;
+    let children: Vec<SessionStat> = child_stmt
+        .query_map(params![id], row_to_stat)?
+        .filter_map(Result::ok)
+        .collect();
+
+    Ok(Some(SessionDetail {
+        session,
+        events,
+        resume_command: format!("elanus code resume {id} \"<message>\""),
+        children,
+    }))
 }
 
 #[cfg(test)]

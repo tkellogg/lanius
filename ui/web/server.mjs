@@ -945,6 +945,31 @@ const server = http.createServer((req, res) => {
     withReadOnlyDb(res, (db) => sendJson(res, 200, { ok: true, conversation: { session, messages: conversationMessages(session, db) } }));
     return;
   }
+  // Observability M2 (read-only): the coding-session projection, served by
+  // proxying to the elanus CLI (`code sessions` / `code session <id>`), NOT by
+  // reading sqlite here — server.mjs stays a relay (docs/security.md entry 11).
+  if (url.pathname === '/api/code/sessions' && req.method === 'GET') {
+    cli(['code', 'sessions', '--json']).then((r) => {
+      if (!r.ok) { sendJson(res, 500, { ok: false, error: r.error || r.stderr }); return; }
+      try { sendJson(res, 200, JSON.parse(r.stdout || '[]')); }
+      catch { sendJson(res, 500, { ok: false, error: 'bad projection output' }); }
+    });
+    return;
+  }
+  {
+    const m = url.pathname.match(/^\/api\/code\/sessions\/([^/]+)$/);
+    if (m && req.method === 'GET') {
+      const id = decodeURIComponent(m[1]);
+      cli(['code', 'session', id, '--json']).then((r) => {
+        if (!r.ok) { sendJson(res, 500, { ok: false, error: r.error || r.stderr }); return; }
+        const out = (r.stdout || '').trim();
+        if (!out || out === 'null') { sendJson(res, 404, { ok: false, error: `no such coding session ${id}` }); return; }
+        try { sendJson(res, 200, JSON.parse(out)); }
+        catch { sendJson(res, 500, { ok: false, error: 'bad projection output' }); }
+      });
+      return;
+    }
+  }
   if (url.pathname.startsWith('/api/admin/')) {
     if (req.method === 'GET') {
       handleAdmin(url, req, res, null);

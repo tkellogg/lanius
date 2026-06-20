@@ -196,6 +196,9 @@ Commands:
   elanus code claim <path>                            announce an advisory edit claim
   elanus code unclaim <path>                          release an advisory edit claim
   elanus code claims [--json]                         show edit claims in this room
+  elanus code project                                  refresh the trace->sqlite session projection
+  elanus code sessions [--json]                        list coding sessions + stats
+  elanus code session <id> [--json]                   one session: stats, timeline, resume command
   elanus code help                                    show this help
   elanus code list                                    list supported launch tools
   elanus code hook <event>                            internal hook bridge"

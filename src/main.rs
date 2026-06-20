@@ -993,6 +993,91 @@ fn run(cli: Cli) -> Result<()> {
                     // claims), M5. `elanus code claims [--json]`.
                     codeagent::claims_cmd(&root, rest)?;
                 }
+                "project" => {
+                    // Observability: run the trace->sqlite projection once now
+                    // (the daemon also does this each tick). Useful to refresh the
+                    // projection manually or before querying on a non-daemon build.
+                    let n = code_projection::project_trace(&root)?;
+                    println!("projected {n} new coding-session event(s)");
+                }
+                "sessions" => {
+                    // Observability M2: list coding sessions from the projection.
+                    // `elanus code sessions [--json]`. Reads the derived sqlite
+                    // projection (code_projection); empty until the daemon (this
+                    // build) has projected at least once.
+                    let want_json = rest.iter().any(|a| a == "--json");
+                    let sessions = code_projection::list_sessions(&root)?;
+                    if want_json {
+                        println!("{}", serde_json::to_string_pretty(&sessions)?);
+                    } else if sessions.is_empty() {
+                        println!(
+                            "(no coding sessions projected yet — is the daemon running this build?)"
+                        );
+                    } else {
+                        for s in &sessions {
+                            let dur = s
+                                .duration_ms
+                                .map(|m| format!("{}s", m / 1000))
+                                .unwrap_or_else(|| "—".into());
+                            println!(
+                                "{}  {:<6}  {}/{}  {:<7}  {:>6}  in:{} out:{}",
+                                s.elanus_session,
+                                s.tool.as_deref().unwrap_or("?"),
+                                s.model.as_deref().unwrap_or("?"),
+                                s.effort.as_deref().unwrap_or("?"),
+                                s.last_status.as_deref().unwrap_or("?"),
+                                dur,
+                                s.input_tokens,
+                                s.output_tokens,
+                            );
+                        }
+                    }
+                }
+                "session" => {
+                    // Observability M2: one session's detail (stats, timeline,
+                    // resume command, children). `elanus code session <id> [--json]`.
+                    let id = rest.first().map(String::as_str).unwrap_or("");
+                    if id.is_empty() {
+                        anyhow::bail!("usage: elanus code session <id> [--json]");
+                    }
+                    let want_json = rest.iter().any(|a| a == "--json");
+                    match code_projection::session_detail(&root, id)? {
+                        None if want_json => println!("null"),
+                        None => println!("no such coding session {id:?}"),
+                        Some(detail) if want_json => {
+                            println!("{}", serde_json::to_string_pretty(&detail)?)
+                        }
+                        Some(detail) => {
+                            let s = &detail.session;
+                            println!(
+                                "session {}  ({}/{}, {})",
+                                s.elanus_session,
+                                s.tool.as_deref().unwrap_or("?"),
+                                s.model.as_deref().unwrap_or("?"),
+                                s.last_status.as_deref().unwrap_or("?"),
+                            );
+                            println!("  resume: {}", detail.resume_command);
+                            if !detail.children.is_empty() {
+                                println!("  children:");
+                                for c in &detail.children {
+                                    println!(
+                                        "    {} ({})",
+                                        c.elanus_session,
+                                        c.tool.as_deref().unwrap_or("?")
+                                    );
+                                }
+                            }
+                            println!("  timeline ({} events):", detail.events.len());
+                            for e in &detail.events {
+                                println!(
+                                    "    {} {}",
+                                    e.ts.as_deref().unwrap_or("?"),
+                                    e.kind.as_deref().unwrap_or("?")
+                                );
+                            }
+                        }
+                    }
+                }
                 _ => {
                     codeagent::launch(&root, tool, rest)?;
                 }
