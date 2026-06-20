@@ -26,6 +26,19 @@ context for the pass currently in flight.
 - [configuration-ux.md](configuration-ux.md) - the configuration-UX altitude and
   scope pass on the web UI (instance vs agent config, essentials vs advanced,
   the off switch). Backed by [../journeys/06-configuration.md](../journeys/06-configuration.md).
+- [coding-agent-dispatch.md](coding-agent-dispatch.md) - the agent-facing seam of
+  worker dispatch: a front door (CLI help + honest briefing), the two dispatch
+  modes (blocking-foreground for a live orchestrator vs async `spawn` for a
+  headless planner), a footgun-free launch (no silently-dropped prompt), capture
+  completeness (D4b), and in-band result visibility. Follow-on to
+  [coding-agents.md](coding-agents.md). Backed by
+  [../journeys/08-dispatching-a-worker.md](../journeys/08-dispatching-a-worker.md).
+- [coding-agent-observability.md](coding-agent-observability.md) - the
+  human-facing companion: materialize the obs/MQTT stream into sqlite, expose it
+  via an API (server.mjs), and render the live session + nested subagent tree in
+  the web UI (tool, model, effort, duration, resumed, resume command). Explainer
+  agent deferred but kept possible via the API. Backed by the *Tim's perspective*
+  section of [../journeys/08-dispatching-a-worker.md](../journeys/08-dispatching-a-worker.md).
 - [chat-conversations.md](chat-conversations.md) - the human's chat seat: turn raw
   kernel session ids into first-class, replyable **conversations** (labeled,
   one-context threads), persist one current web conversation with "+ new" and a

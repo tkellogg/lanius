@@ -43,6 +43,11 @@ the UI.
   interact with agents: never-ending chat, threaded conversations as the unit of
   the UI, ambient interaction, and dashboards. Work plan for the chat surface in
   [../handoffs/chat-conversations.md](../handoffs/chat-conversations.md).
+- [08-dispatching-a-worker.md](08-dispatching-a-worker.md) - the coding-agent's
+  OWN seat: a first-person account of a session under elanus trying to "dispatch
+  a codex worker" and mostly failing (no front door, undocumented launch verb,
+  silently dropped prompt, sync-vs-async confusion). Work plan in
+  [../handoffs/coding-agent-dispatch.md](../handoffs/coding-agent-dispatch.md).
 
 ## Implementation Anchors
 
