@@ -39,6 +39,13 @@ context for the pass currently in flight.
   the web UI (tool, model, effort, duration, resumed, resume command). Explainer
   agent deferred but kept possible via the API. Backed by the *Tim's perspective*
   section of [../journeys/08-dispatching-a-worker.md](../journeys/08-dispatching-a-worker.md).
+- [harness-modes.md](harness-modes.md) - **the canonical mode model**: make every
+  coding harness (Claude Code, Codex, future) launchable in *both* modes — `tui`
+  and `headless` — with uniform CLI and semantics, via a `Harness` adapter seam and
+  a per-(harness, mode) capture matrix (Codex TUI via rollout import is the missing
+  cell). Separates the **launch-mode** axis (tui/headless) from the **drive-pattern**
+  axis (blocking/async) the other coding-agent handoffs use; they defer to this for
+  the mode model. Backed by [../journeys/02-claude-code.md](../journeys/02-claude-code.md).
 - [chat-conversations.md](chat-conversations.md) - the human's chat seat: turn raw
   kernel session ids into first-class, replyable **conversations** (labeled,
   one-context threads), persist one current web conversation with "+ new" and a

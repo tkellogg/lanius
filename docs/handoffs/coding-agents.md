@@ -116,6 +116,18 @@ tools, not guess.
 
 ### Two operating modes, and the planner symmetry
 
+> **Vocabulary note (2026-06-20):** what this section calls "Interactive vs
+> Headless" is the **drive-pattern** axis (who advances the turns). That is
+> *distinct* from the **launch-mode** axis (the harness running as a `tui` process
+> vs a `headless` process). The two compose, and the canonical, uniform model —
+> *both* launch modes for *every* harness, with consistent CLI and a per-(harness,
+> mode) capture matrix — now lives in [harness-modes.md](harness-modes.md). Note in
+> particular that this section's "a human sits at the real TUI … for both tools" is
+> **aspirational, not as-built**: the Codex adapter shipped headless-only (`codex
+> exec --json`); a Codex TUI is the work planned in harness-modes.md (HM2). Read
+> that handoff for the authoritative mode model; this section remains the rationale
+> for the planner/worker symmetry.
+
 A coding session runs in one of two modes, and the difference is entirely **who
 drives its turns**. It is not two kinds of session — it is one durable session
 advanced two ways.

@@ -99,10 +99,16 @@ substituted prompt.
 
 ## Two dispatch modes — and the briefing must teach both
 
-There is not one right "dispatch"; there are two, and the right one depends on
-whether the caller is **live** or **headless**. The journey failure came from
-the briefing teaching only the headless model while the live model was the one
-that fit.
+> **Axis note (2026-06-20):** the "two dispatch modes" here are the
+> **drive-pattern** axis — *blocking one-shot* (the caller waits) vs *async*
+> (the daemon resumes the caller later). That is distinct from the **launch-mode**
+> axis (a harness running as an interactive `tui` vs a `headless` process), whose
+> canonical, harness-uniform model is [harness-modes.md](harness-modes.md). Both
+> compose: blocking/async is *how the result returns*; tui/headless is *how the
+> process runs*. The uniform `--headless` flag and the bare-`elanus code <h>` → TUI
+> behavior described in harness-modes.md supersede the per-tool invocation quirks
+> this handoff assumed (codex positional = headless, claude `--worker`); the
+> briefing must teach **both** axes once HM3/HM4 land.
 
 - **Blocking foreground (a LIVE orchestrator).** A caller that is itself driven
   turn-by-turn — a human in a TUI, or a tool-using agent like Claude Code running
