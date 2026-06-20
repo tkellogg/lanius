@@ -50,21 +50,22 @@ it exists.
 4. Click `#na-create`.
 
 **Observable expectation.** On success the app does NOT leave you on setup with a
-flash — it **routes to the configure tab of the new agent** (`selectAgent(name,
-'configure')`) and writes a durable, explanatory line into `#cfg-note`:
-`created <name> — set its identity below, then converse`. The new agent also
-appears as a `#nav-agents .nav-item` (nav re-renders from disk). On failure,
-`#na-note` shows the error (`name it first` for empty, else the server error /
-`unreachable`) and you stay put.
+flash — it **routes to the converse view for the new agent** (`selectAgent(name,
+'converse')`). The compose input targets that agent, `#conv-configure-hint`
+quietly says configure is available later, and the new agent appears as a
+`#nav-agents .nav-item` (nav re-renders from disk). On failure, `#na-note` shows
+the error (`name it first` for empty, else the server error / `unreachable`) and
+you stay put.
 
 **How to verify (Playwright sketch).**
 ```js
 await page.click('.nav-setup');
 await page.fill('#na-name', 'kestrel');
 await page.click('#na-create');
-// durable: landed on configure for the new agent
-await page.waitForSelector('#view-configure:not([hidden])');
-await expect(page.locator('#cfg-note')).toContainText('created kestrel');
+// durable: landed in conversation with the new agent
+await page.waitForSelector('#view-converse:not([hidden])');
+await expect(page.locator('#compose-input')).toHaveAttribute('aria-label', 'message kestrel');
+await expect(page.locator('#conv-configure-hint')).toContainText('Tune kestrel anytime in configure');
 // durable: nav re-rendered with the new identity
 await expect(page.locator('#nav-agents .nav-item')).toContainText('kestrel');
 ```
@@ -110,9 +111,14 @@ the configure tab.
 3. **Wait for `loadConfigure` to finish** — the form is populated async; it is
    done when `#cfg-model` is non-empty (or `#cfg-note` says `no profile`).
    Filling before this races the on-disk default (e.g. haiku's `max_turns`).
-4. Fill `#cfg-model`, `#cfg-turns`, `#cfg-workdir`, `#cfg-include`,
-   `#cfg-exclude`.
-5. Click `#cfg-save`.
+4. Confirm `#cfg-section-essentials` is the first visible section and contains
+   name, model, max run steps, autonomy, and working directory. Parent/path
+   plumbing is not in that first section.
+5. Fill `#cfg-model`, `#cfg-turns`, and `#cfg-workdir`.
+6. Use the visible add-on toggle controls under `#cfg-package-configs` to change
+   what the agent can use. `#cfg-include` / `#cfg-exclude` are hidden durable
+   storage mirrors, not direct user controls.
+7. Click `#cfg-save`.
 
 **Observable expectation.**
 - *Liveness (transient):* `#cfg-note` goes `saving…` → `saved — applies on the
@@ -124,10 +130,15 @@ the configure tab.
   `skills.exclude` are sent as real arrays (comma-split, trimmed,
   empties dropped); an empty include is coerced to `['#']` (everything), and an
   empty exclude is *always sent* so clearing it actually clears. Re-opening
-  configure after reload shows the same `#cfg-model` / `#cfg-turns` /
-  `#cfg-include` / `#cfg-exclude`.
+  configure after reload shows the same `#cfg-model` / `#cfg-turns`, and the
+  hidden `#cfg-include` / `#cfg-exclude` mirrors match the visible add-on state.
 - The header `#cfg-file` names the agent settings file the edit lands in
   (comments survive).
+- The per-agent cost summary at `.cfg-cost-summary` names this agent's model,
+  hard run-step ceiling, and autonomy. The model field includes an honest
+  cost/performance hint (`cheap`, `balanced`, `powerful`, or `unknown`).
+- `#cfg-autonomy-consequence` changes when `#cfg-autonomy` changes and states
+  what the level lets agent-proposed setting changes do without asking.
 
 **How to verify.** Save, then reload and re-read the fields — never trust the
 note alone:
@@ -135,10 +146,14 @@ note alone:
 await page.click('[data-tab="configure"]');
 await page.waitForSelector('#view-configure:not([hidden])');
 await waitForConfigureLoaded(page);            // #cfg-model non-empty
+await expect(page.locator('#cfg-section-essentials')).toContainText(/name|model|max run steps|autonomy|working directory/);
+await expect(page.locator('#cfg-section-essentials')).not.toContainText(/parent|prepend path|effective path/);
 await page.fill('#cfg-model', 'claude-haiku-4-5-20251001');
 await page.fill('#cfg-turns', '7');
-await page.fill('#cfg-include', '#');
-await page.fill('#cfg-exclude', 'notes');
+await expect(page.locator('.cfg-cost-summary')).toContainText('7 run steps');
+await expect(page.locator('.cfg-cost-summary')).toContainText(/cheap|unknown/);
+await page.locator('.cfg-package-card[data-package="history"] .cfg-package-disable').click();
+await expect(page.locator('#cfg-exclude')).toHaveValue(/history/);
 await page.click('#cfg-save');
 await expect(page.locator('#cfg-note')).toContainText('saved');     // liveness
 await page.reload();                                                // DURABLE check
@@ -146,7 +161,7 @@ await page.reload();                                                // DURABLE c
 await expect(page.locator('#cfg-model')).toHaveValue(/haiku/);
 await expect(page.locator('#cfg-turns')).toHaveValue('7');
 await expect(page.locator('#cfg-include')).toHaveValue(/#/);
-await expect(page.locator('#cfg-exclude')).toHaveValue(/notes/);
+await expect(page.locator('#cfg-exclude')).toHaveValue(/history/);
 ```
 
 ### configure-2 — Clearing the working directory (empty-string is a real save)
@@ -290,7 +305,8 @@ pairs as normal agent configuration.
 **Steps.**
 1. Confirm the configure index has no `vars` entry and there is no standalone
    `#cfg-section-vars`.
-2. Open `#cfg-section-raw` → `advanced context parameters`.
+2. Open `#cfg-section-advanced`, then `#cfg-section-raw` → `advanced context
+   parameters`.
 3. Add a key/value row in `#cfg-vars`.
 4. Click the main `#cfg-save` button.
 
@@ -339,14 +355,15 @@ the user edit raw TOML for the common fields.
 **Preconditions.** Configure loaded.
 
 **Steps.**
-1. Inspect `#cfg-section-context`.
-2. Set `program` to `default`.
-3. Set `max context ms` to `12000`.
-4. Inspect `#cfg-context-chain` and find the `window/window` context-step tile.
-5. Change its `timeout ms` value to `9000`.
-6. Change its declared `Window rows` setting to `60`.
-7. Use the tile move controls when more than one context step is visible.
-8. Click the main `#cfg-save` button.
+1. Open `#cfg-section-advanced`.
+2. Inspect `#cfg-section-context`.
+3. Set `program` to `default`.
+4. Set `max context ms` to `12000`.
+5. Inspect `#cfg-context-chain` and find the `window/window` context-step tile.
+6. Change its `timeout ms` value to `9000`.
+7. Change its declared `Window rows` setting to `60`.
+8. Use the tile move controls when more than one context step is visible.
+9. Click the main `#cfg-save` button.
 
 **Observable expectation.** Save succeeds, reload preserves both controls, and
 the raw settings file contains `[context] max_total_ms = 12000` plus a
@@ -361,6 +378,7 @@ steps as an ordered chain, not as a singleton object.
 ```js
 await expect(page.locator('.cfg-index')).not.toContainText(/\bvars\b/i);
 await expect(page.locator('#cfg-section-vars')).toHaveCount(0);
+await page.click('#cfg-section-advanced > summary');
 await page.click('text=advanced context parameters');
 await page.fill('#cfg-vars .cfg-var-key', 'window_rows');
 await page.fill('#cfg-vars .cfg-var-value', '50');
@@ -389,8 +407,12 @@ await expect(page.locator('#cfg-toml')).toContainText('[vars]');
    `dev`).
 3. Click that row's details button (`button.ghost`).
 
-**Observable expectation.** `#setup-kits` lists each add-on with name + hook; an
-already-added row carries a `.badge` reading `installed` and its action button
+**Observable expectation.** `#setup-kits` lists a non-installable
+`#coding-agent-entry` first, explaining in future-tense language that
+Codex/Claude Code support is coming and that the value will be sandbox,
+recording, and cost control. It must not claim the integration is configured
+today. Other add-ons list with name + hook;
+an already-added row carries a `.badge` reading `installed` and its action button
 reads `add again`. Clicking details toggles a `.setup-readme <pre>` from hidden
 to shown, lazily fetching the text (shows `fetching...` then content). Empty
 catalog shows a dim product-language note.
@@ -399,6 +421,9 @@ catalog shows a dim product-language note.
 ```js
 await page.click('.nav-setup');
 await page.waitForSelector('#view-setup:not([hidden])');
+await expect(page.locator('#coding-agent-entry')).toContainText(/Codex|Claude Code/);
+await expect(page.locator('#coding-agent-entry')).toContainText(/sandbox|recording|cost control/);
+await expect(page.locator('#coding-agent-entry')).toContainText(/coming|not configured/);
 await expect(page.locator('#setup-kits')).toContainText(/dev|core|funnel/);
 const devRow = page.locator('.setup-kit', { hasText: 'dev' });
 await devRow.locator('button.ghost').click();
@@ -422,9 +447,9 @@ on a button label that the re-render destroys.
 **Observable expectation.** The transient button label is destroyed by the
 re-render. The durable confirmation is **`#setup-status`** going `.status-ok`
 with text `added <name>.` (or `.status-err` on failure). Simultaneously
-`#setup-configs` shows the installed add-ons, including settings controls for
-each package surfaced through `/api/admin/configs`. The banner persists because
-it lives outside the re-rendered lists.
+`#setup-configs` shows the installed add-ons, including typed settings controls
+for packages that declare configurable values. The banner persists because it
+lives outside the re-rendered lists.
 
 **How to verify.**
 ```js
@@ -436,7 +461,7 @@ await expect(page.locator('#setup-status')).toContainText('added dev');
 await expect(page.locator('#setup-configs')).toContainText(/git-protect|window|recent-history/i);
 ```
 
-### add-ons-3 — Save package settings and read them back
+### add-ons-3 — Save typed package settings and read them back
 
 **Goal.** Give shared package configuration a visible home and prove writes
 survive a reload.
@@ -444,25 +469,64 @@ survive a reload.
 **Preconditions.** An add-on is installed and visible in `#setup-configs`.
 
 **Steps.**
-1. In the installed add-on card, fill the setting name input and value input.
-2. Click `save setting`.
+1. In the installed add-on card, click `settings`.
+2. Edit a typed setting row rendered from the add-on description, such as
+   `Window rows` under `window`.
+3. Click that row's `save` button.
 3. Expand `current settings`.
 
 **Observable expectation.** The card says these settings apply to every agent
-that uses the add-on. The inline note reads `saved`; expanding current settings
-fetches the raw TOML from `elanus config list <package>` and shows the saved
-key/value. The backend log shows `elanus config set ...`, and the change is
-committed on `config/live`.
+that uses the add-on. The row uses the declared input type from the add-on
+description rather than a raw TOML value box. The inline note reads
+`saved and reloaded`; expanding current settings fetches the raw TOML from
+`elanus config list <package>` and shows the saved key/value. The backend log
+shows `elanus config set ...`, and the change is committed on `config/live`.
+
+**How to verify.**
+```js
+const card = page.locator('#setup-configs .setup-pending-pkg', { hasText: 'window' });
+await card.locator('button', { hasText: 'settings' }).click();
+await card.locator('.cfg-config-row', { hasText: 'Window rows' }).locator('input[type="number"]').fill('72');
+await card.locator('button', { name: 'save window.window_rows for every agent' }).click();
+await expect(card).toContainText('saved and reloaded');
+await card.locator('summary', { hasText: 'current settings' }).click();
+await expect(card.locator('pre')).toContainText('window_rows = 72');
+```
+
+### add-ons-4 — Turn off a linked kit
+
+**Goal.** Give an installed linked kit a reversible off switch without claiming
+that review records or copied package files were erased.
+
+**Preconditions.** A linked kit such as `dev` has been added and one of its
+packages, such as `git-protect`, appears in `#setup-configs`.
+
+**Steps.**
+1. In the installed package card, click `turn off`.
+2. Read the confirmation.
+3. Confirm `turn off <kit>`.
+
+**Observable expectation.** The confirmation says this removes the kit from this
+installation's add-on path and that the review record stays. On success,
+`#setup-status` says `turned off <kit>...`, the package disappears from
+`#setup-configs` after reload, and the backend log shows `elanus kit unlink
+<kit>`. This is a disable via unlink, not a hard uninstall.
+
+Copied kits do not show the `turn off` button because `kit unlink` cannot remove
+copied package files. Their cards say removal is not supported here yet.
 
 **How to verify.**
 ```js
 const card = page.locator('#setup-configs .setup-pending-pkg', { hasText: 'git-protect' });
-await card.locator('input').nth(0).fill('mode');
-await card.locator('input').nth(1).fill('"watch"');
-await card.locator('button', { hasText: 'save setting' }).click();
-await expect(card).toContainText('saved');
-await card.locator('summary', { hasText: 'current settings' }).click();
-await expect(card.locator('pre')).toContainText('mode = "watch"');
+await card.locator('button', { hasText: 'turn off' }).click();
+await expect(card).toContainText('review record stays');
+await card.locator('.setup-confirm button').click();
+await expect(page.locator('#setup-status')).toContainText('turned off dev');
+await expect(page.locator('#setup-configs')).not.toContainText('git-protect');
+// also assert ELANUS_WEB_LOG contains: elanus kit unlink dev
+const copied = page.locator('#setup-configs .setup-pending-pkg', { hasText: 'harness-doctrine' });
+await expect(copied).toContainText('Copied into this installation');
+await expect(copied.locator('button', { hasText: 'turn off' })).toHaveCount(0);
 ```
 
 ---
