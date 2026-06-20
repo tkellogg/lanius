@@ -260,7 +260,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BusCmd,
     },
-    /// Launch and observe an external coding agent (Claude Code today).
+    /// Launch and observe an external coding agent.
     ///
     /// `elanus code <tool> [args...]` launches the real coding agent in this
     /// directory, observed on the bus (`tool` selects the adapter — `claude` or
@@ -270,15 +270,13 @@ enum Cmd {
     /// continues a recorded session in its workdir (the M2-A resume primitive);
     /// `deliver <worker-session> "<message>"` (run from inside a session) dispatches
     /// work to a worker and records the running session as the requester (M4-B);
+    /// `spawn <tool> "<task>"` (run from inside a session) starts a worker
+    /// detached and delivers its completion back to the spawner's mailbox;
     /// `inbox` (run from inside a session) reads ITS OWN inbox (M3, own-inbox-only by
     /// construction); `note <session> "<text>"` leaves a per-session memory note (M3).
     #[command(disable_help_flag = true)]
     Code {
-        /// The adapter (claude, codex), or a reserved word (`hook`, `resume`,
-        /// `deliver`, `inbox`, `note`).
-        tool: String,
-        /// Arguments passed straight through to the tool (or, for `hook`, the
-        /// single hook event name).
+        /// Arguments passed straight through to the tool, or an `elanus code` verb.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -901,64 +899,80 @@ fn run(cli: Cli) -> Result<()> {
                 buscli::subscribe(&root, &filter, count, timeout, b)?;
             }
         },
-        Cmd::Code { tool, args } => {
+        Cmd::Code { args } => {
+            let tool = args.first().map(String::as_str).unwrap_or("");
+            let rest = args.get(1..).unwrap_or(&[]);
             // Reserved first words: `hook` is the internal hook bridge
             // (`elanus code hook <Event>`); `resume` continues a recorded session
             // (`elanus code resume <elanus_session> "<message>"`). Any other first
             // word is a coding-tool adapter to launch.
-            match tool.as_str() {
+            match tool {
+                "" | "help" | "-h" | "--help" => {
+                    codeagent::print_help();
+                }
+                "list" => {
+                    codeagent::print_tools();
+                }
                 "hook" => {
-                    let event = args.first().map(String::as_str).unwrap_or("");
+                    let event = rest.first().map(String::as_str).unwrap_or("");
                     codeagent::hook(&root, event)?;
                 }
                 "resume" => {
-                    let session = args.first().map(String::as_str).unwrap_or("");
+                    let session = rest.first().map(String::as_str).unwrap_or("");
                     if session.is_empty() {
-                        anyhow::bail!(
-                            "usage: elanus code resume <elanus_session> \"<message>\""
-                        );
+                        anyhow::bail!("usage: elanus code resume <elanus_session> \"<message>\"");
                     }
-                    let message = args.get(1..).unwrap_or(&[]).join(" ");
+                    let message = rest.get(1..).unwrap_or(&[]).join(" ");
                     codeagent::resume(&root, session, &message)?;
                 }
                 "deliver" => {
                     // A planner dispatches work to a worker (M4-B). Run from inside
                     // a coding session; records the running session as the requester
                     // so the worker's completion routes back (M4-A).
-                    let worker = args.first().map(String::as_str).unwrap_or("");
+                    let worker = rest.first().map(String::as_str).unwrap_or("");
                     if worker.is_empty() {
-                        anyhow::bail!(
-                            "usage: elanus code deliver <worker-session> \"<message>\""
-                        );
+                        anyhow::bail!("usage: elanus code deliver <worker-session> \"<message>\"");
                     }
-                    let message = args.get(1..).unwrap_or(&[]).join(" ");
+                    let message = rest.get(1..).unwrap_or(&[]).join(" ");
                     codeagent::deliver(&root, worker, &message)?;
+                }
+                "spawn" => {
+                    // A planner creates a new worker in the background. The child
+                    // wrapper gets a pre-generated worker session id and a reply
+                    // route to this session's mailbox, then this command returns
+                    // immediately so the planner can end its turn.
+                    let worker_tool = rest.first().map(String::as_str).unwrap_or("");
+                    if worker_tool.is_empty() {
+                        anyhow::bail!("usage: elanus code spawn <tool> \"<task>\"");
+                    }
+                    let prompt = rest.get(1..).unwrap_or(&[]).join(" ");
+                    codeagent::spawn(&root, worker_tool, &prompt)?;
                 }
                 "inbox" => {
                     // A session pulls its OWN inbox (M3). Identity comes from the
                     // env the launcher set (ELANUS_CODE_SESSION/AGENT) — never an
                     // arg — so it can only ever read its own mailbox. Flags: --all
                     // (full inbox, non-destructive), --json (machine-readable).
-                    codeagent::inbox_cmd(&root, &args)?;
+                    codeagent::inbox_cmd(&root, rest)?;
                 }
                 "note" => {
                     // Leave a per-session memory note (M3), surfaced by the per-turn
                     // injection. `elanus code note <session> "<text>"`; empty text
                     // clears it.
-                    let session = args.first().map(String::as_str).unwrap_or("");
+                    let session = rest.first().map(String::as_str).unwrap_or("");
                     if session.is_empty() {
                         anyhow::bail!(
                             "usage: elanus code note <session> \"<text>\"  (empty text clears the note)"
                         );
                     }
-                    let text = args.get(1..).unwrap_or(&[]).join(" ");
+                    let text = rest.get(1..).unwrap_or(&[]).join(" ");
                     codeagent::note_cmd(&root, session, &text)?;
                 }
                 "claim" => {
                     // Announce an advisory edit claim (M5). Run from inside a
                     // session; identity + room are env/record-derived, so it can
                     // only claim as itself in its own room. `elanus code claim <path>`.
-                    let path = args.first().map(String::as_str).unwrap_or("");
+                    let path = rest.first().map(String::as_str).unwrap_or("");
                     if path.is_empty() {
                         anyhow::bail!("usage: elanus code claim <path>");
                     }
@@ -967,7 +981,7 @@ fn run(cli: Cli) -> Result<()> {
                 "unclaim" => {
                     // Release this session's advisory claim on a path (M5).
                     // `elanus code unclaim <path>`.
-                    let path = args.first().map(String::as_str).unwrap_or("");
+                    let path = rest.first().map(String::as_str).unwrap_or("");
                     if path.is_empty() {
                         anyhow::bail!("usage: elanus code unclaim <path>");
                     }
@@ -976,10 +990,10 @@ fn run(cli: Cli) -> Result<()> {
                 "claims" => {
                     // Show this session's room coordination view (own + peer
                     // claims), M5. `elanus code claims [--json]`.
-                    codeagent::claims_cmd(&root, &args)?;
+                    codeagent::claims_cmd(&root, rest)?;
                 }
                 _ => {
-                    codeagent::launch(&root, &tool, &args)?;
+                    codeagent::launch(&root, tool, rest)?;
                 }
             }
         }

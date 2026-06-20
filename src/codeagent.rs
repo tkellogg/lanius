@@ -64,15 +64,65 @@ use crate::buscli;
 use crate::codesession;
 use crate::paths::Root;
 use crate::topic;
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use std::io::{BufRead as _, Read as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Env vars the launcher sets for the child coding-agent process tree, read back
 /// by `elanus code hook` so each hook event publishes as the session principal.
 const ENV_SESSION: &str = "ELANUS_CODE_SESSION";
 const ENV_AGENT: &str = "ELANUS_CODE_AGENT";
+
+/// Internal launch-control env vars used by `elanus code spawn`.
+///
+/// `ELANUS_CODE_FORCE_SESSION` lets a detached wrapper process use the worker
+/// handle its spawner already printed, after validating that it is a safe
+/// `code-*` principal. `ELANUS_CODE_REPLY_TO` names the spawning session that
+/// should receive the worker's completion, and
+/// `ELANUS_CODE_REPLY_CORRELATION` threads that completion through the same
+/// conversation id the spawn command reported. These vars are consumed by the
+/// elanus wrapper only; they must NOT leak onward into the real coding tool, or a
+/// nested `elanus code <tool>` launched by the worker could accidentally inherit
+/// the forced id / reply route.
+const ENV_FORCE_SESSION: &str = "ELANUS_CODE_FORCE_SESSION";
+const ENV_REPLY_TO: &str = "ELANUS_CODE_REPLY_TO";
+const ENV_REPLY_CORRELATION: &str = "ELANUS_CODE_REPLY_CORRELATION";
+/// Spawn-depth guard carried through detached workers. Unlike the reply/force
+/// launch-control vars, this MUST propagate into the real tool child so nested
+/// `elanus code spawn` calls see and increment the current depth.
+const ENV_SPAWN_DEPTH: &str = "ELANUS_CODE_SPAWN_DEPTH";
+/// Hard cap on recursively spawned detached workers. It is intentionally roomy
+/// for normal delegation trees but stops accidental fork-bomb prompts.
+const MAX_SPAWN_DEPTH: u32 = 8;
+
+/// One-turn teaching nudge surfaced only when the user's submitted prompt is
+/// plausibly asking for delegation, parallelism, or another coding agent.
+const DISPATCH_HINT: &str = "[elanus] Tip: you can dispatch coding workers yourself - run `elanus code help` for all verbs. Live/blocking: `elanus code codex \"<task>\"` runs a Codex worker and returns its result inline; `elanus code claude --worker \"<task>\"` runs a headless Claude worker.";
+
+/// The session-local Claude Code skill body written under the run scratch. Claude
+/// discovers it through `--add-dir <scratch>/skillroot` loading
+/// `.claude/skills/elanus`, so `/elanus` is available only for this session and
+/// vanishes with the scratch without exposing generated settings.json.
+const ELANUS_SKILL: &str = r#"---
+name: elanus
+description: Shows how to dispatch coding workers from this elanus-launched Claude Code session.
+---
+
+# elanus worker dispatch
+
+Use this cheatsheet when you need another coding worker:
+
+- Full help: `elanus code help`
+- Live/blocking Codex worker: `elanus code codex "<task>"`
+- Live/blocking Claude worker: `elanus code claude --worker "<task>"`
+- Async spawn: `elanus code spawn <tool> "<task>"`
+- Async deliver to an existing worker: `elanus code deliver <worker> "<msg>"`
+- Check your own mailbox: `elanus code inbox`
+
+For async `spawn` or `deliver`, end your turn after dispatch. Do not poll, sleep,
+or wait; elanus wakes you later with the result.
+"#;
 
 /// Provider-credential env vars scrubbed from EVERY launched/resumed coding-agent
 /// child (Task 2 / docs/handoffs/coding-agents.md cred-scrub Log).
@@ -114,6 +164,47 @@ fn scrub_provider_creds(cmd: &mut std::process::Command) -> &mut std::process::C
         cmd.env_remove(var);
     }
     cmd
+}
+
+/// Remove internal launch-control variables from a real coding-tool child. They
+/// are instructions to this elanus wrapper, not part of the session identity the
+/// model should inherit. The wrapper sets fresh `ELANUS_CODE_SESSION` /
+/// `ELANUS_CODE_AGENT` for the tool after this scrub.
+fn scrub_launch_control_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for var in [ENV_FORCE_SESSION, ENV_REPLY_TO, ENV_REPLY_CORRELATION] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+pub fn print_help() {
+    println!(
+        "\
+Usage: elanus code <verb> [args...]
+
+Launch tools:
+  elanus code claude [args...]          launch Claude Code
+  elanus code claude --worker \"<task>\"   run Claude headless and print its result
+  elanus code codex \"<task>\"           launch Codex; the task is positional
+
+Commands:
+  elanus code deliver <worker-session> \"<message>\"  dispatch work to a worker session
+  elanus code spawn <tool> \"<task>\"                  start a worker in the background
+  elanus code inbox [--all] [--json]                  show this session's inbox
+  elanus code resume <elanus-session> \"<message>\"    resume a recorded session
+  elanus code note <session> \"<text>\"                set or clear a session note
+  elanus code claim <path>                            announce an advisory edit claim
+  elanus code unclaim <path>                          release an advisory edit claim
+  elanus code claims [--json]                         show edit claims in this room
+  elanus code help                                    show this help
+  elanus code list                                    list supported launch tools
+  elanus code hook <event>                            internal hook bridge"
+    );
+}
+
+pub fn print_tools() {
+    println!("claude");
+    println!("codex");
 }
 
 /// The supported adapters: Claude Code (hook bridge) and Codex (`exec --json`
@@ -568,7 +659,11 @@ pub fn record_delivery(
     // freshly-launched planner whose native id isn't observed yet omits it and
     // relies on the recorded sender once its record exists.
     let mut payload = json!({ "prompt": message });
-    if codesession::read_record(root, &requester).ok().flatten().is_some() {
+    if codesession::read_record(root, &requester)
+        .ok()
+        .flatten()
+        .is_some()
+    {
         payload["reply_to"] = json!(requester);
     }
 
@@ -596,6 +691,258 @@ pub fn record_delivery(
     Ok(id)
 }
 
+// ── The spawn tool: create a worker and route completion back (D3) ───────────
+//
+// `elanus code spawn <tool> "<task>"` is the async counterpart to the blocking
+// foreground launch. It is deliberately just plumbing + record: the spawner and
+// worker are both the user's coding sessions, so there is no new bus authority
+// and no widened session token. The spawner names a tool and prompt; this command
+// starts a detached elanus wrapper with a pre-generated worker id and reply route,
+// then exits immediately. The wrapper mints its OWN scoped worker identity in
+// `launch()`, runs the tool, and on completion records a kernel-ledger delivery
+// to the spawner's mailbox via `mailbox_for_actor` (never a raw topic).
+
+/// Generate a fresh elanus coding-session id in the existing `code-<8hex>` shape.
+/// Kept as a helper so `spawn` and `launch` cannot drift apart.
+fn new_code_session_id() -> String {
+    format!("code-{}", &uuid::Uuid::new_v4().to_string()[..8])
+}
+
+/// Select the session id for a launch. A detached `spawn` pre-generates the
+/// worker handle and passes it as `ELANUS_CODE_FORCE_SESSION`; this function uses
+/// it only after `codesession::is_session_principal` accepts the name AND no
+/// credential file already exists for that principal. Reusing an existing forced
+/// id could clobber a live worker's token; because the liveness probe is private
+/// to `codesession`, existence is treated as unsafe here and the normal random id
+/// path is used. An invalid forced value is ignored with a warning, so a malformed
+/// environment cannot smuggle a path-unsafe principal into the token store.
+fn launch_session_id(root: &Root) -> String {
+    match std::env::var(ENV_FORCE_SESSION)
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(forced) if codesession::is_session_principal(&forced) => {
+            if forced_session_token_exists(root, &forced) {
+                eprintln!(
+                    "[code] ignoring {ENV_FORCE_SESSION}={forced:?}: \
+                     session credential already exists"
+                );
+                new_code_session_id()
+            } else {
+                forced
+            }
+        }
+        Some(forced) => {
+            eprintln!("[code] ignoring invalid {ENV_FORCE_SESSION}={forced:?}");
+            new_code_session_id()
+        }
+        None => new_code_session_id(),
+    }
+}
+
+/// Does the fenced token-store path for a syntactically valid forced session id
+/// already exist? `codesession::read` intentionally hides unparseable tokens; for
+/// the clobber guard, even an unreadable existing file means "do not overwrite".
+fn forced_session_token_exists(root: &Root, principal: &str) -> bool {
+    root.secrets()
+        .join("code-sessions")
+        .join(format!("{principal}.json"))
+        .exists()
+}
+
+/// Remove the spawner's live identity from the detached elanus wrapper process
+/// before setting the worker's launch-control env. The wrapper must mint a fresh
+/// worker token in `launch()`: inheriting the spawner's `ELANUS_PACKAGE`,
+/// `ELANUS_BUS_TOKEN`, `ELANUS_CODE_SESSION`, or `ELANUS_CODE_AGENT` would make
+/// provenance ambiguous and could route hooks as the wrong session.
+fn scrub_spawn_wrapper_identity_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for var in [
+        "ELANUS_PACKAGE",
+        "ELANUS_BUS_TOKEN",
+        ENV_SESSION,
+        ENV_AGENT,
+        ENV_FORCE_SESSION,
+        ENV_REPLY_TO,
+        ENV_REPLY_CORRELATION,
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// `elanus code spawn <tool> "<task>"` — start a worker in the background.
+///
+/// Must run from inside a coding session, identified by `ELANUS_CODE_SESSION`.
+/// The worker's session id is generated before the child starts and passed to the
+/// detached wrapper as `ELANUS_CODE_FORCE_SESSION`; the wrapper validates that
+/// forced id before minting its scoped token. `ELANUS_CODE_REPLY_TO` and
+/// `ELANUS_CODE_REPLY_CORRELATION` tell the wrapper where to deliver the worker's
+/// completion when `launch()` finishes. The detached wrapper inherits
+/// `ELANUS_ROOT` so it resolves the same ledger/root, but it does NOT inherit the
+/// spawner's session/bus identity.
+pub fn spawn(root: &Root, tool: &str, prompt: &str) -> Result<()> {
+    let spawner = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
+    let Some(spawner) = spawner else {
+        bail!(
+            "elanus code spawn must run inside a coding session \
+             (no {ENV_SESSION} in the environment — are you running it from a \
+             session launched by `elanus code`?)"
+        );
+    };
+
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        bail!("usage: elanus code spawn <tool> \"<task>\"");
+    }
+
+    let parsed = Tool::parse(tool)?;
+    let spawn_depth = std::env::var(ENV_SPAWN_DEPTH)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    if spawn_depth >= MAX_SPAWN_DEPTH {
+        bail!("refusing to spawn: max spawn depth {MAX_SPAWN_DEPTH} reached");
+    }
+    let worker_session = new_code_session_id();
+    let correlation = format!("code-spawn-{}", uuid::Uuid::new_v4().simple());
+    let self_exe =
+        std::env::current_exe().context("locating the elanus binary for background spawn")?;
+
+    let mut cmd = std::process::Command::new(self_exe);
+    cmd.arg("code").arg(parsed.binary());
+    if matches!(parsed, Tool::ClaudeCode) {
+        // Claude's interactive TUI cannot run with detached stdio; force the
+        // headless worker shape (`claude -p`) in the background wrapper.
+        cmd.arg("--worker");
+    }
+    cmd.arg(prompt)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    scrub_spawn_wrapper_identity_env(&mut cmd);
+    cmd.env(ENV_FORCE_SESSION, &worker_session)
+        .env(ENV_REPLY_TO, &spawner)
+        .env(ENV_REPLY_CORRELATION, &correlation)
+        .env(ENV_SPAWN_DEPTH, (spawn_depth + 1).to_string())
+        .env("ELANUS_ROOT", &root.dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Put the worker wrapper in its own process group so it does not share
+        // terminal-generated signals with this short-lived CLI process.
+        cmd.process_group(0);
+    }
+
+    cmd.spawn()
+        .with_context(|| format!("starting detached {tool} worker {worker_session}"))?;
+
+    println!(
+        "spawned {tool} worker {worker_session}; its result will be delivered to \
+         your mailbox (correlation {correlation}). End your turn now — do not wait."
+    );
+    Ok(())
+}
+
+/// Build the prompt delivered back to a spawner when a spawned worker finishes.
+/// The result is deliberately a single ordinary prompt string because the daemon's
+/// existing mailbox→resume machinery already knows how to resume a coding session
+/// from a `{"prompt": ...}` payload. It names the worker, includes exit status or
+/// launch error, carries the worker's clipped final text, and lists the files the
+/// capture path observed changing.
+fn completion_delivery_prompt(
+    worker_session: &str,
+    status: Option<&std::process::ExitStatus>,
+    summary: &CaptureSummary,
+    launch_error: Option<&str>,
+) -> String {
+    let status_line = if let Some(err) = launch_error {
+        format!("launch error: {}", clip(err, 2000))
+    } else if let Some(status) = status {
+        match status.code() {
+            Some(124) => format!("timed out after {}s", spawn_timeout_secs()),
+            Some(code) => format!("exit code {code}"),
+            None if status.success() => "success".to_string(),
+            None => "terminated without an exit code".to_string(),
+        }
+    } else {
+        "status unavailable".to_string()
+    };
+    let final_text = summary
+        .final_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| clip(s, FINAL_TEXT_CAP))
+        .unwrap_or_else(|| "(no final text)".to_string());
+    let files = if summary.file_changes.is_empty() {
+        "(none)".to_string()
+    } else {
+        clipped_file_changes(&summary.file_changes)
+    };
+    format!(
+        "Worker {worker_session} finished.\n\
+         Status: {status_line}\n\n\
+         Final text:\n{final_text}\n\n\
+         Files changed: {files}"
+    )
+}
+
+/// Render a bounded file-change list for routed completion prompts. Worker tools
+/// can report very large change sets; the delivery should wake the spawner with
+/// useful context without turning the mailbox item into an unbounded path dump.
+fn clipped_file_changes(paths: &[String]) -> String {
+    const MAX_COMPLETION_FILE_CHANGES: usize = 50;
+    let mut out = paths
+        .iter()
+        .take(MAX_COMPLETION_FILE_CHANGES)
+        .cloned()
+        .collect::<Vec<_>>();
+    if paths.len() > MAX_COMPLETION_FILE_CHANGES {
+        out.push(format!(
+            "… and {} more",
+            paths.len() - MAX_COMPLETION_FILE_CHANGES
+        ));
+    }
+    out.join(", ")
+}
+
+/// Record a spawned worker's completion as a delivery to its spawner. The mailbox
+/// is resolved only through `mailbox_for_actor(root, reply_to, correlation)`, the
+/// same safe path used by delivery routing, so the worker cannot direct a
+/// kernel-authored event to an arbitrary raw topic. The event is stamped with
+/// `sender = <worker_session>` and carries the spawn correlation so the spawner's
+/// resumed turn remains tied to the original dispatch.
+fn emit_completion_delivery(
+    root: &Root,
+    worker_session: &str,
+    reply_to: &str,
+    correlation: Option<&str>,
+    status: Option<&std::process::ExitStatus>,
+    summary: &CaptureSummary,
+    launch_error: Option<&str>,
+) -> Result<i64> {
+    let mailbox = mailbox_for_actor(root, reply_to, correlation).with_context(|| {
+        format!(
+            "resolving completion mailbox for reply_to {reply_to:?} \
+             (worker {worker_session})"
+        )
+    })?;
+    let prompt = completion_delivery_prompt(worker_session, status, summary, launch_error);
+    let conn = crate::db::open(root).context("opening the ledger to record the completion")?;
+    crate::db::init_schema(&conn)?;
+    crate::events::emit(
+        root,
+        &conn,
+        crate::events::EmitOpts {
+            payload: Some(json!({ "prompt": prompt })),
+            correlation: correlation.map(str::to_string),
+            sender: Some(worker_session.to_string()),
+            ..crate::events::EmitOpts::new(&mailbox)
+        },
+    )
+    .context("recording the spawned-worker completion on the ledger")
+}
+
 // ── The launch-envelope briefing (M4-B) ───────────────────────────────────────
 //
 // A coding agent does not, on its own, know it is running under elanus, that it may
@@ -607,22 +954,24 @@ pub fn record_delivery(
 // is M3's separate injection seam.
 
 /// The operating-envelope briefing text, parameterized with this session's own id
-/// so the agent knows its handle. Deliberately short — it tells the agent the four
-/// things it can't infer: it runs under elanus; how to hand work to a worker; that
-/// it must END ITS TURN after dispatching (not busy-wait); and that it should
-/// behave normally toward its human.
+/// so the agent knows its handle. Deliberately short — it tells the agent the
+/// things it can't infer: it runs under elanus; how to create or drive a worker;
+/// the two dispatch modes (blocking foreground vs async wake-later); where to ask
+/// for the complete verb list; and that it should behave normally toward its
+/// human.
 fn briefing(session: &str) -> String {
     format!(
-        "You are running as coding session `{session}` under elanus supervision \
-(an orchestration layer around you). A few things only elanus can tell you:\n\
+        "You are coding session `{session}` under elanus supervision \
+(an orchestration layer around you).\n\
 \n\
-- To hand a sub-task to another coding session (a \"worker\"), run: \
-`elanus code deliver <worker-session> \"<message>\"`. elanus delivers it with your \
-identity recorded as the requester.\n\
-- AFTER you dispatch work, END YOUR TURN cleanly — do NOT poll, sleep, or wait in a \
-loop. You may be paused and the worker's result will reach you later as a NEW turn \
-(elanus resumes you with it). Busy-waiting just burns tokens and the result will \
-never arrive within the same turn.\n\
+- To create a Codex worker, run `elanus code codex \"<prompt>\"`; the prompt is a \
+positional argument. Async dispatch: use \
+`elanus code deliver <worker-session> \"<message>\"` or \
+`elanus code spawn <tool> \"<task>\"`. `elanus code help` lists every verb.\n\
+- Dispatch modes: if you are live/interactive, run a worker in the foreground and \
+read its command output. For async dispatch, use `elanus code deliver` or \
+`elanus code spawn <tool> \"<task>\"`, then END YOUR TURN cleanly — do NOT poll, \
+sleep, or wait; elanus wakes you later with the result.\n\
 - Things addressed to you arrive as a resumed turn with the content in your prompt; \
 you can also pull your own inbox with `elanus code inbox` (only YOUR mailbox). Each \
 turn elanus injects an `[elanus]` note with your inbox status and any memory note. \
@@ -630,6 +979,22 @@ Prior session activity is on the bus under `obs/agent/<noun>/<session>/`.\n\
 - Otherwise behave exactly as you normally would toward your human, who may or may \
 not be watching this session live."
     )
+}
+
+/// Write the `/elanus` Claude Code skill into a dedicated session scratch
+/// subroot, in the exact `.claude/skills/<name>/SKILL.md` shape that
+/// `--add-dir <skillroot>` discovers. Keeping the added dir under `skillroot`
+/// means Claude can see only the generated skill, not the sibling settings.json.
+/// The launch cleanup still removes the whole scratch directory.
+fn write_elanus_skill(scratch: &Path) -> Result<PathBuf> {
+    let skill_root = scratch.join("skillroot");
+    let skill_dir = skill_root.join(".claude").join("skills").join("elanus");
+    std::fs::create_dir_all(&skill_dir)
+        .with_context(|| format!("creating elanus skill dir {}", skill_dir.display()))?;
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::write(&skill_path, ELANUS_SKILL)
+        .with_context(|| format!("writing {}", skill_path.display()))?;
+    Ok(skill_root)
 }
 
 /// Should the launch-envelope briefing be injected? Default yes; a `--no-brief`
@@ -680,6 +1045,75 @@ fn take_room_flag(args: &[String]) -> (Option<String>, Vec<String>) {
     (room, out)
 }
 
+/// Should Claude Code launch in headless worker mode? A `--worker` flag anywhere
+/// in the user args selects `claude -p`, captures stdout, and prints a marked
+/// result for a parent agent to read. The flag is stripped before the real tool
+/// sees argv, matching the other elanus-only launch flags.
+fn take_worker_flag(args: &[String]) -> (bool, Vec<String>) {
+    let mut worker = false;
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        if a == "--worker" {
+            worker = true;
+        } else {
+            out.push(a.clone());
+        }
+    }
+    (worker, out)
+}
+
+/// Best-effort model / reasoning-effort metadata from explicit launch flags
+/// only. The launcher cannot see the coding tool's configured defaults, so absent
+/// flags are recorded as null rather than guessed.
+fn extract_model_effort(args: &[String]) -> (Option<String>, Option<String>) {
+    let mut model = None;
+    let mut effort = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-m" | "--model" => {
+                if let Some(v) = args.get(i + 1).filter(|v| !v.is_empty()) {
+                    model = Some(v.clone());
+                }
+                i += 2;
+                continue;
+            }
+            "--effort" => {
+                if let Some(v) = args.get(i + 1).filter(|v| !v.is_empty()) {
+                    effort = Some(v.clone());
+                }
+                i += 2;
+                continue;
+            }
+            "-c" | "--config" => {
+                if let Some(v) = args.get(i + 1) {
+                    if let Some(e) = extract_reasoning_effort_config(v) {
+                        effort = Some(e);
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (model, effort)
+}
+
+/// Pull `model_reasoning_effort=<value>` out of one tool config arg. The value is
+/// stopped at common separators so a compound config string still yields the
+/// requested scalar signal.
+fn extract_reasoning_effort_config(config: &str) -> Option<String> {
+    let (_, rest) = config.split_once("model_reasoning_effort=")?;
+    let value = rest
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 /// The Codex briefing block written to the child's stdin. Codex `exec` documents:
 /// "If stdin is piped and a prompt is also provided, stdin is appended as a
 /// `<stdin>` block." So piping the briefing delivers it to the agent robustly,
@@ -688,6 +1122,85 @@ fn take_room_flag(args: &[String]) -> (Option<String>, Vec<String>) {
 /// positional; the briefing arrives as out-of-band context.
 fn codex_briefing_block(brief: &str) -> String {
     format!("[elanus operating envelope — read before acting]\n{brief}\n")
+}
+
+/// Heuristically decide whether the `codex exec` argv already carries a prompt
+/// positional. Codex accepts many flags before the prompt; we do NOT attempt a
+/// full Codex CLI parse here. Instead, skip values for the common value-taking
+/// flags elanus may pass through, honor `--`, and treat the first remaining
+/// non-flag token as the prompt. This is intentionally conservative enough to
+/// distinguish "no non-flag prompt was supplied" from the normal
+/// `elanus code codex "<task>"` launch shape without baking Codex's full clap
+/// grammar into elanus.
+fn codex_args_have_prompt(args: &[String]) -> bool {
+    let value_flags = [
+        "-c",
+        "--config",
+        "-m",
+        "--model",
+        "--model-provider",
+        "-s",
+        "--sandbox",
+        "-a",
+        "--ask-for-approval",
+        "--approval-policy",
+        "-C",
+        "--cd",
+        "--profile",
+    ];
+    let mut after_dash_dash = false;
+    let mut skip_next_value = false;
+    for arg in args {
+        if skip_next_value {
+            skip_next_value = false;
+            continue;
+        }
+        if after_dash_dash {
+            return true;
+        }
+        if arg == "--" {
+            after_dash_dash = true;
+            continue;
+        }
+        if value_flags.iter().any(|flag| arg == flag) {
+            skip_next_value = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// If Codex was launched without a prompt positional, promote the launcher's own
+/// stdin to that positional prompt. This keeps Codex's stdin reserved for the
+/// elanus briefing block: the user prompt always reaches Codex as argv, and the
+/// briefing still arrives as piped context. A terminal stdin is treated as absent
+/// so `elanus code codex` fails promptly instead of waiting forever.
+fn codex_args_with_prompt_from_stdin(args: &[String]) -> Result<Vec<String>> {
+    if codex_args_have_prompt(args) {
+        return Ok(args.to_vec());
+    }
+
+    use std::io::IsTerminal as _;
+    let mut prompt = String::new();
+    if !std::io::stdin().is_terminal() {
+        std::io::stdin()
+            .read_to_string(&mut prompt)
+            .context("reading the codex prompt from stdin")?;
+    }
+    if prompt.trim().is_empty() {
+        bail!(
+            "no prompt provided: pass it as an argument (elanus code codex \"<task>\") \
+             or pipe it on stdin"
+        );
+    }
+
+    let mut out = args.to_vec();
+    out.push(prompt);
+    Ok(out)
 }
 
 // ── M3: per-turn context injection + the session's own inbox read ─────────────
@@ -757,7 +1270,11 @@ pub fn inbox_cmd(root: &Root, args: &[String]) -> Result<()> {
     } else if items.is_empty() {
         println!(
             "(your inbox is empty{})",
-            if want_all { "" } else { " — no unread messages" }
+            if want_all {
+                ""
+            } else {
+                " — no unread messages"
+            }
         );
     } else {
         println!(
@@ -772,14 +1289,22 @@ pub fn inbox_cmd(root: &Root, args: &[String]) -> Result<()> {
                 .as_deref()
                 .map(|c| format!(" [{c}]"))
                 .unwrap_or_default();
-            println!("  • from {from}{corr} (event {}): {}", it.event_id, clip(&it.message, 2000));
+            println!(
+                "  • from {from}{corr} (event {}): {}",
+                it.event_id,
+                clip(&it.message, 2000)
+            );
         }
     }
 
     // Mark the listed unseen deliveries as seen (the default pull). --all is a
     // non-destructive view: it does not change the seen-set. Idempotent either way.
     if !want_all {
-        let ids: Vec<i64> = items.iter().filter(|it| !it.seen).map(|it| it.event_id).collect();
+        let ids: Vec<i64> = items
+            .iter()
+            .filter(|it| !it.seen)
+            .map(|it| it.event_id)
+            .collect();
         codesession::mark_inbox_seen(root, &session, &ids)?;
     }
     Ok(())
@@ -872,9 +1397,7 @@ pub fn claims_cmd(root: &Root, args: &[String]) -> Result<()> {
     let own = codesession::own_claims(root, &room, &session)?;
     let peers = codesession::peer_claims(root, &room, &session)?;
     if want_json {
-        let to_json = |c: &codesession::Claim| {
-            json!({ "session": c.session, "path": c.path, "created_at": c.created_at })
-        };
+        let to_json = |c: &codesession::Claim| json!({ "session": c.session, "path": c.path, "created_at": c.created_at });
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -1006,13 +1529,42 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
         ));
         const MAX_CLAIMS: usize = 50;
         for c in peer_claims.iter().take(MAX_CLAIMS) {
-            out.push_str(&format!("\n  {} is editing {}", c.session, clip(&c.path, 400)));
+            out.push_str(&format!(
+                "\n  {} is editing {}",
+                c.session,
+                clip(&c.path, 400)
+            ));
         }
         if peer_claims.len() > MAX_CLAIMS {
             out.push_str(&format!("\n  …and {} more", peer_claims.len() - MAX_CLAIMS));
         }
     }
     Some(out)
+}
+
+/// Detect whether the current Claude Code `UserPromptSubmit` payload looks like
+/// the user is asking about delegation, subagents, parallel work, or Codex, so
+/// the hook can add a focused per-turn dispatch hint exactly when it is relevant.
+fn user_prompt_mentions_dispatch(payload: &serde_json::Value) -> bool {
+    let Some(prompt) = payload.get("prompt").and_then(Value::as_str) else {
+        return false;
+    };
+    let prompt = prompt.to_lowercase();
+    [
+        "subagent",
+        "sub-agent",
+        "sub agent",
+        "delegate",
+        "delegating",
+        "dispatch",
+        "spawn",
+        "in parallel",
+        "worker",
+        "another agent",
+        "codex",
+    ]
+    .iter()
+    .any(|needle| prompt.contains(needle))
 }
 
 /// Compose the message a driven resume hands the model: the per-turn `[elanus]`
@@ -1023,15 +1575,26 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
 /// note), the message is returned unchanged, so a plain resume stays plain.
 fn build_resume_message(root: &Root, agent_noun: &str, session: &str, message: &str) -> String {
     match turn_injection(root, agent_noun, session) {
-        Some(ctx) => format!(
-            "{ctx}\n[elanus] The message you were resumed with follows.\n\n{message}"
-        ),
+        Some(ctx) => {
+            format!("{ctx}\n[elanus] The message you were resumed with follows.\n\n{message}")
+        }
         None => message.to_string(),
     }
 }
 
 /// `elanus code <tool> [args...]` — launch the real coding agent, observed.
 pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
+    // If this launcher is itself running inside a coding session, capture that
+    // parent edge before this function sets ENV_SESSION for the child session.
+    // A blocking nested launch inherits the parent in ENV_SESSION; a DETACHED
+    // `spawn` worker has ENV_SESSION scrubbed (it mints its own identity) but
+    // carries its spawner in ENV_REPLY_TO — so fall back to that, otherwise a
+    // spawned worker would lose the parent→child edge the session tree needs.
+    let parent = std::env::var(ENV_SESSION)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var(ENV_REPLY_TO).ok().filter(|s| !s.is_empty()));
+
     // Reap any session tokens a prior SIGKILL'd launcher leaked, before anything
     // else — a crash must never leave a usable credential lying around
     // (docs/security.md). Done first (even before tool parsing) so a launch is
@@ -1048,14 +1611,20 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     }
 
     // The launch-envelope briefing rides a launch flag (default on; `--no-brief`
-    // suppresses it). The coordination room rides `--room <id>` (M5). Strip both
-    // before the args reach the tool.
+    // suppresses it). The coordination room rides `--room <id>` (M5). Claude's
+    // worker shape rides `--worker`. Strip all before the args reach the tool.
     let (want_brief, args) = take_brief_flag(args);
     let (room, args) = take_room_flag(&args);
+    let (worker, args) = take_worker_flag(&args);
     let args = &args[..];
+    let (model, effort) = extract_model_effort(args);
+    let worker_timeout = std::env::var(ENV_REPLY_TO)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|_| spawn_timeout_secs());
 
     let tool = Tool::parse(tool)?;
-    let session = format!("code-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let session = launch_session_id(root);
     let agent = tool.agent_noun().to_string();
     let brief_text = want_brief.then(|| briefing(&session));
 
@@ -1098,8 +1667,9 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
         .with_context(|| format!("creating run scratch {}", scratch.display()))?;
     let settings_path = scratch.join("settings.json");
 
-    let self_exe = std::env::current_exe().context("locating the elanus binary for hook commands")?;
-    let result = (|| -> Result<std::process::ExitStatus> {
+    let self_exe =
+        std::env::current_exe().context("locating the elanus binary for hook commands")?;
+    let result = (|| -> Result<(std::process::ExitStatus, CaptureSummary)> {
         // Session start (the first ordered record): timestamp + the resolved
         // workdir, so the bus shows when and where the session began. Emitted by
         // the launcher itself for both adapters, before the child runs.
@@ -1114,6 +1684,9 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                 "tool": tool.binary(),
                 "workdir": workdir.display().to_string(),
                 "args": args,
+                "parent": parent,
+                "model": model,
+                "effort": effort,
             }),
         );
 
@@ -1127,56 +1700,135 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                     .expect("hook-bridge adapter generates settings");
                 std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
                     .with_context(|| format!("writing {}", settings_path.display()))?;
+                let skill_root = write_elanus_skill(&scratch)?;
 
                 // Launch the real binary with the generated, isolated config. The
                 // TUI gets inherited stdio so it is a normal, fully usable
                 // session. `--setting-sources ''` loads NO user/project/local
                 // settings (the user's ~/.claude hooks/CLAUDE.md are untouched);
                 // `--settings <file>` loads only our generated hooks (Appendix A).
-                let mut cmd = std::process::Command::new(tool.binary());
-                cmd.arg("--settings")
-                    .arg(&settings_path)
-                    .arg("--setting-sources")
-                    .arg("");
-                // The launch-envelope briefing (M4-B): Claude Code injects it
-                // out-of-band via --append-system-prompt (the system layer, after
-                // the cached prefix — Appendix A), not the user message.
-                if let Some(brief) = &brief_text {
-                    cmd.arg("--append-system-prompt").arg(brief);
+                if worker {
+                    let mut tool_args = vec![
+                        "--settings".to_string(),
+                        settings_path.display().to_string(),
+                        "--setting-sources".to_string(),
+                        "".to_string(),
+                        "--add-dir".to_string(),
+                        skill_root.display().to_string(),
+                    ];
+                    if let Some(brief) = &brief_text {
+                        tool_args.push("--append-system-prompt".to_string());
+                        tool_args.push(brief.clone());
+                    }
+                    tool_args.push("-p".to_string());
+                    tool_args.extend_from_slice(args);
+                    let timeout_suffix;
+                    let (program, tool_args) = if let Some(secs) = worker_timeout {
+                        timeout_suffix = format!(" [timeout {secs}s]");
+                        timeout_wrap(tool.binary(), &tool_args, secs)
+                    } else {
+                        timeout_suffix = String::new();
+                        (tool.binary().to_string(), tool_args)
+                    };
+                    let mut cmd = std::process::Command::new(&program);
+                    cmd.args(&tool_args);
+                    // Scrub elanus's provider credentials FIRST so Claude Code uses
+                    // its own login (`~/.claude`) rather than inheriting elanus's
+                    // DeepSeek ANTHROPIC_BASE_URL/API_KEY (Task 2). The ELANUS_*
+                    // vars set below are NOT scrubbed — the hook bridge depends on
+                    // them.
+                    scrub_provider_creds(&mut cmd);
+                    scrub_launch_control_env(&mut cmd);
+                    // The session's own identity, carried to the hook bridge
+                    // children CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are
+                    // what `elanus bus pub` authenticates with (src/buscli.rs);
+                    // ELANUS_CODE_* tell the bridge which session/agent to file
+                    // under.
+                    cmd.env("ELANUS_PACKAGE", &principal)
+                        .env("ELANUS_BUS_TOKEN", &bus_token)
+                        .env(ENV_SESSION, &session)
+                        .env(ENV_AGENT, &agent)
+                        .env("ELANUS_ROOT", &root.dir);
+                    eprintln!(
+                        "[code] launching {} as session {session}{timeout_suffix}",
+                        tool.binary()
+                    );
+                    cmd.stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::inherit());
+                    let output = cmd.output().with_context(|| {
+                        format!("launching {program} (is it installed and on PATH?)")
+                    })?;
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    print_claude_worker_result(&session, &text);
+                    let final_text = (!text.trim().is_empty()).then(|| clip(&text, FINAL_TEXT_CAP));
+                    Ok((
+                        output.status,
+                        CaptureSummary {
+                            final_text,
+                            file_changes: Vec::new(),
+                        },
+                    ))
+                } else {
+                    // Foreground/interactive launches are deliberately NOT wrapped
+                    // in timeout; real live delegations can run as long as needed.
+                    let mut cmd = std::process::Command::new(tool.binary());
+                    cmd.arg("--settings")
+                        .arg(&settings_path)
+                        .arg("--setting-sources")
+                        .arg("")
+                        .arg("--add-dir")
+                        .arg(&skill_root);
+                    // The launch-envelope briefing (M4-B): Claude Code injects it
+                    // out-of-band via --append-system-prompt (the system layer,
+                    // after the cached prefix — Appendix A), not the user message.
+                    if let Some(brief) = &brief_text {
+                        cmd.arg("--append-system-prompt").arg(brief);
+                    }
+                    // Scrub elanus's provider credentials FIRST so Claude Code uses
+                    // its own login (`~/.claude`) rather than inheriting elanus's
+                    // DeepSeek ANTHROPIC_BASE_URL/API_KEY (Task 2). The ELANUS_*
+                    // vars set below are NOT scrubbed — the hook bridge depends on
+                    // them.
+                    scrub_provider_creds(&mut cmd);
+                    scrub_launch_control_env(&mut cmd);
+                    // The session's own identity, carried to the hook bridge
+                    // children CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are
+                    // what `elanus bus pub` authenticates with (src/buscli.rs);
+                    // ELANUS_CODE_* tell the bridge which session/agent to file
+                    // under.
+                    cmd.env("ELANUS_PACKAGE", &principal)
+                        .env("ELANUS_BUS_TOKEN", &bus_token)
+                        .env(ENV_SESSION, &session)
+                        .env(ENV_AGENT, &agent)
+                        .env("ELANUS_ROOT", &root.dir);
+                    eprintln!("[code] launching {} as session {session}", tool.binary());
+                    cmd.args(args);
+                    let status = cmd.status().with_context(|| {
+                        format!("launching {} (is it installed and on PATH?)", tool.binary())
+                    })?;
+                    Ok((status, CaptureSummary::default()))
                 }
-                cmd.args(args);
-                // Scrub elanus's provider credentials FIRST so Claude Code uses its
-                // own login (`~/.claude`) rather than inheriting elanus's DeepSeek
-                // ANTHROPIC_BASE_URL/API_KEY (Task 2). The ELANUS_* vars set below
-                // are NOT scrubbed — the hook bridge depends on them.
-                scrub_provider_creds(&mut cmd);
-                // The session's own identity, carried to the hook bridge children
-                // CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are what
-                // `elanus bus pub` authenticates with (src/buscli.rs);
-                // ELANUS_CODE_* tell the bridge which session/agent to file under.
-                cmd.env("ELANUS_PACKAGE", &principal)
-                    .env("ELANUS_BUS_TOKEN", &bus_token)
-                    .env(ENV_SESSION, &session)
-                    .env(ENV_AGENT, &agent)
-                    .env("ELANUS_ROOT", &root.dir);
-                eprintln!("[code] launching {} as session {session}", tool.binary());
-                cmd.status().with_context(|| {
-                    format!("launching {} (is it installed and on PATH?)", tool.binary())
-                })
             }
             // ── Codex: stdout JSONL stream ────────────────────────────────────
             // No hooks. Run `codex exec --json`, pipe stdout, and parse+publish
             // each event in-process as the session principal.
             Capture::StreamJson => run_codex_capture(
-                root, &principal, &bus_token, &agent, &session, &workdir, args,
+                root,
+                &principal,
+                &bus_token,
+                &agent,
+                &session,
+                &workdir,
+                args,
                 brief_text.as_deref(),
+                worker_timeout,
             ),
         }
     })();
 
     // Stop (the last ordered record): always emitted, even on a launch error,
     // so the bus shows the session ended and with what code.
-    let exit_code = result.as_ref().ok().and_then(|s| s.code());
+    let exit_code = result.as_ref().ok().and_then(|(s, _)| s.code());
     publish_obs(
         root,
         &principal,
@@ -1184,6 +1836,39 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
         &obs_topic(&agent, &session, "session/stop"),
         json!({ "ts": now_iso(), "exit_code": exit_code }),
     );
+
+    // A detached spawn asks this wrapper to route the worker's result back to the
+    // spawning session's mailbox. This is best-effort and uses the same safe
+    // actor→mailbox resolver as delivery routing; a reply failure is logged but
+    // never changes the worker's normal stop/cleanup/exit behavior.
+    if let Some(reply_to) = std::env::var(ENV_REPLY_TO).ok().filter(|s| !s.is_empty()) {
+        let correlation = std::env::var(ENV_REPLY_CORRELATION)
+            .ok()
+            .filter(|s| !s.is_empty());
+        let launch_error = result.as_ref().err().map(|e| format!("{e:#}"));
+        let fallback_summary;
+        let (status, summary) = match result.as_ref() {
+            Ok((status, summary)) => (Some(status), summary),
+            Err(_) => {
+                fallback_summary = CaptureSummary {
+                    final_text: launch_error.as_deref().map(|e| clip(e, FINAL_TEXT_CAP)),
+                    file_changes: Vec::new(),
+                };
+                (None, &fallback_summary)
+            }
+        };
+        if let Err(e) = emit_completion_delivery(
+            root,
+            &session,
+            &reply_to,
+            correlation.as_deref(),
+            status,
+            summary,
+            launch_error.as_deref(),
+        ) {
+            eprintln!("[code] delivering spawned-worker completion failed (continuing): {e:#}");
+        }
+    }
 
     // No home-state pollution and no lingering credential: drop the generated
     // config and retire the session's scoped token (best-effort; a SIGKILL leaves
@@ -1207,7 +1892,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     // exits it is dead, so the boot reaper will release the membership — but not
     // mid-turn, and not while a live interactive launcher holds the session open.
 
-    let status = result?;
+    let (status, _summary) = result?;
     if !status.success() {
         // Propagate the tool's exit so a script driving the launcher sees it.
         std::process::exit(status.code().unwrap_or(1));
@@ -1224,9 +1909,13 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
 /// `~/.codex`. We do NOT pass `--dangerously-bypass-approvals-and-sandbox`: Codex
 /// keeps its OWN sandbox active (the complete elanus cage is the deferred
 /// prerequisite, recorded in the handoff Log), exactly as the CC adapter keeps
-/// CC's sandbox. The child gets empty stdin (the prompt comes from the user args,
-/// not stdin) so it never blocks reading stdin. stderr is inherited so the human
-/// still sees Codex's own progress/errors.
+/// CC's sandbox. The user prompt must be a positional arg by the time Codex is
+/// spawned; if the caller omitted one, we promote the launcher's stdin to that
+/// positional or fail loudly before spawning. Codex's stdin remains reserved for
+/// the elanus briefing block, and stderr is inherited so the human still sees
+/// Codex's own progress/errors. Returns the native exit status plus the captured
+/// legible result so foreground launches can print it and spawned launches can
+/// route it back to the spawner.
 #[allow(clippy::too_many_arguments)]
 fn run_codex_capture(
     root: &Root,
@@ -1237,13 +1926,30 @@ fn run_codex_capture(
     workdir: &Path,
     args: &[String],
     brief: Option<&str>,
-) -> Result<std::process::ExitStatus> {
+    worker_timeout: Option<u64>,
+) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    let mut cmd = Command::new("codex");
-    cmd.arg("exec").arg("--json").arg("--skip-git-repo-check");
-    cmd.args(args);
+    let args = codex_args_with_prompt_from_stdin(args)?;
+
+    let mut codex_args = vec![
+        "exec".to_string(),
+        "--json".to_string(),
+        "--skip-git-repo-check".to_string(),
+    ];
+    codex_args.extend_from_slice(&args);
+    let timeout_suffix;
+    let (program, codex_args) = if let Some(secs) = worker_timeout {
+        timeout_suffix = format!(" [timeout {secs}s]");
+        timeout_wrap("codex", &codex_args, secs)
+    } else {
+        timeout_suffix = String::new();
+        ("codex".to_string(), codex_args)
+    };
+
+    let mut cmd = Command::new(&program);
+    cmd.args(&codex_args);
     // The launch-envelope briefing (M4-B): Codex exec has no --append-system-prompt,
     // so we deliver it on STDIN. Codex appends piped stdin as a `<stdin>` block
     // alongside the prompt positional — robust, no arg parsing. stdin is piped only
@@ -1251,13 +1957,20 @@ fn run_codex_capture(
     // the child never blocks on stdin). Piped stdout (we parse it), inherited stderr
     // (the human sees Codex's own output). We keep the real CODEX_HOME — setting it
     // to a scratch would drop the user's auth.
-    cmd.stdin(if brief.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+    cmd.stdin(if brief.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::inherit());
     // Scrub elanus's provider credentials so Codex uses its own login (`~/.codex`)
     // rather than inheriting elanus's OPENAI_*/ANTHROPIC_* provider env (Task 2).
     // The ELANUS_* vars set below are NOT scrubbed.
     scrub_provider_creds(&mut cmd);
+    scrub_launch_control_env(&mut cmd);
+    cmd.env_remove("ELANUS_PACKAGE")
+        .env_remove("ELANUS_BUS_TOKEN");
     // The session's own identity, carried to anything the codex session spawns —
     // crucially `elanus code deliver`, which reads ELANUS_CODE_SESSION/AGENT to
     // record the running session as the requester, and ELANUS_ROOT to resolve the
@@ -1266,11 +1979,11 @@ fn run_codex_capture(
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir);
-    eprintln!("[code] launching codex exec --json as session {session}");
+    eprintln!("[code] launching codex exec --json as session {session}{timeout_suffix}");
 
     let mut child = cmd
         .spawn()
-        .context("launching codex (is it installed and on PATH?)")?;
+        .with_context(|| format!("launching {program} (is it installed and on PATH?)"))?;
 
     // Write the briefing to stdin (then close it, so codex stops reading). The
     // child also has the prompt positional; codex folds piped stdin in as context.
@@ -1283,16 +1996,22 @@ fn run_codex_capture(
 
     // On a fresh launch, `thread.started` carries codex's native thread id —
     // persist the durable record (with this workdir) the moment we see it so the
-    // session is resumable after the launcher exits. The launch path doesn't route
-    // a completion, so its capture summary is unused (the resume path is the one
-    // that feeds `route_completion`).
-    let _ = capture_codex_stream(
-        root, principal, bus_token, agent, session, &mut child, Some(workdir),
+    // session is resumable after the launcher exits. The same capture pass also
+    // harvests the worker's legible result; print it in-band for blocking
+    // foreground callers (resume uses the summary for routed completion).
+    let summary = capture_codex_stream(
+        root,
+        principal,
+        bus_token,
+        agent,
+        session,
+        &mut child,
+        Some(workdir),
     );
+    print_codex_worker_result(session, &summary);
 
-    child
-        .wait()
-        .context("waiting for codex exec to finish")
+    let status = child.wait().context("waiting for codex exec to finish")?;
+    Ok((status, summary))
 }
 
 /// The legible result of one capture pass — the worker's REAL output, harvested
@@ -1316,6 +2035,42 @@ impl CaptureSummary {
             return;
         }
         self.file_changes.push(path);
+    }
+}
+
+/// Print the legible result of a blocking Codex launch to the caller's stdout.
+/// The same summary has already been harvested while publishing obs; this is the
+/// in-band surface a live parent can read without any bus authority. Keep the
+/// format marked and plain so another tool can scrape it if needed.
+fn print_codex_worker_result(session: &str, summary: &CaptureSummary) {
+    println!("=== codex worker result (session {session}) ===");
+    match summary.final_text.as_deref() {
+        Some(text) if !text.trim().is_empty() => {
+            println!("{text}");
+        }
+        _ => {
+            println!("(no final text)");
+        }
+    }
+    if summary.file_changes.is_empty() {
+        println!("files changed: (none)");
+    } else {
+        println!("files changed: {}", summary.file_changes.join(", "));
+    }
+}
+
+/// Print the legible result of a headless Claude worker launch to stdout. This
+/// mirrors the Codex worker marker but keeps Claude's stdout verbatim because
+/// `claude -p` already emits the headless final answer as plain text.
+fn print_claude_worker_result(session: &str, text: &str) {
+    println!("=== claude worker result (session {session}) ===");
+    if text.trim().is_empty() {
+        println!("(no final text)");
+    } else {
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
     }
 }
 
@@ -1360,7 +2115,13 @@ fn capture_codex_stream(
                 // A non-JSON line (Codex shouldn't emit one under --json, but
                 // be defensive): record it generically rather than drop it.
                 let (leaf, body) = generic_event("codex_nonjson_line", &Value::Null);
-                publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
+                publish_obs(
+                    root,
+                    principal,
+                    bus_token,
+                    &obs_topic(agent, session, &leaf),
+                    body,
+                );
                 continue;
             }
         };
@@ -1394,7 +2155,13 @@ fn capture_codex_stream(
             }
         }
         if let Some((leaf, body)) = codex_map_event(&event) {
-            publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
+            publish_obs(
+                root,
+                principal,
+                bus_token,
+                &obs_topic(agent, session, &leaf),
+                body,
+            );
         }
     }
     summary
@@ -1409,7 +2176,9 @@ fn codex_collect_summary(event: &Value, summary: &mut CaptureSummary) {
     if event.get("type").and_then(Value::as_str) != Some("item.completed") {
         return;
     }
-    let Some(item) = event.get("item") else { return };
+    let Some(item) = event.get("item") else {
+        return;
+    };
     match item.get("type").and_then(Value::as_str) {
         Some("agent_message") => {
             if let Some(text) = item.get("text").and_then(Value::as_str) {
@@ -1736,6 +2505,20 @@ fn resume_timeout_secs() -> u64 {
         .unwrap_or(RESUME_TIMEOUT_SECS)
 }
 
+/// Wall-clock ceiling on a detached spawned worker. This is deliberately much
+/// larger than a driven resume timeout because a spawned delegation may do a real
+/// chunk of work, but it must still eventually release the spawner wake path if a
+/// native tool wedges. Override per run with `ELANUS_CODE_SPAWN_TIMEOUT_SECS`.
+const SPAWN_TIMEOUT_SECS: u64 = 1800;
+
+fn spawn_timeout_secs() -> u64 {
+    std::env::var("ELANUS_CODE_SPAWN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&s: &u64| s > 0)
+        .unwrap_or(SPAWN_TIMEOUT_SECS)
+}
+
 /// Wrap a resume command in `timeout(1) -s TERM <secs> <program> <args…>` so a
 /// hung native turn is killed rather than holding the caller open forever (the
 /// handoff guardrail: wrap any codex/claude call in `timeout`). `timeout` is in
@@ -1744,7 +2527,12 @@ fn resume_timeout_secs() -> u64 {
 /// `-s TERM` lets the tool flush; `timeout` exits 124 on expiry, which the
 /// caller reports as a failed (timed-out) resume.
 fn timeout_wrap(program: &str, args: &[String], secs: u64) -> (String, Vec<String>) {
-    let mut wrapped = vec!["-s".to_string(), "TERM".to_string(), secs.to_string(), program.to_string()];
+    let mut wrapped = vec![
+        "-s".to_string(),
+        "TERM".to_string(),
+        secs.to_string(),
+        program.to_string(),
+    ];
     wrapped.extend_from_slice(args);
     ("timeout".to_string(), wrapped)
 }
@@ -1874,10 +2662,13 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
         // Command is inherited through the `timeout` exec, so the tool still never
         // sees them.
         scrub_provider_creds(&mut cmd);
-        eprintln!("[code] resuming {} session {session} ({}) [timeout {secs}s]", rec.tool, rec.native_session);
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("launching {program} resume (is it installed and on PATH?)"))?;
+        eprintln!(
+            "[code] resuming {} session {session} ({}) [timeout {secs}s]",
+            rec.tool, rec.native_session
+        );
+        let mut child = cmd.spawn().with_context(|| {
+            format!("launching {program} resume (is it installed and on PATH?)")
+        })?;
 
         match rec.tool.as_str() {
             // Both adapters' resume emit a JSONL stream on stdout. Codex's `exec
@@ -1892,8 +2683,9 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
                 );
             }
             _ => {
-                summary =
-                    capture_claude_stream(root, &principal, &bus_token, &agent, &session, &mut child);
+                summary = capture_claude_stream(
+                    root, &principal, &bus_token, &agent, &session, &mut child,
+                );
             }
         }
         child.wait().context("waiting for the resume to finish")
@@ -1954,7 +2746,13 @@ fn capture_claude_stream(
         // `tool_use` block reports a path it wrote.
         claude_collect_summary(&event, &mut summary);
         if let Some((leaf, body)) = claude_stream_map(&event) {
-            publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
+            publish_obs(
+                root,
+                principal,
+                bus_token,
+                &obs_topic(agent, session, &leaf),
+                body,
+            );
         }
     }
     summary
@@ -2077,7 +2875,10 @@ fn claude_stream_message(event: &Value, ts: &str) -> Option<(String, Value)> {
                 ));
             }
             Some("tool_use") => {
-                let tool = block.get("name").and_then(Value::as_str).unwrap_or("unknown");
+                let tool = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
                 return Some((
                     format!("tool/{}/call", topic::encode_segment(tool)),
                     json!({ "ts": ts, "cc_session": cc_session, "tool": tool, "input": clip_value(block.get("input"), 4000) }),
@@ -2168,16 +2969,29 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // the agent sees how many messages are waiting and any note a planner left.
     // The inbox read here is the SAME own-inbox-only scoped query — built from the
     // session's own env-derived `agent`/`session`, never a hook-supplied id — so a
-    // hook can never surface another session's inbox.
+    // hook can never surface another session's inbox. D5 adds a focused NUDGE on
+    // UserPromptSubmit when the user's prompt mentions dispatch/delegation terms:
+    // this teaches the front door for live coding workers on the exact turn where
+    // the agent is likely to need it, while preserving a fully quiet turn when
+    // there is no inbox/note/peer-claim context and no relevant prompt.
     if matches!(event, "UserPromptSubmit" | "SessionStart") {
-        if let Some(ctx) = turn_injection(root, &agent, &session) {
+        let ctx = turn_injection(root, &agent, &session);
+        let hint = (event == "UserPromptSubmit" && user_prompt_mentions_dispatch(&payload))
+            .then(|| DISPATCH_HINT.to_string());
+        let additional_context = match (ctx, hint) {
+            (Some(ctx), Some(hint)) => Some(format!("{ctx}\n{hint}")),
+            (Some(ctx), None) => Some(ctx),
+            (None, Some(hint)) => Some(hint),
+            (None, None) => None,
+        };
+        if let Some(additional_context) = additional_context {
             // The documented JSON form (Appendix A): hookSpecificOutput with the
             // hook event name + additionalContext. Printed on stdout (exit 0) so
             // Claude Code folds it into the system-reminder layer.
             let out = json!({
                 "hookSpecificOutput": {
                     "hookEventName": event,
-                    "additionalContext": ctx,
+                    "additionalContext": additional_context,
                 }
             });
             println!("{out}");
@@ -2216,7 +3030,9 @@ fn claude_map_event(event: &str, payload: &Value) -> (String, Value) {
             let tool = tool_name(payload);
             (
                 format!("tool/{}/call", topic::encode_segment(&tool)),
-                common(json!({ "tool": tool, "input": clip_value(payload.get("tool_input"), 4000) })),
+                common(
+                    json!({ "tool": tool, "input": clip_value(payload.get("tool_input"), 4000) }),
+                ),
             )
         }
         "PostToolUse" | "PostToolUseFailure" => {
@@ -2389,8 +3205,16 @@ mod tests {
         let dummy_root = Root {
             dir: PathBuf::from("/tmp/fake-root"),
         };
-        assert!(Tool::Codex.settings(Path::new("/usr/local/bin/elanus"), &dummy_root).is_none());
-        assert!(Tool::ClaudeCode.settings(Path::new("/usr/local/bin/elanus"), &dummy_root).is_some());
+        assert!(
+            Tool::Codex
+                .settings(Path::new("/usr/local/bin/elanus"), &dummy_root)
+                .is_none()
+        );
+        assert!(
+            Tool::ClaudeCode
+                .settings(Path::new("/usr/local/bin/elanus"), &dummy_root)
+                .is_some()
+        );
     }
 
     #[test]
@@ -2441,7 +3265,12 @@ mod tests {
         let (leaf, body) = Tool::ClaudeCode.map_event("PostToolUseFailure", &payload);
         assert_eq!(leaf, "tool/Write/result");
         assert_eq!(body["failed"], true);
-        assert!(body["response"].as_str().unwrap().contains("permission denied"));
+        assert!(
+            body["response"]
+                .as_str()
+                .unwrap()
+                .contains("permission denied")
+        );
     }
 
     #[test]
@@ -2545,11 +3374,13 @@ mod tests {
         assert_eq!(body["text"], "hello");
         assert_eq!(body["item_id"], "item_1");
         // The started form of an agent_message has no settled text → dropped.
-        assert!(codex_map_event(&json!({
-            "type": "item.started",
-            "item": { "id": "item_1", "type": "agent_message", "text": "" }
-        }))
-        .is_none());
+        assert!(
+            codex_map_event(&json!({
+                "type": "item.started",
+                "item": { "id": "item_1", "type": "agent_message", "text": "" }
+            }))
+            .is_none()
+        );
     }
 
     #[test]
@@ -2567,7 +3398,12 @@ mod tests {
         .unwrap();
         assert_eq!(call_leaf, "tool/command_execution/call");
         assert_eq!(call_body["tool"], "command_execution");
-        assert!(call_body["command"].as_str().unwrap().contains("echo hello"));
+        assert!(
+            call_body["command"]
+                .as_str()
+                .unwrap()
+                .contains("echo hello")
+        );
 
         let (res_leaf, res_body) = codex_map_event(&json!({
             "type": "item.completed",
@@ -2612,11 +3448,13 @@ mod tests {
         assert_eq!(leaf, "file/write");
         assert!(body["changes"].as_str().unwrap().contains("src/foo.rs"));
         // started has no settled change → dropped.
-        assert!(codex_map_event(&json!({
-            "type": "item.started",
-            "item": { "id": "item_3", "type": "file_change", "status": "in_progress" }
-        }))
-        .is_none());
+        assert!(
+            codex_map_event(&json!({
+                "type": "item.started",
+                "item": { "id": "item_3", "type": "file_change", "status": "in_progress" }
+            }))
+            .is_none()
+        );
     }
 
     #[test]
@@ -2707,8 +3545,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root { dir: dir.clone() };
         let principal = "code-deadbeef";
-        let token = codesession::mint(&root, principal, "claude-code", std::process::id() as i32)
-            .unwrap();
+        let token =
+            codesession::mint(&root, principal, "claude-code", std::process::id() as i32).unwrap();
         // It does NOT resolve as a full-authority fenced secret — the broker's
         // owner-equivalent path (crate::secrets::read) must return None for it.
         assert_eq!(crate::secrets::read(&root, principal), None);
@@ -2776,7 +3614,10 @@ mod tests {
         assert!(args.contains(&"-p".to_string()));
         let resume_pos = args.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(args[resume_pos + 1], "cc-sess-9f");
-        assert!(args.windows(2).any(|w| w == ["--output-format", "stream-json"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--output-format", "stream-json"])
+        );
         assert_eq!(args.last().unwrap(), "continue please");
     }
 
@@ -2869,8 +3710,16 @@ mod tests {
                      "item": { "id": "i5", "type": "agent_message", "text": "partial" } }),
             &mut s,
         );
-        assert_eq!(s.final_text.as_deref(), Some("ALPHA"), "the LAST agent_message is verbatim");
-        assert_eq!(s.file_changes, vec!["src/foo.rs", "src/bar.rs"], "all changed paths, deduped");
+        assert_eq!(
+            s.final_text.as_deref(),
+            Some("ALPHA"),
+            "the LAST agent_message is verbatim"
+        );
+        assert_eq!(
+            s.file_changes,
+            vec!["src/foo.rs", "src/bar.rs"],
+            "all changed paths, deduped"
+        );
     }
 
     #[test]
@@ -2901,8 +3750,16 @@ mod tests {
                      "result": "ALPHA", "is_error": false }),
             &mut s,
         );
-        assert_eq!(s.final_text.as_deref(), Some("ALPHA"), "the result frame text is verbatim");
-        assert_eq!(s.file_changes, vec!["/w/a.rs", "/w/b.rs"], "only file-writer tool paths");
+        assert_eq!(
+            s.final_text.as_deref(),
+            Some("ALPHA"),
+            "the result frame text is verbatim"
+        );
+        assert_eq!(
+            s.file_changes,
+            vec!["/w/a.rs", "/w/b.rs"],
+            "only file-writer tool paths"
+        );
         assert!(claude_is_file_writer("MultiEdit") && claude_is_file_writer("NotebookEdit"));
         assert!(!claude_is_file_writer("Read") && !claude_is_file_writer("Grep"));
     }
@@ -2918,8 +3775,14 @@ mod tests {
             &mut s,
         );
         let ft = s.final_text.unwrap();
-        assert!(ft.starts_with(&"X".repeat(FINAL_TEXT_CAP)), "the head is the worker's real bytes");
-        assert!(ft.contains("clipped"), "truncation is marked, not summarized");
+        assert!(
+            ft.starts_with(&"X".repeat(FINAL_TEXT_CAP)),
+            "the head is the worker's real bytes"
+        );
+        assert!(
+            ft.contains("clipped"),
+            "truncation is marked, not summarized"
+        );
     }
 
     // ── Inbound delivery recognition (M2-B) ──────────────────────────────────
@@ -3032,7 +3895,10 @@ mod tests {
             Some("p")
         );
         // A bare JSON string is taken verbatim.
-        assert_eq!(delivery_message(&json!("just text")).as_deref(), Some("just text"));
+        assert_eq!(
+            delivery_message(&json!("just text")).as_deref(),
+            Some("just text")
+        );
         // Nothing drivable → None (the daemon skips rather than resume on nothing).
         assert!(delivery_message(&json!({ "other": "x" })).is_none());
         assert!(delivery_message(&json!({ "prompt": "" })).is_none());
@@ -3045,14 +3911,20 @@ mod tests {
     fn idempotency_key_prefers_explicit_then_event_id() {
         // An explicit key in the payload wins.
         assert_eq!(
-            idempotency_key(&json!({ "prompt": "x", "idempotency_key": "planner-step-3" }), 42),
+            idempotency_key(
+                &json!({ "prompt": "x", "idempotency_key": "planner-step-3" }),
+                42
+            ),
             "planner-step-3"
         );
         // Otherwise the stable inbound event id (survives the at-least-once replay,
         // which re-pends the SAME row with the SAME id).
         assert_eq!(idempotency_key(&json!({ "prompt": "x" }), 42), "event:42");
         // A blank explicit key falls back too.
-        assert_eq!(idempotency_key(&json!({ "idempotency_key": "  " }), 7), "event:7");
+        assert_eq!(
+            idempotency_key(&json!({ "idempotency_key": "  " }), 7),
+            "event:7"
+        );
     }
 
     #[test]
@@ -3103,13 +3975,15 @@ mod tests {
         .unwrap();
         assert_eq!(req.reply_to, "in/agent/kestrel/room-7");
         // A wildcard reply_to is rejected (not routable).
-        assert!(delivery_requester(
-            &root,
-            &json!({ "prompt": "go", "reply_to": "in/agent/+/code-x" }),
-            None,
-            None,
-        )
-        .is_none());
+        assert!(
+            delivery_requester(
+                &root,
+                &json!({ "prompt": "go", "reply_to": "in/agent/+/code-x" }),
+                None,
+                None,
+            )
+            .is_none()
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -3123,21 +3997,27 @@ mod tests {
         let root = delivery_tmp_root();
         // The headline exploit: route a kernel-authored completion to the owner's
         // human inbox. REJECTED.
-        assert!(delivery_requester(
-            &root,
-            &json!({ "prompt": "x", "reply_to": "in/human/owner" }),
-            Some("owner"),
-            None,
-        )
-        .is_none(), "reply_to in/human/owner must not route");
+        assert!(
+            delivery_requester(
+                &root,
+                &json!({ "prompt": "x", "reply_to": "in/human/owner" }),
+                Some("owner"),
+                None,
+            )
+            .is_none(),
+            "reply_to in/human/owner must not route"
+        );
         // An arbitrary non-mailbox topic. REJECTED.
-        assert!(delivery_requester(
-            &root,
-            &json!({ "prompt": "x", "reply_to": "in/totally/arbitrary/x" }),
-            Some("owner"),
-            None,
-        )
-        .is_none(), "reply_to to an arbitrary in/ topic must not route");
+        assert!(
+            delivery_requester(
+                &root,
+                &json!({ "prompt": "x", "reply_to": "in/totally/arbitrary/x" }),
+                Some("owner"),
+                None,
+            )
+            .is_none(),
+            "reply_to to an arbitrary in/ topic must not route"
+        );
         // Other-plane topics a verbatim route would have published a kernel message
         // onto: work/, signal/, obs/. All REJECTED.
         for bad in [
@@ -3146,26 +4026,34 @@ mod tests {
             "work/agent/exec",
             "in/group/secret-room",
             "in/human/owner/extra",
-            "in/agent/codex",                // too few levels (not a mailbox)
-            "in/agent/codex/code-x/thread",  // too many levels
-            "in/agent/codex/code-ghost",     // a code-* conv with NO record → not an actor
-            "in/agent/+/code-x",             // a wildcard
-            "in/agent/codex/#",              // a wildcard
+            "in/agent/codex",               // too few levels (not a mailbox)
+            "in/agent/codex/code-x/thread", // too many levels
+            "in/agent/codex/code-ghost",    // a code-* conv with NO record → not an actor
+            "in/agent/+/code-x",            // a wildcard
+            "in/agent/codex/#",             // a wildcard
         ] {
             assert!(
-                delivery_requester(&root, &json!({ "prompt": "x", "reply_to": bad }), Some("owner"), None).is_none(),
+                delivery_requester(
+                    &root,
+                    &json!({ "prompt": "x", "reply_to": bad }),
+                    Some("owner"),
+                    None
+                )
+                .is_none(),
                 "reply_to {bad:?} must not route a kernel message"
             );
         }
         // And a bare name that is path-unsafe / reserved cannot be coaxed into a
         // non-agent topic level either.
-        assert!(delivery_requester(
-            &root,
-            &json!({ "prompt": "x", "reply_to": "../../owner" }),
-            Some("owner"),
-            None,
-        )
-        .is_none());
+        assert!(
+            delivery_requester(
+                &root,
+                &json!({ "prompt": "x", "reply_to": "../../owner" }),
+                Some("owner"),
+                None,
+            )
+            .is_none()
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -3202,14 +4090,19 @@ mod tests {
         let root = delivery_tmp_root();
         // The human owner / kernel originating a plain delivery is NOT a planner
         // waiting on a completion — no routing (the M2-B behavior, unchanged).
-        assert!(delivery_requester(&root, &json!({ "prompt": "x" }), Some("owner"), None).is_none());
-        assert!(delivery_requester(&root, &json!({ "prompt": "x" }), Some("kernel"), None).is_none());
+        assert!(
+            delivery_requester(&root, &json!({ "prompt": "x" }), Some("owner"), None).is_none()
+        );
+        assert!(
+            delivery_requester(&root, &json!({ "prompt": "x" }), Some("kernel"), None).is_none()
+        );
         // No sender and no reply_to → nothing to route to.
         assert!(delivery_requester(&root, &json!({ "prompt": "x" }), None, None).is_none());
         // A code-* sender with no durable record can't be addressed → None (not a
         // panic, not a bogus route).
         assert!(
-            delivery_requester(&root, &json!({ "prompt": "x" }), Some("code-ghost00"), None).is_none()
+            delivery_requester(&root, &json!({ "prompt": "x" }), Some("code-ghost00"), None)
+                .is_none()
         );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -3219,11 +4112,17 @@ mod tests {
         let root = delivery_tmp_root();
         // A native (non-code) agent sender routes to its own mailbox, the
         // correlation as the conversation locator.
-        let req = delivery_requester(&root, &json!({ "prompt": "x" }), Some("kestrel"), Some("c42"))
-            .unwrap();
+        let req = delivery_requester(
+            &root,
+            &json!({ "prompt": "x" }),
+            Some("kestrel"),
+            Some("c42"),
+        )
+        .unwrap();
         assert_eq!(req.reply_to, "in/agent/kestrel/c42");
         // No correlation → a stable default conversation.
-        let req = delivery_requester(&root, &json!({ "prompt": "x" }), Some("kestrel"), None).unwrap();
+        let req =
+            delivery_requester(&root, &json!({ "prompt": "x" }), Some("kestrel"), None).unwrap();
         assert_eq!(req.reply_to, "in/agent/kestrel/main");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -3277,8 +4176,13 @@ mod tests {
         record_session(&root, "code-planner1", "claude-code");
         record_session(&root, "code-worker1", "codex");
 
-        let id = record_delivery(&root, "code-planner1", "code-worker1", "  build the thing  ")
-            .unwrap();
+        let id = record_delivery(
+            &root,
+            "code-planner1",
+            "code-worker1",
+            "  build the thing  ",
+        )
+        .unwrap();
         let (etype, sender, payload, corr, state) = read_event(&root, id);
 
         // The delivery is addressed to the worker's session mailbox — exactly the
@@ -3343,6 +4247,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
+    #[test]
+    fn spawn_completion_delivery_uses_safe_mailbox_and_worker_sender() {
+        let root = delivery_tmp_root();
+        record_session(&root, "code-planner1", "claude-code");
+        let summary = CaptureSummary {
+            final_text: Some("finished the task".into()),
+            file_changes: vec!["src/lib.rs".into(), "src/main.rs".into()],
+        };
+
+        let id = emit_completion_delivery(
+            &root,
+            "code-worker1",
+            "code-planner1",
+            Some("code-spawn-corr"),
+            None,
+            &summary,
+            None,
+        )
+        .unwrap();
+        let (etype, sender, payload, corr, state) = read_event(&root, id);
+
+        assert_eq!(etype, "in/agent/claude-code/code-planner1");
+        assert!(recognize_delivery(&root, &etype).is_some());
+        assert_eq!(sender, "code-worker1");
+        assert_eq!(corr, "code-spawn-corr");
+        assert_eq!(state, "pending");
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        let prompt = pv["prompt"].as_str().unwrap();
+        assert!(prompt.contains("Worker code-worker1 finished"));
+        assert!(prompt.contains("finished the task"));
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("src/main.rs"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn completion_delivery_clips_large_file_change_lists() {
+        let summary = CaptureSummary {
+            final_text: Some("done".into()),
+            file_changes: (0..55).map(|i| format!("src/file{i}.rs")).collect(),
+        };
+        let prompt = completion_delivery_prompt("code-worker1", None, &summary, None);
+
+        assert!(prompt.contains("src/file0.rs"));
+        assert!(prompt.contains("src/file49.rs"));
+        assert!(!prompt.contains("src/file50.rs"));
+        assert!(prompt.contains("… and 5 more"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_delivery_names_timeout_exit_124() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let status = std::process::ExitStatus::from_raw(124 << 8);
+        let prompt = completion_delivery_prompt(
+            "code-worker1",
+            Some(&status),
+            &CaptureSummary::default(),
+            None,
+        );
+
+        assert!(prompt.contains("Status: timed out after "));
+    }
+
+    #[test]
+    fn forced_session_token_file_blocks_forced_id_reuse() {
+        let root = delivery_tmp_root();
+        let principal = "code-live0001";
+        codesession::mint(&root, principal, "codex", std::process::id() as i32).unwrap();
+
+        assert!(forced_session_token_exists(&root, principal));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn timeout_wrap_uses_coreutils_timeout_shape() {
+        let (program, args) = timeout_wrap("codex", &["exec".into(), "do it".into()], 1800);
+
+        assert_eq!(program, "timeout");
+        assert_eq!(
+            args,
+            vec![
+                "-s".to_string(),
+                "TERM".to_string(),
+                "1800".to_string(),
+                "codex".to_string(),
+                "exec".to_string(),
+                "do it".to_string(),
+            ]
+        );
+    }
+
     // ── The launch-envelope briefing (M4-B) ──────────────────────────────────
 
     #[test]
@@ -3356,7 +4353,11 @@ mod tests {
         assert!(b.to_lowercase().contains("do not")); // do not poll/sleep/wait
         assert!(b.to_lowercase().contains("human"));
         // Short — a launch briefing, not a manual.
-        assert!(b.len() < 1200, "briefing should be concise, was {} chars", b.len());
+        assert!(
+            b.len() < 1200,
+            "briefing should be concise, was {} chars",
+            b.len()
+        );
     }
 
     #[test]
@@ -3379,6 +4380,31 @@ mod tests {
         let block = codex_briefing_block("BRIEF-BODY");
         assert!(block.contains("elanus operating envelope"));
         assert!(block.contains("BRIEF-BODY"));
+    }
+
+    #[test]
+    fn elanus_skill_is_session_scratch_scoped() {
+        let dir = std::env::temp_dir().join(format!(
+            "elanus-skill-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let skill_root = write_elanus_skill(&dir).unwrap();
+        let skill_path = skill_root
+            .join(".claude")
+            .join("skills")
+            .join("elanus")
+            .join("SKILL.md");
+        let skill = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(skill.contains("name: elanus"));
+        assert!(skill.contains("elanus code help"));
+        assert!(skill.contains("elanus code claude --worker"));
+        assert_eq!(skill_root, dir.join("skillroot"));
+        assert!(!skill_root.join("settings.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── M3: per-turn injection + the inbox read ──────────────────────────────
@@ -3445,10 +4471,19 @@ mod tests {
         assert!(one.contains("fix the parser")); // a brief preview
 
         // Deliver a second → the injection CHANGES (count reflects the new inbox).
-        m3_deliver(&root, "codex", "code-inj00001", "code-planner", "and the lexer");
+        m3_deliver(
+            &root,
+            "codex",
+            "code-inj00001",
+            "code-planner",
+            "and the lexer",
+        );
         let two = turn_injection(&root, "codex", "code-inj00001").unwrap();
         assert!(two.contains("2 new message"));
-        assert_ne!(one, two, "the injected text must change when the inbox changes");
+        assert_ne!(
+            one, two,
+            "the injected text must change when the inbox changes"
+        );
 
         // A memory note also surfaces, and changes when edited.
         codesession::set_note(&root, "code-inj00001", "the lexer lives in src/lex.rs").unwrap();
@@ -3469,10 +4504,18 @@ mod tests {
         let id1 = m3_deliver(&root, "codex", "code-uns00001", "owner", "one");
         m3_deliver(&root, "codex", "code-uns00001", "owner", "two");
         // Two unseen.
-        assert!(turn_injection(&root, "codex", "code-uns00001").unwrap().contains("2 new message"));
+        assert!(
+            turn_injection(&root, "codex", "code-uns00001")
+                .unwrap()
+                .contains("2 new message")
+        );
         // Pulling marks the first seen → the next turn reflects only the unseen.
         codesession::mark_inbox_seen(&root, "code-uns00001", &[id1]).unwrap();
-        assert!(turn_injection(&root, "codex", "code-uns00001").unwrap().contains("1 new message"));
+        assert!(
+            turn_injection(&root, "codex", "code-uns00001")
+                .unwrap()
+                .contains("1 new message")
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -3504,7 +4547,9 @@ mod tests {
         m3_record(&root, "code-ok000001", "codex");
         note_cmd(&root, "code-ok000001", "do the thing").unwrap();
         assert_eq!(
-            codesession::get_note(&root, "code-ok000001").unwrap().as_deref(),
+            codesession::get_note(&root, "code-ok000001")
+                .unwrap()
+                .as_deref(),
             Some("do the thing")
         );
         let _ = std::fs::remove_dir_all(&root.dir);
@@ -3515,11 +4560,8 @@ mod tests {
     #[test]
     fn take_room_flag_extracts_and_strips_room() {
         // --room <id> is parsed out and stripped from the args the tool sees.
-        let (room, rest) = take_room_flag(&[
-            "--room".into(),
-            "team-1".into(),
-            "fix the bug".into(),
-        ]);
+        let (room, rest) =
+            take_room_flag(&["--room".into(), "team-1".into(), "fix the bug".into()]);
         assert_eq!(room.as_deref(), Some("team-1"));
         assert_eq!(rest, vec!["fix the bug".to_string()]);
         // No --room → None, args untouched.
@@ -3563,9 +4605,18 @@ mod tests {
 
         // B's injection: shows A's claim, excludes B's own.
         let b_inj = turn_injection(&root, "codex", "code-bbbb0002").unwrap();
-        assert!(b_inj.contains("code-aaaa0001 is editing src/foo.rs"), "B must see A's claim: {b_inj}");
-        assert!(!b_inj.contains("src/own.rs"), "B must NOT see its own claim: {b_inj}");
-        assert!(b_inj.contains("advisory"), "the claim is presented as advisory: {b_inj}");
+        assert!(
+            b_inj.contains("code-aaaa0001 is editing src/foo.rs"),
+            "B must see A's claim: {b_inj}"
+        );
+        assert!(
+            !b_inj.contains("src/own.rs"),
+            "B must NOT see its own claim: {b_inj}"
+        );
+        assert!(
+            b_inj.contains("advisory"),
+            "the claim is presented as advisory: {b_inj}"
+        );
 
         // A's injection: shows B's claim, excludes A's own.
         let a_inj = turn_injection(&root, "codex", "code-aaaa0001").unwrap();
@@ -3599,8 +4650,14 @@ mod tests {
         m5_member(&root, "room-1", "code-bbbb0002");
         codesession::add_claim(&root, "room-1", "code-aaaa0001", "src/foo.rs").unwrap();
         let msg = build_resume_message(&root, "codex", "code-bbbb0002", "go do the task");
-        assert!(msg.contains("code-aaaa0001 is editing src/foo.rs"), "the resume turn must carry the peer claim: {msg}");
-        assert!(msg.contains("go do the task"), "the delivered message is still present");
+        assert!(
+            msg.contains("code-aaaa0001 is editing src/foo.rs"),
+            "the resume turn must carry the peer claim: {msg}"
+        );
+        assert!(
+            msg.contains("go do the task"),
+            "the delivered message is still present"
+        );
         // The claim block precedes the delivered message (out of band).
         let claim_at = msg.find("is editing src/foo.rs").unwrap();
         let msg_at = msg.find("go do the task").unwrap();
@@ -3645,7 +4702,10 @@ mod tests {
             "ELANUS_CODE_AGENT",
             "ELANUS_ROOT",
         ] {
-            assert!(!PROVIDER_CRED_VARS.contains(&keep), "{keep} must NOT be scrubbed");
+            assert!(
+                !PROVIDER_CRED_VARS.contains(&keep),
+                "{keep} must NOT be scrubbed"
+            );
         }
     }
 

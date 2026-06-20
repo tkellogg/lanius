@@ -28,6 +28,9 @@ that layer.
 - Early v1 architecture or historical build order: read [init.md](init.md).
   Skip it for current implementation questions unless you need the old design
   record.
+- Debugging a *running* instance — where live state is, why obs aren't showing,
+  the live-root-vs-repo distinction, leaked test processes: read
+  [runtime.md](runtime.md).
 
 ## Contents
 
@@ -58,6 +61,10 @@ that layer.
   this before claiming a security property or adding a privileged surface.
 - [topics.md](topics.md) - v3 verb-first topic grammar, mailbox model,
   correlation taxonomy, and v2-to-v3 mapping.
+- [runtime.md](runtime.md) - operating map of a running instance: the live root
+  (`~/.elanus/root`) vs the repo, where `trace.jsonl`/`elanus.db` state
+  materializes and the daemon dependency for recording, trace line format, and
+  known leaked test-process cruft.
 - [journeys/](journeys/README.md) - personas and product journeys for setup,
   coding agents (Codex and Claude Code), costs, risk/trust, and configuration.
 - [ui-flows/](ui-flows/README.md) - executable web-flow catalog and QA findings.
