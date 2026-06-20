@@ -106,9 +106,15 @@ struct CodeDone {
     /// Where to route the completion (M4-A): carried through from the job so the
     /// settle step can deliver to the requester's mailbox. None = no routing.
     requester: Option<crate::codeagent::DeliveryRequester>,
-    /// The worker's final result/summary text for the routed completion (the
-    /// resume's outcome detail) — enough for a planner to react.
-    result: String,
+    /// The worker's VERBATIM final message for the routed completion (M4-A
+    /// follow-on) — its actual last answer, NOT a generated summary. None when the
+    /// worker produced no final text, OR when the resume primitive itself errored
+    /// (no stream to harvest); `route_completion` then falls back to a minimal
+    /// factual line built from `detail`.
+    final_text: Option<String>,
+    /// The on-disk paths the worker reported writing this turn (deduped, possibly
+    /// empty), carried verbatim onto the routed completion.
+    file_changes: Vec<String>,
 }
 
 /// A live per-session worker: its job queue sender plus how many deliveries are
@@ -956,7 +962,9 @@ fn settle_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers
                 &done.session,
                 &req.reply_to,
                 failed,
-                &done.result,
+                done.final_text.as_deref(),
+                &done.file_changes,
+                &done.detail,
                 done.correlation.as_deref(),
             );
         }
@@ -1003,7 +1011,14 @@ fn route_completion(
     session: &str,
     reply_to: &str,
     failed: bool,
-    result: &str,
+    // The worker's VERBATIM final message (None when it produced none, or when the
+    // resume errored before any stream). NEVER a generated summary.
+    final_text: Option<&str>,
+    // The on-disk paths the worker reported writing this turn (possibly empty).
+    file_changes: &[String],
+    // A terse diagnostic (exit_code / error / "recovered after restart") used ONLY
+    // for the minimal factual fallback line when there is no final_text.
+    detail: &str,
     correlation: Option<&str>,
 ) {
     if !crate::topic::valid_name(reply_to) {
@@ -1036,15 +1051,33 @@ fn route_completion(
             crate::topic::encode_segment(session),
         ))
     };
-    let result_line = trace::clip(result, 4000);
+    // The worker's VERBATIM answer is the meat of the completion. We never
+    // summarize: when the worker produced final text we carry it as-is (already
+    // capped/marked upstream); only when it produced NONE (a silent turn, or a
+    // resume that errored before any stream) do we fall back to a minimal factual
+    // line built from the terse diagnostic — never a fabricated description of what
+    // the worker "did".
+    let pointer = obs_pointer.as_str().unwrap_or("its obs subtree");
+    let answer = match final_text {
+        Some(t) if !t.trim().is_empty() => t.to_string(),
+        _ => format!(
+            "(worker {session} completed with no final message; {detail})"
+        ),
+    };
+    // The files the worker changed on disk, as the tool itself reported them.
+    let files_line = if file_changes.is_empty() {
+        "Files changed: none reported.".to_string()
+    } else {
+        format!("Files changed:\n{}", file_changes.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n"))
+    };
+    // The prompt reads like the worker's actual answer, then the files it touched,
+    // then the pointer to the full conversation — clean and honest, no summary.
+    let status_word = if failed { "FAILED" } else { "completed" };
     let prompt = format!(
-        "Worker session {} has completed the work you dispatched (success={}). \
-         Result: {}. Its full transcript is on the bus under {}. \
-         Read the recorded state, then decide the next step.",
-        session,
-        !failed,
-        result_line,
-        obs_pointer.as_str().unwrap_or("its obs subtree"),
+        "Worker session {session} {status_word} the work you dispatched.\n\n\
+         {answer}\n\n\
+         {files_line}\n\n\
+         (full conversation at {pointer})"
     );
     let routed = events::emit(
         root,
@@ -1054,7 +1087,10 @@ fn route_completion(
                 "prompt": prompt,
                 "worker": session,
                 "failed": failed,
-                "result": result_line,
+                // The worker's verbatim final answer + the paths it wrote — the
+                // legible result a parent reads directly (no summary).
+                "final_text": answer,
+                "file_changes": file_changes,
                 "worker_obs": obs_pointer,
                 // A stable idempotency key on the routed delivery: a replayed
                 // completion (or a settle + reconcile overlap) dedupes when it
@@ -1147,7 +1183,11 @@ fn reconcile_lost_routes(root: &Root, conn: &Connection) -> Result<()> {
         if route_already_emitted(conn, worker_event_id, &req.reply_to).unwrap_or(true) {
             continue;
         }
-        // The wake was lost — re-emit the route now. Honest recovered result line.
+        // The wake was lost — re-emit the route now. The worker's live final text
+        // and file changes were in memory and are gone; we pass None/empty and an
+        // honest "recovered" detail, so the fallback line is factual (the worker's
+        // full transcript is still durable on the bus under the obs pointer the
+        // route carries). NOT a fabricated summary.
         route_completion(
             root,
             conn,
@@ -1155,7 +1195,9 @@ fn reconcile_lost_routes(root: &Root, conn: &Connection) -> Result<()> {
             &session,
             &req.reply_to,
             false,
-            &format!("worker {session} completed (route recovered after a restart)"),
+            None,
+            &[],
+            "route recovered after a restart; read the recorded transcript",
             corr_opt,
         );
         recovered += 1;
@@ -1352,9 +1394,11 @@ fn enqueue_code_job(root: &Root, code: &mut CodeDrivers, session: &str, job: Cod
                     event_id,
                     correlation: job.correlation,
                     success: None,
-                    result: detail.clone(),
                     detail,
                     requester: job.requester,
+                    // No stream ran; route_completion builds an honest line from detail.
+                    final_text: None,
+                    file_changes: Vec::new(),
                 });
                 return;
             }
@@ -1374,9 +1418,10 @@ fn enqueue_code_job(root: &Root, code: &mut CodeDrivers, session: &str, job: Cod
                 event_id,
                 correlation: corr,
                 success: None,
-                result: "worker channel closed".into(),
                 detail: "worker channel closed".into(),
                 requester,
+                final_text: None,
+                file_changes: Vec::new(),
             });
         }
     }
@@ -1388,25 +1433,23 @@ fn enqueue_code_job(root: &Root, code: &mut CodeDrivers, session: &str, job: Cod
 /// reported as `success=None`, not propagated.
 fn code_worker(root: Root, session: String, rx: Receiver<CodeJob>, done_tx: Sender<CodeDone>) {
     while let Ok(job) = rx.recv() {
-        let (success, detail, result) =
+        // The routed completion carries the worker's VERBATIM final text + the
+        // files it wrote (M4-A follow-on), harvested by resume_capture from the
+        // tool's own stream — NOT a generated summary. `detail` stays a terse
+        // diagnostic (exit_code / error) for the delivery/complete obs only.
+        let (success, detail, final_text, file_changes) =
             match crate::codeagent::resume_capture(&root, &session, &job.message) {
-                Ok(outcome) => {
-                    let detail = format!("exit_code={:?}", outcome.exit_code);
-                    // The worker's full turn (its final message, tool calls, edits)
-                    // is on the bus under obs/agent/<noun>/<session>/#; the routed
-                    // completion carries a concise result line + that pointer so a
-                    // planner reads the recorded state before acting (M4-A's
-                    // honest-state guidance), rather than us re-capturing the text.
-                    let result = if outcome.success {
-                        format!("worker {session} completed the turn ({detail})")
-                    } else {
-                        format!("worker {session} turn FAILED ({detail})")
-                    };
-                    (Some(outcome.success), detail, result)
-                }
+                Ok(outcome) => (
+                    Some(outcome.success),
+                    format!("exit_code={:?}", outcome.exit_code),
+                    outcome.final_text,
+                    outcome.file_changes,
+                ),
                 Err(e) => {
-                    let d = format!("{e:#}");
-                    (None, d.clone(), format!("worker {session} could not resume: {d}"))
+                    // The resume primitive itself errored (missing record / spawn /
+                    // credential): there was no stream to harvest. No final_text —
+                    // route_completion builds an honest factual line from `detail`.
+                    (None, format!("{e:#}"), None, Vec::new())
                 }
             };
         // If the receiver is gone (daemon shutting down), the event stays
@@ -1418,7 +1461,8 @@ fn code_worker(root: Root, session: String, rx: Receiver<CodeJob>, done_tx: Send
             success,
             detail,
             requester: job.requester,
-            result,
+            final_text,
+            file_changes,
         });
     }
 }
@@ -1886,7 +1930,8 @@ mod tests {
                 success: Some(true),
                 detail: "exit_code=Some(0)".into(),
                 requester: None,
-                result: "ok".into(),
+                final_text: Some("ok".into()),
+                file_changes: Vec::new(),
             })
             .unwrap();
 
@@ -1920,7 +1965,8 @@ mod tests {
                 success: None,
                 detail: "boom".into(),
                 requester: None,
-                result: "boom".into(),
+                final_text: None,
+                file_changes: Vec::new(),
             })
             .unwrap();
         settle_code_deliveries(&root, &conn, &mut code).unwrap();
@@ -2292,7 +2338,10 @@ mod tests {
                 requester: Some(crate::codeagent::DeliveryRequester {
                     reply_to: "in/agent/claude-code/code-plannr03".into(),
                 }),
-                result: "worker finished".into(),
+                // The worker's VERBATIM answer + the file it wrote — carried as-is
+                // to the routed completion (no summary).
+                final_text: Some("ALPHA is the answer".into()),
+                file_changes: vec!["src/answer.rs".into()],
             })
             .unwrap();
 
@@ -2322,6 +2371,78 @@ mod tests {
         assert!(pv["prompt"].as_str().unwrap().contains("code-worker03"));
         assert_eq!(pv["failed"], false);
         assert!(pv["idempotency_key"].as_str().unwrap().starts_with("code-complete:"));
+        // M4-A follow-on: the completion carries the worker's VERBATIM final text,
+        // the file paths it changed, and the obs pointer — NOT a generated summary.
+        assert_eq!(pv["final_text"], "ALPHA is the answer");
+        assert!(pv["prompt"].as_str().unwrap().contains("ALPHA is the answer"));
+        assert_eq!(pv["file_changes"][0], "src/answer.rs");
+        assert!(pv["prompt"].as_str().unwrap().contains("src/answer.rs"));
+        assert!(
+            pv["worker_obs"].as_str().unwrap().contains("code-worker03"),
+            "the completion keeps the obs pointer to the worker's full conversation"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M4-A follow-on — the no-final-text fallback: a worker that produced no final
+    /// message routes a MINIMAL FACTUAL line (built from the diagnostic detail), NOT
+    /// a fabricated summary of what it "did". The obs pointer + empty file_changes
+    /// still ride along.
+    #[test]
+    fn route_completion_falls_back_factually_when_no_final_text() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-silent01".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+                room: None,
+            },
+        )
+        .unwrap();
+        // A worker event id to cause the route off of.
+        let worker_ev = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "x" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-silent01")
+            },
+        )
+        .unwrap();
+        route_completion(
+            &root,
+            &conn,
+            worker_ev,
+            "code-silent01",
+            "in/agent/claude-code/code-plannr04",
+            false,
+            None,          // the worker produced NO final text
+            &[],           // and changed no files
+            "exit_code=Some(0)",
+            Some("corr-silent"),
+        );
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM events WHERE type='in/agent/claude-code/code-plannr04'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("a completion was routed even with no final text");
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        let ft = pv["final_text"].as_str().unwrap();
+        // A minimal factual fallback — names the worker + the diagnostic; it does NOT
+        // claim to describe what the worker accomplished.
+        assert!(ft.contains("no final message"), "factual fallback, not a summary: {ft}");
+        assert!(ft.contains("exit_code=Some(0)"), "the fallback carries the honest diagnostic");
+        assert!(pv["file_changes"].as_array().unwrap().is_empty());
+        assert!(pv["worker_obs"].as_str().unwrap().contains("code-silent01"));
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

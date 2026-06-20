@@ -1232,8 +1232,10 @@ fn run_codex_capture(
 
     // On a fresh launch, `thread.started` carries codex's native thread id —
     // persist the durable record (with this workdir) the moment we see it so the
-    // session is resumable after the launcher exits.
-    capture_codex_stream(
+    // session is resumable after the launcher exits. The launch path doesn't route
+    // a completion, so its capture summary is unused (the resume path is the one
+    // that feeds `route_completion`).
+    let _ = capture_codex_stream(
         root, principal, bus_token, agent, session, &mut child, Some(workdir),
     );
 
@@ -1242,6 +1244,35 @@ fn run_codex_capture(
         .context("waiting for codex exec to finish")
 }
 
+/// The legible result of one capture pass — the worker's REAL output, harvested
+/// from its own stream as we publish obs, so a routed completion can carry the
+/// worker's verbatim answer + the files it touched (M4-A follow-on) instead of a
+/// generated summary. `final_text` is the worker's actual last message (None when
+/// it produced no text); `file_changes` are the on-disk paths the tool itself
+/// reported writing (deduped, in first-seen order).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CaptureSummary {
+    pub final_text: Option<String>,
+    pub file_changes: Vec<String>,
+}
+
+impl CaptureSummary {
+    /// Record a file path the tool reported writing, deduping (a session may edit
+    /// the same file twice; the parent wants the set, in first-seen order).
+    fn note_change(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        if path.is_empty() || self.file_changes.iter().any(|p| p == &path) {
+            return;
+        }
+        self.file_changes.push(path);
+    }
+}
+
+/// A generous cap for the worker's verbatim final text on the routed completion:
+/// real bytes cut + marked (NOT a summary). Large enough to carry a substantive
+/// answer; bounded so a runaway final message can't bloat a delivery payload.
+const FINAL_TEXT_CAP: usize = 8000;
+
 /// Read a codex child's `--json` stdout line-by-line, mapping each JSONL event to
 /// an obs record and publishing it as the session principal. Shared by launch and
 /// resume (the SAME obs grammar lands under the SAME elanus session both times).
@@ -1249,6 +1280,9 @@ fn run_codex_capture(
 /// the durable `code_sessions` record (launch path, carrying the workdir to store);
 /// resume already has a record, so it passes `None`. A malformed line files
 /// generically (nothing dropped); a read error stops the loop but never aborts.
+/// Returns the worker's verbatim final `agent_message` text (capped, marked when
+/// cut) + the `file_change` paths it reported — the legible result for the routed
+/// completion. The obs are still published exactly as before; this is in addition.
 fn capture_codex_stream(
     root: &Root,
     principal: &str,
@@ -1257,9 +1291,10 @@ fn capture_codex_stream(
     session: &str,
     child: &mut std::process::Child,
     record_workdir: Option<&Path>,
-) {
+) -> CaptureSummary {
+    let mut summary = CaptureSummary::default();
     let Some(out) = child.stdout.take() else {
-        return;
+        return summary;
     };
     let reader = std::io::BufReader::new(out);
     for line in reader.lines() {
@@ -1278,6 +1313,11 @@ fn capture_codex_stream(
                 continue;
             }
         };
+        // Harvest the legible result alongside publishing obs: the LAST settled
+        // `agent_message` is the worker's verbatim final answer; every settled
+        // `file_change` reports the paths it wrote. (Codex settles both on
+        // `item.completed`.)
+        codex_collect_summary(&event, &mut summary);
         // The DURABLE session record (M2-A): codex announces its own native
         // resumable session id via `thread.started` → `thread_id`. Persist the
         // record (no secret) the moment we see it, so the session is resumable
@@ -1305,6 +1345,38 @@ fn capture_codex_stream(
         if let Some((leaf, body)) = codex_map_event(&event) {
             publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
         }
+    }
+    summary
+}
+
+/// Harvest the legible result from one codex stream event into `summary`: the text
+/// of each settled `agent_message` (so the LAST one wins — the worker's verbatim
+/// final answer, capped/marked) and the paths of each settled `file_change`. Reads
+/// the SAME settled items `codex_map_item` files as obs; collecting here keeps that
+/// mapping untouched. Anything else is ignored.
+fn codex_collect_summary(event: &Value, summary: &mut CaptureSummary) {
+    if event.get("type").and_then(Value::as_str) != Some("item.completed") {
+        return;
+    }
+    let Some(item) = event.get("item") else { return };
+    match item.get("type").and_then(Value::as_str) {
+        Some("agent_message") => {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                // Last settled agent_message wins (the worker's final word).
+                summary.final_text = Some(clip(text, FINAL_TEXT_CAP));
+            }
+        }
+        Some("file_change") => {
+            // `changes` is an array of { path, kind }; collect the path strings.
+            if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+                for change in changes {
+                    if let Some(path) = change.get("path").and_then(Value::as_str) {
+                        summary.note_change(path);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1641,9 +1713,18 @@ pub fn resume(root: &Root, elanus_session: &str, message: &str) -> Result<()> {
 
 /// The structured result of one driven/CLI resume — enough for the daemon to
 /// thread a completion obs and settle the delivery event without ever exiting.
+/// `final_text` + `file_changes` are the worker's LEGIBLE result (its verbatim last
+/// message and the files it wrote), harvested from the capture stream so the routed
+/// completion carries the worker's real answer (M4-A follow-on) — not a summary.
 pub struct ResumeOutcome {
     pub success: bool,
     pub exit_code: Option<i32>,
+    /// The worker's verbatim final message (capped/marked when huge); None when it
+    /// produced no final text.
+    pub final_text: Option<String>,
+    /// The on-disk paths the worker reported writing this turn (deduped, possibly
+    /// empty).
+    pub file_changes: Vec<String>,
 }
 
 /// Continue a recorded coding session with a fresh, emit-only scoped token,
@@ -1722,6 +1803,9 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
         }),
     );
 
+    // The capture summary (the worker's verbatim final text + the files it wrote),
+    // harvested in the closure below and carried out to the ResumeOutcome.
+    let mut summary = CaptureSummary::default();
     let result = (|| -> Result<std::process::ExitStatus> {
         let mut cmd = Command::new(&program);
         cmd.args(&cmd_args);
@@ -1746,12 +1830,13 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
             // JSONL grammar; map it via the CC stream mapper.
             "codex" => {
                 // record_workdir = None: the record already exists (we read it).
-                capture_codex_stream(
+                summary = capture_codex_stream(
                     root, &principal, &bus_token, &agent, &session, &mut child, None,
                 );
             }
             _ => {
-                capture_claude_stream(root, &principal, &bus_token, &agent, &session, &mut child);
+                summary =
+                    capture_claude_stream(root, &principal, &bus_token, &agent, &session, &mut child);
             }
         }
         child.wait().context("waiting for the resume to finish")
@@ -1768,6 +1853,8 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     Ok(ResumeOutcome {
         success: status.success(),
         exit_code: status.code(),
+        final_text: summary.final_text,
+        file_changes: summary.file_changes,
     })
 }
 
@@ -1779,6 +1866,9 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
 /// `result` (the final settle, carrying `result` text + `session_id` + usage). We
 /// map the load-bearing ones onto the existing obs grammar so a resumed turn reads
 /// like a launched one; anything unmodeled lands generically (nothing dropped).
+/// Returns the worker's verbatim final answer (the `result` frame's `result` text,
+/// capped/marked) + the file paths from each file-writing `tool_use` block — the
+/// legible result for the routed completion, harvested as we publish obs.
 fn capture_claude_stream(
     root: &Root,
     principal: &str,
@@ -1786,9 +1876,10 @@ fn capture_claude_stream(
     agent: &str,
     session: &str,
     child: &mut std::process::Child,
-) {
+) -> CaptureSummary {
+    let mut summary = CaptureSummary::default();
     let Some(out) = child.stdout.take() else {
-        return;
+        return summary;
     };
     let reader = std::io::BufReader::new(out);
     for line in reader.lines() {
@@ -1801,9 +1892,64 @@ fn capture_claude_stream(
             Ok(v) => v,
             Err(_) => continue, // non-JSON line on the print stream: skip
         };
+        // Harvest the legible result alongside publishing obs: the final `result`
+        // frame's text is the worker's verbatim answer; every file-writing
+        // `tool_use` block reports a path it wrote.
+        claude_collect_summary(&event, &mut summary);
         if let Some((leaf, body)) = claude_stream_map(&event) {
             publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
         }
+    }
+    summary
+}
+
+/// The Claude Code tools that write a file (so a `tool_use` for one carries a
+/// `file_path` the worker changed on disk). Matched case-sensitively against the
+/// tool name in the print stream's `tool_use` block.
+fn claude_is_file_writer(tool: &str) -> bool {
+    matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
+}
+
+/// Harvest the legible result from one Claude print-stream event into `summary`:
+/// the `result` frame's `result` text (the worker's verbatim final answer,
+/// capped/marked) and the `file_path` of every file-writing `tool_use` block.
+/// Reads the same frames `claude_stream_map`/`claude_stream_message` file as obs;
+/// collecting here leaves that mapping untouched.
+fn claude_collect_summary(event: &Value, summary: &mut CaptureSummary) {
+    match event.get("type").and_then(Value::as_str) {
+        Some("result") => {
+            if let Some(text) = event.get("result").and_then(Value::as_str) {
+                summary.final_text = Some(clip(text, FINAL_TEXT_CAP));
+            }
+        }
+        Some("assistant") | Some("user") => {
+            let Some(content) = event
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+            else {
+                return;
+            };
+            for block in content {
+                if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    continue;
+                }
+                let Some(tool) = block.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !claude_is_file_writer(tool) {
+                    continue;
+                }
+                if let Some(path) = block
+                    .get("input")
+                    .and_then(|i| i.get("file_path"))
+                    .and_then(Value::as_str)
+                {
+                    summary.note_change(path);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2627,6 +2773,96 @@ mod tests {
         assert!(claude_stream_map(&json!({ "type": "system", "subtype": "compact" })).is_none());
         // Per-turn rate-limit telemetry is dropped (not a session happening).
         assert!(claude_stream_map(&json!({ "type": "rate_limit_event" })).is_none());
+    }
+
+    // ── Capture summary: the worker's verbatim result (M4-A follow-on) ─────────
+
+    #[test]
+    fn codex_capture_summary_takes_last_message_and_all_file_paths() {
+        let mut s = CaptureSummary::default();
+        // Two agent_messages: the LAST one is the worker's final word.
+        codex_collect_summary(
+            &json!({ "type": "item.completed",
+                     "item": { "id": "i1", "type": "agent_message", "text": "first" } }),
+            &mut s,
+        );
+        codex_collect_summary(
+            &json!({ "type": "item.completed",
+                     "item": { "id": "i2", "type": "agent_message", "text": "ALPHA" } }),
+            &mut s,
+        );
+        // A file_change item reports paths via `changes: [{ path, kind }]`.
+        codex_collect_summary(
+            &json!({ "type": "item.completed",
+                     "item": { "id": "i3", "type": "file_change",
+                               "changes": [{ "path": "src/foo.rs", "kind": "update" },
+                                           { "path": "src/bar.rs", "kind": "add" }] } }),
+            &mut s,
+        );
+        // A second change to the same file dedupes (set, first-seen order).
+        codex_collect_summary(
+            &json!({ "type": "item.completed",
+                     "item": { "id": "i4", "type": "file_change",
+                               "changes": [{ "path": "src/foo.rs", "kind": "update" }] } }),
+            &mut s,
+        );
+        // An item.started (not completed) is ignored — the text settles on completed.
+        codex_collect_summary(
+            &json!({ "type": "item.started",
+                     "item": { "id": "i5", "type": "agent_message", "text": "partial" } }),
+            &mut s,
+        );
+        assert_eq!(s.final_text.as_deref(), Some("ALPHA"), "the LAST agent_message is verbatim");
+        assert_eq!(s.file_changes, vec!["src/foo.rs", "src/bar.rs"], "all changed paths, deduped");
+    }
+
+    #[test]
+    fn claude_capture_summary_takes_result_text_and_file_writer_paths() {
+        let mut s = CaptureSummary::default();
+        // A file-writing tool_use reports its path; a non-writer (Bash) does not.
+        claude_collect_summary(
+            &json!({ "type": "assistant", "session_id": "cc",
+                     "message": { "content": [
+                         { "type": "tool_use", "name": "Write", "input": { "file_path": "/w/a.rs" } } ] } }),
+            &mut s,
+        );
+        claude_collect_summary(
+            &json!({ "type": "assistant", "session_id": "cc",
+                     "message": { "content": [
+                         { "type": "tool_use", "name": "Edit", "input": { "file_path": "/w/b.rs" } } ] } }),
+            &mut s,
+        );
+        claude_collect_summary(
+            &json!({ "type": "assistant", "session_id": "cc",
+                     "message": { "content": [
+                         { "type": "tool_use", "name": "Bash", "input": { "command": "ls" } } ] } }),
+            &mut s,
+        );
+        // The final `result` frame carries the verbatim answer text.
+        claude_collect_summary(
+            &json!({ "type": "result", "subtype": "success", "session_id": "cc",
+                     "result": "ALPHA", "is_error": false }),
+            &mut s,
+        );
+        assert_eq!(s.final_text.as_deref(), Some("ALPHA"), "the result frame text is verbatim");
+        assert_eq!(s.file_changes, vec!["/w/a.rs", "/w/b.rs"], "only file-writer tool paths");
+        assert!(claude_is_file_writer("MultiEdit") && claude_is_file_writer("NotebookEdit"));
+        assert!(!claude_is_file_writer("Read") && !claude_is_file_writer("Grep"));
+    }
+
+    #[test]
+    fn capture_summary_final_text_is_truncated_not_summarized() {
+        // A huge final message is CLIPPED to real bytes + marked — never summarized.
+        let big = "X".repeat(FINAL_TEXT_CAP + 500);
+        let mut s = CaptureSummary::default();
+        codex_collect_summary(
+            &json!({ "type": "item.completed",
+                     "item": { "id": "i", "type": "agent_message", "text": big } }),
+            &mut s,
+        );
+        let ft = s.final_text.unwrap();
+        assert!(ft.starts_with(&"X".repeat(FINAL_TEXT_CAP)), "the head is the worker's real bytes");
+        assert!(ft.contains("clipped"), "truncation is marked, not summarized");
     }
 
     // ── Inbound delivery recognition (M2-B) ──────────────────────────────────

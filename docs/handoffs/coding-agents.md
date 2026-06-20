@@ -12,6 +12,9 @@ landed 2026-06-20** — the first increment giving a session any read capability
 scoped own-inbox-only by an env-derived ledger query (the bus token stays
 emit-only). **M5 (advisory peer coordination — rooms + edit claims surfaced via the
 M3 injection, crash-released) landed 2026-06-20 — this completes M0–M5.**
+**M4-A follow-on (2026-06-20): the routed completion now carries the worker's
+VERBATIM final message + the files it changed + the existing obs pointer — the
+generated "Result: …" summary is gone, so a parent sees the worker's real output.**
 See the Log at the bottom for the as-built decisions (the two adapters share one
 envelope but differ in their *capture mechanism* — CC's hooks vs Codex's JSONL
 stream; the durable-session split-record model is in the M2-A entry; the
@@ -1528,3 +1531,102 @@ the main `~/.elanus/root` on `:1883` was never touched).
   scope on the broker, no daemon RPC; see the fix-pass Log above). M0's complete-cage
   criteria (read/egress denial) remain deferred per the sandbox stance above — the
   authority gap is closed, the OS-cage bypass is still gated on the end-state cage.
+
+### 2026-06-20 — M4-A follow-on: the completion carries the worker's VERBATIM result (final text + file changes + pointer) (branch `coding-agents`)
+
+Closes the end-to-end finding from M4-A that a parent couldn't see the worker's
+real output: the routed completion's `prompt`/payload was a **generated summary**
+("Worker session X completed the turn (exit_code=0). … Its full transcript is on
+the bus under obs/…") — an invitation to lie, wasted tokens, and a pointer the
+parent couldn't follow. The completion now carries the worker's **actual final
+message verbatim** + the **files it changed** + the existing **obs pointer**, all
+three, no summary. This is a GENERAL primitive — any session dispatching to any
+session (planner→worker, peer review, RLM) gets the legible result, not just
+planners.
+
+- **Collect during capture (`src/codeagent.rs`).** New `CaptureSummary { final_text:
+  Option<String>, file_changes: Vec<String> }`. Both stream readers now RETURN it
+  (they published obs and returned nothing before); the obs publishing is byte-for-
+  byte unchanged — the harvest runs ALONGSIDE it.
+  - **codex** (`capture_codex_stream` → `codex_collect_summary`): `final_text` = the
+    text of the LAST settled `agent_message` (`item.completed`, `item.type ==
+    "agent_message"`, the `text` field); `file_changes` = every settled
+    `file_change` item's `changes[].path` (deduped, first-seen order).
+  - **claude** (`capture_claude_stream` → `claude_collect_summary`): `final_text` =
+    the `result` frame's `result` text (the final answer); `file_changes` = the
+    `input.file_path` of every `tool_use` block whose tool is a file writer
+    (`Write`/`Edit`/`MultiEdit`/`NotebookEdit` — `claude_is_file_writer`).
+  - `final_text` is clipped with the existing `clip` at `FINAL_TEXT_CAP = 8000` —
+    real bytes cut + marked (`…[clipped N chars]`), NEVER summarized.
+- **Thread through `ResumeOutcome` + `resume_capture` (`src/codeagent.rs`).**
+  `ResumeOutcome` gained `final_text: Option<String>` + `file_changes: Vec<String>`;
+  `resume_capture` captures the returned `CaptureSummary` from whichever adapter ran
+  and puts it on the outcome. (The launch path discards its summary — only resume
+  feeds a completion.)
+- **Carry to the daemon (`src/dispatcher.rs`).** `CodeDone` replaced its generated
+  `result: String` with `final_text: Option<String>` + `file_changes: Vec<String>`;
+  `code_worker` fills them from the outcome (and the resume-errored / spawn-failed /
+  channel-closed paths pass `None`/`[]` with the diagnostic on `detail`). `detail`
+  stays a terse `exit_code=…`/error line used ONLY for the `delivery/complete` obs
+  and the no-text fallback.
+- **Rebuild the completion (`route_completion`, `src/dispatcher.rs`).** Signature
+  now takes `final_text: Option<&str>`, `file_changes: &[String]`, `detail: &str`.
+  The routed `prompt` reads: *the worker's verbatim answer*, then *Files changed: …*
+  (or "none reported"), then *(full conversation at <pointer>)* — clean and honest,
+  the "Result: {summary}" framing GONE. The payload also carries `final_text` +
+  `file_changes` as fields (alongside the unchanged `worker`, `failed`,
+  `worker_obs`, `idempotency_key`, correlation, cause). **Fallback:** only when the
+  worker produced NO final text (a silent turn, or a resume that errored before any
+  stream) does it emit a minimal factual line — `(worker X completed with no final
+  message; <detail>)` — never a fabricated description of what it "did". The boot
+  `reconcile_lost_routes` recovery passes `None`/`[]` (the live text was in memory
+  and is gone) with an honest "route recovered after a restart; read the recorded
+  transcript" detail.
+
+- **Tests.** `cargo test` green, **163 passing** (was 159): +3 codeagent
+  (`codex_capture_summary_takes_last_message_and_all_file_paths` — last
+  agent_message wins, all `changes[].path` deduped, started ignored;
+  `claude_capture_summary_takes_result_text_and_file_writer_paths` — `result` text
+  verbatim, only file-writer tool paths, Bash/Read excluded;
+  `capture_summary_final_text_is_truncated_not_summarized` — a huge final message is
+  byte-clipped + marked, not summarized), +1 dispatcher
+  (`route_completion_falls_back_factually_when_no_final_text` — the no-text path is
+  a factual line carrying the diagnostic, not a summary). The existing
+  `settle_routes_completion_to_requester_mailbox` was extended to assert the
+  payload carries the verbatim `final_text` ("ALPHA is the answer"), the
+  `file_changes` path ("src/answer.rs"), and the obs pointer.
+
+- **Live verification (isolated worktree stack — root `~/.elanus/wt-coding-agents`,
+  broker `:1893`; the MAIN `~/.elanus/root` daemon on `:1883` was never touched).**
+  - **Verbatim final text (the headline).** Launched a real codex worker
+    (`code-e8a2e86b`), then delivered `{"prompt":"Reply with exactly the single
+    word: ALPHA …","reply_to":"code-198d81dd"}`. The daemon resumed the worker,
+    captured its real answer, and routed the completion to the planner's mailbox.
+    Ledger payload (event 239): `"final_text":"ALPHA"`, `"file_changes":[]`,
+    `"prompt":"Worker session code-e8a2e86b completed the work you dispatched.\n\n
+    ALPHA\n\nFiles changed: none reported.\n\n(full conversation at
+    obs/agent/codex/code-e8a2e86b/#)"`, `"worker_obs":"obs/agent/codex/
+    code-e8a2e86b/#"`. The word **ALPHA is verbatim** — NOT "worker completed the
+    turn (exit_code=0)".
+  - **File changes.** Launched a real claude worker (`code-14d68c45`, writable dir
+    `/private/tmp/ca-worker-claude`), delivered a Write task. The completion (event
+    243) carried `"file_changes":["/private/tmp/ca-worker-claude/answer.txt"]` — the
+    exact path the worker's `Write` tool_use reported — and the worker's verbatim
+    `final_text` (a permission request, honestly relayed; the resume's `Write` was
+    permission-gated so no byte landed, but the tool stream's reported path is what
+    `file_changes` records, by design).
+  - **No regression.** Both completions routed exactly once (idempotency held — one
+    route per worker delivery, cause_ids 237/241); the loop closed (the planner was
+    resumed off each routed completion, same correlation `ca-alpha-1`/`ca-file-1`);
+    the per-session emit-only token retired after each resume (no leaked credential
+    for either test worker); `~/.codex`/`~/.claude` config untouched by elanus (the
+    tools keep their own auth, by design).
+
+- **Deferred / honest residual.** `file_changes` is the **tool-reported** path set
+  (codex `file_change.changes[].path`, claude file-writer `tool_use.file_path`) —
+  not a verified on-disk diff. Fuller on-disk effects (a real before/after diff,
+  and writes the tool made without a modeled stream event) await the complete cage
+  (the read camera + write fence, the deferred sandbox prerequisite); the
+  tool-reported set is what is available today. The verbatim `final_text` is
+  whatever the adapter emits as its terminal message (codex's last `agent_message`,
+  claude's `result` frame) — accurate for both adapters as built.
