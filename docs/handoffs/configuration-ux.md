@@ -1,6 +1,6 @@
 # Handoff: configuration UX — altitude and scope
 
-Status: M1 implemented and verified; M2-M4 planned. Intended implementer: Codex.
+Status: M1-M4 implemented and verified. Intended implementer: Codex.
 
 This handoff asks for a focused product-layer pass on the web UI's
 **configuration** surfaces — the setup view (instance config) and the configure
@@ -274,5 +274,31 @@ Acceptance criteria:
   the key is absent. Effective order for same-named keys is therefore:
   per-agent profile value wins, otherwise shared package setting, otherwise the
   package default.
-- "changed since approval" backend support: _TODO_
-- Off-switch decision (disable vs uninstall) and why: _TODO_
+- M2 result: the guided new-agent path now lands in conversation with the new
+  agent, with a visible configure pointer. The setup catalog includes a
+  future-tense coding-agent entry for Codex/Claude Code that names the envelope
+  value (sandbox, recorded activity trail, spend ceiling) without claiming the
+  integration is wired.
+- M3 result: the configure tab is essentials-first (name, model, run-step
+  ceiling, autonomy, workdir) with an agent-specific cost summary and autonomy
+  consequence line. Provider plumbing, package path, context program, sandbox
+  prefixes, throttle, advanced context parameters, and raw settings live under
+  one advanced fold.
+- M4 result: installed linked kits can be turned off through the setup surface by
+  calling `elanus kit unlink <kit>`. The UI labels this as turning off/removing
+  the kit from the installation path, not as erasing package files or approvals.
+  Copied kit packages do not get that affordance because `kit unlink` cannot
+  remove copied files; the UI says removal is not supported there yet. Instance
+  package settings now render typed controls from manifest-declared settings
+  instead of a raw TOML key/value box, and the setup cost panel names the agent
+  it describes.
+- "changed since approval" backend support: deferred. The web package payload
+  exposes current grants and current manifest/code hashes, and grants detach when
+  the hash changes, but the API does not currently return a direct drift verdict
+  comparing the current manifest/grant set against the accepted approval set.
+  Showing the badge without that backend fact would be guesswork.
+- Off-switch decision (disable vs uninstall) and why: shipped reversible disable
+  for linked kits via `kit unlink`. That is the backend-supported operation
+  today: it removes the kit's package directory from discovery, while grants
+  remain recorded and inert. True uninstall/removal of copied packages and grant
+  retirement remains a separate backend feature.

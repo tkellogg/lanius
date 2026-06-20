@@ -119,8 +119,8 @@ function packageBadges(pkg: any) {
 
 function grantState(pkg: any) {
   const grants = pkg.grants ?? [];
-  if (!grants.length) return 'no grants';
-  if (grants.some((g: any) => g.state === 'requested')) return 'pending approval';
+  if (!grants.length) return 'no review record';
+  if (grants.some((g: any) => g.state === 'requested')) return 'needs review';
   if (grants.some((g: any) => g.state === 'approved')) return 'approved';
   return grants[0]?.state ?? 'unknown';
 }
@@ -138,7 +138,7 @@ function riskBadges(pkg: any) {
   if ((manifest.config?.agent_tunable ?? []).length) badges.push('agent-tunable');
   if ((request.publish ?? []).some((v: string) => v === '#' || v.endsWith('/#'))) badges.push('broad publish');
   const state = grantState(pkg);
-  if (state === 'pending approval') badges.unshift('pending approval');
+  if (state === 'needs review') badges.unshift('needs review');
   else if (state === 'approved') badges.unshift('approved');
   return badges.length ? badges : ['low surface'];
 }
@@ -169,6 +169,29 @@ function costSummary(profile: any, fallbackModel = '') {
     hardCaps,
     label: hardCaps.length ? 'hard caps configured' : 'no hard cap visible yet',
   };
+}
+
+function autonomyConsequence(level = 'off') {
+  switch (level) {
+    case 'manual':
+      return 'Agent setting changes can be prepared, but you still confirm before they take effect.';
+    case 'assisted':
+      return 'Low-risk agent setting changes may be accepted automatically; new add-ons and sandbox changes still ask you.';
+    case 'autonomous':
+      return 'This agent may accept its own routine setting changes without asking; high-risk changes still need you.';
+    case 'off':
+    default:
+      return 'This agent cannot accept its own setting changes; every change waits for you.';
+  }
+}
+
+function modelCostHint(model = '') {
+  const m = model.toLowerCase();
+  if (!m) return 'cost/performance: unknown until a model is chosen';
+  if (/haiku|mini|small|cheap|fast/.test(m)) return 'cost/performance: cheap';
+  if (/sonnet|balanced|medium/.test(m)) return 'cost/performance: balanced';
+  if (/opus|gpt-5|large|pro|max|power/.test(m)) return 'cost/performance: powerful';
+  return 'cost/performance: unknown';
 }
 
 function declaredConfigParams(pkg: any) {
@@ -334,7 +357,6 @@ export function App() {
   const seenAsks = useRef(new Set());
   const seenFailures = useRef(new Set());
   const agentSessions = useRef(new Map());
-  const postConfigureNote = useRef('');
   const kitModalRef = useRef<HTMLDialogElement | null>(null);
 
   const touchAgent = (name: string, opts: any = {}) => {
@@ -447,9 +469,9 @@ export function App() {
   const stageNote = sel.kind === 'welcome' ? 'orient, then dive in'
     : sel.kind === 'signals' ? 'a live view of everything happening — orange means something needs your attention'
       : sel.kind === 'setup' ? 'first-run health, agent setup, capabilities, and trust'
-        : sel.tab === 'converse' ? `in/agent/${sel.agent} ⇄ in/human — the mailbox view`
+        : sel.tab === 'converse' ? `messages with ${sel.agent}`
           : sel.tab === 'sessions' ? 'your agent’s past conversations'
-            : sel.tab === 'configure' ? 'who this agent is — model, mailbox, visibility'
+            : sel.tab === 'configure' ? 'who this agent is — model, cost, and add-ons'
               : `obs/agent/${sel.agent}/# — this agent's telemetry`;
 
   const loadSetup = async (opts: any = {}) => {
@@ -492,9 +514,8 @@ export function App() {
     setNewAgent({ name: '', purpose: '', workdir: '', model: '', turns: '24', autonomy: 'off', capability: '' });
     setNewAgentNote('');
     await loadDiskAgents();
-    await loadSetup({ status: `created ${name}. Next: send a message or tune advanced settings.`, statusKind: 'ok' });
-    postConfigureNote.current = `created ${name} — setup choices saved; advanced settings are below`;
-    selectAgent(name, 'configure');
+    await loadSetup({ status: `created ${name}. Next: send a message.`, statusKind: 'ok' });
+    selectAgent(name, 'converse');
   };
 
   const provenance = useMemo(() => {
@@ -630,9 +651,7 @@ export function App() {
     setCfgForm(nextForm);
     resetContextChain(d.context ?? {}, packages, nextForm);
     setCfgLoading(false);
-    const after = postConfigureNote.current;
-    postConfigureNote.current = '';
-    setCfgNote(after || (r.ok ? '' : `no settings file for ${profile} — this agent only exists as traffic; create an agent here to configure it`));
+    setCfgNote(r.ok ? '' : `no settings file for ${profile} — this agent only exists as traffic; create an agent here to configure it`);
   };
 
   const saveConfigure = async () => {
@@ -946,7 +965,7 @@ export function App() {
           </div>
 
           <WelcomeView hidden={sel.kind !== 'welcome'} primary={primaryAgent()} historyOk={historyOk} systemStatus={systemStatus} selectAgent={selectAgent} selectSetup={selectSetup} selectSignals={selectSignals} />
-          <ConverseView hidden={!(sel.kind === 'agent' && sel.tab === 'converse')} agent={sel.agent} messages={conv.get(sel.agent) ?? []} submitCompose={submitCompose} answerAsk={answerAsk} />
+          <ConverseView hidden={!(sel.kind === 'agent' && sel.tab === 'converse')} agent={sel.agent} messages={conv.get(sel.agent) ?? []} submitCompose={submitCompose} answerAsk={answerAsk} selectAgent={selectAgent} />
           <SessionsView hidden={!(sel.kind === 'agent' && sel.tab === 'sessions')} state={sessionsState} agent={sel.agent} openTranscript={openTranscript} loadSessions={loadSessions} />
           <ConfigureView
             hidden={!(sel.kind === 'agent' && sel.tab === 'configure')}
@@ -1152,6 +1171,7 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
 
         <section className="setup-block setup-cost">
           <h3>cost visibility</h3>
+          <p className="dim-note">Showing {primaryProfile?.agent || primaryProfile?.profile || 'the default agent'}.</p>
           <div className="cost-grid">
             <div><span>model</span><strong>{cost.model}</strong></div>
             <div><span>autonomy</span><strong>{cost.autonomy}</strong></div>
@@ -1163,11 +1183,11 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
 
         <section className="setup-block">
           <h3>capability catalog</h3>
-          <p className="dim-note">Ready-made outcomes backed by kits/packages. Expand a card to inspect the underlying mechanics.</p>
+          <p className="dim-note">Ready-made outcomes for your agents. Expand a card before adding unfamiliar capabilities.</p>
           <div id="setup-kits">
             {setup.loading || !kits ? 'resolving…' : kits.ok === false ? <div className="dim-note">capabilities could not load: {kits.error ?? 'unknown - is the elanus binary on the server PATH current?'}</div>
-              : !(kits.kits ?? []).length ? <div className="dim-note">no capabilities found</div>
-                : kits.kits.map((k: any) => <SetupKit key={k.name} kit={k} installed={provenance.has(k.name)} loadSetup={loadSetup} />)}
+              : <><CodingAgentCatalogCard />{!(kits.kits ?? []).length ? <div className="dim-note">no other capabilities found</div>
+                : kits.kits.map((k: any) => <SetupKit key={k.name} kit={k} installed={provenance.has(k.name)} loadSetup={loadSetup} />)}</>}
           </div>
         </section>
         <section className="setup-block">
@@ -1176,7 +1196,7 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
           <div id="setup-configs">
             {setup.loading || !pkgs ? 'checking…' : pkgs.ok === false ? <div className="dim-note">could not load installed capabilities: {pkgs.error ?? 'unknown error'}</div>
               : !(pkgs.packages ?? []).length ? <div className="dim-note">nothing added yet</div>
-                : pkgs.packages.map((p: any) => <SetupPackageConfig key={p.name} pkg={p} />)}
+                : pkgs.packages.map((p: any) => <SetupPackageConfig key={p.name} pkg={p} loadSetup={loadSetup} />)}
           </div>
         </section>
         <section className="setup-block setup-trust">
@@ -1210,6 +1230,24 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
                 : proposals.proposals.map((p: any) => <ProposalCard key={p.proposal} proposal={p} loadSetup={loadSetup} />)}
           </div>
         </section>
+      </div>
+    </div>
+  );
+}
+
+function CodingAgentCatalogCard() {
+  return (
+    <div id="coding-agent-entry" className="setup-kit setup-kit-coming">
+      <div className="setup-kit-head">
+        <span className="setup-kit-name">coding agents</span>
+        <span className="setup-kit-hook dim-note">Coming soon: run Codex or Claude Code with a repo sandbox, a recorded activity trail, and a visible spend ceiling.</span>
+        <span className="badge badge-wait">coming</span>
+        <button disabled>not connected yet</button>
+      </div>
+      <div className="capability-meta">
+        <span>for: coding work you already do</span>
+        <span>value: sandbox, recording, and cost control</span>
+        <span>state: coming soon, not configured here yet</span>
       </div>
     </div>
   );
@@ -1251,11 +1289,15 @@ function SetupKit({ kit, installed, loadSetup }: any) {
   );
 }
 
-function SetupPackageConfig({ pkg }: any) {
-  const [key, setKey] = useState('');
-  const [value, setValue] = useState('');
+function SetupPackageConfig({ pkg, loadSetup }: any) {
+  const params = declaredConfigParams(pkg);
+  const [rows, setRows] = useState<any[] | null>(null);
   const [note, setNote] = useState('');
   const [raw, setRaw] = useState('not loaded');
+  const [confirmOff, setConfirmOff] = useState(false);
+  const source = packageSource(pkg);
+  const kit = (pkg.grants ?? []).map((g: any) => String(g.decided_by ?? '')).find((v: string) => v.startsWith('kit:'))?.slice(4) ?? '';
+  const canUnlink = !!kit && source.kind === 'linked' && source.label === kit;
   const active = (pkg.grants ?? []).some((g: any) => g.state === 'approved');
   const loadRaw = async () => {
     setRaw('loading...');
@@ -1263,26 +1305,49 @@ function SetupPackageConfig({ pkg }: any) {
     setRaw(r.ok ? (r.config?.toml || 'no settings yet') : (r.error ?? 'could not load settings'));
     return r.ok ? (r.config?.toml || 'no settings yet') : null;
   };
-  const save = async () => {
-    if (!key.trim()) { setNote('name the setting first'); return; }
-    setNote('');
-    const r = await adminPost('configs/set', { package: pkg.name, key: key.trim(), value });
+  const loadRows = async () => {
+    const toml = await loadRaw();
+    const current = toml ? parseConfigRows(toml) : [];
+    const byKey = new Map(current.map((row) => [row.key, row.value] as [string, string]));
+    const declared = new Map(params.map((param: any) => [param.key, param]));
+    for (const param of params) if (!byKey.has(param.key)) byKey.set(param.key, tomlDisplayValue(param.default, param.type));
+    for (const key of byKey.keys()) if (!declared.has(key)) declared.set(key, { key, type: 'string', label: key, help: 'Existing setting not declared in the add-on description.', source: 'current settings' });
+    setRows([...declared.values()].sort((a: any, b: any) => a.key.localeCompare(b.key)).map((param: any) => ({
+      param: { ...param, scope: 'applies to every agent that uses this add-on' },
+      value: byKey.get(param.key) ?? '',
+      note: '',
+    })));
+  };
+  const saveRow = async (idx: number) => {
+    if (!rows) return;
+    const row = rows[idx];
+    setRows(rows.map((r, i) => i === idx ? { ...r, note: 'saving...' } : r));
+    const r = await adminPost('configs/set', { package: pkg.name, key: row.param.key, value: row.value });
     if (!r.ok) { setNote(r.error ?? 'save failed'); return; }
-    const loaded = await loadRaw();
-    setNote(loaded && loaded.includes(key.trim()) ? 'saved' : 'saved, but could not verify the reload');
+    await loadRows();
+    setNote('saved and reloaded');
+  };
+  const unlink = async () => {
+    if (!canUnlink) return;
+    setNote('turning off...');
+    const r = await adminPost('kits/unlink', { kit });
+    await loadSetup(r.ok
+      ? { status: `turned off ${kit} for this installation. The review record stays; add it again from the catalog to restore it.`, statusKind: 'ok' }
+      : { status: `✕ couldn't turn off ${kit}: ${r.error ?? 'unknown error'}`, statusKind: 'err' });
   };
   return (
     <div className="setup-pending-pkg">
-      <div className="setup-kit-head"><span className="setup-kit-name">{pkg.name}</span><span className={active ? 'badge' : 'badge badge-wait'}>{active ? 'on' : 'off'}</span><span className="dim-note">{grantState(pkg)}</span></div>
+      <div className="setup-kit-head"><span className="setup-kit-name">{pkg.name}</span><span className={active ? 'badge' : 'badge badge-wait'}>{active ? 'on' : 'off'}</span><span className="dim-note">{grantState(pkg)}{kit ? ` · from ${kit}` : ''}</span>{canUnlink && <button className="ghost" onClick={() => setConfirmOff(!confirmOff)}>{confirmOff ? 'cancel' : 'turn off'}</button>}</div>
       <div className="cfg-package-detail">{packageDescription(pkg)}</div>
       <div className="risk-badges">{riskBadges(pkg).map((b) => <span key={b} className={`badge${/pending|broad|writes|daemon|http|hook|mcp|prompt/.test(b) ? ' badge-wait' : ''}`}>{b}</span>)}</div>
       <p className="dim-note">These settings apply to every agent that uses this add-on. Use an agent's configure tab when only one agent should change.</p>
+      {source.kind === 'copied' && <p className="dim-note">Copied into this installation; removal is not supported here yet.</p>}
+      {confirmOff && <div className="setup-confirm"><strong>Turn off {kit}?</strong><span>This removes it from this installation's add-on path. The review record stays, and adding it again restores it.</span><button onClick={unlink}>turn off {kit}</button></div>}
       <div className="setup-row">
-        <input placeholder="setting" spellCheck={false} value={key} onChange={(e) => setKey(e.target.value)} />
-        <input placeholder="value, using TOML for arrays or numbers" spellCheck={false} value={value} onChange={(e) => setValue(e.target.value)} />
-        <button onClick={save}>save setting</button>
+        <button className="ghost" onClick={loadRows}>settings</button>
         <span className="dim-note">{note}</span>
       </div>
+      <div className="cfg-package-config-panel setup-config-panel" hidden={rows === null}>{rows === null ? null : !rows.length ? <div className="dim-note">no configurable settings declared</div> : rows.map((row, idx) => <ConfigInputRow key={row.param.key} param={row.param} value={row.value} setValue={(v: string) => setRows(rows.map((r, i) => i === idx ? { ...r, value: v } : r))} save={<><IconButton label={`save ${pkg.name}.${row.param.key} for every agent`} onClick={() => saveRow(idx)}>save</IconButton><span className="dim-note">{row.note}</span></>} />)}</div>
       <details onToggle={(e) => e.currentTarget.open && raw === 'not loaded' && void loadRaw()}>
         <summary className="dim-note">current settings</summary>
         <pre className="setup-readme">{raw}</pre>
@@ -1326,51 +1391,88 @@ function ConfigureView(props: any) {
   const [selectedContextStage, setSelectedContextStage] = useState('');
   const addStageValue = selectedContextStage || (availableContextStages[0] ? `${availableContextStages[0].package}/${availableContextStages[0].name}` : '');
   const disabled = cfgLoading;
+  const agentName = form.agent || cfgParsed.agent || cfgProfile || 'this agent';
+  const cost = costSummary({ model: form.model, max_turns: Number(form.turns || 0), autonomy: form.autonomy, throttle: cfgParsed.throttle ?? {} }, form.model);
   const updateVar = (id: string, patch: any) => setForm({ varsRows: form.varsRows.map((r: any) => r.id === id ? { ...r, ...patch } : r) });
   const updateThrottle = (id: string, patch: any) => setForm({ throttleRows: form.throttleRows.map((r: any) => r.id === id ? { ...r, ...patch } : r) });
   return (
     <div id="view-configure" className="view" hidden={hidden}>
       <div className="setup-pane cfg-pane">
         <aside className="cfg-index" aria-label="configure sections">
-          {['agent', 'model', 'context', 'sandbox', 'packages', 'throttle', 'raw'].map((s) => <a key={s} href={`#cfg-section-${s}`}>{s}</a>)}
+          {[
+            ['essentials', 'essentials'],
+            ['packages', 'add-ons'],
+            ['advanced', 'advanced'],
+            ['context', 'context'],
+            ['sandbox', 'sandbox'],
+            ['throttle', 'throttle'],
+            ['raw', 'raw'],
+          ].map(([id, label]) => <a key={id} href={`#cfg-section-${id}`}>{label}</a>)}
         </aside>
         <div className="cfg-sections">
-          <section className="setup-block" id="cfg-section-agent">
-            <h3>agent</h3>
-            <p className="dim-note">edits land in <code id="cfg-file">{cfgProfile ? `${cfgProfile} settings` : "this agent's settings file"}</code> and apply on the agent's next run.</p>
+          <section className="setup-block cfg-essentials" id="cfg-section-essentials">
+            <h3>essentials</h3>
+            <p className="dim-note">These settings apply to {agentName} only. Edits land in <code id="cfg-file">{cfgProfile ? `${cfgProfile} settings` : "this agent's settings file"}</code> and apply on the agent's next run.</p>
+            <div className="cfg-cost-summary">
+              <div><span>model</span><strong>{cost.model}</strong><em>{modelCostHint(form.model)}</em></div>
+              <div><span>spend ceiling</span><strong>{cost.hardCaps.includes(`${Number(form.turns || 0)} run steps`) ? `${form.turns || 'no'} run steps` : cost.label}</strong><em>hard cap for one activation</em></div>
+              <div><span>autonomy</span><strong>{cost.autonomy}</strong><em>{autonomyConsequence(form.autonomy)}</em></div>
+            </div>
             <div className="cfg-grid">
-              <label>agent <input id="cfg-agent" disabled={disabled} spellCheck={false} value={form.agent} onChange={(e) => setForm({ agent: e.target.value })} /></label>
-              <label>owner <input id="cfg-owner" disabled={disabled} spellCheck={false} value={form.owner} onChange={(e) => setForm({ owner: e.target.value })} /></label>
+              <label id="cfg-section-agent">name <input id="cfg-agent" disabled={disabled} spellCheck={false} value={form.agent} onChange={(e) => setForm({ agent: e.target.value })} /></label>
+              <label id="cfg-section-model">model <input id="cfg-model" disabled={disabled} spellCheck={false} list="model-suggestions" value={form.model} onChange={(e) => setForm({ model: e.target.value })} /><span className="cfg-field-hint">{modelCostHint(form.model)}</span></label>
+              <label>max run steps <input id="cfg-turns" disabled={disabled} type="number" min="1" max="200" value={form.turns} onChange={(e) => setForm({ turns: e.target.value })} /><span className="cfg-field-hint">hard ceiling for one activation's model/tool loop</span></label>
               <label>autonomy <select id="cfg-autonomy" disabled={disabled} value={form.autonomy} onChange={(e) => setForm({ autonomy: e.target.value })}>{['off', 'manual', 'assisted', 'autonomous'].map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
-              <label>parent <input id="cfg-parent" disabled={disabled} spellCheck={false} placeholder="default" value={form.parent} onChange={(e) => setForm({ parent: e.target.value })} /></label>
-              <label>prepend path <input id="cfg-package-path" disabled={disabled} spellCheck={false} placeholder="kits/dev, /opt/elanus/packages" value={form.packagePath} onChange={(e) => setForm({ packagePath: e.target.value })} /></label>
-              <label className="cfg-check"><input id="cfg-path-inherit" disabled={disabled} type="checkbox" checked={form.pathInherit} onChange={(e) => setForm({ pathInherit: e.target.checked })} /> include inherited path</label>
-              <label>effective path <input id="cfg-effective-path" disabled={disabled} spellCheck={false} readOnly value={form.effectivePath} /></label>
+              <label>working directory <input id="cfg-workdir" disabled={disabled} spellCheck={false} placeholder="(elanus root)" value={form.workdir} onChange={(e) => setForm({ workdir: e.target.value })} /></label>
             </div>
+            <p id="cfg-autonomy-consequence" className="cfg-consequence">{autonomyConsequence(form.autonomy)}</p>
             <div className="setup-row"><button id="cfg-save" disabled={disabled} onClick={saveConfigure}>save</button><span id="cfg-note" className="dim-note">{cfgNote}</span></div>
-            <p className="dim-note">renaming changes the mailbox for future runs; old messages and history stay under the old name.</p>
-          </section>
-
-          <section className="setup-block" id="cfg-section-model">
-            <h3>model</h3>
-            <p className="dim-note">These settings apply to {form.agent || cfgParsed.agent || cfgProfile || 'this agent'} only.</p>
-            <div className="cfg-grid">
-              <label>model <input id="cfg-model" disabled={disabled} spellCheck={false} list="model-suggestions" value={form.model} onChange={(e) => setForm({ model: e.target.value })} /></label>
-              <label>max run steps <input id="cfg-turns" disabled={disabled} type="number" min="1" max="200" value={form.turns} onChange={(e) => setForm({ turns: e.target.value })} /></label>
-              <label>base URL <input id="cfg-base-url" disabled={disabled} spellCheck={false} placeholder="provider default" value={form.baseUrl} onChange={(e) => setForm({ baseUrl: e.target.value })} /></label>
-              <label>API key env <input id="cfg-api-key-env" disabled={disabled} spellCheck={false} placeholder="adapter default" value={form.apiKeyEnv} onChange={(e) => setForm({ apiKeyEnv: e.target.value })} /></label>
-            </div>
-            <p className="dim-note">caps one activation's model/tool loop, not the lifetime of the conversation.</p>
+            <p className="dim-note">renaming changes where future messages go; old messages and history stay under the old name.</p>
             <datalist id="model-suggestions">
               {(modelOptions.length ? modelOptions.map((m: any) => ({ value: m.id, label: m.display_name })) : [
                 { value: 'claude-fable-5' }, { value: 'claude-sonnet-4-6' }, { value: 'claude-haiku-4-5-20251001' }, { value: 'anthropic::deepseek-chat' },
-              ]).map((m: any) => <option key={m.value} value={m.value} label={m.label} />)}
+              ]).map((m: any) => {
+                const hint = modelCostHint(m.value).replace('cost/performance: ', '');
+                const label = [m.label, hint].filter(Boolean).join(' - ');
+                return <option key={m.value} value={m.value} label={label} />;
+              })}
             </datalist>
           </section>
 
+          <section className="setup-block" id="cfg-section-packages">
+            <h3>add-ons for this agent</h3>
+            <input id="cfg-include" type="hidden" value={form.include} readOnly />
+            <input id="cfg-exclude" type="hidden" value={form.exclude} readOnly />
+            <div className="setup-row cfg-package-toolbar"><button id="cfg-kit-add-toggle" type="button" disabled={disabled} onClick={openKitModal}>add</button><span className="dim-note">copy or link add-ons to change what {agentName} can use</span></div>
+            <div id="cfg-package-configs" className="cfg-tree">
+              <PackageTree packages={cfgPackages.filter((p: any) => skillIncluded(p))} skillExcluded={skillExcluded} setSkillExcluded={setSkillExcluded} setKitPackagesExcluded={setKitPackagesExcluded} cfgConfigPackages={cfgConfigPackages} cfgSharedConfigRows={cfgSharedConfigRows} setCfgSharedConfigRows={setCfgSharedConfigRows} cfgProfile={cfgProfile} cfgParsed={cfgParsed} setCfgContextVarEdits={setCfgContextVarEdits} />
+            </div>
+          </section>
+
+          <details className="setup-block cfg-advanced" id="cfg-section-advanced">
+            <summary><h3>advanced</h3><span className="dim-note">context program, provider plumbing, sandbox prefixes, package paths, throttles, and raw settings</span></summary>
+            <section id="cfg-section-provider">
+              <h4>provider</h4>
+              <div className="cfg-grid">
+                <label>base URL <input id="cfg-base-url" disabled={disabled} spellCheck={false} placeholder="provider default" value={form.baseUrl} onChange={(e) => setForm({ baseUrl: e.target.value })} /></label>
+                <label>API key env <input id="cfg-api-key-env" disabled={disabled} spellCheck={false} placeholder="adapter default" value={form.apiKeyEnv} onChange={(e) => setForm({ apiKeyEnv: e.target.value })} /></label>
+              </div>
+            </section>
+
+            <section id="cfg-section-paths">
+              <h4>package path</h4>
+              <div className="cfg-grid">
+                <label>owner <input id="cfg-owner" disabled={disabled} spellCheck={false} value={form.owner} onChange={(e) => setForm({ owner: e.target.value })} /></label>
+                <label>parent <input id="cfg-parent" disabled={disabled} spellCheck={false} placeholder="default" value={form.parent} onChange={(e) => setForm({ parent: e.target.value })} /></label>
+                <label>prepend path <input id="cfg-package-path" disabled={disabled} spellCheck={false} placeholder="kits/dev, /opt/elanus/packages" value={form.packagePath} onChange={(e) => setForm({ packagePath: e.target.value })} /></label>
+                <label className="cfg-check"><input id="cfg-path-inherit" disabled={disabled} type="checkbox" checked={form.pathInherit} onChange={(e) => setForm({ pathInherit: e.target.checked })} /> include inherited path</label>
+                <label>effective path <input id="cfg-effective-path" disabled={disabled} spellCheck={false} readOnly value={form.effectivePath} /></label>
+              </div>
+            </section>
+
           <section className="setup-block" id="cfg-section-context">
             <h3>context program</h3>
-            <p className="dim-note">These settings apply to {form.agent || cfgParsed.agent || cfgProfile || 'this agent'} only.</p>
+            <p className="dim-note">These settings apply to {agentName} only.</p>
             <div className="cfg-grid">
               <label>program <input id="cfg-context-program" disabled={disabled} spellCheck={false} value={form.contextProgram} onChange={(e) => setForm({ contextProgram: e.target.value })} /></label>
               <label>max context ms <input id="cfg-context-max-ms" disabled={disabled} type="number" min="1" value={form.contextMaxMs} onChange={(e) => setForm({ contextMaxMs: e.target.value })} /></label>
@@ -1386,9 +1488,8 @@ function ConfigureView(props: any) {
 
           <section className="setup-block" id="cfg-section-sandbox">
             <h3>sandbox</h3>
-            <p className="dim-note">These settings apply to {form.agent || cfgParsed.agent || cfgProfile || 'this agent'} only.</p>
+            <p className="dim-note">These settings apply to {agentName} only. Working directory is in essentials; prefixes are advanced.</p>
             <div className="cfg-grid">
-              <label>working directory <input id="cfg-workdir" disabled={disabled} spellCheck={false} placeholder="(elanus root)" value={form.workdir} onChange={(e) => setForm({ workdir: e.target.value })} /></label>
               <label>writable prefixes <input id="cfg-fs-write" disabled={disabled} spellCheck={false} placeholder="comma separated" value={form.fsWrite} onChange={(e) => setForm({ fsWrite: e.target.value })} /></label>
               <label>capture exclude <input id="cfg-capture-exclude" disabled={disabled} spellCheck={false} placeholder="comma separated" value={form.captureExclude} onChange={(e) => setForm({ captureExclude: e.target.value })} /></label>
             </div>
@@ -1396,28 +1497,20 @@ function ConfigureView(props: any) {
 
           <section className="setup-block" id="cfg-section-throttle">
             <h3>throttle</h3>
-            <p className="dim-note">These settings apply to {form.agent || cfgParsed.agent || cfgProfile || 'this agent'} only.</p>
+            <p className="dim-note">These settings apply to {agentName} only.</p>
             <div id="cfg-throttle" className="cfg-table">
               {form.throttleRows.map((r: any) => <div key={r.id} className="cfg-throttle-row"><input className="cfg-throttle-name" disabled={disabled} placeholder="name" spellCheck={false} value={r.name} onChange={(e) => updateThrottle(r.id, { name: e.target.value })} /><input className="cfg-throttle-max" disabled={disabled} type="number" placeholder="max concurrent" value={r.max} onChange={(e) => updateThrottle(r.id, { max: e.target.value })} /><input className="cfg-throttle-rate" disabled={disabled} type="number" placeholder="rate/min" value={r.rate} onChange={(e) => updateThrottle(r.id, { rate: e.target.value })} /><input className="cfg-throttle-tokens" disabled={disabled} type="number" placeholder="tokens/hour" value={r.tokens} onChange={(e) => updateThrottle(r.id, { tokens: e.target.value })} /><label className="cfg-check"><input className="cfg-throttle-coalesce" disabled={disabled} type="checkbox" checked={r.coalesce} onChange={(e) => updateThrottle(r.id, { coalesce: e.target.checked })} /> coalesce</label></div>)}
             </div>
             <button id="cfg-throttle-add" className="ghost" type="button" disabled={disabled} onClick={() => setForm({ throttleRows: [...form.throttleRows, { id: uid(), name: '', max: '', rate: '', tokens: '', coalesce: false }] })}>add throttle</button>
           </section>
 
-          <section className="setup-block" id="cfg-section-packages">
-            <h3>packages</h3>
-            <input id="cfg-include" type="hidden" value={form.include} readOnly />
-            <input id="cfg-exclude" type="hidden" value={form.exclude} readOnly />
-            <div className="setup-row cfg-package-toolbar"><button id="cfg-kit-add-toggle" type="button" disabled={disabled} onClick={openKitModal}>add</button><span className="dim-note">copy or link kits to change available packages</span></div>
-            <div id="cfg-package-configs" className="cfg-tree">
-              <PackageTree packages={cfgPackages.filter((p: any) => skillIncluded(p))} skillExcluded={skillExcluded} setSkillExcluded={setSkillExcluded} setKitPackagesExcluded={setKitPackagesExcluded} cfgConfigPackages={cfgConfigPackages} cfgSharedConfigRows={cfgSharedConfigRows} setCfgSharedConfigRows={setCfgSharedConfigRows} cfgProfile={cfgProfile} cfgParsed={cfgParsed} setCfgContextVarEdits={setCfgContextVarEdits} />
-            </div>
-          </section>
-
           <section className="setup-block" id="cfg-section-raw">
-            <p className="dim-note">These advanced settings apply to {form.agent || cfgParsed.agent || cfgProfile || 'this agent'} only.</p>
+            <h3>raw settings</h3>
+            <p className="dim-note">These advanced settings apply to {agentName} only.</p>
             <details><summary className="dim-note">advanced context parameters</summary><p className="dim-note">Advanced values for context and templates; prefer add-on settings when available. Saved by the main save button above.</p><div id="cfg-vars" className="cfg-table">{form.varsRows.map((r: any) => <div key={r.id} className="cfg-var-row"><input className="cfg-var-key" disabled={disabled} placeholder="name" spellCheck={false} value={r.key} onChange={(e) => updateVar(r.id, { key: e.target.value })} /><input className="cfg-var-value" disabled={disabled} placeholder="value" spellCheck={false} value={r.value} onChange={(e) => updateVar(r.id, { value: e.target.value })} /></div>)}</div><button id="cfg-var-add" className="ghost" type="button" disabled={disabled} onClick={() => setForm({ varsRows: [...form.varsRows, { id: uid(), key: '', value: '' }] })}>add context parameter</button></details>
             <details><summary className="dim-note">the raw settings file</summary><textarea id="cfg-toml" disabled={disabled} spellCheck={false} rows={14} value={cfgToml} onChange={(e) => setCfgToml(e.target.value)} /><div className="setup-row"><button id="cfg-toml-save" disabled={disabled} onClick={saveRawToml}>save raw file</button><span id="cfg-toml-note" className="dim-note">{cfgTomlNote}</span></div></details>
           </section>
+          </details>
         </div>
       </div>
     </div>
@@ -1586,16 +1679,17 @@ function KitAddRow({ kit, cfgForm, cfgPackages, detail, loadKitDetail, installKi
   );
 }
 
-function ConverseView({ hidden, agent, messages, submitCompose, answerAsk }: any) {
+function ConverseView({ hidden, agent, messages, submitCompose, answerAsk, selectAgent }: any) {
   return (
     <div id="view-converse" className="view" hidden={hidden}>
+      <div id="conv-configure-hint" className="conv-configure-hint"><span>Tune {agent} anytime in configure.</span><button className="ghost" type="button" onClick={() => selectAgent(agent, 'configure')}>configure</button></div>
       <div id="conv-holder" className="conv-feed-holder">
         <div className="conv-feed">
           {!messages.length && <div className="conv-empty"><p className="conv-empty-mark">⟁</p><p>nothing yet — say something below.<br />asks and replies thread here by correlation.</p></div>}
           {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `correlation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : m.text}</div></div>)}
         </div>
       </div>
-      <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose}><span className="compose-sigil">»</span><input id="compose-input" type="text" placeholder="message the agent…" spellCheck={false} /><button type="submit" id="compose-send">transmit</button></form>
+      <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><button type="submit" id="compose-send">transmit</button></form>
     </div>
   );
 }

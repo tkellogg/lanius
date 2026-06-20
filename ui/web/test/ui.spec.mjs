@@ -160,9 +160,15 @@ const testAgentProfile = 'harrier';
   await page.fill('#na-model', 'claude-haiku-4-5-20251001');
   await page.fill('#na-turns', '11');
   await page.click('#na-create');
-  await waitFor('new agent: configure tab opens', async () => {
-    return !(await page.$eval('#view-configure', (el) => el.hidden));
+  await waitFor('new agent: converse tab opens', async () => {
+    return !(await page.$eval('#view-converse', (el) => el.hidden));
   }, 10000);
+  const composeLabel = await page.$eval('#compose-input', (el) => el.getAttribute('aria-label'));
+  composeLabel === `message ${testAgentProfile}` ? ok('new agent: compose targets the new agent') : fail(`new agent: compose target wrong (${composeLabel})`);
+  await waitFor('new agent: configure pointer is visible from converse', async () => {
+    const text = await page.$eval('#conv-configure-hint', (el) => el.textContent).catch(() => '');
+    return text.includes(`Tune ${testAgentProfile} anytime in configure`);
+  });
   await waitFor('new agent: appears in nav', async () => {
     const items = await page.$$eval('#nav-agents .nav-item', (els) => els.map((e) => e.textContent));
     return items.some((t) => t.includes(testAgentProfile));
@@ -193,10 +199,35 @@ const testAgentProfile = 'harrier';
   await waitForConfigureLoaded(page);
   await page.fill('#cfg-model', 'claude-haiku-4-5-20251001');
   await page.fill('#cfg-turns', '7');
+  await waitFor('configure: essentials are first and plumbing is advanced', async () => {
+    const essentials = await page.$eval('#cfg-section-essentials', (el) => el.textContent);
+    return /essentials/i.test(essentials)
+      && /name/i.test(essentials)
+      && /model/i.test(essentials)
+      && /max run steps/i.test(essentials)
+      && /autonomy/i.test(essentials)
+      && /working directory/i.test(essentials)
+      && !/parent|prepend path|effective path/i.test(essentials);
+  }, 5000);
+  await waitFor('configure: agent cost summary reflects selected agent', async () => {
+    const text = await page.$eval('.cfg-cost-summary', (el) => el.textContent);
+    return /claude-haiku-4-5-20251001/.test(text)
+      && /7 run steps/.test(text)
+      && /hard cap for one activation/i.test(text)
+      && /cost\/performance:\s*cheap/i.test(text);
+  }, 5000);
+  const beforeAutonomy = await page.$eval('#cfg-autonomy-consequence', (el) => el.textContent);
+  await page.selectOption('#cfg-autonomy', 'assisted');
+  await waitFor('configure: autonomy consequence updates', async () => {
+    const text = await page.$eval('#cfg-autonomy-consequence', (el) => el.textContent);
+    return text !== beforeAutonomy && /low-risk agent setting changes/i.test(text);
+  }, 5000);
+  await page.selectOption('#cfg-autonomy', 'off');
+  await page.click('#cfg-section-advanced > summary');
   await page.fill('#cfg-context-program', 'default');
   await page.fill('#cfg-context-max-ms', '12000');
   await waitFor('configure: run budget label is not conversation turns', async () => {
-    const text = await page.$eval('#cfg-section-model', (el) => el.textContent);
+    const text = await page.$eval('#cfg-section-essentials', (el) => el.textContent);
     return /max run steps/i.test(text)
       && /activation's model\/tool loop/i.test(text)
       && !/max turns/i.test(text);
@@ -409,6 +440,7 @@ const testAgentProfile = 'harrier';
   await page.waitForSelector('#view-configure:not([hidden])');
   // Must wait for the async loadConfigure to finish before reading values.
   await waitForConfigureLoaded(page);
+  await page.click('#cfg-section-advanced > summary');
   const model = await page.$eval('#cfg-model', (el) => el.value);
   const turns = await page.$eval('#cfg-turns', (el) => el.value);
   const contextProgram = await page.$eval('#cfg-context-program', (el) => el.value);
@@ -461,6 +493,7 @@ const testAgentProfile = 'harrier';
       .textContent();
     return /effective here:\s*60/i.test(text) && /overridden here for harrier/i.test(text);
   }, 8000);
+  const harrierCostSummary = await page.$eval('.cfg-cost-summary', (el) => el.textContent);
   await waitFor('configure reload: second agent in nav', async () => {
     const items = await page.$$('#nav-agents .nav-item');
     for (const item of items) {
@@ -472,7 +505,20 @@ const testAgentProfile = 'harrier';
   await page.click('[data-tab="configure"]');
   await page.waitForSelector('#view-configure:not([hidden])');
   await waitForConfigureLoaded(page);
+  await page.click('#cfg-section-advanced > summary');
   const mainWindowPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="window"]').first();
+  await waitFor('configure reload: cost summary follows second agent', async () => {
+    const model = await page.$eval('#cfg-model', (el) => el.value);
+    const turns = await page.$eval('#cfg-turns', (el) => el.value);
+    const autonomy = await page.$eval('#cfg-autonomy', (el) => el.value);
+    const text = await page.$eval('.cfg-cost-summary', (el) => el.textContent);
+    return text !== harrierCostSummary
+      && model !== 'claude-haiku-4-5-20251001'
+      && turns !== '7'
+      && text.includes(model)
+      && text.includes(`${turns} run steps`)
+      && text.includes(autonomy);
+  }, 5000);
   await mainWindowPackage().evaluate((el) => { if (!el.open) el.querySelector('summary')?.click(); });
   await mainWindowPackage().locator('.cfg-package-config-toggle').click();
   await waitFor('configure reload: second agent sees shared package setting', async () => {
@@ -543,12 +589,20 @@ const renamedAgent = 'falcon';
   await page.goto('/');
   await page.click('.nav-setup');
   await page.waitForSelector('#view-setup:not([hidden])');
+  await waitFor('setup: cost panel names the agent it describes', async () => {
+    const text = await page.$eval('.setup-cost', (el) => el.textContent);
+    return /Showing\s+(main|default)/i.test(text);
+  }, 10000);
   await waitFor('kits: catalog visible', async () => {
     return /dev|core|funnel/.test(await page.$eval('#setup-kits', (el) => el.textContent));
   }, 10000);
   await waitFor('capabilities: catalog uses outcome language and installed state', async () => {
     const text = await page.$eval('#setup-kits', (el) => el.textContent);
     return /capability|available|installed|useful behavior/i.test(text);
+  }, 10000);
+  await waitFor('capabilities: coding agents are honest coming-soon catalog entry', async () => {
+    const text = await page.$eval('#coding-agent-entry', (el) => el.textContent).catch(() => '');
+    return /coming soon/i.test(text) && /Codex|Claude Code/.test(text) && /sandbox/.test(text) && /recorded activity trail|recording/.test(text) && /cost control|spend ceiling/.test(text) && /not configured/i.test(text);
   }, 10000);
   // Expand the dev kit readme.
   await waitFor('kits: dev kit readme button', async () => {
@@ -595,35 +649,44 @@ const renamedAgent = 'falcon';
   }, 10000);
   await waitFor('risk: installed capabilities show approval/risk badges', async () => {
     const text = await page.$eval('#setup-configs', (el) => el.textContent);
-    return /approved|pending approval|hook|daemon|local http|broad publish|low surface/i.test(text);
+    return /approved|needs review|hook|daemon|local http|broad publish|low surface/i.test(text);
   }, 10000);
-  let saved = false;
-  let savedCard = null;
-  for (const card of await page.$$('#setup-configs .setup-pending-pkg')) {
-    const text = await card.textContent();
-    if (!/git-protect/.test(text)) continue;
-    const inputs = await card.$$('input');
-    if (inputs.length >= 2) {
-      await inputs[0].fill('mode');
-      await inputs[1].fill('"watch"');
-      const btn = await card.$('button');
-      if (btn) {
-        await btn.click();
-        saved = true;
-        savedCard = card;
-      }
-    }
-    break;
-  }
-  saved ? ok('add-ons: package setting saved from UI') : fail('add-ons: setting form not found');
-  await waitFor('add-ons: package setting save confirmed by readback', async () => {
-    if (!savedCard) return false;
+  const savedCard = page.locator('#setup-configs .setup-pending-pkg', { hasText: 'window' }).first();
+  await savedCard.locator('button', { hasText: 'settings' }).click();
+  await waitFor('add-ons: instance package settings render typed manifest inputs', async () => {
     const text = await savedCard.textContent();
-    return /saved/.test(text);
+    const count = await savedCard.locator('.cfg-config-row', { hasText: 'Window rows' }).locator('input[type="number"]').count();
+    return count > 0 && /applies to every agent/i.test(text) && !/TOML value|using TOML/i.test(text);
   }, 10000);
-  await savedCard.$eval('details', (el) => { if (!el.open) el.querySelector('summary')?.click(); });
+  const setupWindowRows = savedCard.locator('.cfg-config-row', { hasText: 'Window rows' });
+  await setupWindowRows.locator('input[type="number"]').fill('72');
+  await setupWindowRows.locator('button[aria-label="save window.window_rows for every agent"]').click();
+  ok('add-ons: package setting saved from typed UI');
+  await waitFor('add-ons: package setting save confirmed by readback', async () => {
+    return /saved and reloaded/.test(await savedCard.textContent());
+  }, 10000);
+  await savedCard.locator('details').evaluate((el) => { if (!el.open) el.querySelector('summary')?.click(); });
   await waitFor('add-ons: package setting visible in current settings', async () => {
-    return /mode = "watch"/.test(await savedCard.$eval('pre', (el) => el.textContent).catch(() => ''));
+    return /window_rows = 72/.test(await savedCard.locator('pre').textContent().catch(() => ''));
+  }, 10000);
+  const copyResp = await page.evaluate(async () => {
+    const r = await fetch('/api/admin/kits/add', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kit: 'core', copy: true }),
+    });
+    return r.json();
+  });
+  copyResp.ok ? ok('add-ons: copied core kit via API') : fail(`add-ons: copied core kit failed: ${JSON.stringify(copyResp)}`);
+  await page.reload();
+  await page.waitForSelector('.nav-setup');
+  await page.click('.nav-setup');
+  await page.waitForSelector('#view-setup:not([hidden])');
+  await waitFor('add-ons: copied package explains removal gap', async () => {
+    const copied = page.locator('#setup-configs .setup-pending-pkg', { hasText: 'harness-doctrine' }).first();
+    const text = await copied.textContent().catch(() => '');
+    const turnOffCount = await copied.locator('button', { hasText: 'turn off' }).count().catch(() => 1);
+    return /Copied into this installation; removal is not supported here yet/i.test(text) && turnOffCount === 0;
   }, 10000);
   await waitFor('add-ons: agent requests resting state', async () => {
     return /no agent requests/i.test(await page.$eval('#setup-pending', (el) => el.textContent));
@@ -644,6 +707,22 @@ const renamedAgent = 'falcon';
   await waitFor('add-ons: proposal accepted through UI', async () => {
     return /accepted the change/i.test(await page.$eval('#setup-status', (el) => el.textContent));
   }, 10000);
+  const devPackage = page.locator('#setup-configs .setup-pending-pkg', { hasText: 'git-protect' }).first();
+  await devPackage.locator('button', { hasText: 'turn off' }).click();
+  await waitFor('add-ons: turn off confirmation explains unlink behavior', async () => {
+    const text = await devPackage.textContent();
+    return /Turn off dev/i.test(text) && /review record stays/i.test(text);
+  }, 5000);
+  await devPackage.locator('.setup-confirm button').click();
+  await waitFor('add-ons: linked kit turn off is durable', async () => {
+    const status = await page.$eval('#setup-status', (el) => el.textContent);
+    const list = await page.$eval('#setup-configs', (el) => el.textContent);
+    return /turned off dev/i.test(status) && !/git-protect/.test(list);
+  }, 10000);
+  const webLog = fs.readFileSync(WEB_LOG, 'utf8');
+  /elanus kit unlink dev/.test(webLog)
+    ? ok('add-ons: backend log recorded kit unlink')
+    : fail('add-ons: backend log missing kit unlink');
   await page.close();
 }
 

@@ -39,6 +39,8 @@ the UI.
 - [06-configuration.md](06-configuration.md) - why each character opens
   configuration, what they expect, and where instance config and agent config
   blur together (shared-vs-per-agent scope, altitude, the off switch).
+- [07-chatting.md](07-chatting.md) - An explanation of how users will primarily 
+  want to use elanus and interact with agents.
 
 ## Implementation Anchors
 

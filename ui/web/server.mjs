@@ -479,6 +479,12 @@ async function handleAdmin(url, req, res, body) {
     const r = await cli(args);
     return sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
   }
+  if (url.pathname === '/api/admin/kits/unlink' && req.method === 'POST') {
+    const { kit } = body ?? {};
+    if (typeof kit !== 'string' || !PKG_NAME_RE.test(kit)) return sendJson(res, 400, { ok: false, error: 'need {kit}' });
+    const r = await cli(['kit', 'unlink', kit]);
+    return sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
+  }
   if (url.pathname === '/api/admin/packages' && req.method === 'GET') {
     const profile = url.searchParams.get('profile') ?? 'default';
     if (!PROFILE_NAME_RE.test(profile)) return sendJson(res, 400, { ok: false, error: BAD_NAME_MSG });

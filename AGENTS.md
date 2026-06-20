@@ -6,3 +6,8 @@
 - docs/ui-flows/ — browser-flow catalogs and findings for web UI work. Start at docs/ui-flows/README.md, and use the web-qa skill for real UI verification.
 - Use .claude/skills/docs-disclosure-indexer/SKILL.md when adding or auditing docs indexes or docs/code cross-references.
 - Use skills
+
+
+# Current status of this project
+Pre-release. Therefore data migrations and staged implementations are typically not necessary, at
+least not for the normal reasons.
