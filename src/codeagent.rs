@@ -247,11 +247,18 @@ pub struct DeliveryRequester {
 /// delivery, from the payload's explicit `reply_to` and the broker-verified
 /// `sender` of the delivery event. Precedence:
 ///
-/// 1. An explicit `reply_to` in the payload — a full topic (`in/agent/<noun>/
-///    <conv>`) is used verbatim; a bare agent/session NAME (`code-<id>` or an
-///    agent noun) is expanded to that actor's mailbox. This lets a planner name a
-///    different reply address than its own identity (e.g. a shared room), or be
-///    explicit about the conversation.
+/// 1. An explicit `reply_to` in the payload — it must name a **recognized actor**,
+///    not an arbitrary topic. It is ALWAYS resolved through `mailbox_for_actor`
+///    (the same safe path the sender-derived route uses): a coding session
+///    (`code-*` with a durable record) → its own session mailbox; a valid agent
+///    name → `in/agent/<agent>/<conv>`. Two input forms are accepted, both
+///    resolved (never used verbatim): a bare actor NAME (`code-<id>` or an agent
+///    noun), or a full `in/agent/<noun>/<conv>` mailbox topic (from which the
+///    actor is extracted and re-derived). Anything else — a raw/arbitrary `in/...`
+///    topic, `in/human/*`, `signal/`, `obs/`, a wildcard, a path-unsafe name — is
+///    REJECTED (returns None), so a kernel-authored completion can never be
+///    published to the human inbox or an arbitrary topic via `reply_to`
+///    (docs/security.md: confused-deputy).
 /// 2. Otherwise the `sender` the broker stamped on the delivery — the genuine,
 ///    unforgeable requester. A coding-session sender (`code-*`) is expanded to its
 ///    own mailbox (`in/agent/<its-noun>/<sender>`) so the completion resumes it; a
@@ -259,7 +266,7 @@ pub struct DeliveryRequester {
 ///
 /// Returns None when there is no requester to route to (the `kernel`/owner
 /// senders that originate a delivery with no one waiting on a coding completion,
-/// or an unusable reply_to) — a normal worker resume with no routing, so an
+/// or an unresolvable reply_to) — a normal worker resume with no routing, so an
 /// ordinary delivery with no planner still works unchanged.
 pub fn delivery_requester(
     root: &Root,
@@ -267,21 +274,14 @@ pub fn delivery_requester(
     sender: Option<&str>,
     correlation: Option<&str>,
 ) -> Option<DeliveryRequester> {
-    // 1. An explicit reply_to in the payload wins.
+    // 1. An explicit reply_to in the payload wins — but it must RESOLVE to a known
+    //    actor's mailbox, never be routed verbatim. A planner names *who* to reply
+    //    to (itself, a worker, an agent), and the daemon derives the mailbox; it
+    //    cannot dictate a raw topic for a kernel-authored message.
     if let Some(rt) = payload.get("reply_to").and_then(Value::as_str) {
         let rt = rt.trim();
         if !rt.is_empty() {
-            // A full in/ topic is used verbatim (must be a valid, wildcard-free
-            // mailbox name). A bare name is expanded to that actor's mailbox.
-            if rt.starts_with("in/") {
-                // valid_name already rejects wildcards (`#`/`+`), so a routable
-                // reply_to is exactly a concrete, wildcard-free mailbox name.
-                if topic::valid_name(rt) {
-                    return Some(DeliveryRequester { reply_to: rt.to_string() });
-                }
-                return None; // a malformed/wildcard reply_to is not routable
-            }
-            return mailbox_for_actor(root, rt, correlation)
+            return resolve_reply_to(root, rt, correlation)
                 .map(|reply_to| DeliveryRequester { reply_to });
         }
     }
@@ -297,18 +297,70 @@ pub fn delivery_requester(
     mailbox_for_actor(root, sender, correlation).map(|reply_to| DeliveryRequester { reply_to })
 }
 
+/// Resolve an explicit `reply_to` to a recognized actor's mailbox, or None if it
+/// does not name one. This is the constraint that closes the confused-deputy hole:
+/// the daemon routes a kernel-authored completion ONLY to an actor mailbox it
+/// re-derives, never to a verbatim topic a payload chose.
+///
+/// Accepted forms (both resolved through `mailbox_for_actor`, the same safe path
+/// the sender route uses, never used verbatim):
+/// - a **bare actor name** (`code-<id>` or an agent noun): no `/`.
+/// - a full **`in/agent/<noun>/<conv>`** mailbox topic: exactly four levels, the
+///   actor is the (decoded) `<conv>` for a coding session, else the `<noun>`.
+///
+/// Rejected (None): a raw/arbitrary `in/...` topic, `in/human/*`, `in/group/*`,
+/// `signal/`, `obs/`, `work/`, any wildcard, a path-unsafe name — anything that is
+/// not a recognized actor address. The result is itself revalidated as a concrete
+/// mailbox name before use.
+fn resolve_reply_to(root: &Root, rt: &str, correlation: Option<&str>) -> Option<String> {
+    // A bare actor name (no '/'): expand it to its mailbox.
+    if !rt.contains('/') {
+        return mailbox_for_actor(root, rt, correlation);
+    }
+    // A topic form is only accepted if it is a concrete in/agent/<noun>/<conv>
+    // mailbox — never in/human/*, signal/*, obs/*, a room, or a wildcard. Extract
+    // the actor and re-derive the mailbox through the safe path; the original
+    // string is NEVER routed verbatim.
+    if !topic::valid_name(rt) {
+        return None; // wildcards / malformed: not routable
+    }
+    let segs: Vec<&str> = rt.split('/').collect();
+    if segs.len() != 4 || segs[0] != "in" || segs[1] != "agent" {
+        return None; // not an agent-mailbox shape (in/human/*, in/group/*, …)
+    }
+    let noun = decode_segment(segs[2]);
+    let conv = decode_segment(segs[3]);
+    // If the conversation names a coding session, route to ITS own mailbox
+    // (re-derived from the durable record) — exactly the safe sender path. A
+    // session with no record is not a recognized actor → None.
+    if codesession::is_session_principal(&conv) {
+        return mailbox_for_actor(root, &conv, correlation);
+    }
+    // Otherwise treat the noun as an agent name and re-derive its mailbox with the
+    // named conversation (not the message's correlation — the payload addressed a
+    // specific conv). A path-unsafe noun/conv is rejected by mailbox_for_actor.
+    mailbox_for_actor(root, &noun, Some(&conv))
+}
+
 /// Build the mailbox topic for a bare actor name. A coding session (`code-*` with
 /// a record) routes to its OWN session mailbox `in/agent/<its-noun>/<session>` so
 /// the completion resumes it via M2-B. A native agent name routes to
 /// `in/agent/<name>/<conv>` (the correlation as the conversation locator, falling
-/// back to the agent's default conversation). None for an unusable name.
+/// back to the agent's default conversation). None for an unusable or path-unsafe
+/// name (a name with `/` or a reserved prefix could otherwise be coaxed toward a
+/// non-agent topic level — reject it).
 fn mailbox_for_actor(root: &Root, name: &str, correlation: Option<&str>) -> Option<String> {
-    if name.is_empty() {
+    // The actor name becomes a single topic LEVEL. `encode_segment` already
+    // neutralizes wildcards/`/`, but require a valid principal so a path-unsafe or
+    // reserved name (`.`, traversal, an `in/`-shaped string) is rejected outright
+    // rather than encoded into a junk-but-live mailbox.
+    if !crate::secrets::valid_principal(name) {
         return None;
     }
     if codesession::is_session_principal(name) {
         // A coding session: deliver to its own mailbox so M2-B resumes it. Its
-        // noun comes from the durable record; without one we can't address it.
+        // noun comes from the durable record; without one we can't address it
+        // (and an unrecorded code-* name is not a recognized actor).
         let rec = codesession::read_record(root, name).ok().flatten()?;
         return Some(format!(
             "in/agent/{}/{}",
@@ -2011,7 +2063,20 @@ mod tests {
     #[test]
     fn requester_from_explicit_reply_to_topic() {
         let root = delivery_tmp_root();
-        // A full in/ topic reply_to is used verbatim.
+        // A full in/agent/<noun>/<conv> topic whose conv is a RECORDED coding
+        // session resolves to that session's own mailbox (re-derived, not verbatim)
+        // — the legitimate planner-reply form M4-A uses.
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-planner1".into(),
+                native_session: "thr".into(),
+                tool: "claude".into(),
+                agent_noun: "claude-code".into(),
+                workdir: "/tmp".into(),
+            },
+        )
+        .unwrap();
         let req = delivery_requester(
             &root,
             &json!({ "prompt": "go", "reply_to": "in/agent/claude-code/code-planner1" }),
@@ -2020,11 +2085,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.reply_to, "in/agent/claude-code/code-planner1");
+        // A bare agent name resolves to that agent's mailbox, the conversation from
+        // the correlation.
+        let req = delivery_requester(
+            &root,
+            &json!({ "prompt": "go", "reply_to": "kestrel" }),
+            Some("owner"),
+            Some("corr-1"),
+        )
+        .unwrap();
+        assert_eq!(req.reply_to, "in/agent/kestrel/corr-1");
+        // A full in/agent/<noun>/<conv> topic for a NATIVE agent re-derives the
+        // agent mailbox with the named conversation (not verbatim, but identical
+        // shape for a well-formed agent address).
+        let req = delivery_requester(
+            &root,
+            &json!({ "prompt": "go", "reply_to": "in/agent/kestrel/room-7" }),
+            Some("owner"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.reply_to, "in/agent/kestrel/room-7");
         // A wildcard reply_to is rejected (not routable).
         assert!(delivery_requester(
             &root,
             &json!({ "prompt": "go", "reply_to": "in/agent/+/code-x" }),
             None,
+            None,
+        )
+        .is_none());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M4-A confused-deputy (security): an explicit `reply_to` must resolve to a
+    /// RECOGNIZED actor's mailbox; it can NEVER coax a kernel-authored completion
+    /// onto the human inbox or an arbitrary topic. These are the exact abuse probes
+    /// the adversarial verify turned up — each must yield None (no route), so no
+    /// kernel message can ever land on those topics via reply_to.
+    #[test]
+    fn explicit_reply_to_cannot_target_human_inbox_or_arbitrary_topic() {
+        let root = delivery_tmp_root();
+        // The headline exploit: route a kernel-authored completion to the owner's
+        // human inbox. REJECTED.
+        assert!(delivery_requester(
+            &root,
+            &json!({ "prompt": "x", "reply_to": "in/human/owner" }),
+            Some("owner"),
+            None,
+        )
+        .is_none(), "reply_to in/human/owner must not route");
+        // An arbitrary non-mailbox topic. REJECTED.
+        assert!(delivery_requester(
+            &root,
+            &json!({ "prompt": "x", "reply_to": "in/totally/arbitrary/x" }),
+            Some("owner"),
+            None,
+        )
+        .is_none(), "reply_to to an arbitrary in/ topic must not route");
+        // Other-plane topics a verbatim route would have published a kernel message
+        // onto: work/, signal/, obs/. All REJECTED.
+        for bad in [
+            "signal/cancel/all",
+            "obs/agent/codex/code-victim/session/start",
+            "work/agent/exec",
+            "in/group/secret-room",
+            "in/human/owner/extra",
+            "in/agent/codex",                // too few levels (not a mailbox)
+            "in/agent/codex/code-x/thread",  // too many levels
+            "in/agent/codex/code-ghost",     // a code-* conv with NO record → not an actor
+            "in/agent/+/code-x",             // a wildcard
+            "in/agent/codex/#",              // a wildcard
+        ] {
+            assert!(
+                delivery_requester(&root, &json!({ "prompt": "x", "reply_to": bad }), Some("owner"), None).is_none(),
+                "reply_to {bad:?} must not route a kernel message"
+            );
+        }
+        // And a bare name that is path-unsafe / reserved cannot be coaxed into a
+        // non-agent topic level either.
+        assert!(delivery_requester(
+            &root,
+            &json!({ "prompt": "x", "reply_to": "../../owner" }),
+            Some("owner"),
             None,
         )
         .is_none());

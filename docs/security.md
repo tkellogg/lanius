@@ -492,3 +492,59 @@ code-<session>`); a reaped orphan is refused at CONNECT. Regression-tested at th
 prior shape-only suite missed. RESIDUAL: this fixes the bus-authority gap only; M0's
 complete-cage criteria (read/egress denial onto the elanus OS cage) stay deferred per
 the handoff sandbox stance — the tool keeps its own OS sandbox for now.
+
+## 21. [FIXED 2026-06-20] M4-A completion routing: confused-deputy `reply_to` + cross-victim idempotency suppression (found by the M4-A verifier)
+
+The M4-A orchestration loop (a worker's completion is routed back to the requester's
+mailbox by the **daemon's own authority**, so a planner is resumed — branch
+`coding-agents`) shipped two MEDIUM holes the adversarial verify turned up. Both are
+in the daemon's mediated routing, not the session token (which stays emit-only — the
+authority was never widened, per entry 20).
+
+**(a) Confused-deputy `reply_to`.** `codeagent::delivery_requester` accepted an
+explicit payload `reply_to` that merely `starts_with("in/")` and was wildcard-free,
+then the daemon routed a **kernel-authored** completion to it **verbatim**. So a
+delivery carrying `reply_to: in/human/owner` (or any `in/...` / `signal/` / `obs/` /
+`work/` topic) made elanus publish a kernel-authored message to the human inbox or an
+arbitrary topic — the classic confused deputy (a low-authority requester borrows the
+kernel's authority to write where it cannot). FIX: an explicit `reply_to` must now
+**resolve to a recognized actor's mailbox** the same safe way the sender-derived path
+does (`resolve_reply_to` → `mailbox_for_actor`): a coding session (`code-*` with a
+durable record) → its own session mailbox; a valid agent name → `in/agent/<agent>/
+<conv>`. Both a bare actor NAME and a full `in/agent/<noun>/<conv>` mailbox topic are
+accepted, but the topic is never used verbatim — the actor is extracted and the
+mailbox **re-derived**. A raw/arbitrary `in/...` topic, `in/human/*`, `in/group/*`,
+`signal/`, `obs/`, a wildcard, a path-unsafe name, or an unrecorded `code-*` conv all
+resolve to None (no route). `mailbox_for_actor` now also requires `valid_principal`
+so a path-unsafe/reserved name can't be coaxed into a non-agent topic level. Proven
+live (worktree stack, broker :1893, NO model turn — fail-fast worker resume): a
+delivery with `reply_to: in/human/owner` and one with `reply_to: in/totally/
+arbitrary/x` both captured `reply_to: null` (route refused); the `in/human/owner`
+kernel-event count was unchanged and the arbitrary topic had zero events; a
+legitimate `reply_to: code-<planner>` still routed the completion to that planner's
+own mailbox (sender=kernel, same correlation).
+
+**(b) Cross-victim idempotency suppression.** `code_delivery_keys` was keyed on
+`idempotency_key` alone (GLOBAL). An attacker who pre-claimed an explicit key `K`
+(via a delivery to their own session A) silently **suppressed** a *different* victim's
+delivery to a *different* session B that reused `K` — B was settled `done` as a bogus
+duplicate and never driven (a denial of the victim's orchestration step). FIX:
+namespace the dedupe by the **target session** — `PRIMARY KEY (session,
+idempotency_key)`, and `claim_delivery_key`/`delivery_key_seen` are per-session. An
+explicit key now only ever dedupes a delivery to the SAME session; one principal's
+key can never collide with another's delivery to a different session. The default
+`event:<id>` key is globally unique regardless, and the genuine same-session replay
+dedupe (the at-least-once protection) still holds across a restart. Pre-release, the
+table was just dropped+recreated (no migration). Proven live: with `K` pre-claimed
+for session A, a victim delivery to session B reusing `K` was DRIVEN (`delivery/
+accepted`, not `duplicate`), and `K` is now recorded independently for both sessions;
+the genuine replay (same key, same session, re-pended `running` across a SIGKILL +
+restart) was still a recognized `delivery/duplicate` no-op with zero second resume.
+
+Regression-tested (`cargo test`, 134 green): the rejected-`reply_to` probes
+(`explicit_reply_to_cannot_target_human_inbox_or_arbitrary_topic`), the cross-victim
+non-suppression (`cross_victim_key_does_not_suppress_a_different_session_delivery` +
+`delivery_key_is_namespaced_by_session_no_cross_victim_suppression`), and the
+crash-recovery (below). RESIDUAL: none for these two; the session token authority is
+unchanged (the daemon still routes with its own authority, just to a constrained,
+validated destination).

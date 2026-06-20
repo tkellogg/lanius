@@ -356,15 +356,25 @@ CREATE INDEX IF NOT EXISTS idx_code_sessions_native ON code_sessions(native_sess
 -- which would drive a SECOND resume of an already-acted-on turn. Each delivery
 -- carries a key — an explicit `idempotency_key` in the payload, else the inbound
 -- event id — and is recorded here the moment it is claimed. A delivery whose key
--- is already present is recognized and settled as a clean no-op (no second
--- resume). The row is DURABLE, so the replay after a restart is caught, not just
--- a same-process duplicate. Keyed by the key; the session/event are recorded for
--- audit/debug only.
+-- is already present FOR THE SAME TARGET SESSION is recognized and settled as a
+-- clean no-op (no second resume). The row is DURABLE, so the replay after a
+-- restart is caught, not just a same-process duplicate.
+--
+-- The key is namespaced by the target `session` (PRIMARY KEY (session,
+-- idempotency_key) — docs/security.md): a global key would let one principal
+-- pre-claim an explicit key and silently SUPPRESS a different victim's delivery
+-- to a DIFFERENT session that happens to reuse the same key (cross-victim
+-- suppression). Namespacing by session means an explicit key only ever dedupes a
+-- delivery to the SAME session, never collides across sessions. The default
+-- `event:<id>` key is already globally unique (event ids are unique), so it is
+-- unaffected; the replay dedupe (same delivery, same session, same key) still
+-- holds across a restart.
 CREATE TABLE IF NOT EXISTS code_delivery_keys (
-  idempotency_key TEXT PRIMARY KEY,  -- explicit payload key, else "event:<id>"
   session         TEXT NOT NULL,     -- the coding session it was driven to
+  idempotency_key TEXT NOT NULL,     -- explicit payload key, else "event:<id>"
   event_id        INTEGER,           -- the inbound delivery event id (audit)
-  processed_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  processed_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (session, idempotency_key)
 );
 
 -- Subagent lineage substrate. A subagent is an ordinary agent spawned by a

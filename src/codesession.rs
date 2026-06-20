@@ -138,13 +138,23 @@ pub fn read_record(root: &Root, elanus_session: &str) -> Result<Option<SessionRe
 // carries a key (an explicit payload `idempotency_key`, else the inbound event
 // id); we record it DURABLY the moment the delivery is claimed, so the replay
 // after a restart is recognized and skipped — not just a same-process duplicate.
+//
+// The key is namespaced by the TARGET SESSION (docs/security.md). A global key
+// space let an attacker pre-claim an explicit key for one session and silently
+// suppress a different victim's delivery to a DIFFERENT session that reused the
+// key (cross-victim suppression). Keyed by `(session, key)`, an explicit key only
+// dedupes a delivery to the SAME session — one principal's key can never collide
+// with another principal's delivery to a different session. The default
+// `event:<id>` key is globally unique regardless, so it is unaffected.
 
-/// Record a delivery's idempotency key as processed. Returns `true` if this is
-/// the FIRST time the key is seen (the delivery should be driven), `false` if the
-/// key was already recorded (a duplicate — the caller skips the resume as a clean
-/// no-op). Atomic via `INSERT … ON CONFLICT DO NOTHING`, so two concurrent claims
-/// of the same key cannot both win the race. Durable: survives a restart, so the
-/// at-least-once replay is caught.
+/// Record a delivery's idempotency key as processed FOR ITS TARGET SESSION.
+/// Returns `true` if this is the FIRST time the key is seen for that session (the
+/// delivery should be driven), `false` if it was already recorded (a duplicate —
+/// the caller skips the resume as a clean no-op). Atomic via
+/// `INSERT … ON CONFLICT DO NOTHING` on `(session, key)`, so two concurrent claims
+/// of the same key+session cannot both win the race, while the same key for a
+/// DIFFERENT session is a distinct row (no cross-victim suppression). Durable:
+/// survives a restart, so the at-least-once replay is caught.
 pub fn claim_delivery_key(
     root: &Root,
     key: &str,
@@ -154,24 +164,26 @@ pub fn claim_delivery_key(
     let conn = crate::db::open(root).context("opening the ledger for the delivery key")?;
     crate::db::init_schema(&conn)?;
     let inserted = conn.execute(
-        "INSERT INTO code_delivery_keys (idempotency_key, session, event_id)
+        "INSERT INTO code_delivery_keys (session, idempotency_key, event_id)
          VALUES (?1, ?2, ?3)
-         ON CONFLICT(idempotency_key) DO NOTHING",
-        rusqlite::params![key, session, event_id],
+         ON CONFLICT(session, idempotency_key) DO NOTHING",
+        rusqlite::params![session, key, event_id],
     )?;
     Ok(inserted == 1)
 }
 
-/// Has this delivery key already been processed? A read-only check (the claim
-/// itself is `claim_delivery_key`). Best-effort: a db error reads as "not seen"
-/// so a transient failure never silently drops a real delivery.
-pub fn delivery_key_seen(root: &Root, key: &str) -> bool {
+/// Has this delivery key already been processed FOR THIS SESSION? A read-only
+/// check (the claim itself is `claim_delivery_key`). Scoped by session so a key
+/// claimed against a different session does not read as seen here (the
+/// cross-victim suppression the namespacing closes). Best-effort: a db error reads
+/// as "not seen" so a transient failure never silently drops a real delivery.
+pub fn delivery_key_seen(root: &Root, key: &str, session: &str) -> bool {
     let Ok(conn) = crate::db::open(root) else {
         return false;
     };
     conn.query_row(
-        "SELECT 1 FROM code_delivery_keys WHERE idempotency_key = ?1",
-        [key],
+        "SELECT 1 FROM code_delivery_keys WHERE session = ?1 AND idempotency_key = ?2",
+        [session, key],
         |_| Ok(()),
     )
     .optional()
@@ -531,20 +543,45 @@ mod tests {
     #[test]
     fn delivery_key_claim_is_once_and_durable() {
         let root = tmp_root();
-        // First claim of a key wins; the key is now seen.
-        assert!(!delivery_key_seen(&root, "event:5"));
+        // First claim of a key wins; the key is now seen (for that session).
+        assert!(!delivery_key_seen(&root, "event:5", "code-x"));
         assert!(claim_delivery_key(&root, "event:5", "code-x", 5).unwrap());
-        assert!(delivery_key_seen(&root, "event:5"));
-        // A second claim of the SAME key loses (a duplicate — the at-least-once
-        // replay): it must NOT drive a second resume.
+        assert!(delivery_key_seen(&root, "event:5", "code-x"));
+        // A second claim of the SAME key+session loses (a duplicate — the
+        // at-least-once replay): it must NOT drive a second resume.
         assert!(!claim_delivery_key(&root, "event:5", "code-x", 5).unwrap());
         // A different key is independent.
         assert!(claim_delivery_key(&root, "planner-step-2", "code-y", 9).unwrap());
         // Durable across a fresh connection (a restart): the row is in the ledger,
         // so the replayed delivery is still recognized.
-        assert!(delivery_key_seen(&root, "event:5"));
-        assert!(delivery_key_seen(&root, "planner-step-2"));
-        assert!(!delivery_key_seen(&root, "event:999"));
+        assert!(delivery_key_seen(&root, "event:5", "code-x"));
+        assert!(delivery_key_seen(&root, "planner-step-2", "code-y"));
+        assert!(!delivery_key_seen(&root, "event:999", "code-x"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn delivery_key_is_namespaced_by_session_no_cross_victim_suppression() {
+        // The cross-victim suppression probe (docs/security.md): an attacker
+        // pre-claims an explicit key K for session A; a victim delivery to a
+        // DIFFERENT session B reusing K must still be drivable (claim succeeds),
+        // NOT falsely deduped. With a global key space the victim claim would lose;
+        // namespacing by session keeps them independent.
+        let root = tmp_root();
+        let attacker_key = "shared-key-K";
+        // Attacker pre-claims K for session A.
+        assert!(claim_delivery_key(&root, attacker_key, "code-attackerA", 1).unwrap());
+        assert!(delivery_key_seen(&root, attacker_key, "code-attackerA"));
+        // The same key for the VICTIM's session B is NOT seen, so the victim
+        // delivery drives (claim wins) — no suppression.
+        assert!(!delivery_key_seen(&root, attacker_key, "code-victimB"));
+        assert!(
+            claim_delivery_key(&root, attacker_key, "code-victimB", 2).unwrap(),
+            "victim delivery to a different session reusing the key must still drive"
+        );
+        // And the genuine replay (same key + SAME session) is still a no-op.
+        assert!(!claim_delivery_key(&root, attacker_key, "code-victimB", 2).unwrap());
+        assert!(delivery_key_seen(&root, attacker_key, "code-victimB"));
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 

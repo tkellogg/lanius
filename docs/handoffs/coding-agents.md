@@ -1152,6 +1152,86 @@ so it could not have been.)
     same property the `obs/.../complete` emit already had. Acceptable for M4-A
     (the spec's idempotency goal is "don't double-act"); a transactional route or a
     re-derivable-from-`done` route is a hardening for later if a lost wake bites.
+    **CLOSED 2026-06-20 by the boot reconciliation `reconcile_lost_routes` — see the
+    M4-A fix-pass Log entry below.**
+
+### 2026-06-20 — M4-A fix pass: confused-deputy `reply_to`, cross-victim suppression, lost-wake recovery (branch `coding-agents`)
+
+The M4-A adversarial verify turned up two MEDIUM security bugs and confirmed the
+disclosed lost-wake residual was worth closing. All three fixed; `cargo test` green
+(134, was 129); each proven live in the isolated worktree stack (root
+`~/.elanus/wt-coding-agents`, broker `:1893`) with **no model turn** (fail-fast
+resume on a bogus workdir — the failure-routes path). The session token stays
+emit-only; the daemon still routes with its own authority, now to a constrained,
+validated destination (no authority widened). Security ledger: docs/security.md
+entry 21.
+
+- **(MED, FIXED — security) Confused-deputy `reply_to`.** `delivery_requester`
+  accepted an explicit payload `reply_to` that merely `starts_with("in/")` and was
+  wildcard-free and routed a **kernel-authored** completion to it **verbatim** — so
+  `reply_to: in/human/owner` (or any `in/...`/`signal/`/`obs/`/`work/` topic) made the
+  daemon publish a kernel message to the human inbox or an arbitrary topic. Fix
+  (src/codeagent.rs): an explicit `reply_to` now must **resolve to a recognized
+  actor's mailbox** the same safe way the sender path does — new `resolve_reply_to`
+  routes through `mailbox_for_actor`, accepting a bare actor NAME or a full
+  `in/agent/<noun>/<conv>` mailbox (the actor is extracted and the mailbox
+  **re-derived**, never used verbatim), and rejecting raw/arbitrary `in/...`,
+  `in/human/*`, `in/group/*`, `signal/`, `obs/`, wildcards, path-unsafe names, and
+  unrecorded `code-*` convs (→ None, no route). `mailbox_for_actor` now requires
+  `valid_principal`. Proven live: `reply_to: in/human/owner` and `in/totally/
+  arbitrary/x` both captured `reply_to:null` (refused) — the `in/human/owner` kernel
+  count unchanged, the arbitrary topic empty; a legit `reply_to: code-<planner>`
+  still routed to that planner's own mailbox.
+
+- **(MED, FIXED — security) Cross-victim idempotency suppression.**
+  `code_delivery_keys` was keyed on `idempotency_key` alone (global), so an attacker
+  pre-claiming an explicit key `K` (for their own session A) silently suppressed a
+  *different* victim's delivery to session B that reused `K` (B settled `done` as a
+  bogus duplicate, never driven). Fix (src/db.rs + src/codesession.rs): namespace by
+  target session — `PRIMARY KEY (session, idempotency_key)`, claim/lookup per session.
+  An explicit key only dedupes a delivery to the SAME session; the default `event:<id>`
+  is globally unique regardless; the same-session replay dedupe still holds across a
+  restart. Pre-release: the table was dropped+recreated (no migration). Proven live:
+  with `K` pre-claimed for A, a victim delivery to B reusing `K` was DRIVEN
+  (`delivery/accepted`, not `duplicate`), recorded independently per session; the
+  genuine replay (same key+session, re-pended `running` across a SIGKILL+restart) was
+  still a `delivery/duplicate` no-op with zero second resume.
+
+- **(reliability, FIXED — the disclosed residual) Lost planner wake on a crash.** The
+  settle UPDATE (worker delivery → `done`) and the routed completion emit are separate
+  autocommit transactions; a crash between them settles the worker but loses the route,
+  and the boot sweep only re-pends `running` events — never `done` — so the wake was
+  lost forever. Fix (src/dispatcher.rs): a **boot reconciliation**
+  `reconcile_lost_routes` (the cleaner fit for this crash-only codebase — it mirrors
+  the existing boot sweeps for orphaned dispatches / stale leases / orphaned
+  credentials, and needs no cross-connection transaction across `events::emit` +
+  `read_record`). It walks the durable `code_delivery_keys` rows (each marks a delivery
+  that was actually DRIVEN), re-derives the requester from the original delivery
+  event's persisted `sender`/`payload`/`correlation` via `delivery_requester`, and —
+  if a requester resolves and no completion was ever routed
+  (`route_already_emitted`, the `(cause_id, type)` guard) — re-emits the route. The
+  routing is refactored into a shared `route_completion` helper (settle + reconcile),
+  idempotent via that guard + the stable `code-complete:<worker-event-id>` key. A
+  recovered route carries an honest "completed (route recovered after a restart)"
+  result and the worker-obs pointer — its job is to WAKE the planner to read recorded
+  state (the worker transcript is durable on the bus), which it does regardless of the
+  exact result text. Why reconciliation over one transaction: a single settle+route
+  transaction would still lose the wake — a crash rolls the delivery back to `running`,
+  whose re-drive is *deduped* by the durable key and never re-routes; reconciliation is
+  what actually recovers it. Proven live: a crafted settle→route-gap crash state
+  (worker delivery `done`, key recorded, no route) → restart → boot logged
+  `recovered 1 lost completion route(s)`, the route landed on the planner's mailbox
+  (sender=kernel, same correlation); a second restart routed nothing (idempotent).
+
+- **Tests.** `cargo test` green, **134 passing** (was 129): +1 codeagent
+  (`explicit_reply_to_cannot_target_human_inbox_or_arbitrary_topic`; the existing
+  `requester_from_explicit_reply_to_topic` was updated to assert re-derivation, not
+  verbatim), +1 codesession
+  (`delivery_key_is_namespaced_by_session_no_cross_victim_suppression`; the existing
+  key-claim test updated to the per-session signature), +3 dispatcher
+  (`cross_victim_key_does_not_suppress_a_different_session_delivery`,
+  `reconcile_recovers_a_route_lost_in_the_settle_route_gap`,
+  `reconcile_skips_deliveries_with_no_requester`).
 
 ### Still TODO (next increments)
 - **M4-B — the mediated dispatch tool + the launch-envelope briefing.** The two

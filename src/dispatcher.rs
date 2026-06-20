@@ -194,6 +194,14 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
     for orphan in crate::codesession::reap_orphans(root) {
         eprintln!("[daemon] reaped orphaned coding-session credential {orphan}");
     }
+    // Recover any planner wake lost to a crash in the settle->route gap (M4-A
+    // reliability residual): a driven worker delivery may have settled `done` (or
+    // been re-pended and deduped) while its routed completion was never emitted, so
+    // the planner would never be woken. Re-derive the route from durable state and
+    // re-emit it. Crash-only, idempotent (the routed key + a no-route-exists check).
+    if let Err(e) = reconcile_lost_routes(root, &conn) {
+        eprintln!("[daemon] reconciling lost completion routes: {e:#}");
+    }
     // Register what's on the package path; requests only, never grants.
     if let Err(e) = packages::sync(root, &conn) {
         eprintln!("[daemon] package sync: {e:#}");
@@ -929,77 +937,20 @@ fn settle_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers
         // react. If the requester is itself a coding session, the EXISTING M2-B
         // machinery (`drive_code_deliveries`) picks this pending in/agent event up
         // next tick and resumes the planner — exactly like any other delivery; that
-        // is the headless loop. The payload carries a `prompt` (what resumes a
-        // coding-session planner), the success/failure, the worker session, and a
-        // pointer to the worker's recorded obs subtree so the planner reads actual
-        // state before acting. It is a kernel-minted ledger event (sender=kernel),
-        // so the announce sweep delivers it and it carries no session authority.
+        // is the headless loop. (The shared helper builds the payload + emits, and
+        // is reused by the boot reconciliation that recovers a route lost to a crash
+        // in this settle->route gap.)
         if let Some(req) = &done.requester {
-            if crate::topic::valid_name(&req.reply_to) {
-                let noun = crate::codesession::read_record(root, &done.session)
-                    .ok()
-                    .flatten()
-                    .map(|r| r.agent_noun)
-                    .unwrap_or_default();
-                let obs_pointer = if noun.is_empty() {
-                    Value::Null
-                } else {
-                    json!(format!(
-                        "obs/agent/{}/{}/#",
-                        crate::topic::encode_segment(&noun),
-                        crate::topic::encode_segment(&done.session),
-                    ))
-                };
-                let result_line = trace::clip(&done.result, 4000);
-                let prompt = format!(
-                    "Worker session {} has completed the work you dispatched (success={}). \
-                     Result: {}. Its full transcript is on the bus under {}. \
-                     Read the recorded state, then decide the next step.",
-                    done.session,
-                    !failed,
-                    result_line,
-                    obs_pointer.as_str().unwrap_or("its obs subtree"),
-                );
-                let routed = events::emit(
-                    root,
-                    conn,
-                    EmitOpts {
-                        payload: Some(json!({
-                            "prompt": prompt,
-                            "worker": done.session,
-                            "failed": failed,
-                            "result": result_line,
-                            "worker_obs": obs_pointer,
-                            // Carry an idempotency key on the routed delivery too so a
-                            // replayed completion (a crash after the routed emit but
-                            // before settle) dedupes when it drives the planner.
-                            "idempotency_key": format!("code-complete:{}", done.event_id),
-                        })),
-                        // Thread the planner's resume by the SAME correlation the
-                        // requester used, so the round trip is one conversation.
-                        correlation: done.correlation.clone(),
-                        cause: Some(done.event_id),
-                        ..EmitOpts::new(&req.reply_to)
-                    },
-                );
-                match routed {
-                    Ok(rid) => trace::write(
-                        root,
-                        "obs/agent/code/delivery/routed",
-                        &trace::Ids { event_id: Some(rid), correlation_id: done.correlation.clone(), ..Default::default() },
-                        json!({ "worker": done.session, "reply_to": req.reply_to, "failed": failed }),
-                    ),
-                    Err(e) => eprintln!(
-                        "[daemon] routing completion of {} to {} failed: {e:#}",
-                        done.session, req.reply_to
-                    ),
-                }
-            } else {
-                eprintln!(
-                    "[daemon] completion of {} has an unroutable reply_to {:?}; dropping the route",
-                    done.session, req.reply_to
-                );
-            }
+            route_completion(
+                root,
+                conn,
+                done.event_id,
+                &done.session,
+                &req.reply_to,
+                failed,
+                &done.result,
+                done.correlation.as_deref(),
+            );
         }
         // Retire a now-idle worker (inflight back to 0): drop the sender so the
         // thread's recv() ends and it joins out. A later delivery to the same
@@ -1010,6 +961,199 @@ fn settle_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers
                 code.workers.remove(&done.session);
             }
         }
+    }
+    Ok(())
+}
+
+/// Whether a worker delivery (event id `cause`) already has its completion routed
+/// to `reply_to` — the idempotency guard shared by settle and the boot
+/// reconciliation. A routed completion is the unique `(cause_id, type)` pair, so
+/// its presence means the route already happened (this run or a prior one).
+fn route_already_emitted(conn: &Connection, cause: i64, reply_to: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE cause_id = ?1 AND type = ?2",
+        params![cause, reply_to],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Route a worker's completion to the requester's mailbox (M4-A — the loop
+/// closing), shared by `settle_code_deliveries` (the live path) and
+/// `reconcile_lost_routes` (the boot recovery of a route lost to a crash in the
+/// settle->route gap). Idempotent: it no-ops if a completion was already routed for
+/// this worker delivery (the `(cause, reply_to)` guard) and carries a stable
+/// `code-complete:<worker-event-id>` idempotency key, so a planner is never woken
+/// twice for one completion even if both callers run. The routed event is a
+/// kernel-minted ledger delivery (sender=kernel): when the requester is a coding
+/// session, `drive_code_deliveries` picks it up next tick and resumes the planner.
+#[allow(clippy::too_many_arguments)]
+fn route_completion(
+    root: &Root,
+    conn: &Connection,
+    worker_event_id: i64,
+    session: &str,
+    reply_to: &str,
+    failed: bool,
+    result: &str,
+    correlation: Option<&str>,
+) {
+    if !crate::topic::valid_name(reply_to) {
+        eprintln!(
+            "[daemon] completion of {session} has an unroutable reply_to {reply_to:?}; dropping the route"
+        );
+        return;
+    }
+    // Idempotency: never route the same completion twice (settle + reconcile, or
+    // two boots). If a route already exists for this worker delivery, stop.
+    match route_already_emitted(conn, worker_event_id, reply_to) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("[daemon] checking for an existing route of {session}: {e:#}");
+            return;
+        }
+    }
+    let noun = crate::codesession::read_record(root, session)
+        .ok()
+        .flatten()
+        .map(|r| r.agent_noun)
+        .unwrap_or_default();
+    let obs_pointer = if noun.is_empty() {
+        Value::Null
+    } else {
+        json!(format!(
+            "obs/agent/{}/{}/#",
+            crate::topic::encode_segment(&noun),
+            crate::topic::encode_segment(session),
+        ))
+    };
+    let result_line = trace::clip(result, 4000);
+    let prompt = format!(
+        "Worker session {} has completed the work you dispatched (success={}). \
+         Result: {}. Its full transcript is on the bus under {}. \
+         Read the recorded state, then decide the next step.",
+        session,
+        !failed,
+        result_line,
+        obs_pointer.as_str().unwrap_or("its obs subtree"),
+    );
+    let routed = events::emit(
+        root,
+        conn,
+        EmitOpts {
+            payload: Some(json!({
+                "prompt": prompt,
+                "worker": session,
+                "failed": failed,
+                "result": result_line,
+                "worker_obs": obs_pointer,
+                // A stable idempotency key on the routed delivery: a replayed
+                // completion (or a settle + reconcile overlap) dedupes when it
+                // drives the planner.
+                "idempotency_key": format!("code-complete:{worker_event_id}"),
+            })),
+            // Thread the planner's resume by the SAME correlation the requester
+            // used, so the round trip is one conversation.
+            correlation: correlation.map(str::to_string),
+            cause: Some(worker_event_id),
+            ..EmitOpts::new(reply_to)
+        },
+    );
+    match routed {
+        Ok(rid) => trace::write(
+            root,
+            "obs/agent/code/delivery/routed",
+            &trace::Ids {
+                event_id: Some(rid),
+                correlation_id: correlation.map(str::to_string),
+                ..Default::default()
+            },
+            json!({ "worker": session, "reply_to": reply_to, "failed": failed }),
+        ),
+        Err(e) => eprintln!("[daemon] routing completion of {session} to {reply_to} failed: {e:#}"),
+    }
+}
+
+/// Recover any planner wake lost to a crash in the settle->route gap (M4-A
+/// reliability residual). The settle UPDATE (worker delivery -> done) and the
+/// routed completion emit are separate autocommit transactions; a crash between
+/// them settles the worker delivery but never emits the route, and the boot sweep
+/// only re-pends `running` events — it never revisits `done` — so the planner's
+/// wake would be lost forever.
+///
+/// This boot sweep re-derives the route entirely from DURABLE state: every
+/// `code_delivery_keys` row marks a delivery that was actually DRIVEN (the key is
+/// recorded only when a delivery is claimed for a worker, never for an
+/// empty/no-prompt or no-consumer settle). For each, we read the original delivery
+/// event's persisted `sender`/`payload`/`correlation`, re-derive the requester the
+/// same way the live path did, and — if a requester resolves and no completion was
+/// ever routed (`route_already_emitted`) — emit the route now. Idempotent and
+/// crash-only, like every other boot reconciliation (orphaned dispatches, stale
+/// leases, orphaned credentials). A delivery with no requester (a plain owner
+/// resume) resolves to None and is skipped; an already-routed one is skipped by the
+/// guard, so a clean boot does nothing.
+///
+/// We cannot reconstruct the worker's live result text after a crash (it was in
+/// memory), but the routed completion's job is to WAKE the planner to read the
+/// recorded state — the worker's full transcript is durable on the bus — so a
+/// recovered route carries an honest "completed (recovered after a restart)"
+/// result line and the obs pointer; the planner reads actual state regardless.
+fn reconcile_lost_routes(root: &Root, conn: &Connection) -> Result<()> {
+    // Every driven delivery's worker event id (the row's event_id), oldest first.
+    let driven: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT event_id, session FROM code_delivery_keys
+             WHERE event_id IS NOT NULL ORDER BY event_id ASC",
+        )?;
+        let r = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+    let mut recovered = 0u32;
+    for (worker_event_id, session) in driven {
+        // The original delivery event's persisted provenance + payload. If the row
+        // is gone (shouldn't happen pre-release), skip it.
+        let row: Option<(String, Option<String>, Option<String>, String)> = conn
+            .query_row(
+                "SELECT type, sender, payload, correlation_id FROM events WHERE id = ?1",
+                [worker_event_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<String>>(3)?.unwrap_or_default())),
+            )
+            .optional()?;
+        let Some((_etype, sender, payload, correlation)) = row else {
+            continue;
+        };
+        let pv: Value = payload
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
+        let corr_opt = (!correlation.is_empty()).then_some(correlation.as_str());
+        let Some(req) =
+            crate::codeagent::delivery_requester(root, &pv, sender.as_deref(), corr_opt)
+        else {
+            continue; // a plain owner/kernel resume with no one waiting — nothing to route
+        };
+        // Already routed (this is a clean boot, or a prior reconcile did it)? Skip.
+        if route_already_emitted(conn, worker_event_id, &req.reply_to).unwrap_or(true) {
+            continue;
+        }
+        // The wake was lost — re-emit the route now. Honest recovered result line.
+        route_completion(
+            root,
+            conn,
+            worker_event_id,
+            &session,
+            &req.reply_to,
+            false,
+            &format!("worker {session} completed (route recovered after a restart)"),
+            corr_opt,
+        );
+        recovered += 1;
+    }
+    if recovered > 0 {
+        eprintln!("[daemon] recovered {recovered} lost completion route(s) at boot");
     }
     Ok(())
 }
@@ -1062,13 +1206,16 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(Value::Null);
-        // Idempotency (M4-A): a delivery whose key was already processed is the
-        // at-least-once duplicate (a crash mid-resume re-pends the same row). Skip
-        // the resume and settle it `done` — a clean no-op — so the replay does NOT
-        // drive a second turn. Checked BEFORE the durable claim so a replayed row
-        // (re-pended, same id) is recognized even across a restart.
+        // Idempotency (M4-A): a delivery whose key was already processed FOR THIS
+        // SESSION is the at-least-once duplicate (a crash mid-resume re-pends the
+        // same row). Skip the resume and settle it `done` — a clean no-op — so the
+        // replay does NOT drive a second turn. The key is namespaced by the target
+        // session (docs/security.md) so an attacker's pre-claimed key for one
+        // session cannot suppress a victim's delivery to a different one. Checked
+        // BEFORE the durable claim so a replayed row (re-pended, same id) is
+        // recognized even across a restart.
         let key = crate::codeagent::idempotency_key(&pv, id);
-        if crate::codesession::delivery_key_seen(root, &key) {
+        if crate::codesession::delivery_key_seen(root, &key, &session) {
             conn.execute(
                 "UPDATE events SET state='done', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE id=?1 AND state='pending'",
@@ -1863,7 +2010,7 @@ mod tests {
         // First drive: claims + enqueues exactly once, and records the key.
         drive_code_deliveries(&root, &conn, &mut code).unwrap();
         assert_eq!(rx.try_recv().map(|j| j.event_id).ok(), Some(ev));
-        assert!(crate::codesession::delivery_key_seen(&root, &format!("event:{ev}")));
+        assert!(crate::codesession::delivery_key_seen(&root, &format!("event:{ev}"), "code-worker02"));
 
         // Simulate the at-least-once replay across a restart: the row re-pends
         // (boot's running->pending sweep) AND a fresh process's in-flight guard is
@@ -1885,6 +2032,198 @@ mod tests {
             .query_row("SELECT state FROM events WHERE id=?1", [ev], |r| r.get(0))
             .unwrap();
         assert_eq!(st, "done", "the replayed duplicate is settled as a clean no-op");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M4-A cross-victim suppression (security): an attacker who pre-claims an
+    /// explicit idempotency key K (for their own session A) must NOT silently
+    /// suppress a different victim's delivery to a DIFFERENT session B that reuses
+    /// K. With a global key space the victim's delivery would be falsely deduped and
+    /// never driven; namespacing the key by target session keeps them independent,
+    /// so B is driven (claimed + enqueued). This drives through the REAL
+    /// `drive_code_deliveries` path, the exact abuse probe.
+    #[test]
+    fn cross_victim_key_does_not_suppress_a_different_session_delivery() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        // The victim's session B is recorded (drivable).
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-victimbb".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+            },
+        )
+        .unwrap();
+        // The attacker pre-claims key K, but for a DIFFERENT session A (their own).
+        // This is what a global key space would let leak into B's namespace.
+        assert!(crate::codesession::claim_delivery_key(&root, "K", "code-attackeraa", 1).unwrap());
+
+        // The victim delivery to session B reuses the same explicit key K.
+        let ev = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "victim work", "idempotency_key": "K" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-victimbb")
+            },
+        )
+        .unwrap();
+        let mut code = CodeDrivers::default();
+        let (tx, rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-victimbb".into(), CodeWorker { tx, inflight: 0 });
+
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+
+        // B is DRIVEN, not suppressed: the event is claimed `running` and a job was
+        // enqueued for it. (A global key space would have settled it `done` as a
+        // bogus duplicate with no job.)
+        let st: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [ev], |r| r.get(0))
+            .unwrap();
+        assert_eq!(st, "running", "the victim delivery to B must be driven, not suppressed");
+        let job = rx.try_recv().expect("the victim delivery must drive a job");
+        assert_eq!(job.event_id, ev);
+        assert_eq!(job.message, "victim work");
+        // And the key is now recorded under B's namespace (independent of A's).
+        assert!(crate::codesession::delivery_key_seen(&root, "K", "code-victimbb"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M4-A reliability residual (Fix 3): a crash in the settle->route gap settles
+    /// the worker delivery `done` but never emits the route, and the boot sweep only
+    /// re-pends `running` events — so the planner's wake would be lost forever. The
+    /// boot `reconcile_lost_routes` recovers it from durable state. This reproduces
+    /// the exact crash: a driven worker delivery (key recorded, settled done) whose
+    /// requester resolves but with NO routed event — reconcile must emit the route.
+    #[test]
+    fn reconcile_recovers_a_route_lost_in_the_settle_route_gap() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        // Worker W (recorded) and planner P (recorded), both coding sessions.
+        for (s, t, n) in [
+            ("code-wrkr0001", "codex", "codex"),
+            ("code-plnr0001", "claude", "claude-code"),
+        ] {
+            crate::codesession::upsert_record(
+                &root,
+                &crate::codesession::SessionRecord {
+                    elanus_session: s.into(),
+                    native_session: "n".into(),
+                    tool: t.into(),
+                    agent_noun: n.into(),
+                    workdir: root.dir.display().to_string(),
+                },
+            )
+            .unwrap();
+        }
+        // A delivery to W, stamped by the broker as sender = the planner P, threaded
+        // by a correlation. This is the durable state a crash leaves behind.
+        let ev = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "do the work" })),
+                sender: Some("code-plnr0001".into()),
+                correlation: Some("loop-x".into()),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-wrkr0001")
+            },
+        )
+        .unwrap();
+        // The crash state: the delivery was DRIVEN (key recorded) and settled `done`
+        // by settle, but the route was NEVER emitted (crash in the gap).
+        assert!(crate::codesession::claim_delivery_key(&root, &format!("event:{ev}"), "code-wrkr0001", ev).unwrap());
+        conn.execute("UPDATE events SET state='done' WHERE id=?1", [ev]).unwrap();
+        // Precondition: no completion routed to P yet.
+        assert!(!route_already_emitted(&conn, ev, "in/agent/claude-code/code-plnr0001").unwrap());
+
+        // Boot reconciliation recovers the lost wake.
+        reconcile_lost_routes(&root, &conn).unwrap();
+
+        // A completion is now routed to P's mailbox, pending, same correlation — the
+        // planner will be woken (drive picks it up).
+        let (st, corr, payload): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, correlation_id, payload FROM events
+                 WHERE type='in/agent/claude-code/code-plnr0001'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("the lost route is recovered to the planner's mailbox");
+        assert_eq!(st, "pending", "the recovered route is a pending delivery the planner drives");
+        assert_eq!(corr.as_deref(), Some("loop-x"), "same correlation threads the loop");
+        let pv: Value = serde_json::from_str(&payload.unwrap()).unwrap();
+        assert!(pv["prompt"].as_str().unwrap().contains("code-wrkr0001"));
+        assert!(pv["idempotency_key"].as_str().unwrap().starts_with("code-complete:"));
+
+        // Idempotent: a second boot does NOT route a duplicate (the guard sees the
+        // existing route).
+        reconcile_lost_routes(&root, &conn).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type='in/agent/claude-code/code-plnr0001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "a second boot must not route a duplicate wake");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// reconcile_lost_routes does NOT route a wake for a driven delivery that had no
+    /// requester (a plain owner resume) — only deliveries that named a planner are
+    /// recovered, so a normal worker resume is unaffected.
+    #[test]
+    fn reconcile_skips_deliveries_with_no_requester() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-wrkr0002".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+            },
+        )
+        .unwrap();
+        // An owner delivery (no reply_to, sender owner) — no planner waiting.
+        let ev = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "x" })),
+                sender: Some("owner".into()),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-wrkr0002")
+            },
+        )
+        .unwrap();
+        assert!(crate::codesession::claim_delivery_key(&root, &format!("event:{ev}"), "code-wrkr0002", ev).unwrap());
+        conn.execute("UPDATE events SET state='done' WHERE id=?1", [ev]).unwrap();
+
+        reconcile_lost_routes(&root, &conn).unwrap();
+
+        // Nothing was routed (no in/agent/* event other than the original worker
+        // delivery exists with a cause pointing at it).
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE cause_id = ?1",
+                [ev],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "an owner delivery with no requester routes nothing");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
