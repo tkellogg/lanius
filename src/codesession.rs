@@ -74,6 +74,11 @@ pub struct SessionRecord {
     /// Absolute directory the session ran in; resume runs in the same dir so the
     /// native session continues against the same files.
     pub workdir: String,
+    /// The coordination room (`in/group/<room>`) this session shares with its
+    /// peers (M5), or None if it was launched without `--room`. A session sees
+    /// its roommates' edit claims and writes only its own; this is the scope of
+    /// that shared coordination — not a trust boundary.
+    pub room: Option<String>,
 }
 
 /// Persist (or update) the durable record once the native session id is known
@@ -87,13 +92,18 @@ pub fn upsert_record(root: &Root, rec: &SessionRecord) -> Result<()> {
     crate::db::init_schema(&conn)?;
     conn.execute(
         "INSERT INTO code_sessions
-           (elanus_session, native_session, tool, agent_noun, workdir)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+           (elanus_session, native_session, tool, agent_noun, workdir, room)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(elanus_session) DO UPDATE SET
            native_session = excluded.native_session,
            tool           = excluded.tool,
            agent_noun     = excluded.agent_noun,
            workdir        = excluded.workdir,
+           -- Preserve a room set at launch when a later observation (e.g. a CC
+           -- SessionStart that doesn't carry the room) re-upserts the record:
+           -- only overwrite when the new value is non-null (COALESCE keeps the
+           -- existing room rather than clearing it).
+           room           = COALESCE(excluded.room, code_sessions.room),
            last_active    = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
         rusqlite::params![
             rec.elanus_session,
@@ -101,6 +111,7 @@ pub fn upsert_record(root: &Root, rec: &SessionRecord) -> Result<()> {
             rec.tool,
             rec.agent_noun,
             rec.workdir,
+            rec.room,
         ],
     )?;
     Ok(())
@@ -113,7 +124,7 @@ pub fn read_record(root: &Root, elanus_session: &str) -> Result<Option<SessionRe
     crate::db::init_schema(&conn)?;
     let rec = conn
         .query_row(
-            "SELECT elanus_session, native_session, tool, agent_noun, workdir
+            "SELECT elanus_session, native_session, tool, agent_noun, workdir, room
              FROM code_sessions WHERE elanus_session = ?1",
             [elanus_session],
             |r| {
@@ -123,6 +134,7 @@ pub fn read_record(root: &Root, elanus_session: &str) -> Result<Option<SessionRe
                     tool: r.get(2)?,
                     agent_noun: r.get(3)?,
                     workdir: r.get(4)?,
+                    room: r.get(5)?,
                 })
             },
         )
@@ -366,6 +378,248 @@ pub fn get_note(root: &Root, session: &str) -> Result<Option<String>> {
         )
         .optional()?;
     Ok(note)
+}
+
+// ── M5: coordination room membership + advisory edit claims ───────────────────
+//
+// Advisory peer coordination (docs/handoffs/coding-agents.md M5): multiple
+// concurrent coding sessions share a ROOM; each announces edit CLAIMS ("I'm
+// editing src/foo.rs"); each session's per-turn injection (M3) surfaces its
+// ROOMMATES' current claims (excluding its own) so cooperating workers route
+// around each other. This is conflict-avoidance, NOT authorization — there is no
+// trust boundary between the user's own agents, nothing is locked or gated. A
+// claim is advisory metadata the others read.
+//
+// The scope discipline mirrors M3's inbox: a session reads its ROOM's claims (the
+// sessions it shares a room with), and writes/clears only its OWN (its env-derived
+// identity), exactly as `code inbox` reads only its own mailbox and `code hook`
+// publishes as itself. The room a session belongs to is on its durable record
+// (set at launch), so `claim`/`unclaim` derive BOTH the session (from env) and the
+// room (from the record) — a session can never name another session's claim or a
+// room it isn't in.
+//
+// Crash-released, mirroring `reap_orphans` for the session token: membership
+// carries the owner pid, so a SIGKILL'd session's membership and claims are reaped
+// at the next launcher/daemon boot (a dead session's claims must not linger in its
+// roommates' injections forever — the lease-released membership of docs/topics.md
+// decided-5).
+
+/// One advisory edit claim visible in a room: a peer session is working on a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    /// The session that holds the claim (`code-<id>`) — who is editing.
+    pub session: String,
+    /// The path the session claims to be working on (raw, as recorded).
+    pub path: String,
+    /// When the claim was recorded.
+    pub created_at: String,
+}
+
+/// Set the room on a session's durable record without disturbing the rest of it.
+/// The launcher calls this at launch (before the native session id is observed),
+/// so a later `upsert_record` for the native id — which carries `room: None` —
+/// preserves it via the COALESCE in `upsert_record`. Creates a stub record if the
+/// native id isn't known yet (it will be refreshed on `thread.started` /
+/// SessionStart). Best-effort callers may ignore the error.
+pub fn set_room(root: &Root, elanus_session: &str, room: &str) -> Result<()> {
+    let conn = crate::db::open(root).context("opening the ledger to set the room")?;
+    crate::db::init_schema(&conn)?;
+    // Update an existing record's room; if there is none yet (the common case at
+    // launch, before the native id), the room is carried on the membership row and
+    // applied to the record when the native-id upsert runs (COALESCE preserves a
+    // room already present). To keep the record the single source of truth for the
+    // room a resume reads, we upsert a row carrying just the room — the native_id
+    // upsert later fills the rest.
+    let n = conn.execute(
+        "UPDATE code_sessions SET room = ?2 WHERE elanus_session = ?1",
+        rusqlite::params![elanus_session, room],
+    )?;
+    if n == 0 {
+        // No record yet: create a stub the native-id upsert will complete. The
+        // placeholder native_session/tool/agent_noun are overwritten on the first
+        // real upsert (keyed by elanus_session); the room is preserved by COALESCE.
+        conn.execute(
+            "INSERT INTO code_sessions
+               (elanus_session, native_session, tool, agent_noun, workdir, room)
+             VALUES (?1, '', '', '', '', ?2)
+             ON CONFLICT(elanus_session) DO UPDATE SET room = excluded.room",
+            rusqlite::params![elanus_session, room],
+        )?;
+    }
+    Ok(())
+}
+
+/// Record a session's room membership (join). Idempotent per `(room, session)`;
+/// re-joining refreshes the owner pid (so a re-launched/re-driven session updates
+/// the liveness pid). The owner pid is the live process that owns the session, so
+/// the reaper can release a SIGKILL'd session's membership. A session is only ever
+/// a member of ONE room here (the room on its record); joining a different room is
+/// a fresh row, but the launcher only ever joins the one room it was given.
+pub fn join_room(
+    root: &Root,
+    room: &str,
+    session: &str,
+    agent_noun: &str,
+    owner_pid: i32,
+) -> Result<()> {
+    if !is_session_principal(session) {
+        bail!("room member {session:?} is not a valid code-* identity name");
+    }
+    let conn = crate::db::open(root).context("opening the ledger to join the room")?;
+    crate::db::init_schema(&conn)?;
+    conn.execute(
+        "INSERT INTO code_room_members (room, session, agent_noun, owner_pid)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(room, session) DO UPDATE SET
+           agent_noun = excluded.agent_noun,
+           owner_pid  = excluded.owner_pid",
+        rusqlite::params![room, session, agent_noun, owner_pid],
+    )?;
+    Ok(())
+}
+
+/// Record an advisory edit claim: `session` is working on `path` in `room`. The
+/// caller derives `room`/`session` from the session's OWN identity (env-derived
+/// session + the room on its record), never from a peer-supplied argument — so a
+/// session can only ever claim as itself, in its own room. Idempotent per
+/// `(room, session, path)` (re-claiming the same path refreshes the timestamp).
+/// Recording a claim NEVER blocks anyone — it is advisory metadata, not a lock.
+/// The path is stored verbatim (a path is a noun).
+pub fn add_claim(root: &Root, room: &str, session: &str, path: &str) -> Result<()> {
+    if !is_session_principal(session) {
+        bail!("claim holder {session:?} is not a valid code-* identity name");
+    }
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("a claim path must not be empty");
+    }
+    let conn = crate::db::open(root).context("opening the ledger to record the claim")?;
+    crate::db::init_schema(&conn)?;
+    conn.execute(
+        "INSERT INTO code_claims (room, session, path) VALUES (?1, ?2, ?3)
+         ON CONFLICT(room, session, path) DO UPDATE SET
+           created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        rusqlite::params![room, session, path],
+    )?;
+    Ok(())
+}
+
+/// Clear one of a session's OWN advisory claims (unclaim a path it finished). Only
+/// the holder's own `(room, session, path)` row is removed — a session can never
+/// clear a peer's claim (the room/session are its own env-derived identity).
+/// Idempotent: unclaiming a path it doesn't hold is a no-op. Returns whether a row
+/// was removed (so the CLI can report honestly).
+pub fn remove_claim(root: &Root, room: &str, session: &str, path: &str) -> Result<bool> {
+    let path = path.trim();
+    let conn = crate::db::open(root).context("opening the ledger to clear the claim")?;
+    crate::db::init_schema(&conn)?;
+    let n = conn.execute(
+        "DELETE FROM code_claims WHERE room = ?1 AND session = ?2 AND path = ?3",
+        rusqlite::params![room, session, path],
+    )?;
+    Ok(n > 0)
+}
+
+/// List the claims a session should SEE in its room: every claim in `room` held by
+/// a session OTHER than `viewer` (its peers' claims — its own are excluded, that
+/// is the point: a worker sees what its roommates are touching). Newest last. Used
+/// by the M3 per-turn injection to surface "peers: code-X is editing src/foo.rs".
+/// When `room` is empty/None at the call site, the caller passes nothing and gets
+/// no peer claims (a session with no room has no peers).
+pub fn peer_claims(root: &Root, room: &str, viewer: &str) -> Result<Vec<Claim>> {
+    if room.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = crate::db::open(root).context("opening the ledger to read peer claims")?;
+    crate::db::init_schema(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT session, path, created_at FROM code_claims
+         WHERE room = ?1 AND session <> ?2
+         ORDER BY created_at ASC, session ASC, path ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![room, viewer], |r| {
+            Ok(Claim {
+                session: r.get(0)?,
+                path: r.get(1)?,
+                created_at: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// List a session's OWN current claims in a room (what it has announced). For the
+/// `claim`/`unclaim` CLI to show the holder its own state. Newest last.
+pub fn own_claims(root: &Root, room: &str, session: &str) -> Result<Vec<Claim>> {
+    if room.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = crate::db::open(root).context("opening the ledger to read own claims")?;
+    crate::db::init_schema(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT session, path, created_at FROM code_claims
+         WHERE room = ?1 AND session = ?2
+         ORDER BY created_at ASC, path ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![room, session], |r| {
+            Ok(Claim {
+                session: r.get(0)?,
+                path: r.get(1)?,
+                created_at: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Reap room memberships (and their claims) whose owning session process is dead —
+/// a SIGKILL'd session never ran its clean `release_session`, so its claims would
+/// otherwise linger in roommates' injections forever. Mirrors `reap_orphans` for
+/// the session token: signal-0 liveness probe on the recorded `owner_pid`, treat
+/// EPERM as alive (a cross-uid live session is never wrongly reaped). Run at daemon
+/// boot and launcher boot, crash-only like every other liveness sweep. Returns the
+/// `(room, session)` pairs reaped.
+pub fn reap_dead_members(root: &Root) -> Vec<(String, String)> {
+    let mut reaped = Vec::new();
+    let Ok(conn) = crate::db::open(root) else {
+        return reaped;
+    };
+    if crate::db::init_schema(&conn).is_err() {
+        return reaped;
+    }
+    let members: Vec<(String, String, i32)> = {
+        let Ok(mut stmt) =
+            conn.prepare("SELECT room, session, owner_pid FROM code_room_members")
+        else {
+            return reaped;
+        };
+        let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i32>(2)?,
+            ))
+        }) else {
+            return reaped;
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for (room, session, owner_pid) in members {
+        if !pid_alive(owner_pid) {
+            let _ = conn.execute(
+                "DELETE FROM code_claims WHERE room = ?1 AND session = ?2",
+                rusqlite::params![room, session],
+            );
+            let _ = conn.execute(
+                "DELETE FROM code_room_members WHERE room = ?1 AND session = ?2",
+                rusqlite::params![room, session],
+            );
+            reaped.push((room, session));
+        }
+    }
+    reaped
 }
 
 /// Bump a record's `last_active` to now (after a resume completes). Best-effort.
@@ -678,6 +932,7 @@ mod tests {
             tool: "codex".to_string(),
             agent_noun: "codex".to_string(),
             workdir: "/tmp/proj".to_string(),
+            room: None,
         };
         upsert_record(&root, &rec).unwrap();
 
@@ -699,6 +954,7 @@ mod tests {
             tool: "claude".to_string(),
             agent_noun: "claude-code".to_string(),
             workdir: "/tmp/a".to_string(),
+            room: None,
         };
         upsert_record(&root, &rec).unwrap();
         // A re-observed native id / workdir (e.g. a second SessionStart) updates in
@@ -775,6 +1031,7 @@ mod tests {
             tool: "codex".to_string(),
             agent_noun: "codex".to_string(),
             workdir: "/tmp/proj".to_string(),
+            room: None,
         };
         upsert_record(&root, &rec).unwrap();
         // Idle: record present, no token.
@@ -834,6 +1091,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: "/tmp".into(),
+                room: None,
             },
         )
         .unwrap();
@@ -845,6 +1103,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: "/tmp".into(),
+                room: None,
             },
         )
         .unwrap();
@@ -893,6 +1152,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: "/tmp".into(),
+                room: None,
             },
         )
         .unwrap();
@@ -936,6 +1196,184 @@ mod tests {
         assert!(get_note(&root, "code-note0001").unwrap().is_none());
         // A note can't attach to a non-session name.
         assert!(set_note(&root, "owner", "x").is_err());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M5: coordination room membership + advisory edit claims ───────────────
+
+    fn member(root: &Root, room: &str, session: &str, pid: i32) {
+        // Each member also needs a record carrying its room (set_room), so a
+        // claim's room can be derived from identity in the higher layers; here we
+        // exercise the room-keyed primitives directly.
+        upsert_record(
+            root,
+            &SessionRecord {
+                elanus_session: session.into(),
+                native_session: "t".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp".into(),
+                room: Some(room.into()),
+            },
+        )
+        .unwrap();
+        join_room(root, room, session, "codex", pid).unwrap();
+    }
+
+    #[test]
+    fn claim_round_trips_and_peer_view_excludes_own() {
+        // THE M5 CRUX: a session sees its ROOMMATES' claims, never its own, in its
+        // room — and a claim recording never blocks anyone (it's advisory).
+        let root = tmp_root();
+        let live = std::process::id() as i32;
+        member(&root, "room-1", "code-aaaa0001", live);
+        member(&root, "room-1", "code-bbbb0002", live);
+
+        // A claims a file; B claims another.
+        add_claim(&root, "room-1", "code-aaaa0001", "src/foo.rs").unwrap();
+        add_claim(&root, "room-1", "code-bbbb0002", "src/bar.rs").unwrap();
+
+        // B's peer view shows A's claim and EXCLUDES B's own.
+        let b_peers = peer_claims(&root, "room-1", "code-bbbb0002").unwrap();
+        assert_eq!(b_peers.len(), 1);
+        assert_eq!(b_peers[0].session, "code-aaaa0001");
+        assert_eq!(b_peers[0].path, "src/foo.rs");
+        // A's peer view shows B's, excludes A's own.
+        let a_peers = peer_claims(&root, "room-1", "code-aaaa0001").unwrap();
+        assert_eq!(a_peers.len(), 1);
+        assert_eq!(a_peers[0].session, "code-bbbb0002");
+        // A's own-claims view shows only A's.
+        let a_own = own_claims(&root, "room-1", "code-aaaa0001").unwrap();
+        assert_eq!(a_own.len(), 1);
+        assert_eq!(a_own[0].path, "src/foo.rs");
+
+        // Re-claiming the same path is idempotent (no duplicate row).
+        add_claim(&root, "room-1", "code-aaaa0001", "src/foo.rs").unwrap();
+        assert_eq!(own_claims(&root, "room-1", "code-aaaa0001").unwrap().len(), 1);
+
+        // unclaim clears only the holder's own claim; idempotent.
+        assert!(remove_claim(&root, "room-1", "code-aaaa0001", "src/foo.rs").unwrap());
+        assert!(!remove_claim(&root, "room-1", "code-aaaa0001", "src/foo.rs").unwrap());
+        assert!(peer_claims(&root, "room-1", "code-bbbb0002").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn rooms_are_isolated_no_cross_room_claim_leak() {
+        // A session in room R1 must NOT see claims from room R2.
+        let root = tmp_root();
+        let live = std::process::id() as i32;
+        member(&root, "R1", "code-r1a00001", live);
+        member(&root, "R2", "code-r2a00001", live);
+        add_claim(&root, "R1", "code-r1a00001", "r1/file.rs").unwrap();
+        add_claim(&root, "R2", "code-r2a00001", "r2/file.rs").unwrap();
+        // A roommate-less viewer in R1 sees R1's claim, never R2's.
+        member(&root, "R1", "code-r1b00002", live);
+        let r1_peers = peer_claims(&root, "R1", "code-r1b00002").unwrap();
+        assert_eq!(r1_peers.len(), 1);
+        assert_eq!(r1_peers[0].path, "r1/file.rs");
+        // R2's claims are entirely invisible to an R1 query.
+        assert!(!r1_peers.iter().any(|c| c.path.contains("r2/")));
+        // An empty room id returns nothing (a solo session has no peers).
+        assert!(peer_claims(&root, "", "code-r1b00002").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn own_write_only_a_session_cannot_forge_a_claim_as_another() {
+        // The write primitives are keyed by the (room, session) the CALLER supplies,
+        // but every caller in the CLI derives that from its OWN env-derived identity
+        // (session_room_identity) — there is no path that lets a session pass a peer's
+        // id. Here we assert the primitive faithfully attributes a claim to the
+        // session it is told, and that clearing is scoped to that session: removing
+        // "as A" never touches B's claim on the same path.
+        let root = tmp_root();
+        let live = std::process::id() as i32;
+        member(&root, "room-x", "code-realA001", live);
+        member(&root, "room-x", "code-realB002", live);
+        add_claim(&root, "room-x", "code-realA001", "shared.rs").unwrap();
+        add_claim(&root, "room-x", "code-realB002", "shared.rs").unwrap();
+        // A "unclaim" scoped to A removes ONLY A's row; B's claim on the same path
+        // survives (a session can't clear a peer's claim).
+        assert!(remove_claim(&root, "room-x", "code-realA001", "shared.rs").unwrap());
+        let b_still = own_claims(&root, "room-x", "code-realB002").unwrap();
+        assert_eq!(b_still.len(), 1);
+        assert_eq!(b_still[0].session, "code-realB002");
+        // A non-session name can never hold a claim (add_claim rejects it).
+        assert!(add_claim(&root, "room-x", "owner", "x").is_err());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn unclaim_releases_a_path_from_peers_view() {
+        // A session releasing a path with `unclaim` stops its peers from seeing that
+        // claim — the explicit-release production path (the other release path is the
+        // crash reaper, tested below). A session that finishes editing a file frees
+        // its peers to touch it.
+        let root = tmp_root();
+        let live = std::process::id() as i32;
+        member(&root, "room-r", "code-doneone1", live);
+        member(&root, "room-r", "code-stays002", live);
+        add_claim(&root, "room-r", "code-doneone1", "a.rs").unwrap();
+        add_claim(&root, "room-r", "code-doneone1", "b.rs").unwrap();
+        add_claim(&root, "room-r", "code-stays002", "c.rs").unwrap();
+        // Before: the stayer sees the worker's two claims.
+        assert_eq!(peer_claims(&root, "room-r", "code-stays002").unwrap().len(), 2);
+        // The worker finishes a.rs and releases it; b.rs is still held.
+        assert!(remove_claim(&root, "room-r", "code-doneone1", "a.rs").unwrap());
+        let peers = peer_claims(&root, "room-r", "code-stays002").unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].path, "b.rs");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn reap_dead_members_releases_a_sigkilled_sessions_claims_keeps_live() {
+        // A SIGKILL'd session (dead owner pid) has its membership + claims reaped, so
+        // they don't linger in roommates' injections forever. A live session's claims
+        // survive the sweep.
+        let root = tmp_root();
+        let dead_pid = 0x7fff_fffe; // not a live pid on any sane system
+        let live_pid = std::process::id() as i32;
+        member(&root, "room-z", "code-deadone1", dead_pid);
+        member(&root, "room-z", "code-liveone2", live_pid);
+        add_claim(&root, "room-z", "code-deadone1", "dead.rs").unwrap();
+        add_claim(&root, "room-z", "code-liveone2", "live.rs").unwrap();
+        let reaped = reap_dead_members(&root);
+        assert!(reaped.contains(&("room-z".to_string(), "code-deadone1".to_string())));
+        // The dead session's claim is gone; the live session's survives.
+        let live_view = own_claims(&root, "room-z", "code-liveone2").unwrap();
+        assert_eq!(live_view.len(), 1);
+        // The live session no longer sees the dead peer.
+        assert!(peer_claims(&root, "room-z", "code-liveone2").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn upsert_preserves_a_room_set_at_launch() {
+        // set_room writes the room; a later native-id upsert carrying room:None
+        // (the CC SessionStart / codex thread.started path) must PRESERVE it
+        // (COALESCE), not clear it — otherwise a session would lose its room after
+        // the first observation.
+        let root = tmp_root();
+        set_room(&root, "code-keep0001", "my-room").unwrap();
+        // The native-id upsert arrives with room:None.
+        upsert_record(
+            &root,
+            &SessionRecord {
+                elanus_session: "code-keep0001".into(),
+                native_session: "thread-9".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/proj".into(),
+                room: None,
+            },
+        )
+        .unwrap();
+        let rec = read_record(&root, "code-keep0001").unwrap().unwrap();
+        assert_eq!(rec.room.as_deref(), Some("my-room"));
+        assert_eq!(rec.native_session, "thread-9"); // the rest filled in
+        assert_eq!(rec.workdir, "/proj");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

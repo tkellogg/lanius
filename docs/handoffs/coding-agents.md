@@ -10,8 +10,8 @@ M4-B (the mediated dispatch tool + the launch-envelope briefing) landed
 2026-06-20; **M3 (per-turn context injection + the session's own-inbox read)
 landed 2026-06-20** — the first increment giving a session any read capability,
 scoped own-inbox-only by an env-derived ledger query (the bus token stays
-emit-only). **M5 (peer coordination, now unblocked by the M3 injection seam) is
-next.**
+emit-only). **M5 (advisory peer coordination — rooms + edit claims surfaced via the
+M3 injection, crash-released) landed 2026-06-20 — this completes M0–M5.**
 See the Log at the bottom for the as-built decisions (the two adapters share one
 envelope but differ in their *capture mechanism* — CC's hooks vs Codex's JSONL
 stream; the durable-session split-record model is in the M2-A entry; the
@@ -1368,12 +1368,130 @@ was never touched).
   `build_resume_message_prepends_injection_only_when_present`,
   `note_cmd_requires_a_recorded_session`).
 
+### M5 — advisory peer coordination: rooms + edit claims (2026-06-20)
+
+Multiple concurrent coding sessions share a coordination **room**; each announces
+advisory edit **claims** ("I'm editing src/foo.rs"); each session's M3 per-turn
+injection surfaces its ROOMMATES' current claims (excluding its own), so
+cooperating workers route around each other. **This completes M0–M5.** There is NO
+trust model — sessions are the user's own cooperating agents with homogeneous
+authority; a claim is advisory metadata its peers read, never a lock, never a gate
+(Tim's safety = honest record + work preservation, not restriction). Verified live
+in the isolated worktree stack (root `~/.elanus/wt-coding-agents`, broker `:1893`;
+the main `~/.elanus/root` on `:1883` was never touched).
+
+- **Room + membership (minimal, ledger-state like M3).** A session joins a room at
+  launch with `--room <id>` (the flag is parsed out and stripped before the args
+  reach the tool — `take_room_flag`). The room is stored on the durable
+  `code_sessions` record (a new nullable `room` column — `set_room`, preserved
+  across the later native-id upsert by a COALESCE so a CC SessionStart / codex
+  thread.started that carries `room:None` doesn't clear it). Membership is a row in
+  a new `code_room_members` table `(room, session, agent_noun, owner_pid)` —
+  `join_room`. This is the scope a session shares claims with: it SEES its
+  roommates' claims and writes only its own.
+
+- **Edit claims (advisory, never a lock).** `elanus code claim <path>` /
+  `elanus code unclaim <path>` (and a read-only `elanus code claims [--json]` view),
+  run INSIDE a session, env-derived identity exactly like `code inbox`/`code note`
+  (`session_room_identity` reads `ELANUS_CODE_SESSION`/`ELANUS_CODE_AGENT` from the
+  env the launcher set, and the room from the session's OWN record — never a
+  caller-supplied argument). A claim is a row in a new `code_claims` table
+  `(room, session, path)` keyed so re-claiming a path is idempotent; the raw path is
+  stored verbatim in a column (a path is a noun). **Recording a claim never blocks
+  anyone** — `add_claim` is a pure insert. A session can record/clear only its OWN
+  claims (the room/session are its own identity); `remove_claim` is scoped to
+  `(room, session, path)` so a session can never clear a peer's claim.
+
+- **Surfaced via the M3 injection seam (the same out-of-band channel).**
+  `turn_injection` now also reads the session's room (from its OWN record) and
+  appends an `[elanus peers]` block listing the OTHER sessions' claims, EXCLUDING
+  its own (`codesession::peer_claims` selects `room = ? AND session <> viewer`). So
+  for CC the claim rides the `UserPromptSubmit` `additionalContext` system-reminder
+  layer; for codex + driven CC resume it rides `build_resume_message` (prepended
+  ahead of the delivered message, out of band, after the cached prefix). The block
+  is presented as advisory ("route around these files, nothing is locked") and
+  capped at 50 lines so a busy room can't flood a turn.
+
+- **Crash-release (lease-style, docs/topics.md decided-5).** Claims/membership are
+  NOT auto-released on a one-shot turn-process exit — a coding session is DURABLE and
+  RESUMABLE (M2-A: a turn ending is not the session ending), so a worker's claims
+  persist between turns or it would lose them the instant it finished a turn.
+  Release is by (1) explicit `elanus code unclaim`, and (2) crash-reap:
+  `reap_dead_members` (new) drops the membership + claims of any session whose
+  recorded `owner_pid` is dead — a signal-0 liveness probe, EPERM-treated-as-alive,
+  exactly mirroring the session-token `reap_orphans`. Run at daemon boot AND launcher
+  boot (the same liveness sweep as the credential reaper), so a SIGKILL'd (or
+  finished) session's claims don't linger in roommates' injections forever.
+
+- **No token widening (preserves the verified property).** Rooms/claims are
+  kernel-side ledger SQL gated by the session's env-derived identity, exactly the M3
+  approach — the emit-only bus token is **structurally unchanged**
+  (`SessionToken.subscribe` stays `Vec::new()`; the session still cannot subscribe to
+  anything, including `in/group/<id>`). The advisory `in/group/<id>` room is the
+  conceptual address from docs/topics.md; the implementation backs it with the
+  ledger (claims a session reads are a SQL query of its room), not a live bus
+  subscription — consistent with M3's inbox (a ledger query, not a subscribe).
+
+- **Live evidence (isolated worktree stack).** Two codex sessions in room
+  `m5-room`: A = `code-942a7e61`, B = `code-d50f58cd`. A recorded a claim via the
+  real `elanus code claim src/foo.rs` CLI path (env identity).
+  - **B sees A's claim, own excluded:** B's `code claims` view showed
+    `code-942a7e61 is editing src/foo.rs` under peer claims; A's own view listed
+    `src/foo.rs` under "your claims" with "no peer claims" — own correctly excluded.
+    Bidirectional confirmed (after B claimed `src/b-only.rs`, A's peer view showed it
+    while still excluding A's own `src/foo.rs`).
+  - **Real codex resume of B with A's claim active (the headline):** a delivery to
+    B's mailbox drove a real daemon resume; the per-turn injection
+    (`build_resume_message`) carried A's `[elanus peers]` claim, and B's model
+    replied **`PEER-IS-EDITING src/foo.rs`** (trace.jsonl, stamped
+    `sender=code-d50f58cd`) — proof the advisory reached the model and B routed
+    around the file. `cached_input_tokens` rose (48896), confirming the injection
+    landed after the cached prefix.
+  - **Room isolation:** session `code-cccc0003` in room `m5-other` saw NO peer
+    claims — `m5-room`'s `src/foo.rs` is invisible across rooms.
+  - **Own-write-only:** B's claim recorded `session=code-d50f58cd` (its env
+    identity); the CLI takes only `<path>` (no session arg), so there is no code path
+    to forge a claim as another session.
+  - **Crash-release:** SIGKILL'd A's live owner process; the next launcher boot
+    logged "reaped claims of dead session code-942a7e61 in room m5-room" and the
+    claim was gone from `code_claims` — it stopped appearing in B's view.
+  - **No regression:** M3 inbox (unread count + preview) + the memory note +
+    peer claims all coexist in one `[elanus]` injection (shown live for one session
+    with all three); launch/resume/deliver/M4 routing unbroken; emit-only token
+    unchanged; `~/.codex` config untouched (`config.toml` Jun 19, `auth.json` Jun 16
+    predate the run); no idle credential after.
+
+- **Honest residual.** Crash-reap of a session that finished a turn (its launcher pid
+  is dead) happens at the NEXT launcher/daemon boot, not the instant the process
+  exits — between an exit and the next boot, a finished session's claims linger
+  (advisory, eventually-consistent, the same boot-only cadence as `reap_orphans`).
+  This matches the resumable model (a finished turn is not the session ending). An
+  explicit `unclaim` frees a path immediately. The room is backed by the ledger, not
+  a live `in/group/<id>` subscription — a true live room subscription is a later
+  step if real-time (not per-turn) claim propagation is needed.
+
+- **Tests.** `cargo test` green, **159 passing** (was 148): +6 codesession
+  (`claim_round_trips_and_peer_view_excludes_own` — the crux; `rooms_are_isolated_no_cross_room_claim_leak`;
+  `own_write_only_a_session_cannot_forge_a_claim_as_another`;
+  `unclaim_releases_a_path_from_peers_view`;
+  `reap_dead_members_releases_a_sigkilled_sessions_claims_keeps_live`;
+  `upsert_preserves_a_room_set_at_launch`), +5 codeagent
+  (`take_room_flag_extracts_and_strips_room`;
+  `turn_injection_surfaces_peer_claims_excluding_own`;
+  `turn_injection_room_isolation_no_cross_room_claims`;
+  `build_resume_message_carries_peer_claims_to_a_driven_turn`;
+  `solo_session_has_no_peers_and_no_claim_injection`).
+
 ### Still TODO (next increments)
-- **M5 — peer coordination over the bus (advisory).** Now unblocked (M3 is the
-  injection seam): a coordination room (`in/group/<id>`), an edit-claim announced by
-  a session, surfaced in each session's per-turn injection as a new computed block
-  (the M3 `turn_injection` is the place to add it — the same out-of-band channel).
-  Crash-released claim leases (docs/topics.md decided-5).
+- ~~**M5 — peer coordination over the bus (advisory).**~~ **DONE 2026-06-20** (see
+  the M5 Log entry above). A coordination room (`--room <id>`, ledger-backed),
+  `elanus code claim`/`unclaim`/`claims` (env-derived identity), surfaced in each
+  session's per-turn M3 injection as an `[elanus peers]` block excluding its own,
+  crash-released by `reap_dead_members` (owner-pid liveness, like `reap_orphans`).
+  The emit-only token is unchanged (rooms/claims are a kernel-side ledger query, not
+  a bus subscribe). **This completes M0–M5.** Residual: the live `in/group/<id>`
+  room subscription (real-time vs per-turn propagation) and block-substrate
+  integration (below) are the natural next steps, not needed for the advisory surface.
 - **Block-substrate integration (deferred from M3).** Fold the memory note and the
   inbox status into `context_blocks` (the note as a `Session`-scoped block, the
   inbox status as a computed block with a build-log entry) if/when M5's claims block

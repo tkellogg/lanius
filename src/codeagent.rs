@@ -606,6 +606,38 @@ fn take_brief_flag(args: &[String]) -> (bool, Vec<String>) {
     (brief, out)
 }
 
+/// Take the `--room <id>` launch flag (M5) out of the user args: a session
+/// launched with `--room <id>` joins that coordination room, so it sees its
+/// roommates' advisory edit claims in its per-turn injection and its own claims
+/// surface to them. The flag (and its value) are stripped before the args reach
+/// the tool, so the coding binary never sees them. Returns `(room, filtered_args)`;
+/// `room` is None when no `--room` was given (a solo session — no peers, no
+/// coordination). A trailing `--room` with no value is ignored (no room).
+fn take_room_flag(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut room = None;
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--room" {
+            // The next token is the room id; skip both. A bare trailing --room
+            // (no value) is simply dropped.
+            if let Some(v) = args.get(i + 1) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    room = Some(v.to_string());
+                }
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    (room, out)
+}
+
 /// The Codex briefing block written to the child's stdin. Codex `exec` documents:
 /// "If stdin is piped and a prompt is also provided, stdin is appended as a
 /// `<stdin>` block." So piping the briefing delivers it to the agent robustly,
@@ -711,6 +743,127 @@ pub fn inbox_cmd(root: &Root, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ── M5: advisory edit claims (run inside a session) ───────────────────────────
+//
+// `elanus code claim <path>` / `elanus code unclaim <path>` record/clear an
+// advisory claim that THIS session is editing <path>, visible to its roommates in
+// their per-turn injection. Identity (session + agent) comes from the env the
+// launcher set — never an argument — and the room from the session's own durable
+// record, so a session can only ever claim AS ITSELF, IN ITS OWN ROOM. There is no
+// authorization here: a claim is advisory metadata its peers read to route around
+// conflicts, never a lock (recording one blocks no one).
+
+/// Resolve the running session's identity (session + agent noun) and its
+/// coordination room from the env the launcher set plus its durable record. Errors
+/// cleanly when run outside a coding session, or when the session was not launched
+/// with `--room` (no room → no peers to coordinate with). The room is read from the
+/// record (the session's own), never supplied by the caller.
+fn session_room_identity(root: &Root) -> Result<(String, String)> {
+    let session = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
+    let Some(session) = session else {
+        bail!(
+            "this command must run inside a coding session \
+             (no {ENV_SESSION} in the environment — run it from a session launched \
+             by `elanus code`)"
+        );
+    };
+    let rec = codesession::read_record(root, &session)
+        .context("reading this session's record")?
+        .with_context(|| {
+            format!(
+                "no record for session {session:?} yet \
+                 (its native session id may not be observed — try again after the \
+                 first turn)"
+            )
+        })?;
+    let Some(room) = rec.room.filter(|r| !r.is_empty()) else {
+        bail!(
+            "session {session:?} is not in a coordination room \
+             (launch it with `elanus code <tool> --room <id>` to share edit claims \
+             with peers)"
+        );
+    };
+    Ok((session, room))
+}
+
+/// `elanus code claim <path>` — announce that THIS session is editing <path>
+/// (advisory; visible to roommates, locks nothing). Identity + room are derived
+/// from the running session, never an argument. Re-claiming the same path is
+/// idempotent.
+pub fn claim_cmd(root: &Root, path: &str) -> Result<()> {
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("usage: elanus code claim <path>");
+    }
+    let (session, room) = session_room_identity(root)?;
+    codesession::add_claim(root, &room, &session, path)?;
+    println!(
+        "claimed {path} in room {room} (advisory — your peers will see you are \
+editing it; nothing is locked)"
+    );
+    Ok(())
+}
+
+/// `elanus code unclaim <path>` — release THIS session's advisory claim on <path>
+/// (e.g. when it has finished). Only the session's OWN claim is cleared; it can
+/// never clear a peer's. Idempotent (unclaiming a path it doesn't hold is a no-op).
+pub fn unclaim_cmd(root: &Root, path: &str) -> Result<()> {
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("usage: elanus code unclaim <path>");
+    }
+    let (session, room) = session_room_identity(root)?;
+    let removed = codesession::remove_claim(root, &room, &session, path)?;
+    if removed {
+        println!("released your claim on {path} in room {room}");
+    } else {
+        println!("(you held no claim on {path} in room {room})");
+    }
+    Ok(())
+}
+
+/// `elanus code claims [--json]` — show what THIS session sees in its room: its
+/// own claims and its peers' (the advisory coordination view). Read-only.
+pub fn claims_cmd(root: &Root, args: &[String]) -> Result<()> {
+    let want_json = args.iter().any(|a| a == "--json");
+    let (session, room) = session_room_identity(root)?;
+    let own = codesession::own_claims(root, &room, &session)?;
+    let peers = codesession::peer_claims(root, &room, &session)?;
+    if want_json {
+        let to_json = |c: &codesession::Claim| {
+            json!({ "session": c.session, "path": c.path, "created_at": c.created_at })
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "room": room,
+                "session": session,
+                "own": own.iter().map(to_json).collect::<Vec<_>>(),
+                "peers": peers.iter().map(to_json).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+    println!("room {room} — your session {session}");
+    if own.is_empty() {
+        println!("  you hold no claims");
+    } else {
+        println!("  your claims:");
+        for c in &own {
+            println!("    editing {}", c.path);
+        }
+    }
+    if peers.is_empty() {
+        println!("  no peer claims (no roommates are editing anything)");
+    } else {
+        println!("  peer claims (advisory — route around these):");
+        for c in &peers {
+            println!("    {} is editing {}", c.session, c.path);
+        }
+    }
+    Ok(())
+}
+
 /// `elanus code note <session> "<text>"` — set (or replace) a session's memory
 /// note, surfaced by the per-turn injection. An empty `<text>` clears the note.
 /// Run by a planner (or a human) to leave a worker a persistent reminder. Unlike
@@ -754,7 +907,24 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
         .unwrap_or_default();
     let note = codesession::get_note(root, session).ok().flatten();
 
-    if unseen.is_empty() && note.is_none() {
+    // M5: the session's roommates' current advisory edit claims (excluding its
+    // own). The room comes from the session's OWN durable record — never an
+    // argument — so a session only ever sees the claims of the room it is in. A
+    // solo session (no room) has no peers, so this is empty.
+    let room = codesession::read_record(root, session)
+        .ok()
+        .flatten()
+        .and_then(|r| r.room)
+        .unwrap_or_default();
+    let peer_claims = if room.is_empty() {
+        Vec::new()
+    } else {
+        codesession::peer_claims(root, &room, session)
+            .ok()
+            .unwrap_or_default()
+    };
+
+    if unseen.is_empty() && note.is_none() && peer_claims.is_empty() {
         return None;
     }
 
@@ -778,6 +948,27 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
     }
     if let Some(note) = note {
         out.push_str(&format!("\n[elanus note] {}", clip(&note, 2000)));
+    }
+    // M5: surface peers' claims as advisory routing info — "code-X is editing
+    // src/foo.rs" — so this session can route around them. Advisory only; nothing
+    // is locked. One line per claim (capped so a busy room can't flood the turn).
+    if !peer_claims.is_empty() {
+        out.push_str(&format!(
+            "\n[elanus peers] {} other session(s) in room {room} have active edit claims \
+(advisory — route around these files, nothing is locked):",
+            peer_claims
+                .iter()
+                .map(|c| c.session.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        ));
+        const MAX_CLAIMS: usize = 50;
+        for c in peer_claims.iter().take(MAX_CLAIMS) {
+            out.push_str(&format!("\n  {} is editing {}", c.session, clip(&c.path, 400)));
+        }
+        if peer_claims.len() > MAX_CLAIMS {
+            out.push_str(&format!("\n  …and {} more", peer_claims.len() - MAX_CLAIMS));
+        }
     }
     Some(out)
 }
@@ -808,10 +999,17 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     for orphan in codesession::reap_orphans(root) {
         eprintln!("[code] reaped orphaned session credential {orphan}");
     }
+    // M5: also reap any room membership + claims a SIGKILL'd session leaked, so a
+    // dead session's advisory claims don't linger in its roommates' injections.
+    for (room, sess) in codesession::reap_dead_members(root) {
+        eprintln!("[code] reaped claims of dead session {sess} in room {room}");
+    }
 
     // The launch-envelope briefing rides a launch flag (default on; `--no-brief`
-    // suppresses it). Strip the flag before the args reach the tool.
+    // suppresses it). The coordination room rides `--room <id>` (M5). Strip both
+    // before the args reach the tool.
     let (want_brief, args) = take_brief_flag(args);
+    let (room, args) = take_room_flag(&args);
     let args = &args[..];
 
     let tool = Tool::parse(tool)?;
@@ -830,6 +1028,25 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     let token = codesession::mint(root, &principal, &agent, std::process::id() as i32)
         .with_context(|| format!("minting the session credential for {principal}"))?;
     let bus_token = token.secret.clone();
+
+    // M5: if launched with `--room <id>`, set the room on the durable record (so a
+    // later resume/claim derives it from the session's own identity) and join the
+    // room (membership carries this launcher's pid for crash-release). The native
+    // session id isn't known yet, so set_room writes/stubs the record's room and
+    // the later native-id upsert preserves it (COALESCE). Best-effort: a room-setup
+    // failure must not break the launch — the session just runs without coordination.
+    if let Some(room) = &room {
+        if let Err(e) = codesession::set_room(root, &session, room) {
+            eprintln!("[code] setting room {room} (continuing without coordination): {e:#}");
+        }
+        if let Err(e) =
+            codesession::join_room(root, room, &session, &agent, std::process::id() as i32)
+        {
+            eprintln!("[code] joining room {room} (continuing without coordination): {e:#}");
+        } else {
+            eprintln!("[code] session {session} joined coordination room {room}");
+        }
+    }
 
     // The session's run scratch — for CC, the generated hook config lives here;
     // for Codex (no hooks) it's still created for symmetry and is empty. Never
@@ -928,6 +1145,20 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     // owner, work, or another agent).
     let _ = std::fs::remove_dir_all(&scratch);
     codesession::retire(root, &principal);
+    // M5: room membership + advisory claims are NOT released here. A coding
+    // session is DURABLE and RESUMABLE (M2-A: a turn-process exiting is not the
+    // session ending) — a one-shot `codex exec` / `claude -p` turn ends its
+    // process every turn, but the session lives on and may resume editing, so its
+    // claims must persist between turns (otherwise a worker would lose its claims
+    // the instant it finished a turn). Release is therefore by:
+    //   - explicit `elanus code unclaim <path>` (the agent finished a file), and
+    //   - crash-reap: `reap_dead_members` drops the membership+claims of a session
+    //     whose owner pid is gone, at the next launcher/daemon boot — so a
+    //     SIGKILL'd (or simply finished) session's claims don't linger forever
+    //     (the lease-released membership of docs/topics.md decided-5).
+    // The owner pid recorded at join is this launcher's pid; once this process
+    // exits it is dead, so the boot reaper will release the membership — but not
+    // mid-turn, and not while a live interactive launcher holds the session open.
 
     let status = result?;
     if !status.success() {
@@ -1061,6 +1292,9 @@ fn capture_codex_stream(
                         tool: "codex".to_string(),
                         agent_noun: agent.to_string(),
                         workdir: workdir.display().to_string(),
+                        // The room (if any) was set on the record at launch via
+                        // set_room; room:None here preserves it (upsert COALESCE).
+                        room: None,
                     };
                     if let Err(e) = codesession::upsert_record(root, &rec) {
                         eprintln!("[code] recording codex session (continuing): {e:#}");
@@ -1700,6 +1934,9 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
                 tool: "claude".to_string(),
                 agent_noun: agent.clone(),
                 workdir,
+                // The room (if any) was set on the record at launch via set_room;
+                // room:None here preserves it (upsert COALESCE).
+                room: None,
             };
             let _ = codesession::upsert_record(root, &rec);
         }
@@ -2297,6 +2534,7 @@ mod tests {
             tool: "codex".to_string(),
             agent_noun: "codex".to_string(),
             workdir: "/tmp/proj".to_string(),
+            room: None,
         };
         let (prog, args) = resume_command(&rec, "say hi again");
         assert_eq!(prog, "codex");
@@ -2328,6 +2566,7 @@ mod tests {
             tool: "claude".to_string(),
             agent_noun: "claude-code".to_string(),
             workdir: "/work".to_string(),
+            room: None,
         };
         let (prog, args) = resume_command(&rec, "continue please");
         assert_eq!(prog, "claude");
@@ -2413,6 +2652,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: "/tmp/proj".into(),
+                room: None,
             },
         )
         .unwrap();
@@ -2433,6 +2673,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: "/tmp/proj".into(),
+                room: None,
             },
         )
         .unwrap();
@@ -2467,6 +2708,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: "/tmp".into(),
+                room: None,
             },
         )
         .unwrap();
@@ -2534,6 +2776,7 @@ mod tests {
                 tool: "claude".into(),
                 agent_noun: "claude-code".into(),
                 workdir: "/tmp".into(),
+                room: None,
             },
         )
         .unwrap();
@@ -2646,6 +2889,7 @@ mod tests {
                 tool: "claude".into(),
                 agent_noun: "claude-code".into(),
                 workdir: "/tmp".into(),
+                room: None,
             },
         )
         .unwrap();
@@ -2714,6 +2958,7 @@ mod tests {
                 tool: if noun == "codex" { "codex" } else { "claude" }.into(),
                 agent_noun: noun.into(),
                 workdir: "/tmp".into(),
+                room: None,
             },
         )
         .unwrap();
@@ -2864,6 +3109,7 @@ mod tests {
                 tool: if noun == "codex" { "codex" } else { "claude" }.into(),
                 agent_noun: noun.into(),
                 workdir: "/tmp".into(),
+                room: None,
             },
         )
         .unwrap();
@@ -2968,6 +3214,118 @@ mod tests {
             codesession::get_note(&root, "code-ok000001").unwrap().as_deref(),
             Some("do the thing")
         );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M5: room flag + peer-claim surfacing through the M3 injection ─────────
+
+    #[test]
+    fn take_room_flag_extracts_and_strips_room() {
+        // --room <id> is parsed out and stripped from the args the tool sees.
+        let (room, rest) = take_room_flag(&[
+            "--room".into(),
+            "team-1".into(),
+            "fix the bug".into(),
+        ]);
+        assert_eq!(room.as_deref(), Some("team-1"));
+        assert_eq!(rest, vec!["fix the bug".to_string()]);
+        // No --room → None, args untouched.
+        let (room, rest) = take_room_flag(&["fix the bug".into()]);
+        assert!(room.is_none());
+        assert_eq!(rest, vec!["fix the bug".to_string()]);
+        // A bare trailing --room (no value) is dropped, no room.
+        let (room, rest) = take_room_flag(&["do it".into(), "--room".into()]);
+        assert!(room.is_none());
+        assert_eq!(rest, vec!["do it".to_string()]);
+    }
+
+    /// Record a session WITH a room, and join it, so turn_injection can derive the
+    /// room from the record and read peer claims.
+    fn m5_member(root: &Root, room: &str, sess: &str) {
+        codesession::upsert_record(
+            root,
+            &codesession::SessionRecord {
+                elanus_session: sess.into(),
+                native_session: "t".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp".into(),
+                room: Some(room.into()),
+            },
+        )
+        .unwrap();
+        codesession::join_room(root, room, sess, "codex", std::process::id() as i32).unwrap();
+    }
+
+    #[test]
+    fn turn_injection_surfaces_peer_claims_excluding_own() {
+        // The M5 payoff: B's per-turn injection shows A's claim ("code-A is editing
+        // src/foo.rs") and does NOT list B's own claim. The room is derived from B's
+        // OWN record — never an argument.
+        let root = m3_tmp_root();
+        m5_member(&root, "room-1", "code-aaaa0001"); // A
+        m5_member(&root, "room-1", "code-bbbb0002"); // B
+        codesession::add_claim(&root, "room-1", "code-aaaa0001", "src/foo.rs").unwrap();
+        codesession::add_claim(&root, "room-1", "code-bbbb0002", "src/own.rs").unwrap();
+
+        // B's injection: shows A's claim, excludes B's own.
+        let b_inj = turn_injection(&root, "codex", "code-bbbb0002").unwrap();
+        assert!(b_inj.contains("code-aaaa0001 is editing src/foo.rs"), "B must see A's claim: {b_inj}");
+        assert!(!b_inj.contains("src/own.rs"), "B must NOT see its own claim: {b_inj}");
+        assert!(b_inj.contains("advisory"), "the claim is presented as advisory: {b_inj}");
+
+        // A's injection: shows B's claim, excludes A's own.
+        let a_inj = turn_injection(&root, "codex", "code-aaaa0001").unwrap();
+        assert!(a_inj.contains("code-bbbb0002 is editing src/own.rs"));
+        assert!(!a_inj.contains("src/foo.rs"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn turn_injection_room_isolation_no_cross_room_claims() {
+        // A session in R1 never sees an R2 claim in its injection.
+        let root = m3_tmp_root();
+        m5_member(&root, "R1", "code-r1aa0001");
+        m5_member(&root, "R2", "code-r2aa0001");
+        codesession::add_claim(&root, "R2", "code-r2aa0001", "secret/r2.rs").unwrap();
+        // The R1 session has no peers (its only roommate is itself), so a quiet
+        // turn injects nothing about claims and never leaks R2's claim.
+        let r1 = turn_injection(&root, "codex", "code-r1aa0001");
+        assert!(r1.is_none() || !r1.unwrap().contains("secret/r2.rs"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn build_resume_message_carries_peer_claims_to_a_driven_turn() {
+        // The headless/driven path (codex + driven CC resume): the per-turn claim
+        // surfacing rides the resume prompt (build_resume_message), so a driven B
+        // turn receives A's advisory claim out of band, ahead of the delivered
+        // message.
+        let root = m3_tmp_root();
+        m5_member(&root, "room-1", "code-aaaa0001");
+        m5_member(&root, "room-1", "code-bbbb0002");
+        codesession::add_claim(&root, "room-1", "code-aaaa0001", "src/foo.rs").unwrap();
+        let msg = build_resume_message(&root, "codex", "code-bbbb0002", "go do the task");
+        assert!(msg.contains("code-aaaa0001 is editing src/foo.rs"), "the resume turn must carry the peer claim: {msg}");
+        assert!(msg.contains("go do the task"), "the delivered message is still present");
+        // The claim block precedes the delivered message (out of band).
+        let claim_at = msg.find("is editing src/foo.rs").unwrap();
+        let msg_at = msg.find("go do the task").unwrap();
+        assert!(claim_at < msg_at);
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn solo_session_has_no_peers_and_no_claim_injection() {
+        // A session launched without --room (room:None) has no peers; turn_injection
+        // surfaces no claims (and is None on an otherwise-quiet turn).
+        let root = m3_tmp_root();
+        m3_record(&root, "code-solo0001", "codex"); // room: None
+        // Even if some other session (in a room) holds a claim, a roomless session
+        // sees nothing.
+        m5_member(&root, "other-room", "code-elsewhere");
+        codesession::add_claim(&root, "other-room", "code-elsewhere", "x.rs").unwrap();
+        assert!(turn_injection(&root, "codex", "code-solo0001").is_none());
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

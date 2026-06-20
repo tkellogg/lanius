@@ -935,6 +935,30 @@ fn run(cli: Cli) -> Result<()> {
                     let text = args.get(1..).unwrap_or(&[]).join(" ");
                     codeagent::note_cmd(&root, session, &text)?;
                 }
+                "claim" => {
+                    // Announce an advisory edit claim (M5). Run from inside a
+                    // session; identity + room are env/record-derived, so it can
+                    // only claim as itself in its own room. `elanus code claim <path>`.
+                    let path = args.first().map(String::as_str).unwrap_or("");
+                    if path.is_empty() {
+                        anyhow::bail!("usage: elanus code claim <path>");
+                    }
+                    codeagent::claim_cmd(&root, path)?;
+                }
+                "unclaim" => {
+                    // Release this session's advisory claim on a path (M5).
+                    // `elanus code unclaim <path>`.
+                    let path = args.first().map(String::as_str).unwrap_or("");
+                    if path.is_empty() {
+                        anyhow::bail!("usage: elanus code unclaim <path>");
+                    }
+                    codeagent::unclaim_cmd(&root, path)?;
+                }
+                "claims" => {
+                    // Show this session's room coordination view (own + peer
+                    // claims), M5. `elanus code claims [--json]`.
+                    codeagent::claims_cmd(&root, &args)?;
+                }
                 _ => {
                     codeagent::launch(&root, &tool, &args)?;
                 }

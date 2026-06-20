@@ -421,8 +421,54 @@ CREATE TABLE IF NOT EXISTS code_inbox_seen (
   seen_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (session, event_id)
 );
+
+-- Coordination-room membership (M5: advisory peer coordination,
+-- docs/handoffs/coding-agents.md). Multiple concurrent coding sessions share a
+-- room (`in/group/<id>`, ledger-backed — docs/topics.md); a session joins by a
+-- row here (set at launch via `--room <id>`). This is the set a session shares
+-- its claims with: a session SEES its roommates' claims (the point of the room)
+-- and writes only its OWN. There is NO trust model — sessions are the user's own
+-- cooperating agents (homogeneous authority); membership is conflict-avoidance
+-- scope, not authorization.
+--
+-- Crash-released, mirroring the session-token reaper (src/codesession.rs): the
+-- `owner_pid` is the launcher/driver pid that owns the live session, so a
+-- SIGKILL'd session's membership (and its claims) are reaped at the next
+-- launcher/daemon boot — a dead session's claims must not linger in roommates'
+-- injections forever (the lease-released membership of docs/topics.md decided-5).
+CREATE TABLE IF NOT EXISTS code_room_members (
+  room       TEXT NOT NULL,       -- the room id (the <id> of in/group/<id>)
+  session    TEXT NOT NULL,       -- the member coding session (code-<id>)
+  agent_noun TEXT NOT NULL,       -- the obs noun it publishes under
+  owner_pid  INTEGER NOT NULL,    -- the live owner pid; dead → reaped (crash-release)
+  joined_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (room, session)
+);
+CREATE INDEX IF NOT EXISTS idx_code_room_members_session ON code_room_members(session);
+
+-- Advisory edit claims (M5). A session announces "I'm editing <path>"; the
+-- claim is recorded here, in the session's room, durably. It is ADVISORY
+-- metadata, not a lock — recording one never blocks anyone; it surfaces in the
+-- OTHER sessions' per-turn injection so they can route around it. A session can
+-- record/clear only its OWN claims (its env-derived identity), but SEES its
+-- roommates' (shared coordination). The raw path is stored verbatim in a column
+-- (a path is a noun); `(room, session, path)` is the key so re-claiming the same
+-- path is idempotent. Released with membership on session end / crash-reaped.
+CREATE TABLE IF NOT EXISTS code_claims (
+  room       TEXT NOT NULL,       -- the room the claim is visible in
+  session    TEXT NOT NULL,       -- the session that holds the claim (code-<id>)
+  path       TEXT NOT NULL,       -- the claimed path (raw, stored verbatim)
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (room, session, path)
+);
+CREATE INDEX IF NOT EXISTS idx_code_claims_room ON code_claims(room);
+CREATE INDEX IF NOT EXISTS idx_code_claims_session ON code_claims(session);
 "#,
     )?;
+    // M5: the room a coding session belongs to, stored on the durable record so a
+    // claim/resume can derive it from the session's own identity. Nullable —
+    // pre-M5 records (and a session launched with no `--room`) have no room.
+    let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN room TEXT", []);
     // Migrations for databases created before a column existed; the error on
     // a duplicate column is expected and ignored.
     let _ = conn.execute(

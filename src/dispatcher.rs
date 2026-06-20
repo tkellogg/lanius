@@ -194,6 +194,14 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
     for orphan in crate::codesession::reap_orphans(root) {
         eprintln!("[daemon] reaped orphaned coding-session credential {orphan}");
     }
+    // M5: also release the room membership + advisory claims of any coding session
+    // whose owning process is dead (a SIGKILL'd launcher never ran its clean
+    // release). A dead session's claims must not linger in its roommates' per-turn
+    // injections forever (the lease-released membership of docs/topics.md
+    // decided-5). Crash-only, same liveness sweep as the credential reaper.
+    for (room, sess) in crate::codesession::reap_dead_members(root) {
+        eprintln!("[daemon] released claims of dead session {sess} in room {room}");
+    }
     // Recover any planner wake lost to a crash in the settle->route gap (M4-A
     // reliability residual): a driven worker delivery may have settled `done` (or
     // been re-pended and deduped) while its routed completion was never emitted, so
@@ -1710,6 +1718,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: root.dir.display().to_string(),
+                room: None,
             },
         )
         .unwrap();
@@ -1782,6 +1791,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: root.dir.display().to_string(),
+                room: None,
             },
         )
         .unwrap();
@@ -1939,6 +1949,7 @@ mod tests {
                     tool: t.into(),
                     agent_noun: if t == "codex" { "codex" } else { "claude-code" }.into(),
                     workdir: root.dir.display().to_string(),
+                    room: None,
                 },
             )
             .unwrap();
@@ -1989,6 +2000,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: root.dir.display().to_string(),
+                room: None,
             },
         )
         .unwrap();
@@ -2056,6 +2068,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: root.dir.display().to_string(),
+                room: None,
             },
         )
         .unwrap();
@@ -2120,6 +2133,7 @@ mod tests {
                     tool: t.into(),
                     agent_noun: n.into(),
                     workdir: root.dir.display().to_string(),
+                    room: None,
                 },
             )
             .unwrap();
@@ -2194,6 +2208,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: root.dir.display().to_string(),
+                room: None,
             },
         )
         .unwrap();
@@ -2247,6 +2262,7 @@ mod tests {
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
                 workdir: root.dir.display().to_string(),
+                room: None,
             },
         )
         .unwrap();
