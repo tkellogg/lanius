@@ -69,3 +69,40 @@ of UI should be created, and simply enable anything to be easily done (vibe code
 
 One utility is to have all the dashboards discoverable. It's nice to not have to rebuild work. But also, its
 useful to be able to rebuild whenever a slightly better idea comes up.
+
+
+# What chatting should feel like
+Whatever Tim, Lily, or Daniel are doing, the thing they are doing is *having a
+conversation with their agent*. That should be the most obvious object on the
+screen, and it should behave the way every chat app has taught them to expect: you
+say something, the agent answers in the same place, and you can come back tomorrow
+and pick the thread back up. Lily in particular treats her agent like a companion —
+if "talking to it" feels like filing tickets into a void she can't reply to, the
+whole relationship breaks.
+
+So the unit of the UI is a **conversation**: one ongoing thread with the agent,
+the way you'd think of a Slack DM or a thread. Each thread is its own context
+(one sliding window; see "Never ending chat"), but to the person it's just "the
+conversation I'm having." It carries a human label — what it's about — not an
+opaque id. Coming back later resumes it. Starting fresh is an explicit, deliberate
+choice ("new conversation"), not something that silently happens every time you
+reload the page. And when the agent acts on its own — kicked off by a GitHub
+issue, a timer, an inbound event — that shows up as *another conversation you can
+step into and reply to*, not a notification you can only watch. Daniel wants to
+understand why his agent did something; the answer is to open that thread and ask
+it, in the same box he'd use for anything else.
+
+The other thing on the screen should know its place. When Tim drives Claude Code
+or Codex under elanus, the worker runs those spawn are not conversations — they're
+*work in progress he observes*. He wants to see them (which model, how long, did
+it finish), but he is not chatting with `code-7f3a…`. Mixing a stack of those into
+the same list as his real conversations is what makes the screen feel like noise.
+Coding runs belong in their own surface, quiet by default, expanded when he's
+actually watching the work — see
+[../handoffs/coding-agent-observability.md](../handoffs/coding-agent-observability.md).
+
+The deeper principle underneath both is the one in
+[../layering.md](../layering.md): the product speaks the user's language, not the
+kernel's. "Session" is an internal word; nobody chatting with their agent should
+ever have to see it, or a raw id, to know what they're looking at. The work plan
+for getting there is [../handoffs/chat-conversations.md](../handoffs/chat-conversations.md).

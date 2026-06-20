@@ -768,6 +768,44 @@ const renamedAgent = 'falcon';
       && b.correlation
       && a.correlation !== b.correlation;
   }, 5000);
+  const stableConversation = publishes[0]?.payload?.session;
+  await waitFor('converse: nav shows labeled conversation, not a raw id', async () => {
+    const rows = await page.$$eval('#nav-agents .nav-conversation', (els) => els.map((el) => ({
+      text: el.textContent || '',
+      title: el.getAttribute('title') || '',
+    }))).catch(() => []);
+    return rows.some((row) => row.text.includes(msg) && row.title === stableConversation && !row.text.includes(stableConversation));
+  }, 8000);
+  const selectedAgent = await page.$eval('#nav-agents .nav-agent.on', (el) => el.getAttribute('data-sel')?.replace(/^agent:/, '') || 'main').catch(() => 'main');
+  await page.reload();
+  await page.waitForSelector('#nav-agents .nav-agent');
+  await waitFor('converse reload: selected agent returns to converse', async () => {
+    const agents = await page.$$('#nav-agents .nav-agent');
+    for (const item of agents) {
+      if ((await item.getAttribute('data-sel')) === `agent:${selectedAgent}`) { await item.click(); return true; }
+    }
+    return false;
+  }, 8000);
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  const msg3 = `${msg}-after-reload`;
+  await page.fill('#compose-input', msg3);
+  await page.click('#compose-send');
+  await waitFor('converse reload: compose reuses current conversation', async () => {
+    return publishes.length >= 3 && publishes[2]?.payload?.session === stableConversation;
+  }, 8000);
+  await page.click('#conv-new');
+  await waitFor('converse: new conversation clears the visible thread', async () => {
+    const t = await page.$eval('#conv-holder', (el) => el.textContent);
+    return !t.includes(msg) && /nothing yet/i.test(t);
+  }, 5000);
+  const msg4 = `${msg}-fork`;
+  await page.fill('#compose-input', msg4);
+  await page.click('#compose-send');
+  await waitFor('converse: new conversation publishes a fresh id', async () => {
+    return publishes.length >= 4
+      && publishes[3]?.payload?.session
+      && publishes[3].payload.session !== stableConversation;
+  }, 8000);
   // A labeled failure (harness emits these when an agent run breaks) renders
   // as an explicit error bubble in the thread, not silence. Inject one with
   // the correlation of the message we just sent so it threads here.

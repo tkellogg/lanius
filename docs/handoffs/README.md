@@ -26,3 +26,10 @@ context for the pass currently in flight.
 - [configuration-ux.md](configuration-ux.md) - the configuration-UX altitude and
   scope pass on the web UI (instance vs agent config, essentials vs advanced,
   the off switch). Backed by [../journeys/06-configuration.md](../journeys/06-configuration.md).
+- [chat-conversations.md](chat-conversations.md) - the human's chat seat: turn raw
+  kernel session ids into first-class, replyable **conversations** (labeled,
+  one-context threads), persist one current web conversation with "+ new" and a
+  recent list, and evict coding-tool agents from the chat nav into the Workers
+  surface. The nav-split counterpart to
+  [coding-agent-observability.md](coding-agent-observability.md). Backed by
+  [../journeys/07-chatting.md](../journeys/07-chatting.md).

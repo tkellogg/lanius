@@ -3,10 +3,11 @@
 // The PURE-MQTT-CLIENT constraint from ui/tui carries over, one hop removed:
 // browsers cannot speak raw TCP MQTT, so this process is the ordinary
 // anonymous loopback MQTT 5 client, and the browser talks to *it* — bus
-// messages relayed over SSE, publishes accepted over POST. No sqlite, no
-// trace.jsonl, no privileged access; the only filesystem touches are this
-// directory's static files and <root>/bus.toml for broker discovery.
-// History reads proxy to the userland `history` package's HTTP endpoint
+// messages relayed over SSE, publishes accepted over POST. No trace.jsonl, no
+// privileged access; the only filesystem touches are this directory's static
+// files, <root>/bus.toml for broker discovery, and read-only conversation
+// projections from <root>/elanus.db.
+// Transcript history reads proxy to the userland `history` package's HTTP endpoint
 // (HANDOFF phase 3): the daemon assigns it a loopback port, recorded in
 // <root>/run/pkg-history/http.json — discovery from harness state, never
 // retained bus messages (docs/security.md entry 11).
@@ -29,6 +30,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
 import os from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { brokerUrl, parseArgs, resolveRoot } from './config.mjs';
 
 const args = parseArgs(process.argv.slice(2));
@@ -322,6 +324,324 @@ function sendJson(res, code, body) {
   res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(body));
 }
 
+function truncateText(value, max = 72) {
+  const s = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+function shortIso(value) {
+  return typeof value === 'string' ? value.replace('T', ' ').slice(0, 16) : '';
+}
+
+function parsePayload(raw) {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseStored(raw) {
+  if (raw == null) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function messageText(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (typeof content.text === 'string') return content.text;
+  if (typeof content.content === 'string') return content.content;
+  if (content.truncated === true && content.preview != null) return String(content.preview);
+  return JSON.stringify(content);
+}
+
+function sourceFor(session, sender, payload = {}) {
+  const claimed = String(payload.source ?? '').trim().toLowerCase();
+  if (claimed) return claimed;
+  const s = String(session ?? '').toLowerCase();
+  const from = String(sender ?? '').toLowerCase();
+  if (s.startsWith('web-')) return 'web';
+  if (/github|jira|linear/.test(from)) return 'github';
+  if (/cron|timer|schedule/.test(from)) return 'cron';
+  if (!from || from === ownerName().toLowerCase() || from === 'owner') return 'you';
+  return from.replace(/[^a-z0-9_-]+/g, '-').slice(0, 20) || 'you';
+}
+
+function sessionForEvent(row) {
+  const payload = parsePayload(row.payload);
+  return payload.session || (row.correlation_id ? `evt-${row.correlation_id}` : `evt-${row.id}`);
+}
+
+function isWorkerSession(agent, session) {
+  // Coding-tool agent NOUNS are `claude-code` and `codex` (src/codeagent.rs);
+  // bare `claude` is only a CLI alias, never a bus agent — don't evict a real
+  // agent a user happens to name `claude`. The `code-*` session id is the
+  // reliable per-run fallback.
+  return /^(codex|claude-code)$/i.test(String(agent ?? '')) || /^code-[A-Za-z0-9_-]+/.test(String(session ?? ''));
+}
+
+function dbFile() {
+  return ROOT ? path.join(ROOT, 'elanus.db') : null;
+}
+
+function withReadOnlyDb(res, fn) {
+  const file = dbFile();
+  if (!file || !fs.existsSync(file)) return sendJson(res, 503, { ok: false, error: 'conversation history unavailable — no elanus.db for this root' });
+  let db;
+  try {
+    db = new DatabaseSync(file, { readOnly: true });
+    db.exec('PRAGMA query_only = ON');
+    return fn(db);
+  } catch (err) {
+    return sendJson(res, 503, { ok: false, error: `conversation history unavailable: ${String(err.message ?? err)}` });
+  } finally {
+    try { db?.close(); } catch {}
+  }
+}
+
+// Content-identity for a conversation message. The SAME logical message reaches
+// the converse feed from up to three sources whose ids/keys never line up: the
+// live bus tail (keyed by correlation), the durable `messages` table (no
+// correlation), and the `in/human`/`in/agent` event projection (correlation).
+// Keying by (class, text) — and (type, correlation) for asks/failures, which
+// carry no text — is the only attribute all sources share, so a message present
+// in more than one renders once. Keep this in lockstep with convMessageKey in
+// App.tsx. Trade-off: two genuinely identical same-class texts in one thread
+// collapse to one — rare, and far better than guaranteed duplication.
+function convKey(m) {
+  const cls = m.cls ?? (m.who === 'you' ? 'you' : 'agent');
+  if (m.type === 'ask') return `ask:${m.corr ?? m.event_id ?? ''}`;
+  if (cls === 'failed') return `failed:${m.corr ?? m.event_id ?? ''}`;
+  return `${cls}:${String(m.text ?? '')}`;
+}
+
+function addConversationMessage(list, seen, msg) {
+  const key = convKey(msg);
+  if (seen.has(key)) return;
+  seen.add(key);
+  list.push({ ...msg, key });
+}
+
+function placeholders(values) {
+  return values.map(() => '?').join(',');
+}
+
+function conversationRows(agent, db) {
+  const inbound = db.prepare(
+    "SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type = ? ORDER BY id ASC LIMIT 5000",
+  ).all(`in/agent/${agent}`);
+  const bySession = new Map();
+  const corrToSession = new Map();
+
+  const ensure = (session, seed = {}) => {
+    if (!bySession.has(session)) {
+      bySession.set(session, {
+        session,
+        agent,
+        title: '',
+        source: seed.source || 'you',
+        last_ts: seed.last_ts || '',
+        message_count: 0,
+        preview: '',
+        last_role: '',
+        _first_ts: seed.last_ts || '',
+      });
+    }
+    return bySession.get(session);
+  };
+
+  const touch = (row, role, text, count = true) => {
+    if (!text) return;
+    const item = ensure(row.session, row);
+    if (!item.title && role === 'you') item.title = truncateText(text);
+    item.preview = truncateText(text, 110);
+    item.last_role = role;
+    item.last_ts = row.last_ts || item.last_ts;
+    if (!item._first_ts) item._first_ts = row.last_ts;
+    if (count) item.message_count += 1;
+  };
+
+  for (const row of inbound) {
+    const payload = parsePayload(row.payload);
+    const session = sessionForEvent(row);
+    if (isWorkerSession(agent, session)) continue;
+    corrToSession.set(row.correlation_id, session);
+    const source = sourceFor(session, row.sender, payload);
+    ensure(session, { source, last_ts: row.created_at });
+    const prompt = payload.prompt ?? payload.text;
+    if (typeof prompt === 'string') touch({ session, last_ts: row.created_at }, 'you', prompt);
+  }
+
+  if (corrToSession.size) {
+    const corrs = [...corrToSession.keys()].filter(Boolean);
+    if (corrs.length) {
+      const humanRows = db.prepare(
+        `SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type LIKE 'in/human/%' AND correlation_id IN (${placeholders(corrs)}) ORDER BY id ASC LIMIT 5000`,
+      ).all(...corrs);
+      for (const row of humanRows) {
+        const session = corrToSession.get(row.correlation_id);
+        if (!session) continue;
+        const payload = parsePayload(row.payload);
+        if (payload.failed) touch({ session, last_ts: row.created_at }, 'failed', payload.error || 'the agent failed');
+        else if (payload.question != null) touch({ session, last_ts: row.created_at }, 'ask', payload.question);
+        else if (typeof payload.text === 'string') touch({ session, last_ts: row.created_at }, 'agent', payload.text);
+        else if (payload.answer != null) touch({ session, last_ts: row.created_at }, 'you', payload.answer);
+      }
+    }
+
+    const sessions = [...bySession.keys()];
+    if (sessions.length) {
+      const msgRows = db.prepare(
+        `SELECT m.id, m.session_id, m.role, m.content, m.event_id, m.created_at, e.correlation_id, e.type AS event_type
+           FROM messages m LEFT JOIN events e ON m.event_id = e.id
+          WHERE m.session_id IN (${placeholders(sessions)})
+          ORDER BY m.id ASC LIMIT 5000`,
+      ).all(...sessions);
+      for (const row of msgRows) {
+        const content = parseStored(row.content);
+        const text = messageText(content);
+        const role = row.role === 'user' ? 'you' : row.role === 'assistant' ? 'agent' : row.role;
+        // count=false: turns are already counted from the in/agent prompt +
+        // in/human reply events above; counting messages rows too would
+        // double-count every web turn.
+        touch({ session: row.session_id, last_ts: row.created_at }, role, text, false);
+      }
+    }
+  }
+
+  return [...bySession.values()].map((c) => {
+    const source = c.source || 'you';
+    return {
+      session: c.session,
+      agent: c.agent,
+      title: c.title || `${source} conversation ${shortIso(c._first_ts || c.last_ts) || ''}`.trim(),
+      source,
+      last_ts: c.last_ts || c._first_ts || '',
+      message_count: c.message_count,
+      preview: c.preview,
+      last_role: c.last_role,
+    };
+  }).sort((a, b) => String(b.last_ts).localeCompare(String(a.last_ts))).slice(0, 100);
+}
+
+function conversationMessages(session, db) {
+  const messages = [];
+  const seen = new Set();
+  const rows = db.prepare(
+    "SELECT id, role, content, event_id, created_at FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT 2000",
+  ).all(session);
+  for (const row of rows) {
+    // Converse is the human chat: only the you/agent turns belong here. Skip
+    // tool/system rows so a stored tool-call payload can't surface as a raw-JSON
+    // "system" bubble on re-open (the full transcript still lives in the
+    // SESSIONS tab).
+    if (row.role !== 'user' && row.role !== 'assistant') continue;
+    const content = parseStored(row.content);
+    const text = messageText(content);
+    if (!text) continue;
+    const cls = row.role === 'user' ? 'you' : 'agent';
+    addConversationMessage(messages, seen, {
+      id: `m-${row.id}`,
+      type: 'msg',
+      who: cls,
+      cls,
+      text,
+      ts: row.created_at,
+      event_id: row.event_id,
+    });
+  }
+
+  // Scope the in/agent scan to THIS session in SQL — a blanket `LIMIT N` over
+  // every in/* event returns the oldest N and silently drops recent
+  // conversations on a busy ledger. A session is either carried in the payload
+  // (`{"session":"<id>"}`) or, for ambient triggers with no session, derived as
+  // `evt-<correlation_id>`/`evt-<id>` by sessionForEvent. The payload LIKE may
+  // over-match (it ignores JSON structure), so sessionForEvent() still filters
+  // below; it never under-matches a real session id (web-*/evt-*/code-* contain
+  // no LIKE wildcards, and `"` is rejected at the route).
+  const isEvt = session.startsWith('evt-');
+  const evtSuffix = isEvt ? session.slice(4) : '';
+  const agentRows = isEvt
+    ? db.prepare(
+      "SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type LIKE 'in/agent/%' AND (correlation_id = ? OR id = ?) ORDER BY id ASC LIMIT 4000",
+    ).all(evtSuffix, evtSuffix)
+    : db.prepare(
+      "SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type LIKE 'in/agent/%' AND payload LIKE ? ORDER BY id ASC LIMIT 4000",
+    ).all(`%"session":"${session}"%`);
+  const corrs = new Set();
+  for (const row of agentRows) {
+    if (sessionForEvent(row) !== session) continue;
+    if (row.correlation_id) corrs.add(row.correlation_id);
+    const payload = parsePayload(row.payload);
+    const text = payload.prompt ?? payload.text;
+    if (typeof text === 'string') {
+      addConversationMessage(messages, seen, {
+        id: `e-${row.id}`,
+        type: 'msg',
+        who: 'you',
+        cls: 'you',
+        text,
+        corr: row.correlation_id,
+        ts: row.created_at,
+        event_id: row.id,
+      });
+    }
+  }
+  const humanRows = corrs.size
+    ? db.prepare(
+      `SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type LIKE 'in/human/%' AND correlation_id IN (${placeholders([...corrs])}) ORDER BY id ASC LIMIT 4000`,
+    ).all(...corrs)
+    : [];
+  for (const row of humanRows) {
+    const payload = parsePayload(row.payload);
+    if (payload.failed) {
+      addConversationMessage(messages, seen, {
+        id: `e-${row.id}`,
+        key: `event:${row.id}:failed`,
+        type: 'msg',
+        who: 'agent failed',
+        cls: 'failed',
+        text: payload.error || 'the agent failed with no detail.',
+        corr: row.correlation_id,
+        failed: true,
+        ts: row.created_at,
+        event_id: row.id,
+      });
+    } else if (payload.question != null) {
+      addConversationMessage(messages, seen, {
+        id: `e-${row.id}`,
+        key: `event:${row.id}:ask`,
+        type: 'ask',
+        corr: row.correlation_id,
+        payload,
+        answered: null,
+        ts: row.created_at,
+        event_id: row.id,
+      });
+    } else if (typeof payload.text === 'string') {
+      addConversationMessage(messages, seen, {
+        id: `e-${row.id}`,
+        key: `event:${row.id}:agent`,
+        type: 'msg',
+        who: 'agent',
+        cls: 'agent',
+        text: payload.text,
+        corr: row.correlation_id,
+        ts: row.created_at,
+        event_id: row.id,
+      });
+    }
+  }
+  return messages.sort((a, b) => String(a.ts || '').localeCompare(String(b.ts || '')));
+}
+
 function existsKind(file) {
   try {
     const st = fs.statSync(file);
@@ -596,6 +916,33 @@ const server = http.createServer((req, res) => {
   }
   if (url.pathname === '/api/status' && req.method === 'GET') {
     sendJson(res, 200, systemStatus());
+    return;
+  }
+  if (url.pathname === '/api/conversations' && req.method === 'GET') {
+    const agent = url.searchParams.get('agent') ?? '';
+    if (!PROFILE_NAME_RE.test(agent)) {
+      sendJson(res, 400, { ok: false, error: BAD_NAME_MSG });
+      return;
+    }
+    withReadOnlyDb(res, (db) => sendJson(res, 200, { ok: true, conversations: conversationRows(agent, db) }));
+    return;
+  }
+  if (url.pathname.startsWith('/api/conversations/') && req.method === 'GET') {
+    let session;
+    try {
+      // A malformed %-escape (e.g. /api/conversations/%) makes decodeURIComponent
+      // throw synchronously; the request handler has no outer catch, so an
+      // unguarded decode here would crash the whole server (loopback DoS).
+      session = decodeURIComponent(url.pathname.slice('/api/conversations/'.length));
+    } catch {
+      sendJson(res, 400, { ok: false, error: 'bad conversation' });
+      return;
+    }
+    if (!session || session.length > 160 || /[\\\0"]/.test(session)) {
+      sendJson(res, 400, { ok: false, error: 'bad conversation' });
+      return;
+    }
+    withReadOnlyDb(res, (db) => sendJson(res, 200, { ok: true, conversation: { session, messages: conversationMessages(session, db) } }));
     return;
   }
   if (url.pathname.startsWith('/api/admin/')) {

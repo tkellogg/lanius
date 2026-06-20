@@ -16,6 +16,18 @@ const timeOf = (env: any) => {
   const d = new Date(env?.ts ?? Date.now());
   return isNaN(d.getTime()) ? '--:--:--' : d.toTimeString().slice(0, 8);
 };
+const relativeTime = (t: unknown) => {
+  const d = new Date(String(t ?? ''));
+  if (isNaN(d.getTime())) return '';
+  const sec = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+  if (sec < 60) return 'now';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hrs = Math.floor(min / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return days < 14 ? `${days}d ago` : shortTs(t).slice(0, 10);
+};
 const summarize = (p: unknown, max = 110) => {
   if (p == null) return '';
   const s = typeof p === 'string' ? p : JSON.stringify(p);
@@ -23,6 +35,37 @@ const summarize = (p: unknown, max = 110) => {
 };
 const agentOf = (topic: string) => topic.match(/^(?:in|obs)\/agent\/([^/]+)/)?.[1] ?? null;
 const uid = () => Math.random().toString(36).slice(2);
+const newWebConversationId = (agent: string) => `web-${agent}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+const conversationStorageKey = (agent: string) => `elanus.currentConversation.${agent}`;
+// Coding-tool agent NOUNS are `claude-code` and `codex` (src/codeagent.rs); bare
+// `claude` is only a CLI alias, never a bus agent — keep it out so a real agent a
+// user names `claude` isn't evicted to Workers. The `code-*` session id (see
+// isWorkerSessionId) is the reliable per-run fallback.
+const codingAgentNames = new Set(['claude-code', 'codex']);
+const isWorkerAgentName = (name: string) => codingAgentNames.has(String(name ?? '').toLowerCase());
+const isWorkerSessionId = (session: string) => /^code-[A-Za-z0-9_-]+/.test(String(session ?? ''));
+const sessionFromPayload = (payload: any, env: any) => payload?.session || (env?.correlation_id ? `evt-${env.correlation_id}` : env?.id ? `evt-${env.id}` : '');
+// Content-identity for a conversation message, IDENTICAL to convKey in
+// server.mjs. The same logical message arrives both as a live bus event (keyed
+// by correlation) and from the durable backfill (which may lack a correlation),
+// so they must collapse to one key or every reply doubles on re-open. (class,
+// text) is the only attribute both sources share; asks/failures carry no text so
+// they key on correlation. Trade-off: two identical same-class texts in one
+// thread merge — rare, and the right call versus guaranteed duplication.
+const convMessageKey = (m: any) => {
+  const cls = m.cls ?? (m.who === 'you' ? 'you' : 'agent');
+  if (m.type === 'ask') return `ask:${m.corr ?? m.event_id ?? ''}`;
+  if (cls === 'failed') return `failed:${m.corr ?? m.event_id ?? ''}`;
+  return `${cls}:${String(m.text ?? '')}`;
+};
+const mergeConvMessages = (current: any[] = [], incoming: any[] = []) => {
+  const byKey = new Map();
+  for (const m of [...current, ...incoming]) {
+    const key = convMessageKey(m);
+    if (!byKey.has(key)) byKey.set(key, { id: m.id ?? uid(), ...m, key });
+  }
+  return [...byKey.values()].sort((a, b) => String(a.ts ?? '').localeCompare(String(b.ts ?? '')));
+};
 
 function topicFilterMatches(filterText: string, value: string) {
   const f = String(filterText ?? '');
@@ -324,6 +367,7 @@ export function App() {
   const [filter, setFilter] = useState('signals');
   const [paused, setPaused] = useState(false);
   const [conv, setConv] = useState(new Map());
+  const [conversations, setConversations] = useState(new Map());
   const [sessionsState, setSessionsState] = useState<any>({ status: 'idle', sessions: [], transcript: null, error: '' });
   const [modelOptions, setModelOptions] = useState<any[]>([]);
   const [modelsHint, setModelsHint] = useState('');
@@ -351,8 +395,9 @@ export function App() {
   const [kitModalOpen, setKitModalOpen] = useState(false);
 
   const refs = useRef<any>({});
-  refs.current = { sel, agents, diskProfiles, defaultAgent, historyOk, filter, paused, cfgForm, cfgPackages, cfgContextChain };
+  refs.current = { sel, agents, diskProfiles, defaultAgent, historyOk, filter, paused, cfgForm, cfgPackages, cfgContextChain, conversations };
   const corrAgent = useRef(new Map());
+  const corrSession = useRef(new Map());
   const sentCorrs = useRef(new Set());
   const seenAsks = useRef(new Set());
   const seenFailures = useRef(new Set());
@@ -455,11 +500,71 @@ export function App() {
     setSel((prev: any) => ({ kind: 'agent', agent, tab: tab ?? (prev.kind === 'agent' && prev.agent === agent ? prev.tab : 'converse') }));
   };
 
+  const conversationStateFor = (agent: string) => conversations.get(agent) ?? { status: 'idle', list: [], error: '' };
+  const currentConversation = (agent: string) => agentSessions.current.get(agent) ?? localStorage.getItem(conversationStorageKey(agent)) ?? '';
+  const rememberConversation = (agent: string, session: string) => {
+    if (!agent || !session) return;
+    agentSessions.current.set(agent, session);
+    localStorage.setItem(conversationStorageKey(agent), session);
+  };
+  const loadConversations = async (agent: string) => {
+    if (!agent || isWorkerAgentName(agent)) return;
+    setConversations((prev) => new Map(prev).set(agent, { ...(prev.get(agent) ?? {}), status: 'loading', error: '' }));
+    try {
+      const r = await fetch(`/api/conversations?agent=${encodeURIComponent(agent)}`);
+      const j = await r.json().catch(() => ({}));
+      if (!j.ok) throw new Error(j.error ?? 'conversation list unavailable');
+      setConversations((prev) => new Map(prev).set(agent, { status: 'list', list: j.conversations ?? [], error: '' }));
+    } catch (err: any) {
+      setConversations((prev) => new Map(prev).set(agent, { status: 'error', list: prev.get(agent)?.list ?? [], error: String(err.message ?? err) }));
+    }
+  };
+  const loadConversation = async (agent: string, session: string) => {
+    if (!agent || !session) return;
+    rememberConversation(agent, session);
+    try {
+      const r = await fetch(`/api/conversations/${encodeURIComponent(session)}`);
+      const j = await r.json().catch(() => ({}));
+      if (!j.ok) return;
+      setConv((prev) => {
+        const next = new Map(prev);
+        next.set(agent, mergeConvMessages(next.get(agent) ?? [], j.conversation?.messages ?? []));
+        return next;
+      });
+    } catch {
+      /* live tail still works */
+    }
+  };
+  const openConversation = (agent: string, session: string) => {
+    rememberConversation(agent, session);
+    selectAgent(agent, 'converse');
+    void loadConversation(agent, session);
+  };
+  const newConversation = (agent: string) => {
+    const session = newWebConversationId(agent);
+    rememberConversation(agent, session);
+    setConv((prev) => new Map(prev).set(agent, []));
+    selectAgent(agent, 'converse');
+    requestAnimationFrame(() => document.querySelector<HTMLInputElement>('#compose-input')?.focus());
+  };
+
+  const agentNamesKey = [...agents.keys()].sort().join('|');
+  useEffect(() => {
+    for (const name of agentNamesKey.split('|').filter(Boolean)) {
+      if (!isWorkerAgentName(name)) void loadConversations(name);
+    }
+  }, [agentNamesKey]);
+
   useEffect(() => {
     if (sel.kind === 'setup' && !setup.loading && !setup.kits) void loadSetup();
     if (sel.kind === 'agent' && sel.tab === 'configure') void loadConfigure(sel.agent);
     if (sel.kind === 'agent' && sel.tab === 'sessions') void loadSessions(sel.agent);
     if (sel.kind === 'agent' && sel.tab === 'telemetry') setFilter('all');
+    if (sel.kind === 'agent' && sel.tab === 'converse') {
+      void loadConversations(sel.agent);
+      const stored = currentConversation(sel.agent);
+      if (stored) void loadConversation(sel.agent, stored);
+    }
   }, [sel.kind, sel.agent, sel.tab]);
 
   const stageTitle = sel.kind === 'welcome' ? 'welcome'
@@ -810,25 +915,45 @@ export function App() {
     if (topic.startsWith('in/human/')) {
       const corr = env.correlation_id;
       const agent = corrAgent.current.get(corr) ?? (refs.current.sel.kind === 'agent' ? refs.current.sel.agent : null) ?? [...refs.current.agents.keys()][0] ?? refs.current.defaultAgent;
-      if (p.failed) addFailure(agent, env);
-      else if (p.question != null) addAsk(agent, env);
-      else if (typeof p.text === 'string') addConv(agent, { who: 'agent', cls: 'agent', text: p.text, corr });
+      const session = corrSession.current.get(corr);
+      const cur = agent ? currentConversation(agent) : '';
+      // Only render a reply into the open thread when we can positively attribute
+      // it (session known AND === the open conversation). If the
+      // correlation→session mapping is unknown — the originating in/agent wasn't
+      // seen live, e.g. an event-triggered or resumed-from-history thread —
+      // blind-appending would leak a reply into whatever thread happens to be
+      // open. Instead refresh the list, and best-effort backfill the open thread
+      // from the durable transcript (idempotent via mergeConvMessages) in case
+      // the reply actually belongs to it.
+      if (agent && cur && session === cur) {
+        if (p.failed) addFailure(agent, env);
+        else if (p.question != null) addAsk(agent, env);
+        else if (typeof p.text === 'string') addConv(agent, { who: 'agent', cls: 'agent', text: p.text, corr, ts: env.ts ?? new Date().toISOString() });
+      } else if (agent && cur && !session) {
+        void loadConversation(agent, cur);
+      }
+      if (agent) void loadConversations(agent);
       return;
     }
     if (noun && topic.startsWith('in/agent/')) {
-      if (env.correlation_id) corrAgent.current.set(env.correlation_id, noun);
+      const session = sessionFromPayload(p, env);
+      if (env.correlation_id) {
+        corrAgent.current.set(env.correlation_id, noun);
+        if (session) corrSession.current.set(env.correlation_id, session);
+      }
       if (typeof p.prompt === 'string') {
-        if (!sentCorrs.current.has(env.correlation_id)) addConv(noun, { who: 'you', cls: 'you', text: p.prompt, corr: env.correlation_id });
+        if (session && currentConversation(noun) === session && !sentCorrs.current.has(env.correlation_id)) addConv(noun, { key: `live:${env.correlation_id}:you:${p.prompt}`, who: 'you', cls: 'you', text: p.prompt, corr: env.correlation_id, ts: env.ts ?? new Date().toISOString() });
       } else if (p.answer != null) {
         closeAskFromOutside(env.correlation_id, p.answer);
       }
+      if (session) void loadConversations(noun);
     }
   };
 
   const addConv = (agent: string, message: any) => {
     setConv((prev) => {
       const next = new Map(prev);
-      next.set(agent, [...(next.get(agent) ?? []), { id: uid(), type: 'msg', ...message }]);
+      next.set(agent, mergeConvMessages(next.get(agent) ?? [], [{ id: uid(), type: 'msg', ts: new Date().toISOString(), ...message }]));
       return next;
     });
   };
@@ -836,7 +961,7 @@ export function App() {
     const corr = env.correlation_id;
     if (corr && seenFailures.current.has(corr)) return;
     if (corr) seenFailures.current.add(corr);
-    addConv(agent, { who: 'agent failed', cls: 'failed', text: env.payload?.error || 'the agent failed with no detail.', corr, failed: true });
+    addConv(agent, { key: `live:${corr}:failed`, who: 'agent failed', cls: 'failed', text: env.payload?.error || 'the agent failed with no detail.', corr, failed: true, ts: env.ts ?? new Date().toISOString() });
   };
   const addAsk = (agent: string, env: any) => {
     const corr = env.correlation_id;
@@ -844,7 +969,7 @@ export function App() {
     if (corr) seenAsks.current.add(corr);
     setConv((prev) => {
       const next = new Map(prev);
-      next.set(agent, [...(next.get(agent) ?? []), { id: uid(), type: 'ask', corr, payload: env.payload ?? {}, answered: null }]);
+      next.set(agent, mergeConvMessages(next.get(agent) ?? [], [{ id: uid(), key: `live:${corr}:ask`, type: 'ask', corr, payload: env.payload ?? {}, answered: null, ts: env.ts ?? new Date().toISOString() }]));
       return next;
     });
   };
@@ -877,14 +1002,16 @@ export function App() {
     if (!text) return;
     const agent = sel.agent;
     const corr = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-    const session = agentSessions.current.get(agent) ?? `web-${agent}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-    agentSessions.current.set(agent, session);
+    const session = currentConversation(agent) || newWebConversationId(agent);
+    rememberConversation(agent, session);
     sentCorrs.current.add(corr);
     corrAgent.current.set(corr, agent);
-    addConv(agent, { who: 'you', cls: 'you', text, corr });
+    corrSession.current.set(corr, session);
+    addConv(agent, { key: `live:${corr}:you:${text}`, who: 'you', cls: 'you', text, corr, ts: new Date().toISOString() });
     input.value = '';
     const btn = e.currentTarget.querySelector('#compose-send') as HTMLButtonElement;
     const ok = await publish(`in/agent/${agent}`, { prompt: text, session }, corr);
+    void loadConversations(agent);
     btn.textContent = ok ? 'accepted ✓' : 'failed ✕';
     btn.classList.toggle('sent', ok);
     setTimeout(() => { btn.textContent = 'transmit'; btn.classList.remove('sent'); }, 1400);
@@ -951,7 +1078,7 @@ export function App() {
       </header>
 
       <main className="deck">
-        <Nav agents={agents} sel={sel} historyOk={historyOk} selectAgent={selectAgent} selectSignals={selectSignals} selectSetup={selectSetup} />
+        <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} />
 
         <section className="stage panel" aria-label="view">
           <div className="panel-head">
@@ -965,7 +1092,18 @@ export function App() {
           </div>
 
           <WelcomeView hidden={sel.kind !== 'welcome'} primary={primaryAgent()} historyOk={historyOk} systemStatus={systemStatus} selectAgent={selectAgent} selectSetup={selectSetup} selectSignals={selectSignals} />
-          <ConverseView hidden={!(sel.kind === 'agent' && sel.tab === 'converse')} agent={sel.agent} messages={conv.get(sel.agent) ?? []} submitCompose={submitCompose} answerAsk={answerAsk} selectAgent={selectAgent} />
+          <ConverseView
+            hidden={!(sel.kind === 'agent' && sel.tab === 'converse')}
+            agent={sel.agent}
+            messages={conv.get(sel.agent) ?? []}
+            conversations={sel.kind === 'agent' ? conversationStateFor(sel.agent) : { list: [] }}
+            current={sel.kind === 'agent' ? currentConversation(sel.agent) : ''}
+            submitCompose={submitCompose}
+            answerAsk={answerAsk}
+            selectAgent={selectAgent}
+            openConversation={openConversation}
+            newConversation={newConversation}
+          />
           <SessionsView hidden={!(sel.kind === 'agent' && sel.tab === 'sessions')} state={sessionsState} agent={sel.agent} openTranscript={openTranscript} loadSessions={loadSessions} />
           <ConfigureView
             hidden={!(sel.kind === 'agent' && sel.tab === 'configure')}
@@ -1042,8 +1180,15 @@ export function App() {
   );
 }
 
-function Nav({ agents, sel, historyOk, selectAgent, selectSignals, selectSetup }: any) {
+function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversation, selectSignals, selectSetup }: any) {
   const items = [...agents.keys()].sort();
+  const isWorkerItem = (name: string) => {
+    const a = agents.get(name);
+    return isWorkerAgentName(name) || [...(a?.sessions ?? [])].some((s) => isWorkerSessionId(s));
+  };
+  const chatItems = items.filter((name) => !isWorkerItem(name));
+  const workerItems = items.filter(isWorkerItem);
+  const workerCount = workerItems.reduce((n, name) => n + Math.max(1, agents.get(name)?.sessions?.size ?? 0), 0);
   const onKey = (e: any) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
     e.preventDefault();
@@ -1060,21 +1205,37 @@ function Nav({ agents, sel, historyOk, selectAgent, selectSignals, selectSetup }
         <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
         <div className="nav-label">agents</div>
         <div id="nav-agents">
-          {items.map((name) => {
+          {chatItems.map((name) => {
             const a = agents.get(name);
-            const sessions = [...(a.sessions ?? [])].sort().reverse();
+            const convoState = conversations.get(name) ?? {};
+            const convos = convoState.list ?? [];
             return (
               <div key={name}>
                 <button className={`nav-item nav-agent${sel.kind === 'agent' && sel.agent === name ? ' on' : ''}`} data-sel={`agent:${name}`} onClick={() => selectAgent(name)}>
                   <span className="nav-sigil">⟁</span> {name}{a.live && <span className="nav-live">·live</span>}
                 </button>
-                {sessions.slice(0, 12).map((s) => <button key={s} className="nav-item nav-session" onClick={() => selectAgent(name, 'sessions')}>{s}</button>)}
-                {sessions.length > 12 && <div className="nav-hint">+{sessions.length - 12} more in sessions</div>}
+                {convos.slice(0, 8).map((c: any) => (
+                  <button key={c.session} className="nav-item nav-conversation" title={c.session} onClick={() => openConversation(name, c.session)}>
+                    <span className="nav-convo-title">{c.title || c.preview || 'conversation'}</span>
+                    <span className="nav-convo-meta"><span className="source-badge">{c.source || 'you'}</span>{relativeTime(c.last_ts)}</span>
+                  </button>
+                ))}
+                {convoState.status === 'loading' && !convos.length && <div className="nav-hint">loading conversations…</div>}
+                {convoState.status === 'error' && !convos.length && <div className="nav-hint">conversation list unavailable</div>}
+                {convos.length > 8 && <div className="nav-hint">+{convos.length - 8} more recent</div>}
               </div>
             );
           })}
         </div>
-        <div id="nav-empty" className="nav-hint" hidden={agents.size > 0}>no agents yet — create one below</div>
+        <div id="nav-empty" className="nav-hint" hidden={chatItems.length > 0}>no agents yet — create one below</div>
+        {!!workerItems.length && (
+          <details id="nav-workers" className="nav-workers">
+            <summary><span>workers</span><span className="nav-worker-count">{workerCount}</span></summary>
+            <div className="nav-worker-list">
+              {workerItems.map((name) => <button key={name} className="nav-item nav-worker" onClick={() => selectAgent(name, 'telemetry')}><span>{name}</span><span className="nav-convo-meta">{agents.get(name)?.sessions?.size ?? 0} run{(agents.get(name)?.sessions?.size ?? 0) === 1 ? '' : 's'}</span></button>)}
+            </div>
+          </details>
+        )}
         <button id="nav-new-agent" className="nav-item nav-new" onClick={() => selectSetup()}><span className="nav-sigil">＋</span> new agent</button>
       </div>
       <div id="history-hint" className="nav-hint nav-foot" hidden={historyOk !== false}>transcripts unavailable — live view only</div>
@@ -1679,13 +1840,36 @@ function KitAddRow({ kit, cfgForm, cfgPackages, detail, loadKitDetail, installKi
   );
 }
 
-function ConverseView({ hidden, agent, messages, submitCompose, answerAsk, selectAgent }: any) {
+function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation }: any) {
+  const recent = conversations?.list ?? [];
+  const active = recent.find((c: any) => c.session === current);
   return (
     <div id="view-converse" className="view" hidden={hidden}>
-      <div id="conv-configure-hint" className="conv-configure-hint"><span>Tune {agent} anytime in configure.</span><button className="ghost" type="button" onClick={() => selectAgent(agent, 'configure')}>configure</button></div>
+      <div id="conv-configure-hint" className="conv-configure-hint">
+        <span>Tune {agent} anytime in configure.</span>
+        <button id="conv-new" className="ghost" type="button" onClick={() => newConversation(agent)}>＋ new conversation</button>
+        <button className="ghost" type="button" onClick={() => selectAgent(agent, 'configure')}>configure</button>
+      </div>
+      <div id="conv-recent" className="conv-recent">
+        <div className="conv-current">
+          <span>current conversation</span>
+          <strong title={current || ''}>{active?.title || (current ? 'untitled conversation' : 'say something to start')}</strong>
+        </div>
+        <div className="conv-recent-list" aria-label={`recent conversations with ${agent}`}>
+          {conversations?.status === 'loading' && !recent.length ? <span className="dim-inline">loading conversations…</span>
+            : conversations?.status === 'error' && !recent.length ? <span className="dim-inline">recent conversations unavailable</span>
+              : !recent.length ? <span className="dim-inline">recent conversations will appear here.</span>
+                : recent.slice(0, 6).map((c: any) => (
+                  <button key={c.session} className={`conv-recent-row${c.session === current ? ' on' : ''}`} title={c.session} type="button" onClick={() => openConversation(agent, c.session)}>
+                    <span>{c.title || c.preview || 'conversation'}</span>
+                    <em><span className="source-badge">{c.source || 'you'}</span>{relativeTime(c.last_ts)}</em>
+                  </button>
+                ))}
+        </div>
+      </div>
       <div id="conv-holder" className="conv-feed-holder">
         <div className="conv-feed">
-          {!messages.length && <div className="conv-empty"><p className="conv-empty-mark">⟁</p><p>nothing yet — say something below.<br />asks and replies thread here by correlation.</p></div>}
+          {!messages.length && <div className="conv-empty"><p className="conv-empty-mark">⟁</p><p>nothing yet — say something below.<br />asks and replies stay in this conversation.</p></div>}
           {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `correlation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : m.text}</div></div>)}
         </div>
       </div>
