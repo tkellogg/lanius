@@ -32,6 +32,22 @@
 //!   observations with the session id and a timestamp, matching the existing
 //!   `obs/agent/<name>/<sess>/tool/<name>/{call,result}` grammar (src/exec.rs).
 //!
+//! **Two adapters, two capture mechanisms (one envelope).** The shared envelope —
+//! launch, per-session grant-scoped identity, the obs grammar, the reaper — is
+//! tool-agnostic; only the *capture mechanism* differs, and that is the `Tool`
+//! seam (`Tool::capture`):
+//!
+//! - **Claude Code — a hook bridge.** The launcher inherits the child's stdio and
+//!   the child's own *hooks* (a generated `--settings` config) call
+//!   `elanus code hook <Event>`, which publishes. The launcher parses nothing.
+//! - **Codex — a stdout stream.** Codex 0.141's hooks are plugin/managed-config
+//!   based and a dead end for this (Appendix B), so the Codex adapter does NOT use
+//!   hooks at all: it runs `codex exec --json`, which prints a JSONL event stream
+//!   to stdout. The launcher **pipes the child's stdout, reads it line-by-line as
+//!   JSONL, maps each event, and publishes the obs record itself** (in-process,
+//!   authenticating as the session principal — the same scoped-token identity).
+//!   No `elanus code hook` bridge, no hooks.json, no `~/.codex` pollution at all.
+//!
 //! **Sandbox stance for this increment (recorded in the handoff Log).** We do NOT
 //! bypass Claude Code's own sandbox onto today's elanus cage. Today the cage is a
 //! write-only fence (reads/network open) and is built for one-shot captured
@@ -50,7 +66,7 @@ use crate::paths::Root;
 use crate::topic;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::io::Read as _;
+use std::io::{BufRead as _, Read as _};
 use std::path::Path;
 
 /// Env vars the launcher sets for the child coding-agent process tree, read back
@@ -58,26 +74,37 @@ use std::path::Path;
 const ENV_SESSION: &str = "ELANUS_CODE_SESSION";
 const ENV_AGENT: &str = "ELANUS_CODE_AGENT";
 
-/// The supported adapters. Today only Claude Code; Codex is the next increment.
+/// The supported adapters: Claude Code (hook bridge) and Codex (`exec --json`
+/// stdout stream). They share the envelope; only the capture mechanism differs.
 #[derive(Clone, Copy)]
 enum Tool {
     ClaudeCode,
+    Codex,
+}
+
+/// How the launcher captures a session's activity — the per-tool seam.
+enum Capture {
+    /// The child's own hooks call `elanus code hook` (Claude Code): the launcher
+    /// inherits stdio and parses nothing.
+    HookBridge,
+    /// The launcher pipes the child's stdout and parses its JSONL event stream
+    /// in-process (Codex `exec --json`): no hooks, no home pollution.
+    StreamJson,
 }
 
 impl Tool {
     fn parse(s: &str) -> Result<Tool> {
         match s {
             "claude" | "claude-code" | "cc" => Ok(Tool::ClaudeCode),
-            "codex" => bail!(
-                "the codex adapter is not built yet (next increment); only `claude` is wired"
-            ),
-            other => bail!("unknown coding tool {other:?} (supported: claude)"),
+            "codex" => Ok(Tool::Codex),
+            other => bail!("unknown coding tool {other:?} (supported: claude, codex)"),
         }
     }
     /// The agent noun this tool's sessions publish under: obs/agent/<noun>/...
     fn agent_noun(self) -> &'static str {
         match self {
             Tool::ClaudeCode => "claude-code",
+            Tool::Codex => "codex",
         }
     }
     /// Recover the adapter from the agent noun the launcher recorded in the
@@ -87,6 +114,7 @@ impl Tool {
     fn from_agent_noun(noun: &str) -> Option<Tool> {
         match noun {
             "claude-code" => Some(Tool::ClaudeCode),
+            "codex" => Some(Tool::Codex),
             _ => None,
         }
     }
@@ -94,22 +122,38 @@ impl Tool {
     fn binary(self) -> &'static str {
         match self {
             Tool::ClaudeCode => "claude",
+            Tool::Codex => "codex",
+        }
+    }
+    /// How the launcher captures this adapter's activity (the capture seam).
+    fn capture(self) -> Capture {
+        match self {
+            Tool::ClaudeCode => Capture::HookBridge,
+            // Codex 0.141 hooks are a plugin/managed-config dead end; capture the
+            // `codex exec --json` stdout stream in-process instead (Appendix B).
+            Tool::Codex => Capture::StreamJson,
         }
     }
     /// The generated tool config that routes this adapter's hook events through
-    /// `elanus code hook <Event>` to the bus. Dispatches to the adapter-specific
-    /// generator so the Codex adapter slots in by adding an arm here.
-    fn settings(self, self_exe: &Path, root: &Root) -> Value {
+    /// `elanus code hook <Event>` to the bus. Only the hook-bridge adapter
+    /// (Claude Code) generates one; the stream-parse adapter (Codex) does not use
+    /// hooks at all, so it has no settings (and writes nothing to the tool home).
+    fn settings(self, self_exe: &Path, root: &Root) -> Option<Value> {
         match self {
-            Tool::ClaudeCode => claude_settings(self_exe, root),
+            Tool::ClaudeCode => Some(claude_settings(self_exe, root)),
+            Tool::Codex => None,
         }
     }
     /// Map one of this adapter's hook events + its payload to an obs/ topic leaf
     /// and a trimmed body. Adapter-specific (the hook event names and payload
-    /// shapes differ per tool); the Codex adapter adds its own arm.
+    /// shapes differ per tool). Only the hook-bridge adapter routes through here;
+    /// Codex maps its own JSONL stream events directly in the launcher.
     fn map_event(self, event: &str, payload: &Value) -> (String, Value) {
         match self {
             Tool::ClaudeCode => claude_map_event(event, payload),
+            // Codex never reaches the hook bridge (no hooks); file generically if
+            // it somehow does, so nothing is dropped.
+            Tool::Codex => generic_event(event, payload),
         }
     }
 }
@@ -142,7 +186,9 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
         .with_context(|| format!("minting the session credential for {principal}"))?;
     let bus_token = token.secret.clone();
 
-    // Generated hook config in the session's run scratch — never ~/.claude.
+    // The session's run scratch — for CC, the generated hook config lives here;
+    // for Codex (no hooks) it's still created for symmetry and is empty. Never
+    // ~/.claude / ~/.codex.
     let scratch = root.run_dir().join(&session);
     std::fs::create_dir_all(&scratch)
         .with_context(|| format!("creating run scratch {}", scratch.display()))?;
@@ -150,12 +196,9 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
 
     let self_exe = std::env::current_exe().context("locating the elanus binary for hook commands")?;
     let result = (|| -> Result<std::process::ExitStatus> {
-        let settings = tool.settings(&self_exe, root);
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
-            .with_context(|| format!("writing {}", settings_path.display()))?;
-
         // Session start (the first ordered record): timestamp + the resolved
-        // workdir, so the bus shows when and where the session began.
+        // workdir, so the bus shows when and where the session began. Emitted by
+        // the launcher itself for both adapters, before the child runs.
         let workdir = std::env::current_dir().unwrap_or_else(|_| root.dir.clone());
         publish_obs(
             root,
@@ -170,29 +213,49 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
             }),
         );
 
-        // Launch the real binary with the generated, isolated config. The TUI
-        // gets inherited stdio so it is a normal, fully usable session.
-        // `--setting-sources ''` loads NO user/project/local settings (the
-        // user's ~/.claude hooks/CLAUDE.md are untouched); `--settings <file>`
-        // loads only our generated hooks (Appendix A).
-        let mut cmd = std::process::Command::new(tool.binary());
-        cmd.arg("--settings")
-            .arg(&settings_path)
-            .arg("--setting-sources")
-            .arg("");
-        cmd.args(args);
-        // The session's own identity, carried to the hook bridge children CC
-        // spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are what `elanus bus pub`
-        // authenticates with (src/buscli.rs); ELANUS_CODE_* tell the bridge
-        // which session/agent to file events under.
-        cmd.env("ELANUS_PACKAGE", &principal)
-            .env("ELANUS_BUS_TOKEN", &bus_token)
-            .env(ENV_SESSION, &session)
-            .env(ENV_AGENT, &agent)
-            .env("ELANUS_ROOT", &root.dir);
-        eprintln!("[code] launching {} as session {session}", tool.binary());
-        cmd.status()
-            .with_context(|| format!("launching {} (is it installed and on PATH?)", tool.binary()))
+        match tool.capture() {
+            // ── Claude Code: hook bridge ──────────────────────────────────────
+            // The child's own generated hooks call `elanus code hook`; the
+            // launcher inherits stdio and parses nothing.
+            Capture::HookBridge => {
+                let settings = tool
+                    .settings(&self_exe, root)
+                    .expect("hook-bridge adapter generates settings");
+                std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
+                    .with_context(|| format!("writing {}", settings_path.display()))?;
+
+                // Launch the real binary with the generated, isolated config. The
+                // TUI gets inherited stdio so it is a normal, fully usable
+                // session. `--setting-sources ''` loads NO user/project/local
+                // settings (the user's ~/.claude hooks/CLAUDE.md are untouched);
+                // `--settings <file>` loads only our generated hooks (Appendix A).
+                let mut cmd = std::process::Command::new(tool.binary());
+                cmd.arg("--settings")
+                    .arg(&settings_path)
+                    .arg("--setting-sources")
+                    .arg("");
+                cmd.args(args);
+                // The session's own identity, carried to the hook bridge children
+                // CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are what
+                // `elanus bus pub` authenticates with (src/buscli.rs);
+                // ELANUS_CODE_* tell the bridge which session/agent to file under.
+                cmd.env("ELANUS_PACKAGE", &principal)
+                    .env("ELANUS_BUS_TOKEN", &bus_token)
+                    .env(ENV_SESSION, &session)
+                    .env(ENV_AGENT, &agent)
+                    .env("ELANUS_ROOT", &root.dir);
+                eprintln!("[code] launching {} as session {session}", tool.binary());
+                cmd.status().with_context(|| {
+                    format!("launching {} (is it installed and on PATH?)", tool.binary())
+                })
+            }
+            // ── Codex: stdout JSONL stream ────────────────────────────────────
+            // No hooks. Run `codex exec --json`, pipe stdout, and parse+publish
+            // each event in-process as the session principal.
+            Capture::StreamJson => {
+                run_codex_capture(root, &principal, &bus_token, &agent, &session, args)
+            }
+        }
     })();
 
     // Stop (the last ordered record): always emitted, even on a launch error,
@@ -220,6 +283,323 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+/// Run Codex non-interactively and capture its JSONL event stream, publishing
+/// each mapped event as an obs record (in-process, as the session principal —
+/// the Codex capture path; see the module header).
+///
+/// `codex exec --json --skip-git-repo-check [args…]`, cwd = the workdir, keeping
+/// the user's real `CODEX_HOME` so auth stays intact and nothing is written to
+/// `~/.codex`. We do NOT pass `--dangerously-bypass-approvals-and-sandbox`: Codex
+/// keeps its OWN sandbox active (the complete elanus cage is the deferred
+/// prerequisite, recorded in the handoff Log), exactly as the CC adapter keeps
+/// CC's sandbox. The child gets empty stdin (the prompt comes from the user args,
+/// not stdin) so it never blocks reading stdin. stderr is inherited so the human
+/// still sees Codex's own progress/errors.
+fn run_codex_capture(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    args: &[String],
+) -> Result<std::process::ExitStatus> {
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new("codex");
+    cmd.arg("exec").arg("--json").arg("--skip-git-repo-check");
+    cmd.args(args);
+    // Empty stdin (prompt is in args), piped stdout (we parse it), inherited
+    // stderr (the human sees Codex's own output). We keep the real CODEX_HOME —
+    // setting it to a scratch would drop the user's auth.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    eprintln!("[code] launching codex exec --json as session {session}");
+
+    let mut child = cmd
+        .spawn()
+        .context("launching codex (is it installed and on PATH?)")?;
+
+    // Read stdout line-by-line; each non-empty line is one JSON event. Map and
+    // publish each as the session principal. A malformed line files generically
+    // (nothing is dropped); reading errors stop the loop but never abort the run.
+    if let Some(out) = child.stdout.take() {
+        let reader = std::io::BufReader::new(out);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let event: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    // A non-JSON line (Codex shouldn't emit one under --json, but
+                    // be defensive): record it generically rather than drop it.
+                    let (leaf, body) = generic_event("codex_nonjson_line", &Value::Null);
+                    publish_obs(
+                        root,
+                        principal,
+                        bus_token,
+                        &obs_topic(agent, session, &leaf),
+                        body,
+                    );
+                    continue;
+                }
+            };
+            if let Some((leaf, body)) = codex_map_event(&event) {
+                publish_obs(
+                    root,
+                    principal,
+                    bus_token,
+                    &obs_topic(agent, session, &leaf),
+                    body,
+                );
+            }
+        }
+    }
+
+    child
+        .wait()
+        .context("waiting for codex exec to finish")
+}
+
+/// Map one Codex `exec --json` stream event to an obs/ topic leaf and a trimmed
+/// body, matching the exec.rs grammar (`tool/<name>/{call,result}`, session/turn
+/// leaves). Returns `None` for events we deliberately drop (a redundant
+/// thread-level `session/started` and bare turn markers). The event types and
+/// item.type strings were confirmed against codex 0.141.0
+/// (`codex exec --json`): top-level `thread.started`, `turn.started`,
+/// `item.started`, `item.updated`, `item.completed`, `turn.completed`,
+/// `turn.failed`, `error`; item types `agent_message`, `reasoning`,
+/// `command_execution`, `file_change`, `mcp_tool_call`, `web_search`,
+/// `todo_list`. Anything unmodeled still lands via `generic_event`.
+fn codex_map_event(event: &Value) -> Option<(String, Value)> {
+    let ts = now_iso();
+    let etype = event.get("type").and_then(Value::as_str).unwrap_or("");
+    match etype {
+        // The launcher already emitted its own session/start at launch (workdir +
+        // args). thread.started carries Codex's own thread id: record it as a
+        // distinct leaf (NOT a second session/start) so the thread id is on the
+        // bus without a confusing double session-start.
+        "thread.started" => Some((
+            "session/thread".into(),
+            json!({
+                "ts": ts,
+                "codex_thread": event.get("thread_id").cloned().unwrap_or(Value::Null),
+            }),
+        )),
+        // Bare turn markers: skip turn.started (no payload); turn.completed
+        // carries the token usage (a cost signal) and lands as session/idle.
+        "turn.started" => None,
+        "turn.completed" => {
+            let usage = event.get("usage").cloned().unwrap_or(Value::Null);
+            Some((
+                "session/idle".into(),
+                json!({ "ts": ts, "event": "turn.completed", "usage": usage }),
+            ))
+        }
+        "turn.failed" => Some((
+            "session/idle".into(),
+            json!({
+                "ts": ts,
+                "event": "turn.failed",
+                "error": clip_value(event.get("error"), 4000),
+            }),
+        )),
+        // A top-level error event (e.g. a stream/usage-limit error).
+        "error" => Some((
+            "session/idle".into(),
+            json!({
+                "ts": ts,
+                "event": "error",
+                "error": clip_value(event.get("message").or_else(|| event.get("error")), 4000),
+            }),
+        )),
+        // Item lifecycle: only `item.completed` carries the settled item. We file
+        // command/mcp calls' *result* on completed; the `item.started` for a
+        // command is its *call* (so a tool shows as call→result like CC).
+        "item.started" => codex_map_item(event.get("item")?, /*completed=*/ false, &ts),
+        "item.completed" => codex_map_item(event.get("item")?, /*completed=*/ true, &ts),
+        // item.updated is a streaming partial — skip (the completed item carries
+        // the settled state; updates would be noisy duplicates).
+        "item.updated" => None,
+        // Anything else still lands, tagged by its event type, so nothing is
+        // silently dropped.
+        other => {
+            let (leaf, mut body) = generic_event(other, event);
+            if let Value::Object(m) = &mut body {
+                m.insert("codex_event".into(), json!(other));
+            }
+            Some((leaf, body))
+        }
+    }
+}
+
+/// Map one settled Codex thread item (the `item` object of an `item.started` /
+/// `item.completed` event) to an obs leaf + body. `completed` distinguishes a
+/// command's call (started) from its result (completed). Item types confirmed
+/// against codex 0.141.0; an unmodeled item type files generically.
+fn codex_map_item(item: &Value, completed: bool, ts: &str) -> Option<(String, Value)> {
+    let itype = item.get("type").and_then(Value::as_str).unwrap_or("");
+    let item_id = item.get("id").cloned().unwrap_or(Value::Null);
+    match itype {
+        // The assistant's message to the user.
+        "agent_message" => {
+            if !completed {
+                return None; // the text settles on completed
+            }
+            Some((
+                "assistant/message".into(),
+                json!({
+                    "ts": ts,
+                    "item_id": item_id,
+                    "text": clip_opt(item.get("text"), 4000),
+                }),
+            ))
+        }
+        // The model's reasoning trace (when summaries are emitted).
+        "reasoning" => {
+            if !completed {
+                return None;
+            }
+            Some((
+                "assistant/reasoning".into(),
+                json!({
+                    "ts": ts,
+                    "item_id": item_id,
+                    "text": clip_opt(item.get("text"), 4000),
+                }),
+            ))
+        }
+        // A shell command Codex ran. started → tool/<name>/call,
+        // completed → tool/<name>/result (carrying output + exit code), so it
+        // reads like CC's Bash pre/post pair.
+        "command_execution" => {
+            let leaf = if completed {
+                "tool/command_execution/result"
+            } else {
+                "tool/command_execution/call"
+            };
+            let mut body = json!({
+                "ts": ts,
+                "item_id": item_id,
+                "tool": "command_execution",
+                "command": clip_value(item.get("command"), 2000),
+            });
+            if let Value::Object(m) = &mut body {
+                if completed {
+                    m.insert("failed".into(), json!(!command_succeeded(item)));
+                    m.insert(
+                        "exit_code".into(),
+                        item.get("exit_code").cloned().unwrap_or(Value::Null),
+                    );
+                    m.insert(
+                        "output".into(),
+                        clip_value(item.get("aggregated_output"), 4000),
+                    );
+                }
+                m.insert(
+                    "status".into(),
+                    item.get("status").cloned().unwrap_or(Value::Null),
+                );
+            }
+            Some((leaf.into(), body))
+        }
+        // An edit/write to one or more files (apply_patch). file_change settles on
+        // completed; file it as a file-write leaf carrying the changed paths.
+        "file_change" => {
+            if !completed {
+                return None;
+            }
+            Some((
+                "file/write".into(),
+                json!({
+                    "ts": ts,
+                    "item_id": item_id,
+                    "changes": clip_value(item.get("changes"), 4000),
+                    "status": item.get("status").cloned().unwrap_or(Value::Null),
+                }),
+            ))
+        }
+        // An MCP tool call. started → call, completed → result.
+        "mcp_tool_call" => {
+            let name = item
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp_tool");
+            let leaf = if completed {
+                format!("tool/{}/result", topic::encode_segment(name))
+            } else {
+                format!("tool/{}/call", topic::encode_segment(name))
+            };
+            let mut body = json!({
+                "ts": ts,
+                "item_id": item_id,
+                "tool": name,
+                "server": item.get("server").cloned().unwrap_or(Value::Null),
+                "arguments": clip_value(item.get("arguments"), 2000),
+            });
+            if completed {
+                if let Value::Object(m) = &mut body {
+                    m.insert("result".into(), clip_value(item.get("result"), 4000));
+                    m.insert(
+                        "status".into(),
+                        item.get("status").cloned().unwrap_or(Value::Null),
+                    );
+                }
+            }
+            Some((leaf, body))
+        }
+        // A web search the model ran.
+        "web_search" => {
+            if !completed {
+                return None;
+            }
+            Some((
+                "tool/web_search/result".into(),
+                json!({
+                    "ts": ts,
+                    "item_id": item_id,
+                    "tool": "web_search",
+                    "query": clip_value(item.get("query"), 1000),
+                }),
+            ))
+        }
+        // A todo/plan list update.
+        "todo_list" => {
+            if !completed {
+                return None;
+            }
+            Some((
+                "assistant/todo".into(),
+                json!({
+                    "ts": ts,
+                    "item_id": item_id,
+                    "items": clip_value(item.get("items"), 4000),
+                }),
+            ))
+        }
+        // Any item type this binary doesn't model: file it generically (tagged by
+        // item type) so nothing is dropped. Only on completed to avoid a noisy
+        // started/completed pair for items we don't understand.
+        other => {
+            if !completed {
+                return None;
+            }
+            Some((
+                format!("item/{}", topic::encode_segment(other)),
+                json!({ "ts": ts, "item_id": item_id, "item_type": other }),
+            ))
+        }
+    }
+}
+
+/// A `command_execution` item succeeded iff it completed with exit code 0.
+fn command_succeeded(item: &Value) -> bool {
+    item.get("exit_code").and_then(Value::as_i64) == Some(0)
 }
 
 /// `elanus code hook <event>` — the bridge. Reads the Claude Code hook JSON
@@ -446,8 +826,24 @@ mod tests {
     fn tool_parse() {
         assert!(matches!(Tool::parse("claude"), Ok(Tool::ClaudeCode)));
         assert!(matches!(Tool::parse("cc"), Ok(Tool::ClaudeCode)));
-        assert!(Tool::parse("codex").is_err());
+        assert!(matches!(Tool::parse("codex"), Ok(Tool::Codex)));
         assert!(Tool::parse("nonsense").is_err());
+    }
+
+    #[test]
+    fn capture_strategy_and_agent_noun_per_tool() {
+        // CC uses the hook bridge and generates settings; Codex uses the JSONL
+        // stream and generates NO settings (no hooks, no home pollution).
+        assert!(matches!(Tool::ClaudeCode.capture(), Capture::HookBridge));
+        assert!(matches!(Tool::Codex.capture(), Capture::StreamJson));
+        assert_eq!(Tool::Codex.agent_noun(), "codex");
+        assert_eq!(Tool::Codex.binary(), "codex");
+        assert!(matches!(Tool::from_agent_noun("codex"), Some(Tool::Codex)));
+        let dummy_root = Root {
+            dir: PathBuf::from("/tmp/fake-root"),
+        };
+        assert!(Tool::Codex.settings(Path::new("/usr/local/bin/elanus"), &dummy_root).is_none());
+        assert!(Tool::ClaudeCode.settings(Path::new("/usr/local/bin/elanus"), &dummy_root).is_some());
     }
 
     #[test]
@@ -549,6 +945,208 @@ mod tests {
         let c = clip(&"x".repeat(100), 10);
         assert!(c.starts_with(&"x".repeat(10)));
         assert!(c.contains("clipped 90"));
+    }
+
+    // ── Codex `exec --json` stream mapping ───────────────────────────────────
+
+    #[test]
+    fn codex_thread_started_is_its_own_leaf_not_a_second_session_start() {
+        // thread.started carries Codex's thread id; the launcher already emitted
+        // its own session/start, so this must NOT be a second session/start.
+        let (leaf, body) = codex_map_event(&json!({
+            "type": "thread.started",
+            "thread_id": "019ee252-3d31-7681-b1d7-7a4b3c494fb5",
+        }))
+        .unwrap();
+        assert_eq!(leaf, "session/thread");
+        assert_eq!(body["codex_thread"], "019ee252-3d31-7681-b1d7-7a4b3c494fb5");
+        assert!(body["ts"].is_string());
+    }
+
+    #[test]
+    fn codex_turn_started_is_skipped_completed_carries_usage() {
+        // A bare turn marker is dropped.
+        assert!(codex_map_event(&json!({ "type": "turn.started" })).is_none());
+        // turn.completed carries the token usage (the cost signal) and lands as
+        // session/idle.
+        let (leaf, body) = codex_map_event(&json!({
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 52818,
+                "cached_input_tokens": 49408,
+                "output_tokens": 38,
+                "reasoning_output_tokens": 0
+            }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "session/idle");
+        assert_eq!(body["event"], "turn.completed");
+        assert_eq!(body["usage"]["input_tokens"], 52818);
+        assert_eq!(body["usage"]["output_tokens"], 38);
+    }
+
+    #[test]
+    fn codex_agent_message_is_an_assistant_message() {
+        // Confirmed live shape: {"type":"item.completed","item":{"id":"item_1",
+        // "type":"agent_message","text":"hello"}}.
+        let (leaf, body) = codex_map_event(&json!({
+            "type": "item.completed",
+            "item": { "id": "item_1", "type": "agent_message", "text": "hello" }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "assistant/message");
+        assert_eq!(body["text"], "hello");
+        assert_eq!(body["item_id"], "item_1");
+        // The started form of an agent_message has no settled text → dropped.
+        assert!(codex_map_event(&json!({
+            "type": "item.started",
+            "item": { "id": "item_1", "type": "agent_message", "text": "" }
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn codex_command_execution_maps_call_then_result() {
+        // Confirmed live shapes: item.started (in_progress) is the call;
+        // item.completed (exit_code+aggregated_output) is the result.
+        let (call_leaf, call_body) = codex_map_event(&json!({
+            "type": "item.started",
+            "item": {
+                "id": "item_0", "type": "command_execution",
+                "command": "/bin/zsh -lc 'echo hello'",
+                "aggregated_output": "", "exit_code": null, "status": "in_progress"
+            }
+        }))
+        .unwrap();
+        assert_eq!(call_leaf, "tool/command_execution/call");
+        assert_eq!(call_body["tool"], "command_execution");
+        assert!(call_body["command"].as_str().unwrap().contains("echo hello"));
+
+        let (res_leaf, res_body) = codex_map_event(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_0", "type": "command_execution",
+                "command": "/bin/zsh -lc 'echo hello'",
+                "aggregated_output": "hello\n", "exit_code": 0, "status": "completed"
+            }
+        }))
+        .unwrap();
+        assert_eq!(res_leaf, "tool/command_execution/result");
+        assert_eq!(res_body["failed"], false);
+        assert_eq!(res_body["exit_code"], 0);
+        assert!(res_body["output"].as_str().unwrap().contains("hello"));
+    }
+
+    #[test]
+    fn codex_command_nonzero_exit_is_failed() {
+        let (_, body) = codex_map_event(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_2", "type": "command_execution",
+                "command": "false", "aggregated_output": "", "exit_code": 1,
+                "status": "completed"
+            }
+        }))
+        .unwrap();
+        assert_eq!(body["failed"], true);
+        assert_eq!(body["exit_code"], 1);
+    }
+
+    #[test]
+    fn codex_file_change_is_a_file_write() {
+        let (leaf, body) = codex_map_event(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_3", "type": "file_change", "status": "completed",
+                "changes": [{ "path": "src/foo.rs", "kind": "update" }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "file/write");
+        assert!(body["changes"].as_str().unwrap().contains("src/foo.rs"));
+        // started has no settled change → dropped.
+        assert!(codex_map_event(&json!({
+            "type": "item.started",
+            "item": { "id": "item_3", "type": "file_change", "status": "in_progress" }
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn codex_mcp_tool_call_maps_call_and_result_by_tool_name() {
+        let (leaf, body) = codex_map_event(&json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_4", "type": "mcp_tool_call",
+                "server": "fetch", "tool_name": "get", "status": "completed",
+                "arguments": { "url": "https://x" }, "result": { "ok": true }
+            }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "tool/get/result");
+        assert_eq!(body["tool"], "get");
+        assert_eq!(body["server"], "fetch");
+    }
+
+    #[test]
+    fn codex_web_search_and_todo_and_reasoning() {
+        let (leaf, body) = codex_map_event(&json!({
+            "type": "item.completed",
+            "item": { "id": "i", "type": "web_search", "query": "rust mqtt" }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "tool/web_search/result");
+        assert!(body["query"].as_str().unwrap().contains("rust mqtt"));
+
+        let (leaf, _) = codex_map_event(&json!({
+            "type": "item.completed",
+            "item": { "id": "i", "type": "reasoning", "text": "thinking" }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "assistant/reasoning");
+
+        let (leaf, _) = codex_map_event(&json!({
+            "type": "item.completed",
+            "item": { "id": "i", "type": "todo_list", "items": [] }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "assistant/todo");
+    }
+
+    #[test]
+    fn codex_turn_failed_and_top_level_error_are_recorded() {
+        let (leaf, body) = codex_map_event(&json!({
+            "type": "turn.failed", "error": { "message": "boom" }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "session/idle");
+        assert_eq!(body["event"], "turn.failed");
+        assert!(body["error"].as_str().unwrap().contains("boom"));
+
+        let (leaf, body) = codex_map_event(&json!({
+            "type": "error", "message": "usage limit"
+        }))
+        .unwrap();
+        assert_eq!(leaf, "session/idle");
+        assert!(body["error"].as_str().unwrap().contains("usage limit"));
+    }
+
+    #[test]
+    fn codex_unknown_item_type_lands_generically_nothing_dropped() {
+        // An item type this binary doesn't model still lands (on completed),
+        // tagged by type, so nothing is silently dropped.
+        let (leaf, body) = codex_map_event(&json!({
+            "type": "item.completed",
+            "item": { "id": "i", "type": "some_future_item" }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "item/some_future_item");
+        assert_eq!(body["item_type"], "some_future_item");
+
+        // An unknown top-level event type also lands.
+        let (leaf, body) = codex_map_event(&json!({ "type": "future.event" })).unwrap();
+        assert_eq!(leaf, "event/future.event");
+        assert_eq!(body["codex_event"], "future.event");
     }
 
     #[test]

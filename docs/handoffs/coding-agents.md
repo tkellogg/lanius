@@ -1,10 +1,11 @@
 # Handoff: coding-agent support (Codex & Claude Code)
 
-Status: **M0 launcher scaffolding + M1 hook→bus bridge landed for the Claude Code
-adapter** (2026-06-19, branch `coding-agents`). Verified end to end against the
-live worktree stack. M2–M5 and the Codex adapter are not started. Intended
-implementer for the rest: Codex (with Tim, and possibly a planner agent, in the
-loop). See the Log at the bottom for the as-built decisions.
+Status: **M0 launcher + M1 record landed for BOTH adapters** — Claude Code (hook
+bridge) 2026-06-19, and Codex (`codex exec --json` stdout stream) 2026-06-20,
+branch `coding-agents`. Both verified end to end against the live worktree stack.
+M2–M5 are not started; M2 (the session inbox) is next. See the Log at the bottom
+for the as-built decisions (the two adapters share one envelope but differ in their
+*capture mechanism* — CC's hooks vs Codex's JSONL stream).
 
 This handoff asks elanus to **launch and supervise external coding agents** — the
 Codex CLI/TUI and Claude Code — and bridge their lifecycle, tools, and context
@@ -649,13 +650,121 @@ owner-equivalent, and a SIGKILL leaked the live credential. This pass closed it.
   scope, not just shape), with the codeagent secret-roundtrip test replaced by a
   scoped-token regression guard.
 
+### 2026-06-20 — Codex adapter (M1 parity) via `codex exec --json` (branch `coding-agents`)
+
+The Codex adapter reaches M1 parity with the CC adapter: the same envelope (launch,
+grant-scoped per-session identity, the obs grammar, the reaper) with a **different
+capture mechanism**. The `Tool` enum is the seam (`Tool::capture` →
+`Capture::{HookBridge, StreamJson}`).
+
+- **Capture = the `codex exec --json` stdout stream, NOT hooks (the key design
+  decision).** Codex 0.141.0's hooks are plugin/managed-config based (Appendix B):
+  `type=command` hooks need a Codex *trust review* for non-managed hooks, and the
+  managed/plugin layer is a dead end for a per-launch, no-home-pollution bridge —
+  there is no clean way to inject a temporary generated hook the way CC's
+  `--settings` does. The clean path is `codex exec --json --skip-git-repo-check`,
+  which prints a **JSONL event stream to stdout**. So the Codex adapter is
+  fundamentally different from the CC adapter: where CC inherits stdio and the
+  child's *hooks* call `elanus code hook` (the launcher parses nothing), the Codex
+  launcher **pipes the child's stdout, reads it line-by-line as JSONL, maps each
+  event, and publishes the obs record itself** — in-process, authenticating as the
+  session principal (`ELANUS_PACKAGE`/`ELANUS_BUS_TOKEN` like `publish_obs` already
+  sets). **No `elanus code hook` bridge for codex, no hooks.json, no `~/.codex`
+  pollution at all.** Why the stream is cleaner: one process reads one stdout pipe
+  in-order (no concurrent hook fan-out, no trust-review prompt, no managed-config
+  file to write into the user's home), and it's strictly more observable (every
+  thread item, not just the events a hook set models). Code: `run_codex_capture` +
+  `codex_map_event` / `codex_map_item` in `src/codeagent.rs`; the launcher branches
+  on `Tool::capture()`.
+
+- **Launch.** `codex exec --json --skip-git-repo-check [user args…]`, cwd = the
+  workdir, **keeping the user's real `CODEX_HOME`** (auth intact, zero pollution —
+  setting it to a scratch would drop auth). Empty stdin (`Stdio::null` — the prompt
+  comes from the user args, so the child never blocks reading stdin), piped stdout
+  (parsed), inherited stderr (the human still sees Codex's own progress). The
+  launcher emits its OWN `session/start` (workdir + args) before the child runs, as
+  for CC.
+
+- **Event model — confirmed live against codex 0.141.0** (one guarded
+  `codex exec --json` run inside the worktree, plus the binary's serde tags).
+  Top-level event types: `thread.started`, `turn.started`, `item.started`,
+  `item.updated`, `item.completed`, `turn.completed`, `turn.failed`, `error`. Item
+  types (`item.{type}`): **`agent_message`, `reasoning`, `command_execution`,
+  `file_change`, `mcp_tool_call`, `web_search`, `todo_list`**. Mapping to the
+  exec.rs obs grammar:
+  - `thread.started` → `session/thread` (carries codex's `thread_id` as
+    `codex_thread`) — a DISTINCT leaf, NOT a second `session/start` (the launcher
+    already emitted that), so the thread id lands without a confusing double start.
+  - `turn.started` → skipped (bare marker); `turn.completed` → `session/idle`
+    carrying `usage` (`input_tokens`/`cached_input_tokens`/`output_tokens`/
+    `reasoning_output_tokens` — the cost signal, kept); `turn.failed` / top-level
+    `error` → `session/idle` with the error.
+  - `command_execution`: `item.started` → `tool/command_execution/call`,
+    `item.completed` → `tool/command_execution/result` (carries `command`,
+    `exit_code`, `failed = exit_code != 0`, `aggregated_output`), so a shell command
+    reads like CC's Bash call→result pair.
+  - `file_change` (completed) → `file/write` (carries the `changes` array: path +
+    add/update/delete).
+  - `mcp_tool_call` → `tool/<tool_name>/{call,result}`; `web_search` →
+    `tool/web_search/result`; `agent_message` → `assistant/message`; `reasoning` →
+    `assistant/reasoning`; `todo_list` → `assistant/todo`.
+  - `item.updated` is a streaming partial → skipped (the completed item carries the
+    settled state). Any unmodeled event type or item type still lands generically
+    (`event/<type>` / `item/<type>`) — like CC's `generic_event` — so nothing is
+    dropped. A non-JSON stdout line (shouldn't happen under `--json`) lands as
+    `event/codex_nonjson_line` rather than being dropped.
+
+- **Sandbox stance — unchanged from the CC adapter, deliberately.** We do NOT pass
+  `--dangerously-bypass-approvals-and-sandbox`: Codex keeps its OWN sandbox active
+  (Seatbelt/bubblewrap, `read-only`/`workspace-write`/`danger-full-access`), exactly
+  as the CC adapter keeps CC's sandbox. The complete elanus cage (write + read +
+  egress) is the deferred core prerequisite for the single-cage bypass; until it
+  lands, bypassing onto today's write-only fence would be a containment regression.
+  elanus owns the workdir + observation + identity; the tool owns containment.
+
+- **Identity — same scoped-token path end to end.** The codex session publishes as
+  `sender = code-<session>`, scoped to its own `obs/agent/codex/<session>/#`
+  (`codesession::mint` derives the scope from the agent noun `codex`). The launcher
+  publishes the mapped events in-process by setting `ELANUS_PACKAGE`/
+  `ELANUS_BUS_TOKEN` (the grant-scoped token) before each `buscli::publish`, so the
+  broker stamps the session — never the owner.
+
+- **Tests + verification.** `cargo test` green, **105 passing** (was 93): +12 in
+  `codeagent` covering the JSONL → obs mapping (thread.started ≠ a second
+  session/start; turn.completed usage; command call→result + non-zero-exit failure;
+  file_change → file/write; mcp_tool_call by tool name; web_search/reasoning/
+  todo_list; turn.failed + top-level error; unknown event/item lands generically;
+  the capture-strategy/settings-per-tool seam). **ONE guarded live run** through the
+  launcher (isolated worktree daemon on the worktree root `~/.elanus/wt-coding-agents`,
+  broker `:1893` — the main `~/.elanus/root` daemon was never touched): a real
+  `codex exec --json` "echo elanus-codex-probe" run produced the full ordered,
+  broker-stamped record — `session/start → session/thread → tool/command_execution/
+  call → tool/command_execution/result (failed:false, exit_code:0, output
+  "elanus-codex-probe\n") → session/idle (turn.completed usage) → session/stop
+  (exit_code:0)` — **every record stamped `sender = code-<session>`** (verified in
+  the worktree root's `trace.jsonl`, the broker's verified-sender ledger). `~/.codex`
+  config **untouched**: `config.toml` and `auth.json` mtimes unchanged (elanus wrote
+  no config, auth intact); only codex's own `models_cache.json` refreshed on startup
+  (same size, the tool's own state — exactly the CC-adapter guarantee: "elanus
+  changes no user config," the tool still writes its own session/cache state).
+
 ### Still TODO (next increments)
 
 - Posture-mode → cage mapping (Codex read-only/workspace-write/full ↔ cage write +
   read + egress) and the complete cage (incl. read scoping) before bypass: BLOCKED
-  on the docs/sandbox.md end-state cage; deferred per the stance above.
-- Codex adapter (hook JSON payloads; `--dangerously-bypass-hook-trust` scoping;
-  context-injection placement developer/system vs user).
+  on the docs/sandbox.md end-state cage; deferred per the stance above. Applies to
+  both adapters (each keeps its own sandbox until the end-state cage lands).
+- M2 inbox (inbound delivery) for both adapters — the next milestone. Interactive
+  pull vs headless resume (`codex exec resume`, `claude -p --resume`). When M2 grants
+  a session *read* authority (its inbox), extend its `subscribe` scope in
+  `codesession` (today it is empty — emit-only).
+- Codex context-injection placement (M3): confirm whether Codex's prompt-hook
+  injection lands as developer/system vs user text, and prefer the out-of-band
+  channel for parity with CC's system-reminder seam. (Codex's plugin hooks were a
+  dead end for *capture*; M3 injection is a separate question to re-verify.)
+- ~~Codex adapter (M1 parity)~~ — **DONE 2026-06-20** via `codex exec --json` (see
+  the Log entry above). Hooks were ruled out (plugin/managed dead end); the stdout
+  JSONL stream is the capture path.
 - Context-injection placement per tool + measured cache behavior (M3, the
   `UserPromptSubmit` `additionalContext` system-reminder seam).
 - Inbound-delivery mechanism (M2 inbox: interactive pull vs headless `--resume`).
