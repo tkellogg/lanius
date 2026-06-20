@@ -41,6 +41,7 @@
 use crate::paths::Root;
 use crate::secrets;
 use anyhow::{bail, Context, Result};
+use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -127,6 +128,56 @@ pub fn read_record(root: &Root, elanus_session: &str) -> Result<Option<SessionRe
         )
         .ok();
     Ok(rec)
+}
+
+// ── Delivery idempotency (M4-A) ───────────────────────────────────────────────
+//
+// Driven deliveries are at-least-once (docs/handoffs/coding-agents.md): a daemon
+// crash mid-resume re-pends the claimed event on the next start, which would
+// otherwise drive a SECOND resume of an already-acted-on turn. Each delivery
+// carries a key (an explicit payload `idempotency_key`, else the inbound event
+// id); we record it DURABLY the moment the delivery is claimed, so the replay
+// after a restart is recognized and skipped — not just a same-process duplicate.
+
+/// Record a delivery's idempotency key as processed. Returns `true` if this is
+/// the FIRST time the key is seen (the delivery should be driven), `false` if the
+/// key was already recorded (a duplicate — the caller skips the resume as a clean
+/// no-op). Atomic via `INSERT … ON CONFLICT DO NOTHING`, so two concurrent claims
+/// of the same key cannot both win the race. Durable: survives a restart, so the
+/// at-least-once replay is caught.
+pub fn claim_delivery_key(
+    root: &Root,
+    key: &str,
+    session: &str,
+    event_id: i64,
+) -> Result<bool> {
+    let conn = crate::db::open(root).context("opening the ledger for the delivery key")?;
+    crate::db::init_schema(&conn)?;
+    let inserted = conn.execute(
+        "INSERT INTO code_delivery_keys (idempotency_key, session, event_id)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(idempotency_key) DO NOTHING",
+        rusqlite::params![key, session, event_id],
+    )?;
+    Ok(inserted == 1)
+}
+
+/// Has this delivery key already been processed? A read-only check (the claim
+/// itself is `claim_delivery_key`). Best-effort: a db error reads as "not seen"
+/// so a transient failure never silently drops a real delivery.
+pub fn delivery_key_seen(root: &Root, key: &str) -> bool {
+    let Ok(conn) = crate::db::open(root) else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT 1 FROM code_delivery_keys WHERE idempotency_key = ?1",
+        [key],
+        |_| Ok(()),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .is_some()
 }
 
 /// Bump a record's `last_active` to now (after a resume completes). Best-effort.
@@ -475,6 +526,26 @@ mod tests {
         touch_record(&root, "code-cafef00d").unwrap();
         let again = read_record(&root, "code-cafef00d").unwrap().unwrap();
         assert_eq!(again.native_session, "thread-2");
+    }
+
+    #[test]
+    fn delivery_key_claim_is_once_and_durable() {
+        let root = tmp_root();
+        // First claim of a key wins; the key is now seen.
+        assert!(!delivery_key_seen(&root, "event:5"));
+        assert!(claim_delivery_key(&root, "event:5", "code-x", 5).unwrap());
+        assert!(delivery_key_seen(&root, "event:5"));
+        // A second claim of the SAME key loses (a duplicate — the at-least-once
+        // replay): it must NOT drive a second resume.
+        assert!(!claim_delivery_key(&root, "event:5", "code-x", 5).unwrap());
+        // A different key is independent.
+        assert!(claim_delivery_key(&root, "planner-step-2", "code-y", 9).unwrap());
+        // Durable across a fresh connection (a restart): the row is in the ledger,
+        // so the replayed delivery is still recognized.
+        assert!(delivery_key_seen(&root, "event:5"));
+        assert!(delivery_key_seen(&root, "planner-step-2"));
+        assert!(!delivery_key_seen(&root, "event:999"));
+        let _ = std::fs::remove_dir_all(&root.dir);
     }
 
     #[test]

@@ -2,11 +2,12 @@
 
 Status: **M0+M1 landed for BOTH adapters; M2-A (durable resumable sessions + the
 resume primitive) landed 2026-06-20; M2-B (daemon-driven inbound delivery off a
-session mailbox → resume) landed 2026-06-20** — Claude Code (hook bridge)
-2026-06-19, Codex (`codex exec --json` stdout stream) 2026-06-20, branch
-`coding-agents`. All verified end to end against the live worktree stack. **M4 (the
-planner side — an agent sending work + waking on the completion obs) and M3
-(interactive pull / a session read grant) are next/deferred; M5 is not started.**
+session mailbox → resume) landed 2026-06-20; M4-A (the orchestration loop closing:
+requester capture → completion routing → idempotency) landed 2026-06-20** — Claude
+Code (hook bridge) 2026-06-19, Codex (`codex exec --json` stdout stream) 2026-06-20,
+branch `coding-agents`. All verified end to end against the live worktree stack.
+**M4-B (the mediated dispatch tool + the launch-envelope briefing) is the next
+slice, then M3 (interactive pull / a session read grant), then M5.**
 See the Log at the bottom for the as-built decisions (the two adapters share one
 envelope but differ in their *capture mechanism* — CC's hooks vs Codex's JSONL
 stream; the durable-session split-record model is in the M2-A entry; the
@@ -1025,7 +1026,138 @@ already has authority) reads the delivery and drives the M2-A resume primitive.
     per-resume token retired); **`~/.codex` config untouched** (`config.toml` /
     `auth.json` mtimes predate the run).
 
+### 2026-06-20 — M4-A: the orchestration loop closes (requester capture → completion routing → idempotency) (branch `coding-agents`)
+
+M2-B delivered work to a worker and observed the result but left the loop open: a
+worker's completion was never routed back to whoever asked, so a planner could not
+be woken to react. M4-A closes that loop — **a worker's completion is delivered to
+the requester's mailbox, which (when the requester is itself a coding session)
+resumes the planner via the SAME M2-B machinery** — plus a durable idempotency key
+so the at-least-once duplicate can't double-act. The planner symmetry holds: a
+planner is just a resumable session whose mailbox carries the worker's completion.
+**M4-B (the mediated dispatch tool + the launch-envelope briefing) is deferred** —
+see the note at the end of this entry. (Built + verified in the isolated worktree
+stack: root `~/.elanus/wt-coding-agents`, broker `:1893`; the main `~/.elanus/root`
+on `:1883` was never touched — its `elanus.db` has no `code_sessions` table at all,
+so it could not have been.)
+
+- **Requester capture — where.** `drive_code_deliveries` (src/dispatcher.rs) now
+  reads the materialized delivery row's broker-verified `sender` and JSON `payload`
+  alongside the topic. `codeagent::delivery_requester(root, payload, sender, corr)`
+  resolves who to reply to, with precedence: (1) an explicit `reply_to` in the
+  payload — a full `in/` topic verbatim (must be wildcard-free), or a bare actor
+  name expanded to that actor's mailbox; else (2) the broker-verified `sender`.
+  A coding-session requester (`code-*` with a durable record) resolves to its OWN
+  session mailbox `in/agent/<its-noun>/<session>`, so routing the completion there
+  resumes it. The `kernel`/`owner` senders are NOT planners waiting on a completion
+  → None (a plain owner delivery routes nothing — the M2-B behavior, unchanged).
+  The captured requester rides the in-flight `CodeJob` → `CodeDone` so the settle
+  step can route it. **The session token is NOT widened** — the daemon (which
+  already holds authority) does the routing emit; the session stays emit-only.
+
+- **Completion routing — where.** `settle_code_deliveries` (src/dispatcher.rs),
+  after the existing `obs/agent/code/delivery/complete` obs (kept), now — if the
+  delivery named a requester — emits a delivery to that requester's mailbox carrying
+  the SAME `correlation_id`, a `prompt` (what resumes a coding-session planner), the
+  success/failure flag, a concise `result` line, and a `worker_obs` pointer to the
+  worker's `obs/agent/<noun>/<session>/#` subtree (so the planner reads recorded
+  state before acting — the honest-state guidance). It is a kernel-minted ledger
+  event (`sender=kernel`), inserted `pending`, so `drive_code_deliveries` picks it up
+  the next tick and resumes the planner exactly like any other delivery — that is
+  the loop closing, reusing M2-B end to end with no new path. **A worker FAILURE
+  routes too** (the synthetic-failure paths in `enqueue_code_job` carry the
+  requester), so a planner's loop is not left hanging on a worker that never started.
+
+- **Idempotency — how it dedupes + survives restart.** Each delivery carries a key:
+  `codeagent::idempotency_key(payload, event_id)` = an explicit payload
+  `idempotency_key` if present, else `event:<inbound-event-id>` (stable across the
+  at-least-once replay, which re-pends the SAME row with the SAME id). A new DURABLE
+  table `code_delivery_keys` (src/db.rs, keyed by the key) records a processed
+  delivery; `codesession::claim_delivery_key` does an atomic
+  `INSERT … ON CONFLICT DO NOTHING` (returns true only for the first claimant), and
+  `delivery_key_seen` is the read-side check. In `drive_code_deliveries` a delivery
+  whose key is already present is settled `done` as a recognized no-op
+  (`obs/agent/code/delivery/duplicate`, `reason: already processed`) — NO second
+  resume. The row is durable, so the replay a daemon-crash-mid-resume re-pends
+  (boot's `running → pending` sweep) is caught across the restart, not just a
+  same-process duplicate. The routed completion also carries
+  `idempotency_key = code-complete:<worker-event-id>` so a replayed completion
+  dedupes when it drives the planner.
+
+- **Live evidence — the deliver→worker→completion→planner-resume chain.** Two real
+  idle codex sessions: worker `W = code-e4da979b` (`/private/tmp/m4a-worker`),
+  planner `P = code-021d43f4` (`/private/tmp/m4a-planner`). Published to `W`'s
+  mailbox `{"prompt":"…M4A-WORKER-DID-THE-WORK…","reply_to":"in/agent/codex/
+  code-021d43f4"}` (`--correlation m4a-loop-1`, as `owner`). Result, all from the
+  worktree-root ledger/`trace.jsonl`:
+  - **W resumed and acted** — `assistant/message "M4A-WORKER-DID-THE-WORK"`, stamped
+    `sender=code-e4da979b`. The delivery (event 75) settled `done`.
+  - **The completion routed to P** — event 78, `in/agent/codex/code-021d43f4`,
+    `sender=kernel`, **same `correlation_id=m4a-loop-1`**, payload `{prompt, failed:
+    false, worker:"code-e4da979b", worker_obs:"obs/agent/codex/code-e4da979b/#",
+    idempotency_key:"code-complete:75"}`.
+  - **P was then resumed and reacted** — a NEW turn, `sender=code-021d43f4`,
+    "I'll read the worker transcript/state first… Given the completion report says
+    success…". That chain (deliver → worker resume → completion → planner resume),
+    each session stamped with its own `sender=code-<session>`, is the headless loop.
+
+- **Live evidence — idempotency (the no-op).** Re-published the same delivery twice
+  with an explicit `idempotency_key:"m4a-dup-key-1"` (`m4a-dup-A`, `m4a-dup-B`): the
+  first (event 80) was `accepted` and drove ONE resume (W: "Understood."); the second
+  (event 81, same key) was the recognized `duplicate` (`reason: already processed`),
+  settled `done`, **NO second resume** (W's assistant-turn count went 2→3, not →4).
+
+- **Live evidence — the mid-resume crash replay.** Published a delivery
+  (`idempotency_key:"m4a-crash-key"`, event 83); SIGKILL'd the daemon; forced the
+  event back to `running` (the state a crash leaves — claimed, never settled, key
+  recorded); restarted. The boot sweep re-pended event 83 (`running → pending`); the
+  durable key made the re-drive a recognized no-op (`duplicate`, `already
+  processed`), event 83 settled `done`, **W's turn count unchanged at 3, zero resume
+  of W in the restarted daemon log**. The replay was caught across the restart.
+
+- **No regression.** A normal delivery to `W` with no requester (owner, no reply_to)
+  resumed the worker (W 3→4 turns) and routed NOTHING (P unchanged, zero routed
+  events). Ordinary agent dispatch (`in/agent/kestrel/conv-xyz`) settled `done` via
+  the existing no-consumer `dispatch_pending` path, never touched the coding path,
+  daemon stayed up (no panic). **No idle credential** after (`.secrets/code-sessions/`
+  empty); **`~/.codex` config untouched** (`config.toml` 2026-06-19 09:33,
+  `auth.json` 2026-06-16 22:00 — both predate the run); the main root never touched.
+
+- **Tests.** `cargo test` green, **129 passing** (was 120): +5 in `codeagent`
+  (`idempotency_key` precedence; `delivery_requester` from explicit reply_to topic /
+  from a coding-session sender → its own mailbox / None for owner-kernel-unrecorded /
+  native-agent sender uses the correlation conv), +1 in `codesession`
+  (`claim_delivery_key` is once-and-durable, the replay loses, survives a fresh
+  connection), +3 in `dispatcher` (drive captures the requester from the sender; a
+  replayed delivery with the same key is a no-op with no second job; settle routes a
+  completion to the requester's mailbox, pending, same correlation, with the prompt +
+  idempotency key).
+
+- **Deferred to M4-B (NOT built — noted per the spec):**
+  - **The mediated dispatch tool** — a CLI/MCP a planner calls (e.g. `elanus code
+    deliver <session> "<msg>"` or an elanus MCP tool) that performs the delivery to a
+    worker's mailbox **with elanus's authority** and records the planner as the
+    requester, so the session's emit-only token never has to publish into another
+    mailbox. M4-A only wired the loop that closes once a delivery is in a worker's
+    mailbox; how a coding-session planner *originates* that delivery (without
+    widening its token) is M4-B. (Today a planner's delivery would have to be placed
+    by the human/owner or a native agent; the routing back is what M4-A added.)
+  - **The launch-envelope briefing** — injecting the operating-modes briefing at
+    launch (`--append-system-prompt` for CC; the Codex equivalent) so a planner ends
+    its turn cleanly after dispatching and is resumed on completion rather than
+    busy-waiting. The one-time briefing rides the launch flag (it does not need M3).
+  - Honest residual: the settle UPDATE and the routed emit are not one transaction,
+    so a daemon crash in that tiny gap settles the worker delivery but loses the
+    route (the planner would not be woken) — at-most-once for the route itself, the
+    same property the `obs/.../complete` emit already had. Acceptable for M4-A
+    (the spec's idempotency goal is "don't double-act"); a transactional route or a
+    re-derivable-from-`done` route is a hardening for later if a lost wake bites.
+
 ### Still TODO (next increments)
+- **M4-B — the mediated dispatch tool + the launch-envelope briefing.** The two
+  deferred pieces above: how a coding-session planner *originates* a delivery to a
+  worker with elanus authority (the session token stays emit-only), and the
+  one-time operating-envelope briefing at launch so a planner ends its turn cleanly.
 - **M3 interactive-pull / session read grant.** When a session is given read
   authority over its own inbox, extend its `subscribe` scope in `codesession`
   (today empty — emit-only). M2-A deliberately did NOT do this.

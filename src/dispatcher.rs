@@ -85,6 +85,11 @@ struct CodeJob {
     event_id: i64,
     correlation: Option<String>,
     message: String,
+    /// Where to route the worker's completion (M4-A): the requester captured from
+    /// the inbound delivery (explicit `reply_to`, else the broker-verified
+    /// `sender`). None = a plain worker resume with no one waiting (the M2-B
+    /// behavior, unchanged).
+    requester: Option<crate::codeagent::DeliveryRequester>,
 }
 
 /// A worker thread's outcome for one delivery, reported back to the tick loop so
@@ -98,6 +103,12 @@ struct CodeDone {
     /// Some(success) = the tool ran and exited (success=false on a non-zero/timeout).
     success: Option<bool>,
     detail: String,
+    /// Where to route the completion (M4-A): carried through from the job so the
+    /// settle step can deliver to the requester's mailbox. None = no routing.
+    requester: Option<crate::codeagent::DeliveryRequester>,
+    /// The worker's final result/summary text for the routed completion (the
+    /// resume's outcome detail) — enough for a planner to react.
+    result: String,
 }
 
 /// A live per-session worker: its job queue sender plus how many deliveries are
@@ -895,8 +906,8 @@ fn settle_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers
             params![state, done.event_id],
         )?;
         // A small completion obs so a waiter can thread the result by the
-        // delivery's correlation_id (M4's planner reads this). Kernel-emitted, so
-        // the announce sweep delivers it; it carries no read authority.
+        // delivery's correlation_id (a dashboard / monitor reads this). Kernel-
+        // emitted, so the announce sweep delivers it; it carries no read authority.
         let _ = events::emit(
             root,
             conn,
@@ -911,6 +922,85 @@ fn settle_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers
                 ..EmitOpts::new("obs/agent/code/delivery/complete")
             },
         );
+        // Route the completion to the requester's mailbox (M4-A — the loop
+        // closing). When the original delivery named a requester (an explicit
+        // reply_to, else the broker-verified sender), publish the completion to
+        // that mailbox carrying the SAME correlation_id, so a planner is resumed to
+        // react. If the requester is itself a coding session, the EXISTING M2-B
+        // machinery (`drive_code_deliveries`) picks this pending in/agent event up
+        // next tick and resumes the planner — exactly like any other delivery; that
+        // is the headless loop. The payload carries a `prompt` (what resumes a
+        // coding-session planner), the success/failure, the worker session, and a
+        // pointer to the worker's recorded obs subtree so the planner reads actual
+        // state before acting. It is a kernel-minted ledger event (sender=kernel),
+        // so the announce sweep delivers it and it carries no session authority.
+        if let Some(req) = &done.requester {
+            if crate::topic::valid_name(&req.reply_to) {
+                let noun = crate::codesession::read_record(root, &done.session)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.agent_noun)
+                    .unwrap_or_default();
+                let obs_pointer = if noun.is_empty() {
+                    Value::Null
+                } else {
+                    json!(format!(
+                        "obs/agent/{}/{}/#",
+                        crate::topic::encode_segment(&noun),
+                        crate::topic::encode_segment(&done.session),
+                    ))
+                };
+                let result_line = trace::clip(&done.result, 4000);
+                let prompt = format!(
+                    "Worker session {} has completed the work you dispatched (success={}). \
+                     Result: {}. Its full transcript is on the bus under {}. \
+                     Read the recorded state, then decide the next step.",
+                    done.session,
+                    !failed,
+                    result_line,
+                    obs_pointer.as_str().unwrap_or("its obs subtree"),
+                );
+                let routed = events::emit(
+                    root,
+                    conn,
+                    EmitOpts {
+                        payload: Some(json!({
+                            "prompt": prompt,
+                            "worker": done.session,
+                            "failed": failed,
+                            "result": result_line,
+                            "worker_obs": obs_pointer,
+                            // Carry an idempotency key on the routed delivery too so a
+                            // replayed completion (a crash after the routed emit but
+                            // before settle) dedupes when it drives the planner.
+                            "idempotency_key": format!("code-complete:{}", done.event_id),
+                        })),
+                        // Thread the planner's resume by the SAME correlation the
+                        // requester used, so the round trip is one conversation.
+                        correlation: done.correlation.clone(),
+                        cause: Some(done.event_id),
+                        ..EmitOpts::new(&req.reply_to)
+                    },
+                );
+                match routed {
+                    Ok(rid) => trace::write(
+                        root,
+                        "obs/agent/code/delivery/routed",
+                        &trace::Ids { event_id: Some(rid), correlation_id: done.correlation.clone(), ..Default::default() },
+                        json!({ "worker": done.session, "reply_to": req.reply_to, "failed": failed }),
+                    ),
+                    Err(e) => eprintln!(
+                        "[daemon] routing completion of {} to {} failed: {e:#}",
+                        done.session, req.reply_to
+                    ),
+                }
+            } else {
+                eprintln!(
+                    "[daemon] completion of {} has an unroutable reply_to {:?}; dropping the route",
+                    done.session, req.reply_to
+                );
+            }
+        }
         // Retire a now-idle worker (inflight back to 0): drop the sender so the
         // thread's recv() ends and it joins out. A later delivery to the same
         // session simply spawns a fresh worker.
@@ -934,18 +1024,34 @@ fn settle_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers
 fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers) -> Result<()> {
     // Only `in/agent/*` pending events can be a delivery — let the SQL prefilter
     // do the obvious narrowing so a busy daemon doesn't scan every pending event.
-    let pending: Vec<(i64, String, Option<String>, Option<String>)> = {
+    // A small row struct (vs a 5-tuple) keeps the delivery's sender/payload named.
+    struct PendingDelivery {
+        id: i64,
+        etype: String,
+        corr: Option<String>,
+        payload: Option<String>,
+        sender: Option<String>,
+    }
+    let pending: Vec<PendingDelivery> = {
         let mut stmt = conn.prepare(
-            "SELECT id, type, correlation_id, payload FROM events
+            "SELECT id, type, correlation_id, payload, sender FROM events
              WHERE state='pending' AND type LIKE 'in/agent/%'
              ORDER BY priority DESC, id ASC LIMIT 100",
         )?;
         let r = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .query_map([], |r| {
+                Ok(PendingDelivery {
+                    id: r.get(0)?,
+                    etype: r.get(1)?,
+                    corr: r.get(2)?,
+                    payload: r.get(3)?,
+                    sender: r.get(4)?,
+                })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         r
     };
-    for (id, etype, corr, payload) in pending {
+    for PendingDelivery { id, etype, corr, payload, sender } in pending {
         if code.claimed.contains(&id) {
             continue; // already handed to a worker this process; row not yet settled
         }
@@ -956,6 +1062,26 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(Value::Null);
+        // Idempotency (M4-A): a delivery whose key was already processed is the
+        // at-least-once duplicate (a crash mid-resume re-pends the same row). Skip
+        // the resume and settle it `done` — a clean no-op — so the replay does NOT
+        // drive a second turn. Checked BEFORE the durable claim so a replayed row
+        // (re-pended, same id) is recognized even across a restart.
+        let key = crate::codeagent::idempotency_key(&pv, id);
+        if crate::codesession::delivery_key_seen(root, &key) {
+            conn.execute(
+                "UPDATE events SET state='done', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id=?1 AND state='pending'",
+                [id],
+            )?;
+            trace::write(
+                root,
+                "obs/agent/code/delivery/duplicate",
+                &trace::Ids { event_id: Some(id), correlation_id: corr.clone(), ..Default::default() },
+                json!({ "session": session, "idempotency_key": key, "reason": "already processed" }),
+            );
+            continue;
+        }
         let Some(message) = crate::codeagent::delivery_message(&pv) else {
             // A delivery with no prompt/text is not drivable: settle it done
             // (it WAS delivered, there is just nothing to resume on) rather than
@@ -973,9 +1099,43 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
             );
             continue;
         };
+        // Record the idempotency key DURABLY as part of claiming (M4-A). This is
+        // the durable guard the at-least-once replay is checked against above; the
+        // race-free INSERT also means two concurrent claims of the same key cannot
+        // both proceed. If the key was just taken by another claimant, this row is
+        // the loser of the race — settle it as a no-op and move on.
+        match crate::codesession::claim_delivery_key(root, &key, &session, id) {
+            Ok(true) => {} // first claimant — proceed to drive
+            Ok(false) => {
+                conn.execute(
+                    "UPDATE events SET state='done', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE id=?1 AND state='pending'",
+                    [id],
+                )?;
+                trace::write(
+                    root,
+                    "obs/agent/code/delivery/duplicate",
+                    &trace::Ids { event_id: Some(id), correlation_id: corr.clone(), ..Default::default() },
+                    json!({ "session": session, "idempotency_key": key, "reason": "key claimed concurrently" }),
+                );
+                continue;
+            }
+            Err(e) => {
+                // Couldn't record the key — don't drive (we'd risk a double-act on
+                // replay). Leave the row pending; the next tick retries.
+                eprintln!("[daemon] recording delivery key for event {id} failed: {e:#}");
+                continue;
+            }
+        }
+        // Who to route the completion back to (M4-A): the explicit reply_to, else
+        // the broker-verified sender. None for a plain owner/kernel delivery (the
+        // M2-B behavior, unchanged — worker resumes, no routing).
+        let requester =
+            crate::codeagent::delivery_requester(root, &pv, sender.as_deref(), corr.as_deref());
         // Claim it durably BEFORE hand-off: a restart mid-resume re-pends a
         // `running` event and replays it (at-least-once). The in-memory guard
-        // stops a same-process re-claim while the worker drains it.
+        // stops a same-process re-claim while the worker drains it. (The durable
+        // idempotency key above is what makes that replay a no-op, not a re-drive.)
         conn.execute(
             "UPDATE events SET state='running' WHERE id=?1 AND state='pending'",
             [id],
@@ -985,13 +1145,18 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
             root,
             "obs/agent/code/delivery/accepted",
             &trace::Ids { event_id: Some(id), correlation_id: corr.clone(), ..Default::default() },
-            json!({ "session": session, "type": etype }),
+            json!({
+                "session": session,
+                "type": etype,
+                "idempotency_key": key,
+                "reply_to": requester.as_ref().map(|r| r.reply_to.clone()),
+            }),
         );
         enqueue_code_job(
             root,
             code,
             &session,
-            CodeJob { event_id: id, correlation: corr, message },
+            CodeJob { event_id: id, correlation: corr, message, requester },
         );
     }
     Ok(())
@@ -1022,13 +1187,19 @@ fn enqueue_code_job(root: &Root, code: &mut CodeDrivers, session: &str, job: Cod
             Err(e) => {
                 eprintln!("[daemon] code worker spawn for {session} failed: {e}");
                 // Couldn't spawn — report a synthetic failure so the event settles
-                // (it stays `running` otherwise until a restart replays it).
+                // (it stays `running` otherwise until a restart replays it). The
+                // failure still routes to the requester so a planner's loop is not
+                // left hanging on a worker that never started (M4-A: a worker
+                // failure reaches the planner).
+                let detail = format!("worker spawn failed: {e}");
                 let _ = code.done_tx.send(CodeDone {
                     session: session.to_string(),
                     event_id,
                     correlation: job.correlation,
                     success: None,
-                    detail: format!("worker spawn failed: {e}"),
+                    result: detail.clone(),
+                    detail,
+                    requester: job.requester,
                 });
                 return;
             }
@@ -1036,6 +1207,7 @@ fn enqueue_code_job(root: &Root, code: &mut CodeDrivers, session: &str, job: Cod
     }
     if let Some(w) = code.workers.get_mut(session) {
         let corr = job.correlation.clone();
+        let requester = job.requester.clone();
         if w.tx.send(job).is_ok() {
             w.inflight += 1;
         } else {
@@ -1047,7 +1219,9 @@ fn enqueue_code_job(root: &Root, code: &mut CodeDrivers, session: &str, job: Cod
                 event_id,
                 correlation: corr,
                 success: None,
+                result: "worker channel closed".into(),
                 detail: "worker channel closed".into(),
+                requester,
             });
         }
     }
@@ -1059,13 +1233,27 @@ fn enqueue_code_job(root: &Root, code: &mut CodeDrivers, session: &str, job: Cod
 /// reported as `success=None`, not propagated.
 fn code_worker(root: Root, session: String, rx: Receiver<CodeJob>, done_tx: Sender<CodeDone>) {
     while let Ok(job) = rx.recv() {
-        let (success, detail) = match crate::codeagent::resume_capture(&root, &session, &job.message) {
-            Ok(outcome) => (
-                Some(outcome.success),
-                format!("exit_code={:?}", outcome.exit_code),
-            ),
-            Err(e) => (None, format!("{e:#}")),
-        };
+        let (success, detail, result) =
+            match crate::codeagent::resume_capture(&root, &session, &job.message) {
+                Ok(outcome) => {
+                    let detail = format!("exit_code={:?}", outcome.exit_code);
+                    // The worker's full turn (its final message, tool calls, edits)
+                    // is on the bus under obs/agent/<noun>/<session>/#; the routed
+                    // completion carries a concise result line + that pointer so a
+                    // planner reads the recorded state before acting (M4-A's
+                    // honest-state guidance), rather than us re-capturing the text.
+                    let result = if outcome.success {
+                        format!("worker {session} completed the turn ({detail})")
+                    } else {
+                        format!("worker {session} turn FAILED ({detail})")
+                    };
+                    (Some(outcome.success), detail, result)
+                }
+                Err(e) => {
+                    let d = format!("{e:#}");
+                    (None, d.clone(), format!("worker {session} could not resume: {d}"))
+                }
+            };
         // If the receiver is gone (daemon shutting down), the event stays
         // `running` and replays on the next start — at-least-once holds.
         let _ = done_tx.send(CodeDone {
@@ -1074,6 +1262,8 @@ fn code_worker(root: Root, session: String, rx: Receiver<CodeJob>, done_tx: Send
             correlation: job.correlation,
             success,
             detail,
+            requester: job.requester,
+            result,
         });
     }
 }
@@ -1538,6 +1728,8 @@ mod tests {
                 correlation: None,
                 success: Some(true),
                 detail: "exit_code=Some(0)".into(),
+                requester: None,
+                result: "ok".into(),
             })
             .unwrap();
 
@@ -1570,6 +1762,8 @@ mod tests {
                 correlation: None,
                 success: None,
                 detail: "boom".into(),
+                requester: None,
+                result: "boom".into(),
             })
             .unwrap();
         settle_code_deliveries(&root, &conn, &mut code).unwrap();
@@ -1577,6 +1771,202 @@ mod tests {
             .query_row("SELECT state FROM events WHERE id=?1", [ev2], |r| r.get(0))
             .unwrap();
         assert_eq!(st, "failed", "an errored resume settles the delivery failed");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M4-A — requester capture: a delivery whose broker-verified `sender` is a
+    /// recorded coding session (a planner) captures that planner's own mailbox as
+    /// the job's requester, so the completion can later route back and resume it.
+    #[test]
+    fn drive_captures_requester_from_sender() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        // Worker W and planner P, both recorded coding sessions.
+        for (s, t) in [("code-worker01", "codex"), ("code-plannr01", "claude")] {
+            crate::codesession::upsert_record(
+                &root,
+                &crate::codesession::SessionRecord {
+                    elanus_session: s.into(),
+                    native_session: "n".into(),
+                    tool: t.into(),
+                    agent_noun: if t == "codex" { "codex" } else { "claude-code" }.into(),
+                    workdir: root.dir.display().to_string(),
+                },
+            )
+            .unwrap();
+        }
+        // A delivery to W, stamped (as the broker would) sender = the planner P.
+        let ev = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "do the work" })),
+                sender: Some("code-plannr01".into()),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-worker01")
+            },
+        )
+        .unwrap();
+        let mut code = CodeDrivers::default();
+        let (tx, rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-worker01".into(), CodeWorker { tx, inflight: 0 });
+
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+
+        let job = rx.try_recv().expect("a job was enqueued");
+        assert_eq!(job.event_id, ev);
+        // The requester is the planner's OWN mailbox — routing the completion there
+        // resumes the planner (the loop closing).
+        let req = job.requester.expect("the planner sender is captured as requester");
+        assert_eq!(req.reply_to, "in/agent/claude-code/code-plannr01");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M4-A — idempotency: a replayed delivery with the same key (the at-least-once
+    /// duplicate a mid-resume crash re-pends) is recognized and settled as a clean
+    /// no-op — no second resume is driven. We drive once (recording the key), then
+    /// re-pend the same row (as the boot sweep does) and drive again; the second
+    /// drive must NOT enqueue a second job.
+    #[test]
+    fn drive_dedupes_replayed_delivery_no_second_resume() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-worker02".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+            },
+        )
+        .unwrap();
+        let ev = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "once only" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-worker02")
+            },
+        )
+        .unwrap();
+        let mut code = CodeDrivers::default();
+        let (tx, rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-worker02".into(), CodeWorker { tx, inflight: 0 });
+
+        // First drive: claims + enqueues exactly once, and records the key.
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+        assert_eq!(rx.try_recv().map(|j| j.event_id).ok(), Some(ev));
+        assert!(crate::codesession::delivery_key_seen(&root, &format!("event:{ev}")));
+
+        // Simulate the at-least-once replay across a restart: the row re-pends
+        // (boot's running->pending sweep) AND a fresh process's in-flight guard is
+        // empty (the `claimed` set does not survive a restart).
+        conn.execute("UPDATE events SET state='pending', finished_at=NULL WHERE id=?1", [ev])
+            .unwrap();
+        let mut code2 = CodeDrivers::default();
+        let (tx2, rx2) = std::sync::mpsc::channel::<CodeJob>();
+        code2
+            .workers
+            .insert("code-worker02".into(), CodeWorker { tx: tx2, inflight: 0 });
+
+        drive_code_deliveries(&root, &conn, &mut code2).unwrap();
+
+        // The replay is a recognized no-op: NO second job, and the row is settled
+        // `done` (not re-driven, not left pending forever).
+        assert!(rx2.try_recv().is_err(), "the duplicate must not drive a second resume");
+        let st: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [ev], |r| r.get(0))
+            .unwrap();
+        assert_eq!(st, "done", "the replayed duplicate is settled as a clean no-op");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M4-A — completion routing: a settled delivery whose job named a requester
+    /// publishes a completion to that requester's mailbox carrying the SAME
+    /// correlation, so a planner is resumed. We feed a CodeDone with a requester and
+    /// assert the routed in/agent event lands as a pending delivery the planner's
+    /// drive would pick up — that is the loop closing.
+    #[test]
+    fn settle_routes_completion_to_requester_mailbox() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        // The worker session must be recorded so the routed completion can name its
+        // obs subtree.
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-worker03".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+            },
+        )
+        .unwrap();
+        let ev = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "x" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-worker03")
+            },
+        )
+        .unwrap();
+        conn.execute("UPDATE events SET state='running' WHERE id=?1", [ev]).unwrap();
+        let mut code = CodeDrivers::default();
+        code.claimed.insert(ev);
+        let (tx, _rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-worker03".into(), CodeWorker { tx, inflight: 1 });
+        code.done_tx
+            .send(CodeDone {
+                session: "code-worker03".into(),
+                event_id: ev,
+                correlation: Some("loop-corr-1".into()),
+                success: Some(true),
+                detail: "exit_code=Some(0)".into(),
+                requester: Some(crate::codeagent::DeliveryRequester {
+                    reply_to: "in/agent/claude-code/code-plannr03".into(),
+                }),
+                result: "worker finished".into(),
+            })
+            .unwrap();
+
+        settle_code_deliveries(&root, &conn, &mut code).unwrap();
+
+        // The original delivery settled done.
+        let st: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [ev], |r| r.get(0))
+            .unwrap();
+        assert_eq!(st, "done");
+        // A completion was routed to the planner's mailbox, pending, threaded by the
+        // SAME correlation — exactly what drive_code_deliveries resumes the planner
+        // on (the loop closing).
+        let (routed_state, routed_corr, routed_payload): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, correlation_id, payload FROM events
+                 WHERE type='in/agent/claude-code/code-plannr03'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("a completion was routed to the planner's mailbox");
+        assert_eq!(routed_state, "pending", "the routed completion is a pending delivery");
+        assert_eq!(routed_corr.as_deref(), Some("loop-corr-1"), "same correlation threads the loop");
+        let pv: Value = serde_json::from_str(&routed_payload.unwrap()).unwrap();
+        // The payload carries a prompt (resumes a coding-session planner), the
+        // success flag, and an idempotency key so a replayed completion dedupes.
+        assert!(pv["prompt"].as_str().unwrap().contains("code-worker03"));
+        assert_eq!(pv["failed"], false);
+        assert!(pv["idempotency_key"].as_str().unwrap().starts_with("code-complete:"));
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

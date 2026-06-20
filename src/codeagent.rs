@@ -228,6 +228,120 @@ pub fn recognize_delivery(root: &Root, topic_name: &str) -> Option<(String, Stri
     Some((rec.elanus_session, rec.agent_noun))
 }
 
+/// Who to route a worker's completion back to (M4-A). When a planner hands work
+/// to a worker, the completion must reach the planner so it resumes to react —
+/// closing the orchestration loop. The requester is captured from the inbound
+/// delivery and stored with the in-flight job so `settle_code_deliveries` can
+/// publish the completion to the requester's mailbox carrying the same
+/// `correlation_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryRequester {
+    /// The mailbox topic to deliver the completion to, e.g.
+    /// `in/agent/claude-code/code-<planner>`. If the requester is itself a coding
+    /// session this is its session mailbox, so the existing M2-B machinery
+    /// resumes it — that is the loop closing.
+    pub reply_to: String,
+}
+
+/// Determine where a worker's completion should be routed for an inbound
+/// delivery, from the payload's explicit `reply_to` and the broker-verified
+/// `sender` of the delivery event. Precedence:
+///
+/// 1. An explicit `reply_to` in the payload — a full topic (`in/agent/<noun>/
+///    <conv>`) is used verbatim; a bare agent/session NAME (`code-<id>` or an
+///    agent noun) is expanded to that actor's mailbox. This lets a planner name a
+///    different reply address than its own identity (e.g. a shared room), or be
+///    explicit about the conversation.
+/// 2. Otherwise the `sender` the broker stamped on the delivery — the genuine,
+///    unforgeable requester. A coding-session sender (`code-*`) is expanded to its
+///    own mailbox (`in/agent/<its-noun>/<sender>`) so the completion resumes it; a
+///    native agent sender becomes `in/agent/<sender>/<conv>`.
+///
+/// Returns None when there is no requester to route to (the `kernel`/owner
+/// senders that originate a delivery with no one waiting on a coding completion,
+/// or an unusable reply_to) — a normal worker resume with no routing, so an
+/// ordinary delivery with no planner still works unchanged.
+pub fn delivery_requester(
+    root: &Root,
+    payload: &Value,
+    sender: Option<&str>,
+    correlation: Option<&str>,
+) -> Option<DeliveryRequester> {
+    // 1. An explicit reply_to in the payload wins.
+    if let Some(rt) = payload.get("reply_to").and_then(Value::as_str) {
+        let rt = rt.trim();
+        if !rt.is_empty() {
+            // A full in/ topic is used verbatim (must be a valid, wildcard-free
+            // mailbox name). A bare name is expanded to that actor's mailbox.
+            if rt.starts_with("in/") {
+                // valid_name already rejects wildcards (`#`/`+`), so a routable
+                // reply_to is exactly a concrete, wildcard-free mailbox name.
+                if topic::valid_name(rt) {
+                    return Some(DeliveryRequester { reply_to: rt.to_string() });
+                }
+                return None; // a malformed/wildcard reply_to is not routable
+            }
+            return mailbox_for_actor(root, rt, correlation)
+                .map(|reply_to| DeliveryRequester { reply_to });
+        }
+    }
+    // 2. Fall back to the broker-verified sender of the delivery.
+    let sender = sender?.trim();
+    // The kernel and the human owner are not coding planners waiting on a
+    // completion — don't route a reply back to them (their delivery is a plain
+    // worker resume, the existing behavior). A coding session or a native agent
+    // sender IS a requester.
+    if sender.is_empty() || sender == "kernel" || sender == "owner" {
+        return None;
+    }
+    mailbox_for_actor(root, sender, correlation).map(|reply_to| DeliveryRequester { reply_to })
+}
+
+/// Build the mailbox topic for a bare actor name. A coding session (`code-*` with
+/// a record) routes to its OWN session mailbox `in/agent/<its-noun>/<session>` so
+/// the completion resumes it via M2-B. A native agent name routes to
+/// `in/agent/<name>/<conv>` (the correlation as the conversation locator, falling
+/// back to the agent's default conversation). None for an unusable name.
+fn mailbox_for_actor(root: &Root, name: &str, correlation: Option<&str>) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    if codesession::is_session_principal(name) {
+        // A coding session: deliver to its own mailbox so M2-B resumes it. Its
+        // noun comes from the durable record; without one we can't address it.
+        let rec = codesession::read_record(root, name).ok().flatten()?;
+        return Some(format!(
+            "in/agent/{}/{}",
+            topic::encode_segment(&rec.agent_noun),
+            topic::encode_segment(name),
+        ));
+    }
+    // A native agent (or any non-session actor): its mailbox under its name. Use
+    // the correlation as the conversation locator so the planner threads it; fall
+    // back to a stable default conversation when there is none.
+    let conv = correlation.filter(|c| !c.is_empty()).unwrap_or("main");
+    Some(format!(
+        "in/agent/{}/{}",
+        topic::encode_segment(name),
+        topic::encode_segment(conv),
+    ))
+}
+
+/// The idempotency key for an inbound delivery (M4-A). An explicit
+/// `idempotency_key` in the payload wins (a planner/tool that wants exactly-once
+/// across re-publishes sets it); otherwise the inbound event id, which is stable
+/// across the at-least-once replay (a daemon crash re-pends the SAME row, same
+/// id). Pure — no db, unit-testable.
+pub fn idempotency_key(payload: &Value, event_id: i64) -> String {
+    payload
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("event:{event_id}"))
+}
+
 /// Pull the message text out of a delivery payload. Accept `prompt` (the
 /// documented field) or `text` (a convenience alias), in that order; a bare JSON
 /// string is taken verbatim. None if neither is present (an empty/structureless
@@ -1876,6 +1990,103 @@ mod tests {
         assert!(delivery_message(&json!({ "other": "x" })).is_none());
         assert!(delivery_message(&json!({ "prompt": "" })).is_none());
         assert!(delivery_message(&Value::Null).is_none());
+    }
+
+    // ── Requester capture + idempotency key (M4-A) ───────────────────────────
+
+    #[test]
+    fn idempotency_key_prefers_explicit_then_event_id() {
+        // An explicit key in the payload wins.
+        assert_eq!(
+            idempotency_key(&json!({ "prompt": "x", "idempotency_key": "planner-step-3" }), 42),
+            "planner-step-3"
+        );
+        // Otherwise the stable inbound event id (survives the at-least-once replay,
+        // which re-pends the SAME row with the SAME id).
+        assert_eq!(idempotency_key(&json!({ "prompt": "x" }), 42), "event:42");
+        // A blank explicit key falls back too.
+        assert_eq!(idempotency_key(&json!({ "idempotency_key": "  " }), 7), "event:7");
+    }
+
+    #[test]
+    fn requester_from_explicit_reply_to_topic() {
+        let root = delivery_tmp_root();
+        // A full in/ topic reply_to is used verbatim.
+        let req = delivery_requester(
+            &root,
+            &json!({ "prompt": "go", "reply_to": "in/agent/claude-code/code-planner1" }),
+            Some("owner"),
+            Some("corr-1"),
+        )
+        .unwrap();
+        assert_eq!(req.reply_to, "in/agent/claude-code/code-planner1");
+        // A wildcard reply_to is rejected (not routable).
+        assert!(delivery_requester(
+            &root,
+            &json!({ "prompt": "go", "reply_to": "in/agent/+/code-x" }),
+            None,
+            None,
+        )
+        .is_none());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn requester_from_sender_coding_session_routes_to_its_own_mailbox() {
+        let root = delivery_tmp_root();
+        // A planner that is a recorded coding session: its sender resolves to its
+        // OWN session mailbox, so the completion resumes it (the loop closing).
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-planner1".into(),
+                native_session: "thr".into(),
+                tool: "claude".into(),
+                agent_noun: "claude-code".into(),
+                workdir: "/tmp".into(),
+            },
+        )
+        .unwrap();
+        let req = delivery_requester(
+            &root,
+            &json!({ "prompt": "do work" }),
+            Some("code-planner1"),
+            Some("corr-9"),
+        )
+        .unwrap();
+        assert_eq!(req.reply_to, "in/agent/claude-code/code-planner1");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn requester_none_for_owner_kernel_or_unrecorded_session() {
+        let root = delivery_tmp_root();
+        // The human owner / kernel originating a plain delivery is NOT a planner
+        // waiting on a completion — no routing (the M2-B behavior, unchanged).
+        assert!(delivery_requester(&root, &json!({ "prompt": "x" }), Some("owner"), None).is_none());
+        assert!(delivery_requester(&root, &json!({ "prompt": "x" }), Some("kernel"), None).is_none());
+        // No sender and no reply_to → nothing to route to.
+        assert!(delivery_requester(&root, &json!({ "prompt": "x" }), None, None).is_none());
+        // A code-* sender with no durable record can't be addressed → None (not a
+        // panic, not a bogus route).
+        assert!(
+            delivery_requester(&root, &json!({ "prompt": "x" }), Some("code-ghost00"), None).is_none()
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn requester_from_native_agent_sender_uses_correlation_conv() {
+        let root = delivery_tmp_root();
+        // A native (non-code) agent sender routes to its own mailbox, the
+        // correlation as the conversation locator.
+        let req = delivery_requester(&root, &json!({ "prompt": "x" }), Some("kestrel"), Some("c42"))
+            .unwrap();
+        assert_eq!(req.reply_to, "in/agent/kestrel/c42");
+        // No correlation → a stable default conversation.
+        let req = delivery_requester(&root, &json!({ "prompt": "x" }), Some("kestrel"), None).unwrap();
+        assert_eq!(req.reply_to, "in/agent/kestrel/main");
+        let _ = std::fs::remove_dir_all(&root.dir);
     }
 
     #[test]

@@ -350,6 +350,23 @@ CREATE TABLE IF NOT EXISTS code_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_code_sessions_native ON code_sessions(native_session);
 
+-- Idempotency for driven coding-session deliveries (M4-A). Delivery is
+-- at-least-once (docs/handoffs/coding-agents.md): a daemon crash mid-resume
+-- re-pends the claimed event on the next start (boot's running->pending sweep),
+-- which would drive a SECOND resume of an already-acted-on turn. Each delivery
+-- carries a key — an explicit `idempotency_key` in the payload, else the inbound
+-- event id — and is recorded here the moment it is claimed. A delivery whose key
+-- is already present is recognized and settled as a clean no-op (no second
+-- resume). The row is DURABLE, so the replay after a restart is caught, not just
+-- a same-process duplicate. Keyed by the key; the session/event are recorded for
+-- audit/debug only.
+CREATE TABLE IF NOT EXISTS code_delivery_keys (
+  idempotency_key TEXT PRIMARY KEY,  -- explicit payload key, else "event:<id>"
+  session         TEXT NOT NULL,     -- the coding session it was driven to
+  event_id        INTEGER,           -- the inbound delivery event id (audit)
+  processed_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 -- Subagent lineage substrate. A subagent is an ordinary agent spawned by a
 -- parent run; the launcher will insert one row per child session/run so
 -- cancellation, budget attribution, and observability can follow the tree.
