@@ -40,10 +40,105 @@
 
 use crate::paths::Root;
 use crate::secrets;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+// ── The durable session RECORD (M2-A) ────────────────────────────────────────
+//
+// The split-session model (docs/handoffs/coding-agents.md) keeps the durable
+// *record* of a session apart from the ephemeral *token* above. The record lives
+// in `elanus.db` (`code_sessions`), carries **no secret**, and survives process
+// exit: it maps the elanus session id to the tool's own native resumable session
+// id (codex `thread_id` / CC `session_id`), the tool, the agent noun, and the
+// workdir. An idle resumable session is exactly this — a record with no live
+// token. `elanus code resume` reads the record to mint a FRESH scoped token and
+// continue the native session in its recorded workdir, then retires the token.
+// This preserves the verified "no idle live credential" property while enabling
+// resume: the credential is per-run, the record is durable.
+
+/// A durable coding-session record (the `code_sessions` row). Carries no secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    /// The elanus session id (`code-<8hex>`), the stable handle a human resumes.
+    pub elanus_session: String,
+    /// The tool's own native resumable session id — codex `thread_id` / CC
+    /// `session_id`. This is what the native resume command targets.
+    pub native_session: String,
+    /// The binary that ran this session: `claude` | `codex`.
+    pub tool: String,
+    /// The obs agent noun the session publishes under: `claude-code` | `codex`.
+    pub agent_noun: String,
+    /// Absolute directory the session ran in; resume runs in the same dir so the
+    /// native session continues against the same files.
+    pub workdir: String,
+}
+
+/// Persist (or update) the durable record once the native session id is known
+/// (codex: on `thread.started`; CC: on the SessionStart hook). Idempotent per
+/// elanus session: a re-observed native id (e.g. a second SessionStart) refreshes
+/// `native_session`/`workdir` and bumps `last_active` rather than duplicating.
+/// Best-effort callers may ignore the error — a missing record just means that
+/// session can't be resumed, never that the live session breaks.
+pub fn upsert_record(root: &Root, rec: &SessionRecord) -> Result<()> {
+    let conn = crate::db::open(root).context("opening the ledger for the session record")?;
+    crate::db::init_schema(&conn)?;
+    conn.execute(
+        "INSERT INTO code_sessions
+           (elanus_session, native_session, tool, agent_noun, workdir)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(elanus_session) DO UPDATE SET
+           native_session = excluded.native_session,
+           tool           = excluded.tool,
+           agent_noun     = excluded.agent_noun,
+           workdir        = excluded.workdir,
+           last_active    = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        rusqlite::params![
+            rec.elanus_session,
+            rec.native_session,
+            rec.tool,
+            rec.agent_noun,
+            rec.workdir,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Read a durable record by elanus session id. None if there is no such session
+/// (never launched, or launched but the native id was never observed).
+pub fn read_record(root: &Root, elanus_session: &str) -> Result<Option<SessionRecord>> {
+    let conn = crate::db::open(root).context("opening the ledger for the session record")?;
+    crate::db::init_schema(&conn)?;
+    let rec = conn
+        .query_row(
+            "SELECT elanus_session, native_session, tool, agent_noun, workdir
+             FROM code_sessions WHERE elanus_session = ?1",
+            [elanus_session],
+            |r| {
+                Ok(SessionRecord {
+                    elanus_session: r.get(0)?,
+                    native_session: r.get(1)?,
+                    tool: r.get(2)?,
+                    agent_noun: r.get(3)?,
+                    workdir: r.get(4)?,
+                })
+            },
+        )
+        .ok();
+    Ok(rec)
+}
+
+/// Bump a record's `last_active` to now (after a resume completes). Best-effort.
+pub fn touch_record(root: &Root, elanus_session: &str) -> Result<()> {
+    let conn = crate::db::open(root)?;
+    conn.execute(
+        "UPDATE code_sessions SET last_active = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE elanus_session = ?1",
+        [elanus_session],
+    )?;
+    Ok(())
+}
 
 /// The session-id prefix that marks a coding-session actor everywhere (CONNECT
 /// resolution, ACL, reaping). A principal name starting with this is resolved
@@ -328,5 +423,91 @@ mod tests {
         assert!(read(&root, "code-deadbeef").is_none());
         assert!(read(&root, "code-livesess").is_some());
         let _ = live;
+    }
+
+    // ── The durable session RECORD (M2-A) ────────────────────────────────────
+
+    #[test]
+    fn record_roundtrips_and_carries_no_secret() {
+        let root = tmp_root();
+        // No record before a launch observes the native id.
+        assert!(read_record(&root, "code-abcd1234").unwrap().is_none());
+
+        let rec = SessionRecord {
+            elanus_session: "code-abcd1234".to_string(),
+            native_session: "019ee252-3d31-7681-b1d7-7a4b3c494fb5".to_string(),
+            tool: "codex".to_string(),
+            agent_noun: "codex".to_string(),
+            workdir: "/tmp/proj".to_string(),
+        };
+        upsert_record(&root, &rec).unwrap();
+
+        let read_back = read_record(&root, "code-abcd1234").unwrap().unwrap();
+        assert_eq!(read_back, rec);
+        // The record is the DURABLE half: it carries the native resume key and the
+        // workdir, but NO secret (the token is the ephemeral half, minted per run).
+        // Resume mints a fresh token from this record; the record itself never holds
+        // a credential — proven by the struct having no secret field and the table
+        // having no secret column (this row reads back identical without one).
+    }
+
+    #[test]
+    fn record_upsert_refreshes_native_and_workdir_keyed_by_elanus_session() {
+        let root = tmp_root();
+        let mut rec = SessionRecord {
+            elanus_session: "code-cafef00d".to_string(),
+            native_session: "thread-1".to_string(),
+            tool: "claude".to_string(),
+            agent_noun: "claude-code".to_string(),
+            workdir: "/tmp/a".to_string(),
+        };
+        upsert_record(&root, &rec).unwrap();
+        // A re-observed native id / workdir (e.g. a second SessionStart) updates in
+        // place rather than duplicating — the elanus session is the stable key.
+        rec.native_session = "thread-2".to_string();
+        rec.workdir = "/tmp/b".to_string();
+        upsert_record(&root, &rec).unwrap();
+        let read_back = read_record(&root, "code-cafef00d").unwrap().unwrap();
+        assert_eq!(read_back.native_session, "thread-2");
+        assert_eq!(read_back.workdir, "/tmp/b");
+
+        // touch_record bumps last_active without disturbing the mapping.
+        touch_record(&root, "code-cafef00d").unwrap();
+        let again = read_record(&root, "code-cafef00d").unwrap().unwrap();
+        assert_eq!(again.native_session, "thread-2");
+    }
+
+    #[test]
+    fn resume_mints_fresh_token_then_retires_no_idle_credential() {
+        // The resume token lifecycle in isolation: an idle session has a record but
+        // NO live token; a resume mints a fresh scoped token (emit-only) and retires
+        // it — leaving no idle credential, exactly as a launch does. (The full
+        // resume() also runs the tool; here we assert the credential property the
+        // resume primitive must preserve.)
+        let root = tmp_root();
+        let rec = SessionRecord {
+            elanus_session: "code-resume01".to_string(),
+            native_session: "thread-x".to_string(),
+            tool: "codex".to_string(),
+            agent_noun: "codex".to_string(),
+            workdir: "/tmp/proj".to_string(),
+        };
+        upsert_record(&root, &rec).unwrap();
+        // Idle: record present, no token.
+        assert!(read_record(&root, "code-resume01").unwrap().is_some());
+        assert!(read(&root, "code-resume01").is_none());
+
+        // Resume mints a fresh, emit-only token …
+        let token = mint(&root, "code-resume01", "codex", std::process::id() as i32).unwrap();
+        assert!(token.may_publish("obs/agent/codex/code-resume01/session/resume"));
+        assert!(!token.may_publish("in/human/owner"));
+        assert!(token.subscribe.is_empty(), "resume token must be emit-only");
+        assert!(read(&root, "code-resume01").is_some());
+
+        // … and retires it: no idle credential survives the resume.
+        retire(&root, "code-resume01");
+        assert!(read(&root, "code-resume01").is_none());
+        // The durable record outlives the token — still resumable later.
+        assert!(read_record(&root, "code-resume01").unwrap().is_some());
     }
 }

@@ -249,13 +249,14 @@ enum Cmd {
     /// Launch and observe an external coding agent (Claude Code today).
     ///
     /// `elanus code <tool> [args...]` launches the real coding agent in this
-    /// directory, observed on the bus (`tool` selects the adapter — currently
-    /// `claude`; everything after it is passed through unchanged). The reserved
-    /// first word `hook` is the internal hook bridge the generated hooks invoke
-    /// (`elanus code hook <Event>`) — not meant to be run by hand.
+    /// directory, observed on the bus (`tool` selects the adapter — `claude` or
+    /// `codex`; everything after it is passed through unchanged). Reserved first
+    /// words: `hook` is the internal hook bridge the generated hooks invoke
+    /// (`elanus code hook <Event>`); `resume <elanus_session> "<message>"`
+    /// continues a recorded session in its workdir (the M2-A resume primitive).
     #[command(disable_help_flag = true)]
     Code {
-        /// The adapter (claude, codex next), or the reserved word `hook`.
+        /// The adapter (claude, codex), or a reserved word (`hook`, `resume`).
         tool: String,
         /// Arguments passed straight through to the tool (or, for `hook`, the
         /// single hook event name).
@@ -877,13 +878,28 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Cmd::Code { tool, args } => {
-            // `hook` is the reserved internal bridge: `elanus code hook <Event>`.
-            // Any other first word is a coding-tool adapter to launch.
-            if tool == "hook" {
-                let event = args.first().map(String::as_str).unwrap_or("");
-                codeagent::hook(&root, event)?;
-            } else {
-                codeagent::launch(&root, &tool, &args)?;
+            // Reserved first words: `hook` is the internal hook bridge
+            // (`elanus code hook <Event>`); `resume` continues a recorded session
+            // (`elanus code resume <elanus_session> "<message>"`). Any other first
+            // word is a coding-tool adapter to launch.
+            match tool.as_str() {
+                "hook" => {
+                    let event = args.first().map(String::as_str).unwrap_or("");
+                    codeagent::hook(&root, event)?;
+                }
+                "resume" => {
+                    let session = args.first().map(String::as_str).unwrap_or("");
+                    if session.is_empty() {
+                        anyhow::bail!(
+                            "usage: elanus code resume <elanus_session> \"<message>\""
+                        );
+                    }
+                    let message = args.get(1..).unwrap_or(&[]).join(" ");
+                    codeagent::resume(&root, session, &message)?;
+                }
+                _ => {
+                    codeagent::launch(&root, &tool, &args)?;
+                }
             }
         }
         Cmd::Events { limit } => {

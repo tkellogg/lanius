@@ -327,6 +327,29 @@ CREATE TABLE IF NOT EXISTS context_build_log (
 CREATE INDEX IF NOT EXISTS idx_context_build_log_session ON context_build_log(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_context_build_log_run ON context_build_log(run_id, id);
 
+-- Durable coding-session records (docs/handoffs/coding-agents.md, M2-A). One row
+-- per launched coding session, mapping the elanus session id to the tool's own
+-- NATIVE resumable session id (codex thread_id / Claude Code session_id), the
+-- tool, the agent noun it publishes under, and the workdir it ran in. This is the
+-- DURABLE half of the split session model: the record carries NO secret and
+-- survives process exit, so an idle resumable session has a record but no live
+-- credential. The ephemeral scoped TOKEN (src/codesession.rs) is minted per run
+-- and per resume and retired at the end — the record is what `elanus code resume`
+-- looks up to mint a fresh token and continue the native session in its workdir.
+-- Written once the native id is known (codex: thread.started; CC: SessionStart),
+-- updated on each resume (last_active). Keyed by the elanus session.
+CREATE TABLE IF NOT EXISTS code_sessions (
+  id             INTEGER PRIMARY KEY,
+  elanus_session TEXT NOT NULL UNIQUE,  -- code-<8hex>, the elanus session id
+  native_session TEXT NOT NULL,         -- codex thread_id / CC session_id (resume key)
+  tool           TEXT NOT NULL,         -- the binary: claude | codex
+  agent_noun     TEXT NOT NULL,         -- the obs noun: claude-code | codex
+  workdir        TEXT NOT NULL,         -- absolute dir the session ran in (resume cwd)
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  last_active    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_code_sessions_native ON code_sessions(native_session);
+
 -- Subagent lineage substrate. A subagent is an ordinary agent spawned by a
 -- parent run; the launcher will insert one row per child session/run so
 -- cancellation, budget attribution, and observability can follow the tree.

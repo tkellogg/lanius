@@ -1,11 +1,13 @@
 # Handoff: coding-agent support (Codex & Claude Code)
 
-Status: **M0 launcher + M1 record landed for BOTH adapters** — Claude Code (hook
-bridge) 2026-06-19, and Codex (`codex exec --json` stdout stream) 2026-06-20,
-branch `coding-agents`. Both verified end to end against the live worktree stack.
-M2–M5 are not started; M2 (the session inbox) is next. See the Log at the bottom
-for the as-built decisions (the two adapters share one envelope but differ in their
-*capture mechanism* — CC's hooks vs Codex's JSONL stream).
+Status: **M0+M1 landed for BOTH adapters; M2-A (durable resumable sessions + the
+resume primitive) landed 2026-06-20** — Claude Code (hook bridge) 2026-06-19,
+Codex (`codex exec --json` stdout stream) 2026-06-20, branch `coding-agents`. All
+verified end to end against the live worktree stack. M2-B (daemon-driven inbound
+delivery off a session mailbox) and M3–M5 are not started; **M2-B is next**. See
+the Log at the bottom for the as-built decisions (the two adapters share one
+envelope but differ in their *capture mechanism* — CC's hooks vs Codex's JSONL
+stream; the durable-session split-record model is in the M2-A entry).
 
 This handoff asks elanus to **launch and supervise external coding agents** — the
 Codex CLI/TUI and Claude Code — and bridge their lifecycle, tools, and context
@@ -748,7 +750,110 @@ capture mechanism**. The `Tool` enum is the seam (`Tool::capture` →
   (same size, the tool's own state — exactly the CC-adapter guarantee: "elanus
   changes no user config," the tool still writes its own session/cache state).
 
+### 2026-06-20 — M2-A: durable resumable sessions + the resume primitive (branch `coding-agents`)
+
+The foundation for inbound delivery (M2): a session can be **resumed** after the
+launcher exits, while preserving the verified "no idle live credential" property.
+
+- **The split-session model — durable RECORD vs ephemeral TOKEN (the load-bearing
+  decision).** The durable half is a new `code_sessions` row in `elanus.db`
+  (`src/db.rs`): `elanus_session` (code-<id>) ↔ `native_session` (codex `thread_id`
+  / CC `session_id`) ↔ `tool` ↔ `agent_noun` ↔ `workdir` ↔ created/last_active. It
+  carries **NO secret** and survives process exit. The ephemeral half is unchanged
+  in spirit (`src/codesession.rs`): a fresh grant-scoped, **emit-only** token minted
+  at the START of each run AND each resume, retired at end, reaped on crash. So an
+  idle resumable session = a record with no live token. Record read/write/touch live
+  in `src/codesession.rs` (`SessionRecord`, `upsert_record`, `read_record`,
+  `touch_record`); the table is created by the idempotent `init_schema`.
+
+- **When the record is written.** Once the native session id is known, from the SAME
+  observation point that already surfaces it (no new tool round-trip): **codex** on
+  `thread.started` (the `thread_id`, persisted inside the stdout-capture loop —
+  `capture_codex_stream`, factored out of `run_codex_capture` so launch and resume
+  share it); **CC** on the `SessionStart` hook (`session_id` + `cwd` from the hook
+  payload, in `codeagent::hook`). Upsert is keyed by the elanus session, so a
+  re-observed native id refreshes in place rather than duplicating.
+
+- **The resume primitive — `elanus code resume <elanus_session> "<message>"`**
+  (`codeagent::resume`, wired as a reserved first word in `src/main.rs` `Cmd::Code`
+  alongside `hook`). It: reaps orphans (like launch) → reads the record → mints a
+  FRESH scoped emit-only token → publishes a `session/resume` marker under the SAME
+  elanus session → runs the tool's native resume in the recorded **workdir** (set as
+  the child cwd) capturing the result stream under the SAME `obs/agent/<agent>/<sess>/#`
+  tree → retires the token → bumps `last_active`. The native resume commands
+  (built by the pure, unit-tested `resume_command`):
+  - **Codex:** `codex exec resume <thread_id> --json --skip-git-repo-check "<msg>"`
+    — confirmed against codex-cli 0.141.0 (`codex exec resume [SESSION_ID] [PROMPT]`,
+    takes an id OR `--last`; we pass the recorded id). It has **no `--cd`**, so the
+    workdir is applied as the child cwd. Its `--json` stream is identical to launch
+    (thread.started for the resumed thread, item.*), reusing `capture_codex_stream`
+    (`record_thread=false` — the record already exists).
+  - **Claude Code:** `claude -p --resume <session_id> --output-format stream-json
+    --verbose "<msg>"` — confirmed against CC 2.1.183. **Decision: parse the JSONL
+    print stream, do NOT rely on hooks.** A bare `-p --resume` does not reload the
+    launch-time generated `--settings` hooks (that scratch is cleaned up at the
+    launch's end), so CC resume captures like codex: a new `capture_claude_stream` +
+    `claude_stream_map` maps the print grammar (`system/init` → `session/started`
+    ONCE; `assistant`/`user` content blocks → `assistant/message` /
+    `tool/<name>/call` / `tool/result`; `result` → `session/idle` with the answer +
+    usage). A subtype guard drops the non-`init` `system` frames a resume replays and
+    `rate_limit_event` noise, so a long history doesn't flood the bus with duplicate
+    starts (caught + fixed during the live run — the first cut emitted one
+    `session/started` per replayed frame).
+
+- **No new read authority (preserves the verified property).** The resume token is
+  minted with the SAME structural scope as a launch token — publish only the
+  session's own obs subtree, **subscribe nothing** (`codesession` `subscribe` is
+  still empty). Resume cannot read the bus. This is deliberate: M2-B (below) gives
+  the DAEMON — which already has authority — the job of reading a session's mailbox
+  and driving resume; the session never gains read authority. M3's interactive-pull
+  read grant remains deferred.
+
+- **M2-B (DEFERRED, next): daemon-driven inbound delivery.** This pass builds the
+  resume primitive so it can be invoked directly (and tested). The next increment
+  wires the daemon to drive resume automatically when a message lands on a session's
+  mailbox (`in/agent/<noun>/<session>/...`): the daemon (with authority) reads the
+  mailbox and calls `code resume`, draining it into a resumed turn. The session token
+  stays emit-only throughout — only the daemon reads.
+
+- **Tests + verification.** `cargo test` green, **112 passing** (was 105): +3 in
+  `codesession` (record round-trip + no-secret; upsert refresh keyed by elanus
+  session + touch; resume mints-fresh-then-retires = no idle credential) and +4 in
+  `codeagent` (codex resume command targets the recorded thread; claude resume
+  command resumes the recorded session headlessly; claude print-stream → obs grammar
+  incl. the non-init/rate-limit drops; resume errors cleanly with no record). **Live
+  evidence (isolated worktree stack, root `~/.elanus/wt-coding-agents`, broker
+  `:1893`; the main `~/.elanus/root` daemon was never touched):**
+  - **Codex:** launched `code-198d81dd` → durable record written (native thread
+    `019ee27c-9aed-7432-…`); `elanus code resume code-198d81dd "what phrase did I
+    ask for?"` produced a NEW ordered record under the SAME elanus session, every
+    record stamped `sender = code-198d81dd` (verified in `trace.jsonl`), with
+    `session/thread` showing the SAME `codex_thread=019ee27c-…` (the native session
+    CONTINUED, not a new one) and the model **recalling the launch turn's phrase**
+    (`assistant/message "elanus-m2a-launch"`) — proof the resume targeted the right
+    thread with its history.
+  - **Claude Code:** launched `code-278e4576` → record written via the SessionStart
+    hook (native CC session `4356b466-…`); `elanus code resume code-278e4576 …`
+    produced a tidy ordered record (one `session/started`, `assistant/message`,
+    `session/idle result`) under the SAME elanus session, stamped
+    `sender = code-278e4576`, targeting the SAME native session, with the model
+    **recalling `cc-clean-launch`** — continuity proven on both adapters.
+  - **No idle credential** after either resume (the `code-sessions/` token store is
+    empty — the per-resume token was retired); **`last_active` bumped** on the record
+    (codex: launch `00:44:37` → resume `00:45:15`); **`~/.codex` and `~/.claude`
+    config untouched** (`config.toml`/`auth.json` and `~/.claude/settings.json`
+    mtimes all predate the run); the **reaper still covers crashes** (resume reaps
+    orphans on entry, same as launch; the reap test passes).
+
 ### Still TODO (next increments)
+
+- **M2-B (NEXT): daemon-driven inbound delivery.** Wire the daemon to drive
+  `code resume` when a message lands on a session's mailbox — the daemon reads the
+  mailbox (it has the authority), the session token stays emit-only. The resume
+  primitive (M2-A) is the building block; this is the auto-drive on top.
+- **M3 interactive-pull / session read grant.** When a session is given read
+  authority over its own inbox, extend its `subscribe` scope in `codesession`
+  (today empty — emit-only). M2-A deliberately did NOT do this.
 
 - Posture-mode → cage mapping (Codex read-only/workspace-write/full ↔ cage write +
   read + egress) and the complete cage (incl. read scoping) before bypass: BLOCKED

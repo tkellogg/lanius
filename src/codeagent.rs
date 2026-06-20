@@ -252,9 +252,9 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
             // ── Codex: stdout JSONL stream ────────────────────────────────────
             // No hooks. Run `codex exec --json`, pipe stdout, and parse+publish
             // each event in-process as the session principal.
-            Capture::StreamJson => {
-                run_codex_capture(root, &principal, &bus_token, &agent, &session, args)
-            }
+            Capture::StreamJson => run_codex_capture(
+                root, &principal, &bus_token, &agent, &session, &workdir, args,
+            ),
         }
     })();
 
@@ -303,6 +303,7 @@ fn run_codex_capture(
     bus_token: &str,
     agent: &str,
     session: &str,
+    workdir: &Path,
     args: &[String],
 ) -> Result<std::process::ExitStatus> {
     use std::process::{Command, Stdio};
@@ -322,48 +323,79 @@ fn run_codex_capture(
         .spawn()
         .context("launching codex (is it installed and on PATH?)")?;
 
-    // Read stdout line-by-line; each non-empty line is one JSON event. Map and
-    // publish each as the session principal. A malformed line files generically
-    // (nothing is dropped); reading errors stop the loop but never abort the run.
-    if let Some(out) = child.stdout.take() {
-        let reader = std::io::BufReader::new(out);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let event: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => {
-                    // A non-JSON line (Codex shouldn't emit one under --json, but
-                    // be defensive): record it generically rather than drop it.
-                    let (leaf, body) = generic_event("codex_nonjson_line", &Value::Null);
-                    publish_obs(
-                        root,
-                        principal,
-                        bus_token,
-                        &obs_topic(agent, session, &leaf),
-                        body,
-                    );
-                    continue;
-                }
-            };
-            if let Some((leaf, body)) = codex_map_event(&event) {
-                publish_obs(
-                    root,
-                    principal,
-                    bus_token,
-                    &obs_topic(agent, session, &leaf),
-                    body,
-                );
-            }
-        }
-    }
+    // On a fresh launch, `thread.started` carries codex's native thread id —
+    // persist the durable record (with this workdir) the moment we see it so the
+    // session is resumable after the launcher exits.
+    capture_codex_stream(
+        root, principal, bus_token, agent, session, &mut child, Some(workdir),
+    );
 
     child
         .wait()
         .context("waiting for codex exec to finish")
+}
+
+/// Read a codex child's `--json` stdout line-by-line, mapping each JSONL event to
+/// an obs record and publishing it as the session principal. Shared by launch and
+/// resume (the SAME obs grammar lands under the SAME elanus session both times).
+/// When `record_workdir` is `Some`, a `thread.started` event also persists/refreshes
+/// the durable `code_sessions` record (launch path, carrying the workdir to store);
+/// resume already has a record, so it passes `None`. A malformed line files
+/// generically (nothing dropped); a read error stops the loop but never aborts.
+fn capture_codex_stream(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    child: &mut std::process::Child,
+    record_workdir: Option<&Path>,
+) {
+    let Some(out) = child.stdout.take() else {
+        return;
+    };
+    let reader = std::io::BufReader::new(out);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                // A non-JSON line (Codex shouldn't emit one under --json, but
+                // be defensive): record it generically rather than drop it.
+                let (leaf, body) = generic_event("codex_nonjson_line", &Value::Null);
+                publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
+                continue;
+            }
+        };
+        // The DURABLE session record (M2-A): codex announces its own native
+        // resumable session id via `thread.started` → `thread_id`. Persist the
+        // record (no secret) the moment we see it, so the session is resumable
+        // even after this launcher exits. Best-effort: a record-write failure
+        // never breaks the live session (it just means it can't be resumed).
+        if let Some(workdir) = record_workdir {
+            if event.get("type").and_then(Value::as_str) == Some("thread.started") {
+                if let Some(thread_id) = event.get("thread_id").and_then(Value::as_str) {
+                    let rec = codesession::SessionRecord {
+                        elanus_session: session.to_string(),
+                        native_session: thread_id.to_string(),
+                        tool: "codex".to_string(),
+                        agent_noun: agent.to_string(),
+                        workdir: workdir.display().to_string(),
+                    };
+                    if let Err(e) = codesession::upsert_record(root, &rec) {
+                        eprintln!("[code] recording codex session (continuing): {e:#}");
+                    }
+                }
+            }
+        }
+        if let Some((leaf, body)) = codex_map_event(&event) {
+            publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
+        }
+    }
 }
 
 /// Map one Codex `exec --json` stream event to an obs/ topic leaf and a trimmed
@@ -602,6 +634,280 @@ fn command_succeeded(item: &Value) -> bool {
     item.get("exit_code").and_then(Value::as_i64) == Some(0)
 }
 
+// ── The resume primitive (M2-A) ──────────────────────────────────────────────
+//
+// `elanus code resume <elanus_session> "<message>"` continues a recorded session.
+// It is the foundation of inbound delivery (M2-B): a session has a DURABLE record
+// (no secret) but no idle token; resume mints a FRESH scoped token, runs the
+// tool's native resume in the recorded workdir capturing output into the SAME obs
+// tree under the SAME elanus session, publishes the result, retires the token, and
+// bumps last_active. The token is emit-only on resume too (no read/subscribe grant
+// — that is M3's interactive-pull). M2-B (the daemon driving resume off a session
+// mailbox message) is deferred: the DAEMON has the authority to read the mailbox
+// and call this; the session itself never gains read authority.
+
+/// Build the native resume command (program + args) for a recorded session and a
+/// message. Pure and unit-testable — no process spawn, no env. The resume runs in
+/// the record's `workdir` (set by the caller via `Command::current_dir`):
+/// - **codex:** `codex exec resume <thread_id> --json --skip-git-repo-check "<msg>"`
+///   — confirmed against codex-cli 0.141.0 (`codex exec resume [SESSION_ID]
+///   [PROMPT]`, with `--json` JSONL stdout and `--skip-git-repo-check`). Note
+///   `codex exec resume` has NO `--cd`, so the workdir is set as the child cwd.
+/// - **claude:** `claude -p --resume <session_id> --output-format stream-json
+///   --verbose "<msg>"` — headless print, resuming the recorded native session id,
+///   capturing the JSONL result stream (the generated hooks are NOT reloaded on a
+///   bare `-p --resume`, so resume parses the stream like codex rather than relying
+///   on hooks). Confirmed flags against Claude Code 2.1.183.
+fn resume_command(rec: &codesession::SessionRecord, message: &str) -> (String, Vec<String>) {
+    match rec.tool.as_str() {
+        "codex" => (
+            "codex".to_string(),
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                rec.native_session.clone(),
+                "--json".to_string(),
+                "--skip-git-repo-check".to_string(),
+                message.to_string(),
+            ],
+        ),
+        // Default to the claude shape for "claude" (and any CC-noun record).
+        _ => (
+            "claude".to_string(),
+            vec![
+                "-p".to_string(),
+                "--resume".to_string(),
+                rec.native_session.clone(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                message.to_string(),
+            ],
+        ),
+    }
+}
+
+/// `elanus code resume <elanus_session> "<message>"` — continue a recorded coding
+/// session with a fresh, emit-only scoped token, capturing the result under the
+/// same elanus session. Returns an error if there is no resumable record.
+pub fn resume(root: &Root, elanus_session: &str, message: &str) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    // Heal any orphaned credentials a prior crash leaked, same as launch.
+    for orphan in codesession::reap_orphans(root) {
+        eprintln!("[code] reaped orphaned session credential {orphan}");
+    }
+
+    let rec = codesession::read_record(root, elanus_session)
+        .context("reading the coding-session record")?
+        .with_context(|| {
+            format!(
+                "no resumable coding session {elanus_session:?} \
+                 (never launched, or its native session id was never observed)"
+            )
+        })?;
+
+    // Mint a FRESH scoped token for this resume run, with the SAME deterministic
+    // principal/scope derived from the session name — exactly as a launch does.
+    // An idle session has no token; this one lives only for the resume and is
+    // retired at the end (reaped on crash). It is emit-only: no read/subscribe
+    // grant (M3's interactive-pull is deferred), so resume cannot read the bus.
+    let principal = rec.elanus_session.clone();
+    let token = codesession::mint(root, &principal, &rec.agent_noun, std::process::id() as i32)
+        .with_context(|| format!("minting the resume credential for {principal}"))?;
+    let bus_token = token.secret.clone();
+    let agent = rec.agent_noun.clone();
+    let session = rec.elanus_session.clone();
+    let workdir = std::path::PathBuf::from(&rec.workdir);
+
+    let (program, cmd_args) = resume_command(&rec, message);
+
+    // A resume marker under the SAME elanus session, so the bus shows the session
+    // continued and with what message.
+    publish_obs(
+        root,
+        &principal,
+        &bus_token,
+        &obs_topic(&agent, &session, "session/resume"),
+        json!({
+            "ts": now_iso(),
+            "tool": rec.tool,
+            "native_session": rec.native_session,
+            "workdir": rec.workdir,
+            "message": clip(message, 4000),
+        }),
+    );
+
+    let result = (|| -> Result<std::process::ExitStatus> {
+        let mut cmd = Command::new(&program);
+        cmd.args(&cmd_args);
+        // Run in the recorded workdir so the native session continues against the
+        // same files. Empty stdin (the message is an arg), piped stdout (we parse
+        // the JSONL result), inherited stderr (the human sees tool progress). We
+        // keep the real CODEX_HOME / ~/.claude so auth stays intact.
+        cmd.current_dir(&workdir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        eprintln!("[code] resuming {} session {session} ({})", rec.tool, rec.native_session);
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("launching {program} resume (is it installed and on PATH?)"))?;
+
+        match rec.tool.as_str() {
+            // Both adapters' resume emit a JSONL stream on stdout. Codex's `exec
+            // resume --json` is identical to the launch stream (thread.started for
+            // the resumed thread, item.*; record_thread=false — we already have a
+            // record). Claude's `-p --output-format stream-json` is a DIFFERENT
+            // JSONL grammar; map it via the CC stream mapper.
+            "codex" => {
+                // record_workdir = None: the record already exists (we read it).
+                capture_codex_stream(
+                    root, &principal, &bus_token, &agent, &session, &mut child, None,
+                );
+            }
+            _ => {
+                capture_claude_stream(root, &principal, &bus_token, &agent, &session, &mut child);
+            }
+        }
+        child.wait().context("waiting for the resume to finish")
+    })();
+
+    // Retire the per-resume token — no idle credential is left behind (a SIGKILL
+    // would leak it, but it is reaped at the next launcher/daemon boot, and even
+    // unreaped it can only publish this dead session's own obs subtree). Bump
+    // last_active so the record reflects the resume.
+    codesession::retire(root, &principal);
+    let _ = codesession::touch_record(root, &session);
+
+    let status = result?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Read a Claude Code `-p --output-format stream-json` child's stdout line-by-line,
+/// mapping each JSONL message to an obs record under the resumed elanus session.
+/// Claude's print stream is a different grammar from codex's: top-level objects
+/// with a `type` of `system` (init), `assistant`/`user` (message turns carrying a
+/// nested `message` with `content` blocks: `text`, `tool_use`, `tool_result`), and
+/// `result` (the final settle, carrying `result` text + `session_id` + usage). We
+/// map the load-bearing ones onto the existing obs grammar so a resumed turn reads
+/// like a launched one; anything unmodeled lands generically (nothing dropped).
+fn capture_claude_stream(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    child: &mut std::process::Child,
+) {
+    let Some(out) = child.stdout.take() else {
+        return;
+    };
+    let reader = std::io::BufReader::new(out);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue, // non-JSON line on the print stream: skip
+        };
+        if let Some((leaf, body)) = claude_stream_map(&event) {
+            publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
+        }
+    }
+}
+
+/// Map one Claude Code `--output-format stream-json` top-level message to an obs
+/// leaf + body. Returns None for messages we deliberately drop. Confirmed against
+/// Claude Code 2.1.183's print stream.
+fn claude_stream_map(event: &Value) -> Option<(String, Value)> {
+    let ts = now_iso();
+    let etype = event.get("type").and_then(Value::as_str).unwrap_or("");
+    let subtype = event.get("subtype").and_then(Value::as_str).unwrap_or("");
+    match etype {
+        // Only the `init` system message (model/tools/cwd) records the resumed
+        // session id as session/started — ONCE. Any other `system` subtype (and a
+        // resume replays prior-turn system frames) is dropped, so a long history
+        // does not flood the bus with duplicate starts. Confirmed against CC
+        // 2.1.183: a clean print/resume emits exactly one `system/init`.
+        "system" if subtype == "init" => Some((
+            "session/started".into(),
+            json!({
+                "ts": ts,
+                "cc_session": event.get("session_id").cloned().unwrap_or(Value::Null),
+                "subtype": "init",
+            }),
+        )),
+        "system" => None,
+        // Per-turn rate-limit telemetry — not a session happening; drop it.
+        "rate_limit_event" => None,
+        // An assistant/user turn: the nested message carries content blocks. We
+        // file tool_use as a tool call, tool_result as a tool result, and text as
+        // an assistant message, matching the obs grammar.
+        "assistant" | "user" => claude_stream_message(event, &ts),
+        // The final settle: the model's answer text + usage + the session id.
+        "result" => Some((
+            "session/idle".into(),
+            json!({
+                "ts": ts,
+                "event": "result",
+                "cc_session": event.get("session_id").cloned().unwrap_or(Value::Null),
+                "result": clip_value(event.get("result"), 4000),
+                "usage": event.get("usage").cloned().unwrap_or(Value::Null),
+                "is_error": event.get("is_error").cloned().unwrap_or(Value::Null),
+            }),
+        )),
+        // Anything else (stream_event partials, etc.) lands generically.
+        other => {
+            let (leaf, mut body) = generic_event(other, event);
+            if let Value::Object(m) = &mut body {
+                m.insert("cc_stream_event".into(), json!(other));
+            }
+            Some((leaf, body))
+        }
+    }
+}
+
+/// Map the content blocks of a Claude print-stream `assistant`/`user` message to a
+/// single obs record (the first load-bearing block). A turn typically carries one
+/// salient block: text (assistant message), tool_use (a tool call), or tool_result
+/// (a tool result). We file that block; finer block-by-block fan-out is M3's job.
+fn claude_stream_message(event: &Value, ts: &str) -> Option<(String, Value)> {
+    let cc_session = event.get("session_id").cloned().unwrap_or(Value::Null);
+    let content = event.get("message")?.get("content")?.as_array()?;
+    for block in content {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                return Some((
+                    "assistant/message".into(),
+                    json!({ "ts": ts, "cc_session": cc_session, "text": clip_opt(block.get("text"), 4000) }),
+                ));
+            }
+            Some("tool_use") => {
+                let tool = block.get("name").and_then(Value::as_str).unwrap_or("unknown");
+                return Some((
+                    format!("tool/{}/call", topic::encode_segment(tool)),
+                    json!({ "ts": ts, "cc_session": cc_session, "tool": tool, "input": clip_value(block.get("input"), 4000) }),
+                ));
+            }
+            Some("tool_result") => {
+                return Some((
+                    "tool/result".into(),
+                    json!({ "ts": ts, "cc_session": cc_session, "content": clip_value(block.get("content"), 4000) }),
+                ));
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
 /// `elanus code hook <event>` — the bridge. Reads the Claude Code hook JSON
 /// payload on stdin and publishes one ordered observation to the bus as the
 /// session principal. Always exits 0 (and prints nothing on stdout): a hook that
@@ -621,6 +927,30 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
         // and we must not fail the coding session. Stay quiet.
         return Ok(());
     };
+
+    // The DURABLE session record (M2-A): Claude Code carries its own native
+    // resumable session id in every hook payload (`session_id`). On SessionStart —
+    // the first hook of a run — persist the record (elanus session ↔ CC session_id
+    // ↔ workdir), so the session is resumable (`claude -p --resume <session_id>`)
+    // even after the launcher exits. The record carries no secret. Best-effort: a
+    // failure here must never break the hook or the coding session.
+    if matches!(event, "SessionStart" | "Setup") {
+        if let Some(native) = payload.get("session_id").and_then(Value::as_str) {
+            let workdir = payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or(".")
+                .to_string();
+            let rec = codesession::SessionRecord {
+                elanus_session: session.clone(),
+                native_session: native.to_string(),
+                tool: "claude".to_string(),
+                agent_noun: agent.clone(),
+                workdir,
+            };
+            let _ = codesession::upsert_record(root, &rec);
+        }
+    }
 
     // Route event-mapping through the adapter the launcher recorded as the
     // session's agent noun. An unknown noun (a future adapter this binary
@@ -1173,6 +1503,125 @@ mod tests {
         // Retire kills it.
         codesession::retire(&root, principal);
         assert!(codesession::read(&root, principal).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── The resume primitive (M2-A) ──────────────────────────────────────────
+
+    #[test]
+    fn resume_command_codex_targets_the_recorded_thread() {
+        // codex resume = `codex exec resume <thread_id> --json --skip-git-repo-check
+        // "<msg>"` (confirmed against codex-cli 0.141.0). The native session id from
+        // the record is the resume target; the workdir is applied by the caller as
+        // the child cwd (no --cd on `codex exec resume`).
+        let rec = codesession::SessionRecord {
+            elanus_session: "code-aaaa1111".to_string(),
+            native_session: "019ee252-3d31-7681-b1d7-7a4b3c494fb5".to_string(),
+            tool: "codex".to_string(),
+            agent_noun: "codex".to_string(),
+            workdir: "/tmp/proj".to_string(),
+        };
+        let (prog, args) = resume_command(&rec, "say hi again");
+        assert_eq!(prog, "codex");
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "resume",
+                "019ee252-3d31-7681-b1d7-7a4b3c494fb5",
+                "--json",
+                "--skip-git-repo-check",
+                "say hi again",
+            ]
+        );
+        // The thread id is positional right after `resume` — the resume targets THE
+        // recorded thread, not --last.
+        assert_eq!(args[2], rec.native_session);
+    }
+
+    #[test]
+    fn resume_command_claude_resumes_the_recorded_session_headlessly() {
+        // claude resume = `claude -p --resume <session_id> --output-format
+        // stream-json --verbose "<msg>"` (confirmed against Claude Code 2.1.183).
+        // Headless print, resuming the recorded native session id, capturing the
+        // JSONL result stream (hooks are not reloaded on a bare -p --resume).
+        let rec = codesession::SessionRecord {
+            elanus_session: "code-bbbb2222".to_string(),
+            native_session: "cc-sess-9f".to_string(),
+            tool: "claude".to_string(),
+            agent_noun: "claude-code".to_string(),
+            workdir: "/work".to_string(),
+        };
+        let (prog, args) = resume_command(&rec, "continue please");
+        assert_eq!(prog, "claude");
+        assert!(args.contains(&"-p".to_string()));
+        let resume_pos = args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(args[resume_pos + 1], "cc-sess-9f");
+        assert!(args.windows(2).any(|w| w == ["--output-format", "stream-json"]));
+        assert_eq!(args.last().unwrap(), "continue please");
+    }
+
+    #[test]
+    fn claude_stream_result_and_message_map_to_obs_grammar() {
+        // The print-stream `result` settle → session/idle carrying the answer text.
+        let (leaf, body) = claude_stream_map(&json!({
+            "type": "result",
+            "subtype": "success",
+            "session_id": "cc-sess-9f",
+            "result": "done!",
+            "is_error": false,
+            "usage": { "input_tokens": 10, "output_tokens": 3 }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "session/idle");
+        assert_eq!(body["event"], "result");
+        assert_eq!(body["cc_session"], "cc-sess-9f");
+        assert!(body["result"].as_str().unwrap().contains("done!"));
+
+        // An assistant text turn → assistant/message.
+        let (leaf, body) = claude_stream_map(&json!({
+            "type": "assistant",
+            "session_id": "cc-sess-9f",
+            "message": { "content": [{ "type": "text", "text": "hi again" }] }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "assistant/message");
+        assert_eq!(body["text"], "hi again");
+
+        // A tool_use block → tool/<name>/call.
+        let (leaf, body) = claude_stream_map(&json!({
+            "type": "assistant",
+            "session_id": "cc-sess-9f",
+            "message": { "content": [{ "type": "tool_use", "name": "Bash", "input": { "command": "ls" } }] }
+        }))
+        .unwrap();
+        assert_eq!(leaf, "tool/Bash/call");
+        assert_eq!(body["tool"], "Bash");
+
+        // The init system message → session/started (resumed session id), ONCE.
+        let (leaf, body) = claude_stream_map(&json!({
+            "type": "system", "subtype": "init", "session_id": "cc-sess-9f"
+        }))
+        .unwrap();
+        assert_eq!(leaf, "session/started");
+        assert_eq!(body["cc_session"], "cc-sess-9f");
+
+        // A non-init system frame (a resume replays these) is DROPPED — so a long
+        // session history does not flood the bus with duplicate starts.
+        assert!(claude_stream_map(&json!({ "type": "system", "subtype": "compact" })).is_none());
+        // Per-turn rate-limit telemetry is dropped (not a session happening).
+        assert!(claude_stream_map(&json!({ "type": "rate_limit_event" })).is_none());
+    }
+
+    #[test]
+    fn resume_errors_with_no_record() {
+        // Resuming a session that was never recorded is a clean error, not a panic
+        // and not a silent no-op (so a caller/test sees the missing record).
+        let dir = std::env::temp_dir().join(format!("elanus-resume-norec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let err = resume(&root, "code-nope0000", "hi").unwrap_err();
+        assert!(format!("{err:#}").contains("no resumable coding session"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
