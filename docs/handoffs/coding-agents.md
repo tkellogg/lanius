@@ -6,8 +6,12 @@ session mailbox → resume) landed 2026-06-20; M4-A (the orchestration loop clos
 requester capture → completion routing → idempotency) landed 2026-06-20** — Claude
 Code (hook bridge) 2026-06-19, Codex (`codex exec --json` stdout stream) 2026-06-20,
 branch `coding-agents`. All verified end to end against the live worktree stack.
-**M4-B (the mediated dispatch tool + the launch-envelope briefing) is the next
-slice, then M3 (interactive pull / a session read grant), then M5.**
+M4-B (the mediated dispatch tool + the launch-envelope briefing) landed
+2026-06-20; **M3 (per-turn context injection + the session's own-inbox read)
+landed 2026-06-20** — the first increment giving a session any read capability,
+scoped own-inbox-only by an env-derived ledger query (the bus token stays
+emit-only). **M5 (peer coordination, now unblocked by the M3 injection seam) is
+next.**
 See the Log at the bottom for the as-built decisions (the two adapters share one
 envelope but differ in their *capture mechanism* — CC's hooks vs Codex's JSONL
 stream; the durable-session split-record model is in the M2-A entry; the
@@ -1267,14 +1271,120 @@ issue, there isn't one"). The tool is plumbing + record, not a new bus authority
   verified** (the impl agent died on an auth error before the e2e step). The adversarial
   verify does the live deliver→worker→completion→planner-resume run.
 
+### M3 — per-turn context injection + the session's own inbox read (2026-06-20)
+
+The per-turn counterpart to the one-time launch briefing: every turn a session is
+told its inbox status and any memory note, injected OUT OF BAND (a system note,
+after the cached prefix — not the user message). This is the FIRST increment where
+a session gains any READ capability, and it is widened by EXACTLY one thing: a
+session may read its OWN inbox. Verified live in the isolated worktree stack (root
+`~/.elanus/wt-coding-agents`, broker `:1893`; the main `~/.elanus/root` on `:1883`
+was never touched).
+
+- **The read-scope approach (the crux) — a scoped LEDGER QUERY by env-derived
+  identity, NOT a bus-token widening.** `codesession::inbox_for_session` selects the
+  `events` rows whose topic is the session's OWN mailbox `in/agent/<noun>/<session>`,
+  where `<noun>`/`<session>` come from the running session's env
+  (`ELANUS_CODE_AGENT`/`ELANUS_CODE_SESSION` the launcher set) — **never from an
+  argument**. So a session can never name another session's inbox: the mailbox topic
+  is built from its OWN identity, exactly as `elanus code hook` publishes as itself.
+  The emit-only bus token is **structurally unchanged** — `SessionToken.subscribe`
+  stays `Vec::new()` (the broker ACL still denies the token any subscribe, including
+  to its own inbox `#` and `obs/#`). The new read authority is the kernel-side query
+  gated by the env-derived identity, the approach the M3 spec prefers (no bus-token
+  widening needed). **Proven own-inbox-only, live and adversarially:** session A and
+  session B each see ONLY their own deliveries; passing B's id as an arg to A's
+  `inbox` is silently ignored (no session-id arg exists — flags only) and A still
+  reads only A's; no env → cleanly refused; any child A spawns inherits A's env (the
+  only way to "be B" is to hold B's env, i.e. to BE B). The broker session-scope ACL
+  tests (`session_actor_is_scoped_by_the_broker_acl`,
+  `unminted_session_actor_authorizes_nothing`) still pass — the token cannot
+  subscribe to anything.
+
+- **`elanus code inbox`** (`codeagent::inbox_cmd`, reserved word under `Cmd::Code`).
+  Run from inside a session: lists THIS session's pending/unseen deliveries (message
+  + who-from + correlation + state), scoped to its own env-derived mailbox by
+  construction. "Seen" is tracked in a new durable `code_inbox_seen` table keyed by
+  `(session, event_id)`: pulling marks the listed deliveries seen (idempotent — a
+  second pull doesn't re-surface them, `INSERT … ON CONFLICT DO NOTHING`); the
+  per-turn injection counts only UNSEEN. `--all` shows the full inbox
+  (non-destructive, marks nothing); `--json` for a tool to parse. A session can only
+  mark ITS OWN deliveries seen (the keyspace is namespaced by session).
+
+- **Per-turn injection (`codeagent::turn_injection`)** — an out-of-band `[elanus]`
+  block reporting inbox status ("N new message(s)" + a brief preview of the latest)
+  and an optional memory note. None when there's nothing to say (a quiet turn injects
+  nothing). Kept per-turn, OUT of the cached prefix, so it never busts prompt caching.
+  Per adapter:
+  - **Claude Code (interactive):** the `UserPromptSubmit` (and `SessionStart`) hook
+    now prints `{"hookSpecificOutput":{"hookEventName":…,"additionalContext":…}}` on
+    stdout — the **system-reminder layer** (Appendix A), NOT the user message.
+    Verified live: the hook emits the inbox+note `additionalContext`, and it CHANGES
+    when the inbox changes (2 unseen → pull → "no new messages" → deliver again →
+    "1 new message") and when the note is edited (`src/parse.rs` → `src/parser/mod.rs`).
+  - **Codex + driven CC resume (headless):** a driven resume does NOT fire the
+    launch-time hooks (a bare `-p --resume`/`codex exec resume` doesn't reload the
+    generated `--settings`), so the per-turn context rides the **resume prompt the
+    daemon builds** — `build_resume_message` prepends the `[elanus]` block ahead of
+    the delivered message, out of band. Verified live: with a note
+    `ELANUS-NOTE-XK42`, a daemon-driven codex resume produced the model replying
+    `ELANUS-NOTE-XK42` verbatim — proof the note rode the resume prompt and the model
+    read it.
+
+- **The per-session memory note (`code note <session> "<text>"`,
+  `codesession::{set_note,get_note}`)** — a minimal stored, editable block keyed by
+  session in a new durable `code_notes` table (one row per session; latest wins;
+  empty text clears it). A planner (or human) leaves a worker a persistent reminder;
+  it surfaces in the per-turn injection. Round-trips live (set → appears in the next
+  turn's injection; change → the change shows). Refuses a non-recorded session
+  (a note would otherwise sit unread).
+
+- **Deferred from the block substrate (noted per the spec).** The full
+  `context_blocks` substrate (`Placement`, registers, computed blocks, the build
+  log, docs/context.md) is NOT integrated — the note is a thin, purpose-built stored
+  value, and the inbox status is computed inline in `turn_injection`. A clean reuse
+  of `context_blocks` (the note as a `Session`-scoped block, the inbox status as a
+  computed block) is the natural next step but was not needed for M3's surface; M5's
+  edit-claims block points at the same seam. Recorded as a deliberate deferral.
+
+- **No regression.** The emit-only publish scope is unchanged (only own-inbox READ
+  added, via the ledger query, not the token); launch/resume/deliver/M4-A routing
+  unbroken (M4-B `code deliver` still records the requester and the daemon drives it);
+  `~/.codex`/`~/.claude` config untouched (M3 writes no tool config — `config.toml`
+  Jun 19, `auth.json` Jun 16 both predate the run); no idle credential after a resume.
+  **Operational note (per the spec):** the launch briefing tells the agent to run
+  `elanus code deliver`/`elanus code inbox`, which need `elanus` on PATH — a
+  dev-from-worktree planner uses `target/debug/elanus` (the dev stack prepends
+  `target/debug` to PATH; a hand-driven test must do the same or use the absolute
+  path).
+
+- **Tests.** `cargo test` green, **148 passing** (was 141): +3 codesession
+  (`inbox_reads_only_the_sessions_own_mailbox` — the crux: A sees only A's, B only
+  B's, a mismatched noun reads its own empty mailbox not another's, a non-session
+  name has no inbox; `inbox_seen_is_idempotent_and_scopes_unseen`;
+  `note_round_trips_and_clears`), +4 codeagent
+  (`turn_injection_reflects_inbox_and_note_and_changes_with_state`,
+  `turn_injection_shows_only_unseen_inbox`,
+  `build_resume_message_prepends_injection_only_when_present`,
+  `note_cmd_requires_a_recorded_session`).
+
 ### Still TODO (next increments)
-- **M4-B — the mediated dispatch tool + the launch-envelope briefing.** The two
-  deferred pieces above: how a coding-session planner *originates* a delivery to a
-  worker with elanus authority (the session token stays emit-only), and the
-  one-time operating-envelope briefing at launch so a planner ends its turn cleanly.
-- **M3 interactive-pull / session read grant.** When a session is given read
-  authority over its own inbox, extend its `subscribe` scope in `codesession`
-  (today empty — emit-only). M2-A deliberately did NOT do this.
+- **M5 — peer coordination over the bus (advisory).** Now unblocked (M3 is the
+  injection seam): a coordination room (`in/group/<id>`), an edit-claim announced by
+  a session, surfaced in each session's per-turn injection as a new computed block
+  (the M3 `turn_injection` is the place to add it — the same out-of-band channel).
+  Crash-released claim leases (docs/topics.md decided-5).
+- **Block-substrate integration (deferred from M3).** Fold the memory note and the
+  inbox status into `context_blocks` (the note as a `Session`-scoped block, the
+  inbox status as a computed block with a build-log entry) if/when M5's claims block
+  makes the substrate reuse clean. Today they are a thin stored value + an inline
+  computed string.
+- ~~M3 session read grant.~~ **DONE 2026-06-20** (see the M3 Log entry above). The
+  read was NOT done by widening the bus token's `subscribe` scope — that stays empty
+  (emit-only) — but by a kernel-side scoped LEDGER QUERY gated by the session's own
+  env-derived identity (`codesession::inbox_for_session`). So the M2-A "no read
+  authority on the bus token" property is preserved; the read is own-inbox-only by
+  construction.
 
 - Posture-mode → cage mapping (Codex read-only/workspace-write/full ↔ cage write +
   read + egress) and the complete cage (incl. read scoping) before bypass: BLOCKED

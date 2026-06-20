@@ -581,10 +581,10 @@ identity recorded as the requester.\n\
 loop. You may be paused and the worker's result will reach you later as a NEW turn \
 (elanus resumes you with it). Busy-waiting just burns tokens and the result will \
 never arrive within the same turn.\n\
-- Things addressed to you (a worker's completion, a message) arrive as a resumed \
-turn with the content in your prompt; you don't have a live inbox to poll. Recorded \
-session activity lives on the bus under `obs/agent/<noun>/<session>/` if you need to \
-inspect prior state with `elanus events` or `elanus bus`.\n\
+- Things addressed to you arrive as a resumed turn with the content in your prompt; \
+you can also pull your own inbox with `elanus code inbox` (only YOUR mailbox). Each \
+turn elanus injects an `[elanus]` note with your inbox status and any memory note. \
+Prior session activity is on the bus under `obs/agent/<noun>/<session>/`.\n\
 - Otherwise behave exactly as you normally would toward your human, who may or may \
 not be watching this session live."
     )
@@ -614,6 +614,187 @@ fn take_brief_flag(args: &[String]) -> (bool, Vec<String>) {
 /// positional; the briefing arrives as out-of-band context.
 fn codex_briefing_block(brief: &str) -> String {
     format!("[elanus operating envelope — read before acting]\n{brief}\n")
+}
+
+// ── M3: per-turn context injection + the session's own inbox read ─────────────
+//
+// M3 is the PER-TURN counterpart to the one-time launch briefing: it keeps a
+// session informed every turn of its inbox status and an optional memory note,
+// injected OUT OF BAND (a system-reminder, after the cached prefix — not the user
+// message). It is also the first increment where a session gains any READ
+// capability, and that capability is deliberately narrow: a session may read ONLY
+// its OWN inbox.
+//
+// **The read-scope crux — a scoped ledger query, NOT a bus-token widening.** The
+// inbox read is `codesession::inbox_for_session`, a SQL query of the `events`
+// ledger filtered to the session's OWN mailbox `in/agent/<noun>/<session>`, where
+// `<noun>`/`<session>` come from the running session's own env (the launcher set
+// ELANUS_CODE_AGENT / ELANUS_CODE_SESSION) — NEVER from an argument. So a session
+// cannot name another session's inbox: the mailbox topic is built from its own
+// identity, exactly as `elanus code hook` publishes as itself. The emit-only bus
+// token's subscribe scope is UNTOUCHED (still empty — `codesession::SessionToken`
+// `subscribe: Vec::new()`); the session still cannot read the bus at all. The new
+// read authority is the kernel-side query gated by the env-derived identity, the
+// approach docs/handoffs/coding-agents.md M3 prefers.
+
+/// `elanus code inbox` — list THIS session's own inbox (run from inside a
+/// session). Reads ELANUS_CODE_SESSION / ELANUS_CODE_AGENT from the env the
+/// launcher set; the inbox is its OWN mailbox by construction (no session-id arg,
+/// so it can never name another session's inbox). Prints the pending/unseen
+/// deliveries (message + who-from + correlation) and marks them seen so a second
+/// pull is idempotent. With `--all`, shows the full inbox (seen + unseen) and
+/// marks nothing. With `--json`, emits machine-readable JSON for a tool to parse.
+pub fn inbox_cmd(root: &Root, args: &[String]) -> Result<()> {
+    let want_all = args.iter().any(|a| a == "--all");
+    let want_json = args.iter().any(|a| a == "--json");
+
+    // Identity comes ONLY from the env the launcher set — never an argument. This
+    // is the structural own-inbox-only guarantee: there is no code path by which a
+    // caller names a different session's mailbox.
+    let session = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
+    let agent = std::env::var(ENV_AGENT).ok().filter(|s| !s.is_empty());
+    let (Some(session), Some(agent)) = (session, agent) else {
+        bail!(
+            "elanus code inbox must run inside a coding session \
+             (no {ENV_SESSION}/{ENV_AGENT} in the environment — run it from a \
+             session launched by `elanus code`)"
+        );
+    };
+
+    // unseen-only is the default (the interactive pull); --all shows everything.
+    let items = codesession::inbox_for_session(root, &agent, &session, !want_all)?;
+
+    if want_json {
+        let arr: Vec<Value> = items
+            .iter()
+            .map(|it| {
+                json!({
+                    "event_id": it.event_id,
+                    "from": it.from,
+                    "correlation": it.correlation,
+                    "state": it.state,
+                    "created_at": it.created_at,
+                    "seen": it.seen,
+                    "message": it.message,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json!(arr))?);
+    } else if items.is_empty() {
+        println!(
+            "(your inbox is empty{})",
+            if want_all { "" } else { " — no unread messages" }
+        );
+    } else {
+        println!(
+            "{} message(s) in your inbox{}:",
+            items.len(),
+            if want_all { "" } else { " (unread)" }
+        );
+        for it in &items {
+            let from = it.from.as_deref().unwrap_or("?");
+            let corr = it
+                .correlation
+                .as_deref()
+                .map(|c| format!(" [{c}]"))
+                .unwrap_or_default();
+            println!("  • from {from}{corr} (event {}): {}", it.event_id, clip(&it.message, 2000));
+        }
+    }
+
+    // Mark the listed unseen deliveries as seen (the default pull). --all is a
+    // non-destructive view: it does not change the seen-set. Idempotent either way.
+    if !want_all {
+        let ids: Vec<i64> = items.iter().filter(|it| !it.seen).map(|it| it.event_id).collect();
+        codesession::mark_inbox_seen(root, &session, &ids)?;
+    }
+    Ok(())
+}
+
+/// `elanus code note <session> "<text>"` — set (or replace) a session's memory
+/// note, surfaced by the per-turn injection. An empty `<text>` clears the note.
+/// Run by a planner (or a human) to leave a worker a persistent reminder. Unlike
+/// `inbox`, this names the target session explicitly (a planner annotates a
+/// worker) — and it is plumbing + record, not a bus authority: it writes a row a
+/// session reads back through its own per-turn injection, with no token involved.
+pub fn note_cmd(root: &Root, session: &str, text: &str) -> Result<()> {
+    let session = session.trim();
+    if session.is_empty() {
+        bail!("usage: elanus code note <session> \"<text>\"  (empty text clears the note)");
+    }
+    // A note can only attach to a real recorded session — otherwise it would sit
+    // unread (nothing surfaces it). Keep the failure honest.
+    if codesession::read_record(root, session)?.is_none() {
+        bail!(
+            "no coding session {session:?} to leave a note for \
+             (never launched, or its native session id was never observed)"
+        );
+    }
+    codesession::set_note(root, session, text)?;
+    if text.trim().is_empty() {
+        println!("cleared the note for {session}");
+    } else {
+        println!("note set for {session}");
+    }
+    Ok(())
+}
+
+/// Build the per-turn injection text for a session — the OUT-OF-BAND system note
+/// (system-reminder layer for CC, the `[elanus]` resume block for codex) that
+/// reports the session's current inbox status and any memory note. Returns None
+/// when there is nothing to say (no unseen inbox, no note) so a quiet turn injects
+/// nothing. Deliberately short; it is per-turn context, kept OUT of the cached
+/// prefix (it changes every turn) so it never busts prompt caching.
+///
+/// The inbox read is the same own-inbox-only scoped query the CLI uses — built
+/// from the session's own `agent_noun`/`session`, never a caller-supplied id.
+pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<String> {
+    let unseen = codesession::inbox_for_session(root, agent_noun, session, true)
+        .ok()
+        .unwrap_or_default();
+    let note = codesession::get_note(root, session).ok().flatten();
+
+    if unseen.is_empty() && note.is_none() {
+        return None;
+    }
+
+    let mut out = String::from("[elanus] ");
+    if unseen.is_empty() {
+        out.push_str("Your inbox has no new messages.");
+    } else {
+        out.push_str(&format!(
+            "You have {} new message(s) in your inbox. Run `elanus code inbox` to read them.",
+            unseen.len()
+        ));
+        // A brief preview of the most recent one or two (clipped), so the agent
+        // has a hint without pulling — but the authoritative read is the command.
+        if let Some(latest) = unseen.last() {
+            let from = latest.from.as_deref().unwrap_or("?");
+            out.push_str(&format!(
+                "\n  Latest from {from}: {}",
+                clip(&latest.message, 200)
+            ));
+        }
+    }
+    if let Some(note) = note {
+        out.push_str(&format!("\n[elanus note] {}", clip(&note, 2000)));
+    }
+    Some(out)
+}
+
+/// Compose the message a driven resume hands the model: the per-turn `[elanus]`
+/// injection block (inbox status + memory note) prepended to the delivered
+/// message, OUT OF BAND. The injection is bracketed so the model reads it as a
+/// system note, not as the user's words; the delivered message follows under its
+/// own marker. When there is nothing to inject (a quiet turn — no unseen inbox, no
+/// note), the message is returned unchanged, so a plain resume stays plain.
+fn build_resume_message(root: &Root, agent_noun: &str, session: &str, message: &str) -> String {
+    match turn_injection(root, agent_noun, session) {
+        Some(ctx) => format!(
+            "{ctx}\n[elanus] The message you were resumed with follows.\n\n{message}"
+        ),
+        None => message.to_string(),
+    }
 }
 
 /// `elanus code <tool> [args...]` — launch the real coding agent, observed.
@@ -1274,7 +1455,19 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     let session = rec.elanus_session.clone();
     let workdir = std::path::PathBuf::from(&rec.workdir);
 
-    let (program, cmd_args) = resume_command(&rec, message);
+    // M3 per-turn injection (the headless/driven path, both adapters). A driven
+    // resume does NOT fire the launch-time UserPromptSubmit hook (a bare
+    // `-p --resume` / `codex exec resume` doesn't reload the generated hooks), so
+    // the per-turn context rides the RESUME PROMPT instead — prepended as an
+    // out-of-band `[elanus]` block ahead of the delivered message. It carries the
+    // session's inbox status + memory note (the same own-inbox-only scoped read,
+    // built from this session's own noun/id), kept per-turn so it reflects the
+    // current state every resume. The injection is prepended to the message the
+    // model sees; it is NOT cached (a resume is a fresh turn), so it never busts
+    // any prompt cache. None when there's nothing to inject (a quiet turn).
+    let injected = build_resume_message(root, &agent, &session, message);
+
+    let (program, cmd_args) = resume_command(&rec, &injected);
     // Bound the native turn (handoff guardrail): timeout(1) kills a hung model.
     let secs = resume_timeout_secs();
     let (program, cmd_args) = timeout_wrap(&program, &cmd_args, secs);
@@ -1467,8 +1660,11 @@ fn claude_stream_message(event: &Value, ts: &str) -> Option<(String, Value)> {
 
 /// `elanus code hook <event>` — the bridge. Reads the Claude Code hook JSON
 /// payload on stdin and publishes one ordered observation to the bus as the
-/// session principal. Always exits 0 (and prints nothing on stdout): a hook that
-/// fails or emits stray output must never break or alter the coding session.
+/// session principal. Always exits 0: a hook that fails must never break or alter
+/// the coding session. It prints to stdout only for the M3 per-turn injection —
+/// on `UserPromptSubmit`/`SessionStart` it emits a `hookSpecificOutput`
+/// `additionalContext` object (the system-reminder layer, Appendix A) carrying the
+/// session's inbox status + memory note; every other event prints nothing.
 pub fn hook(root: &Root, event: &str) -> Result<()> {
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
@@ -1523,6 +1719,30 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
         &obs_topic(&agent, &session, &leaf),
         body,
     );
+
+    // M3 per-turn injection (Claude Code): on UserPromptSubmit (and SessionStart),
+    // return the session's inbox status + memory note as `additionalContext` — the
+    // SYSTEM-REMINDER layer (Appendix A: stdout of these hooks lands as an
+    // out-of-band system note AFTER the cached prefix, not in the user message).
+    // This is the per-turn counterpart to the one-time launch briefing: each turn
+    // the agent sees how many messages are waiting and any note a planner left.
+    // The inbox read here is the SAME own-inbox-only scoped query — built from the
+    // session's own env-derived `agent`/`session`, never a hook-supplied id — so a
+    // hook can never surface another session's inbox.
+    if matches!(event, "UserPromptSubmit" | "SessionStart") {
+        if let Some(ctx) = turn_injection(root, &agent, &session) {
+            // The documented JSON form (Appendix A): hookSpecificOutput with the
+            // hook event name + additionalContext. Printed on stdout (exit 0) so
+            // Claude Code folds it into the system-reminder layer.
+            let out = json!({
+                "hookSpecificOutput": {
+                    "hookEventName": event,
+                    "additionalContext": ctx,
+                }
+            });
+            println!("{out}");
+        }
+    }
     Ok(())
 }
 
@@ -2621,5 +2841,133 @@ mod tests {
         let block = codex_briefing_block("BRIEF-BODY");
         assert!(block.contains("elanus operating envelope"));
         assert!(block.contains("BRIEF-BODY"));
+    }
+
+    // ── M3: per-turn injection + the inbox read ──────────────────────────────
+
+    fn m3_tmp_root() -> Root {
+        let dir = std::env::temp_dir().join(format!(
+            "elanus-m3-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Root { dir }
+    }
+
+    fn m3_record(root: &Root, sess: &str, noun: &str) {
+        codesession::upsert_record(
+            root,
+            &codesession::SessionRecord {
+                elanus_session: sess.into(),
+                native_session: "t".into(),
+                tool: if noun == "codex" { "codex" } else { "claude" }.into(),
+                agent_noun: noun.into(),
+                workdir: "/tmp".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn m3_deliver(root: &Root, noun: &str, sess: &str, from: &str, msg: &str) -> i64 {
+        let conn = crate::db::open(root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let topic = format!(
+            "in/agent/{}/{}",
+            topic::encode_segment(noun),
+            topic::encode_segment(sess),
+        );
+        crate::events::emit(
+            root,
+            &conn,
+            crate::events::EmitOpts {
+                payload: Some(json!({ "prompt": msg })),
+                sender: Some(from.to_string()),
+                ..crate::events::EmitOpts::new(&topic)
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn turn_injection_reflects_inbox_and_note_and_changes_with_state() {
+        let root = m3_tmp_root();
+        m3_record(&root, "code-inj00001", "codex");
+
+        // A quiet turn: nothing to inject.
+        assert!(turn_injection(&root, "codex", "code-inj00001").is_none());
+
+        // Deliver one message → the injection reports it (system-note style).
+        m3_deliver(&root, "codex", "code-inj00001", "owner", "fix the parser");
+        let one = turn_injection(&root, "codex", "code-inj00001").unwrap();
+        assert!(one.starts_with("[elanus]"));
+        assert!(one.contains("1 new message"));
+        assert!(one.contains("elanus code inbox")); // tells the agent how to read
+        assert!(one.contains("fix the parser")); // a brief preview
+
+        // Deliver a second → the injection CHANGES (count reflects the new inbox).
+        m3_deliver(&root, "codex", "code-inj00001", "code-planner", "and the lexer");
+        let two = turn_injection(&root, "codex", "code-inj00001").unwrap();
+        assert!(two.contains("2 new message"));
+        assert_ne!(one, two, "the injected text must change when the inbox changes");
+
+        // A memory note also surfaces, and changes when edited.
+        codesession::set_note(&root, "code-inj00001", "the lexer lives in src/lex.rs").unwrap();
+        let with_note = turn_injection(&root, "codex", "code-inj00001").unwrap();
+        assert!(with_note.contains("[elanus note]"));
+        assert!(with_note.contains("src/lex.rs"));
+        codesession::set_note(&root, "code-inj00001", "actually src/lexer/mod.rs").unwrap();
+        let edited = turn_injection(&root, "codex", "code-inj00001").unwrap();
+        assert!(edited.contains("src/lexer/mod.rs"));
+        assert!(!edited.contains("src/lex.rs"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn turn_injection_shows_only_unseen_inbox() {
+        let root = m3_tmp_root();
+        m3_record(&root, "code-uns00001", "codex");
+        let id1 = m3_deliver(&root, "codex", "code-uns00001", "owner", "one");
+        m3_deliver(&root, "codex", "code-uns00001", "owner", "two");
+        // Two unseen.
+        assert!(turn_injection(&root, "codex", "code-uns00001").unwrap().contains("2 new message"));
+        // Pulling marks the first seen → the next turn reflects only the unseen.
+        codesession::mark_inbox_seen(&root, "code-uns00001", &[id1]).unwrap();
+        assert!(turn_injection(&root, "codex", "code-uns00001").unwrap().contains("1 new message"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn build_resume_message_prepends_injection_only_when_present() {
+        let root = m3_tmp_root();
+        m3_record(&root, "code-bld00001", "codex");
+        // No inbox / no note → the message is unchanged (a plain resume stays plain).
+        let plain = build_resume_message(&root, "codex", "code-bld00001", "do the work");
+        assert_eq!(plain, "do the work");
+        // With a note, the `[elanus]` block is prepended and the delivered message
+        // is kept under its own marker.
+        codesession::set_note(&root, "code-bld00001", "remember X").unwrap();
+        let injected = build_resume_message(&root, "codex", "code-bld00001", "do the work");
+        assert!(injected.starts_with("[elanus]"));
+        assert!(injected.contains("remember X"));
+        assert!(injected.contains("do the work"));
+        assert!(injected.contains("message you were resumed with"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn note_cmd_requires_a_recorded_session() {
+        let root = m3_tmp_root();
+        // No record → clean error (a note would otherwise sit unread).
+        let err = note_cmd(&root, "code-nope0000", "hi").unwrap_err();
+        assert!(format!("{err:#}").contains("no coding session"));
+        // With a record, it round-trips through codesession.
+        m3_record(&root, "code-ok000001", "codex");
+        note_cmd(&root, "code-ok000001", "do the thing").unwrap();
+        assert_eq!(
+            codesession::get_note(&root, "code-ok000001").unwrap().as_deref(),
+            Some("do the thing")
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

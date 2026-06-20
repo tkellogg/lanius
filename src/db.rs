@@ -397,6 +397,30 @@ CREATE TABLE IF NOT EXISTS subagent_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_subagent_parent ON subagent_sessions(parent_session_id, id);
 CREATE INDEX IF NOT EXISTS idx_subagent_child ON subagent_sessions(child_session_id);
+
+-- A per-session memory note (M3): a small, editable block a planner leaves a
+-- worker (or a persistent reminder), surfaced by the per-turn injection. One
+-- row per session — the latest text wins (upsert). Deliberately minimal (a
+-- stored string keyed by session); the full context_blocks substrate
+-- integration is deferred (docs/handoffs/coding-agents.md M3 entry).
+CREATE TABLE IF NOT EXISTS code_notes (
+  session    TEXT PRIMARY KEY,   -- the coding session the note is for (code-<id>)
+  note       TEXT NOT NULL,      -- the note text shown in the per-turn injection
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- Inbox read-tracking (M3): which of a session's own mailbox deliveries it has
+-- already pulled via `elanus code inbox`. Keyed by (session, event_id) so the
+-- read is idempotent — pulling twice does not re-surface the same message, and
+-- the per-turn injection counts only UNSEEN deliveries. A session only ever
+-- writes rows for ITS OWN deliveries (the inbox read is scoped to its own
+-- env-derived mailbox by construction), so there is no cross-session write.
+CREATE TABLE IF NOT EXISTS code_inbox_seen (
+  session   TEXT NOT NULL,       -- the coding session that pulled the delivery
+  event_id  INTEGER NOT NULL,    -- the delivery event id (the ledger row)
+  seen_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (session, event_id)
+);
 "#,
     )?;
     // Migrations for databases created before a column existed; the error on

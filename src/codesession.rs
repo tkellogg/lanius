@@ -192,6 +192,182 @@ pub fn delivery_key_seen(root: &Root, key: &str, session: &str) -> bool {
     .is_some()
 }
 
+// ── The session inbox + memory note (M3) ──────────────────────────────────────
+//
+// M3 gives a session its FIRST read capability — but a narrow, structural one
+// that does NOT widen the emit-only bus token (which stays subscribe-empty). A
+// session reads ONLY its own inbox, and it does so as a SCOPED LEDGER QUERY by
+// its own identity, not over the bus: `inbox_for_session` selects the `events`
+// rows whose topic is the session's own mailbox `in/agent/<noun>/<session>`. The
+// caller (the `elanus code inbox` CLI) derives `<noun>`/`<session>` from the
+// process env the launcher set (ELANUS_CODE_AGENT / ELANUS_CODE_SESSION), never
+// from an argument — so a session can never name another session's inbox, and
+// the read is own-inbox-only BY CONSTRUCTION. The bus token's subscribe scope is
+// untouched (still empty): the read authority is the kernel-side query, gated by
+// the env-derived identity, exactly as `elanus code hook` publishes as itself.
+
+/// One delivery in a session's own inbox (a `code-*` mailbox `events` row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxItem {
+    /// The ledger event id (the durable delivery row).
+    pub event_id: i64,
+    /// The message text the delivery carried (the `prompt`/`text` field).
+    pub message: String,
+    /// The broker-verified sender of the delivery (who it is from), if recorded.
+    pub from: Option<String>,
+    /// The correlation that threads this delivery's round trip, if any.
+    pub correlation: Option<String>,
+    /// The delivery's lifecycle state (pending / running / done / failed …) —
+    /// honest about whether the daemon has already driven it.
+    pub state: String,
+    /// When the delivery was recorded.
+    pub created_at: String,
+    /// Whether this session has already pulled this delivery via `code inbox`.
+    pub seen: bool,
+}
+
+/// Read a session's OWN inbox: the deliveries on ITS mailbox topic
+/// `in/agent/<noun>/<session>`. `noun` and `session` MUST come from the running
+/// session's own env (the CLI derives them), never from a caller-supplied id —
+/// that is what makes this own-inbox-only by construction. With `unseen_only`,
+/// returns just the deliveries this session has not yet pulled (the per-turn
+/// status counts these); otherwise the full inbox. Newest last (chronological).
+/// The mailbox topic is built with `encode_segment` so it matches exactly what
+/// the launcher/deliverer addressed (the same encoding `recognize_delivery` and
+/// `record_delivery` use), even for a name with reserved characters.
+pub fn inbox_for_session(
+    root: &Root,
+    agent_noun: &str,
+    session: &str,
+    unseen_only: bool,
+) -> Result<Vec<InboxItem>> {
+    // Guard: only a real `code-*` session has an inbox, and the mailbox is built
+    // from the session's own identity. A non-session name yields nothing rather
+    // than a crafted topic.
+    if !is_session_principal(session) {
+        return Ok(Vec::new());
+    }
+    let mailbox = format!(
+        "in/agent/{}/{}",
+        crate::topic::encode_segment(agent_noun),
+        crate::topic::encode_segment(session),
+    );
+    let conn = crate::db::open(root).context("opening the ledger for the inbox")?;
+    crate::db::init_schema(&conn)?;
+    // The session's own mailbox rows, joined to its seen-set. The `session`
+    // binding on the LEFT JOIN is the SAME env-derived session, so a row's seen
+    // flag is THIS session's read state, never another's.
+    let mut stmt = conn.prepare(
+        "SELECT e.id, COALESCE(e.payload,''), e.sender, e.correlation_id, e.state, e.created_at,
+                (s.event_id IS NOT NULL) AS seen
+         FROM events e
+         LEFT JOIN code_inbox_seen s
+           ON s.session = ?1 AND s.event_id = e.id
+         WHERE e.type = ?2
+         ORDER BY e.id ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![session, mailbox], |r| {
+            let payload: String = r.get(1)?;
+            let seen: bool = r.get(6)?;
+            Ok((
+                r.get::<_, i64>(0)?,
+                payload,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                seen,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut items = Vec::new();
+    for (event_id, payload, from, correlation, state, created_at, seen) in rows {
+        if unseen_only && seen {
+            continue;
+        }
+        let pv: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+        // Reuse the same message extraction the daemon uses to drive a delivery,
+        // so the inbox shows exactly what a resume would act on.
+        let message = crate::codeagent::delivery_message(&pv).unwrap_or_default();
+        items.push(InboxItem {
+            event_id,
+            message,
+            from,
+            correlation,
+            state,
+            created_at,
+            seen,
+        });
+    }
+    Ok(items)
+}
+
+/// Mark a set of the session's own inbox deliveries as seen (idempotent). Called
+/// after `elanus code inbox` lists them, so a second pull does not re-surface the
+/// same messages and the per-turn count reflects only genuinely new deliveries.
+/// Writes ONLY rows for the env-derived `session` — a session can never mark
+/// another session's deliveries seen. `INSERT … ON CONFLICT DO NOTHING` so a
+/// re-mark is a no-op.
+pub fn mark_inbox_seen(root: &Root, session: &str, event_ids: &[i64]) -> Result<()> {
+    if event_ids.is_empty() || !is_session_principal(session) {
+        return Ok(());
+    }
+    let conn = crate::db::open(root).context("opening the ledger to mark the inbox seen")?;
+    crate::db::init_schema(&conn)?;
+    for id in event_ids {
+        conn.execute(
+            "INSERT INTO code_inbox_seen (session, event_id) VALUES (?1, ?2)
+             ON CONFLICT(session, event_id) DO NOTHING",
+            rusqlite::params![session, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Set (or replace) a session's memory note — the small editable block a planner
+/// leaves a worker, surfaced by the per-turn injection. One row per session; the
+/// latest text wins. An empty note clears it (a deliberate way to remove a stale
+/// reminder). The session must be a valid `code-*` id.
+pub fn set_note(root: &Root, session: &str, note: &str) -> Result<()> {
+    if !is_session_principal(session) {
+        bail!("note session {session:?} is not a valid code-* identity name");
+    }
+    let conn = crate::db::open(root).context("opening the ledger to set the note")?;
+    crate::db::init_schema(&conn)?;
+    let note = note.trim();
+    if note.is_empty() {
+        conn.execute("DELETE FROM code_notes WHERE session = ?1", [session])?;
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO code_notes (session, note) VALUES (?1, ?2)
+         ON CONFLICT(session) DO UPDATE SET
+           note = excluded.note,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        rusqlite::params![session, note],
+    )?;
+    Ok(())
+}
+
+/// Read a session's memory note, if one is set. None when there is no note (the
+/// per-turn injection omits the note line in that case).
+pub fn get_note(root: &Root, session: &str) -> Result<Option<String>> {
+    if !is_session_principal(session) {
+        return Ok(None);
+    }
+    let conn = crate::db::open(root).context("opening the ledger to read the note")?;
+    crate::db::init_schema(&conn)?;
+    let note = conn
+        .query_row(
+            "SELECT note FROM code_notes WHERE session = ?1",
+            [session],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(note)
+}
+
 /// Bump a record's `last_active` to now (after a resume completes). Best-effort.
 pub fn touch_record(root: &Root, elanus_session: &str) -> Result<()> {
     let conn = crate::db::open(root)?;
@@ -617,5 +793,149 @@ mod tests {
         assert!(read(&root, "code-resume01").is_none());
         // The durable record outlives the token — still resumable later.
         assert!(read_record(&root, "code-resume01").unwrap().is_some());
+    }
+
+    // ── The session inbox + memory note (M3) ─────────────────────────────────
+
+    /// Emit a delivery into a session's mailbox via the kernel ledger, exactly as
+    /// a real deliver/owner publish does, so the inbox read sees a genuine row.
+    fn deliver_into(root: &Root, noun: &str, session: &str, sender: &str, msg: &str) -> i64 {
+        let conn = crate::db::open(root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let topic = format!(
+            "in/agent/{}/{}",
+            crate::topic::encode_segment(noun),
+            crate::topic::encode_segment(session),
+        );
+        crate::events::emit(
+            root,
+            &conn,
+            crate::events::EmitOpts {
+                payload: Some(serde_json::json!({ "prompt": msg })),
+                sender: Some(sender.to_string()),
+                ..crate::events::EmitOpts::new(&topic)
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn inbox_reads_only_the_sessions_own_mailbox() {
+        // THE CRUX (M3 read-scoping): a session's inbox read returns ITS OWN
+        // deliveries and NEVER another session's, because the mailbox topic is
+        // built from the (env-derived) own identity — there is no code path that
+        // names a different session's mailbox.
+        let root = tmp_root();
+        upsert_record(
+            &root,
+            &SessionRecord {
+                elanus_session: "code-mine0001".into(),
+                native_session: "t1".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp".into(),
+            },
+        )
+        .unwrap();
+        upsert_record(
+            &root,
+            &SessionRecord {
+                elanus_session: "code-other002".into(),
+                native_session: "t2".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp".into(),
+            },
+        )
+        .unwrap();
+        // Two deliveries to MINE, one to OTHER.
+        deliver_into(&root, "codex", "code-mine0001", "owner", "for me #1");
+        deliver_into(&root, "codex", "code-mine0001", "code-planner", "for me #2");
+        deliver_into(&root, "codex", "code-other002", "owner", "for someone else");
+
+        // My inbox, read by MY identity, has exactly my two — never the other's.
+        let mine = inbox_for_session(&root, "codex", "code-mine0001", false).unwrap();
+        assert_eq!(mine.len(), 2);
+        let msgs: Vec<&str> = mine.iter().map(|i| i.message.as_str()).collect();
+        assert!(msgs.contains(&"for me #1"));
+        assert!(msgs.contains(&"for me #2"));
+        assert!(!msgs.iter().any(|m| m.contains("someone else")));
+        // who-from + correlation are surfaced.
+        assert_eq!(mine[1].from.as_deref(), Some("code-planner"));
+
+        // The other session reads its own one delivery (proof the scoping cuts the
+        // other way too — neither can see the other's).
+        let other = inbox_for_session(&root, "codex", "code-other002", false).unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].message, "for someone else");
+
+        // The mailbox topic is derived from identity, so even passing a DELIBERATELY
+        // mismatched noun for my session simply reads a DIFFERENT (empty) topic — it
+        // can never read another real session's inbox. (There is no parameter that
+        // lets `code-mine0001`'s caller read `code-other002`'s rows.)
+        let wrong_noun = inbox_for_session(&root, "claude-code", "code-mine0001", false).unwrap();
+        assert!(wrong_noun.is_empty(), "a different noun reads its own empty mailbox, not another session's");
+
+        // A non-session name has no inbox at all (no crafted topic).
+        assert!(inbox_for_session(&root, "codex", "owner", false).unwrap().is_empty());
+        assert!(inbox_for_session(&root, "codex", "code-../escape", false).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn inbox_seen_is_idempotent_and_scopes_unseen() {
+        let root = tmp_root();
+        upsert_record(
+            &root,
+            &SessionRecord {
+                elanus_session: "code-seen0001".into(),
+                native_session: "t".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp".into(),
+            },
+        )
+        .unwrap();
+        let id1 = deliver_into(&root, "codex", "code-seen0001", "owner", "one");
+        let _id2 = deliver_into(&root, "codex", "code-seen0001", "owner", "two");
+
+        // Both start unseen.
+        assert_eq!(inbox_for_session(&root, "codex", "code-seen0001", true).unwrap().len(), 2);
+        // Mark the first seen — only one remains unseen, idempotently.
+        mark_inbox_seen(&root, "code-seen0001", &[id1]).unwrap();
+        mark_inbox_seen(&root, "code-seen0001", &[id1]).unwrap(); // re-mark = no-op
+        let unseen = inbox_for_session(&root, "codex", "code-seen0001", true).unwrap();
+        assert_eq!(unseen.len(), 1);
+        assert_eq!(unseen[0].message, "two");
+        // The full inbox still shows both, with the seen flag honest.
+        let all = inbox_for_session(&root, "codex", "code-seen0001", false).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().find(|i| i.event_id == id1).unwrap().seen);
+        // A session can only mark ITS OWN deliveries seen: marking under a
+        // different session id touches a different (session, event) keyspace and
+        // does NOT hide my unseen row.
+        mark_inbox_seen(&root, "code-attacker9", &[unseen[0].event_id]).unwrap();
+        assert_eq!(inbox_for_session(&root, "codex", "code-seen0001", true).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn note_round_trips_and_clears() {
+        let root = tmp_root();
+        assert!(get_note(&root, "code-note0001").unwrap().is_none());
+        set_note(&root, "code-note0001", "  remember the migration  ").unwrap();
+        assert_eq!(get_note(&root, "code-note0001").unwrap().as_deref(), Some("remember the migration"));
+        // Replacing the note shows the new text.
+        set_note(&root, "code-note0001", "actually do the rename first").unwrap();
+        assert_eq!(
+            get_note(&root, "code-note0001").unwrap().as_deref(),
+            Some("actually do the rename first")
+        );
+        // An empty note clears it.
+        set_note(&root, "code-note0001", "   ").unwrap();
+        assert!(get_note(&root, "code-note0001").unwrap().is_none());
+        // A note can't attach to a non-session name.
+        assert!(set_note(&root, "owner", "x").is_err());
+        let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

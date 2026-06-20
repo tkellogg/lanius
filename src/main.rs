@@ -255,10 +255,13 @@ enum Cmd {
     /// (`elanus code hook <Event>`); `resume <elanus_session> "<message>"`
     /// continues a recorded session in its workdir (the M2-A resume primitive);
     /// `deliver <worker-session> "<message>"` (run from inside a session) dispatches
-    /// work to a worker and records the running session as the requester (M4-B).
+    /// work to a worker and records the running session as the requester (M4-B);
+    /// `inbox` (run from inside a session) reads ITS OWN inbox (M3, own-inbox-only by
+    /// construction); `note <session> "<text>"` leaves a per-session memory note (M3).
     #[command(disable_help_flag = true)]
     Code {
-        /// The adapter (claude, codex), or a reserved word (`hook`, `resume`, `deliver`).
+        /// The adapter (claude, codex), or a reserved word (`hook`, `resume`,
+        /// `deliver`, `inbox`, `note`).
         tool: String,
         /// Arguments passed straight through to the tool (or, for `hook`, the
         /// single hook event name).
@@ -911,6 +914,26 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     let message = args.get(1..).unwrap_or(&[]).join(" ");
                     codeagent::deliver(&root, worker, &message)?;
+                }
+                "inbox" => {
+                    // A session pulls its OWN inbox (M3). Identity comes from the
+                    // env the launcher set (ELANUS_CODE_SESSION/AGENT) — never an
+                    // arg — so it can only ever read its own mailbox. Flags: --all
+                    // (full inbox, non-destructive), --json (machine-readable).
+                    codeagent::inbox_cmd(&root, &args)?;
+                }
+                "note" => {
+                    // Leave a per-session memory note (M3), surfaced by the per-turn
+                    // injection. `elanus code note <session> "<text>"`; empty text
+                    // clears it.
+                    let session = args.first().map(String::as_str).unwrap_or("");
+                    if session.is_empty() {
+                        anyhow::bail!(
+                            "usage: elanus code note <session> \"<text>\"  (empty text clears the note)"
+                        );
+                    }
+                    let text = args.get(1..).unwrap_or(&[]).join(" ");
+                    codeagent::note_cmd(&root, session, &text)?;
                 }
                 _ => {
                     codeagent::launch(&root, &tool, &args)?;
