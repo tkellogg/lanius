@@ -541,10 +541,23 @@ accepted`, not `duplicate`), and `K` is now recorded independently for both sess
 the genuine replay (same key, same session, re-pended `running` across a SIGKILL +
 restart) was still a recognized `delivery/duplicate` no-op with zero second resume.
 
+**(c) Lost planner wake on a crash (reliability, not a hole).** The same fix pass
+closed the disclosed M4-A residual: the settle UPDATE (worker delivery → `done`) and
+the routed completion emit are separate autocommit transactions, so a crash between
+them settled the worker but lost the planner's wake forever (the boot sweep only
+re-pends `running` events, never `done`). FIX: a boot reconciliation
+`reconcile_lost_routes` (src/dispatcher.rs) walks the durable `code_delivery_keys`
+rows (each marks a delivery actually driven), re-derives the requester from the
+original delivery event's persisted `sender`/`payload`/`correlation`, and re-emits
+the route if none was ever emitted (`route_already_emitted` guard) — idempotent and
+crash-only, like the other boot sweeps. Proven live: a crafted settle→route-gap crash
+state recovered exactly one route on restart, and a second restart routed nothing.
+
 Regression-tested (`cargo test`, 134 green): the rejected-`reply_to` probes
 (`explicit_reply_to_cannot_target_human_inbox_or_arbitrary_topic`), the cross-victim
 non-suppression (`cross_victim_key_does_not_suppress_a_different_session_delivery` +
 `delivery_key_is_namespaced_by_session_no_cross_victim_suppression`), and the
-crash-recovery (below). RESIDUAL: none for these two; the session token authority is
-unchanged (the daemon still routes with its own authority, just to a constrained,
-validated destination).
+crash-recovery (`reconcile_recovers_a_route_lost_in_the_settle_route_gap`,
+`reconcile_skips_deliveries_with_no_requester`). RESIDUAL: none for these; the session
+token authority is unchanged (the daemon still routes with its own authority, just to
+a constrained, validated destination).

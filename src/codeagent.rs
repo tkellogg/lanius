@@ -413,6 +413,209 @@ pub fn delivery_message(payload: &Value) -> Option<String> {
     None
 }
 
+// ── The deliver tool: a planner dispatches work to a worker (M4-B) ────────────
+//
+// `elanus code deliver <worker-session> "<message>"` is how a *planner* coding
+// session hands work to a *worker* coding session without busy-waiting. It is the
+// origination half the M4-A loop left open: M4-A routes a worker's completion back
+// to whoever asked; this is how a coding-session planner *becomes* that asker.
+//
+// **Plumbing + record, NOT a new bus authority.** Planner and worker are both the
+// user's own agents with the SAME authority — there is no trust boundary between
+// them and nothing to gate. The tool does NOT use the session's bus token to
+// publish into the worker's mailbox (that token is emit-only — its own obs subtree,
+// nothing else — and stays that way). Instead it writes a `pending` delivery event
+// straight to the kernel ledger via `events::emit`, stamped `sender = <the running
+// planner session>`, exactly as the daemon's own `route_completion` does. The
+// daemon's `drive_code_deliveries` picks it up next tick, drives the worker, and —
+// because the recorded `sender` is the planner (a `code-*` session with a record) —
+// M4-A's `delivery_requester` routes the completion back to the planner's mailbox,
+// resuming it. The safety here is the audit trail: who dispatched what to whom, on
+// the bus, with honest provenance — not a permission check.
+
+/// `elanus code deliver <worker-session> "<message>"` — dispatch work to a worker.
+///
+/// Run from inside a coding session (the launcher sets `ELANUS_CODE_SESSION` /
+/// `ELANUS_CODE_AGENT` in the child's env): that running session is recorded as the
+/// **requester**, so M4-A routes the worker's completion back to it. Fails cleanly
+/// if there is no running-session identity in the env, if the worker session has no
+/// durable record (never launched / wrong id), or if a session tries to deliver to
+/// itself (which would self-resume into a loop). The delivery carries the message,
+/// the requester as `reply_to`, and a correlation, and is emitted through the
+/// kernel ledger so it is recorded with provenance — the planner's emit-only token
+/// is never used or widened.
+pub fn deliver(root: &Root, worker_session: &str, message: &str) -> Result<()> {
+    // The running session is the requester — captured from the env the launcher
+    // set on this coding agent's process tree. Without it we are not inside a
+    // coding session and have no honest requester to record (fail rather than
+    // dispatch anonymously, which would route the completion nowhere).
+    let requester = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
+    let Some(requester) = requester else {
+        bail!(
+            "elanus code deliver must run inside a coding session \
+             (no {ENV_SESSION} in the environment — are you running it from a \
+             session launched by `elanus code`?)"
+        );
+    };
+    let id = record_delivery(root, &requester, worker_session, message)?;
+    eprintln!("[code] delivered to {worker_session} (event {id}, from {requester})");
+    println!(
+        "delivered to {worker_session}: the daemon will resume it with your message; \
+         its completion will be delivered back to your mailbox. End your turn now — \
+         do not wait."
+    );
+    Ok(())
+}
+
+/// Build and record the delivery to a worker, with `requester` as the recorded
+/// sender. The env-free core of `deliver` (the requester comes from the env in the
+/// CLI; here it is explicit so the path is unit-testable). Returns the emitted
+/// event id. Fails cleanly on an empty message, an unknown worker, or a
+/// self-delivery.
+pub fn record_delivery(
+    root: &Root,
+    requester: &str,
+    worker_session: &str,
+    message: &str,
+) -> Result<i64> {
+    let worker_session = worker_session.trim();
+    if worker_session.is_empty() {
+        bail!("usage: elanus code deliver <worker-session> \"<message>\"");
+    }
+    let message = message.trim();
+    if message.is_empty() {
+        bail!("a deliver message must not be empty");
+    }
+    let requester = requester.to_string();
+
+    // The worker must be a real, recorded session — otherwise the delivery would
+    // sit in a mailbox the daemon never resumes. Resolve its record to get the
+    // agent noun for the mailbox address, and to confirm it exists.
+    let rec = codesession::read_record(root, worker_session)
+        .context("reading the worker session record")?
+        .with_context(|| {
+            format!(
+                "no coding session {worker_session:?} to deliver to \
+                 (never launched, or its native session id was never observed)"
+            )
+        })?;
+
+    if worker_session == requester {
+        bail!(
+            "refusing to deliver to your own session {requester:?} \
+             (a session cannot dispatch work to itself)"
+        );
+    }
+
+    // The worker's mailbox: in/agent/<worker-noun>/<worker-session> — exactly the
+    // address `recognize_delivery` resumes (M2-B). Encode the segments so a name
+    // with reserved characters can't escape its level.
+    let mailbox = format!(
+        "in/agent/{}/{}",
+        topic::encode_segment(&rec.agent_noun),
+        topic::encode_segment(worker_session),
+    );
+
+    // An explicit reply_to: the planner's OWN session mailbox, so M4-A routes the
+    // worker's completion straight back to it. The recorded `sender` alone already
+    // drives M4-A's requester capture (a `code-*` sender → its own mailbox), but
+    // setting reply_to makes the intent explicit and is the bare requester NAME,
+    // which `delivery_requester` re-derives through `mailbox_for_actor` (never used
+    // verbatim — it can't be coaxed into an arbitrary topic). We only set it when
+    // the requester has a durable record (so the route is addressable); a
+    // freshly-launched planner whose native id isn't observed yet omits it and
+    // relies on the recorded sender once its record exists.
+    let mut payload = json!({ "prompt": message });
+    if codesession::read_record(root, &requester).ok().flatten().is_some() {
+        payload["reply_to"] = json!(requester);
+    }
+
+    // A correlation threads the whole round trip (deliver → worker → completion →
+    // planner resume) as one conversation.
+    let correlation = format!("code-deliver-{}", uuid::Uuid::new_v4().simple());
+
+    // Emit through the kernel ledger as the planner session. This is the SAME path
+    // the daemon's route_completion uses (events::emit with an explicit sender) —
+    // it does NOT touch the session's bus token, so the emit-only scope is never
+    // widened. The event is `pending`; drive_code_deliveries picks it up next tick.
+    let conn = crate::db::open(root).context("opening the ledger to record the delivery")?;
+    crate::db::init_schema(&conn)?;
+    let id = crate::events::emit(
+        root,
+        &conn,
+        crate::events::EmitOpts {
+            payload: Some(payload),
+            correlation: Some(correlation.clone()),
+            sender: Some(requester.clone()),
+            ..crate::events::EmitOpts::new(&mailbox)
+        },
+    )
+    .context("recording the delivery on the ledger")?;
+    Ok(id)
+}
+
+// ── The launch-envelope briefing (M4-B) ───────────────────────────────────────
+//
+// A coding agent does not, on its own, know it is running under elanus, that it may
+// be resumed headlessly, or how hand-off works (docs/handoffs/coding-agents.md,
+// "elanus briefs the session on the envelope at launch"). The launcher injects a
+// one-time operating-envelope briefing at launch — CC via `--append-system-prompt`
+// (the out-of-band system layer), Codex by prepending it to the prompt (Codex exec
+// has no system-prompt flag). The per-turn ongoing context (inbox status, claims)
+// is M3's separate injection seam.
+
+/// The operating-envelope briefing text, parameterized with this session's own id
+/// so the agent knows its handle. Deliberately short — it tells the agent the four
+/// things it can't infer: it runs under elanus; how to hand work to a worker; that
+/// it must END ITS TURN after dispatching (not busy-wait); and that it should
+/// behave normally toward its human.
+fn briefing(session: &str) -> String {
+    format!(
+        "You are running as coding session `{session}` under elanus supervision \
+(an orchestration layer around you). A few things only elanus can tell you:\n\
+\n\
+- To hand a sub-task to another coding session (a \"worker\"), run: \
+`elanus code deliver <worker-session> \"<message>\"`. elanus delivers it with your \
+identity recorded as the requester.\n\
+- AFTER you dispatch work, END YOUR TURN cleanly — do NOT poll, sleep, or wait in a \
+loop. You may be paused and the worker's result will reach you later as a NEW turn \
+(elanus resumes you with it). Busy-waiting just burns tokens and the result will \
+never arrive within the same turn.\n\
+- Things addressed to you (a worker's completion, a message) arrive as a resumed \
+turn with the content in your prompt; you don't have a live inbox to poll. Recorded \
+session activity lives on the bus under `obs/agent/<noun>/<session>/` if you need to \
+inspect prior state with `elanus events` or `elanus bus`.\n\
+- Otherwise behave exactly as you normally would toward your human, who may or may \
+not be watching this session live."
+    )
+}
+
+/// Should the launch-envelope briefing be injected? Default yes; a `--no-brief`
+/// flag anywhere in the user args suppresses it (and is stripped before the args
+/// reach the tool, so it never confuses the binary). Returns the filtered args.
+fn take_brief_flag(args: &[String]) -> (bool, Vec<String>) {
+    let mut brief = true;
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        if a == "--no-brief" {
+            brief = false;
+        } else {
+            out.push(a.clone());
+        }
+    }
+    (brief, out)
+}
+
+/// The Codex briefing block written to the child's stdin. Codex `exec` documents:
+/// "If stdin is piped and a prompt is also provided, stdin is appended as a
+/// `<stdin>` block." So piping the briefing delivers it to the agent robustly,
+/// WITHOUT parsing the arg list to find the prompt positional (which would be
+/// fragile against flag values like `-m <model>`). The user's prompt stays the
+/// positional; the briefing arrives as out-of-band context.
+fn codex_briefing_block(brief: &str) -> String {
+    format!("[elanus operating envelope — read before acting]\n{brief}\n")
+}
+
 /// `elanus code <tool> [args...]` — launch the real coding agent, observed.
 pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     // Reap any session tokens a prior SIGKILL'd launcher leaked, before anything
@@ -425,9 +628,15 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
         eprintln!("[code] reaped orphaned session credential {orphan}");
     }
 
+    // The launch-envelope briefing rides a launch flag (default on; `--no-brief`
+    // suppresses it). Strip the flag before the args reach the tool.
+    let (want_brief, args) = take_brief_flag(args);
+    let args = &args[..];
+
     let tool = Tool::parse(tool)?;
     let session = format!("code-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let agent = tool.agent_noun().to_string();
+    let brief_text = want_brief.then(|| briefing(&session));
 
     // Per-session identity: a GRANT-SCOPED session token (NOT a full-authority
     // fenced secret — docs/security.md entry 16). The launcher is uncaged (the
@@ -489,6 +698,12 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                     .arg(&settings_path)
                     .arg("--setting-sources")
                     .arg("");
+                // The launch-envelope briefing (M4-B): Claude Code injects it
+                // out-of-band via --append-system-prompt (the system layer, after
+                // the cached prefix — Appendix A), not the user message.
+                if let Some(brief) = &brief_text {
+                    cmd.arg("--append-system-prompt").arg(brief);
+                }
                 cmd.args(args);
                 // The session's own identity, carried to the hook bridge children
                 // CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are what
@@ -509,6 +724,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
             // each event in-process as the session principal.
             Capture::StreamJson => run_codex_capture(
                 root, &principal, &bus_token, &agent, &session, &workdir, args,
+                brief_text.as_deref(),
             ),
         }
     })();
@@ -552,6 +768,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
 /// CC's sandbox. The child gets empty stdin (the prompt comes from the user args,
 /// not stdin) so it never blocks reading stdin. stderr is inherited so the human
 /// still sees Codex's own progress/errors.
+#[allow(clippy::too_many_arguments)]
 fn run_codex_capture(
     root: &Root,
     principal: &str,
@@ -560,23 +777,46 @@ fn run_codex_capture(
     session: &str,
     workdir: &Path,
     args: &[String],
+    brief: Option<&str>,
 ) -> Result<std::process::ExitStatus> {
+    use std::io::Write as _;
     use std::process::{Command, Stdio};
 
     let mut cmd = Command::new("codex");
     cmd.arg("exec").arg("--json").arg("--skip-git-repo-check");
     cmd.args(args);
-    // Empty stdin (prompt is in args), piped stdout (we parse it), inherited
-    // stderr (the human sees Codex's own output). We keep the real CODEX_HOME —
-    // setting it to a scratch would drop the user's auth.
-    cmd.stdin(Stdio::null())
+    // The launch-envelope briefing (M4-B): Codex exec has no --append-system-prompt,
+    // so we deliver it on STDIN. Codex appends piped stdin as a `<stdin>` block
+    // alongside the prompt positional — robust, no arg parsing. stdin is piped only
+    // when there is a briefing to write; otherwise null (the prompt is the arg, so
+    // the child never blocks on stdin). Piped stdout (we parse it), inherited stderr
+    // (the human sees Codex's own output). We keep the real CODEX_HOME — setting it
+    // to a scratch would drop the user's auth.
+    cmd.stdin(if brief.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    // The session's own identity, carried to anything the codex session spawns —
+    // crucially `elanus code deliver`, which reads ELANUS_CODE_SESSION/AGENT to
+    // record the running session as the requester, and ELANUS_ROOT to resolve the
+    // same root. (Bus auth uses the in-process env per publish; these are for child
+    // processes the agent runs.)
+    cmd.env(ENV_SESSION, session)
+        .env(ENV_AGENT, agent)
+        .env("ELANUS_ROOT", &root.dir);
     eprintln!("[code] launching codex exec --json as session {session}");
 
     let mut child = cmd
         .spawn()
         .context("launching codex (is it installed and on PATH?)")?;
+
+    // Write the briefing to stdin (then close it, so codex stops reading). The
+    // child also has the prompt positional; codex folds piped stdin in as context.
+    if let Some(b) = brief {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(codex_briefing_block(b).as_bytes());
+            // Dropping stdin here closes it → EOF, so codex proceeds.
+        }
+    }
 
     // On a fresh launch, `thread.started` carries codex's native thread id —
     // persist the durable record (with this workdir) the moment we see it so the
@@ -2241,5 +2481,145 @@ mod tests {
         let err = resume(&root, "code-nope0000", "hi").unwrap_err();
         assert!(format!("{err:#}").contains("no resumable coding session"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── The deliver tool (M4-B) ──────────────────────────────────────────────
+
+    fn record_session(root: &Root, sess: &str, noun: &str) {
+        codesession::upsert_record(
+            root,
+            &codesession::SessionRecord {
+                elanus_session: sess.into(),
+                native_session: "thr".into(),
+                tool: if noun == "codex" { "codex" } else { "claude" }.into(),
+                agent_noun: noun.into(),
+                workdir: "/tmp".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// Read back the most recent event a `record_delivery` emitted (id, type,
+    /// sender, payload, correlation, state).
+    fn read_event(root: &Root, id: i64) -> (String, String, String, String, String) {
+        let conn = crate::db::open(root).unwrap();
+        conn.query_row(
+            "SELECT type, sender, COALESCE(payload,''), COALESCE(correlation_id,''), state
+             FROM events WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn deliver_builds_the_worker_mailbox_delivery_recording_the_requester() {
+        let root = delivery_tmp_root();
+        // A recorded planner (the requester) and a recorded codex worker.
+        record_session(&root, "code-planner1", "claude-code");
+        record_session(&root, "code-worker1", "codex");
+
+        let id = record_delivery(&root, "code-planner1", "code-worker1", "  build the thing  ")
+            .unwrap();
+        let (etype, sender, payload, corr, state) = read_event(&root, id);
+
+        // The delivery is addressed to the worker's session mailbox — exactly the
+        // address the daemon's recognize_delivery resumes.
+        assert_eq!(etype, "in/agent/codex/code-worker1");
+        assert!(recognize_delivery(&root, &etype).is_some());
+        // It is recorded with the planner as the sender (honest provenance — M4-A's
+        // requester capture reads this).
+        assert_eq!(sender, "code-planner1");
+        // The event is pending — the daemon drives it next tick. Not announced as a
+        // session bus publish (the emit-only token was never used).
+        assert_eq!(state, "pending");
+        // The message (trimmed) is the prompt; the reply_to is the planner.
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["prompt"], "build the thing");
+        assert_eq!(pv["reply_to"], "code-planner1");
+        assert!(!corr.is_empty());
+
+        // The captured requester from this delivery resolves to the planner's own
+        // mailbox — so M4-A routes the completion back and resumes it (the loop).
+        let req = delivery_requester(&root, &pv, Some(&sender), Some(&corr)).unwrap();
+        assert_eq!(req.reply_to, "in/agent/claude-code/code-planner1");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn deliver_to_unknown_worker_fails_cleanly() {
+        let root = delivery_tmp_root();
+        record_session(&root, "code-planner1", "claude-code");
+        let err = record_delivery(&root, "code-planner1", "code-ghost000", "do it").unwrap_err();
+        assert!(format!("{err:#}").contains("no coding session"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn deliver_rejects_self_delivery_and_empty_message() {
+        let root = delivery_tmp_root();
+        record_session(&root, "code-self0001", "codex");
+        // A session cannot dispatch to itself (would self-resume into a loop).
+        let err = record_delivery(&root, "code-self0001", "code-self0001", "go").unwrap_err();
+        assert!(format!("{err:#}").contains("own session"));
+        // An empty message is rejected (nothing to act on).
+        record_session(&root, "code-worker9", "codex");
+        let err = record_delivery(&root, "code-self0001", "code-worker9", "   ").unwrap_err();
+        assert!(format!("{err:#}").contains("must not be empty"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn deliver_omits_reply_to_when_requester_unrecorded_but_still_records_sender() {
+        // A freshly-launched planner whose native id isn't observed yet has no
+        // record. The delivery still emits (sender carries the provenance), just
+        // without an explicit reply_to — M4-A re-derives from the sender once the
+        // record exists, or routes nothing if it never does (no crash).
+        let root = delivery_tmp_root();
+        record_session(&root, "code-worker1", "codex");
+        let id = record_delivery(&root, "code-planner-unrec", "code-worker1", "x").unwrap();
+        let (_etype, sender, payload, _corr, _state) = read_event(&root, id);
+        assert_eq!(sender, "code-planner-unrec");
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert!(pv.get("reply_to").is_none(), "no reply_to without a record");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── The launch-envelope briefing (M4-B) ──────────────────────────────────
+
+    #[test]
+    fn briefing_covers_the_envelope_essentials() {
+        let b = briefing("code-abcd1234");
+        // It names the session, the deliver command, the end-your-turn rule, and
+        // the behave-normally-toward-the-human note.
+        assert!(b.contains("code-abcd1234"));
+        assert!(b.contains("elanus code deliver"));
+        assert!(b.to_lowercase().contains("end your turn"));
+        assert!(b.to_lowercase().contains("do not")); // do not poll/sleep/wait
+        assert!(b.to_lowercase().contains("human"));
+        // Short — a launch briefing, not a manual.
+        assert!(b.len() < 1200, "briefing should be concise, was {} chars", b.len());
+    }
+
+    #[test]
+    fn brief_flag_is_on_by_default_and_strippable() {
+        // No flag → briefing on, args unchanged.
+        let (on, args) = take_brief_flag(&["exec".into(), "do x".into()]);
+        assert!(on);
+        assert_eq!(args, vec!["exec".to_string(), "do x".to_string()]);
+        // --no-brief → off, and the flag is stripped so the tool never sees it.
+        let (on, args) = take_brief_flag(&["--no-brief".into(), "do x".into()]);
+        assert!(!on);
+        assert_eq!(args, vec!["do x".to_string()]);
+    }
+
+    #[test]
+    fn codex_briefing_block_wraps_the_brief_for_stdin() {
+        // Codex gets the briefing on stdin (folded in as a `<stdin>` block) rather
+        // than via arg injection, which would be fragile against flag values like
+        // `-m <model>`. The block carries the full briefing body.
+        let block = codex_briefing_block("BRIEF-BODY");
+        assert!(block.contains("elanus operating envelope"));
+        assert!(block.contains("BRIEF-BODY"));
     }
 }

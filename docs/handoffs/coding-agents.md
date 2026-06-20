@@ -1233,6 +1233,40 @@ entry 21.
   `reconcile_recovers_a_route_lost_in_the_settle_route_gap`,
   `reconcile_skips_deliveries_with_no_requester`).
 
+### M4-B — the deliver tool + the launch-envelope briefing (2026-06-20)
+
+The loop is now **planner-originated**: a planner coding session dispatches work to a
+worker with one tool call, no human as the wire. There is no authorization model here —
+planner and worker are the user's own agents with homogeneous authority; the safety is
+the recorded provenance, not a gate (Tim: "if you're trying to make this into a trust
+issue, there isn't one"). The tool is plumbing + record, not a new bus authority.
+
+- **`elanus code deliver <worker-session> "<message>"`** (`codeagent::deliver` +
+  `record_delivery`, reserved word under `Cmd::Code`). Run from inside a coding session
+  (reads `ELANUS_CODE_*`): records the running session as the **requester** so M4-A
+  routes the worker's completion back to it. Writes a `pending` delivery event to the
+  worker's mailbox `in/agent/<worker-noun>/<worker-session>` with the message, the
+  requester as `reply_to` (a valid coding-session mailbox — passes M4-A's constraint),
+  and a `code-deliver-<uuid>` correlation threading the whole round trip. The dispatch
+  goes through the kernel ledger emit, so the planner's **emit-only token is not
+  widened**; the daemon's `drive_code_deliveries` picks it up next tick. Refuses an
+  unrecorded/unknown worker and **self-delivery** (which would self-resume into a loop),
+  and an empty message — all with clear errors.
+- **Launch-envelope briefing** (`briefing`, `take_brief_flag`, `codex_briefing_block`):
+  injected at launch (default on; `--no-brief` suppresses). CC via
+  `--append-system-prompt`; Codex as an out-of-band stdin `[elanus operating envelope]`
+  block. Tells the agent: you run under elanus supervision; hand work off with
+  `elanus code deliver`; **end your turn after dispatching — do not busy-wait** — the
+  result returns as a resumed turn.
+- Also fixed the dangling "(below)" cross-reference in `docs/security.md` entry 21.
+- **Tests.** `cargo test` **141 passing** (was 134): +7 codeagent (deliver builds the
+  worker delivery recording the requester; unknown-worker / self-delivery / empty-message
+  clean failures; the unrecorded-requester-still-records-sender path; the briefing covers
+  the envelope essentials; the `--no-brief` flag; the codex briefing block).
+- **STATUS: implementation complete + unit-tested; live planner-originated loop NOT yet
+  verified** (the impl agent died on an auth error before the e2e step). The adversarial
+  verify does the live deliver→worker→completion→planner-resume run.
+
 ### Still TODO (next increments)
 - **M4-B — the mediated dispatch tool + the launch-envelope briefing.** The two
   deferred pieces above: how a coding-session planner *originates* a delivery to a

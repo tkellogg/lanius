@@ -253,10 +253,12 @@ enum Cmd {
     /// `codex`; everything after it is passed through unchanged). Reserved first
     /// words: `hook` is the internal hook bridge the generated hooks invoke
     /// (`elanus code hook <Event>`); `resume <elanus_session> "<message>"`
-    /// continues a recorded session in its workdir (the M2-A resume primitive).
+    /// continues a recorded session in its workdir (the M2-A resume primitive);
+    /// `deliver <worker-session> "<message>"` (run from inside a session) dispatches
+    /// work to a worker and records the running session as the requester (M4-B).
     #[command(disable_help_flag = true)]
     Code {
-        /// The adapter (claude, codex), or a reserved word (`hook`, `resume`).
+        /// The adapter (claude, codex), or a reserved word (`hook`, `resume`, `deliver`).
         tool: String,
         /// Arguments passed straight through to the tool (or, for `hook`, the
         /// single hook event name).
@@ -896,6 +898,19 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     let message = args.get(1..).unwrap_or(&[]).join(" ");
                     codeagent::resume(&root, session, &message)?;
+                }
+                "deliver" => {
+                    // A planner dispatches work to a worker (M4-B). Run from inside
+                    // a coding session; records the running session as the requester
+                    // so the worker's completion routes back (M4-A).
+                    let worker = args.first().map(String::as_str).unwrap_or("");
+                    if worker.is_empty() {
+                        anyhow::bail!(
+                            "usage: elanus code deliver <worker-session> \"<message>\""
+                        );
+                    }
+                    let message = args.get(1..).unwrap_or(&[]).join(" ");
+                    codeagent::deliver(&root, worker, &message)?;
                 }
                 _ => {
                     codeagent::launch(&root, &tool, &args)?;
