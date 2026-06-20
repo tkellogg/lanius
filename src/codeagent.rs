@@ -74,6 +74,48 @@ use std::path::Path;
 const ENV_SESSION: &str = "ELANUS_CODE_SESSION";
 const ENV_AGENT: &str = "ELANUS_CODE_AGENT";
 
+/// Provider-credential env vars scrubbed from EVERY launched/resumed coding-agent
+/// child (Task 2 / docs/handoffs/coding-agents.md cred-scrub Log).
+///
+/// elanus loads its own `.env` into its process (`dotenv::load` in main.rs) so its
+/// NATIVE agents can reach a provider through the genai anthropic-compat path — in
+/// the field that `.env` points `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` at a
+/// DeepSeek endpoint. A spawned coding tool (Claude Code / Codex) would otherwise
+/// INHERIT those vars and be misdirected away from its own login (`~/.claude` /
+/// `~/.codex`). The coding tool brings its OWN auth, so the launcher must NOT leak
+/// elanus's provider credentials into it: each spawn `env_remove`s these before
+/// exec. This scrubs ONLY provider credentials — the `ELANUS_*` session/bus/root
+/// vars the hook bridge and `elanus code …` children depend on are set explicitly
+/// AFTER the scrub and are never in this list.
+///
+/// (A future `--inherit-credentials` flag could opt back in to passing them, for a
+/// user who deliberately wants the tool to use elanus's provider; not built — the
+/// correct default is the tool's own auth.)
+const PROVIDER_CRED_VARS: &[&str] = &[
+    // Anthropic / Claude Code (and the genai anthropic-compat path elanus uses).
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    // OpenAI / Codex (and any OpenAI-compatible provider elanus is pointed at).
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "OPENAI_MODEL",
+];
+
+/// Scrub elanus's provider credentials from a child `Command` before it spawns the
+/// coding tool, so the tool uses its OWN login rather than inheriting elanus's
+/// provider env (see `PROVIDER_CRED_VARS`). Returns the same `&mut Command` for
+/// chaining. The `ELANUS_*` session/bus/root vars the bridge needs are set by the
+/// caller AFTER this and are deliberately NOT scrubbed.
+fn scrub_provider_creds(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for var in PROVIDER_CRED_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// The supported adapters: Claude Code (hook bridge) and Codex (`exec --json`
 /// stdout stream). They share the envelope; only the capture mechanism differs.
 #[derive(Clone, Copy)]
@@ -1103,6 +1145,11 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                     cmd.arg("--append-system-prompt").arg(brief);
                 }
                 cmd.args(args);
+                // Scrub elanus's provider credentials FIRST so Claude Code uses its
+                // own login (`~/.claude`) rather than inheriting elanus's DeepSeek
+                // ANTHROPIC_BASE_URL/API_KEY (Task 2). The ELANUS_* vars set below
+                // are NOT scrubbed — the hook bridge depends on them.
+                scrub_provider_creds(&mut cmd);
                 // The session's own identity, carried to the hook bridge children
                 // CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are what
                 // `elanus bus pub` authenticates with (src/buscli.rs);
@@ -1207,6 +1254,10 @@ fn run_codex_capture(
     cmd.stdin(if brief.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    // Scrub elanus's provider credentials so Codex uses its own login (`~/.codex`)
+    // rather than inheriting elanus's OPENAI_*/ANTHROPIC_* provider env (Task 2).
+    // The ELANUS_* vars set below are NOT scrubbed.
+    scrub_provider_creds(&mut cmd);
     // The session's own identity, carried to anything the codex session spawns —
     // crucially `elanus code deliver`, which reads ELANUS_CODE_SESSION/AGENT to
     // record the running session as the requester, and ELANUS_ROOT to resolve the
@@ -1817,6 +1868,12 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        // Scrub elanus's provider credentials so the resumed tool uses its own
+        // login rather than inheriting elanus's provider env (Task 2). The native
+        // tool (claude/codex) is wrapped in `timeout`, but env_remove on the parent
+        // Command is inherited through the `timeout` exec, so the tool still never
+        // sees them.
+        scrub_provider_creds(&mut cmd);
         eprintln!("[code] resuming {} session {session} ({}) [timeout {secs}s]", rec.tool, rec.native_session);
         let mut child = cmd
             .spawn()
@@ -3563,5 +3620,92 @@ mod tests {
         codesession::add_claim(&root, "other-room", "code-elsewhere", "x.rs").unwrap();
         assert!(turn_injection(&root, "codex", "code-solo0001").is_none());
         let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn scrub_removes_provider_creds_but_keeps_elanus_vars() {
+        // The denylist constant scrubs exactly the provider-credential vars and
+        // nothing else; the ELANUS_* session/bus/root vars are not in it.
+        for v in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_BASE",
+            "OPENAI_MODEL",
+        ] {
+            assert!(PROVIDER_CRED_VARS.contains(&v), "{v} must be scrubbed");
+        }
+        for keep in [
+            "ELANUS_PACKAGE",
+            "ELANUS_BUS_TOKEN",
+            "ELANUS_CODE_SESSION",
+            "ELANUS_CODE_AGENT",
+            "ELANUS_ROOT",
+        ] {
+            assert!(!PROVIDER_CRED_VARS.contains(&keep), "{keep} must NOT be scrubbed");
+        }
+    }
+
+    #[test]
+    fn scrubbed_child_does_not_inherit_provider_creds_but_keeps_session_vars() {
+        // The spawn-env construction the launcher uses: provider creds set on the
+        // parent Command are env_remove'd before exec, while the ELANUS_* vars set
+        // AFTER the scrub reach the child. We spawn a real child (`env`) through the
+        // SAME `scrub_provider_creds` helper the three spawn paths use, so the test
+        // exercises the actual construction, not a re-statement of it.
+        use std::process::{Command, Stdio};
+
+        let mut cmd = Command::new("/usr/bin/env");
+        // The denylisted provider creds (set as elanus's .env would), INCLUDING the
+        // exact DeepSeek-leak vars from the user's bug.
+        cmd.env("ANTHROPIC_BASE_URL", "https://deepseek.example/x")
+            .env("ANTHROPIC_API_KEY", "sk-deepseek-test")
+            .env("ANTHROPIC_AUTH_TOKEN", "tok-test")
+            .env("ANTHROPIC_MODEL", "deepseek-chat")
+            .env("OPENAI_API_KEY", "sk-openai-test")
+            .env("OPENAI_BASE_URL", "https://openai.example")
+            .env("OPENAI_API_BASE", "https://openai.example/v1")
+            .env("OPENAI_MODEL", "gpt-test");
+        // Scrub them (the launcher's first env step), THEN set the ELANUS_* vars the
+        // hook bridge / `elanus code …` children depend on (the launcher's second
+        // step) — exactly the order the real spawn paths use.
+        scrub_provider_creds(&mut cmd);
+        cmd.env("ELANUS_PACKAGE", "code-deadbeef")
+            .env("ELANUS_BUS_TOKEN", "bus-secret")
+            .env(ENV_SESSION, "code-deadbeef")
+            .env(ENV_AGENT, "claude-code")
+            .env("ELANUS_ROOT", "/tmp/fake-root");
+        cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+
+        let out = cmd.output().expect("running `env`");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let names: std::collections::HashSet<&str> = text
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+            .collect();
+
+        // The provider creds were scrubbed: the child never sees them.
+        for scrubbed in PROVIDER_CRED_VARS {
+            assert!(
+                !names.contains(scrubbed),
+                "child must NOT inherit provider cred {scrubbed}; saw env:\n{text}"
+            );
+        }
+        // The session/bus/root vars the bridge needs survive.
+        for kept in [
+            "ELANUS_PACKAGE",
+            "ELANUS_BUS_TOKEN",
+            ENV_SESSION,
+            ENV_AGENT,
+            "ELANUS_ROOT",
+        ] {
+            assert!(
+                names.contains(kept),
+                "child must inherit {kept}; saw env:\n{text}"
+            );
+        }
     }
 }
