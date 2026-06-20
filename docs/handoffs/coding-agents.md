@@ -1630,3 +1630,77 @@ planners.
   tool-reported set is what is available today. The verbatim `final_text` is
   whatever the adapter emits as its terminal message (codex's last `agent_message`,
   claude's `result` frame) — accurate for both adapters as built.
+
+### 2026-06-20 — `elanus serve` (packaged launcher) + provider-credential scrub (branch `coding-agents`)
+
+Two operability additions so the coding-agents feature is easy to RUN for real — a
+packaged supervisor, and the fix for the DeepSeek-credential leak into the spawned
+tool. cargo test 165 (was 163; +2 for the scrub). Both verified live against an
+isolated stack (root `~/.elanus/wt-coding-agents`, broker `1893`, web port `7280`).
+
+- **`elanus serve` — the packaged counterpart of `elanus dev`** (`src/dev.rs::serve`,
+  `Cmd::Serve` in `src/main.rs`). Where `dev` supervises three DEV services (a
+  `cargo run` debug daemon, `node server.mjs --watch`, the Vite dev server), `serve`
+  supervises the PROD stack with no dev toolchain, reusing dev.rs's Service /
+  CommandSpec / Log / signal / restart-backoff / group-teardown / root-cleanup
+  machinery (a sibling `serve` fn in the same module — no copy-paste):
+  - **Daemon = the running binary**, not `cargo run`: `serve` is itself launched from
+    a built binary, so `std::env::current_exe()` IS elanus; it re-invokes it as
+    `<self> -C <root> daemon --interval-ms <n>`.
+  - **Web = the built SPA**, no watch/Vite: `node ui/web/server.mjs --root <root>
+    --port <web-port>`. server.mjs serves `ui/web/dist/` (its `DIST`/`PUB`) — the prod
+    path.
+  - **dist/ built if missing.** Before starting the web server, if
+    `ui/web/dist/index.html` is absent (or `--rebuild` forces it), `serve` runs
+    `npm run build` in `ui/web`, streaming the build to the combined log, and aborts
+    on failure (the web server would otherwise serve a 404 app). An existing dist/ is
+    used as-is.
+  - **Args:** `--web-port` (default 7180, same as dev's web relay), `--interval-ms`
+    (daemon poll, default 1000), `--rebuild`. No vite port. Combined log at
+    `target/elanus-serve.log`. No file-watch / restart-on-source-change (a packaged
+    service runs the artifact as-is); exit-restart-with-backoff is kept.
+  - **Live check.** `cargo build`, then
+    `elanus -C ~/.elanus/wt-coding-agents serve --web-port 7280`: dist/ was absent →
+    built (`npm run build`, index.html + hashed `assets/index-*.{js,css}` produced);
+    the daemon came up with its broker on the root's `bus.toml` port (1893); the web
+    server served the BUILT SPA at 7280 — `curl http://127.0.0.1:7280/` returned the
+    prod `index.html` referencing `/assets/index-Crg75dWh.js` (the build hash) with NO
+    Vite dev markers (`@vite/client`, `/src/main`), the hashed asset served 200, and
+    `/api/status` reported `dist_present: true`. SIGTERM tore down the whole tree
+    cleanly (supervisor + daemon + node all gone, ports 7280/1893 free, root-scoped
+    children swept) — no orphans.
+
+- **Provider-credential scrub — the tool uses its OWN auth, not elanus's provider
+  env** (`src/codeagent.rs`). The user's real problem: elanus loads its `.env`
+  (`dotenv::load`) so its NATIVE agents reach DeepSeek via the genai anthropic-compat
+  path — that `.env` sets `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` to a DeepSeek
+  endpoint. The spawned coding tool INHERITED elanus's environment, so Claude
+  Code/Codex picked up the DeepSeek `ANTHROPIC_BASE_URL`/`API_KEY` and were misdirected
+  away from their own login. Fix: a `PROVIDER_CRED_VARS` denylist + a
+  `scrub_provider_creds(&mut Command)` helper that `env_remove`s those vars on EVERY
+  tool spawn — all three paths: `launch` (Claude Code hook-bridge `Command`),
+  `run_codex_capture` (Codex `exec --json` `Command`), and `resume_capture` (the
+  driven-resume `Command`, wrapped in `timeout` — env_remove is inherited through the
+  `timeout` exec). Denylist: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`,
+  `OPENAI_API_BASE`, `OPENAI_MODEL`. Scrub runs BEFORE the launcher sets its own
+  `ELANUS_*` vars, so the session/bus/root vars the hook bridge + `elanus code
+  hook/inbox/deliver` children depend on (`ELANUS_PACKAGE`, `ELANUS_BUS_TOKEN`,
+  `ELANUS_CODE_SESSION`, `ELANUS_CODE_AGENT`, `ELANUS_ROOT`) are KEPT — only provider
+  credentials are removed. This is the correct default (the tool brings its own auth);
+  a future `--inherit-credentials` flag could opt back in (not built).
+  - **Unit tests (+2).** `scrub_removes_provider_creds_but_keeps_elanus_vars` (the
+    denylist contains every provider var and none of the ELANUS_* vars) and
+    `scrubbed_child_does_not_inherit_provider_creds_but_keeps_session_vars` (spawns a
+    real `/usr/bin/env` child through the SAME `scrub_provider_creds` helper with the
+    DeepSeek-leak vars + ELANUS_* set, asserts the child sees none of the providers
+    and all of the session vars — exercising the actual construction).
+  - **Live proof.** Launched a real codex session via the launcher with
+    `ANTHROPIC_BASE_URL=https://deepseek.example/x ANTHROPIC_API_KEY=sk-deepseek-test
+    OPENAI_BASE_URL=… OPENAI_API_KEY=sk-openai-leak` set in the launcher's env (exactly
+    as elanus's `.env` would), having codex `env | grep` its own environment. The
+    child saw **NO `ANTHROPIC_*` at all** (neither var is ambient in the test shell, so
+    their absence proves elanus scrubbed the injected DeepSeek values) and the injected
+    `OPENAI_API_KEY=sk-openai-leak` was gone — while `ELANUS_CODE_AGENT=codex` and
+    `ELANUS_CODE_SESSION=code-…` WERE present. Closes the DeepSeek-leak problem: the
+    coding tool now uses its own `~/.claude`/`~/.codex` login.

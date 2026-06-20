@@ -148,6 +148,20 @@ enum Cmd {
         #[arg(long, default_value_t = 5173)]
         vite_port: u16,
     },
+    /// Run the packaged stack: the daemon (this binary) + the web server serving
+    /// the built SPA from ui/web/dist/, supervised. The prod counterpart of `dev`
+    /// — no cargo, no `--watch`, no Vite. Builds ui/web/dist/ if it's missing.
+    Serve {
+        /// Dispatcher poll interval for the daemon child.
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Port for the web server (serves the built SPA).
+        #[arg(long, default_value_t = 7180)]
+        web_port: u16,
+        /// Force a fresh `npm run build` even when ui/web/dist/ already exists.
+        #[arg(long)]
+        rebuild: bool,
+    },
     /// Emit an event — the universal entry point
     Emit {
         r#type: String,
@@ -479,6 +493,11 @@ fn run(cli: Cli) -> Result<()> {
             web_port,
             vite_port,
         } => dev::run(&root, interval_ms, web_port, vite_port)?,
+        Cmd::Serve {
+            interval_ms,
+            web_port,
+            rebuild,
+        } => dev::serve(&root, interval_ms, web_port, rebuild)?,
         Cmd::Emit {
             r#type,
             payload,
