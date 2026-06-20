@@ -88,6 +88,11 @@ that layer.
   and [packages/window/](../packages/window/).
 - Sandbox and leases: [src/sandbox.rs](../src/sandbox.rs) and
   [src/exec.rs](../src/exec.rs).
+- Coding-agent launcher (`elanus code`, Claude Code adapter — launch, hook to bus
+  bridge): [src/codeagent.rs](../src/codeagent.rs); the grant-scoped per-session
+  identity (the broker resolves `code-*` as a scoped actor, not full authority) is
+  [src/codesession.rs](../src/codesession.rs); see
+  [handoffs/coding-agents.md](handoffs/coding-agents.md).
 - Web product and QA flows: [ui/web/src/App.tsx](../ui/web/src/App.tsx),
   [ui/web/server.mjs](../ui/web/server.mjs), and
   [ui/web/test/ui.spec.mjs](../ui/web/test/ui.spec.mjs).

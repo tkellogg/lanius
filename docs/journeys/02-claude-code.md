@@ -60,9 +60,22 @@ Put both coding agents on elanus and that loop closes on its own. The planner
 kicks off a coding session for M1, the session does the work and announces it's
 done, the planner reads the result, decides it's good (or sends it back), and
 moves on to M2 — and I'm watching, free to interrupt, but no longer the wire. The
-planner doesn't need a special "drive Codex" tool; it publishes work into the
-coding session's mailbox and wakes when the session reports back, the same
-addressed-message machinery every other actor already uses.
+planner reaches Codex through one elanus-mediated dispatch, and wakes when the
+session reports back — the same addressed-message machinery every other actor
+already uses.
+
+The piece that took me a while to see is that the planner doesn't have to be a
+special kind of thing. If the planner is Claude Code — me, basically — it's just
+another coding session, same as the worker: it takes a turn, hands work to Codex,
+and ends its turn; when Codex finishes, the result lands in the planner's own
+mailbox and wakes it for the next step. Planner and worker are the same machinery
+pointed at each other. The one real fork is whether I'm sitting in the live session.
+If I am — a real terminal — elanus can't make me take a turn on my own, so a result
+just waits in my inbox until I hit Enter; I'm the pump. That's exactly what I want
+when my hands are on it. But when I want it to grind on its own, the planner runs
+headless: it ends its turn after handing off, and elanus wakes it when the worker is
+done, no Enter from me. Same durable session either way — so I can let it run
+headless and drop back in to steer whenever I feel like it.
 
 A step past that is where it gets interesting. Run more than one coding session at
 once — one writing, one verifying — and let them coordinate over the bus. Not hard

@@ -1,6 +1,8 @@
 mod broker;
 mod bus;
 mod buscli;
+mod codeagent;
+mod codesession;
 mod config_repo;
 mod configcli;
 mod context;
@@ -243,6 +245,28 @@ enum Cmd {
     Bus {
         #[command(subcommand)]
         cmd: BusCmd,
+    },
+    /// Launch and observe an external coding agent (Claude Code today).
+    ///
+    /// `elanus code <tool> [args...]` launches the real coding agent in this
+    /// directory, observed on the bus (`tool` selects the adapter — `claude` or
+    /// `codex`; everything after it is passed through unchanged). Reserved first
+    /// words: `hook` is the internal hook bridge the generated hooks invoke
+    /// (`elanus code hook <Event>`); `resume <elanus_session> "<message>"`
+    /// continues a recorded session in its workdir (the M2-A resume primitive);
+    /// `deliver <worker-session> "<message>"` (run from inside a session) dispatches
+    /// work to a worker and records the running session as the requester (M4-B);
+    /// `inbox` (run from inside a session) reads ITS OWN inbox (M3, own-inbox-only by
+    /// construction); `note <session> "<text>"` leaves a per-session memory note (M3).
+    #[command(disable_help_flag = true)]
+    Code {
+        /// The adapter (claude, codex), or a reserved word (`hook`, `resume`,
+        /// `deliver`, `inbox`, `note`).
+        tool: String,
+        /// Arguments passed straight through to the tool (or, for `hook`, the
+        /// single hook event name).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -858,6 +882,88 @@ fn run(cli: Cli) -> Result<()> {
                 buscli::subscribe(&root, &filter, count, timeout, b)?;
             }
         },
+        Cmd::Code { tool, args } => {
+            // Reserved first words: `hook` is the internal hook bridge
+            // (`elanus code hook <Event>`); `resume` continues a recorded session
+            // (`elanus code resume <elanus_session> "<message>"`). Any other first
+            // word is a coding-tool adapter to launch.
+            match tool.as_str() {
+                "hook" => {
+                    let event = args.first().map(String::as_str).unwrap_or("");
+                    codeagent::hook(&root, event)?;
+                }
+                "resume" => {
+                    let session = args.first().map(String::as_str).unwrap_or("");
+                    if session.is_empty() {
+                        anyhow::bail!(
+                            "usage: elanus code resume <elanus_session> \"<message>\""
+                        );
+                    }
+                    let message = args.get(1..).unwrap_or(&[]).join(" ");
+                    codeagent::resume(&root, session, &message)?;
+                }
+                "deliver" => {
+                    // A planner dispatches work to a worker (M4-B). Run from inside
+                    // a coding session; records the running session as the requester
+                    // so the worker's completion routes back (M4-A).
+                    let worker = args.first().map(String::as_str).unwrap_or("");
+                    if worker.is_empty() {
+                        anyhow::bail!(
+                            "usage: elanus code deliver <worker-session> \"<message>\""
+                        );
+                    }
+                    let message = args.get(1..).unwrap_or(&[]).join(" ");
+                    codeagent::deliver(&root, worker, &message)?;
+                }
+                "inbox" => {
+                    // A session pulls its OWN inbox (M3). Identity comes from the
+                    // env the launcher set (ELANUS_CODE_SESSION/AGENT) — never an
+                    // arg — so it can only ever read its own mailbox. Flags: --all
+                    // (full inbox, non-destructive), --json (machine-readable).
+                    codeagent::inbox_cmd(&root, &args)?;
+                }
+                "note" => {
+                    // Leave a per-session memory note (M3), surfaced by the per-turn
+                    // injection. `elanus code note <session> "<text>"`; empty text
+                    // clears it.
+                    let session = args.first().map(String::as_str).unwrap_or("");
+                    if session.is_empty() {
+                        anyhow::bail!(
+                            "usage: elanus code note <session> \"<text>\"  (empty text clears the note)"
+                        );
+                    }
+                    let text = args.get(1..).unwrap_or(&[]).join(" ");
+                    codeagent::note_cmd(&root, session, &text)?;
+                }
+                "claim" => {
+                    // Announce an advisory edit claim (M5). Run from inside a
+                    // session; identity + room are env/record-derived, so it can
+                    // only claim as itself in its own room. `elanus code claim <path>`.
+                    let path = args.first().map(String::as_str).unwrap_or("");
+                    if path.is_empty() {
+                        anyhow::bail!("usage: elanus code claim <path>");
+                    }
+                    codeagent::claim_cmd(&root, path)?;
+                }
+                "unclaim" => {
+                    // Release this session's advisory claim on a path (M5).
+                    // `elanus code unclaim <path>`.
+                    let path = args.first().map(String::as_str).unwrap_or("");
+                    if path.is_empty() {
+                        anyhow::bail!("usage: elanus code unclaim <path>");
+                    }
+                    codeagent::unclaim_cmd(&root, path)?;
+                }
+                "claims" => {
+                    // Show this session's room coordination view (own + peer
+                    // claims), M5. `elanus code claims [--json]`.
+                    codeagent::claims_cmd(&root, &args)?;
+                }
+                _ => {
+                    codeagent::launch(&root, &tool, &args)?;
+                }
+            }
+        }
         Cmd::Events { limit } => {
             let conn = open(&root)?;
             let mut stmt = conn.prepare(

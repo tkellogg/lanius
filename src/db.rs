@@ -327,6 +327,56 @@ CREATE TABLE IF NOT EXISTS context_build_log (
 CREATE INDEX IF NOT EXISTS idx_context_build_log_session ON context_build_log(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_context_build_log_run ON context_build_log(run_id, id);
 
+-- Durable coding-session records (docs/handoffs/coding-agents.md, M2-A). One row
+-- per launched coding session, mapping the elanus session id to the tool's own
+-- NATIVE resumable session id (codex thread_id / Claude Code session_id), the
+-- tool, the agent noun it publishes under, and the workdir it ran in. This is the
+-- DURABLE half of the split session model: the record carries NO secret and
+-- survives process exit, so an idle resumable session has a record but no live
+-- credential. The ephemeral scoped TOKEN (src/codesession.rs) is minted per run
+-- and per resume and retired at the end — the record is what `elanus code resume`
+-- looks up to mint a fresh token and continue the native session in its workdir.
+-- Written once the native id is known (codex: thread.started; CC: SessionStart),
+-- updated on each resume (last_active). Keyed by the elanus session.
+CREATE TABLE IF NOT EXISTS code_sessions (
+  id             INTEGER PRIMARY KEY,
+  elanus_session TEXT NOT NULL UNIQUE,  -- code-<8hex>, the elanus session id
+  native_session TEXT NOT NULL,         -- codex thread_id / CC session_id (resume key)
+  tool           TEXT NOT NULL,         -- the binary: claude | codex
+  agent_noun     TEXT NOT NULL,         -- the obs noun: claude-code | codex
+  workdir        TEXT NOT NULL,         -- absolute dir the session ran in (resume cwd)
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  last_active    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_code_sessions_native ON code_sessions(native_session);
+
+-- Idempotency for driven coding-session deliveries (M4-A). Delivery is
+-- at-least-once (docs/handoffs/coding-agents.md): a daemon crash mid-resume
+-- re-pends the claimed event on the next start (boot's running->pending sweep),
+-- which would drive a SECOND resume of an already-acted-on turn. Each delivery
+-- carries a key — an explicit `idempotency_key` in the payload, else the inbound
+-- event id — and is recorded here the moment it is claimed. A delivery whose key
+-- is already present FOR THE SAME TARGET SESSION is recognized and settled as a
+-- clean no-op (no second resume). The row is DURABLE, so the replay after a
+-- restart is caught, not just a same-process duplicate.
+--
+-- The key is namespaced by the target `session` (PRIMARY KEY (session,
+-- idempotency_key) — docs/security.md): a global key would let one principal
+-- pre-claim an explicit key and silently SUPPRESS a different victim's delivery
+-- to a DIFFERENT session that happens to reuse the same key (cross-victim
+-- suppression). Namespacing by session means an explicit key only ever dedupes a
+-- delivery to the SAME session, never collides across sessions. The default
+-- `event:<id>` key is already globally unique (event ids are unique), so it is
+-- unaffected; the replay dedupe (same delivery, same session, same key) still
+-- holds across a restart.
+CREATE TABLE IF NOT EXISTS code_delivery_keys (
+  session         TEXT NOT NULL,     -- the coding session it was driven to
+  idempotency_key TEXT NOT NULL,     -- explicit payload key, else "event:<id>"
+  event_id        INTEGER,           -- the inbound delivery event id (audit)
+  processed_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (session, idempotency_key)
+);
+
 -- Subagent lineage substrate. A subagent is an ordinary agent spawned by a
 -- parent run; the launcher will insert one row per child session/run so
 -- cancellation, budget attribution, and observability can follow the tree.
@@ -347,8 +397,78 @@ CREATE TABLE IF NOT EXISTS subagent_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_subagent_parent ON subagent_sessions(parent_session_id, id);
 CREATE INDEX IF NOT EXISTS idx_subagent_child ON subagent_sessions(child_session_id);
+
+-- A per-session memory note (M3): a small, editable block a planner leaves a
+-- worker (or a persistent reminder), surfaced by the per-turn injection. One
+-- row per session — the latest text wins (upsert). Deliberately minimal (a
+-- stored string keyed by session); the full context_blocks substrate
+-- integration is deferred (docs/handoffs/coding-agents.md M3 entry).
+CREATE TABLE IF NOT EXISTS code_notes (
+  session    TEXT PRIMARY KEY,   -- the coding session the note is for (code-<id>)
+  note       TEXT NOT NULL,      -- the note text shown in the per-turn injection
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- Inbox read-tracking (M3): which of a session's own mailbox deliveries it has
+-- already pulled via `elanus code inbox`. Keyed by (session, event_id) so the
+-- read is idempotent — pulling twice does not re-surface the same message, and
+-- the per-turn injection counts only UNSEEN deliveries. A session only ever
+-- writes rows for ITS OWN deliveries (the inbox read is scoped to its own
+-- env-derived mailbox by construction), so there is no cross-session write.
+CREATE TABLE IF NOT EXISTS code_inbox_seen (
+  session   TEXT NOT NULL,       -- the coding session that pulled the delivery
+  event_id  INTEGER NOT NULL,    -- the delivery event id (the ledger row)
+  seen_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (session, event_id)
+);
+
+-- Coordination-room membership (M5: advisory peer coordination,
+-- docs/handoffs/coding-agents.md). Multiple concurrent coding sessions share a
+-- room (`in/group/<id>`, ledger-backed — docs/topics.md); a session joins by a
+-- row here (set at launch via `--room <id>`). This is the set a session shares
+-- its claims with: a session SEES its roommates' claims (the point of the room)
+-- and writes only its OWN. There is NO trust model — sessions are the user's own
+-- cooperating agents (homogeneous authority); membership is conflict-avoidance
+-- scope, not authorization.
+--
+-- Crash-released, mirroring the session-token reaper (src/codesession.rs): the
+-- `owner_pid` is the launcher/driver pid that owns the live session, so a
+-- SIGKILL'd session's membership (and its claims) are reaped at the next
+-- launcher/daemon boot — a dead session's claims must not linger in roommates'
+-- injections forever (the lease-released membership of docs/topics.md decided-5).
+CREATE TABLE IF NOT EXISTS code_room_members (
+  room       TEXT NOT NULL,       -- the room id (the <id> of in/group/<id>)
+  session    TEXT NOT NULL,       -- the member coding session (code-<id>)
+  agent_noun TEXT NOT NULL,       -- the obs noun it publishes under
+  owner_pid  INTEGER NOT NULL,    -- the live owner pid; dead → reaped (crash-release)
+  joined_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (room, session)
+);
+CREATE INDEX IF NOT EXISTS idx_code_room_members_session ON code_room_members(session);
+
+-- Advisory edit claims (M5). A session announces "I'm editing <path>"; the
+-- claim is recorded here, in the session's room, durably. It is ADVISORY
+-- metadata, not a lock — recording one never blocks anyone; it surfaces in the
+-- OTHER sessions' per-turn injection so they can route around it. A session can
+-- record/clear only its OWN claims (its env-derived identity), but SEES its
+-- roommates' (shared coordination). The raw path is stored verbatim in a column
+-- (a path is a noun); `(room, session, path)` is the key so re-claiming the same
+-- path is idempotent. Released with membership on session end / crash-reaped.
+CREATE TABLE IF NOT EXISTS code_claims (
+  room       TEXT NOT NULL,       -- the room the claim is visible in
+  session    TEXT NOT NULL,       -- the session that holds the claim (code-<id>)
+  path       TEXT NOT NULL,       -- the claimed path (raw, stored verbatim)
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (room, session, path)
+);
+CREATE INDEX IF NOT EXISTS idx_code_claims_room ON code_claims(room);
+CREATE INDEX IF NOT EXISTS idx_code_claims_session ON code_claims(session);
 "#,
     )?;
+    // M5: the room a coding session belongs to, stored on the durable record so a
+    // claim/resume can derive it from the session's own identity. Nullable —
+    // pre-M5 records (and a session launched with no `--room`) have no room.
+    let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN room TEXT", []);
     // Migrations for databases created before a column existed; the error on
     // a duplicate column is expected and ignored.
     let _ = conn.execute(

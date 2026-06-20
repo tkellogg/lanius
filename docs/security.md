@@ -460,3 +460,104 @@ preamble and ran `elanus`/`git` in the repo itself — leaving 501 junk
 servers (one squatted an e2e port and caused a spurious §20 failure). All cleaned
 + `/config/` gitignored. Re-run such workflows with `isolation: "worktree"` per
 agent so their git side effects can't touch the main repo.
+
+## 20. [FIXED 2026-06-19] Coding-session credential was a full-authority principal (entry-16 sibling, found by the coding-agents verifier)
+
+The first coding-agents slice (`elanus code launch claude`, branch
+`coding-agents`) minted each session's credential as a **plain fenced secret**
+named `code-<session>` in `Root::secrets()`. The broker resolves a fenced secret as
+a **full-authority principal** (`actor = None`), and every bus ACL gate is
+`if let Some(pkg) = &actor` — so for a session credential **no gate ran**. A minted
+`code-<session>` token (verifier proved it live) could publish to `in/human/owner`,
+`work/agent/exec`, and other agents' mailboxes, and subscribe `obs/#` (read every
+agent's telemetry). Attribution was correct and forge-resistant (`sender =
+code-<session>`, the egress lesson of entry 16 was honored), but **authority was
+owner-equivalent** — exactly the inverse of entry 16's other half: there an emitter
+mis-attributes; here it attributes correctly but over-authorizes. A SIGKILL also
+leaked the live full-authority credential (no reaper).
+
+FIX (grant-scoped session token, src/codesession.rs + src/broker.rs): the session
+credential moves to a fenced sub-store (`Root::secrets()/code-sessions/`, still
+cage-fenced — the forge asymmetry is unchanged), and the broker resolves a `code-*`
+principal **before** the fenced-secret path as a **grant-scoped actor** (`actor =
+Some`), so the ACL gates run. The scope is **structural** (a session has no
+manifest): publish ONLY the session's own `obs/agent/<agent>/<session>/#`, subscribe
+nothing. This copies the webhook daemon's grant-scoped shape (entry 16's prescribed
+fix) rather than inventing identity. The leaked-on-crash hazard is closed by a reaper
+(`codesession::reap_orphans`, run at daemon + launcher boot, signal-0 pid probe like
+the lease reaper). Proven live: the four publish attacks + the `obs/#` subscribe now
+`NotAuthorized`; the session's own obs still publishes (stamped `sender =
+code-<session>`); a reaped orphan is refused at CONNECT. Regression-tested at the
+**authority** level (broker ACL denies a session actor outside scope), the gap the
+prior shape-only suite missed. RESIDUAL: this fixes the bus-authority gap only; M0's
+complete-cage criteria (read/egress denial onto the elanus OS cage) stay deferred per
+the handoff sandbox stance — the tool keeps its own OS sandbox for now.
+
+## 21. [FIXED 2026-06-20] M4-A completion routing: confused-deputy `reply_to` + cross-victim idempotency suppression (found by the M4-A verifier)
+
+The M4-A orchestration loop (a worker's completion is routed back to the requester's
+mailbox by the **daemon's own authority**, so a planner is resumed — branch
+`coding-agents`) shipped two MEDIUM holes the adversarial verify turned up. Both are
+in the daemon's mediated routing, not the session token (which stays emit-only — the
+authority was never widened, per entry 20).
+
+**(a) Confused-deputy `reply_to`.** `codeagent::delivery_requester` accepted an
+explicit payload `reply_to` that merely `starts_with("in/")` and was wildcard-free,
+then the daemon routed a **kernel-authored** completion to it **verbatim**. So a
+delivery carrying `reply_to: in/human/owner` (or any `in/...` / `signal/` / `obs/` /
+`work/` topic) made elanus publish a kernel-authored message to the human inbox or an
+arbitrary topic — the classic confused deputy (a low-authority requester borrows the
+kernel's authority to write where it cannot). FIX: an explicit `reply_to` must now
+**resolve to a recognized actor's mailbox** the same safe way the sender-derived path
+does (`resolve_reply_to` → `mailbox_for_actor`): a coding session (`code-*` with a
+durable record) → its own session mailbox; a valid agent name → `in/agent/<agent>/
+<conv>`. Both a bare actor NAME and a full `in/agent/<noun>/<conv>` mailbox topic are
+accepted, but the topic is never used verbatim — the actor is extracted and the
+mailbox **re-derived**. A raw/arbitrary `in/...` topic, `in/human/*`, `in/group/*`,
+`signal/`, `obs/`, a wildcard, a path-unsafe name, or an unrecorded `code-*` conv all
+resolve to None (no route). `mailbox_for_actor` now also requires `valid_principal`
+so a path-unsafe/reserved name can't be coaxed into a non-agent topic level. Proven
+live (worktree stack, broker :1893, NO model turn — fail-fast worker resume): a
+delivery with `reply_to: in/human/owner` and one with `reply_to: in/totally/
+arbitrary/x` both captured `reply_to: null` (route refused); the `in/human/owner`
+kernel-event count was unchanged and the arbitrary topic had zero events; a
+legitimate `reply_to: code-<planner>` still routed the completion to that planner's
+own mailbox (sender=kernel, same correlation).
+
+**(b) Cross-victim idempotency suppression.** `code_delivery_keys` was keyed on
+`idempotency_key` alone (GLOBAL). An attacker who pre-claimed an explicit key `K`
+(via a delivery to their own session A) silently **suppressed** a *different* victim's
+delivery to a *different* session B that reused `K` — B was settled `done` as a bogus
+duplicate and never driven (a denial of the victim's orchestration step). FIX:
+namespace the dedupe by the **target session** — `PRIMARY KEY (session,
+idempotency_key)`, and `claim_delivery_key`/`delivery_key_seen` are per-session. An
+explicit key now only ever dedupes a delivery to the SAME session; one principal's
+key can never collide with another's delivery to a different session. The default
+`event:<id>` key is globally unique regardless, and the genuine same-session replay
+dedupe (the at-least-once protection) still holds across a restart. Pre-release, the
+table was just dropped+recreated (no migration). Proven live: with `K` pre-claimed
+for session A, a victim delivery to session B reusing `K` was DRIVEN (`delivery/
+accepted`, not `duplicate`), and `K` is now recorded independently for both sessions;
+the genuine replay (same key, same session, re-pended `running` across a SIGKILL +
+restart) was still a recognized `delivery/duplicate` no-op with zero second resume.
+
+**(c) Lost planner wake on a crash (reliability, not a hole).** The same fix pass
+closed the disclosed M4-A residual: the settle UPDATE (worker delivery → `done`) and
+the routed completion emit are separate autocommit transactions, so a crash between
+them settled the worker but lost the planner's wake forever (the boot sweep only
+re-pends `running` events, never `done`). FIX: a boot reconciliation
+`reconcile_lost_routes` (src/dispatcher.rs) walks the durable `code_delivery_keys`
+rows (each marks a delivery actually driven), re-derives the requester from the
+original delivery event's persisted `sender`/`payload`/`correlation`, and re-emits
+the route if none was ever emitted (`route_already_emitted` guard) — idempotent and
+crash-only, like the other boot sweeps. Proven live: a crafted settle→route-gap crash
+state recovered exactly one route on restart, and a second restart routed nothing.
+
+Regression-tested (`cargo test`, 134 green): the rejected-`reply_to` probes
+(`explicit_reply_to_cannot_target_human_inbox_or_arbitrary_topic`), the cross-victim
+non-suppression (`cross_victim_key_does_not_suppress_a_different_session_delivery` +
+`delivery_key_is_namespaced_by_session_no_cross_victim_suppression`), and the
+crash-recovery (`reconcile_recovers_a_route_lost_in_the_settle_route_gap`,
+`reconcile_skips_deliveries_with_no_requester`). RESIDUAL: none for these; the session
+token authority is unchanged (the daemon still routes with its own authority, just to
+a constrained, validated destination).
