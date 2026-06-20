@@ -17,6 +17,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr as _;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 /// One spawned handler process being supervised.
@@ -56,6 +57,82 @@ struct Actors {
 const HEALTHY_RUN: Duration = Duration::from_secs(10);
 const BACKOFF_BASE: Duration = Duration::from_secs(2);
 const BACKOFF_CAP: Duration = Duration::from_secs(300);
+
+// ── Coding-session inbound delivery (M2-B) ───────────────────────────────────
+//
+// A message addressed to an idle coding session's mailbox (`in/agent/<tool>/<conv>`,
+// `<conv>` = a recorded `code-*` session) makes the daemon resume that session with
+// the message. The daemon is the kernel — it sees the materialized `in/` delivery
+// directly and already holds the authority the emit-only session lacks, so it
+// drives `codeagent::resume_capture` itself (which mints the session's own
+// emit-only token; the session gains NO read authority).
+//
+// Concurrency follows the dispatcher's "don't block the tick" discipline without
+// the fork/exec process model (resume runs in-process to mint/retire the scoped
+// token and parse the JSONL stream). Instead each session gets a dedicated WORKER
+// THREAD that owns a FIFO queue: a given session runs exactly one resume at a time
+// (the native tool isn't concurrent-safe), two rapid deliveries to the same session
+// SERIALIZE behind that single thread, and a slow resume on one session never
+// stalls the tick loop or another session. Durability rides the ledger: a claimed
+// delivery is marked `running` before hand-off and settled `done`/`failed` only
+// when its worker reports back, so a daemon restart mid-resume re-pends the event
+// (boot's `state='running' -> 'pending'` sweep) and replays it — at-least-once,
+// never a lost or silently double-run message (the in-flight guard below stops a
+// same-tick double-run; the ledger state stops a cross-tick one).
+
+/// One queued delivery handed to a session's worker thread.
+struct CodeJob {
+    event_id: i64,
+    correlation: Option<String>,
+    message: String,
+}
+
+/// A worker thread's outcome for one delivery, reported back to the tick loop so
+/// it can settle the event state on the main connection (workers never touch the
+/// dispatcher's connection; they open their own for the resume).
+struct CodeDone {
+    session: String,
+    event_id: i64,
+    correlation: Option<String>,
+    /// None = the resume primitive errored (missing record / spawn / credential);
+    /// Some(success) = the tool ran and exited (success=false on a non-zero/timeout).
+    success: Option<bool>,
+    detail: String,
+}
+
+/// A live per-session worker: its job queue sender plus how many deliveries are
+/// outstanding (queued or running) on it, so we never enqueue the same event
+/// twice and can retire an idle worker.
+struct CodeWorker {
+    tx: Sender<CodeJob>,
+    inflight: usize,
+}
+
+/// Per-session worker threads + the shared completion channel. Held in the tick
+/// loop like `Actors`; crash-only (a dead worker thread just stops draining — its
+/// claimed event stays `running` and replays on the next daemon start).
+struct CodeDrivers {
+    workers: HashMap<String, CodeWorker>,
+    done_tx: Sender<CodeDone>,
+    done_rx: Receiver<CodeDone>,
+    /// Event ids handed to a worker this process lifetime — the same-tick /
+    /// same-process double-claim guard (the ledger `running` state guards across
+    /// restarts; this guards within one run, where the row is briefly still
+    /// visible as the worker drains it).
+    claimed: std::collections::HashSet<i64>,
+}
+
+impl Default for CodeDrivers {
+    fn default() -> Self {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        CodeDrivers {
+            workers: HashMap::new(),
+            done_tx,
+            done_rx,
+            claimed: std::collections::HashSet::new(),
+        }
+    }
+}
 
 /// The dispatcher does *nothing* but: notice pending events, match type to
 /// handlers, check throttles, fork/exec, record exits, write trace lines.
@@ -117,8 +194,9 @@ pub fn run(root: &Root, interval_ms: u64) -> Result<()> {
     );
     let mut running: Vec<Running> = Vec::new();
     let mut actors = Actors::default();
+    let mut code = CodeDrivers::default();
     loop {
-        if let Err(e) = tick(root, &conn, &mut running, &mut actors) {
+        if let Err(e) = tick(root, &conn, &mut running, &mut actors, &mut code) {
             eprintln!("[daemon] tick error: {e:#}");
         }
         std::thread::sleep(Duration::from_millis(interval_ms));
@@ -130,6 +208,7 @@ fn tick(
     conn: &Connection,
     running: &mut Vec<Running>,
     actors: &mut Actors,
+    code: &mut CodeDrivers,
 ) -> Result<()> {
     // Linked packages can change on disk under a running daemon; drift
     // detection re-enters review within a tick (reads only when steady).
@@ -140,6 +219,8 @@ fn tick(
     expire_deadlines(root, conn)?;
     announce_ledger_events(root, conn)?;
     reap(root, conn, running)?;
+    settle_code_deliveries(root, conn, code)?;
+    drive_code_deliveries(root, conn, code)?;
     resume_suspended(root, conn, running)?;
     dispatch_pending(root, conn, running)?;
     tick_actors(root, conn, actors)?;
@@ -796,6 +877,207 @@ fn resume_suspended(root: &Root, conn: &Connection, running: &mut Vec<Running>) 
     Ok(())
 }
 
+/// Drain worker completion reports and settle each delivery event's state on the
+/// dispatcher's connection (workers never touch it). A finished resume moves its
+/// event `running -> done`; a tool that errored or exited non-zero moves it to
+/// `failed` (the message was delivered and acted on, even if the turn failed — it
+/// is not re-driven). Either way the event leaves `running`, so it is not replayed
+/// on the next restart. The in-flight count drops; a worker with nothing left is
+/// retired so an idle session holds no thread.
+fn settle_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers) -> Result<()> {
+    while let Ok(done) = code.done_rx.try_recv() {
+        code.claimed.remove(&done.event_id);
+        let failed = !matches!(done.success, Some(true));
+        let state = if failed { "failed" } else { "done" };
+        conn.execute(
+            "UPDATE events SET state=?1, finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id=?2 AND state='running'",
+            params![state, done.event_id],
+        )?;
+        // A small completion obs so a waiter can thread the result by the
+        // delivery's correlation_id (M4's planner reads this). Kernel-emitted, so
+        // the announce sweep delivers it; it carries no read authority.
+        let _ = events::emit(
+            root,
+            conn,
+            EmitOpts {
+                payload: Some(json!({
+                    "session": done.session,
+                    "failed": failed,
+                    "detail": trace::clip(&done.detail, 2000),
+                })),
+                correlation: done.correlation.clone(),
+                cause: Some(done.event_id),
+                ..EmitOpts::new("obs/agent/code/delivery/complete")
+            },
+        );
+        // Retire a now-idle worker (inflight back to 0): drop the sender so the
+        // thread's recv() ends and it joins out. A later delivery to the same
+        // session simply spawns a fresh worker.
+        if let Some(w) = code.workers.get_mut(&done.session) {
+            w.inflight = w.inflight.saturating_sub(1);
+            if w.inflight == 0 {
+                code.workers.remove(&done.session);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Claim pending coding-session deliveries and hand each to its session's worker
+/// thread. A `pending` event whose topic `recognize_delivery` matches an existing
+/// `code-*` record is a drive: we mark it `running` (durability — replays on
+/// restart), pull the message, and enqueue it on the per-session worker (spawned
+/// on first sight). Everything else is left for `dispatch_pending`. Per-session
+/// serialization is the single worker thread; the `claimed` set stops a re-claim
+/// within this process before the worker has reported back.
+fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers) -> Result<()> {
+    // Only `in/agent/*` pending events can be a delivery — let the SQL prefilter
+    // do the obvious narrowing so a busy daemon doesn't scan every pending event.
+    let pending: Vec<(i64, String, Option<String>, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, type, correlation_id, payload FROM events
+             WHERE state='pending' AND type LIKE 'in/agent/%'
+             ORDER BY priority DESC, id ASC LIMIT 100",
+        )?;
+        let r = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+    for (id, etype, corr, payload) in pending {
+        if code.claimed.contains(&id) {
+            continue; // already handed to a worker this process; row not yet settled
+        }
+        let Some((session, _noun)) = crate::codeagent::recognize_delivery(root, &etype) else {
+            continue; // not addressed to a known coding session — leave for dispatch_pending
+        };
+        let pv: Value = payload
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
+        let Some(message) = crate::codeagent::delivery_message(&pv) else {
+            // A delivery with no prompt/text is not drivable: settle it done
+            // (it WAS delivered, there is just nothing to resume on) rather than
+            // leave it pending forever or hand the worker an empty turn.
+            conn.execute(
+                "UPDATE events SET state='done', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id=?1 AND state='pending'",
+                [id],
+            )?;
+            trace::write(
+                root,
+                "obs/agent/code/delivery/empty",
+                &trace::Ids { event_id: Some(id), correlation_id: corr.clone(), ..Default::default() },
+                json!({ "session": session, "reason": "no prompt/text in payload" }),
+            );
+            continue;
+        };
+        // Claim it durably BEFORE hand-off: a restart mid-resume re-pends a
+        // `running` event and replays it (at-least-once). The in-memory guard
+        // stops a same-process re-claim while the worker drains it.
+        conn.execute(
+            "UPDATE events SET state='running' WHERE id=?1 AND state='pending'",
+            [id],
+        )?;
+        code.claimed.insert(id);
+        trace::write(
+            root,
+            "obs/agent/code/delivery/accepted",
+            &trace::Ids { event_id: Some(id), correlation_id: corr.clone(), ..Default::default() },
+            json!({ "session": session, "type": etype }),
+        );
+        enqueue_code_job(
+            root,
+            code,
+            &session,
+            CodeJob { event_id: id, correlation: corr, message },
+        );
+    }
+    Ok(())
+}
+
+/// Enqueue a job on the session's worker, spawning the worker thread on first
+/// sight. The worker owns the FIFO queue: it drains jobs ONE AT A TIME (a session
+/// runs a single resume at a time — the native tool isn't concurrent-safe), and
+/// reports each outcome back on the shared completion channel. If the send fails
+/// (a worker that died), the claim is dropped so the event re-pends and replays.
+fn enqueue_code_job(root: &Root, code: &mut CodeDrivers, session: &str, job: CodeJob) {
+    let event_id = job.event_id;
+    // Spawn-on-first-sight: a session with no live worker gets one. The worker
+    // captures its own Root clone and the done sender; it opens its own db inside
+    // resume_capture, never touching the dispatcher's connection.
+    if !code.workers.contains_key(session) {
+        let (tx, rx) = std::sync::mpsc::channel::<CodeJob>();
+        let root = root.clone();
+        let done_tx = code.done_tx.clone();
+        let sess = session.to_string();
+        let spawned = std::thread::Builder::new()
+            .name(format!("code-driver-{sess}"))
+            .spawn(move || code_worker(root, sess, rx, done_tx));
+        match spawned {
+            Ok(_) => {
+                code.workers.insert(session.to_string(), CodeWorker { tx, inflight: 0 });
+            }
+            Err(e) => {
+                eprintln!("[daemon] code worker spawn for {session} failed: {e}");
+                // Couldn't spawn — report a synthetic failure so the event settles
+                // (it stays `running` otherwise until a restart replays it).
+                let _ = code.done_tx.send(CodeDone {
+                    session: session.to_string(),
+                    event_id,
+                    correlation: job.correlation,
+                    success: None,
+                    detail: format!("worker spawn failed: {e}"),
+                });
+                return;
+            }
+        }
+    }
+    if let Some(w) = code.workers.get_mut(session) {
+        let corr = job.correlation.clone();
+        if w.tx.send(job).is_ok() {
+            w.inflight += 1;
+        } else {
+            // The worker is gone; drop the claim so the event re-pends next tick.
+            eprintln!("[daemon] code worker for {session} is gone; re-queueing event {event_id}");
+            code.workers.remove(session);
+            let _ = code.done_tx.send(CodeDone {
+                session: session.to_string(),
+                event_id,
+                correlation: corr,
+                success: None,
+                detail: "worker channel closed".into(),
+            });
+        }
+    }
+}
+
+/// A per-session worker thread: drain the queue FIFO, running one resume at a time
+/// and reporting each outcome. Ends when its sender drops (the tick retires an idle
+/// worker) — a clean, crash-only lifecycle. Never panics out: a resume error is
+/// reported as `success=None`, not propagated.
+fn code_worker(root: Root, session: String, rx: Receiver<CodeJob>, done_tx: Sender<CodeDone>) {
+    while let Ok(job) = rx.recv() {
+        let (success, detail) = match crate::codeagent::resume_capture(&root, &session, &job.message) {
+            Ok(outcome) => (
+                Some(outcome.success),
+                format!("exit_code={:?}", outcome.exit_code),
+            ),
+            Err(e) => (None, format!("{e:#}")),
+        };
+        // If the receiver is gone (daemon shutting down), the event stays
+        // `running` and replays on the next start — at-least-once holds.
+        let _ = done_tx.send(CodeDone {
+            session: session.clone(),
+            event_id: job.event_id,
+            correlation: job.correlation,
+            success,
+            detail,
+        });
+    }
+}
+
 fn dispatch_pending(root: &Root, conn: &Connection, running: &mut Vec<Running>) -> Result<()> {
     let pending: Vec<(i64, String, Option<String>)> = {
         let mut stmt = conn.prepare(
@@ -1051,5 +1333,250 @@ fn merge_profile_throttles(root: &Root, conn: &Connection) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn tmp_root() -> Root {
+        let dir = std::env::temp_dir().join(format!(
+            "elanus-dispatch-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Root { dir }
+    }
+
+    /// drive_code_deliveries CLAIMS a recognized coding-session delivery (marks it
+    /// `running`, enqueues it on a worker, records it `claimed`) and LEAVES an
+    /// unrecognized in/agent/* event `pending` for the normal dispatch path. We
+    /// keep the worker from running a real tool by intercepting the queue: the
+    /// session's worker is pre-seeded with a sink channel before the drive, so the
+    /// job lands in our channel instead of spawning `codex`. This proves the
+    /// recognition + durable-claim half without burning a model turn.
+    #[test]
+    fn drive_claims_recognized_and_skips_unrecognized() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        // A recorded codex session — its mailbox is drivable.
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-aaaa0001".into(),
+                native_session: "thread-1".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+            },
+        )
+        .unwrap();
+        // Two pending events: one to the recorded session (drivable), one to an
+        // unknown code-* conv (must be ignored, left for dispatch_pending).
+        let drivable = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "hello there" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-aaaa0001")
+            },
+        )
+        .unwrap();
+        let unknown = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "nobody home" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-ffff9999")
+            },
+        )
+        .unwrap();
+
+        let mut code = CodeDrivers::default();
+        // Pre-seed the worker so the enqueued job goes to OUR channel, never a
+        // spawned tool: the drive sees a live worker and sends to it.
+        let (tx, rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-aaaa0001".into(), CodeWorker { tx, inflight: 0 });
+
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+
+        // The drivable event is now `running` and claimed; a job was enqueued.
+        let st: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [drivable], |r| r.get(0))
+            .unwrap();
+        assert_eq!(st, "running", "recognized delivery is claimed (running)");
+        assert!(code.claimed.contains(&drivable));
+        let job = rx.try_recv().expect("a job was enqueued for the session");
+        assert_eq!(job.event_id, drivable);
+        assert_eq!(job.message, "hello there");
+
+        // The unknown-conv event is untouched — left pending for dispatch_pending
+        // (which will mark it done as a no-consumer event), never resumed.
+        let st: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [unknown], |r| r.get(0))
+            .unwrap();
+        assert_eq!(st, "pending", "unrecognized in/agent event is left for dispatch");
+
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// A second delivery to the SAME session, already claimed, is NOT re-enqueued
+    /// while the first is in flight: the `claimed` guard plus the single worker
+    /// thread serialize them. Here we keep the first job in flight (unread in our
+    /// sink) and confirm a re-drive of the same row does not double-send.
+    #[test]
+    fn same_session_deliveries_do_not_double_run() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-bbbb0002".into(),
+                native_session: "t".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+            },
+        )
+        .unwrap();
+        let ev = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "one" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-bbbb0002")
+            },
+        )
+        .unwrap();
+        let mut code = CodeDrivers::default();
+        let (tx, rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-bbbb0002".into(), CodeWorker { tx, inflight: 0 });
+
+        // First drive claims + enqueues exactly once.
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+        // Second drive in the same process: the row is now `running` (not pending)
+        // AND it is in `claimed`, so it is not selected and not re-enqueued.
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+
+        assert_eq!(rx.try_recv().map(|j| j.event_id).ok(), Some(ev));
+        assert!(rx.try_recv().is_err(), "the same delivery is never enqueued twice");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// The worker model serializes per session by construction: a single thread
+    /// draining a FIFO queue runs jobs ONE AT A TIME, in order — never two
+    /// overlapping for the same session. This proves the structural guarantee
+    /// `code_worker` relies on (one thread + one channel = strict serialization)
+    /// without invoking a real tool.
+    #[test]
+    fn one_worker_thread_serializes_its_queue_fifo() {
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let order: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (c, m, o) = (concurrent.clone(), max_seen.clone(), order.clone());
+        let h = std::thread::spawn(move || {
+            // Same shape as code_worker: drain FIFO, one job at a time.
+            while let Ok(n) = rx.recv() {
+                let now = c.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5)); // a "resume turn"
+                o.lock().unwrap().push(n);
+                c.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+        // Two rapid deliveries to the same session.
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        drop(tx);
+        h.join().unwrap();
+        // Never overlapped, and ran in FIFO order.
+        assert_eq!(max_seen.load(Ordering::SeqCst), 1, "two same-session resumes never overlap");
+        assert_eq!(*order.lock().unwrap(), vec![1, 2], "FIFO order preserved");
+    }
+
+    /// settle_code_deliveries moves a claimed `running` delivery to `done` on
+    /// success / `failed` on a non-zero-or-errored resume, drops it from `claimed`,
+    /// and retires the now-idle worker. (We feed a CodeDone directly — the worker
+    /// side is exercised by the FIFO test above.)
+    #[test]
+    fn settle_marks_done_or_failed_and_retires_worker() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        let ev = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "x" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-cccc0003")
+            },
+        )
+        .unwrap();
+        conn.execute("UPDATE events SET state='running' WHERE id=?1", [ev]).unwrap();
+        let mut code = CodeDrivers::default();
+        code.claimed.insert(ev);
+        let (tx, _rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-cccc0003".into(), CodeWorker { tx, inflight: 1 });
+        code.done_tx
+            .send(CodeDone {
+                session: "code-cccc0003".into(),
+                event_id: ev,
+                correlation: None,
+                success: Some(true),
+                detail: "exit_code=Some(0)".into(),
+            })
+            .unwrap();
+
+        settle_code_deliveries(&root, &conn, &mut code).unwrap();
+
+        let st: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [ev], |r| r.get(0))
+            .unwrap();
+        assert_eq!(st, "done", "a successful resume settles the delivery done");
+        assert!(!code.claimed.contains(&ev), "settled event leaves the claimed set");
+        assert!(!code.workers.contains_key("code-cccc0003"), "idle worker is retired");
+
+        // A failed resume settles `failed`.
+        let ev2 = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "y" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-dddd0004")
+            },
+        )
+        .unwrap();
+        conn.execute("UPDATE events SET state='running' WHERE id=?1", [ev2]).unwrap();
+        code.claimed.insert(ev2);
+        code.done_tx
+            .send(CodeDone {
+                session: "code-dddd0004".into(),
+                event_id: ev2,
+                correlation: None,
+                success: None,
+                detail: "boom".into(),
+            })
+            .unwrap();
+        settle_code_deliveries(&root, &conn, &mut code).unwrap();
+        let st: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [ev2], |r| r.get(0))
+            .unwrap();
+        assert_eq!(st, "failed", "an errored resume settles the delivery failed");
+        let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

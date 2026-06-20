@@ -158,6 +158,95 @@ impl Tool {
     }
 }
 
+// ── Inbound delivery: mailbox → resume (M2-B) ────────────────────────────────
+//
+// A coding session's mailbox is `in/agent/<tool>/<conv>` — symmetric with its
+// telemetry `obs/agent/<tool>/<session>/...` (docs/topics.md: `in/` first locator
+// is the conversation; here the conversation IS the session, the stable handle a
+// resume targets). `<tool>` is the agent NOUN (`codex` / `claude-code`), so the
+// mailbox and the obs subtree share the same first locators. The daemon (the
+// kernel — it has the authority the emit-only session lacks) recognizes such an
+// event, reads the durable record, and drives `resume_capture`. The session never
+// gains read authority; only the daemon reads the mailbox.
+
+/// Decode a session id the launcher encoded into a topic segment with
+/// `topic::encode_segment` (percent-encodes `% + # /`). Inverse of that encoder,
+/// so a recovered `code-<id>` matches the durable record's key exactly even for a
+/// name carrying reserved characters. Lenient on a trailing/partial `%` (returns
+/// the literal) — a malformed segment simply won't match any real session id.
+fn decode_segment(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// If `topic` is a coding-session mailbox addressed to an EXISTING recorded
+/// session, return its `(elanus_session, agent_noun)`. The topic must be exactly
+/// `in/agent/<tool>/<conv>` where `<conv>` decodes to a `code-*` id with a durable
+/// `code_sessions` record AND `<tool>` is the agent noun that record publishes
+/// under (so `in/agent/codex/code-x` drives `code-x` only if it is a codex
+/// session — a mismatched noun is ignored, not cross-driven). Returns None for
+/// anything else: a non-mailbox topic, an unknown/never-recorded conv, a
+/// non-`code-*` conv (an ordinary agent's mailbox), or a noun/record mismatch —
+/// so a delivery to a non-session address is cleanly ignored (no panic, no
+/// spurious resume). The daemon calls this on every materialized `in/` event.
+pub fn recognize_delivery(root: &Root, topic_name: &str) -> Option<(String, String)> {
+    let segs: Vec<&str> = topic_name.split('/').collect();
+    // Exactly four levels: in / agent / <tool> / <conv>. A finer-grained
+    // sub-conversation locator (`in/agent/<tool>/<conv>/<thread>`) is NOT a
+    // session drive in M2-B — keep recognition tight so only the documented
+    // address resumes.
+    if segs.len() != 4 || segs[0] != "in" || segs[1] != "agent" {
+        return None;
+    }
+    let conv = decode_segment(segs[3]);
+    // Cheap structural gate before any db read: only `code-*` convs can be a
+    // coding session, and the name must be a valid session principal.
+    if !codesession::is_session_principal(&conv) {
+        return None;
+    }
+    let rec = codesession::read_record(root, &conv).ok().flatten()?;
+    // The mailbox noun must be the noun this session publishes under, so a
+    // delivery to `in/agent/codex/<conv>` drives a codex session only, never a
+    // claude-code one with the same id (ids are globally unique, but this keeps
+    // the address honest and rejects a typo'd noun rather than cross-driving).
+    if decode_segment(segs[2]) != rec.agent_noun {
+        return None;
+    }
+    Some((rec.elanus_session, rec.agent_noun))
+}
+
+/// Pull the message text out of a delivery payload. Accept `prompt` (the
+/// documented field) or `text` (a convenience alias), in that order; a bare JSON
+/// string is taken verbatim. None if neither is present (an empty/structureless
+/// payload is not a drivable message — the daemon skips it rather than resume on
+/// nothing).
+pub fn delivery_message(payload: &Value) -> Option<String> {
+    if let Some(s) = payload.as_str() {
+        return Some(s.to_string());
+    }
+    for key in ["prompt", "text"] {
+        if let Some(s) = payload.get(key).and_then(Value::as_str) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// `elanus code <tool> [args...]` — launch the real coding agent, observed.
 pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     // Reap any session tokens a prior SIGKILL'd launcher leaked, before anything
@@ -687,10 +776,69 @@ fn resume_command(rec: &codesession::SessionRecord, message: &str) -> (String, V
     }
 }
 
-/// `elanus code resume <elanus_session> "<message>"` — continue a recorded coding
-/// session with a fresh, emit-only scoped token, capturing the result under the
-/// same elanus session. Returns an error if there is no resumable record.
+/// Wall-clock ceiling on a single resume's native model turn. A resume is one
+/// turn (a real model round trip + any tool calls it makes); a few minutes is
+/// generous for the headless `-p`/`exec` shapes while still bounding a wedged
+/// run. The native call is wrapped in `timeout(1)` so a hung model never holds
+/// a session worker (or a CLI invocation) open forever. Override per run with
+/// `ELANUS_CODE_RESUME_TIMEOUT_S`.
+const RESUME_TIMEOUT_SECS: u64 = 600;
+
+fn resume_timeout_secs() -> u64 {
+    std::env::var("ELANUS_CODE_RESUME_TIMEOUT_S")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&s: &u64| s > 0)
+        .unwrap_or(RESUME_TIMEOUT_SECS)
+}
+
+/// Wrap a resume command in `timeout(1) -s TERM <secs> <program> <args…>` so a
+/// hung native turn is killed rather than holding the caller open forever (the
+/// handoff guardrail: wrap any codex/claude call in `timeout`). `timeout` is in
+/// coreutils/BSD on every platform elanus targets; if it is somehow absent the
+/// child simply fails to spawn and the resume errors cleanly (no hang). The
+/// `-s TERM` lets the tool flush; `timeout` exits 124 on expiry, which the
+/// caller reports as a failed (timed-out) resume.
+fn timeout_wrap(program: &str, args: &[String], secs: u64) -> (String, Vec<String>) {
+    let mut wrapped = vec!["-s".to_string(), "TERM".to_string(), secs.to_string(), program.to_string()];
+    wrapped.extend_from_slice(args);
+    ("timeout".to_string(), wrapped)
+}
+
+/// `elanus code resume <elanus_session> "<message>"` — the CLI entry. Runs the
+/// resume in-process and PROPAGATES the tool's exit code via `process::exit` so a
+/// script driving the launcher sees it. The daemon must NEVER use this path (a
+/// worker tool's non-zero exit would kill the whole daemon); it calls
+/// `resume_capture`, which returns the outcome instead of exiting.
 pub fn resume(root: &Root, elanus_session: &str, message: &str) -> Result<()> {
+    let outcome = resume_capture(root, elanus_session, message)?;
+    if !outcome.success {
+        std::process::exit(outcome.exit_code.unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// The structured result of one driven/CLI resume — enough for the daemon to
+/// thread a completion obs and settle the delivery event without ever exiting.
+pub struct ResumeOutcome {
+    pub success: bool,
+    pub exit_code: Option<i32>,
+}
+
+/// Continue a recorded coding session with a fresh, emit-only scoped token,
+/// capturing the result under the same elanus session, and RETURN the outcome
+/// (never `process::exit`). This is the in-process resume primitive the daemon
+/// drives off a mailbox delivery (M2-B). Returns an error only for a missing
+/// record or a credential/spawn failure; a non-zero tool exit is a successful
+/// call with `success=false` (the daemon records it, the session lives on).
+///
+/// The native resume command is wrapped in `timeout` (handoff guardrail) and run
+/// non-interactively (empty stdin, piped stdout we parse, inherited stderr). The
+/// token is emit-only — minted here, retired at the end, reaped on crash — so a
+/// driven resume gains the session NO read authority (M3's interactive-pull
+/// remains deferred); the DAEMON, which already has authority, is the only reader
+/// of the mailbox.
+pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Result<ResumeOutcome> {
     use std::process::{Command, Stdio};
 
     // Heal any orphaned credentials a prior crash leaked, same as launch.
@@ -721,6 +869,9 @@ pub fn resume(root: &Root, elanus_session: &str, message: &str) -> Result<()> {
     let workdir = std::path::PathBuf::from(&rec.workdir);
 
     let (program, cmd_args) = resume_command(&rec, message);
+    // Bound the native turn (handoff guardrail): timeout(1) kills a hung model.
+    let secs = resume_timeout_secs();
+    let (program, cmd_args) = timeout_wrap(&program, &cmd_args, secs);
 
     // A resume marker under the SAME elanus session, so the bus shows the session
     // continued and with what message.
@@ -749,7 +900,7 @@ pub fn resume(root: &Root, elanus_session: &str, message: &str) -> Result<()> {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        eprintln!("[code] resuming {} session {session} ({})", rec.tool, rec.native_session);
+        eprintln!("[code] resuming {} session {session} ({}) [timeout {secs}s]", rec.tool, rec.native_session);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("launching {program} resume (is it installed and on PATH?)"))?;
@@ -781,10 +932,10 @@ pub fn resume(root: &Root, elanus_session: &str, message: &str) -> Result<()> {
     let _ = codesession::touch_record(root, &session);
 
     let status = result?;
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
+    Ok(ResumeOutcome {
+        success: status.success(),
+        exit_code: status.code(),
+    })
 }
 
 /// Read a Claude Code `-p --output-format stream-json` child's stdout line-by-line,
@@ -1611,6 +1762,120 @@ mod tests {
         assert!(claude_stream_map(&json!({ "type": "system", "subtype": "compact" })).is_none());
         // Per-turn rate-limit telemetry is dropped (not a session happening).
         assert!(claude_stream_map(&json!({ "type": "rate_limit_event" })).is_none());
+    }
+
+    // ── Inbound delivery recognition (M2-B) ──────────────────────────────────
+
+    fn delivery_tmp_root() -> Root {
+        let dir = std::env::temp_dir().join(format!(
+            "elanus-delivery-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Root { dir }
+    }
+
+    #[test]
+    fn recognize_matches_a_recorded_session_mailbox() {
+        let root = delivery_tmp_root();
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-abcd1234".into(),
+                native_session: "thread-x".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp/proj".into(),
+            },
+        )
+        .unwrap();
+        // The documented address resolves to (session, noun).
+        let got = recognize_delivery(&root, "in/agent/codex/code-abcd1234");
+        assert_eq!(got, Some(("code-abcd1234".into(), "codex".into())));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn recognize_rejects_non_session_addresses() {
+        let root = delivery_tmp_root();
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-abcd1234".into(),
+                native_session: "thread-x".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp/proj".into(),
+            },
+        )
+        .unwrap();
+        // An ordinary agent's mailbox (non-code conv) is not a coding session.
+        assert!(recognize_delivery(&root, "in/agent/kestrel/c123").is_none());
+        // A never-recorded code-* conv is ignored cleanly (no panic, no resume).
+        assert!(recognize_delivery(&root, "in/agent/codex/code-00000000").is_none());
+        // The wrong noun for the record (typo / cross-drive attempt) is rejected.
+        assert!(recognize_delivery(&root, "in/agent/claude-code/code-abcd1234").is_none());
+        // Wrong verb/category, too few/many levels, an obs topic — all None.
+        assert!(recognize_delivery(&root, "obs/agent/codex/code-abcd1234").is_none());
+        assert!(recognize_delivery(&root, "in/human/owner").is_none());
+        assert!(recognize_delivery(&root, "in/agent/codex").is_none());
+        assert!(recognize_delivery(&root, "in/agent/codex/code-abcd1234/extra").is_none());
+        // A path-traversal-shaped conv is not a valid session principal.
+        assert!(recognize_delivery(&root, "in/agent/codex/code-..%2Fowner").is_none());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn recognize_decodes_an_encoded_conv_segment() {
+        // The launcher encodes the conv with topic::encode_segment; recognition
+        // must decode it back to the record key. A session id with a reserved
+        // char round-trips through encode → topic → decode.
+        let root = delivery_tmp_root();
+        let sess = "code-a+b"; // '+' would split a level if not encoded
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: sess.into(),
+                native_session: "t".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp".into(),
+            },
+        )
+        .unwrap();
+        let topic = format!("in/agent/codex/{}", topic::encode_segment(sess));
+        assert!(topic::valid_name(&topic)); // the '+' is encoded, no wildcard
+        assert_eq!(
+            recognize_delivery(&root, &topic),
+            Some((sess.into(), "codex".into()))
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn delivery_message_accepts_prompt_text_or_bare_string() {
+        // The documented field.
+        assert_eq!(
+            delivery_message(&json!({ "prompt": "do the thing" })).as_deref(),
+            Some("do the thing")
+        );
+        // The convenience alias.
+        assert_eq!(
+            delivery_message(&json!({ "text": "also fine" })).as_deref(),
+            Some("also fine")
+        );
+        // prompt wins over text when both are present.
+        assert_eq!(
+            delivery_message(&json!({ "prompt": "p", "text": "t" })).as_deref(),
+            Some("p")
+        );
+        // A bare JSON string is taken verbatim.
+        assert_eq!(delivery_message(&json!("just text")).as_deref(), Some("just text"));
+        // Nothing drivable → None (the daemon skips rather than resume on nothing).
+        assert!(delivery_message(&json!({ "other": "x" })).is_none());
+        assert!(delivery_message(&json!({ "prompt": "" })).is_none());
+        assert!(delivery_message(&Value::Null).is_none());
     }
 
     #[test]

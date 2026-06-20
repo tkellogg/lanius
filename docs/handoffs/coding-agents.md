@@ -1,13 +1,16 @@
 # Handoff: coding-agent support (Codex & Claude Code)
 
 Status: **M0+M1 landed for BOTH adapters; M2-A (durable resumable sessions + the
-resume primitive) landed 2026-06-20** — Claude Code (hook bridge) 2026-06-19,
-Codex (`codex exec --json` stdout stream) 2026-06-20, branch `coding-agents`. All
-verified end to end against the live worktree stack. M2-B (daemon-driven inbound
-delivery off a session mailbox) and M3–M5 are not started; **M2-B is next**. See
-the Log at the bottom for the as-built decisions (the two adapters share one
+resume primitive) landed 2026-06-20; M2-B (daemon-driven inbound delivery off a
+session mailbox → resume) landed 2026-06-20** — Claude Code (hook bridge)
+2026-06-19, Codex (`codex exec --json` stdout stream) 2026-06-20, branch
+`coding-agents`. All verified end to end against the live worktree stack. **M4 (the
+planner side — an agent sending work + waking on the completion obs) and M3
+(interactive pull / a session read grant) are next/deferred; M5 is not started.**
+See the Log at the bottom for the as-built decisions (the two adapters share one
 envelope but differ in their *capture mechanism* — CC's hooks vs Codex's JSONL
-stream; the durable-session split-record model is in the M2-A entry).
+stream; the durable-session split-record model is in the M2-A entry; the
+mailbox→resume drive + per-session serialization are in the M2-B entry).
 
 This handoff asks elanus to **launch and supervise external coding agents** — the
 Codex CLI/TUI and Claude Code — and bridge their lifecycle, tools, and context
@@ -809,12 +812,12 @@ launcher exits, while preserving the verified "no idle live credential" property
   and driving resume; the session never gains read authority. M3's interactive-pull
   read grant remains deferred.
 
-- **M2-B (DEFERRED, next): daemon-driven inbound delivery.** This pass builds the
-  resume primitive so it can be invoked directly (and tested). The next increment
-  wires the daemon to drive resume automatically when a message lands on a session's
-  mailbox (`in/agent/<noun>/<session>/...`): the daemon (with authority) reads the
-  mailbox and calls `code resume`, draining it into a resumed turn. The session token
-  stays emit-only throughout — only the daemon reads.
+- **M2-B (DONE 2026-06-20): daemon-driven inbound delivery.** M2-A built the resume
+  primitive so it could be invoked directly (and tested); M2-B (the next Log entry
+  below) wired the daemon to drive resume automatically when a message lands on a
+  session's mailbox (`in/agent/<noun>/<conv>`): the daemon (with authority) reads the
+  delivery and calls `resume_capture`, draining it into a resumed turn. The session
+  token stays emit-only throughout — only the daemon reads.
 
 - **Tests + verification.** `cargo test` green, **112 passing** (was 105): +3 in
   `codesession` (record round-trip + no-secret; upsert refresh keyed by elanus
@@ -845,12 +848,116 @@ launcher exits, while preserving the verified "no idle live credential" property
     mtimes all predate the run); the **reaper still covers crashes** (resume reaps
     orphans on entry, same as launch; the reap test passes).
 
-### Still TODO (next increments)
+### 2026-06-20 — M2-B: daemon-driven inbound delivery (mailbox → resume) (branch `coding-agents`)
 
-- **M2-B (NEXT): daemon-driven inbound delivery.** Wire the daemon to drive
-  `code resume` when a message lands on a session's mailbox — the daemon reads the
-  mailbox (it has the authority), the session token stays emit-only. The resume
-  primitive (M2-A) is the building block; this is the auto-drive on top.
+A message addressed to an idle coding session's mailbox makes the daemon resume
+that session with the message — closing "deliver → the session acts → result
+observed." The session never gains read authority; the DAEMON (the kernel, which
+already has authority) reads the delivery and drives the M2-A resume primitive.
+
+- **Addressing — `in/agent/<tool>/<conv>`.** A session's mailbox is `in/agent/<tool>/
+  <conv>` where `<tool>` is the agent NOUN (`codex` / `claude-code`) and `<conv>` is
+  the elanus session `code-<id>` (the conversation locator — symmetric with the
+  session's telemetry `obs/agent/<tool>/<session>/...`, same first locators). Payload
+  carries the message as `{"prompt":"…"}` (a `text` alias and a bare JSON string are
+  also accepted). Recognition is `codeagent::recognize_delivery(root, topic)`: exactly
+  four levels `in/agent/<tool>/<conv>`, `<conv>` decodes (inverse of
+  `topic::encode_segment`) to a valid `code-*` principal with a `code_sessions` record,
+  AND `<tool>` equals that record's `agent_noun` (a mismatched noun is ignored, never
+  cross-driven). Everything else returns None → left for the normal dispatch path.
+
+- **Dispatcher integration — two new tick steps, between `reap` and
+  `resume_suspended`** (`src/dispatcher.rs`):
+  - `drive_code_deliveries` runs BEFORE `dispatch_pending`. It SQL-prefilters
+    `state='pending' AND type LIKE 'in/agent/%'`, calls `recognize_delivery` on each,
+    and for a match: marks the event `running` (durable claim), pulls the message
+    (`delivery_message`), and enqueues a `CodeJob` on the session's worker. A
+    recognized delivery with no prompt/text settles `done` (delivered, nothing to
+    resume on). An UNRECOGNIZED `in/agent/*` event is left `pending` and falls through
+    to `dispatch_pending`, which marks it `done` as a no-consumer event (the existing
+    behavior) — so an ordinary agent mailbox or a never-recorded `code-*` conv is
+    ignored cleanly (no panic, no spurious resume).
+  - `settle_code_deliveries` runs after `reap`. It drains the workers' completion
+    channel and settles each delivery event `running → done` (success) / `failed`
+    (errored or non-zero/timeout exit — the message WAS delivered and acted on, so it
+    is not re-driven), drops it from the in-flight `claimed` set, emits a small
+    `obs/agent/code/delivery/complete` threaded by the delivery's `correlation_id`
+    (a waiter / M4 planner reads it), and retires the now-idle worker.
+
+- **Serialization + non-blocking — one worker THREAD per session, FIFO queue.**
+  Resume runs in-process (it mints/retires the scoped token and parses the JSONL
+  stream), so the fork/exec-and-reap model the rest of the dispatcher uses doesn't
+  fit. Instead each session gets a dedicated `code-driver-<session>` thread that owns
+  a `mpsc` FIFO: a given session runs exactly ONE resume at a time (the native tool
+  isn't concurrent-safe on one thread), two rapid deliveries to the same session
+  SERIALIZE behind that single thread, and a slow resume never stalls the tick loop or
+  another session (the tick only enqueues + later drains a channel; it never blocks on
+  a turn). The worker opens its OWN db connection inside `resume_capture` and never
+  touches the dispatcher's connection. **At-least-once durability** rides the ledger:
+  the claim is marked `running` BEFORE hand-off, so a daemon restart mid-resume
+  re-pends it (boot's `state='running' → 'pending'` sweep) and replays it; the
+  in-process `claimed` set stops a same-tick/same-process double-claim while the row is
+  still visible as the worker drains it. **No double-run, no lost message.**
+
+- **No new authority — `resume_capture` (no `process::exit`).** The M2-A CLI `resume`
+  called `std::process::exit` on a non-zero tool exit — which would KILL the daemon if
+  driven in-process. Refactored: `resume_capture` returns a `ResumeOutcome { success,
+  exit_code }`; the CLI `resume` is a thin wrapper that still propagates the code via
+  `process::exit` (script behavior unchanged), and the daemon uses `resume_capture`,
+  which never exits. The driven resume mints the session's own emit-only scoped token
+  exactly as before — publish only its own obs subtree, **subscribe nothing** — so the
+  session gains NO read authority; only the daemon reads the mailbox. The token is
+  retired after each resume and reaped on crash (the M2-A reaper covers a crash
+  mid-delivery — `resume_capture` reaps orphans on entry, the daemon reaps at boot).
+
+- **Bounded — `timeout` wraps every native call.** Both the CLI and daemon resume
+  paths now wrap the native command in `timeout -s TERM <secs> codex|claude …`
+  (default 600s, override `ELANUS_CODE_RESUME_TIMEOUT_S`) so a hung model turn is
+  killed rather than holding a worker (or a CLI run) open forever (the handoff
+  guardrail). `timeout` exiting 124 reports as a failed (timed-out) resume.
+
+- **What's now possible:** publish `in/agent/<noun>/<code-session>` with
+  `{"prompt":"…"}` → the daemon resumes the session with that message → the model acts
+  → a new ordered obs record lands under the same session, stamped
+  `sender = code-<session>`, plus a completion obs threaded by correlation. M4 (the
+  planner side — an agent sending work + waking on the completion obs) is NOT built
+  here. M3 (interactive pull / a session read grant on its own inbox) is still
+  deferred — M2-B keeps the session emit-only.
+
+- **Tests + verification.** `cargo test` green, **120 passing** (was 112): +4 in
+  `codeagent` (recognition matches a recorded mailbox / rejects non-session +
+  wrong-noun + malformed addresses / decodes an encoded conv segment; `delivery_message`
+  accepts prompt/text/bare-string and rejects empty), +4 in `dispatcher` (drive claims
+  a recognized delivery + leaves an unrecognized one for dispatch; the same delivery is
+  never enqueued twice; one worker thread serializes its FIFO with no overlap; settle
+  marks done/failed + retires the idle worker). **Live evidence (isolated worktree
+  stack, root `~/.elanus/wt-coding-agents`, broker `:1893`; the main `~/.elanus/root`
+  daemon on `:1883` was never touched — verified zero `m2b-*` events + no session row
+  in the main root):**
+  - Launched codex `code-41e2e011` (workdir `/tmp/ca-m2b-work`, native thread
+    `019ee293-…`) with codeword `ELANUS-M2B-LAUNCH-7`, then went idle (no live token).
+  - `bus pub in/agent/codex/code-41e2e011 {"prompt":"What was the secret codeword…?"}`
+    (as owner, `--correlation m2b-deliver-1`) → the daemon recognized it (event 23,
+    `delivery/accepted`), resumed the SAME native thread `019ee293-…`, and the model
+    **recalled `ELANUS-M2B-LAUNCH-7`** (`assistant/message`) — proof the resume targeted
+    the right thread with its history. A NEW ordered record (`session/resume →
+    session/thread → assistant/message → session/idle`) landed under the same elanus
+    session, every record stamped **`sender = code-41e2e011`**; `last_active` bumped
+    (`01:09:18 → 01:09:55`); `delivery/complete` emitted (`cause_id=23`,
+    `correlation=m2b-deliver-1`, `failed:false`).
+  - **Serialization:** two rapid deliveries (`m2b-serial-A`, `m2b-serial-B`) were both
+    accepted in the same tick (`01:10:39.529` / `.531`) but completed SEQUENTIALLY
+    (`A` `01:10:45.736`, then `B` `01:10:52.187` — ~6.5s apart, no overlap), the model
+    replying `SERIAL-A-DONE` then `SERIAL-B-DONE` in order — the single worker thread
+    serialized them, no corruption.
+  - **Non-existent / non-session deliveries ignored cleanly:** `in/agent/codex/
+    code-deadbeef` (never recorded) and `in/agent/kestrel/c999` (ordinary agent) both
+    settled `done` with ZERO resume attempts and no panic — the daemon stayed up.
+  - **No idle credential** after any resume (`.secrets/code-sessions/` empty — the
+    per-resume token retired); **`~/.codex` config untouched** (`config.toml` /
+    `auth.json` mtimes predate the run).
+
+### Still TODO (next increments)
 - **M3 interactive-pull / session read grant.** When a session is given read
   authority over its own inbox, extend its `subscribe` scope in `codesession`
   (today empty — emit-only). M2-A deliberately did NOT do this.
