@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import CodeSessions from './CodeSessions';
 import { adminGet, adminPost, adminPut, history, publish, status as fetchStatus } from './api';
 import { openLiveStream } from './live';
 import { Button, IconButton } from './components/primitives';
@@ -447,6 +448,9 @@ export function App() {
 
   const selectWelcome = () => setSel({ kind: 'welcome' });
   const selectSignals = () => { setFilter('signals'); setSel({ kind: 'signals' }); };
+  // Observability M4: the coding-session tree (a "workers" surface). Minimal mount
+  // — final placement belongs in the Workers nav the chat track is building.
+  const selectCodeSessions = () => setSel({ kind: 'code-sessions' });
   const selectSetup = (status?: any) => {
     setSel({ kind: 'setup' });
     void loadSetup(status);
@@ -465,9 +469,11 @@ export function App() {
   const stageTitle = sel.kind === 'welcome' ? 'welcome'
     : sel.kind === 'signals' ? 'signals'
       : sel.kind === 'setup' ? 'setup'
-        : sel.agent;
+        : sel.kind === 'code-sessions' ? 'workers'
+          : sel.agent;
   const stageNote = sel.kind === 'welcome' ? 'orient, then dive in'
     : sel.kind === 'signals' ? 'a live view of everything happening — orange means something needs your attention'
+      : sel.kind === 'code-sessions' ? 'coding sessions and the workers they spawned — tool, model, effort, duration, and a resume command'
       : sel.kind === 'setup' ? 'first-run health, agent setup, capabilities, and trust'
         : sel.tab === 'converse' ? `messages with ${sel.agent}`
           : sel.tab === 'sessions' ? 'your agent’s past conversations'
@@ -951,7 +957,7 @@ export function App() {
       </header>
 
       <main className="deck">
-        <Nav agents={agents} sel={sel} historyOk={historyOk} selectAgent={selectAgent} selectSignals={selectSignals} selectSetup={selectSetup} />
+        <Nav agents={agents} sel={sel} historyOk={historyOk} selectAgent={selectAgent} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} />
 
         <section className="stage panel" aria-label="view">
           <div className="panel-head">
@@ -1002,6 +1008,7 @@ export function App() {
             setKitPackagesExcluded={setKitPackagesExcluded}
             openKitModal={openKitModal}
           />
+          {sel.kind === 'code-sessions' && <CodeSessions />}
           <SetupView
             hidden={sel.kind !== 'setup'}
             setup={setup}
@@ -1042,7 +1049,7 @@ export function App() {
   );
 }
 
-function Nav({ agents, sel, historyOk, selectAgent, selectSignals, selectSetup }: any) {
+function Nav({ agents, sel, historyOk, selectAgent, selectSignals, selectSetup, selectCodeSessions }: any) {
   const items = [...agents.keys()].sort();
   const onKey = (e: any) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
@@ -1058,6 +1065,7 @@ function Nav({ agents, sel, historyOk, selectAgent, selectSignals, selectSetup }
       <div id="nav-list" className="nav-list" onKeyDown={onKey}>
         <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" onClick={selectSignals}><span className="nav-sigil">◮</span> signals</button>
         <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
+        <button className={`nav-item nav-workers${sel.kind === 'code-sessions' ? ' on' : ''}`} data-sel="code-sessions" onClick={() => selectCodeSessions && selectCodeSessions()}><span className="nav-sigil">⚙</span> workers</button>
         <div className="nav-label">agents</div>
         <div id="nav-agents">
           {items.map((name) => {
