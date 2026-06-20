@@ -106,34 +106,66 @@ These are the load-bearing choices. Some are settled by the existing docs; some
 are genuine open questions flagged honestly for you to resolve against the real
 tools, not guess.
 
-### A coding agent is an external actor with two operating modes
+### Two operating modes, and the planner symmetry
 
-The key clarification the research forces: there is **no supported way to type
-into a running interactive TUI** (neither Codex nor Claude Code exposes
-"inject a message into the live session"). Programmatic drive is headless: a fresh
-turn resumed into the same session (`claude -p --resume <id>`, Codex's equivalent),
-or stream-json/SDK. So the envelope has **two modes**, and they are different
-products:
+A coding session runs in one of two modes, and the difference is entirely **who
+drives its turns**. It is not two kinds of session — it is one durable session
+advanced two ways.
 
-- **Supervised-interactive.** A human sits at the real TUI. elanus owns the cage
-  and *observes* (hooks → bus) and *injects context* (the prompt hook), but does
-  not drive turns. Because elanus cannot push a turn into the live session, the
-  delivery mechanism here is an **inbox**: messages addressed to the session
-  accumulate, and the agent *checks the inbox* when it chooses — prompted by the
-  per-turn injection ("you have N new messages"). This is Daniel's mode and the
-  honest reading of "launch the real TUI."
-- **Headless-orchestrated.** elanus (or a planner agent) drives the session
-  programmatically — headless turns resumed into one session id (`claude -p
-  --resume`, `codex exec` resume), or the Agent SDK. A delivered message drains the
-  inbox by triggering a resumed turn. This is the mode the orchestration vision
-  (planner→worker, multi-session) needs. The "real TUI" is not in this loop; the
-  real *session* and *model loop* are. The hard part here is **keeping the human in
-  the loop** — they aren't watching a TUI, so the hook→bus record and the elanus UI
-  are how they see what the headless turns did.
+- **Interactive.** A human sits at the real TUI and drives the turns. elanus owns
+  the cage, *observes* the session (hooks/stream → bus), and *injects context* into
+  each turn (the system-reminder seam, M3) — but it does not and cannot push a turn
+  in. There is no supported way to inject a turn into a running interactive TUI
+  (confirmed for both tools). So anything elanus wants the session to notice — a
+  message in its mailbox, a coordination claim — can only surface as injected
+  context on the *next* turn, and the next turn happens only when the human submits
+  one. **The human is the pump.** Right for a person working hands-on; wrong for an
+  autonomous loop, which cannot advance without someone pressing Enter.
+- **Headless.** elanus drives the turns. A message delivered to the session's
+  mailbox makes the daemon resume the session non-interactively (`claude -p
+  --resume` / `codex exec resume`) with that message; the session takes a turn and
+  the turn ends. No human is in the loop; the human watches or joins through the
+  elanus UI and the recorded bus stream. This is the mode the orchestration vision
+  needs. **(M2-A + M2-B build exactly this for the worker side, verified.)**
 
-Design the envelope so a session can be either, over the same inbox: interactive
-sessions *pull*, headless sessions are *driven*. Do not promise interactive
-message-injection into a live TUI; it isn't there.
+**The same durable session bridges both** (M2-A). You can start interactive, let it
+run headless, and resume it interactively later — same session id. So "ending
+interactive mode" is not a teardown: the human just stops driving and elanus drives
+subsequent turns by resume. "Never starting interactive" means launching headless
+from the first turn for any session meant to run in a loop. A session destined for
+orchestration should go headless from the start; a session a human is shepherding
+can hand off to headless when they step away.
+
+**The planner is the same kind of thing as the worker.** When a coding agent acts
+as a *planner* — hands work to a worker and reacts to the result — the clean
+realization in headless mode is that the planner is *itself* a resumable session: it
+takes a turn, dispatches work to a worker's mailbox, and **ends its turn**; when the
+worker completes, that completion is delivered to the *planner's* mailbox, which
+resumes the planner for the next step. Planner and worker ride the identical
+"message arrives → daemon resumes the session" machinery (M2-B); the only difference
+is who is waiting on whom, and a session can be a worker in one relationship and a
+planner in another. (A native elanus agent can also be the planner — it waits by
+suspending/resuming on elanus's own machinery instead of by ending a headless turn —
+but a coding agent planning another, Claude Code → Codex, is the headline case and
+fits the resume model directly. See M4.)
+
+**elanus briefs the session on the envelope at launch.** A coding agent does not, on
+its own, know it is running under elanus, that it may be resumed headlessly, or how
+hand-off works — so the launcher must *tell it*. Inject an operating-envelope
+briefing at launch (Claude Code: `--append-system-prompt`; Codex: the equivalent
+system/developer instruction) covering: you are under elanus supervision; when you
+hand work off, **end your turn cleanly rather than waiting in a busy loop**; results
+reach you as a resumed turn; here is how to address a worker and read your inbox;
+and how to behave toward your human (who may or may not be watching). This briefing
+is what makes a session a well-behaved loop participant instead of one that stalls
+waiting for a turn that will never come on its own. The one-time briefing rides the
+launch flag; the per-turn ongoing context (inbox status, claims) rides the M3
+injection seam.
+
+The honest caveat for any driven loop: delivery is **at-least-once** (M2-B), so a
+daemon crash mid-resume can replay a turn. A planner must read the actual recorded
+state before acting, not assume each wake-up is unique. Idempotency hardening (a
+delivery key) is part of M4.
 
 ### The hook→bus bridge is the ledger
 
@@ -319,6 +351,12 @@ Acceptance criteria:
 
 ### M3 — Memory/inbox/context via the prompt hook
 
+This is the **per-turn** counterpart to the one-time launch-envelope briefing
+(operating-modes section): the briefing tells a session how the envelope works once,
+at launch; M3 keeps it informed every turn. It is also what makes interactive mode's
+inbox-*pull* work (the human-pumped "you have N messages" surfacing) and what M5
+points at to surface coordination claims.
+
 Shape:
 - Wire the coding agent's per-turn prompt hook to elanus's block substrate: return
   approved blocks for this session plus computed blocks — an "open inbox" status
@@ -335,29 +373,59 @@ Acceptance criteria:
   "don't bust the cached prefix" goal, and the doc states where injected context
   actually lands for each tool.
 
-### M4 — Orchestration loop: planner drives worker
+### M4 — The orchestration loop: planner drives worker
+
+Builds directly on M2-B (deliver → resume) and the operating-modes/planner-symmetry
+section above. The planner is itself a resumable session; closing the loop is mostly
+wiring + a briefing + a mediated dispatch tool.
 
 Shape:
-- A planner agent launches/prompts a coding session for a milestone, detects
-  completion (the Stop/idle event from M1), reviews the result, and issues the next
-  milestone — gated on the worker's done-signal. Provide the supervision primitive
-  (session lifecycle event → "ready for next work") and a minimal planner recipe.
-- The human can watch the whole loop on the bus and interrupt.
+- **Close the loop M2-B leaves open:** route a worker's completion back to **the
+  deliverer's mailbox** (carrying the delivery's `correlation_id`), so a planner
+  session is resumed to react. Today M2-B emits `obs/agent/code/delivery/complete`
+  but does not deliver it to whoever asked — that reply is the missing wire. The
+  completion delivered to the planner's mailbox is itself an M2-B delivery, so it
+  resumes the planner exactly like any other.
+- **Give the planner a mediated way to dispatch work:** a tool the planner calls —
+  an elanus MCP tool or `elanus code deliver <session> "<msg>"` — that performs the
+  delivery to the worker's mailbox **with elanus's authority** and records the
+  planner as the requester. Do NOT widen the session's emit-only token to publish
+  into other mailboxes; route authority through the mediated tool (the planner asks
+  elanus to deliver, elanus does it and records who asked).
+- **Launch-envelope briefing** (operating-modes section): so the planner ends its
+  turn after dispatching and is resumed on completion, rather than busy-waiting.
+- **Idempotency:** stamp each delivery with a key so a replayed completion/turn (the
+  at-least-once duplicate on a mid-resume crash) is recognized and not double-acted;
+  the planner reads recorded state before acting.
+- The planner may be a coding agent (Claude Code → Codex, the headline) or a native
+  elanus agent (which waits by suspend/resume). Build for the coding-agent case;
+  note the native-agent path.
 
 Acceptance criteria:
-- A planner runs at least two milestones of some real task by launching/prompting a
-  coding session, each next step gated on the prior worker completion event — with
-  no human acting as the wire.
-- Every handoff (planner→worker prompt, worker→planner completion) is observable on
-  the bus; the human can interrupt mid-loop.
-- A worker failure surfaces (signal/observation) rather than hanging the loop.
+- A planner (a coding session) runs ≥2 steps of a real task **fully headless**: it
+  dispatches to a worker, ends its turn, is resumed by the worker's completion,
+  reviews, and dispatches the next — with no human acting as the wire. The whole
+  loop is observable on the bus; the human can watch in the UI and join/interrupt,
+  and resume any session later (M2-A).
+- A worker failure reaches the planner (a failed completion) rather than hanging the
+  loop.
+- A replayed delivery (simulate a mid-resume crash) does not double-act: the
+  idempotency key makes the second run a recognized no-op.
+- The planner dispatches through the mediated tool (elanus authority, planner
+  recorded as requester); the session token stays emit-only.
 
 ### M5 — Peer coordination over the bus (advisory)
+
+**Depends on M3.** Surfacing claims to a session is the M3 injection seam pointed at
+a new computed block, so M3 lands before M5. Build order from here: **M4** (close the
+loop) → **M3** (the per-turn injection seam: inbox status + claims) → **M5** (the
+coordination room that M3 surfaces). The M4 launch briefing can use the launch flag
+without M3; the per-turn surfacing cannot.
 
 Shape:
 - Multiple concurrent coding sessions share a coordination room (`in/group/<id>`,
   ledger-backed). A session announces an edit claim ("editing src/foo.rs"); each
-  session's M3 hook injects the current claims into its prompt. Advisory only — no
+  session's M3 injection shows the current claims in its prompt. Advisory only — no
   hard locks.
 
 Acceptance criteria:
