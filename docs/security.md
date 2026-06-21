@@ -693,3 +693,38 @@ files.
 Still LATENT after M2 (M3): fs read/write, the tool/command allowlist, and
 `blocking` are still flat per-kind, not `subset(spawner)`. The env-keyed
 spawner-name residual (above) is unchanged — still M2+ follow-up.
+
+**[M3 LANDED 2026-06-21]** The delegation contract is now **complete across every
+named capability dimension** — `Grants` carries `fs_write`, `fs_read`,
+`tool_allowlist`, and `blocking` (each `Option<Vec<String>>`, `#[serde(default)]`,
+`None` = unbounded), and `mint` asserts `child ⊆ spawner` for ALL of them under the
+*same* M1 flock, via one uniform `narrow` contract: budget keeps its fungible
+`Σ ≤ parent`; bus keeps its M2 `covers`; the four capability dims use two decidable,
+deny-when-unsure primitives — **path containment** (`topic::path_covered`:
+component-wise `Path::starts_with` over lexically-normalized absolute paths — no
+`canonicalize`, since grant prefixes need not exist and symlink resolution stays a
+runtime cage concern; `/a/b` covers `/a/b/c` but not `/a/bc`; `..`-escape and
+relative/empty prefixes deny) and **exact set-membership** (tool/blocking). Every
+child entry is checked (loop, not first-only); a child can never flip a bounded dim
+to unbounded. The request side is unified into `RequestedGrants` (retiring the
+`mint` arg-count smell). Scope was deliberately **mint-bound** (Tim's call): the
+contract is recorded and enforced at spawn for all four; *runtime* enforcement is
+unchanged — `fs_write` keeps its existing cage/`acquire_lease` `lease ⊆ grant`
+(profile-driven, untouched), and `fs_read`/`tool_allowlist`/`blocking` are
+mint-bound only, runtime-enforced later (mirroring sandbox.md's read-scoping
+deferral). Owner-spawned sessions get all four dims `None` (unbounded), lock-free —
+zero behavior change. 217 + 2 doctests green; clippy clean on the touched modules.
+
+Adversarial validation (committed-tree, no git-mutation) found one **latent HIGH**
+before finalize: an empty-string `wide` prefix made `path_covered` a silent root
+wildcard (`"/etc".starts_with("")` is true in Rust) — not reachable in shipped M3
+(no production path mints `Some([""])`; sessions get `None`) but a root-wildcard
+escalation the moment fs grants get populated (M4 / deferred runtime). Fixed by
+requiring `wide` prefixes be absolute (rejects empty *and* relative degenerate
+prefixes) + a regression test. Lesson for M4: when the `--grants` CLI populates fs
+grants, **validate prefixes at construction** (absolute, non-empty) too.
+
+Still LATENT after M3: runtime enforcement for `fs_read`/`tool_allowlist`/`blocking`
+(mint-bound only today); and the env-keyed spawner-name residual (unchanged) — the
+`ELANUS_CODE_REPLY_TO` lookup should move onto a capability reference. M4 (optional)
+is the `--grants`/budget CLI surface for deliberate narrowing.

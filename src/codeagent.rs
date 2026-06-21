@@ -1644,7 +1644,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     // `parent` is None when the owner runs `elanus code` directly → unbounded.
     // No explicit budget request here — inherit-equal is the default policy.
     let token = codesession::mint(root, &principal, &agent, std::process::id() as i32,
-                                  parent.as_deref(), None, None, None)
+                                  parent.as_deref(), codesession::RequestedGrants::default())
         .with_context(|| format!("minting the session credential for {principal}"))?;
     let bus_token = token.secret.clone();
 
@@ -2614,7 +2614,7 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     // so it is not charged against any spawner budget (the budget was consumed
     // at launch time, not at resume). Pass spawner=None, requested_budget=None.
     let token = codesession::mint(root, &principal, &rec.agent_noun, std::process::id() as i32,
-                                  None, None, None, None)
+                                  None, codesession::RequestedGrants::default())
         .with_context(|| format!("minting the resume credential for {principal}"))?;
     let bus_token = token.secret.clone();
     let agent = rec.agent_noun.clone();
@@ -3559,7 +3559,7 @@ mod tests {
         let principal = "code-deadbeef";
         let token =
             codesession::mint(&root, principal, "claude-code", std::process::id() as i32,
-                              None, None, None, None).unwrap();
+                              None, codesession::RequestedGrants::default()).unwrap();
         // It does NOT resolve as a full-authority fenced secret — the broker's
         // owner-equivalent path (crate::secrets::read) must return None for it.
         assert_eq!(crate::secrets::read(&root, principal), None);
@@ -4329,7 +4329,7 @@ mod tests {
     fn forced_session_token_file_blocks_forced_id_reuse() {
         let root = delivery_tmp_root();
         let principal = "code-live0001";
-        codesession::mint(&root, principal, "codex", std::process::id() as i32, None, None, None, None).unwrap();
+        codesession::mint(&root, principal, "codex", std::process::id() as i32, None, codesession::RequestedGrants::default()).unwrap();
 
         assert!(forced_session_token_exists(&root, principal));
         let _ = std::fs::remove_dir_all(&root.dir);

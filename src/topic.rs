@@ -196,6 +196,110 @@ pub fn encode_path(p: &std::path::Path) -> String {
     segs.join("/")
 }
 
+/// Is `narrow` contained within some prefix in `wide_prefixes`?
+///
+/// Used at mint to assert `child ⊆ spawner` for the `fs_write` and `fs_read`
+/// capability dimensions (docs/handoffs/authority-delegation.md M3,
+/// docs/security.md entry 22).
+///
+/// ## Semantics
+///
+/// Returns `true` iff `narrow` is within some entry in `wide_prefixes` using
+/// **component-wise prefix containment** (`std::path::Path::starts_with`) on
+/// **lexically-normalized absolute paths** (`.` / `..` components resolved
+/// lexically via `Path::components`, not via `canonicalize()` — grant prefixes
+/// need not exist on disk at mint time; symlink resolution is a runtime concern,
+/// delegated to the cage's `canonicalize` in exec.rs).
+///
+/// ## Conservative deny-when-unsure rules
+///
+/// - `narrow` must be absolute after lexical normalization (a relative path
+///   denies — cannot verify containment without knowing the CWD).
+/// - A `narrow` that, after normalization, contains a `..` component that would
+///   escape to the filesystem root also denies (lexical normalization cannot
+///   safely remove a `..` that crosses the root).
+/// - Empty `wide_prefixes` → `false` (no prefix can cover narrow).
+/// - A `narrow` covered by the empty string or zero-length path → `false`.
+///
+/// ## Component-aware vs. string-prefix
+///
+/// `Path::starts_with` is component-aware: `/a/b` is a prefix of `/a/b/c` but
+/// NOT of `/a/bc`. Using string `starts_with` would confuse the two — this
+/// function explicitly does NOT do that.
+///
+/// ## Examples
+///
+/// ```text
+/// path_covered(&["/a/b"], "/a/b/c")     → true
+/// path_covered(&["/a/b"], "/a/bc")      → false  (not a component boundary)
+/// path_covered(&["/a/b"], "/a/b")       → true   (exact match is ⊆)
+/// path_covered(&["/a/b"], "/a/b/..")    → false  (.. not resolved — deny)
+/// path_covered(&["/a/b"], "a/b/c")      → false  (relative path — deny)
+/// path_covered(&["/a/b"], "/x/y")       → false  (disjoint)
+/// path_covered(&[], "/a/b/c")           → false  (empty wide)
+/// path_covered(&["/"], "/a/b")          → true   (root covers everything)
+/// ```
+pub fn path_covered(wide_prefixes: &[String], narrow: &str) -> bool {
+    use std::path::{Component, Path};
+
+    // Lexically normalize narrow: walk components, reject relative or escaping paths.
+    let raw = Path::new(narrow);
+    let mut components: Vec<std::ffi::OsString> = Vec::new();
+    let mut is_absolute = false;
+    for comp in raw.components() {
+        match comp {
+            Component::RootDir => {
+                is_absolute = true;
+            }
+            Component::Normal(seg) => {
+                components.push(seg.to_os_string());
+            }
+            Component::ParentDir => {
+                // `..` in the narrow path: if we can pop a component, do so
+                // (lexical normalization of `a/b/../c` → `a/c`). But if the
+                // stack is empty, the `..` would escape — deny.
+                if components.pop().is_none() {
+                    // `..` escapes the path root — conservative deny.
+                    return false;
+                }
+            }
+            Component::CurDir => {
+                // `.` is a no-op; skip it.
+            }
+            Component::Prefix(_) => {
+                // Windows drive prefix; treat as absolute but not our concern
+                // on macOS/Linux. Fall through — the Path machinery handles it.
+                is_absolute = true;
+            }
+        }
+    }
+
+    if !is_absolute {
+        // Relative narrow path: cannot determine containment without CWD — deny.
+        return false;
+    }
+
+    // Reconstruct the normalized absolute narrow path.
+    let mut normalized = std::path::PathBuf::from("/");
+    for seg in &components {
+        normalized.push(seg);
+    }
+
+    // Check component-wise prefix containment against every wide prefix.
+    // wide_prefixes are from the spawner's persisted Grants and need NOT exist on
+    // disk — use them lexically as-is (no canonicalize). But a wide prefix MUST be
+    // absolute: the empty string (and any relative prefix) is a prefix of every
+    // path under `Path::starts_with` (`"/etc".starts_with("")` is true), so an
+    // unfiltered empty entry would be a silent root wildcard — a widening hole the
+    // moment a degenerate config/split yields `""`. Requiring absolute is the
+    // decidable, conservative guard (deny-when-unsure): a non-absolute grant
+    // prefix grants nothing.
+    wide_prefixes
+        .iter()
+        .filter(|wide| Path::new(wide.as_str()).is_absolute())
+        .any(|wide| normalized.starts_with(Path::new(wide.as_str())))
+}
+
 /// The agent noun's mailbox topic (docs/topics.md): in/agent/<noun>.
 pub fn agent_mailbox(noun: &str) -> String {
     format!("in/agent/{}", encode_segment(noun))
@@ -419,6 +523,108 @@ mod tests {
         assert!(covers("a/#", "a/b/c/d/e"));
         assert!(covers("a/#", "a/b"));
         assert!(covers("a/#", "a")); // § sport/# matches sport
+    }
+
+    // ── path_covered(): component-wise path prefix containment (M3) ─────────────
+
+    #[test]
+    fn path_covered_basic_containment() {
+        // Direct parent/child relationship.
+        assert!(path_covered(&["/a/b".into()], "/a/b/c"));
+        assert!(path_covered(&["/a/b".into()], "/a/b/c/d/e"));
+        // Exact match: prefix of itself is ⊆.
+        assert!(path_covered(&["/a/b".into()], "/a/b"));
+    }
+
+    #[test]
+    fn path_covered_component_boundary_trap() {
+        // THE CRITICAL TRAP: /a/b is NOT a prefix of /a/bc (component boundary).
+        // String-prefix would say yes; Path::starts_with correctly says no.
+        assert!(!path_covered(&["/a/b".into()], "/a/bc"));
+        assert!(!path_covered(&["/Users/tim".into()], "/Users/timothy/doc.txt"));
+        assert!(!path_covered(&["/foo".into()], "/foobar/baz"));
+    }
+
+    #[test]
+    fn path_covered_trailing_slash_in_wide() {
+        // A wide prefix ending with '/' is still component-wise matched by Path.
+        // "/a/b/" as a Path is the same as "/a/b" after normalization.
+        assert!(path_covered(&["/a/b/".into()], "/a/b/c"));
+        assert!(path_covered(&["/a/b/".into()], "/a/b"));
+    }
+
+    #[test]
+    fn path_covered_dotdot_in_narrow() {
+        // `..` that normalizes safely within the root is allowed (lexical normalization):
+        // /a/b/c/../d normalizes to /a/b/d which IS inside /a/b.
+        assert!(path_covered(&["/a/b".into()], "/a/b/c/../d"));
+        // `..` that would escape the filesystem root (go above /) denies.
+        assert!(!path_covered(&["/".into()], "/../etc/passwd"));
+        // `..` that escapes OUTSIDE the wide prefix but is still absolute:
+        // /a/b/../c/../.. normalizes to / which IS within wide "/" but the stack
+        // could go negative. Real case: /a/x/../../../etc → goes above root → deny.
+        assert!(!path_covered(&["/a/b".into()], "/a/../../etc"));
+    }
+
+    #[test]
+    fn path_covered_relative_narrow_denies() {
+        // A relative narrow path cannot be checked without a CWD — always deny.
+        assert!(!path_covered(&["/a/b".into()], "a/b/c"));
+        assert!(!path_covered(&["/a/b".into()], "b/c"));
+        assert!(!path_covered(&["/".into()], "relative"));
+    }
+
+    #[test]
+    fn path_covered_empty_wide_denies() {
+        // No prefixes → nothing is covered.
+        assert!(!path_covered(&[], "/a/b/c"));
+        assert!(!path_covered(&[], "/"));
+    }
+
+    #[test]
+    fn path_covered_empty_string_wide_is_not_a_root_wildcard() {
+        // An empty-string wide entry must NOT cover everything. In Rust,
+        // `Path::new("/etc").starts_with(Path::new(""))` is true, so an unfiltered
+        // empty entry would be a silent root wildcard (a widening hole the moment a
+        // split/trim/config-parse yields ""). path_covered requires absolute wide
+        // prefixes, so "" grants nothing.
+        assert!(!path_covered(&["".to_string()], "/etc/passwd"));
+        assert!(!path_covered(&["".to_string()], "/"));
+        // A relative wide prefix is equally degenerate and grants nothing.
+        assert!(!path_covered(&["relative/dir".to_string()], "/relative/dir/x"));
+        // A mix: the empty/relative entries are ignored, the real one still works.
+        assert!(path_covered(
+            &["".to_string(), "/work/proj".to_string()],
+            "/work/proj/src/main.rs"
+        ));
+        assert!(!path_covered(
+            &["".to_string(), "/work/proj".to_string()],
+            "/etc/passwd"
+        ));
+    }
+
+    #[test]
+    fn path_covered_root_covers_everything() {
+        // "/" is a prefix of every absolute path.
+        assert!(path_covered(&["/".into()], "/a/b/c"));
+        assert!(path_covered(&["/".into()], "/etc/passwd"));
+        assert!(path_covered(&["/".into()], "/"));
+    }
+
+    #[test]
+    fn path_covered_disjoint_denies() {
+        // Completely different subtrees.
+        assert!(!path_covered(&["/a/b".into()], "/x/y"));
+        assert!(!path_covered(&["/Users/tim".into()], "/tmp/work"));
+    }
+
+    #[test]
+    fn path_covered_multiple_wide_prefixes() {
+        // Any matching prefix in the wide set is enough.
+        let wide = vec!["/a/b".into(), "/c/d".into()];
+        assert!(path_covered(&wide, "/a/b/file.txt"));
+        assert!(path_covered(&wide, "/c/d/sub/file.txt"));
+        assert!(!path_covered(&wide, "/e/f/file.txt"));
     }
 
     // Brute-force soundness oracle. covers(w,n) must imply that every concrete

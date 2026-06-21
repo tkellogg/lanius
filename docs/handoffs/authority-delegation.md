@@ -236,3 +236,21 @@ see it refused if it tries to exceed it.
   intact; test module equivalent-not-identical). **M3 next**: fold fs read/write +
   tool/command allowlist + `blocking` into the same `covers`/`⊆` contract, reusing
   `lease ⊆ grant`'s prefix machinery for paths.
+
+- 2026-06-21 — **M3 implemented**, scope = **contract-complete, mint-bound** (Tim's
+  call; the four named dims are in different states in the code — only fs_write has
+  runtime enforcement, fs_read/tool-allowlist were never modeled, blocking was
+  package-only). `Grants` now carries `fs_write`/`fs_read`/`tool_allowlist`/
+  `blocking` (`Option<Vec<String>>`, `None`=unbounded); `mint` asserts `child ⊆
+  spawner` for ALL capability dims under the M1 flock via one uniform `narrow` —
+  paths via `topic::path_covered` (component-wise lexical prefix, no canonicalize),
+  tool/blocking via exact membership. Request side unified into `RequestedGrants`
+  (removed the `mint` arg-count allow). Runtime enforcement unchanged (fs_write
+  cage stays; the other three are mint-bound only, deferred). Acceptance met: every
+  capability dimension a spawn confers is `⊆` the spawner's by one decidable check.
+  Validation (committed-tree, no git-mutation this time — process hardened: WIP
+  checkpoint before validate) caught one latent HIGH — an empty-string `wide`
+  prefix was a silent root wildcard in `path_covered` — fixed (require absolute
+  prefixes) + regression test. security.md entry 22 [M3 LANDED]. **M4 (optional,
+  last)**: the `--grants`/budget CLI surface for deliberate narrowing — and it must
+  validate fs-grant prefixes (absolute, non-empty) at construction.
