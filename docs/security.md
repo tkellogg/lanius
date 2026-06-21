@@ -728,3 +728,36 @@ Still LATENT after M3: runtime enforcement for `fs_read`/`tool_allowlist`/`block
 (mint-bound only today); and the env-keyed spawner-name residual (unchanged) — the
 `ELANUS_CODE_REPLY_TO` lookup should move onto a capability reference. M4 (optional)
 is the `--grants`/budget CLI surface for deliberate narrowing.
+
+**[M4 LANDED 2026-06-21 — handoff COMPLETE]** Narrowing is now first-class in the
+UX. `elanus code <tool>` accepts `--budget <N>` and repeatable
+`--grant-{publish,subscribe,fs-write,fs-read,tool,blocking}`; `take_grants_flags`
+(src/codeagent.rs) strips them from argv (the rest is forwarded to the tool
+verbatim), **validates at construction** (numeric budget; `topic::valid_filter` for
+bus filters; fs paths must be absolute, non-empty, whitespace-free, contain no `..`,
+and name a real directory below root — `/`, `//`, `/../..` are refused, closing the
+M3 root-wildcard footgun *at the door*; tool/blocking non-empty), and `launch`
+threads the resulting `RequestedGrants` into `mint`. Absent flags ⇒
+`RequestedGrants::default()` ⇒ byte-identical prior behavior. The CLI only checks
+well-formedness; the *bound* is still mint's `child ⊆ spawner` / `Σ ≤ parent`
+(unchanged) — e.g. `--grant-publish '#'` parses fine but a child is refused it
+unless its spawner holds it. Acceptance met (e2e tests asserting refusals): an owner
+`--budget 4` session has remaining 4, and a child requesting >4 (or an fs_write /
+publish outside an owner-set grant) is refused. Adversarial validation found **no
+bypass** (every requested grant is re-checked at mint); residuals were LOW and
+addressed (degenerate-absolute hardening above; a vacuous-pass test made
+unconditional). 241 + 2 doctests green; clippy clean on the touched module.
+
+The `--budget`/`--grant-*` names are a **reserved elanus flag namespace** — they are
+stripped from anywhere in argv before the tool sees them (no `--` end-of-options
+sentinel today), so a future tool adopting one of these names would have it captured
+by elanus. Acceptable now (claude/codex use none of them); revisit if it bites.
+
+Residuals carried past the handoff (all recorded, none blocking): (1) runtime
+enforcement for `fs_read`/`tool_allowlist`/`blocking` is still deferred (mint-bound
+only) — when it lands, the token grant becomes the cage's source instead of the
+profile; (2) the env-keyed spawner-name lookup (`ELANUS_CODE_REPLY_TO`) should move
+onto a capability reference before budget/grants become load-bearing at runtime;
+(3) async `spawn` does not yet forward `--grant-*` flags to detached workers (mint
+still prevents widening — it just can't pass an explicit narrowing request through
+the async path); (4) the cross-process lock is unix-only by construction.

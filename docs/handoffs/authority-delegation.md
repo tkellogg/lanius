@@ -254,3 +254,20 @@ see it refused if it tries to exceed it.
   prefixes) + regression test. security.md entry 22 [M3 LANDED]. **M4 (optional,
   last)**: the `--grants`/budget CLI surface for deliberate narrowing — and it must
   validate fs-grant prefixes (absolute, non-empty) at construction.
+
+- 2026-06-21 — **M4 implemented — HANDOFF COMPLETE.** `elanus code <tool>` gains
+  `--budget` + repeatable `--grant-{publish,subscribe,fs-write,fs-read,tool,blocking}`
+  (`take_grants_flags`, src/codeagent.rs): strips them from argv, validates at
+  construction (numeric budget; `valid_filter` filters; fs paths absolute +
+  non-empty + no-whitespace + no-`..` + below-root — `/` and `/../..` refused,
+  closing the M3 footgun at the door), threads `RequestedGrants` into `mint`. The CLI
+  only validates well-formedness; the bound stays mint's `child ⊆ spawner` / `Σ ≤
+  parent`. Acceptance met (e2e refusal tests): owner `--budget 4` ⇒ remaining 4; a
+  child exceeding it (or requesting fs/publish outside an owner-set grant) is refused.
+  Validation found NO bypass; LOW residuals addressed (degenerate-absolute hardening,
+  a vacuous-pass test fixed). security.md entry 22 [M4 LANDED]. **All four milestones
+  (M1 budget, M2 bus, M3 capability dims, M4 CLI) are done on branch
+  `authority-delegation-rest` (M1 already on `main`).** Carried residuals (recorded,
+  non-blocking): runtime enforcement of fs_read/tool/blocking still deferred; the
+  env-keyed spawner-name (`ELANUS_CODE_REPLY_TO`) should move to a capability ref;
+  async `spawn` doesn't forward `--grant-*` yet; the lock is unix-only.

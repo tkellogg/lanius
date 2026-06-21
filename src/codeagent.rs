@@ -187,6 +187,17 @@ Launch tools:
   elanus code claude --worker \"<task>\"   run Claude headless and print its result
   elanus code codex \"<task>\"           launch Codex; the task is positional
 
+Authority-narrowing flags (M4 — strip before tool, enforced at mint):
+  --budget <N>                 turn budget for this session (u64; child ⊆ Σ≤ parent)
+  --grant-publish <filter>     publish filter to grant (repeatable; MQTT wildcard OK)
+  --grant-subscribe <filter>   subscribe filter to grant (repeatable)
+  --grant-fs-write <path>      absolute fs-write prefix to grant (repeatable)
+  --grant-fs-read <path>       absolute fs-read prefix to grant (repeatable)
+  --grant-tool <name>          tool-allowlist entry to grant (repeatable)
+  --grant-blocking <point>     blocking-class entry to grant (repeatable)
+  Absent flags → inherit-equal from spawner (no change from before M4).
+  Mint enforces child ⊆ spawner for capabilities and Σ children ≤ parent for budget.
+
 Commands:
   elanus code deliver <worker-session> \"<message>\"  dispatch work to a worker session
   elanus code spawn <tool> \"<task>\"                  start a worker in the background
@@ -1117,6 +1128,178 @@ fn extract_reasoning_effort_config(config: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Pull M4 grant-narrowing flags out of the user args, validate them, and return
+/// the populated `RequestedGrants` plus the remaining args (which are forwarded
+/// to the tool untouched, just like the other take_*_flag helpers).
+///
+/// Flags recognised (each is an elanus-only flag stripped before the tool sees
+/// argv):
+///
+/// - `--budget <N>`           → `budget: Some(N)` (u64; rejects non-numeric)
+/// - `--grant-publish <filter>`  (repeatable) → `publish`
+/// - `--grant-subscribe <filter>` (repeatable) → `subscribe`
+/// - `--grant-fs-write <path>` (repeatable)  → `fs_write` (absolute, non-empty)
+/// - `--grant-fs-read <path>`  (repeatable)  → `fs_read`  (absolute, non-empty)
+/// - `--grant-tool <name>`    (repeatable)   → `tool_allowlist` (non-empty)
+/// - `--grant-blocking <pt>`  (repeatable)   → `blocking`       (non-empty)
+///
+/// A flag present with no value, or an invalid value, is a hard usage error
+/// (bail! naming the flag and what is wrong). Absent flags leave the
+/// corresponding `RequestedGrants` field as `None` (inherit-equal).
+///
+/// Security note (docs/security.md entry 22 [M3 lesson]): fs path prefixes are
+/// validated absolute + non-empty here, at construction, so an empty/relative
+/// prefix — which would be a silent root-wildcard footgun in `path_covered` —
+/// is rejected before it reaches `mint`.
+fn take_grants_flags(args: &[String]) -> anyhow::Result<(codesession::RequestedGrants, Vec<String>)> {
+    let mut budget: Option<u64> = None;
+    let mut publish: Vec<String> = Vec::new();
+    let mut subscribe: Vec<String> = Vec::new();
+    let mut fs_write: Vec<String> = Vec::new();
+    let mut fs_read: Vec<String> = Vec::new();
+    let mut tool_allowlist: Vec<String> = Vec::new();
+    let mut blocking: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        // Value-taking flags: consume flag + next token, reject if next token is missing.
+        match flag {
+            "--budget" | "--grant-publish" | "--grant-subscribe"
+            | "--grant-fs-write" | "--grant-fs-read"
+            | "--grant-tool" | "--grant-blocking" => {
+                let value = args
+                    .get(i + 1)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                // A bare trailing flag (no value) or a value that itself looks like a
+                // flag is a usage error.
+                if value.is_empty() || value.starts_with("--") {
+                    anyhow::bail!(
+                        "flag `{flag}` requires a value but none was provided"
+                    );
+                }
+                match flag {
+                    "--budget" => {
+                        let n: u64 = value.parse().map_err(|_| {
+                            anyhow::anyhow!(
+                                "--budget requires a non-negative integer, got {:?}",
+                                value
+                            )
+                        })?;
+                        budget = Some(n);
+                    }
+                    "--grant-publish" => {
+                        if !crate::topic::valid_filter(value) {
+                            anyhow::bail!(
+                                "--grant-publish {:?} is not a valid MQTT topic filter \
+                                 (wildcards: + per-level, # only at end)",
+                                value
+                            );
+                        }
+                        publish.push(value.to_string());
+                    }
+                    "--grant-subscribe" => {
+                        if !crate::topic::valid_filter(value) {
+                            anyhow::bail!(
+                                "--grant-subscribe {:?} is not a valid MQTT topic filter",
+                                value
+                            );
+                        }
+                        subscribe.push(value.to_string());
+                    }
+                    "--grant-fs-write" => {
+                        validate_fs_grant_path("--grant-fs-write", value)?;
+                        fs_write.push(value.to_string());
+                    }
+                    "--grant-fs-read" => {
+                        validate_fs_grant_path("--grant-fs-read", value)?;
+                        fs_read.push(value.to_string());
+                    }
+                    "--grant-tool" => {
+                        if value.is_empty() {
+                            anyhow::bail!("--grant-tool requires a non-empty tool name");
+                        }
+                        tool_allowlist.push(value.to_string());
+                    }
+                    "--grant-blocking" => {
+                        if value.is_empty() {
+                            anyhow::bail!("--grant-blocking requires a non-empty blocking-class name");
+                        }
+                        blocking.push(value.to_string());
+                    }
+                    _ => unreachable!(),
+                }
+                i += 2;
+                continue;
+            }
+            _ => {
+                out.push(args[i].clone());
+            }
+        }
+        i += 1;
+    }
+
+    let grants = codesession::RequestedGrants {
+        budget,
+        publish: if publish.is_empty() { None } else { Some(publish) },
+        subscribe: if subscribe.is_empty() { None } else { Some(subscribe) },
+        fs_write: if fs_write.is_empty() { None } else { Some(fs_write) },
+        fs_read: if fs_read.is_empty() { None } else { Some(fs_read) },
+        tool_allowlist: if tool_allowlist.is_empty() { None } else { Some(tool_allowlist) },
+        blocking: if blocking.is_empty() { None } else { Some(blocking) },
+    };
+    Ok((grants, out))
+}
+
+/// Validate a filesystem path supplied to a `--grant-fs-*` flag:
+/// must be non-empty and absolute. An empty or relative prefix is the
+/// root-wildcard footgun `path_covered` caught (security.md entry 22 [M3]).
+fn validate_fs_grant_path(flag: &str, path: &str) -> anyhow::Result<()> {
+    use std::path::{Component, Path};
+    if path.is_empty() {
+        anyhow::bail!("{flag} requires a non-empty path");
+    }
+    // Reject leading/trailing whitespace — almost always a config/split artifact,
+    // and " /x" / "/x " are silently different from the intended prefix.
+    if path != path.trim() {
+        anyhow::bail!("{flag} {path:?} has leading/trailing whitespace");
+    }
+    if !Path::new(path).is_absolute() {
+        anyhow::bail!(
+            "{flag} {:?} must be an absolute path (a relative prefix would be a \
+             root-wildcard footgun; supply an absolute prefix like /home/user/project)",
+            path
+        );
+    }
+    // Deny degenerate absolutes that are lexically root-or-escaping. `is_absolute`
+    // alone admits `/`, `//`, `/.`, `/../..` — each normalizes to (or escapes
+    // toward) the filesystem root, i.e. a near-root grant (the M3 root-wildcard
+    // footgun's cousin). Mirror path_covered's deny-when-degenerate posture: a
+    // grant must name at least one real directory below root and must not contain
+    // `..`. "Unbounded" is expressed by OMITTING the flag (None), never `/`.
+    let mut normal_segments = 0usize;
+    for comp in Path::new(path).components() {
+        match comp {
+            Component::ParentDir => anyhow::bail!(
+                "{flag} {path:?} contains `..` — supply a fully-resolved absolute \
+                 prefix (no parent traversal)"
+            ),
+            Component::Normal(_) => normal_segments += 1,
+            _ => {} // RootDir / CurDir / Prefix
+        }
+    }
+    if normal_segments == 0 {
+        anyhow::bail!(
+            "{flag} {path:?} resolves to the filesystem root — refusing a near-root \
+             grant; name a real directory below root, or omit the flag to inherit \
+             (None = unbounded)"
+        );
+    }
+    Ok(())
+}
+
 /// The Codex briefing block written to the child's stdin. Codex `exec` documents:
 /// "If stdin is piped and a prompt is also provided, stdin is appended as a
 /// `<stdin>` block." So piping the briefing delivers it to the agent robustly,
@@ -1615,8 +1798,12 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
 
     // The launch-envelope briefing rides a launch flag (default on; `--no-brief`
     // suppresses it). The coordination room rides `--room <id>` (M5). Claude's
-    // worker shape rides `--worker`. Strip all before the args reach the tool.
-    let (want_brief, args) = take_brief_flag(args);
+    // worker shape rides `--worker`. M4 grant-narrowing flags (`--budget`,
+    // `--grant-*`) are also elanus-only and stripped before the tool sees argv.
+    // Order matters: pull M4 flags first (they may appear anywhere), then the
+    // others; all return filtered args.
+    let (requested_grants, args) = take_grants_flags(args)?;
+    let (want_brief, args) = take_brief_flag(&args);
     let (room, args) = take_room_flag(&args);
     let (worker, args) = take_worker_flag(&args);
     let args = &args[..];
@@ -1639,12 +1826,15 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     // obs subtree. We record this launcher's pid as the token owner so the reaper
     // can distinguish a live session from a SIGKILL orphan.
     let principal = session.clone();
-    // M1 (authority-delegation): pass the spawner session so mint can enforce
+    // M1/M4 (authority-delegation): pass the spawner session so mint can enforce
     // Σ children ≤ parent.remaining at the fenced-store level (never from env).
     // `parent` is None when the owner runs `elanus code` directly → unbounded.
-    // No explicit budget request here — inherit-equal is the default policy.
+    // M4: pass `requested_grants` from the CLI flags so the owner can deliberately
+    // narrow the child's slice (e.g. `--budget 4` gives the session 4 turns).
+    // When no M4 flags are present, `requested_grants` is `RequestedGrants::default()`
+    // (all None → inherit-equal), preserving the existing behavior exactly.
     let token = codesession::mint(root, &principal, &agent, std::process::id() as i32,
-                                  parent.as_deref(), codesession::RequestedGrants::default())
+                                  parent.as_deref(), requested_grants)
         .with_context(|| format!("minting the session credential for {principal}"))?;
     let bus_token = token.secret.clone();
 
@@ -4585,6 +4775,312 @@ mod tests {
         let (room, rest) = take_room_flag(&["do it".into(), "--room".into()]);
         assert!(room.is_none());
         assert_eq!(rest, vec!["do it".to_string()]);
+    }
+
+    // ── M4: take_grants_flags unit tests ─────────────────────────────────────
+
+    fn s(v: &str) -> String { v.to_string() }
+    fn sv(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn take_grants_flags_absent_gives_default() {
+        // No M4 flags → RequestedGrants::default() and args unchanged.
+        let (grants, rest) = take_grants_flags(&sv(&["claude", "fix it"])).unwrap();
+        assert!(grants.budget.is_none());
+        assert!(grants.publish.is_none());
+        assert!(grants.subscribe.is_none());
+        assert!(grants.fs_write.is_none());
+        assert!(grants.fs_read.is_none());
+        assert!(grants.tool_allowlist.is_none());
+        assert!(grants.blocking.is_none());
+        assert_eq!(rest, sv(&["claude", "fix it"]));
+    }
+
+    #[test]
+    fn take_grants_flags_budget_parsed() {
+        let (grants, rest) = take_grants_flags(&sv(&["--budget", "42", "do it"])).unwrap();
+        assert_eq!(grants.budget, Some(42));
+        assert_eq!(rest, sv(&["do it"]));
+    }
+
+    #[test]
+    fn take_grants_flags_budget_zero_ok() {
+        let (grants, _) = take_grants_flags(&sv(&["--budget", "0"])).unwrap();
+        assert_eq!(grants.budget, Some(0));
+    }
+
+    #[test]
+    fn take_grants_flags_budget_non_numeric_errors() {
+        let err = take_grants_flags(&sv(&["--budget", "abc"])).unwrap_err();
+        assert!(err.to_string().contains("--budget"), "msg: {err}");
+    }
+
+    #[test]
+    fn take_grants_flags_budget_missing_value_errors() {
+        let err = take_grants_flags(&sv(&["--budget"])).unwrap_err();
+        assert!(err.to_string().contains("--budget"), "msg: {err}");
+    }
+
+    #[test]
+    fn take_grants_flags_publish_accumulates() {
+        let (grants, rest) = take_grants_flags(
+            &sv(&["--grant-publish", "obs/#", "--grant-publish", "work/+/status", "go"])
+        ).unwrap();
+        assert_eq!(grants.publish, Some(vec![s("obs/#"), s("work/+/status")]));
+        assert_eq!(rest, sv(&["go"]));
+    }
+
+    #[test]
+    fn take_grants_flags_subscribe_accumulates() {
+        let (grants, _) = take_grants_flags(
+            &sv(&["--grant-subscribe", "in/agent/#", "--grant-subscribe", "obs/agent/+/code-abc/#"])
+        ).unwrap();
+        assert_eq!(grants.subscribe, Some(vec![s("in/agent/#"), s("obs/agent/+/code-abc/#")]));
+    }
+
+    #[test]
+    fn take_grants_flags_publish_invalid_filter_errors() {
+        // "#" in the middle of a filter is invalid.
+        let err = take_grants_flags(&sv(&["--grant-publish", "obs/#/bad"])).unwrap_err();
+        assert!(err.to_string().contains("--grant-publish"), "msg: {err}");
+    }
+
+    #[test]
+    fn take_grants_flags_subscribe_invalid_filter_errors() {
+        let err = take_grants_flags(&sv(&["--grant-subscribe", "##"])).unwrap_err();
+        assert!(err.to_string().contains("--grant-subscribe"), "msg: {err}");
+    }
+
+    #[test]
+    fn take_grants_flags_fs_write_absolute_ok() {
+        let (grants, rest) = take_grants_flags(
+            &sv(&["--grant-fs-write", "/home/user/proj", "extra"])
+        ).unwrap();
+        assert_eq!(grants.fs_write, Some(vec![s("/home/user/proj")]));
+        assert_eq!(rest, sv(&["extra"]));
+    }
+
+    #[test]
+    fn take_grants_flags_fs_write_accumulates() {
+        let (grants, _) = take_grants_flags(
+            &sv(&["--grant-fs-write", "/a", "--grant-fs-write", "/b"])
+        ).unwrap();
+        assert_eq!(grants.fs_write, Some(vec![s("/a"), s("/b")]));
+    }
+
+    #[test]
+    fn take_grants_flags_fs_write_relative_errors() {
+        // Security: a relative path is a root-wildcard footgun — reject at construction.
+        let err = take_grants_flags(&sv(&["--grant-fs-write", "relative/path"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--grant-fs-write"), "msg: {msg}");
+        assert!(msg.contains("absolute"), "msg: {msg}");
+    }
+
+    #[test]
+    fn take_grants_flags_fs_read_relative_errors() {
+        let err = take_grants_flags(&sv(&["--grant-fs-read", "relative/p"])).unwrap_err();
+        assert!(err.to_string().contains("absolute"), "msg: {err}");
+    }
+
+    #[test]
+    fn take_grants_flags_fs_write_empty_errors() {
+        // An empty path would also be the root-wildcard footgun (path_covered rejects it).
+        // In practice the shell won't pass an empty arg, but validate anyway.
+        // A flag whose next token looks like another flag triggers the "no value" error.
+        let err = take_grants_flags(&sv(&["--grant-fs-write", "--grant-fs-read", "/ok"])).unwrap_err();
+        assert!(err.to_string().contains("--grant-fs-write"), "msg: {err}");
+    }
+
+    #[test]
+    fn take_grants_flags_fs_write_degenerate_absolute_errors() {
+        // is_absolute() alone admits near-root grants — reject them at construction
+        // (defense-in-depth, mirroring path_covered's deny-when-degenerate posture).
+        for bad in ["/", "//", "/.", "/../..", "/a/..", "/a/.."] {
+            let err = take_grants_flags(&sv(&["--grant-fs-write", bad])).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("root") || msg.contains(".."),
+                "expected a degenerate-path rejection for {bad:?}, got: {msg}"
+            );
+        }
+        // Leading/trailing whitespace is rejected too.
+        let err = take_grants_flags(&sv(&["--grant-fs-write", "/abs "])).unwrap_err();
+        assert!(err.to_string().contains("whitespace"), "msg: {err}");
+        // A real directory below root is accepted.
+        let (g, _) = take_grants_flags(&sv(&["--grant-fs-write", "/home/u/proj"])).unwrap();
+        assert_eq!(g.fs_write, Some(vec!["/home/u/proj".to_string()]));
+    }
+
+    #[test]
+    fn take_grants_flags_fs_read_accumulates() {
+        let (grants, _) = take_grants_flags(
+            &sv(&["--grant-fs-read", "/read/a", "--grant-fs-read", "/read/b"])
+        ).unwrap();
+        assert_eq!(grants.fs_read, Some(vec![s("/read/a"), s("/read/b")]));
+    }
+
+    #[test]
+    fn take_grants_flags_tool_allowlist_accumulates() {
+        let (grants, rest) = take_grants_flags(
+            &sv(&["--grant-tool", "bash", "--grant-tool", "read_file", "arg"])
+        ).unwrap();
+        assert_eq!(grants.tool_allowlist, Some(vec![s("bash"), s("read_file")]));
+        assert_eq!(rest, sv(&["arg"]));
+    }
+
+    #[test]
+    fn take_grants_flags_blocking_accumulates() {
+        let (grants, _) = take_grants_flags(
+            &sv(&["--grant-blocking", "disk-io", "--grant-blocking", "network"])
+        ).unwrap();
+        assert_eq!(grants.blocking, Some(vec![s("disk-io"), s("network")]));
+    }
+
+    #[test]
+    fn take_grants_flags_remaining_args_preserved_in_order() {
+        // Non-M4 args pass through untouched and in original order.
+        let args = sv(&["--budget", "5", "claude", "--model", "opus", "--grant-publish", "obs/#", "task"]);
+        let (grants, rest) = take_grants_flags(&args).unwrap();
+        assert_eq!(grants.budget, Some(5));
+        assert_eq!(grants.publish, Some(vec![s("obs/#")]));
+        assert_eq!(rest, sv(&["claude", "--model", "opus", "task"]));
+    }
+
+    #[test]
+    fn take_grants_flags_all_fields_together() {
+        let args = sv(&[
+            "--budget", "10",
+            "--grant-publish", "obs/#",
+            "--grant-subscribe", "in/agent/#",
+            "--grant-fs-write", "/tmp/work",
+            "--grant-fs-read", "/src",
+            "--grant-tool", "grep",
+            "--grant-blocking", "shell",
+            "the-task",
+        ]);
+        let (grants, rest) = take_grants_flags(&args).unwrap();
+        assert_eq!(grants.budget, Some(10));
+        assert_eq!(grants.publish, Some(vec![s("obs/#")]));
+        assert_eq!(grants.subscribe, Some(vec![s("in/agent/#")]));
+        assert_eq!(grants.fs_write, Some(vec![s("/tmp/work")]));
+        assert_eq!(grants.fs_read, Some(vec![s("/src")]));
+        assert_eq!(grants.tool_allowlist, Some(vec![s("grep")]));
+        assert_eq!(grants.blocking, Some(vec![s("shell")]));
+        assert_eq!(rest, sv(&["the-task"]));
+    }
+
+    // ── M4: end-to-end mint-layer acceptance tests ───────────────────────────
+
+    #[test]
+    fn m4_owner_budget_sets_remaining() {
+        // An owner-launched session minted with --budget 4 has remaining = 4.
+        let root = m3_tmp_root();
+        let pid = std::process::id() as i32;
+        let tok = codesession::mint(
+            &root, "code-m4owner1", "claude-code", pid, None,
+            codesession::RequestedGrants { budget: Some(4), ..Default::default() }
+        ).unwrap();
+        assert_eq!(tok.grants.turn_budget, Some(4));
+        assert_eq!(tok.grants.remaining_budget, Some(4));
+    }
+
+    #[test]
+    fn m4_child_budget_exceeds_parent_is_refused() {
+        // A child requesting budget 10 from a parent with budget 4 is refused.
+        let root = m3_tmp_root();
+        let pid = std::process::id() as i32;
+        codesession::mint(
+            &root, "code-m4par2", "claude-code", pid, None,
+            codesession::RequestedGrants { budget: Some(4), ..Default::default() }
+        ).unwrap();
+        let err = codesession::mint(
+            &root, "code-m4child2", "claude-code", pid,
+            Some("code-m4par2"),
+            codesession::RequestedGrants { budget: Some(10), ..Default::default() }
+        ).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("budget") || msg.contains("remaining") || msg.contains("exceed"),
+            "expected budget-exceeded error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn m4_child_fs_write_outside_parent_refused() {
+        // A child requesting an fs_write outside the owner's grant is refused.
+        let root = m3_tmp_root();
+        let pid = std::process::id() as i32;
+        // Owner has fs_write limited to /tmp/work.
+        codesession::mint(
+            &root, "code-m4fspar", "claude-code", pid, None,
+            codesession::RequestedGrants {
+                fs_write: Some(vec!["/tmp/work".to_string()]),
+                ..Default::default()
+            }
+        ).unwrap();
+        // Child tries to widen to /tmp (a broader prefix that would cover /tmp/work
+        // and more) — refused because /tmp is not covered by /tmp/work.
+        let err = codesession::mint(
+            &root, "code-m4fschild", "claude-code", pid,
+            Some("code-m4fspar"),
+            codesession::RequestedGrants {
+                fs_write: Some(vec!["/tmp".to_string()]),
+                ..Default::default()
+            }
+        ).unwrap_err();
+        assert!(
+            err.to_string().contains("fs_write") || err.to_string().contains("not covered"),
+            "expected fs_write widening error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn m4_child_publish_outside_parent_refused() {
+        // A child requesting a publish filter not covered by the parent is refused.
+        let root = m3_tmp_root();
+        let pid = std::process::id() as i32;
+        // Owner minted without explicit publish → unbounded (None).
+        // Then that session spawns with publish limited to obs/agent/claude-code/code-m4pubpar/#.
+        // Owner mint → publish defaults to the parent's own structural subtree.
+        let own_pub = "obs/agent/claude-code/code-m4pubpar/#".to_string();
+        codesession::mint(
+            &root, "code-m4pubpar", "claude-code", pid, None,
+            codesession::RequestedGrants { ..Default::default() }
+        ).unwrap();
+        // Setup (asserted unconditionally so the refusal check below can never be
+        // skipped vacuously): a child requesting exactly the spawner's own publish
+        // filter is covered by the spawner → granted.
+        let child_ok = codesession::mint(
+            &root, "code-m4pubchok", "claude-code", pid,
+            Some("code-m4pubpar"),
+            codesession::RequestedGrants {
+                publish: Some(vec![own_pub.clone()]),
+                ..Default::default()
+            }
+        );
+        assert!(
+            child_ok.is_ok(),
+            "setup: a child requesting the spawner's own publish filter must be granted: {child_ok:?}"
+        );
+        // The real check: a child requesting obs/# (wider than the parent's narrow
+        // scope, and not its own subtree) must be REFUSED.
+        let err = codesession::mint(
+            &root, "code-m4pubchfail", "claude-code", pid,
+            Some("code-m4pubpar"),
+            codesession::RequestedGrants {
+                publish: Some(vec!["obs/#".to_string()]),
+                ..Default::default()
+            }
+        );
+        assert!(
+            err.is_err(),
+            "child requesting obs/# from a narrowly-scoped parent must be refused"
+        );
+        // And take_grants_flags parsed the wide filter without itself bounding it
+        // (well-formedness only; mint does the bounding).
+        let (grants, _) = take_grants_flags(&sv(&["--grant-publish", "obs/#"])).unwrap();
+        assert_eq!(grants.publish, Some(vec!["obs/#".to_string()]));
     }
 
     /// Record a session WITH a room, and join it, so turn_injection can derive the
