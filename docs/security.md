@@ -561,3 +561,45 @@ crash-recovery (`reconcile_recovers_a_route_lost_in_the_settle_route_gap`,
 `reconcile_skips_deliveries_with_no_requester`). RESIDUAL: none for these; the session
 token authority is unchanged (the daemon still routes with its own authority, just to
 a constrained, validated destination).
+
+## 22. [DOCTRINE + LATENT, 2026-06-20] Delegated authority is not bounded by the spawner
+
+The recurring class in this file is "an actor ends up with more authority than its
+position warrants" — entry 20 (a session credential was owner-equivalent), entry 16
+(an exec handler emits as the owner), entries 13/21 (confused deputies borrow a
+higher surface's standing). Underneath them is one missing rule, now stated as
+doctrine: **a spawned actor's authority must be a strict subset (≤) of its
+spawner's, reconstructed at spawn and enforced at mint** — `child.grants ⊆
+parent.grants`, monotone down the spawn chain (Tim, 2026-06-20; design in
+docs/handoffs/authority-delegation.md, doctrine in docs/identity.md "Delegation").
+
+Why DOCTRINE: it is the line to hold — no spawn may widen authority, ever. Why also
+LATENT: the invariant is **not yet enforced**, and one half of the mechanism is
+already right while the other is missing:
+
+- **Right today.** The worker-spawn path re-mints rather than inherits:
+  `scrub_spawn_wrapper_identity_env` strips the parent's `ELANUS_PACKAGE`/
+  `ELANUS_BUS_TOKEN`/`ELANUS_CODE_SESSION` and the wrapper mints a fresh scoped
+  token (entry 20). A tool the session shells (e.g. `elanus bus pub`) *correctly*
+  inherits the session's own identity (the trivial subset — it is the same actor
+  using a tool). And one capability dimension is already subset-enforced:
+  `lease ⊆ grant` for filesystem writes (docs/sandbox.md).
+- **Missing today.** The minted child scope is a **flat per-kind constant** (entry
+  20's structural `obs/agent/<agent>/<session>/#`), **independent of the spawner** —
+  a worker spawned by a tightly-scoped agent gets the same bus scope as one spawned
+  by the owner. There is **no enforced `child ⊆ parent` check** at mint, **no
+  unified `Grants` value** that gets subsetted (authority is scattered: bus ACL in
+  the broker, fs as `lease ⊆ grant`, cost as a profile `max_turns`), and **no
+  fungible budget dimension** (`Σ children ≤ parent` for turns/cost/fan-out — the
+  RLM "halve it to pass context down" case).
+
+Not a confirmed exploit on its own (every code-session is already bounded to its own
+obs subtree by entry 20, and re-minted not inherited) — it is the *absence of the
+bounding relation* that would let a future, broader-grant spawner hand a child
+authority it should not, and the absence of the monotone guarantee that makes the
+whole cage reason-about-able ("no descendant exceeds any ancestor"). The fix is the
+delegation handoff: a `Grants` value, `narrow(parent, request)` with `⊆`/`Σ≤`
+asserted at mint (the same decidable check sandbox.md demands of `lease ⊆ grant`),
+the broker/sandbox enforcing each dimension at runtime. Build the budget dimension
+first (fungible, zero behavior change, ships the assert skeleton), then the
+capability subsets. Cite this entry in that work.

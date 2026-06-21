@@ -248,6 +248,49 @@ the security lives in where the root credential sits and what the
 high-stakes actions additionally require, not in which storage slot the
 delegated token rides in.
 
+## Delegation: authority is a subset of the spawner
+
+Identity above settles *who you are*. It does not, by itself, settle *what you
+may do relative to who started you* — and that is a second rule, just as load-
+bearing. Stated plainly (Tim, 2026-06-20):
+
+**A thing the kernel launches gets authority that is a strict subset (≤) of
+whoever launched it — reconstructed and re-authenticated by the harness at spawn,
+never blindly inherited.** `child.grants ⊆ parent.grants`, asserted at mint, so no
+descendant can out-authorize an ancestor. Authority narrows *monotonically* down a
+spawn chain.
+
+This completes the launcher-vouched idea (point 1 above). The launcher already
+vouches for *who* a child is — it minted the child's secret, so it knows. The same
+launcher is therefore the right place to bound *what* the child may do: it can only
+hand down authority it holds, and it hands down a slice ≤ its own. "On behalf of"
+is the human→surface case of this; spawn delegation is the general case.
+
+Two flavors, and the distinction matters:
+
+- **Capability dimensions are subsetted.** Bus topic patterns, fs roots, tool
+  allowlist: the child gets a subset; siblings may overlap. This is exactly the
+  `lease ⊆ grant` rule docs/sandbox.md already enforces for filesystem writes —
+  generalized to every dimension and across the spawn boundary, using the same
+  "decidable, boring function" (canonicalized prefixes, not glob soup).
+- **Budget dimensions are partitioned.** Turn/cost budget, wall-clock, spawn
+  fan-out: the child gets an allocation carved from the parent's *remaining*, and
+  siblings partition it (`Σ children ≤ parent`). Cutting a child's budget to a half
+  or a quarter as a way of passing context down (an RLM-style sub-call) is this
+  flavor — divisible authority split at a spawn, not a subset.
+
+The everyday default may be *equal* — a sibling session the human spawns directly
+often gets the human's own broad slice, which is the equal case of `⊆`. That is
+fine. The invariant is `⊆`, not equality, and the moment one actor spawns another,
+the subset rule (not "they're peers") is what holds. This is the reconciliation of
+the "homogeneous authority among the user's own agents" language in the coding-agent
+handoffs: homogeneous is the *default equal case*, not a competing model — see
+docs/security.md entry 22 and docs/handoffs/authority-delegation.md for the contract
+and its (not-yet-built) enforcement. Today the mechanism is half-present: a spawned
+worker is re-minted rather than inherited (the launch wrapper scrubs the parent's
+token), but the minted scope is a flat per-kind constant (entry 20's structural
+code-session scope), not yet a function of — or bounded by — the spawner's grants.
+
 ## Why this also settles the agent-versus-package question
 
 Once the broker stamps a verified sender on every change, the question that

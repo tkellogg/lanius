@@ -53,3 +53,12 @@ context for the pass currently in flight.
   surface. The nav-split counterpart to
   [coding-agent-observability.md](coding-agent-observability.md). Backed by
   [../journeys/07-chatting.md](../journeys/07-chatting.md).
+- [authority-delegation.md](authority-delegation.md) - the **delegation** half of
+  the identity model: a spawned actor's authority must be a strict subset (≤) of
+  its spawner's, reconstructed at spawn and enforced at mint (`child.grants ⊆
+  parent.grants`, monotone down the chain), with two flavors — capability subsets
+  (`lease ⊆ grant` generalized) and partitioned budgets (`Σ children ≤ parent`, the
+  RLM "halve it to pass context down" case). Closes the doctrine on the
+  "more-authority-than-warranted" class (security.md entries 13/16/20/21). Backed by
+  [../identity.md](../identity.md) ("Delegation") and
+  [../security.md](../security.md) entry 22.
