@@ -640,6 +640,25 @@ pub const PREFIX: &str = "code-";
 
 /// One minted session token plus the structural scope the broker enforces for
 /// it. Stored as JSON at `<root>/.secrets/code-sessions/<session>.json`.
+///
+/// ## Budget dimension (M1 — docs/handoffs/authority-delegation.md)
+///
+/// `turn_budget` is the fungible authority dimension: how many turns (model
+/// calls) this session may consume in total. `None` = unbounded (the owner
+/// path, and the common case for directly-launched sessions). A spawned
+/// child's budget is carved from its spawner's remaining budget — `Σ children
+/// ≤ parent.remaining` is asserted at mint (docs/security.md entry 22).
+///
+/// `remaining_budget` is the runtime balance: starts equal to `turn_budget`
+/// and decremented each time a child is minted from this session as spawner.
+/// The entire read→classify→decrement→write-back critical section is
+/// serialized by an exclusive `flock(LOCK_EX)` on `<store>/budget.lock`
+/// whenever the spawner token file exists on disk. The classification (bounded
+/// vs. unbounded) happens INSIDE the lock — never from a pre-lock parse that
+/// could observe a torn file. An unreadable/corrupt spawner token inside the
+/// lock is refused (fail-closed), not treated as unbounded. Token writes use
+/// atomic rename(2) so concurrent readers never observe a partial/empty file.
+/// Missing in older tokens → deserializes as `None` (unbounded, backward-compatible).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionToken {
     /// The session principal, e.g. `code-2af51b7e`. Equals the file stem.
@@ -658,6 +677,18 @@ pub struct SessionToken {
     /// session needs to *emit* its record, not read the bus, so it gets no read
     /// authority at all (M2's inbox is a later, explicitly-granted capability).
     pub subscribe: Vec<String>,
+    /// Total turn budget granted to this session. `None` = unbounded (the
+    /// owner-spawned / common case). Set at mint; decremented into
+    /// `remaining_budget` as children are allocated (M1). Absent in tokens
+    /// written before M1 → deserializes as `None`.
+    #[serde(default)]
+    pub turn_budget: Option<u64>,
+    /// Remaining turns this session may still allocate to children. Starts
+    /// equal to `turn_budget`; the spawner's persisted token is rewritten
+    /// (remaining decremented) each time a child is minted. `None` = unbounded
+    /// (no cap). Absent in tokens written before M1 → deserializes as `None`.
+    #[serde(default)]
+    pub remaining_budget: Option<u64>,
 }
 
 impl SessionToken {
@@ -689,12 +720,112 @@ fn token_path(root: &Root, principal: &str) -> PathBuf {
     store_dir(root).join(format!("{principal}.json"))
 }
 
+/// Path of the cross-process advisory lock file for the budget critical section.
+fn budget_lock_path(root: &Root) -> PathBuf {
+    store_dir(root).join("budget.lock")
+}
+
+/// RAII guard that holds an exclusive `flock(LOCK_EX)` on the budget lock file.
+///
+/// Acquiring: `BudgetLock::acquire(root)` opens (or creates) the lock file and
+/// calls `flock(LOCK_EX)`, blocking until the lock is available. Because `flock`
+/// is scoped to the open-file-description (not the fd number), a new open per
+/// acquisition correctly serializes both:
+/// - Separate OS processes that each call `mint()` in parallel (the fan-out case).
+/// - Separate threads within one process that each open their own fd.
+///
+/// Releasing: `drop(BudgetLock)` calls `flock(LOCK_UN)` then closes the file.
+/// The file itself is never removed — it is a stable sentinel; its presence is
+/// harmless and removing it would race with concurrent acquirers.
+#[cfg(unix)]
+struct BudgetLock {
+    fd: std::os::unix::io::RawFd,
+}
+
+#[cfg(unix)]
+impl BudgetLock {
+    fn acquire(root: &Root) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = budget_lock_path(root);
+        // create_dir_all is idempotent; the store dir may already exist.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false) // lock file: content is irrelevant, do not truncate
+            .mode(0o600)
+            .open(&path)?;
+        let fd = std::os::unix::io::IntoRawFd::into_raw_fd(file);
+        // LOCK_EX | LOCK_NB would be non-blocking; we want blocking (LOCK_EX only).
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        Ok(BudgetLock { fd })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BudgetLock {
+    fn drop(&mut self) {
+        // flock(LOCK_UN) releases the lock; close() releases the fd. Both are
+        // best-effort in a destructor — errors here cannot be surfaced.
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+            libc::close(self.fd);
+        }
+    }
+}
+
 /// Mint a grant-scoped session token for `principal` publishing `agent`
-/// telemetry. Writes the 0600 token file inside the fenced store and returns the
-/// token (the launcher hands `.secret` to the child as ELANUS_BUS_TOKEN). The
-/// scope is structural: publish only `obs/agent/<agent>/<session>/#`, subscribe
-/// nothing.
-pub fn mint(root: &Root, principal: &str, agent: &str, owner_pid: i32) -> Result<SessionToken> {
+/// telemetry. Writes the 0600 token file inside the fenced store and returns
+/// the token (the launcher hands `.secret` to the child as ELANUS_BUS_TOKEN).
+/// The scope is structural: publish only `obs/agent/<agent>/<session>/#`,
+/// subscribe nothing.
+///
+/// ## Budget dimension (M1 — docs/handoffs/authority-delegation.md, security.md entry 22)
+///
+/// `spawner` is the session that is minting this child (read from the fenced
+/// token store — **never** from an inherited env variable, which is the
+/// authority the doctrine forbids reconstructing from). Pass `None` when the
+/// spawner is the owner (no session token exists → unbounded) or when the
+/// spawning context is already the top of the chain.
+///
+/// `requested_budget` is how many turns the child requests. `None` = inherit
+/// the spawner's full remaining (the **inherit-equal** default — narrowing
+/// only happens on an explicit request). Explicit values must be ≤ the
+/// spawner's remaining; if they would over-allocate, `mint` returns an error
+/// and the spawn is refused — the same decidable, boring check sandbox.md
+/// demands of `lease ⊆ grant`.
+///
+/// The invariant enforced here: **Σ children ≤ parent.remaining** (budget is
+/// fungible — siblings partition, not share, the parent's allocation). When
+/// the spawner token file exists on disk, `mint` always acquires an exclusive
+/// `flock(LOCK_EX)` on `<store>/budget.lock` before reading the spawner token,
+/// classifying it (bounded vs. unbounded), and writing back the decremented
+/// value. The boundary signal is the FILE'S EXISTENCE, not a parse result —
+/// this prevents a torn read (empty/partial file during a concurrent write)
+/// from being misclassified as "no token → unbounded". Token writes use atomic
+/// `rename(2)` so readers always see a complete file, eliminating the
+/// truncate→write window. An unreadable spawner token inside the lock is
+/// refused (fail-closed), never treated as unlimited authority.
+///
+/// Owner path (spawner = `None`) and absent-file path (pre-M1 tokens, or no
+/// spawner session): the budget check is vacuously satisfied. The lock is NOT
+/// acquired on these paths — they remain zero-overhead and zero-behavior-change
+/// for all existing call sites.
+pub fn mint(
+    root: &Root,
+    principal: &str,
+    agent: &str,
+    owner_pid: i32,
+    spawner: Option<&str>,
+    requested_budget: Option<u64>,
+) -> Result<SessionToken> {
     if !is_session_principal(principal) {
         bail!("session principal {principal:?} is not a valid code-* identity name");
     }
@@ -707,6 +838,141 @@ pub fn mint(root: &Root, principal: &str, agent: &str, owner_pid: i32) -> Result
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
+
+    // ── Budget invariant: Σ children ≤ parent.remaining ─────────────────────
+    //
+    // Read the spawner's token from the fenced store (the authoritative source).
+    // NEVER read from the environment — the doctrine (security.md entry 22) is
+    // explicit: authority is reconstructed at spawn from the persisted record,
+    // not blindly inherited. If the spawner has no token (owner path, or a
+    // context that predates M1), its budget is unbounded and the check passes
+    // vacuously.
+    //
+    // CROSS-PROCESS SERIALIZATION: whenever the spawner token file EXISTS on
+    // disk, the entire read→check→decrement→write-back is serialized by an
+    // exclusive advisory flock on `<store>/budget.lock`. Spawned workers are
+    // detached OS processes (codeagent::launch calls cmd.spawn() without wait),
+    // so a parent fanning out N children runs N parallel mint() calls — without
+    // the lock, two siblings would both read the same parent_remaining, both
+    // pass the per-child check, and Σ would silently exceed the parent.
+    //
+    // FAIL-CLOSED CLASSIFICATION: the decision of whether to take the lock-free
+    // path is made by checking whether the spawner token FILE EXISTS on disk
+    // (a stable POSIX signal), NOT by attempting to parse the file (which could
+    // return None on a torn read and be misclassified as "unbounded"). If the
+    // file exists but is unparseable inside the lock, the spawn is REFUSED —
+    // a corrupt or half-written spawner token must never be treated as unlimited
+    // authority.
+    //
+    // ATOMIC WRITES: write_0600 uses rename(2) so readers always see a complete
+    // token, eliminating the truncate→write torn-read window that previously
+    // existed. The exists-check and the locked read are belt-and-suspenders:
+    // either fix alone closes the race; both together make it impossible.
+    //
+    // The lock-free fast paths:
+    //   - spawner=None (owner/top-of-chain): no spawner file to check at all.
+    //   - spawner file genuinely ABSENT (token predates M1, or owner context):
+    //     unbounded → no lock needed. This preserves zero-overhead / zero-
+    //     behavior-change for all existing call sites.
+    //
+    // NOTE: ELANUS_CODE_REPLY_TO is used in codeagent.rs to choose which spawner
+    // token to charge. Pinning the spawner-name via a capability reference rather
+    // than an env variable is a known follow-up (M2+). // TODO M2: replace env-key
+    // spawner lookup with a capability-reference in the minted child token.
+    let child_budget: Option<u64> = if let Some(spawner_name) = spawner {
+        let spawner_token_path = token_path(root, spawner_name);
+        // Use the file's EXISTENCE as the branch signal — a stable, atomic
+        // POSIX observation that cannot be confused by a concurrent torn write.
+        // try_exists() returns false if the path is absent, true if present,
+        // and an error only on permission failures (treated as exists=true, so
+        // we take the locked path and fail-closed inside).
+        let file_exists = spawner_token_path.try_exists().unwrap_or(true);
+        if !file_exists {
+            // Spawner token file is genuinely absent (owner context or pre-M1
+            // session): treat as unbounded. No lock needed; no token to parse.
+            requested_budget
+        } else {
+            // Spawner token file EXISTS → we MUST take the budget lock before
+            // reading, classifying, and writing back. This is required even if
+            // the token turns out to have remaining_budget=None (unbounded)
+            // because we cannot safely determine that without a lock-guarded
+            // parse. The locked path covers all three cases:
+            //   • parsed + remaining_budget=None  → unbounded, no decrement.
+            //   • parsed + remaining_budget=Some  → finite, Σ-check + decrement.
+            //   • unparseable                     → FAIL CLOSED, spawn refused.
+            #[cfg(unix)]
+            let _lock = BudgetLock::acquire(root)
+                .map_err(|e| anyhow::anyhow!("budget lock acquire failed: {e}"))?;
+
+            // Authoritative read under the lock. write_0600's atomic rename
+            // means this always sees a complete file; we still fail-closed on
+            // any parse error as an independent safety layer.
+            let spawner_tok = read(root, spawner_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "budget spawn refused: spawner token {spawner_name:?} exists on disk \
+                     but could not be parsed — treating as corrupt rather than unbounded \
+                     (fail-closed: docs/security.md entry 22)"
+                )
+            })?;
+
+            match spawner_tok.remaining_budget {
+                None => {
+                    // Token is present and parseable but has no budget cap
+                    // (e.g. a pre-M1 token that happened to exist, or an
+                    // owner-path token written with remaining_budget=None).
+                    // Treat as unbounded — no decrement needed.
+                    requested_budget
+                }
+                Some(parent_remaining) => {
+                    // Spawner has a finite remaining budget. The child gets at
+                    // most what was requested (or the full remaining if
+                    // inherit-equal).
+                    let child_alloc = requested_budget.unwrap_or(parent_remaining);
+                    if child_alloc > parent_remaining {
+                        bail!(
+                            "budget allocation refused: child requested {child_alloc} turns but \
+                             spawner {spawner_name:?} only has {parent_remaining} remaining \
+                             (Σ children ≤ parent.remaining — docs/security.md entry 22)"
+                        );
+                    }
+                    // Decrement the spawner's remaining budget and persist it
+                    // BEFORE the lock is released and BEFORE the child token is
+                    // written. Fail-closed: a failed write-back aborts the entire
+                    // mint — authority is never granted without a durable charge.
+                    // Crash between write-back and child write: the parent's budget
+                    // is consumed without a child being granted — fail-safe toward
+                    // conservation, never toward over-grant.
+                    let mut tok = spawner_tok;
+                    tok.remaining_budget = Some(parent_remaining.saturating_sub(child_alloc));
+                    let json = serde_json::to_string(&tok).map_err(|e| {
+                        anyhow::anyhow!(
+                            "budget write-back serialization failed for spawner \
+                             {spawner_name:?}: {e}"
+                        )
+                    })?;
+                    write_0600(&token_path(root, spawner_name), &json).map_err(|e| {
+                        anyhow::anyhow!(
+                            "budget write-back failed for spawner {spawner_name:?}: {e} \
+                             — mint refused (fail-closed: authority not granted without \
+                             durable charge)"
+                        )
+                    })?;
+                    // The lock (_lock) is still held here; it is released when
+                    // child_budget falls out of the if-let block (Drop runs before
+                    // the child token write below, which is intentional: the child
+                    // write does not need the lock, and releasing earlier reduces
+                    // contention).
+                    Some(child_alloc)
+                }
+            }
+        }
+    } else {
+        // Owner (no spawner session): unbounded or explicitly capped by the
+        // caller. requested_budget is honoured directly; None = unbounded.
+        // No lock acquired on this path.
+        requested_budget
+    };
+
     let secret = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
@@ -727,6 +993,8 @@ pub fn mint(root: &Root, principal: &str, agent: &str, owner_pid: i32) -> Result
         owner_pid,
         publish: vec![own_obs],
         subscribe: Vec::new(),
+        turn_budget: child_budget,
+        remaining_budget: child_budget,
     };
     write_0600(&token_path(root, principal), &serde_json::to_string(&token)?)?;
     Ok(token)
@@ -805,14 +1073,52 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 fn write_0600(path: &Path, contents: &str) -> std::io::Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    // ATOMIC WRITE: write to a sibling temp file, set 0600, then rename into
+    // place. On POSIX, rename(2) within a single filesystem is atomic — a
+    // concurrent reader sees either the old complete file or the new complete
+    // file, never a truncated/empty intermediate. This eliminates the torn-read
+    // window that previously existed when truncate(true) zeroed the file before
+    // write_all completed.
+    //
+    // Temp name: `<path>.tmp.<pid>.<counter>` — unique across processes and
+    // across concurrent calls within the same process (the counter is per-
+    // process and monotonically increasing).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "write_0600: path has no parent")
+    })?;
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(
+        "{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("token"),
+        std::process::id(),
+        seq,
+    );
+    let tmp_path = parent.join(&tmp_name);
+
+    // Write to the temp file, then atomically rename into place. On error at
+    // any step, attempt to remove the temp file so we do not litter.
+    let result = (|| -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&tmp_path)?.write_all(contents.as_bytes())?;
+        std::fs::rename(&tmp_path, path)
+    })();
+
+    if result.is_err() {
+        // Best-effort cleanup; ignore secondary errors.
+        let _ = std::fs::remove_file(&tmp_path);
     }
-    opts.open(path)?.write_all(contents.as_bytes())
+    result
 }
 
 #[cfg(test)]
@@ -845,7 +1151,7 @@ mod tests {
     #[test]
     fn mint_scope_is_only_the_own_obs_subtree() {
         let root = tmp_root();
-        let tok = mint(&root, "code-deadbeef", "claude-code", 999_999).unwrap();
+        let tok = mint(&root, "code-deadbeef", "claude-code", 999_999, None, None).unwrap();
         // Publishes its own obs subtree …
         assert!(tok.may_publish("obs/agent/claude-code/code-deadbeef/session/start"));
         assert!(tok.may_publish("obs/agent/claude-code/code-deadbeef/tool/Bash/call"));
@@ -865,7 +1171,7 @@ mod tests {
     #[test]
     fn roundtrip_and_retire() {
         let root = tmp_root();
-        let minted = mint(&root, "code-cafef00d", "claude-code", 1234).unwrap();
+        let minted = mint(&root, "code-cafef00d", "claude-code", 1234, None, None).unwrap();
         let read_back = read(&root, "code-cafef00d").unwrap();
         assert_eq!(read_back.secret, minted.secret);
         assert_eq!(read_back.agent, "claude-code");
@@ -902,12 +1208,14 @@ mod tests {
         // a token owned by a definitely-dead pid (pid 1 exists but we use a high
         // unlikely-live pid for the dead case; current pid for the live case)
         let dead_pid = 0x7fff_fffe; // not a live pid on any sane system
-        mint(&root, "code-deadbeef", "claude-code", dead_pid).unwrap();
+        mint(&root, "code-deadbeef", "claude-code", dead_pid, None, None).unwrap();
         let live = mint(
             &root,
             "code-livesess",
             "claude-code",
             std::process::id() as i32,
+            None,
+            None,
         )
         .unwrap();
         let reaped = reap_orphans(&root);
@@ -1039,7 +1347,7 @@ mod tests {
         assert!(read(&root, "code-resume01").is_none());
 
         // Resume mints a fresh, emit-only token …
-        let token = mint(&root, "code-resume01", "codex", std::process::id() as i32).unwrap();
+        let token = mint(&root, "code-resume01", "codex", std::process::id() as i32, None, None).unwrap();
         assert!(token.may_publish("obs/agent/codex/code-resume01/session/resume"));
         assert!(!token.may_publish("in/human/owner"));
         assert!(token.subscribe.is_empty(), "resume token must be emit-only");
@@ -1374,6 +1682,314 @@ mod tests {
         assert_eq!(rec.room.as_deref(), Some("my-room"));
         assert_eq!(rec.native_session, "thread-9"); // the rest filled in
         assert_eq!(rec.workdir, "/proj");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M1: budget dimension + Σ≤parent assert ───────────────────────────────
+    //
+    // The regression tests for docs/handoffs/authority-delegation.md M1 and
+    // docs/security.md entry 22. They assert at the MINT LAYER — the level
+    // entry 20's fix taught us to test: authority, not shape.
+
+    #[test]
+    fn budget_unbounded_owner_path_is_zero_behavior_change() {
+        // THE BASELINE: the owner spawns a session directly (no spawner session
+        // token in the fenced store). spawner=None, requested_budget=None →
+        // unbounded — turn_budget and remaining_budget are both None.
+        // This is the existing path; the test proves it is unchanged.
+        let root = tmp_root();
+        let tok = mint(&root, "code-budget001", "claude-code", 999_999, None, None).unwrap();
+        assert_eq!(tok.turn_budget, None, "owner path must be unbounded");
+        assert_eq!(tok.remaining_budget, None, "owner path must be unbounded");
+        // Roundtrip: the token file deserializes back with None budgets.
+        let read_back = read(&root, "code-budget001").unwrap();
+        assert_eq!(read_back.turn_budget, None);
+        assert_eq!(read_back.remaining_budget, None);
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn budget_inherit_equal_child_gets_parents_full_remaining() {
+        // When a spawner has a finite budget and the child makes no explicit
+        // request (requested_budget=None), the child inherits the spawner's
+        // full remaining — the inherit-equal default (handoff open decision 1).
+        let root = tmp_root();
+        let parent_pid = std::process::id() as i32;
+        // Mint the parent with a finite budget (e.g. 100 turns).
+        mint(&root, "code-parent01", "claude-code", parent_pid, None, Some(100)).unwrap();
+        // Child inherits full remaining (100) via inherit-equal.
+        let child = mint(&root, "code-child001", "claude-code", parent_pid,
+                         Some("code-parent01"), None).unwrap();
+        assert_eq!(child.turn_budget, Some(100), "inherit-equal: child gets parent's full remaining");
+        assert_eq!(child.remaining_budget, Some(100));
+        // Parent's remaining is now 0 (the child took the full 100).
+        let parent_after = read(&root, "code-parent01").unwrap();
+        assert_eq!(parent_after.remaining_budget, Some(0),
+                   "parent's remaining is decremented by the child's allocation");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn budget_explicit_narrow_child_gets_requested_amount() {
+        // When the child explicitly requests a smaller budget than the parent's
+        // remaining, it gets exactly what it asked for — narrowing is the point
+        // of the RLM case ("halve it to pass context down").
+        let root = tmp_root();
+        let pid = std::process::id() as i32;
+        mint(&root, "code-parent02", "claude-code", pid, None, Some(100)).unwrap();
+        let child = mint(&root, "code-child002", "claude-code", pid,
+                         Some("code-parent02"), Some(40)).unwrap();
+        assert_eq!(child.turn_budget, Some(40), "explicit narrowing: child gets requested 40");
+        assert_eq!(child.remaining_budget, Some(40));
+        // Parent's remaining decremented by 40.
+        let parent_after = read(&root, "code-parent02").unwrap();
+        assert_eq!(parent_after.remaining_budget, Some(60));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn budget_child_cannot_exceed_parent_remaining() {
+        // THE CRUX (security.md entry 22): a child requesting more turns than the
+        // spawner has remaining MUST be refused at mint — the spawn does not happen.
+        // This is the monotone-narrowing invariant: no spawn may widen authority.
+        let root = tmp_root();
+        let pid = std::process::id() as i32;
+        // Parent has 50 turns remaining.
+        mint(&root, "code-parent03", "claude-code", pid, None, Some(50)).unwrap();
+        // Child requests 51 — one more than the parent has.
+        let result = mint(&root, "code-child003", "claude-code", pid,
+                          Some("code-parent03"), Some(51));
+        assert!(result.is_err(), "over-allocation must be refused at mint");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("budget allocation refused"),
+                "error must name the refusal class: {err}");
+        assert!(err.contains("code-parent03"),
+                "error must name the spawner: {err}");
+        // The refused mint must NOT have written a child token.
+        assert!(read(&root, "code-child003").is_none(),
+                "refused mint must not leave a token file");
+        // The parent's remaining is unchanged — the failed mint must not charge it.
+        let parent_after = read(&root, "code-parent03").unwrap();
+        assert_eq!(parent_after.remaining_budget, Some(50),
+                   "failed mint must not decrement the spawner's remaining");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn budget_sigma_siblings_partition_parent() {
+        // The Σ (sigma) invariant: siblings PARTITION the parent's budget, not
+        // share it. The second sibling that would push the cumulative allocation
+        // over the parent's remaining is refused — this is the "Σ children ≤
+        // parent" from the handoff, not just "each child ≤ parent".
+        let root = tmp_root();
+        let pid = std::process::id() as i32;
+        // Parent starts with 60 turns.
+        mint(&root, "code-parent04", "claude-code", pid, None, Some(60)).unwrap();
+
+        // First child claims 40: succeeds; parent now has 20 remaining.
+        let c1 = mint(&root, "code-sib001", "claude-code", pid,
+                      Some("code-parent04"), Some(40)).unwrap();
+        assert_eq!(c1.turn_budget, Some(40));
+        let after_c1 = read(&root, "code-parent04").unwrap();
+        assert_eq!(after_c1.remaining_budget, Some(20));
+
+        // Second child claims 21: would push Σ to 61 > 60 → REFUSED.
+        let result = mint(&root, "code-sib002", "claude-code", pid,
+                          Some("code-parent04"), Some(21));
+        assert!(result.is_err(), "second sibling must be refused when Σ > parent");
+        assert!(read(&root, "code-sib002").is_none(),
+                "refused sibling must not leave a token");
+
+        // Parent's remaining is still 20 (the failed mint did not charge it).
+        let after_fail = read(&root, "code-parent04").unwrap();
+        assert_eq!(after_fail.remaining_budget, Some(20));
+
+        // Third sibling that fits (20) succeeds — the partition has exactly 0 left.
+        let c3 = mint(&root, "code-sib003", "claude-code", pid,
+                      Some("code-parent04"), Some(20)).unwrap();
+        assert_eq!(c3.turn_budget, Some(20));
+        let after_c3 = read(&root, "code-parent04").unwrap();
+        assert_eq!(after_c3.remaining_budget, Some(0),
+                   "siblings exactly exhaust the parent's budget — Σ = parent");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn budget_old_token_without_field_deserializes_as_unbounded() {
+        // Backward-compatibility: a token file written BEFORE M1 (no turn_budget /
+        // remaining_budget fields) must deserialize with both fields as None so
+        // existing sessions are treated as unbounded — zero behavior change for
+        // tokens that predate the M1 serialization.
+        let root = tmp_root();
+        let dir = store_dir(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write a token in the pre-M1 shape (no budget fields).
+        let legacy_json = r#"{
+            "principal":"code-legacy01",
+            "agent":"claude-code",
+            "secret":"abc123",
+            "owner_pid":1,
+            "publish":["obs/agent/claude-code/code-legacy01/#"],
+            "subscribe":[]
+        }"#;
+        let path = dir.join("code-legacy01.json");
+        std::fs::write(&path, legacy_json).unwrap();
+        let tok = read(&root, "code-legacy01").expect("legacy token must be readable");
+        assert_eq!(tok.turn_budget, None,
+                   "missing turn_budget in old token → None (unbounded)");
+        assert_eq!(tok.remaining_budget, None,
+                   "missing remaining_budget in old token → None (unbounded)");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn budget_concurrent_siblings_cannot_exceed_parent_via_race() {
+        // REGRESSION TEST FOR FINDING 1 (HIGH — concurrent-sibling TOCTOU).
+        //
+        // Two fixes close this race:
+        //   1. write_0600 uses atomic rename(2) — readers never see a torn file.
+        //   2. The pre-lock branch decision uses Path::try_exists (stable POSIX
+        //      signal), not a parse result that could return None on a partial read.
+        //
+        // This test MUST FAIL reliably if either fix is reverted. It hammers the
+        // race window across 60 iterations, each spawning 12 threads against a
+        // budget that only 3 can succeed — 9× oversub, 60× repetition.
+        //
+        // Assertions per iteration:
+        //   (a) Σ of granted child budgets ≤ parent_start.
+        //   (b) Exactly floor(parent_budget / per_child) children succeed.
+        //   (c) The parent's final persisted remaining == parent_start − Σgranted.
+        //
+        // Threads open separate fds, so flock correctly provides mutual exclusion
+        // (same as separate processes — lock is per open-file-description, not per-pid).
+        use std::sync::{Arc, Mutex};
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+        let pid = std::process::id() as i32;
+
+        // Parent: 30 turns total. Each child requests 10 → 3 succeed, 9 are refused.
+        let parent_budget: u64 = 30;
+        let per_child: u64 = 10;
+        let expected_successes: usize = (parent_budget / per_child) as usize;
+        // 12 threads competing for 3 slots — 4× oversub per iteration.
+        let n_threads: usize = 12;
+        // 60 iterations hammers the race window far more reliably than a single run.
+        let n_iters: usize = 60;
+
+        // Unique name counter so each iteration gets fresh principals (no leftover
+        // token state from a previous iteration leaking through).
+        static ITER_CTR: AtomicUsize = AtomicUsize::new(0);
+
+        for _iter in 0..n_iters {
+            let ctr = ITER_CTR.fetch_add(1, AOrdering::Relaxed);
+            let root = Arc::new(tmp_root());
+            let parent_name = format!("code-racep{ctr:04}");
+
+            mint(&root, &parent_name, "claude-code", pid, None, Some(parent_budget)).unwrap();
+
+            let successes: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let handles: Vec<_> = (0..n_threads)
+                .map(|i| {
+                    let root = Arc::clone(&root);
+                    let successes = Arc::clone(&successes);
+                    let parent_name = parent_name.clone();
+                    std::thread::spawn(move || {
+                        let child_name = format!("code-racec{ctr:04}t{i:02}");
+                        let result = mint(
+                            &root,
+                            &child_name,
+                            "claude-code",
+                            pid,
+                            Some(&parent_name),
+                            Some(per_child),
+                        );
+                        if let Ok(tok) = result {
+                            let granted = tok.turn_budget.unwrap_or(0);
+                            successes.lock().unwrap().push(granted);
+                        }
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().expect("thread panicked");
+            }
+
+            let granted_vec = successes.lock().unwrap().clone();
+            let n_succeeded = granted_vec.len();
+            let sigma: u64 = granted_vec.iter().sum();
+
+            // (a) Σ granted must never exceed the parent budget — the invariant.
+            assert!(
+                sigma <= parent_budget,
+                "iter {_iter}: Σ granted ({sigma}) must not exceed parent budget \
+                 ({parent_budget}) — concurrency bug"
+            );
+
+            // (b) Exactly the expected number of children succeed.
+            assert_eq!(
+                n_succeeded, expected_successes,
+                "iter {_iter}: expected {expected_successes} successes \
+                 (budget={parent_budget}, per_child={per_child}); got {n_succeeded}"
+            );
+
+            // (c) The parent's final persisted remaining equals parent_start − Σgranted.
+            let parent_final = read(&root, &parent_name)
+                .expect("parent token must still be readable after concurrent mints");
+            let final_remaining = parent_final.remaining_budget
+                .expect("parent remaining must be Some after finite-budget mints");
+            assert_eq!(
+                final_remaining,
+                parent_budget - sigma,
+                "iter {_iter}: parent remaining ({final_remaining}) must equal \
+                 parent_start ({parent_budget}) − Σgranted ({sigma})"
+            );
+
+            let _ = std::fs::remove_dir_all(&root.dir);
+        }
+    }
+
+    #[test]
+    fn budget_unparseable_spawner_token_fails_closed() {
+        // REGRESSION TEST FOR FAIL-CLOSED CLASSIFICATION (belt-and-suspenders).
+        //
+        // If the spawner token file exists but is corrupt/unparseable, mint()
+        // must REFUSE the spawn — not treat it as unbounded authority.
+        // Previously (before the fix), a None parse result from a torn read
+        // was indistinguishable from "no token" and granted the child.
+        let root = tmp_root();
+        let pid = std::process::id() as i32;
+        let dir = store_dir(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a syntactically invalid JSON file at the spawner token path.
+        let path = dir.join("code-corruptparent.json");
+        std::fs::write(&path, b"{ THIS IS NOT VALID JSON }").unwrap();
+
+        // Attempting to mint a child with this as spawner must fail.
+        let result = mint(
+            &root,
+            "code-child-of-corrupt",
+            "claude-code",
+            pid,
+            Some("code-corruptparent"),
+            Some(10),
+        );
+        assert!(
+            result.is_err(),
+            "mint with unparseable spawner token must be refused (fail-closed)"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("corrupt") || err.contains("parsed") || err.contains("could not be"),
+            "error must explain the refusal reason: {err}"
+        );
+        // No child token must have been written.
+        assert!(
+            read(&root, "code-child-of-corrupt").is_none(),
+            "refused mint must not write a child token"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

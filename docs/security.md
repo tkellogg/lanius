@@ -603,3 +603,52 @@ asserted at mint (the same decidable check sandbox.md demands of `lease ⊆ gran
 the broker/sandbox enforcing each dimension at runtime. Build the budget dimension
 first (fungible, zero behavior change, ships the assert skeleton), then the
 capability subsets. Cite this entry in that work.
+
+**[M1 LANDED 2026-06-20]** The **budget dimension** is now enforced (the assert
+skeleton the doctrine called for, built first as recommended). `SessionToken`
+carries `turn_budget`/`remaining_budget` (`None` = unbounded; `#[serde(default)]`
+so pre-M1 tokens read as unbounded). `codesession::mint` gained `spawner` +
+`requested_budget`: it reads the spawner's **remaining from the fenced token store —
+never from env** (the doctrine's "reconstructed at spawn, not inherited"), asserts
+**`Σ children ≤ parent.remaining`** at mint, decrements-and-persists the spawner's
+remaining before writing the child, and **refuses the spawn** (clear, entry-22-citing
+error) if it would over-allocate. Default policy = **inherit-equal** (narrow only on
+explicit request; open-decision 1). Owner path (spawner `None` / no token) stays
+unbounded and lock-free → zero behavior change for every existing call site.
+
+The interesting part is what adversarial validation caught before this shipped — two
+real over-grant bugs in the code whose *whole point* is the bound:
+
+1. **Concurrent-sibling TOCTOU.** The `Σ` decrement was a non-atomic
+   read-check-write with no cross-process serialization, yet spawned workers are
+   separate detached processes (`elanus code spawn` → `cmd.spawn()`), so the RLM
+   fan-out the doctrine names could let N siblings each read the same stale
+   remaining and all pass → `Σ > parent`. Fixed with a cross-process advisory lock
+   (`libc::flock(LOCK_EX)` on `<store>/budget.lock`, RAII-released on every path
+   incl. the `bail!` refusal and panic), wrapping the entire read→check→decrement→
+   write-back. Owner/unbounded path never takes the lock.
+2. **Torn-read fail-OPEN.** A first lock attempt still leaked: a lock-free "peek"
+   classified unbounded-vs-finite *before* the lock, and `write_0600` truncated
+   in place — so a sibling reading during another's write got a partial file,
+   `serde` returned `None`, and an *unreadable* token was treated as *unbounded*
+   and granted lock-free. Closed by (a) making `write_0600` atomic (temp +
+   `rename(2)`, no reader ever sees a partial token) and (b) gating the lock-free
+   path on the spawner token **file existing** (`try_exists`, a stable signal),
+   not on a parse result — an existing-but-unparseable token now **fails closed**
+   under the lock. A corrupt/half-written spawner token can never read as
+   unlimited authority.
+
+Both were proven load-bearing by neutralization (revert a fix → the 60-iter ×
+12-thread `budget_concurrent_siblings_cannot_exceed_parent_via_race` test fails
+deterministically; `budget_unparseable_spawner_token_fails_closed` covers the
+fail-closed path). 7 budget regression tests; full suite 181 + 2 doctests green.
+
+Still LATENT after M1 (not closed by this increment): the **capability** dimensions
+(bus ACL, fs read, tool/command allowlist, `blocking`) are still flat per-kind
+constants, not `subset(spawner)` — that is M2/M3. And the *spawner name* (which
+token to charge) is still taken from `ELANUS_CODE_REPLY_TO` (env), while only the
+*value* comes from the fenced store; a caged actor naming an arbitrary existing
+session as its spawner is bounded (it cannot forge a fenced token) but is the
+env-as-authority-key seam to close when budget becomes runtime-enforced (M2+,
+marked with a `TODO` at the spawner lookup). The cross-process lock guarantee is
+unix-only by construction (the whole 0600/flock model is POSIX).

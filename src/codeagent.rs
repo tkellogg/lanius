@@ -1639,7 +1639,12 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     // obs subtree. We record this launcher's pid as the token owner so the reaper
     // can distinguish a live session from a SIGKILL orphan.
     let principal = session.clone();
-    let token = codesession::mint(root, &principal, &agent, std::process::id() as i32)
+    // M1 (authority-delegation): pass the spawner session so mint can enforce
+    // Σ children ≤ parent.remaining at the fenced-store level (never from env).
+    // `parent` is None when the owner runs `elanus code` directly → unbounded.
+    // No explicit budget request here — inherit-equal is the default policy.
+    let token = codesession::mint(root, &principal, &agent, std::process::id() as i32,
+                                  parent.as_deref(), None)
         .with_context(|| format!("minting the session credential for {principal}"))?;
     let bus_token = token.secret.clone();
 
@@ -2605,7 +2610,11 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     // retired at the end (reaped on crash). It is emit-only: no read/subscribe
     // grant (M3's interactive-pull is deferred), so resume cannot read the bus.
     let principal = rec.elanus_session.clone();
-    let token = codesession::mint(root, &principal, &rec.agent_noun, std::process::id() as i32)
+    // Resume re-mints a credential for the SAME session — it is not a new spawn,
+    // so it is not charged against any spawner budget (the budget was consumed
+    // at launch time, not at resume). Pass spawner=None, requested_budget=None.
+    let token = codesession::mint(root, &principal, &rec.agent_noun, std::process::id() as i32,
+                                  None, None)
         .with_context(|| format!("minting the resume credential for {principal}"))?;
     let bus_token = token.secret.clone();
     let agent = rec.agent_noun.clone();
@@ -3549,7 +3558,8 @@ mod tests {
         let root = Root { dir: dir.clone() };
         let principal = "code-deadbeef";
         let token =
-            codesession::mint(&root, principal, "claude-code", std::process::id() as i32).unwrap();
+            codesession::mint(&root, principal, "claude-code", std::process::id() as i32,
+                              None, None).unwrap();
         // It does NOT resolve as a full-authority fenced secret — the broker's
         // owner-equivalent path (crate::secrets::read) must return None for it.
         assert_eq!(crate::secrets::read(&root, principal), None);
@@ -4319,7 +4329,7 @@ mod tests {
     fn forced_session_token_file_blocks_forced_id_reuse() {
         let root = delivery_tmp_root();
         let principal = "code-live0001";
-        codesession::mint(&root, principal, "codex", std::process::id() as i32).unwrap();
+        codesession::mint(&root, principal, "codex", std::process::id() as i32, None, None).unwrap();
 
         assert!(forced_session_token_exists(&root, principal));
         let _ = std::fs::remove_dir_all(&root.dir);

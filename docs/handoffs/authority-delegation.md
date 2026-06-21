@@ -203,3 +203,20 @@ see it refused if it tries to exceed it.
   making the minted scope a function of the *spawner's* grants, enforcing `⊆`/`Σ≤`
   at mint, and adding the fungible **budget** dimension (the RLM case). Recorded as
   security.md entry 22 + a Delegation section in identity.md.
+
+- 2026-06-20 — **M1 implemented** (budget dimension + `Σ children ≤ parent` asserted
+  at `codesession::mint`; inherit-equal default; owner path unbounded + zero
+  behavior change). Acceptance met: a child cannot be minted with a budget exceeding
+  the spawner's remaining, refused at the mint layer, with a regression test. Built
+  implement→validate with an adversarial loop (medium-effort impl, xhigh validation),
+  which caught **two real over-grant bugs** in the bound itself before commit: (1) a
+  concurrent-sibling TOCTOU — the decrement had no cross-process lock, defeatable by
+  the `elanus code spawn` fan-out — fixed with `libc::flock` over the whole
+  read→check→decrement→write-back; (2) a torn-read **fail-open** — a lock-free peek
+  plus non-atomic `write_0600` let an unreadable token be granted as unbounded —
+  fixed by atomic temp+`rename` writes and gating the lock-free path on file
+  *existence* (fail-closed on an unparseable token under the lock). Both proven
+  load-bearing by neutralization. Details in security.md entry 22 [M1 LANDED].
+  **M2 next**: unify `Grants` + subset the bus ACL from the spawner; also re-key the
+  spawner lookup off `ELANUS_CODE_REPLY_TO` (env) onto a capability reference (TODO
+  marked at the lookup) before budget becomes runtime-enforced.
