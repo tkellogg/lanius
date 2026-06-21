@@ -1330,7 +1330,7 @@ mod tests {
     fn session_actor_is_scoped_by_the_broker_acl() {
         let root = tmp_root();
         // Mint a real scoped session token (the launcher's path).
-        crate::codesession::mint(&root, "code-deadbeef", "claude-code", 999_999, None, None).unwrap();
+        crate::codesession::mint(&root, "code-deadbeef", "claude-code", 999_999, None, None, None, None).unwrap();
         let b = Broker::new(root);
         let actor = "code-deadbeef";
 

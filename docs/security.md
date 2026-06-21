@@ -652,3 +652,44 @@ session as its spawner is bounded (it cannot forge a fenced token) but is the
 env-as-authority-key seam to close when budget becomes runtime-enforced (M2+,
 marked with a `TODO` at the spawner lookup). The cross-process lock guarantee is
 unix-only by construction (the whole 0600/flock model is POSIX).
+
+**[M2 LANDED 2026-06-21]** The **bus capability dimension** now narrows by
+`child ⊆ spawner`, and the scattered dimensions are unified into one **`Grants`**
+value carried on `SessionToken` via `#[serde(flatten)]` (on-disk JSON unchanged —
+M1 and pre-M1 tokens still deserialize). `mint` gained `requested_publish`/
+`requested_subscribe`; when the spawner token file exists, under the *same* M1
+`flock` it asserts:
+- **subscribe (read authority): strict** — every child filter must be `covers`-ed
+  by some spawner subscribe filter (`child.subscribe ⊆ spawner.subscribe`), else
+  the spawn is refused. (Sessions get empty subscribe today; this is the
+  forward-looking guard.)
+- **publish:** the child may **always** emit its own structural self-telemetry
+  subtree `obs/agent/<agent>/<session>/#` (its own audit trail — disjoint,
+  write-only-own, *not* a widening), plus any filter `covers`-ed by the spawner's
+  publish grants; anything else is refused.
+
+The decision was the design fork M2 raised: entry-20 gives each session a
+*disjoint* obs subtree, so a literal `child ⊆ parent` on publish would forbid a
+child emitting its own telemetry. Resolved as above — read authority narrows
+strictly; self-telemetry is always allowed because it is own-data-only and
+structurally disjoint from everything else (the child's `own_obs` is built from the
+*child's* launcher-set principal/agent, so it cannot name another session's
+subtree). Owner-spawned sessions (no spawner token) get the exact entry-20
+structural scope unconditionally — **zero behavior change** for the common case.
+The broker is unchanged: it already gates `code-*` actors from the token's
+publish/subscribe, and runtime subscribe (exact-match) is *stricter* than the
+mint-time `covers` containment, so no widening.
+
+Soundness rests on **`topic::covers(wide, narrow)`** — a decidable filter-
+containment with a conservative "deny when unsure" bias, including the MQTT
+`$`-topic rule (a root wildcard does not cover a `$`-anchored filter — without it
+`covers("#", "$x/#")` falsely reports ⊆, an overstated guarantee = a defect). It
+is proven by a brute-force soundness oracle (`covers(w,n) ⟹ ∀ topic: matches(n,t)
+⟹ matches(w,t)`) over a generated filter/topic alphabet incl. `$`-cases, plus
+adversarial review with an *extended* oracle outside the shipped alphabet — no
+widening counterexample found. 198 + 2 doctests green; clippy clean on the changed
+files.
+
+Still LATENT after M2 (M3): fs read/write, the tool/command allowlist, and
+`blocking` are still flat per-kind, not `subset(spawner)`. The env-keyed
+spawner-name residual (above) is unchanged — still M2+ follow-up.

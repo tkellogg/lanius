@@ -220,3 +220,19 @@ see it refused if it tries to exceed it.
   **M2 next**: unify `Grants` + subset the bus ACL from the spawner; also re-key the
   spawner lookup off `ELANUS_CODE_REPLY_TO` (env) onto a capability reference (TODO
   marked at the lookup) before budget becomes runtime-enforced.
+
+- 2026-06-21 — **M2 implemented** (one `Grants` value via `#[serde(flatten)]`; bus
+  scope narrows `child ⊆ spawner` at mint — subscribe strict, publish allows the
+  child's own self-telemetry subtree + the spawner's publish; owner path unchanged).
+  Soundness rests on a new decidable `topic::covers` (filter-containment) proven by a
+  brute-force oracle + adversarial extended oracle; the MQTT `$`-topic hole in
+  `covers` was found and fixed before commit. Acceptance met: a bus-scoped spawner's
+  child cannot subscribe/publish outside the spawner (broker denies; child cannot
+  widen). Design fork resolved: a child may always emit its *own* disjoint obs
+  subtree (own audit trail, not a widening) — recorded in security.md entry 22
+  [M2 LANDED]. **Process note:** the validation workflow stalled once (machine asleep)
+  and a validator agent `git checkout`-discarded the uncommitted tree mid-run; the
+  change was reconstructed and re-verified faithful (production code + topic.rs byte-
+  intact; test module equivalent-not-identical). **M3 next**: fold fs read/write +
+  tool/command allowlist + `blocking` into the same `covers`/`⊆` contract, reusing
+  `lease ⊆ grant`'s prefix machinery for paths.

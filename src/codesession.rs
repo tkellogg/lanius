@@ -638,44 +638,34 @@ pub fn touch_record(root: &Root, elanus_session: &str) -> Result<()> {
 /// through this module, never the full-authority fenced-secret path.
 pub const PREFIX: &str = "code-";
 
-/// One minted session token plus the structural scope the broker enforces for
-/// it. Stored as JSON at `<root>/.secrets/code-sessions/<session>.json`.
+/// Every harness-controlled authority dimension for a session principal, unified
+/// into one value. Carried on `SessionToken` via `#[serde(flatten)]` so the
+/// on-disk JSON shape is UNCHANGED — tokens written by M1 (flat
+/// `publish`/`subscribe`/`turn_budget`/`remaining_budget` fields) still
+/// deserialize byte-for-byte (docs/handoffs/authority-delegation.md M2).
 ///
-/// ## Budget dimension (M1 — docs/handoffs/authority-delegation.md)
+/// ## Dimensions
 ///
-/// `turn_budget` is the fungible authority dimension: how many turns (model
-/// calls) this session may consume in total. `None` = unbounded (the owner
-/// path, and the common case for directly-launched sessions). A spawned
-/// child's budget is carved from its spawner's remaining budget — `Σ children
-/// ≤ parent.remaining` is asserted at mint (docs/security.md entry 22).
+/// - **Bus capability (non-fungible):** `publish` and `subscribe` are MQTT-filter
+///   vecs — the broker gates every publish/subscribe against these.
+///   `child ⊆ spawner` (every child filter must be `covers`-ed by some spawner
+///   filter) is asserted at mint (docs/security.md entry 22).
+/// - **Budget (fungible):** `turn_budget` / `remaining_budget` — the M1 dimension;
+///   `Σ children ≤ parent.remaining` is asserted at mint.
 ///
-/// `remaining_budget` is the runtime balance: starts equal to `turn_budget`
-/// and decremented each time a child is minted from this session as spawner.
-/// The entire read→classify→decrement→write-back critical section is
-/// serialized by an exclusive `flock(LOCK_EX)` on `<store>/budget.lock`
-/// whenever the spawner token file exists on disk. The classification (bounded
-/// vs. unbounded) happens INSIDE the lock — never from a pre-lock parse that
-/// could observe a torn file. An unreadable/corrupt spawner token inside the
-/// lock is refused (fail-closed), not treated as unbounded. Token writes use
-/// atomic rename(2) so concurrent readers never observe a partial/empty file.
-/// Missing in older tokens → deserializes as `None` (unbounded, backward-compatible).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionToken {
-    /// The session principal, e.g. `code-2af51b7e`. Equals the file stem.
-    pub principal: String,
-    /// The agent noun this session publishes under (`claude-code`, `codex`).
-    pub agent: String,
-    /// The secret the child presents as ELANUS_BUS_TOKEN.
-    pub secret: String,
-    /// The launcher pid that owns this session — used by the reaper to tell a
-    /// live session's token from an orphan a SIGKILL left behind.
-    pub owner_pid: i32,
+/// M3 will add fs-read/write and tool-allowlist dimensions here; each will carry
+/// its own `⊆`/`Σ≤` assertion at mint and no changes to the existing fields.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Grants {
     /// Publish filters this session may publish to (structural: its own obs
     /// subtree). Everything else is denied by the broker ACL.
+    #[serde(default)]
     pub publish: Vec<String>,
     /// Subscribe filters this session may subscribe to. Empty today — a coding
     /// session needs to *emit* its record, not read the bus, so it gets no read
-    /// authority at all (M2's inbox is a later, explicitly-granted capability).
+    /// authority at all. A later explicit grant can widen this while still
+    /// satisfying `child ⊆ spawner`.
+    #[serde(default)]
     pub subscribe: Vec<String>,
     /// Total turn budget granted to this session. `None` = unbounded (the
     /// owner-spawned / common case). Set at mint; decremented into
@@ -691,17 +681,57 @@ pub struct SessionToken {
     pub remaining_budget: Option<u64>,
 }
 
+/// One minted session token plus the structural scope the broker enforces for
+/// it. Stored as JSON at `<root>/.secrets/code-sessions/<session>.json`.
+///
+/// ## On-disk JSON shape (back-compat invariant)
+///
+/// `grants` is stored with `#[serde(flatten)]`, so the serialized form is
+/// identical to M1's flat layout — `publish`, `subscribe`, `turn_budget`, and
+/// `remaining_budget` appear at the top level, not nested under a `grants` key.
+/// M1-era tokens deserialize without modification; `Grants` fields default to
+/// their natural zero (empty vecs / `None`) when absent.
+///
+/// ## Budget dimension (M1 — docs/handoffs/authority-delegation.md)
+///
+/// `grants.turn_budget` is the fungible authority dimension. `grants.remaining_budget`
+/// is the runtime balance. See `Grants` for the full description and the
+/// `flock`/atomic-write discipline.
+///
+/// ## Bus-scope dimension (M2 — docs/handoffs/authority-delegation.md)
+///
+/// `grants.publish` / `grants.subscribe` are the bus capability dimensions.
+/// `child ⊆ spawner` is asserted at mint via `topic::covers`. See `mint` and
+/// `Grants` for details.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionToken {
+    /// The session principal, e.g. `code-2af51b7e`. Equals the file stem.
+    pub principal: String,
+    /// The agent noun this session publishes under (`claude-code`, `codex`).
+    pub agent: String,
+    /// The secret the child presents as ELANUS_BUS_TOKEN.
+    pub secret: String,
+    /// The launcher pid that owns this session — used by the reaper to tell a
+    /// live session's token from an orphan a SIGKILL left behind.
+    pub owner_pid: i32,
+    /// All harness-controlled authority dimensions for this session. Stored
+    /// flattened so the on-disk JSON is unchanged from M1 (back-compat).
+    #[serde(flatten)]
+    pub grants: Grants,
+}
+
 impl SessionToken {
-    /// May this session publish here? Structural scope only.
+    /// May this session publish to `topic_name`? Delegates to the grants.
     pub fn may_publish(&self, topic_name: &str) -> bool {
-        self.publish
+        self.grants
+            .publish
             .iter()
             .any(|f| crate::topic::matches(f, topic_name))
     }
-    /// May this session subscribe to this filter? Exact-filter match against the
-    /// granted set (today: none).
+    /// May this session subscribe to `filter`? Exact-filter match against the
+    /// granted set (today: none for the structural default).
     pub fn may_subscribe(&self, filter: &str) -> bool {
-        self.subscribe.iter().any(|f| f == filter)
+        self.grants.subscribe.iter().any(|f| f == filter)
     }
 }
 
@@ -784,7 +814,7 @@ impl Drop for BudgetLock {
 /// Mint a grant-scoped session token for `principal` publishing `agent`
 /// telemetry. Writes the 0600 token file inside the fenced store and returns
 /// the token (the launcher hands `.secret` to the child as ELANUS_BUS_TOKEN).
-/// The scope is structural: publish only `obs/agent/<agent>/<session>/#`,
+/// The default scope is structural: publish only `obs/agent/<agent>/<session>/#`,
 /// subscribe nothing.
 ///
 /// ## Budget dimension (M1 — docs/handoffs/authority-delegation.md, security.md entry 22)
@@ -818,6 +848,38 @@ impl Drop for BudgetLock {
 /// spawner session): the budget check is vacuously satisfied. The lock is NOT
 /// acquired on these paths — they remain zero-overhead and zero-behavior-change
 /// for all existing call sites.
+///
+/// ## Bus-scope dimension (M2 — docs/handoffs/authority-delegation.md, security.md entry 22)
+///
+/// `requested_publish` / `requested_subscribe` allow the caller to request a
+/// narrower-than-default bus scope for the child. `None` = use the structural
+/// default (`publish`: own obs subtree; `subscribe`: empty). An explicit
+/// request that would widen beyond the spawner's grants is refused at mint.
+///
+/// When the spawner IS a finite-scope session (token file exists), the child's
+/// bus grants are bounded by the spawner's under the same `flock(LOCK_EX)` that
+/// serializes the budget critical section:
+///
+/// - **subscribe (read authority):** every child subscribe filter must be
+///   `covers`-ed by some spawner subscribe filter (`child.subscribe ⊆
+///   spawner.subscribe`). Today sessions get empty subscribe, so the default
+///   child subscribe (also empty) trivially satisfies this; this is the
+///   forward-looking guard.
+///
+/// - **publish:** the child may ALWAYS emit its OWN structural self-telemetry
+///   subtree (`obs/agent/<agent>/<session>/#`) — this is its own audit trail
+///   and NOT a widening of authority. Beyond that, every publish filter must
+///   be `covers`-ed by some spawner publish filter (or by the child's own
+///   structural subtree). The DEFAULT child.publish is exactly its own subtree,
+///   so it always passes the check.
+///
+/// When the spawner is `None` (owner/top-of-chain), the child gets its
+/// structural default unconditionally — zero behavior change for the common case.
+// TODO M4: bundle requested_budget/requested_publish/requested_subscribe into a
+// single `RequestedGrants` struct when the `--grants` CLI surface lands — that is
+// the natural place to unify the request side the way `Grants` unifies the held
+// side. Until then the explicit params keep the call sites legible.
+#[allow(clippy::too_many_arguments)]
 pub fn mint(
     root: &Root,
     principal: &str,
@@ -825,6 +887,8 @@ pub fn mint(
     owner_pid: i32,
     spawner: Option<&str>,
     requested_budget: Option<u64>,
+    requested_publish: Option<Vec<String>>,
+    requested_subscribe: Option<Vec<String>>,
 ) -> Result<SessionToken> {
     if !is_session_principal(principal) {
         bail!("session principal {principal:?} is not a valid code-* identity name");
@@ -879,34 +943,49 @@ pub fn mint(
     // token to charge. Pinning the spawner-name via a capability reference rather
     // than an env variable is a known follow-up (M2+). // TODO M2: replace env-key
     // spawner lookup with a capability-reference in the minted child token.
-    let child_budget: Option<u64> = if let Some(spawner_name) = spawner {
+    // Structural scope: exactly the session's own obs subtree, encoded the same
+    // way codeagent::obs_topic encodes the agent/session segments so the filter
+    // and the published topics agree even for names with reserved characters.
+    // This is the child's UNCONDITIONAL self-telemetry — its own audit trail —
+    // and is never a widening of authority relative to the spawner (it is own-
+    // data-only, structurally disjoint from everything else).
+    let own_obs = format!(
+        "obs/agent/{}/{}/#",
+        crate::topic::encode_segment(agent),
+        crate::topic::encode_segment(principal),
+    );
+
+    // ── Budget + bus-scope invariants: serialized by the same lock ───────────
+    //
+    // When the spawner token file EXISTS on disk, all reads/checks/writes for
+    // BOTH the budget AND bus-scope dimensions are serialized under the same
+    // exclusive flock(LOCK_EX). This is the same discipline M1 established;
+    // M2 piggybacks on it to check child.publish ⊆ spawner.publish and
+    // child.subscribe ⊆ spawner.subscribe.
+    //
+    // Lock-free fast paths (zero behavior change for the common case):
+    //   - spawner=None (owner/top-of-chain): no spawner file to check.
+    //   - spawner file genuinely ABSENT (pre-M1 token, or owner context):
+    //     unbounded on all dimensions; no lock needed.
+    let (child_budget, child_publish, child_subscribe) = if let Some(spawner_name) = spawner {
         let spawner_token_path = token_path(root, spawner_name);
-        // Use the file's EXISTENCE as the branch signal — a stable, atomic
-        // POSIX observation that cannot be confused by a concurrent torn write.
-        // try_exists() returns false if the path is absent, true if present,
-        // and an error only on permission failures (treated as exists=true, so
-        // we take the locked path and fail-closed inside).
+        // Use the file's EXISTENCE as the branch signal (M1's fail-closed
+        // discipline: see the M1 comment above for the full rationale).
         let file_exists = spawner_token_path.try_exists().unwrap_or(true);
         if !file_exists {
             // Spawner token file is genuinely absent (owner context or pre-M1
-            // session): treat as unbounded. No lock needed; no token to parse.
-            requested_budget
+            // session): treat as unbounded on all dimensions.
+            let pub_vec = requested_publish.unwrap_or_else(|| vec![own_obs.clone()]);
+            let sub_vec = requested_subscribe.unwrap_or_default();
+            (requested_budget, pub_vec, sub_vec)
         } else {
-            // Spawner token file EXISTS → we MUST take the budget lock before
-            // reading, classifying, and writing back. This is required even if
-            // the token turns out to have remaining_budget=None (unbounded)
-            // because we cannot safely determine that without a lock-guarded
-            // parse. The locked path covers all three cases:
-            //   • parsed + remaining_budget=None  → unbounded, no decrement.
-            //   • parsed + remaining_budget=Some  → finite, Σ-check + decrement.
-            //   • unparseable                     → FAIL CLOSED, spawn refused.
+            // Spawner token file EXISTS → acquire the lock before reading,
+            // checking, and writing back. Covers budget + bus-scope together.
             #[cfg(unix)]
             let _lock = BudgetLock::acquire(root)
                 .map_err(|e| anyhow::anyhow!("budget lock acquire failed: {e}"))?;
 
-            // Authoritative read under the lock. write_0600's atomic rename
-            // means this always sees a complete file; we still fail-closed on
-            // any parse error as an independent safety layer.
+            // Authoritative read under the lock.
             let spawner_tok = read(root, spawner_name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "budget spawn refused: spawner token {spawner_name:?} exists on disk \
@@ -915,18 +994,60 @@ pub fn mint(
                 )
             })?;
 
-            match spawner_tok.remaining_budget {
+            // ── Bus-scope: child ⊆ spawner ─────────────────────────────────
+            //
+            // The child's structural own-obs subtree is ALWAYS allowed — it is
+            // the session's own audit trail and NOT a widening of the spawner's
+            // authority. Every OTHER publish filter the child requests must be
+            // covered by some spawner publish filter.
+            //
+            // subscribe: every child filter must be covered by some spawner
+            // subscribe filter. Today spawner.subscribe is empty and the default
+            // child.subscribe is empty (trivially satisfies ⊆).
+            let child_pub_req = requested_publish.unwrap_or_else(|| vec![own_obs.clone()]);
+            let child_sub_req = requested_subscribe.unwrap_or_default();
+
+            // Check publish: child filter must be covered by own_obs OR some spawner pub filter.
+            for filter in &child_pub_req {
+                let covered_by_own = crate::topic::covers(&own_obs, filter);
+                let covered_by_spawner = spawner_tok
+                    .grants
+                    .publish
+                    .iter()
+                    .any(|sf| crate::topic::covers(sf, filter));
+                if !covered_by_own && !covered_by_spawner {
+                    bail!(
+                        "bus publish refused (docs/security.md entry 22): child filter \
+                         {filter:?} is not covered by spawner {spawner_name:?}'s publish \
+                         grants or its own structural subtree — child ⊆ spawner violated"
+                    );
+                }
+            }
+
+            // Check subscribe: child filter must be covered by some spawner sub filter.
+            for filter in &child_sub_req {
+                let covered = spawner_tok
+                    .grants
+                    .subscribe
+                    .iter()
+                    .any(|sf| crate::topic::covers(sf, filter));
+                if !covered {
+                    bail!(
+                        "bus subscribe refused (docs/security.md entry 22): child filter \
+                         {filter:?} is not covered by spawner {spawner_name:?}'s subscribe \
+                         grants — child ⊆ spawner violated"
+                    );
+                }
+            }
+
+            // ── Budget: Σ children ≤ parent.remaining ──────────────────────
+            let child_budget = match spawner_tok.grants.remaining_budget {
                 None => {
-                    // Token is present and parseable but has no budget cap
-                    // (e.g. a pre-M1 token that happened to exist, or an
-                    // owner-path token written with remaining_budget=None).
-                    // Treat as unbounded — no decrement needed.
+                    // Token present and parseable but no budget cap (pre-M1 or
+                    // owner-path token): treat as unbounded — no decrement.
                     requested_budget
                 }
                 Some(parent_remaining) => {
-                    // Spawner has a finite remaining budget. The child gets at
-                    // most what was requested (or the full remaining if
-                    // inherit-equal).
                     let child_alloc = requested_budget.unwrap_or(parent_remaining);
                     if child_alloc > parent_remaining {
                         bail!(
@@ -937,13 +1058,10 @@ pub fn mint(
                     }
                     // Decrement the spawner's remaining budget and persist it
                     // BEFORE the lock is released and BEFORE the child token is
-                    // written. Fail-closed: a failed write-back aborts the entire
-                    // mint — authority is never granted without a durable charge.
-                    // Crash between write-back and child write: the parent's budget
-                    // is consumed without a child being granted — fail-safe toward
-                    // conservation, never toward over-grant.
+                    // written (fail-closed: see M1 comment above).
                     let mut tok = spawner_tok;
-                    tok.remaining_budget = Some(parent_remaining.saturating_sub(child_alloc));
+                    tok.grants.remaining_budget =
+                        Some(parent_remaining.saturating_sub(child_alloc));
                     let json = serde_json::to_string(&tok).map_err(|e| {
                         anyhow::anyhow!(
                             "budget write-back serialization failed for spawner \
@@ -957,20 +1075,19 @@ pub fn mint(
                              durable charge)"
                         )
                     })?;
-                    // The lock (_lock) is still held here; it is released when
-                    // child_budget falls out of the if-let block (Drop runs before
-                    // the child token write below, which is intentional: the child
-                    // write does not need the lock, and releasing earlier reduces
-                    // contention).
                     Some(child_alloc)
                 }
-            }
+            };
+
+            (child_budget, child_pub_req, child_sub_req)
         }
     } else {
-        // Owner (no spawner session): unbounded or explicitly capped by the
-        // caller. requested_budget is honoured directly; None = unbounded.
-        // No lock acquired on this path.
-        requested_budget
+        // Owner (no spawner session): no bus-scope check needed. The child
+        // gets its requested/default scope unconditionally — zero behavior
+        // change for the owner-spawned common case.
+        let pub_vec = requested_publish.unwrap_or_else(|| vec![own_obs.clone()]);
+        let sub_vec = requested_subscribe.unwrap_or_default();
+        (requested_budget, pub_vec, sub_vec)
     };
 
     let secret = format!(
@@ -978,23 +1095,17 @@ pub fn mint(
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    // Structural scope: exactly the session's own obs subtree, encoded the same
-    // way codeagent::obs_topic encodes the agent/session segments so the filter
-    // and the published topics agree even for names with reserved characters.
-    let own_obs = format!(
-        "obs/agent/{}/{}/#",
-        crate::topic::encode_segment(agent),
-        crate::topic::encode_segment(principal),
-    );
     let token = SessionToken {
         principal: principal.to_string(),
         agent: agent.to_string(),
         secret,
         owner_pid,
-        publish: vec![own_obs],
-        subscribe: Vec::new(),
-        turn_budget: child_budget,
-        remaining_budget: child_budget,
+        grants: Grants {
+            publish: child_publish,
+            subscribe: child_subscribe,
+            turn_budget: child_budget,
+            remaining_budget: child_budget,
+        },
     };
     write_0600(&token_path(root, principal), &serde_json::to_string(&token)?)?;
     Ok(token)
@@ -1151,7 +1262,7 @@ mod tests {
     #[test]
     fn mint_scope_is_only_the_own_obs_subtree() {
         let root = tmp_root();
-        let tok = mint(&root, "code-deadbeef", "claude-code", 999_999, None, None).unwrap();
+        let tok = mint(&root, "code-deadbeef", "claude-code", 999_999, None, None, None, None).unwrap();
         // Publishes its own obs subtree …
         assert!(tok.may_publish("obs/agent/claude-code/code-deadbeef/session/start"));
         assert!(tok.may_publish("obs/agent/claude-code/code-deadbeef/tool/Bash/call"));
@@ -1171,7 +1282,7 @@ mod tests {
     #[test]
     fn roundtrip_and_retire() {
         let root = tmp_root();
-        let minted = mint(&root, "code-cafef00d", "claude-code", 1234, None, None).unwrap();
+        let minted = mint(&root, "code-cafef00d", "claude-code", 1234, None, None, None, None).unwrap();
         let read_back = read(&root, "code-cafef00d").unwrap();
         assert_eq!(read_back.secret, minted.secret);
         assert_eq!(read_back.agent, "claude-code");
@@ -1208,12 +1319,14 @@ mod tests {
         // a token owned by a definitely-dead pid (pid 1 exists but we use a high
         // unlikely-live pid for the dead case; current pid for the live case)
         let dead_pid = 0x7fff_fffe; // not a live pid on any sane system
-        mint(&root, "code-deadbeef", "claude-code", dead_pid, None, None).unwrap();
+        mint(&root, "code-deadbeef", "claude-code", dead_pid, None, None, None, None).unwrap();
         let live = mint(
             &root,
             "code-livesess",
             "claude-code",
             std::process::id() as i32,
+            None,
+            None,
             None,
             None,
         )
@@ -1347,10 +1460,10 @@ mod tests {
         assert!(read(&root, "code-resume01").is_none());
 
         // Resume mints a fresh, emit-only token …
-        let token = mint(&root, "code-resume01", "codex", std::process::id() as i32, None, None).unwrap();
+        let token = mint(&root, "code-resume01", "codex", std::process::id() as i32, None, None, None, None).unwrap();
         assert!(token.may_publish("obs/agent/codex/code-resume01/session/resume"));
         assert!(!token.may_publish("in/human/owner"));
-        assert!(token.subscribe.is_empty(), "resume token must be emit-only");
+        assert!(token.grants.subscribe.is_empty(), "resume token must be emit-only");
         assert!(read(&root, "code-resume01").is_some());
 
         // … and retires it: no idle credential survives the resume.
@@ -1698,13 +1811,13 @@ mod tests {
         // unbounded — turn_budget and remaining_budget are both None.
         // This is the existing path; the test proves it is unchanged.
         let root = tmp_root();
-        let tok = mint(&root, "code-budget001", "claude-code", 999_999, None, None).unwrap();
-        assert_eq!(tok.turn_budget, None, "owner path must be unbounded");
-        assert_eq!(tok.remaining_budget, None, "owner path must be unbounded");
+        let tok = mint(&root, "code-budget001", "claude-code", 999_999, None, None, None, None).unwrap();
+        assert_eq!(tok.grants.turn_budget, None, "owner path must be unbounded");
+        assert_eq!(tok.grants.remaining_budget, None, "owner path must be unbounded");
         // Roundtrip: the token file deserializes back with None budgets.
         let read_back = read(&root, "code-budget001").unwrap();
-        assert_eq!(read_back.turn_budget, None);
-        assert_eq!(read_back.remaining_budget, None);
+        assert_eq!(read_back.grants.turn_budget, None);
+        assert_eq!(read_back.grants.remaining_budget, None);
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -1716,15 +1829,15 @@ mod tests {
         let root = tmp_root();
         let parent_pid = std::process::id() as i32;
         // Mint the parent with a finite budget (e.g. 100 turns).
-        mint(&root, "code-parent01", "claude-code", parent_pid, None, Some(100)).unwrap();
+        mint(&root, "code-parent01", "claude-code", parent_pid, None, Some(100), None, None).unwrap();
         // Child inherits full remaining (100) via inherit-equal.
         let child = mint(&root, "code-child001", "claude-code", parent_pid,
-                         Some("code-parent01"), None).unwrap();
-        assert_eq!(child.turn_budget, Some(100), "inherit-equal: child gets parent's full remaining");
-        assert_eq!(child.remaining_budget, Some(100));
+                         Some("code-parent01"), None, None, None).unwrap();
+        assert_eq!(child.grants.turn_budget, Some(100), "inherit-equal: child gets parent's full remaining");
+        assert_eq!(child.grants.remaining_budget, Some(100));
         // Parent's remaining is now 0 (the child took the full 100).
         let parent_after = read(&root, "code-parent01").unwrap();
-        assert_eq!(parent_after.remaining_budget, Some(0),
+        assert_eq!(parent_after.grants.remaining_budget, Some(0),
                    "parent's remaining is decremented by the child's allocation");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -1736,14 +1849,14 @@ mod tests {
         // of the RLM case ("halve it to pass context down").
         let root = tmp_root();
         let pid = std::process::id() as i32;
-        mint(&root, "code-parent02", "claude-code", pid, None, Some(100)).unwrap();
+        mint(&root, "code-parent02", "claude-code", pid, None, Some(100), None, None).unwrap();
         let child = mint(&root, "code-child002", "claude-code", pid,
-                         Some("code-parent02"), Some(40)).unwrap();
-        assert_eq!(child.turn_budget, Some(40), "explicit narrowing: child gets requested 40");
-        assert_eq!(child.remaining_budget, Some(40));
+                         Some("code-parent02"), Some(40), None, None).unwrap();
+        assert_eq!(child.grants.turn_budget, Some(40), "explicit narrowing: child gets requested 40");
+        assert_eq!(child.grants.remaining_budget, Some(40));
         // Parent's remaining decremented by 40.
         let parent_after = read(&root, "code-parent02").unwrap();
-        assert_eq!(parent_after.remaining_budget, Some(60));
+        assert_eq!(parent_after.grants.remaining_budget, Some(60));
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -1755,10 +1868,10 @@ mod tests {
         let root = tmp_root();
         let pid = std::process::id() as i32;
         // Parent has 50 turns remaining.
-        mint(&root, "code-parent03", "claude-code", pid, None, Some(50)).unwrap();
+        mint(&root, "code-parent03", "claude-code", pid, None, Some(50), None, None).unwrap();
         // Child requests 51 — one more than the parent has.
         let result = mint(&root, "code-child003", "claude-code", pid,
-                          Some("code-parent03"), Some(51));
+                          Some("code-parent03"), Some(51), None, None);
         assert!(result.is_err(), "over-allocation must be refused at mint");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("budget allocation refused"),
@@ -1770,7 +1883,7 @@ mod tests {
                 "refused mint must not leave a token file");
         // The parent's remaining is unchanged — the failed mint must not charge it.
         let parent_after = read(&root, "code-parent03").unwrap();
-        assert_eq!(parent_after.remaining_budget, Some(50),
+        assert_eq!(parent_after.grants.remaining_budget, Some(50),
                    "failed mint must not decrement the spawner's remaining");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -1784,32 +1897,32 @@ mod tests {
         let root = tmp_root();
         let pid = std::process::id() as i32;
         // Parent starts with 60 turns.
-        mint(&root, "code-parent04", "claude-code", pid, None, Some(60)).unwrap();
+        mint(&root, "code-parent04", "claude-code", pid, None, Some(60), None, None).unwrap();
 
         // First child claims 40: succeeds; parent now has 20 remaining.
         let c1 = mint(&root, "code-sib001", "claude-code", pid,
-                      Some("code-parent04"), Some(40)).unwrap();
-        assert_eq!(c1.turn_budget, Some(40));
+                      Some("code-parent04"), Some(40), None, None).unwrap();
+        assert_eq!(c1.grants.turn_budget, Some(40));
         let after_c1 = read(&root, "code-parent04").unwrap();
-        assert_eq!(after_c1.remaining_budget, Some(20));
+        assert_eq!(after_c1.grants.remaining_budget, Some(20));
 
         // Second child claims 21: would push Σ to 61 > 60 → REFUSED.
         let result = mint(&root, "code-sib002", "claude-code", pid,
-                          Some("code-parent04"), Some(21));
+                          Some("code-parent04"), Some(21), None, None);
         assert!(result.is_err(), "second sibling must be refused when Σ > parent");
         assert!(read(&root, "code-sib002").is_none(),
                 "refused sibling must not leave a token");
 
         // Parent's remaining is still 20 (the failed mint did not charge it).
         let after_fail = read(&root, "code-parent04").unwrap();
-        assert_eq!(after_fail.remaining_budget, Some(20));
+        assert_eq!(after_fail.grants.remaining_budget, Some(20));
 
         // Third sibling that fits (20) succeeds — the partition has exactly 0 left.
         let c3 = mint(&root, "code-sib003", "claude-code", pid,
-                      Some("code-parent04"), Some(20)).unwrap();
-        assert_eq!(c3.turn_budget, Some(20));
+                      Some("code-parent04"), Some(20), None, None).unwrap();
+        assert_eq!(c3.grants.turn_budget, Some(20));
         let after_c3 = read(&root, "code-parent04").unwrap();
-        assert_eq!(after_c3.remaining_budget, Some(0),
+        assert_eq!(after_c3.grants.remaining_budget, Some(0),
                    "siblings exactly exhaust the parent's budget — Σ = parent");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -1835,11 +1948,135 @@ mod tests {
         let path = dir.join("code-legacy01.json");
         std::fs::write(&path, legacy_json).unwrap();
         let tok = read(&root, "code-legacy01").expect("legacy token must be readable");
-        assert_eq!(tok.turn_budget, None,
+        assert_eq!(tok.grants.turn_budget, None,
                    "missing turn_budget in old token → None (unbounded)");
-        assert_eq!(tok.remaining_budget, None,
+        assert_eq!(tok.grants.remaining_budget, None,
                    "missing remaining_budget in old token → None (unbounded)");
         let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M2: bus-scope child ⊆ spawner (docs/handoffs/authority-delegation.md) ───
+
+    /// Helper: mint a spawner, then overwrite its grants to a specific bus scope.
+    fn spawner_with_scope(root: &Root, name: &str, publish: &[&str], subscribe: &[&str]) {
+        let mut sp = mint(root, name, "claude-code", 999_999, None, None, None, None).unwrap();
+        sp.grants.publish = publish.iter().map(|s| s.to_string()).collect();
+        sp.grants.subscribe = subscribe.iter().map(|s| s.to_string()).collect();
+        write_0600(&token_path(root, name), &serde_json::to_string(&sp).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn m2_owner_spawned_default_scope_is_unchanged() {
+        // The common case (no spawner) is byte-identical to entry-20/M1: publish
+        // exactly the own obs subtree, subscribe nothing.
+        let root = tmp_root();
+        let tok = mint(&root, "code-ownerdef", "claude-code", 1, None, None, None, None).unwrap();
+        assert_eq!(tok.grants.publish, vec!["obs/agent/claude-code/code-ownerdef/#".to_string()]);
+        assert!(tok.grants.subscribe.is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn m2_child_publish_must_be_subset_of_spawner() {
+        let root = tmp_root();
+        spawner_with_scope(&root, "code-scopep1", &["obs/agent/claude-code/#"], &[]);
+        // A child requesting a WIDER publish (obs/#) than the spawner is refused.
+        let widen = mint(&root, "code-cwide1", "claude-code", 1, Some("code-scopep1"),
+                         None, Some(vec!["obs/#".to_string()]), None);
+        assert!(widen.is_err(), "widening publish must be refused");
+        let err = widen.unwrap_err().to_string();
+        assert!(err.contains("bus publish refused"), "must name the refusal: {err}");
+        // A child requesting another agent's subtree (not its own, not under
+        // spawner's claude-code-only grant) is refused.
+        let cross = mint(&root, "code-ccross1", "claude-code", 1, Some("code-scopep1"),
+                         None, Some(vec!["obs/agent/codex/code-ccross1/#".to_string()]), None);
+        assert!(cross.is_err(), "cross-agent publish must be refused");
+        // A child requesting a filter under the spawner's grant succeeds.
+        let ok = mint(&root, "code-cok1", "claude-code", 1, Some("code-scopep1"),
+                      None, Some(vec!["obs/agent/claude-code/code-cok1/#".to_string()]), None);
+        assert!(ok.is_ok(), "publish ⊆ spawner must pass: {ok:?}");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn m2_child_own_obs_always_allowed_even_if_spawner_narrower() {
+        // The child's own self-telemetry subtree is its own audit trail and is
+        // ALWAYS allowed, even when the spawner's grant does not cover it.
+        let root = tmp_root();
+        // Spawner can only publish a DISJOINT subtree (a different agent).
+        spawner_with_scope(&root, "code-scopep2", &["obs/agent/codex/#"], &[]);
+        let own = "obs/agent/claude-code/code-cown2/#".to_string();
+        let tok = mint(&root, "code-cown2", "claude-code", 1, Some("code-scopep2"),
+                       None, Some(vec![own.clone()]), None).unwrap();
+        assert_eq!(tok.grants.publish, vec![own]);
+        // But the child CANNOT borrow the spawner's disjoint subtree for itself
+        // unless it explicitly requests it AND it is covered — requesting codex's
+        // subtree IS covered by the spawner here, so that is legitimately allowed
+        // (it is ⊆ spawner). Requesting something neither own nor ⊆ spawner fails.
+        let bad = mint(&root, "code-cown2b", "claude-code", 1, Some("code-scopep2"),
+                       None, Some(vec!["in/human/owner".to_string()]), None);
+        assert!(bad.is_err(), "a filter neither own nor ⊆ spawner must be refused");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn m2_default_child_publish_passes_against_narrow_spawner() {
+        // With no requested_publish, the child's default is its own obs subtree —
+        // which is always allowed — so a narrow spawner never blocks the default.
+        let root = tmp_root();
+        spawner_with_scope(&root, "code-scopep3", &["obs/agent/codex/#"], &[]);
+        let tok = mint(&root, "code-cdef3", "claude-code", 1, Some("code-scopep3"),
+                       None, None, None).unwrap();
+        assert_eq!(tok.grants.publish, vec!["obs/agent/claude-code/code-cdef3/#".to_string()]);
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn m2_child_subscribe_must_be_subset_of_spawner() {
+        let root = tmp_root();
+        // Spawner has a non-empty subscribe scope.
+        spawner_with_scope(&root, "code-scopes1", &["obs/agent/claude-code/#"],
+                           &["obs/agent/claude-code/#"]);
+        // A child subscribe not covered by the spawner's is refused.
+        let widen = mint(&root, "code-csub1", "claude-code", 1, Some("code-scopes1"),
+                         None, None, Some(vec!["obs/#".to_string()]));
+        assert!(widen.is_err(), "widening subscribe must be refused");
+        let err = widen.unwrap_err().to_string();
+        assert!(err.contains("bus subscribe refused"), "must name the refusal: {err}");
+        // A covered subscribe passes.
+        let ok = mint(&root, "code-csub2", "claude-code", 1, Some("code-scopes1"),
+                      None, None, Some(vec!["obs/agent/claude-code/code-x/#".to_string()]));
+        assert!(ok.is_ok(), "subscribe ⊆ spawner must pass: {ok:?}");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn m2_default_empty_subscribe_passes_under_empty_spawner() {
+        // The default child subscribe is empty, which trivially satisfies ⊆ even
+        // when the spawner's subscribe is also empty (today's structural default).
+        let root = tmp_root();
+        spawner_with_scope(&root, "code-scopes2", &["obs/agent/claude-code/#"], &[]);
+        let tok = mint(&root, "code-csub3", "claude-code", 1, Some("code-scopes2"),
+                       None, None, None).unwrap();
+        assert!(tok.grants.subscribe.is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn m2_flat_m1_token_json_still_deserializes() {
+        // serde(flatten) back-compat: an M1-era flat token (publish/subscribe/
+        // turn_budget/remaining_budget at top level) deserializes into Grants.
+        let m1 = r#"{"principal":"code-m1tok","agent":"codex","secret":"s","owner_pid":3,
+                     "publish":["obs/agent/codex/code-m1tok/#"],"subscribe":[],
+                     "turn_budget":5,"remaining_budget":2}"#;
+        let tok: SessionToken = serde_json::from_str(m1).unwrap();
+        assert_eq!(tok.grants.publish, vec!["obs/agent/codex/code-m1tok/#".to_string()]);
+        assert_eq!(tok.grants.turn_budget, Some(5));
+        assert_eq!(tok.grants.remaining_budget, Some(2));
+        // And it re-serializes to the same flat shape (no nested "grants" key).
+        let back = serde_json::to_string(&tok).unwrap();
+        assert!(back.contains("\"publish\""), "publish stays top-level: {back}");
+        assert!(!back.contains("\"grants\""), "no nested grants key: {back}");
     }
 
     #[test]
@@ -1885,7 +2122,7 @@ mod tests {
             let root = Arc::new(tmp_root());
             let parent_name = format!("code-racep{ctr:04}");
 
-            mint(&root, &parent_name, "claude-code", pid, None, Some(parent_budget)).unwrap();
+            mint(&root, &parent_name, "claude-code", pid, None, Some(parent_budget), None, None).unwrap();
 
             let successes: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -1903,9 +2140,11 @@ mod tests {
                             pid,
                             Some(&parent_name),
                             Some(per_child),
+                            None,
+                            None,
                         );
                         if let Ok(tok) = result {
-                            let granted = tok.turn_budget.unwrap_or(0);
+                            let granted = tok.grants.turn_budget.unwrap_or(0);
                             successes.lock().unwrap().push(granted);
                         }
                     })
@@ -1937,7 +2176,7 @@ mod tests {
             // (c) The parent's final persisted remaining equals parent_start − Σgranted.
             let parent_final = read(&root, &parent_name)
                 .expect("parent token must still be readable after concurrent mints");
-            let final_remaining = parent_final.remaining_budget
+            let final_remaining = parent_final.grants.remaining_budget
                 .expect("parent remaining must be Some after finite-budget mints");
             assert_eq!(
                 final_remaining,
@@ -1975,6 +2214,8 @@ mod tests {
             pid,
             Some("code-corruptparent"),
             Some(10),
+            None,
+            None,
         );
         assert!(
             result.is_err(),
