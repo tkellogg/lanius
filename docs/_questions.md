@@ -18,3 +18,10 @@ be ideal, to keep dependencies light.
 
 If I run `elanus code claude --resume`, it seems to pass on arbitrary args (wonderful!) but does it register the 
 session properly? Since we're resuming an old one... really curious if this works properly.
+
+
+I think the agents are bumping into each other. I have to keep explaining to them who else is there. But the whole
+purpose for Elanus is so they just know and self-navigate and negotiate. I'm thinking that claude/codex agents need
+to have memory blocks injected by default that let them know what else is going on. Like which agent, what the 
+agent is trying to do, etc. I'm imagining this just happens by default. I'm not sure why any agent needs to have
+this turned off, just feels like a basic functionality of elanus that most agents all get injected.
