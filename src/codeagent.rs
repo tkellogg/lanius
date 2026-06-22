@@ -2683,6 +2683,12 @@ fn codex_collect_summary(event: &Value, summary: &mut CaptureSummary) {
 /// `turn.failed`, `error`; item types `agent_message`, `reasoning`,
 /// `command_execution`, `file_change`, `mcp_tool_call`, `web_search`,
 /// `todo_list`. Anything unmodeled still lands via `generic_event`.
+// READ CAMERA scope (read-provenance handoff, M1): Codex's `exec --json` stream
+// does NOT surface per-file reads — its items are command/mcp/agent_message, and
+// Codex reads happen inside its `shell`/`apply_patch` commands (shell-buried,
+// source B). So this adapter deliberately projects no `obs/fs` read event; Codex
+// read provenance falls to M2 (the authoritative cage read camera, below the
+// shell), which is platform-gated (macOS accepted-gap) and DEFERRED.
 fn codex_map_event(event: &Value) -> Option<(String, Value)> {
     let ts = now_iso();
     let etype = event.get("type").and_then(Value::as_str).unwrap_or("");
@@ -3466,6 +3472,22 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
         body,
     );
 
+    // READ CAMERA — M1 (read-provenance handoff). For Claude Code only, ALSO
+    // project read-shaped tool calls (Read/Grep/Glob) into the WRITE camera's
+    // spatial, path-keyed noun: an `obs/fs/<encoded-canonical-path>` event with
+    // `op: "read"`, `via: "tool"`, carrying the causing `tool_use_id` — so "what
+    // did this agent read, and when" is the same `obs/fs/<subtree>/#` subscription
+    // the write side already affords. These ride the SAME default-none recorder
+    // rule as write deltas (`obs/fs/#` → Sink::None in src/recorder.rs): opt-in per
+    // subtree, never recorded-by-default. Advisory/honest-agent tier only — see
+    // `claude_read_fs_events`. Codex/opencode are NOT projected here (Codex reads
+    // are shell-buried → M2; opencode is out of M1's Claude-Code-only scope).
+    if event == "PreToolUse" && matches!(Tool::from_agent_noun(&agent), Some(Tool::ClaudeCode)) {
+        for (topic_name, fs_body) in claude_read_fs_events(&payload, &session) {
+            publish_obs(root, &principal, &token, &topic_name, fs_body);
+        }
+    }
+
     // M3 per-turn injection (Claude Code): on UserPromptSubmit (and SessionStart),
     // return the session's inbox status + memory note as `additionalContext` — the
     // SYSTEM-REMINDER layer (Appendix A: stdout of these hooks lands as an
@@ -3564,6 +3586,125 @@ fn claude_map_event(event: &str, payload: &Value) -> (String, Value) {
             (leaf, common(body))
         }
     }
+}
+
+/// READ CAMERA — M1 (read-provenance handoff). Project Claude Code's read-shaped
+/// tool calls into the SAME spatial, path-keyed shape as the WRITE camera
+/// (`src/exec.rs::emit_fs_delta` → `obs/fs/<encoded-canonical-path>`), so "what did
+/// this agent read, and when" is the same `obs/fs/<subtree>/#` subscription the
+/// write side already affords — not a tool-noun scan, not the agent's fuzzy memory.
+///
+/// Given a Claude Code `PreToolUse` payload, return zero or more
+/// `(topic, body)` read events. The body mirrors the write delta's shape with
+/// `op: "read"` and adds `via: "tool"` so a consumer can tell the read flavor from
+/// the write flavor on the shared noun, and carries the causing `tool_use_id` as
+/// `cause` — attribution is structural (the hook IS the bracket), exactly like the
+/// write camera carrying `tool_call_id`.
+///
+/// HONESTY / SCOPE — load-bearing, also stamped on every event as `scope`:
+/// - This is the ADVISORY, honest-agent tier (handoff wonky-bit #2): it records an
+///   honest agent's Read/Grep/Glob, and a `Bash`+`cat` walks straight around it.
+///   It is NOT the safety boundary. The authoritative version is M2 (cage camera).
+/// - CLAUDE CODE ONLY. Codex's `exec --json` stream does not surface per-file reads
+///   (its items are command/mcp/agent_message — reads are shell-buried), so Codex
+///   reads fall to M2; `codex_map_event` deliberately emits no read events.
+///   opencode's stream does carry its `read`/`grep`/`glob` tool calls, but M1 is
+///   scoped to Claude Code per the handoff; opencode reads also fall to M2.
+/// - Covers SOURCE (A) explicit tool reads only. SOURCE (B) shell-buried reads
+///   (`cat`, `<`, build inputs inside a `Bash` tool call) and SOURCE (C) context
+///   auto-loads (CLAUDE.md, MCP resources, injected reminders) are OUT OF SCOPE
+///   here — this is stamped on each event (`covers: "A"`, `omits: ["B","C"]`) so a
+///   consumer never reads an empty/partial result as "no reads happened."
+/// - Read SHAPE differs by tool: `Read` opens a CONCRETE file (`file_path`); `Grep`
+///   and `Glob` read a search ROOT (a directory/pattern, optional `path`, defaulting
+///   to cwd) — NOT a single opened file. We label the locus (`locus: "file"` vs
+///   `"search-root"`) so a consumer isn't misled into treating a search root as a
+///   read of one file.
+///
+/// M2 (the authoritative cage read camera, sits below the shell — catches source B)
+/// and M3 (the status surface / fast-fail subscribe) are DEFERRED: M2 is
+/// platform-gated (macOS has no free authoritative read-open notification — needs
+/// the Endpoint-Security entitlement + a signed system extension; the unprivileged
+/// seccomp-unotify path is Linux-only) AND gated on coding-agents.md's tool-sandbox
+/// bypass (coding agents are not in elanus's cage today). See the read-provenance
+/// handoff. M1 is the only tier that delivers on macOS now.
+fn claude_read_fs_events(payload: &Value, session: &str) -> Vec<(String, Value)> {
+    let tool = tool_name(payload);
+    // Locus differs: Read opens a concrete file; Grep/Glob read a search root.
+    let (input_key, locus) = match tool.as_str() {
+        "Read" => ("file_path", "file"),
+        "Grep" | "Glob" => ("path", "search-root"),
+        // Not a read-shaped tool — no fs read event (Write/Edit/Bash etc. are the
+        // write camera's or out-of-scope source B).
+        _ => return Vec::new(),
+    };
+    let input = payload.get("tool_input");
+    // Read's path is required; Grep/Glob's `path` is optional (a search rooted at
+    // cwd when absent). Fall back to the hook's cwd so a search still has a locus —
+    // emitted honestly via the `locus` label, never as a concrete file read.
+    let raw_path = input
+        .and_then(|i| i.get(input_key))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let cwd = payload.get("cwd").and_then(Value::as_str);
+    let path = match (raw_path, cwd) {
+        (Some(p), _) => p.to_string(),
+        // No path arg (Grep/Glob search rooted at cwd): use the cwd as the locus.
+        (None, Some(c)) => c.to_string(),
+        // No path and no cwd — nothing honest to key on; skip rather than fabricate.
+        (None, None) => return Vec::new(),
+    };
+    // Mirror the write camera: key on the encoded canonical absolute path. A
+    // relative path (Grep/Glob may pass one) is resolved against the hook's cwd;
+    // canonicalize best-effort, falling back to the lexical join so a path that no
+    // longer exists (or a glob pattern) still keys spatially rather than dropping.
+    let p = PathBuf::from(&path);
+    let abs = if p.is_absolute() {
+        p
+    } else if let Some(c) = cwd {
+        Path::new(c).join(&p)
+    } else {
+        p
+    };
+    let canon = std::fs::canonicalize(&abs).unwrap_or(abs);
+    let tool_use_id = payload
+        .get("tool_use_id")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let cc_session = payload.get("session_id").cloned().unwrap_or(Value::Null);
+    let topic_name = format!("obs/fs/{}", topic::encode_path(&canon));
+    let body = json!({
+        "op": "read",
+        "via": "tool",
+        "tool": tool,
+        // SESSION ATTRIBUTION — the milestone's acceptance ("the human pulls the
+        // read stream FOR THE SESSION"). The spatial obs/fs/<path> topic carries no
+        // session level by design, so stamp the elanus `session` (and the native CC
+        // `cc_session`) onto the body — matching what the write camera's envelope
+        // carries on the shared obs/fs noun (emit_fs_delta stamps session_id via
+        // trace::Ids), so a consumer of obs/fs/<subtree>/# can session-scope READ
+        // events just as it can WRITE events. `cause` alone (the opaque tool_use_id)
+        // is not a session key and does not join the obs/agent/.../tool/Read stream.
+        "session": session,
+        "cc_session": cc_session,
+        // The read locus: a concrete opened file (Read) vs a search root (Grep/Glob).
+        "locus": locus,
+        // The original argument as the agent wrote it (relative or a glob pattern),
+        // kept alongside the canonical topic so a search pattern isn't lost.
+        "arg": path,
+        // Structural attribution: the causing tool_use, exactly as the write camera
+        // carries `tool_call_id`.
+        "cause": tool_use_id,
+        // HONEST SCOPE stamped on the event (see fn doc): advisory, not the safety
+        // boundary; covers source (A) only; (B) shell-buried + (C) context
+        // auto-loads are NOT witnessed here — never read an empty result as
+        // "no reads happened."
+        "tier": "advisory",
+        "covers": "A",
+        "omits": ["B", "C"],
+        "ts": now_iso(),
+    });
+    vec![(topic_name, body)]
 }
 
 /// Fallback mapping for an event no adapter explicitly modeled (or whose adapter
@@ -3792,6 +3933,109 @@ mod tests {
                 .contains("permission denied")
         );
     }
+
+    // ── READ CAMERA (M1, read-provenance handoff) ───────────────────────────
+
+    #[test]
+    fn read_tool_projects_an_obs_fs_read_event() {
+        // A Read tool call projects an obs/fs/<encoded-canonical-path> event in the
+        // WRITE camera's spatial noun, with op:"read", via:"tool", and the causing
+        // tool_use id as `cause` — so write and read share `obs/fs/<subtree>/#`.
+        let payload = json!({
+            "session_id": "cc-123",
+            "cwd": "/tmp/proj",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_use_id": "toolu_ABC",
+            "tool_input": { "file_path": "/tmp/proj/notes.md" },
+        });
+        let events = claude_read_fs_events(&payload, "sess-42");
+        assert_eq!(events.len(), 1, "one read locus for a Read");
+        let (topic_name, body) = &events[0];
+        // Same spatial topic shape the write camera emits (encode_path, leading
+        // slash dropped) — a consumer's obs/fs/tmp/proj/# matches both flavors.
+        assert_eq!(
+            *topic_name,
+            format!("obs/fs/{}", topic::encode_path(Path::new("/tmp/proj/notes.md")))
+        );
+        assert!(topic::valid_name(topic_name));
+        assert!(topic::matches("obs/fs/tmp/proj/#", topic_name));
+        assert_eq!(body["op"], "read");
+        assert_eq!(body["via"], "tool");
+        assert_eq!(body["tool"], "Read");
+        assert_eq!(body["locus"], "file");
+        // Structural attribution: the causing tool_use, like the write camera's
+        // tool_call_id.
+        assert_eq!(body["cause"], "toolu_ABC");
+        // Honest scope stamped on the event so an empty read stream is never
+        // misread as "no reads happened".
+        assert_eq!(body["tier"], "advisory");
+        assert_eq!(body["covers"], "A");
+        assert_eq!(body["omits"], json!(["B", "C"]));
+        // SESSION ATTRIBUTION — the milestone's acceptance ("pull the read stream
+        // FOR THE SESSION"). The spatial obs/fs/<path> topic has no session level,
+        // so the body must carry the elanus `session` (matching the write camera's
+        // envelope on the shared noun) and the native CC `cc_session`.
+        assert_eq!(body["session"], "sess-42");
+        assert_eq!(body["cc_session"], "cc-123");
+    }
+
+    #[test]
+    fn grep_and_glob_project_honestly_as_search_roots() {
+        // Grep/Glob read a search ROOT (a directory/pattern), NOT a single opened
+        // file. We emit the path arg as the locus and label it search-root so a
+        // consumer isn't misled into treating it as a concrete file read.
+        let grep = json!({
+            "cwd": "/tmp/proj",
+            "tool_name": "Grep",
+            "tool_use_id": "toolu_G",
+            "tool_input": { "pattern": "TODO", "path": "/tmp/proj/src" },
+        });
+        let g = claude_read_fs_events(&grep, "sess-g");
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].1["locus"], "search-root");
+        assert_eq!(g[0].1["op"], "read");
+        assert_eq!(g[0].1["tool"], "Grep");
+        assert!(topic::matches("obs/fs/tmp/proj/#", &g[0].0));
+
+        // Glob with no `path` arg searches from cwd — emit honestly keyed on cwd
+        // (the search locus), never fabricating a concrete file.
+        let glob = json!({
+            "cwd": "/tmp/proj",
+            "tool_name": "Glob",
+            "tool_use_id": "toolu_X",
+            "tool_input": { "pattern": "**/*.rs" },
+        });
+        let gl = claude_read_fs_events(&glob, "sess-gl");
+        assert_eq!(gl.len(), 1);
+        assert_eq!(gl[0].1["locus"], "search-root");
+        assert_eq!(
+            gl[0].0,
+            format!("obs/fs/{}", topic::encode_path(Path::new("/tmp/proj")))
+        );
+    }
+
+    #[test]
+    fn non_read_tools_project_no_fs_read_event() {
+        // Bash/Write/Edit are NOT read-shaped: Bash's reads are shell-buried
+        // (source B, M2's job); Write/Edit are the write camera. No read event.
+        for tool in ["Bash", "Write", "Edit", "WebFetch"] {
+            let payload = json!({
+                "cwd": "/tmp/proj",
+                "tool_name": tool,
+                "tool_use_id": "toolu_N",
+                "tool_input": { "command": "cat /etc/passwd", "file_path": "/x" },
+            });
+            assert!(
+                claude_read_fs_events(&payload, "sess-n").is_empty(),
+                "{tool} must not project a read event"
+            );
+        }
+    }
+
+    // The read flavor's default-none recorder property (it inherits obs/fs/#) is
+    // asserted in recorder.rs::tests::read_camera_flavor_inherits_default_none,
+    // where the recorder internals are in scope.
 
     #[test]
     fn map_user_prompt_and_stop() {

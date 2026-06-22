@@ -181,4 +181,17 @@ mod tests {
         assert_eq!(r.sink_for("obs/agent/main/s1/fs/summary"), Sink::Trace);
         assert_eq!(r.sink_for("signal/pain"), Sink::Trace);
     }
+
+    #[test]
+    fn read_camera_flavor_inherits_default_none() {
+        // Read-provenance M1: the read flavor (op:"read") lands on the SAME
+        // obs/fs/<path> noun as the write camera, so it inherits obs/fs/#'s default
+        // Sink::None — opt-in volume per subtree, NEVER recorded-by-default. This
+        // guards against a regression that makes reads always-on.
+        let r = Recorder {
+            rules: Recorder::default_rules(),
+        };
+        // The exact topic shape claude_read_fs_events emits (encode_path form).
+        assert_eq!(r.sink_for("obs/fs/Users/tim/proj/notes.md"), Sink::None);
+    }
 }
