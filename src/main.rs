@@ -1006,7 +1006,15 @@ fn run(cli: Cli) -> Result<()> {
                     // projection (code_projection); empty until the daemon (this
                     // build) has projected at least once.
                     let want_json = rest.iter().any(|a| a == "--json");
-                    let sessions = code_projection::list_sessions(&root)?;
+                    // Grouped by default (one row per native thread; manual
+                    // --resume relaunches fold into one). --raw/--ungrouped emits
+                    // the per-incarnation rows (the old behaviour / debugging).
+                    let want_raw = rest.iter().any(|a| a == "--raw" || a == "--ungrouped");
+                    let sessions = if want_raw {
+                        code_projection::list_sessions_raw(&root)?
+                    } else {
+                        code_projection::list_sessions(&root)?
+                    };
                     if want_json {
                         println!("{}", serde_json::to_string_pretty(&sessions)?);
                     } else if sessions.is_empty() {
@@ -1036,6 +1044,13 @@ fn run(cli: Cli) -> Result<()> {
                 "session" => {
                     // Observability M2: one session's detail (stats, timeline,
                     // resume command, children). `elanus code session <id> [--json]`.
+                    // Thread-grouping (TG1): <id> may be any incarnation's elanus
+                    // id OR a native thread_key; the detail shows the UNIONED
+                    // thread timeline across all incarnations by default. The
+                    // richer per-incarnation web rendering (TG3 CodeSessions.tsx
+                    // expandable incarnations row) is DEFERRED — the --json wire is
+                    // a backward-compatible superset so the existing UI renders the
+                    // grouped threads unchanged.
                     let id = rest.first().map(String::as_str).unwrap_or("");
                     if id.is_empty() {
                         anyhow::bail!("usage: elanus code session <id> [--json]");
