@@ -1341,11 +1341,61 @@ pub fn inbox_cmd(root: &Root, args: &[String]) -> Result<()> {
 // authorization here: a claim is advisory metadata its peers read to route around
 // conflicts, never a lock (recording one blocks no one).
 
+// ── SA1: the workdir IS the room (ambient claims, no flag) ────────────────────
+//
+// docs/handoffs/sibling-awareness.md SA1. Two of the owner's agents in the SAME
+// checkout should see each other with ZERO flags. We make that structural:
+// absent an explicit `--room <id>`, a session's room defaults to a STABLE id
+// derived from its CANONICAL workdir. Same checkout → same id → same room →
+// siblings coordinate on turn one. An explicit `--room` still OVERRIDES (e.g. a
+// planner grouping workers across directories). A solo session in a unique dir
+// gets a room with no peers — identical to today, so the solo case never
+// regresses. This is advisory coordination, never authorization (homogeneous
+// authority, docs/security.md): the room is just the scope a session reads its
+// roommates' claims from; nothing is locked, no agent is blocked by a sibling.
+
+/// Canonicalize a workdir to a stable absolute path, falling back to the lexical
+/// path when canonicalize fails (a dir that was removed, or a permission quirk) so
+/// the derived room id is still deterministic for the same input. Two sessions in
+/// the same checkout resolve to the same canonical path → the same room.
+fn canonical_workdir(workdir: &Path) -> PathBuf {
+    std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf())
+}
+
+/// Derive the stable default room id for a canonical workdir. The id only has to
+/// be stable for the SAME path within one elanus install (it scopes a ledger
+/// query, never a bus topic), and short + string-safe. We hash the canonical path
+/// with a deterministic FNV-1a (NOT DefaultHasher — its hashing is not guaranteed
+/// stable across toolchains, and two concurrently-running sessions must agree) and
+/// prefix `wd-` so a workdir-room is visibly distinct from an explicit `--room`.
+fn workdir_room_id(canonical: &Path) -> String {
+    // FNV-1a over the path bytes — deterministic across processes and builds.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in canonical.as_os_str().to_string_lossy().as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("wd-{hash:016x}")
+}
+
+/// The room a session belongs to, given its launch `--room` (if any) and its
+/// workdir. An explicit room wins; otherwise default to the workdir-derived room
+/// (SA1). Always Some — every session is in a room now (a solo session's room
+/// simply has no peers).
+fn resolve_room(explicit: Option<&str>, workdir: &Path) -> String {
+    match explicit {
+        Some(r) if !r.trim().is_empty() => r.trim().to_string(),
+        _ => workdir_room_id(&canonical_workdir(workdir)),
+    }
+}
+
 /// Resolve the running session's identity (session + agent noun) and its
 /// coordination room from the env the launcher set plus its durable record. Errors
-/// cleanly when run outside a coding session, or when the session was not launched
-/// with `--room` (no room → no peers to coordinate with). The room is read from the
-/// record (the session's own), never supplied by the caller.
+/// cleanly when run outside a coding session. SA1: a session no longer needs a
+/// `--room` flag — when its record carries no explicit room it derives the default
+/// workdir-room from its recorded workdir, so `claim`/`unclaim`/`claims` work in
+/// the same checkout with no flags. The room is the session's own (read from the
+/// record or derived from its own workdir), never supplied by the caller.
 fn session_room_identity(root: &Root) -> Result<(String, String)> {
     let session = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
     let Some(session) = session else {
@@ -1364,12 +1414,13 @@ fn session_room_identity(root: &Root) -> Result<(String, String)> {
                  first turn)"
             )
         })?;
-    let Some(room) = rec.room.filter(|r| !r.is_empty()) else {
-        bail!(
-            "session {session:?} is not in a coordination room \
-             (launch it with `elanus code <tool> --room <id>` to share edit claims \
-             with peers)"
-        );
+    // SA1: an absent/empty room is no longer an error — derive the default
+    // workdir-room from the session's own recorded workdir, so siblings in the
+    // same checkout coordinate with zero flags. An explicit room on the record
+    // (set at launch from `--room`) still wins.
+    let room = match rec.room.filter(|r| !r.is_empty()) {
+        Some(r) => r,
+        None => resolve_room(None, Path::new(&rec.workdir)),
     };
     Ok((session, room))
 }
@@ -1493,15 +1544,25 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
         .unwrap_or_default();
     let note = codesession::get_note(root, session).ok().flatten();
 
-    // M5: the session's roommates' current advisory edit claims (excluding its
+    // M5/SA1: the session's roommates' current advisory edit claims (excluding its
     // own). The room comes from the session's OWN durable record — never an
-    // argument — so a session only ever sees the claims of the room it is in. A
-    // solo session (no room) has no peers, so this is empty.
-    let room = codesession::read_record(root, session)
-        .ok()
-        .flatten()
-        .and_then(|r| r.room)
-        .unwrap_or_default();
+    // argument. SA1: when the record carries no explicit room, derive the default
+    // workdir-room from the recorded workdir, so siblings in the same checkout see
+    // each other with zero flags. A genuinely solo session's room simply has no
+    // peers.
+    let rec = codesession::read_record(root, session).ok().flatten();
+    let workdir = rec.as_ref().map(|r| r.workdir.clone()).unwrap_or_default();
+    let room = rec
+        .as_ref()
+        .and_then(|r| r.room.clone())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| {
+            if workdir.is_empty() {
+                String::new()
+            } else {
+                resolve_room(None, Path::new(&workdir))
+            }
+        });
     let peer_claims = if room.is_empty() {
         Vec::new()
     } else {
@@ -1510,11 +1571,79 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
             .unwrap_or_default()
     };
 
-    if unseen.is_empty() && note.is_none() && peer_claims.is_empty() {
+    // SA2: the LIVE siblings sharing this session's workdir (roster + liveness from
+    // `code_sessions`, honest liveness — stale/dead sessions age out). "What each
+    // is touching" is cross-referenced from SA1's per-path claims below (per-file
+    // touch is not projected — docs/handoffs/sibling-awareness.md data note). A
+    // solo session has no live siblings, so this stays empty and the turn is quiet.
+    //
+    // SA3 (touching-a-file IS the claim — an obs/fs bus subscriber that auto-creates
+    // claims) is DEFERRED: it is a new long-running runtime component whose read
+    // half rides the not-yet-shipped read camera, out of scope for this read-only
+    // injection change. Until it lands, "what each sibling is touching" is only as
+    // fresh as the claims an agent volunteered via `elanus code claim`.
+    let live_siblings = if workdir.is_empty() {
+        Vec::new()
+    } else {
+        codesession::live_siblings(root, session, &workdir)
+    };
+
+    if unseen.is_empty() && note.is_none() && peer_claims.is_empty() && live_siblings.is_empty() {
         return None;
     }
 
-    let mut out = String::from("[elanus] ");
+    let mut out = String::new();
+
+    // SA2: PREPEND one line naming the live siblings in this workdir, and — where a
+    // claim tells us — what each is touching. One line (count + the one or two most
+    // relevant siblings, most-recently-active first), so a busy directory never
+    // floods the turn. Quiet when alone: this block is absent for a solo session.
+    if !live_siblings.is_empty() {
+        // Map each sibling to its most recent claimed path (if any) so we can say
+        // "last editing <path>". peer_claims is ordered oldest→newest, so the last
+        // match wins. Per-file touch is only as fresh as SA1's claims (SA3 deferred).
+        let mut last_path: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for c in &peer_claims {
+            last_path.insert(c.session.as_str(), c.path.as_str());
+        }
+        const MAX_NAMED: usize = 2;
+        let n = live_siblings.len();
+        out.push_str(&format!(
+            "[elanus siblings] {n} other coding session(s) active here (advisory — \
+divide the work, nothing is locked): "
+        ));
+        let named: Vec<String> = live_siblings
+            .iter()
+            .take(MAX_NAMED)
+            .map(|s| {
+                let touching = last_path
+                    .get(s.session.as_str())
+                    .map(|p| format!(", last editing {}", clip(p, 200)))
+                    .unwrap_or_default();
+                format!("{} ({}){}", s.session, s.agent_noun, touching)
+            })
+            .collect();
+        out.push_str(&named.join("; "));
+        if n > MAX_NAMED {
+            out.push_str(&format!("; …and {} more", n - MAX_NAMED));
+        }
+        // SA4: a sibling shares this WORKING TREE → suggest isolating with a git
+        // worktree (advisory; never auto-creates, never blocks — homogeneous
+        // authority). Scoped to "same canonical workdir" (live_siblings already
+        // matched on it). TODO(SA4): when both sessions are distinct *worktrees* of
+        // one repo they share no index to collide on — skip the nudge there by
+        // comparing `git rev-parse --git-common-dir` / worktree paths. Distinguishing
+        // worktrees is non-trivial (needs a git probe), so it is deferred per the
+        // handoff's "scope to same canonical workdir" fallback.
+        out.push_str(
+            "\n  You share this working tree with the session(s) above; if you will edit \
+overlapping files, consider isolating in a separate `git worktree` to avoid a shared-index \
+collision (advisory).",
+        );
+        out.push('\n');
+    }
+
+    out.push_str("[elanus] ");
     if unseen.is_empty() {
         out.push_str("Your inbox has no new messages.");
     } else {
@@ -1666,18 +1795,26 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
         .with_context(|| format!("minting the session credential for {principal}"))?;
     let bus_token = token.secret.clone();
 
-    // M5: if launched with `--room <id>`, set the room on the durable record (so a
-    // later resume/claim derives it from the session's own identity) and join the
-    // room (membership carries this launcher's pid for crash-release). The native
-    // session id isn't known yet, so set_room writes/stubs the record's room and
-    // the later native-id upsert preserves it (COALESCE). Best-effort: a room-setup
-    // failure must not break the launch — the session just runs without coordination.
-    if let Some(room) = &room {
-        if let Err(e) = codesession::set_room(root, &session, room) {
+    // SA1: every session is in a room now. An explicit `--room <id>` wins;
+    // otherwise the room defaults to a stable id derived from the CANONICAL
+    // workdir, so two `elanus code` launched in the SAME checkout with NO flags
+    // see each other (docs/handoffs/sibling-awareness.md). This is advisory
+    // coordination, not authorization — a solo session in a unique dir gets a room
+    // with no peers, identical to today.
+    //
+    // We compute the workdir HERE (the launcher's cwd, the dir the child runs in)
+    // so the derived room matches what `session_room_identity` later derives from
+    // the recorded workdir. The native session id isn't known yet, so set_room
+    // writes/stubs the record's room and the later native-id upsert preserves it
+    // (COALESCE). Best-effort: a room-setup failure must not break the launch.
+    let launch_workdir = std::env::current_dir().unwrap_or_else(|_| root.dir.clone());
+    let room = resolve_room(room.as_deref(), &launch_workdir);
+    {
+        if let Err(e) = codesession::set_room(root, &session, &room) {
             eprintln!("[code] setting room {room} (continuing without coordination): {e:#}");
         }
         if let Err(e) =
-            codesession::join_room(root, room, &session, &agent, std::process::id() as i32)
+            codesession::join_room(root, &room, &session, &agent, std::process::id() as i32)
         {
             eprintln!("[code] joining room {room} (continuing without coordination): {e:#}");
         } else {
@@ -5501,8 +5638,15 @@ mod tests {
     }
 
     /// Record a session WITH a room, and join it, so turn_injection can derive the
-    /// room from the record and read peer claims.
+    /// room from the record and read peer claims. Workdir `/tmp` (SA2 then treats
+    /// two `/tmp` members as workdir-siblings — use `m5_member_wd` to separate).
     fn m5_member(root: &Root, room: &str, sess: &str) {
+        m5_member_wd(root, room, sess, "/tmp");
+    }
+
+    /// Like `m5_member` but with an explicit workdir, so a test can keep two
+    /// sessions out of each other's SA2 workdir-sibling roster.
+    fn m5_member_wd(root: &Root, room: &str, sess: &str, workdir: &str) {
         codesession::upsert_record(
             root,
             &codesession::SessionRecord {
@@ -5510,7 +5654,7 @@ mod tests {
                 native_session: "t".into(),
                 tool: "codex".into(),
                 agent_noun: "codex".into(),
-                workdir: "/tmp".into(),
+                workdir: workdir.into(),
                 room: Some(room.into()),
             },
         )
@@ -5555,8 +5699,10 @@ mod tests {
     fn turn_injection_room_isolation_no_cross_room_claims() {
         // A session in R1 never sees an R2 claim in its injection.
         let root = m3_tmp_root();
-        m5_member(&root, "R1", "code-r1aa0001");
-        m5_member(&root, "R2", "code-r2aa0001");
+        // Distinct workdirs so SA2 does not make them workdir-siblings — this test
+        // isolates the CLAIM-room boundary, not the workdir roster.
+        m5_member_wd(&root, "R1", "code-r1aa0001", "/tmp");
+        m5_member_wd(&root, "R2", "code-r2aa0001", "/var/tmp");
         codesession::add_claim(&root, "R2", "code-r2aa0001", "secret/r2.rs").unwrap();
         // The R1 session has no peers (its only roommate is itself), so a quiet
         // turn injects nothing about claims and never leaks R2's claim.
@@ -5596,12 +5742,163 @@ mod tests {
         // A session launched without --room (room:None) has no peers; turn_injection
         // surfaces no claims (and is None on an otherwise-quiet turn).
         let root = m3_tmp_root();
-        m3_record(&root, "code-solo0001", "codex"); // room: None
+        m3_record(&root, "code-solo0001", "codex"); // room: None, workdir /tmp
         // Even if some other session (in a room) holds a claim, a roomless session
-        // sees nothing.
-        m5_member(&root, "other-room", "code-elsewhere");
+        // in a DIFFERENT workdir sees nothing (a distinct dir so SA2 does not make
+        // them workdir-siblings — this test is about claim-room isolation).
+        m5_member_wd(&root, "other-room", "code-elsewhere", "/var/tmp");
         codesession::add_claim(&root, "other-room", "code-elsewhere", "x.rs").unwrap();
         assert!(turn_injection(&root, "codex", "code-solo0001").is_none());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── SA1: the workdir is the room (ambient claims, no flag) ────────────────
+
+    #[test]
+    fn sa1_resolve_room_derives_from_canonical_workdir() {
+        // No explicit room → a stable, workdir-derived id with the `wd-` marker.
+        let dir = std::env::temp_dir();
+        let r1 = resolve_room(None, &dir);
+        let r2 = resolve_room(None, &dir);
+        assert!(r1.starts_with("wd-"), "default room is workdir-derived: {r1}");
+        assert_eq!(r1, r2, "the same workdir must derive the SAME room (stable)");
+        // A different dir derives a different room.
+        let other = resolve_room(None, Path::new("/"));
+        assert_ne!(r1, other, "distinct workdirs derive distinct rooms");
+    }
+
+    #[test]
+    fn sa1_explicit_room_overrides_workdir_default() {
+        let dir = std::env::temp_dir();
+        let explicit = resolve_room(Some("team-1"), &dir);
+        assert_eq!(explicit, "team-1", "an explicit --room wins over the workdir");
+        // A blank/whitespace explicit value falls back to the workdir default.
+        let blank = resolve_room(Some("   "), &dir);
+        assert!(blank.starts_with("wd-"), "a blank --room falls back to workdir: {blank}");
+    }
+
+    #[test]
+    fn sa1_two_flagless_sessions_in_same_dir_share_a_room_and_see_claims() {
+        // The SA1 acceptance: two sessions recorded with NO room but the SAME
+        // workdir derive the SAME room, so one's claim is the other's peer claim —
+        // with zero flags. (We use a real, canonicalizable shared dir.)
+        let root = m3_tmp_root();
+        let shared = root.dir.join("checkout");
+        std::fs::create_dir_all(&shared).unwrap();
+        let wd = shared.display().to_string();
+        // Both sessions: room: None (no --room), same workdir.
+        for sess in ["code-amb00001", "code-amb00002"] {
+            codesession::upsert_record(
+                &root,
+                &codesession::SessionRecord {
+                    elanus_session: sess.into(),
+                    native_session: "t".into(),
+                    tool: "codex".into(),
+                    agent_noun: "codex".into(),
+                    workdir: wd.clone(),
+                    room: None,
+                },
+            )
+            .unwrap();
+        }
+        // Session 1 claims a path via the derived room (session_room_identity is
+        // env-driven; here we derive the room directly and add the claim).
+        let room = resolve_room(None, &shared);
+        codesession::add_claim(&root, &room, "code-amb00001", "src/foo.rs").unwrap();
+        // Session 2's injection surfaces it as a peer claim — no flags anywhere.
+        let inj = turn_injection(&root, "codex", "code-amb00002").unwrap();
+        assert!(
+            inj.contains("code-amb00001 is editing src/foo.rs"),
+            "a flagless same-dir sibling's claim must surface: {inj}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── SA2: live siblings in the per-turn injection ──────────────────────────
+
+    #[test]
+    fn sa2_injection_names_a_live_sibling_in_the_same_workdir() {
+        // With a live sibling in the same workdir, the block prepends a one-line
+        // siblings roster naming the other session and (from its claim) what it is
+        // touching.
+        let root = m3_tmp_root();
+        let shared = root.dir.join("repo");
+        std::fs::create_dir_all(&shared).unwrap();
+        let wd = shared.display().to_string();
+        // A is a live sibling of viewer B (both fresh, this process owns both pids).
+        m5_member_wd(&root, "room-x", "code-livea001", &wd);
+        m5_member_wd(&root, "room-x", "code-liveb002", &wd);
+        codesession::add_claim(&root, "room-x", "code-livea001", "ui/App.tsx").unwrap();
+        let b = turn_injection(&root, "codex", "code-liveb002").unwrap();
+        assert!(
+            b.contains("[elanus siblings]"),
+            "the siblings roster line must appear: {b}"
+        );
+        assert!(b.contains("code-livea001"), "names the live sibling: {b}");
+        assert!(
+            b.contains("last editing ui/App.tsx"),
+            "surfaces what the sibling is touching (from its claim): {b}"
+        );
+        assert!(
+            b.contains("git worktree"),
+            "SA4: a same-tree sibling triggers the worktree nudge: {b}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa2_solo_session_block_is_unchanged_no_sibling_line() {
+        // A genuinely solo session (unique workdir, no sibling) gets NO siblings
+        // line — the block is unchanged from M3/M5 (and None on a quiet turn).
+        let root = m3_tmp_root();
+        let shared = root.dir.join("alone");
+        std::fs::create_dir_all(&shared).unwrap();
+        let wd = shared.display().to_string();
+        m5_member_wd(&root, "room-solo", "code-alone001", &wd);
+        // Quiet turn, no siblings → nothing to say.
+        assert!(turn_injection(&root, "codex", "code-alone001").is_none());
+        // Give it an inbox message: the block appears but carries NO siblings line.
+        m3_deliver(&root, "codex", "code-alone001", "owner", "hi");
+        let inj = turn_injection(&root, "codex", "code-alone001").unwrap();
+        assert!(inj.starts_with("[elanus]"), "solo block is unchanged: {inj}");
+        assert!(
+            !inj.contains("[elanus siblings]"),
+            "a solo session must have no siblings line: {inj}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa2_dead_sibling_is_excluded_from_the_roster() {
+        // A sibling whose owner pid is dead (pid 1 is not us; use an impossible pid)
+        // must NOT appear in the roster — stale-session hygiene.
+        let root = m3_tmp_root();
+        let shared = root.dir.join("repo2");
+        std::fs::create_dir_all(&shared).unwrap();
+        let wd = shared.display().to_string();
+        // Viewer, live.
+        m5_member_wd(&root, "room-d", "code-viewerd1", &wd);
+        // A "dead" sibling: record + a membership row with a pid that cannot be
+        // alive. join_room takes a pid; pass one that pid_alive rejects.
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-deadsib1".into(),
+                native_session: "t".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: wd.clone(),
+                room: Some("room-d".into()),
+            },
+        )
+        .unwrap();
+        // A pid that is not alive (i32::MAX is never a live process here).
+        codesession::join_room(&root, "room-d", "code-deadsib1", "codex", i32::MAX).unwrap();
+        let live = codesession::live_siblings(&root, "code-viewerd1", &wd);
+        assert!(
+            !live.iter().any(|s| s.session == "code-deadsib1"),
+            "a dead-pid sibling must be excluded: {live:?}"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 

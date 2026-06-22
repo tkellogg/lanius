@@ -117,6 +117,132 @@ pub fn upsert_record(root: &Root, rec: &SessionRecord) -> Result<()> {
     Ok(())
 }
 
+// ── SA2: live siblings in the same workdir (the per-turn injection roster) ─────
+//
+// docs/handoffs/sibling-awareness.md SA2. The per-turn injection prepends one
+// line naming the OTHER live sessions in this session's workdir. The roster +
+// liveness come from `code_sessions` (which carries `workdir` + `last_active` —
+// the column the upsert bumps but `SessionRecord`/`read_record` don't surface);
+// rather than widen `SessionRecord` (and every struct literal across the tree),
+// SA2 uses this DEDICATED sibling query.
+//
+// LIVENESS, DEFINED HONESTLY (the handoff guardrail): a sibling counts as LIVE
+// only if it is BOTH plausibly current and not a crashed ghost:
+//   • `last_active` within a freshness window (LIVE_WINDOW_SECS), AND
+//   • its room-membership `owner_pid` is still alive (signal-0 probe), when a
+//     membership row exists. A SIGKILL'd session whose pid is gone ages out
+//     immediately; a session with no membership row falls back to the time
+//     window alone. Either signal going stale drops it from the roster, so a
+//     dead session never haunts a sibling's injection (stale-session hygiene).
+
+/// How fresh a session's `last_active` must be to count as a live sibling. A
+/// crashed session whose `last_active` is older than this ages out even if its
+/// owner pid is somehow still reported (belt-and-suspenders with the pid probe).
+const LIVE_WINDOW_SECS: i64 = 15 * 60;
+
+/// One live sibling sharing this session's workdir (SA2 roster entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveSibling {
+    /// The sibling session id (`code-<id>`).
+    pub session: String,
+    /// The obs noun it runs under (`claude-code` | `codex`) — shown in the line.
+    pub agent_noun: String,
+}
+
+/// List the LIVE sibling sessions sharing `viewer`'s canonical workdir (SA2). A
+/// sibling is any OTHER `code_sessions` row whose workdir canonicalizes to the
+/// same path AND that is live by the honest definition above. `viewer` is
+/// excluded (a session is never its own sibling). Ordered most-recently-active
+/// first so the capped injection line surfaces the most relevant peers. Returns an
+/// empty list (never an error to the caller) so a quiet/solo turn stays quiet.
+pub fn live_siblings(root: &Root, viewer: &str, viewer_workdir: &str) -> Vec<LiveSibling> {
+    let want = canon_str(viewer_workdir);
+    let Ok(conn) = crate::db::open(root) else {
+        return Vec::new();
+    };
+    if crate::db::init_schema(&conn).is_err() {
+        return Vec::new();
+    }
+    // Candidate rows: every recorded session except the viewer. We filter by
+    // canonical workdir + liveness in Rust (canonicalization and the pid probe
+    // are not SQL). Pull owner_pid from the room membership (may be absent).
+    let mut stmt = match conn.prepare(
+        "SELECT s.elanus_session, s.agent_noun, s.workdir, s.last_active, m.owner_pid
+           FROM code_sessions s
+           LEFT JOIN code_room_members m ON m.session = s.elanus_session
+          WHERE s.elanus_session <> ?1",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map([viewer], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<i32>>(4)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    let now = chrono_now_secs();
+    let mut out: Vec<(i64, LiveSibling)> = Vec::new();
+    for row in rows.flatten() {
+        let (session, agent_noun, workdir, last_active, owner_pid) = row;
+        if canon_str(&workdir) != want {
+            continue; // a different checkout — not a sibling here
+        }
+        let last_secs = iso_to_secs(&last_active);
+        let fresh = match last_secs {
+            Some(t) => now.saturating_sub(t) <= LIVE_WINDOW_SECS,
+            None => false, // an unparseable timestamp is not trusted as live
+        };
+        if !fresh {
+            continue; // stale → aged out, never haunts the injection
+        }
+        // If a membership row exists, its owner pid must still be alive; absent a
+        // membership row, the freshness window alone governs (older records).
+        if let Some(pid) = owner_pid {
+            if !pid_alive(pid) {
+                continue; // a SIGKILL'd ghost — drop it
+            }
+        }
+        out.push((last_secs.unwrap_or(0), LiveSibling { session, agent_noun }));
+    }
+    // Most-recently-active first.
+    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.session.cmp(&b.1.session)));
+    out.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Canonicalize a workdir string to a comparable absolute path string, falling
+/// back to the raw string when canonicalize fails (a removed dir) so two sessions
+/// recorded with the same raw workdir still compare equal.
+fn canon_str(workdir: &str) -> String {
+    std::fs::canonicalize(workdir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| workdir.to_string())
+}
+
+/// Current unix time in seconds (best-effort; 0 if the clock is before the epoch).
+fn chrono_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse one of our `strftime('%Y-%m-%dT%H:%M:%fZ')` timestamps to unix seconds.
+/// None on any parse failure (treated as "not live" by the caller).
+fn iso_to_secs(ts: &str) -> Option<i64> {
+    // The stored format is RFC3339-ish (`2026-06-22T12:34:56.789Z`). Parse with
+    // chrono, which the projection already depends on.
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
 /// Read a durable record by elanus session id. None if there is no such session
 /// (never launched, or launched but the native id was never observed).
 pub fn read_record(root: &Root, elanus_session: &str) -> Result<Option<SessionRecord>> {
@@ -1989,6 +2115,103 @@ mod tests {
         assert!(
             read(&root, "code-child-of-corrupt").is_none(),
             "refused mint must not write a child token"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── SA2: live-sibling roster + honest liveness ────────────────────────────
+
+    fn sa2_record(root: &Root, sess: &str, workdir: &str, room: &str, pid: i32) {
+        upsert_record(
+            root,
+            &SessionRecord {
+                elanus_session: sess.into(),
+                native_session: "t".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: workdir.into(),
+                room: Some(room.into()),
+            },
+        )
+        .unwrap();
+        join_room(root, room, sess, "codex", pid).unwrap();
+    }
+
+    /// Force a session's `last_active` to an old value so the freshness window
+    /// ages it out (stale-session hygiene without a real elapsed wait).
+    fn backdate(root: &Root, sess: &str) {
+        let conn = crate::db::open(root).unwrap();
+        conn.execute(
+            "UPDATE code_sessions SET last_active = '2000-01-01T00:00:00.000Z' \
+             WHERE elanus_session = ?1",
+            [sess],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn live_siblings_lists_a_fresh_same_workdir_peer() {
+        let root = tmp_root();
+        let wd = root.dir.join("co").display().to_string();
+        std::fs::create_dir_all(&wd).unwrap();
+        let me = std::process::id() as i32;
+        sa2_record(&root, "code-view00001", &wd, "r", me);
+        sa2_record(&root, "code-peer00002", &wd, "r", me);
+        let sibs = live_siblings(&root, "code-view00001", &wd);
+        assert_eq!(sibs.len(), 1, "exactly one live sibling: {sibs:?}");
+        assert_eq!(sibs[0].session, "code-peer00002");
+        // The viewer is never its own sibling.
+        assert!(!sibs.iter().any(|s| s.session == "code-view00001"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn live_siblings_excludes_a_different_workdir() {
+        let root = tmp_root();
+        let wd_a = root.dir.join("a").display().to_string();
+        let wd_b = root.dir.join("b").display().to_string();
+        std::fs::create_dir_all(&wd_a).unwrap();
+        std::fs::create_dir_all(&wd_b).unwrap();
+        let me = std::process::id() as i32;
+        sa2_record(&root, "code-aaa00001", &wd_a, "r", me);
+        sa2_record(&root, "code-bbb00002", &wd_b, "r", me);
+        assert!(
+            live_siblings(&root, "code-aaa00001", &wd_a).is_empty(),
+            "a peer in a different workdir is not a sibling"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn live_siblings_ages_out_a_stale_session() {
+        let root = tmp_root();
+        let wd = root.dir.join("co").display().to_string();
+        std::fs::create_dir_all(&wd).unwrap();
+        let me = std::process::id() as i32;
+        sa2_record(&root, "code-view00001", &wd, "r", me);
+        sa2_record(&root, "code-stale0002", &wd, "r", me);
+        backdate(&root, "code-stale0002"); // last_active far in the past
+        let sibs = live_siblings(&root, "code-view00001", &wd);
+        assert!(
+            sibs.is_empty(),
+            "a session past the freshness window must age out: {sibs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn live_siblings_excludes_a_dead_pid() {
+        let root = tmp_root();
+        let wd = root.dir.join("co").display().to_string();
+        std::fs::create_dir_all(&wd).unwrap();
+        let me = std::process::id() as i32;
+        sa2_record(&root, "code-view00001", &wd, "r", me);
+        // Fresh last_active but a pid that is not alive → excluded.
+        sa2_record(&root, "code-dead00002", &wd, "r", i32::MAX);
+        let sibs = live_siblings(&root, "code-view00001", &wd);
+        assert!(
+            !sibs.iter().any(|s| s.session == "code-dead00002"),
+            "a dead-pid sibling must be excluded: {sibs:?}"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
