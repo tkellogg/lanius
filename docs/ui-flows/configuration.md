@@ -44,10 +44,20 @@ it exists.
 **Steps.**
 1. Click `.nav-setup` (opens `#view-setup`), or `#nav-new-agent` /
    `#welcome-new` (both call `selectSetup()` then focus `#na-name`).
-2. Type a name into `#na-name` (e.g. `kestrel`).
-3. Optionally type a model into `#na-model` (datalist `#model-suggestions`;
-   default is `claude-sonnet-4-6`).
-4. Click `#na-create`.
+2. Type a name into `#na-name` (e.g. `kestrel`). **Create is disabled until
+   this field is non-empty** (M3); Enter in any wizard field submits the form.
+3. Optionally choose a model from `#na-model`. This is now a real picker
+   (`ModelField`, M3) populated from `/api/admin/models`:
+   - when the provider list is loaded, the field is a `<select>` with a final
+     `custom…` escape row that reveals a text input (for Tim's typo-prone ids);
+   - when the list is empty (no API key, provider unavailable), the field
+     renders an `<input>` plus an inline `provider list unavailable — type a
+     model id or set an API key` note at the field. `#na-model` always
+     identifies the input element for `fill()`.
+4. `#na-workdir` runs a server-side exists/writable check on blur (M3); a
+   typo'd path shows `path does not exist` / `not a directory` /
+   `not writable by the agent` inline before Create is clicked.
+5. Click `#na-create` (or press Enter).
 
 **Observable expectation.** On success the app does NOT leave you on setup with a
 flash — it **routes to the converse view for the new agent** (`selectAgent(name,
@@ -78,18 +88,20 @@ await expect(page.locator('#nav-agents .nav-item')).toContainText('kestrel');
 
 **Steps.**
 1. Leave `#na-name` blank.
-2. Click `#na-create`.
+2. Observe `#na-create` is `disabled` (M3) — the button is non-invokable.
+3. Attempt to submit the wizard via Enter in any other field — the form refuses.
 
-**Observable expectation.** `#na-note` immediately reads `name it first`; no
-network call fires, no nav change. This is transient text but it is the *only*
-feedback for a rejected gesture, so the verification is simply that it appears
+**Observable expectation.** `#na-create` carries the `disabled` attribute and
+the default `#na-note` copy reads `Name it to enable Create.`. No network call
+fires, no nav change. This is transient text but it is the *only* feedback for
+a rejected gesture, so the verification is simply that the button is disabled
 and nothing else changed.
 
 **How to verify.**
 ```js
+await expect(page.locator('#na-create')).toBeDisabled();
 await page.fill('#na-name', '');
-await page.click('#na-create');
-await expect(page.locator('#na-note')).toHaveText('name it first');
+await page.keyboard.press('Enter');
 await expect(page.locator('#view-setup')).toBeVisible(); // no navigation
 ```
 
@@ -134,11 +146,20 @@ the configure tab.
   hidden `#cfg-include` / `#cfg-exclude` mirrors match the visible add-on state.
 - The header `#cfg-file` names the agent settings file the edit lands in
   (comments survive).
-- The per-agent cost summary at `.cfg-cost-summary` names this agent's model,
-  hard run-step ceiling, and autonomy. The model field includes an honest
-  cost/performance hint (`cheap`, `balanced`, `powerful`, or `unknown`).
+- The essentials section shows this agent's model + autonomy. As of M6 the
+  run-step cap renders **once** — at the `#cfg-turns` input + its `hard
+  ceiling for one activation's model/tool loop` hint, not duplicated in the
+  cost summary card. `.cfg-cost-summary` carries the model + autonomy
+  consequence (`#cfg-autonomy-consequence`, M6 id moved off the removed
+  standalone `<p>`); the autonomy consequence now appears exactly once in a
+  configure screenful. The model field includes an honest cost/performance hint
+  (`cheap`, `balanced`, `powerful`, or `unknown`).
 - `#cfg-autonomy-consequence` changes when `#cfg-autonomy` changes and states
   what the level lets agent-proposed setting changes do without asking.
+- The model field is a `ModelField` picker (M3) — a `<select>` over the
+  provider list when it loads, plus a `custom…` escape row that reveals a
+  text input. When the provider list is unavailable, the field shows an
+  inline `provider list unavailable` note at the field.
 
 **How to verify.** Save, then reload and re-read the fields — never trust the
 note alone:
@@ -150,8 +171,11 @@ await expect(page.locator('#cfg-section-essentials')).toContainText(/name|model|
 await expect(page.locator('#cfg-section-essentials')).not.toContainText(/parent|prepend path|effective path/);
 await page.fill('#cfg-model', 'claude-haiku-4-5-20251001');
 await page.fill('#cfg-turns', '7');
-await expect(page.locator('.cfg-cost-summary')).toContainText('7 run steps');
+// M6: run-step cap renders once at the input, not duplicated in the cost card.
+await expect(page.locator('#cfg-section-essentials')).toContainText('7 run steps');
 await expect(page.locator('.cfg-cost-summary')).toContainText(/cheap|unknown/);
+// M6: autonomy consequence appears exactly once in essentials.
+await expect(page.locator('#cfg-autonomy-consequence')).toBeVisible();
 await page.locator('.cfg-package-card[data-package="history"] .cfg-package-disable').click();
 await expect(page.locator('#cfg-exclude')).toHaveValue(/history/);
 await page.click('#cfg-save');
@@ -623,3 +647,130 @@ await expect(page.locator('#history-hint')).toBeHidden();           // healed
 await expect(page.locator('#sessions-pane .sess-list, #sessions-pane'))
   .toContainText(/session|no recorded sessions/i);
 ```
+
+---
+
+## fidelity (web-ui-fidelity pass)
+
+These are the cross-cutting product-fidelity flows added by the
+`docs/handoffs/web-ui-fidelity.md` pass. They live here so the regression suite
+and the catalog stay in sync. The acceptance criteria map to the milestones in
+that handoff: contrast (M1), responsive (M2), control fidelity (M3),
+accessibility (M4), product language + identity (M5), and visual consistency
+(M6).
+
+### fidelity-1 — Contrast baseline (M1)
+
+Every text token clears WCAG AA 4.5:1 against the page background, the panel
+background, and the active-row background. The values are locked in
+`ui/web/test/ui.spec.mjs` by reading computed values from `:root` and
+re-deriving the ratios.
+
+- `--ink` (bone) — primary text
+- `--dim` (~`#9a988c`) — secondary text; ~6.6:1 on bg, ~5.9:1 on active row
+- `--meta` (~`#8f8d82`) — meta text (was the text tier of `--faint`); ~5.4:1
+  on bg, ~5.1:1 on active row
+- `--faint` (~`#4a4a42`) — **non-text only**: the connection-down dot and
+  hairlines/dividers. Any usage that a human must read has been swept onto
+  `--meta`.
+
+### fidelity-2 — Responsive / narrow viewport (M2)
+
+At ≤900 px the layout reflows instead of clipping:
+
+- The nav panel is a **drawer** (`#nav-toggle` button in the panel-head);
+  collapsed by default, expands to `max-height: 60vh`, closes again when a
+  person picks something (so picking an agent never leaves the drawer open).
+- The agent tab strip (`#agent-tabs`) wraps (`flex-wrap: wrap`); the deck
+  padding tightens; `.mast` stacks and `.mast-sub` hides so "CONNECTED" isn't
+  clipped. The vignette softens (180 px → 60 px inset) so the phone view
+  doesn't read as disabled.
+- Configure collapses to one column; the index becomes a chip row; session
+  rows shrink to two columns. Conversation recent grid stacks.
+
+Assertion contract: at 400×800, `document.documentElement.scrollWidth <=
+window.innerWidth` on boot, on configure, and the compose input's
+`getBoundingClientRect()` stays inside the viewport.
+
+### fidelity-3 — Control fidelity (M3)
+
+- `ModelField` (in `ui/web/src/components/primitives.tsx`) is a real picker:
+  `<select>` over `/api/admin/models` with a single `custom…` escape row.
+  Empty provider list → honest `provider list unavailable — type a model id
+  or set an API key` note at the field. Wired into both the wizard and
+  configure essentials.
+- `WorkdirInput` calls `/api/admin/path-check?path=…` on blur and shows
+  `path does not exist` / `not a directory` / `not writable by the agent`
+  inline. The check is read-only and loopback-only — the web is the user's
+  terminal, so probing a typed path matches `ls` authority.
+- The wizard is wrapped in a `<form>`; Enter submits; Create is disabled
+  until `#na-name` is non-empty.
+
+### fidelity-4 — Accessibility (M4)
+
+- A global `:focus-visible` rule (2 px `--focus` outline) is the single
+  keyboard affordance. `:focus:not(:focus-visible)` strips the outline so
+  mouse users don't see one.
+- The agent tab strip and the rail filters dropped the misleading
+  `role="tablist"` (there is no `aria-controls` linkage). They are button
+  groups with `aria-pressed`.
+- The conversation feed is `role="log" aria-live="polite"` so a screen reader
+  announces agent replies. The high-volume telemetry feed is
+  `aria-live="off"` (not announced).
+- Min hit target is 24 px on every interactive control; 32 px at narrow.
+- The alarm pulse and entrance animations are gated behind
+  `prefers-reduced-motion: reduce` (animation off; alarm stays visible as a
+  static orange dot + border).
+
+### fidelity-5 — Product language + identity (M5)
+
+- Warm copy is the default; the cockpit vocabulary lives behind the
+  `#theme-toggle` in the masthead (persisted in `localStorage.elanus.cockpit`).
+  Defaults: `explore` (was INSTRUMENTS), `history` (was SESSIONS),
+  `activity` (was TELEMETRY), `Send` (was transmit). With the toggle on,
+  Tim's cockpit nouns come back across the board.
+- Each agent has a deterministic identity chip (`AgentChip`) — a colored
+  monogram in a bordered box, hue derived from a 6-color on-brand palette
+  hashed from the name. Shown in nav, converse header, welcome, and the
+  conversation empty state. Two agents are visually distinguishable at a
+  glance.
+- The conversation empty state was the cold `nothing yet — say something
+  below.` log buffer; it is now `Start a conversation with {agent}. Replies
+  and asks stay in this thread.`, paired with the large identity chip.
+- "Coding sessions" → "Coding runs" in the Workers surface; raw ids stay in
+  `title=` tooltips, never as visible columns.
+
+### fidelity-6 — Visual consistency (M6)
+
+- **One radius idiom.** Two tiers via tokens: `--r-sharp: 3px` for inputs,
+  tabs, buttons, badges (the cockpit idiom); `--r-card: 6px` for cards,
+  modals, banners, popovers. Form inputs dropped from 6 px to the sharp tier
+  — the worst "two people built this" tell.
+- **One primary button style.** The split-action primary (`link ⌄`) now uses
+  the same `--ink` background as every other primary, not a separate
+  brighter blend.
+- **No duplicated content.** The autonomy consequence renders exactly once
+  (the cost-card `<em>`); the standalone `<p id="cfg-autonomy-consequence">`
+  was removed and the id moved onto the `<em>`. The run-step cap renders
+  once at the input + its hint; the spend-ceiling card was dropped from the
+  cost summary.
+- **Welcome collapsed.** The redundant "guided setup" + "capabilities"
+  buttons (both routed to `selectSetup()`) collapsed into one; the empty
+  `<p id="welcome-hint">` renders nothing when history is fine — the element
+  is omitted entirely in that case.
+- **Signals empty state.** `.rail-empty` shows a real message when no rows
+  arrive (or when paused, or when a filter has no matches), so the view no
+  longer reads as a black void with chips.
+- **Setup fold discipline.** Cost visibility, installed capabilities (open
+  by default — it is the most-touched surface), trust and footprint, and
+  agent requests (auto-opens when there are pending proposals) are wrapped
+  in `<details class="setup-fold">`. The wizard stays the dominant block.
+- **Scope-residual.** Shared ("every agent") saves use
+  `.cfg-shared-save` — amber border + `⚑ affects all agents` glyph — so
+  the wider blast radius is unmistakable next to the same-shaped per-agent
+  button (`.cfg-agent-save`, teal outline).
+- **Raw-TOML save confirms.** The unvalidated `#cfg-toml-save` path now
+  triggers a `window.confirm` matching the linked-kit off-switch pattern.
+- **Glyph distinction.** The app kite (`⟁` in the masthead) is no longer
+  overloaded onto agent rows — agents use `AgentChip`, the kite belongs to
+  the brand only. Nav glyphs gained explanatory `title=` tooltips.

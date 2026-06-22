@@ -828,6 +828,26 @@ async function handleAdmin(url, req, res, body) {
     const r = await cli(['config', 'set', pkg, key.trim(), value]);
     return sendJson(res, r.ok ? 200 : 400, { ok: r.ok, output: r.stdout, error: r.ok ? undefined : (r.stderr || r.error) });
   }
+  // Filesystem existence/writability probe for workdir/path fields. The web is
+  // the user's terminal (loopback + same-origin), so checking a path a person
+  // just typed is the same authority as `ls` in their shell. Read-only.
+  if (url.pathname === '/api/admin/path-check' && req.method === 'GET') {
+    const p = (url.searchParams.get('path') ?? '').trim();
+    if (!p) return sendJson(res, 200, { ok: true, exists: false, empty: true });
+    if (p.length > 1024 || /[\0]/.test(p)) return sendJson(res, 400, { ok: false, error: 'bad path' });
+    try {
+      const abs = path.resolve(p);
+      let stat;
+      try { stat = fs.statSync(abs); } catch {
+        return sendJson(res, 200, { ok: true, exists: false, path: abs });
+      }
+      let writable = true;
+      try { fs.accessSync(abs, fs.constants.W_OK); } catch { writable = false; }
+      return sendJson(res, 200, { ok: true, exists: true, isDir: stat.isDirectory(), writable, path: abs });
+    } catch (e) {
+      return sendJson(res, 200, { ok: true, exists: false, error: String(e.message ?? e) });
+    }
+  }
   if (url.pathname === '/api/admin/proposals' && req.method === 'GET') {
     const r = await cli(['config', 'proposals']);
     return sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, proposals: jsonLines(r.stdout) } : { ok: false, error: r.stderr || r.error });

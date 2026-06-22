@@ -183,7 +183,7 @@ export default function CodeSessions() {
     <div className="cs-wrap">
       <style>{CS_STYLE}</style>
       <div className="cs-tree">
-        <h3 className="cs-h">Coding sessions</h3>
+        <h3 className="cs-h">Coding runs</h3>
         {error && <div className="cs-err">projection unavailable: {error}</div>}
         {!error && sessions.length === 0 && (
           <div className="cs-dim">No coding sessions yet. (Run `elanus code project` to refresh, or start a worker.)</div>

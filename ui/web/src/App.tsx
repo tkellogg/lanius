@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import CodeSessions from './CodeSessions';
 import { adminGet, adminPost, adminPut, history, publish, status as fetchStatus } from './api';
 import { openLiveStream } from './live';
-import { Button, IconButton } from './components/primitives';
+import { Button, IconButton, ModelField, WorkdirInput } from './components/primitives';
 
 // Product setup language is guided by docs/journeys/README.md and
 // docs/layering.md. Durable browser-flow expectations live in
@@ -17,6 +17,35 @@ const timeOf = (env: any) => {
   const d = new Date(env?.ts ?? Date.now());
   return isNaN(d.getTime()) ? '--:--:--' : d.toTimeString().slice(0, 8);
 };
+// Product language (M5): the warm copy is the default; cockpit nouns live
+// behind the power toggle so Tim keeps his vocabulary and Lily/Daniel stop
+// paying the vocabulary tax. docs/journeys/07-chatting.md + docs/layering.md.
+const LABELS = {
+  warm:     { explore: 'explore', history: 'history', telemetry: 'activity', sessions: 'history', workers: 'runs', send: 'Send' },
+  cockpit:  { explore: 'instruments', history: 'sessions', telemetry: 'telemetry', sessions: 'sessions', workers: 'runs', send: 'transmit' },
+};
+const labelKey = (cockpit: boolean) => cockpit ? LABELS.cockpit : LABELS.warm;
+
+// Deterministic per-agent identity chip: a small monogram in a bordered box,
+// colored from a small on-brand palette. Same name → same chip every render.
+const AGENT_PALETTE = [
+  '#e3b769', // amber (matches agent voice)
+  '#6db8a6', // teal (matches work/in)
+  '#e3a08c', // coral
+  '#9aa7c0', // sage
+  '#b89cd1', // violet
+  '#d4b25a', // gold
+];
+function agentColor(name: string) {
+  let h = 0;
+  for (const c of String(name).toLowerCase()) h = (h * 31 + c.charCodeAt(0)) | 0;
+  return AGENT_PALETTE[Math.abs(h) % AGENT_PALETTE.length];
+}
+function AgentChip({ name, size = 'sm' as 'sm' | 'md' | 'lg', className = '' }: { name: string; size?: 'sm' | 'md' | 'lg'; className?: string }) {
+  const color = agentColor(name);
+  const mono = String(name).trim().slice(0, 2).toUpperCase() || '??';
+  return <span className={`agent-chip agent-chip-${size}${className ? ` ${className}` : ''}`} style={{ borderColor: color, color }} aria-hidden="true">{mono}</span>;
+}
 const relativeTime = (t: unknown) => {
   const d = new Date(String(t ?? ''));
   if (isNaN(d.getTime())) return '';
@@ -362,6 +391,12 @@ export function App() {
   const [signal, setSignal] = useState({ lit: false, label: 'signal' });
   const [historyOk, setHistoryOk] = useState<boolean | null>(null);
   const [sel, setSel] = useState<any>({ kind: 'welcome' });
+  const [navOpen, setNavOpen] = useState(false);
+  const [cockpit, setCockpit] = useState<boolean>(() => {
+    try { return localStorage.getItem('elanus.cockpit') === '1'; } catch { return false; }
+  });
+  useEffect(() => { try { localStorage.setItem('elanus.cockpit', cockpit ? '1' : '0'); } catch {} }, [cockpit]);
+  const L = labelKey(cockpit);
   const [agents, setAgents] = useState(new Map());
   const [diskProfiles, setDiskProfiles] = useState<any[]>([]);
   const [buffer, setBuffer] = useState<any[]>([]);
@@ -571,6 +606,9 @@ export function App() {
     }
   }, [sel.kind, sel.agent, sel.tab]);
 
+  // Narrow viewport: collapse the nav drawer as soon as a person picks something.
+  useEffect(() => { setNavOpen(false); }, [sel]);
+
   const stageTitle = sel.kind === 'welcome' ? 'welcome'
     : sel.kind === 'signals' ? 'signals'
       : sel.kind === 'setup' ? 'setup'
@@ -578,7 +616,7 @@ export function App() {
           : sel.agent;
   const stageNote = sel.kind === 'welcome' ? 'orient, then dive in'
     : sel.kind === 'signals' ? 'a live view of everything happening — orange means something needs your attention'
-      : sel.kind === 'code-sessions' ? 'coding sessions and the workers they spawned — tool, model, effort, duration, and a resume command'
+      : sel.kind === 'code-sessions' ? 'coding runs and the workers they spawned — tool, model, effort, duration, and a resume command'
       : sel.kind === 'setup' ? 'first-run health, agent setup, capabilities, and trust'
         : sel.tab === 'converse' ? `messages with ${sel.agent}`
           : sel.tab === 'sessions' ? 'your agent’s past conversations'
@@ -819,6 +857,11 @@ export function App() {
 
   const saveRawToml = async () => {
     if (!cfgProfile) return;
+    // Raw TOML bypasses the field-level save's validation and rewrite. The
+    // off-switch for a linked kit confirms; a raw write that can rewrite
+    // grants or sandbox paths should too. Plain prompt — durable confirm is
+    // the resulting cfg-toml-note that survives the re-load.
+    if (!window.confirm(`Save raw TOML for ${cfgProfile}? This rewrites the whole file and bypasses field-level checks.`)) return;
     setCfgTomlNote('saving…');
     const r = await adminPut(`profile?name=${encodeURIComponent(cfgProfile)}`, { toml: cfgToml });
     setCfgTomlNote(r.ok ? 'saved' : 'save failed');
@@ -1020,7 +1063,7 @@ export function App() {
     void loadConversations(agent);
     btn.textContent = ok ? 'accepted ✓' : 'failed ✕';
     btn.classList.toggle('sent', ok);
-    setTimeout(() => { btn.textContent = 'transmit'; btn.classList.remove('sent'); }, 1400);
+    setTimeout(() => { btn.textContent = 'Send'; btn.classList.remove('sent'); }, 1400);
   };
 
   const loadSessions = async (agent: string) => {
@@ -1076,6 +1119,9 @@ export function App() {
           <span className="mast-sub">agent explorer // live</span>
         </button>
         <div className="mast-right">
+          <button id="theme-toggle" type="button" className="lamp" title={cockpit ? 'cockpit vocabulary on — click for plain language' : 'plain language on — click for cockpit vocabulary'} aria-pressed={cockpit} onClick={() => setCockpit(!cockpit)}>
+            <span aria-hidden="true">{cockpit ? '⌬' : '∝'}</span><span className="lamp-label">{cockpit ? 'cockpit' : 'plain'}</span>
+          </button>
           <button id="signal-lamp" className={`lamp${signal.lit ? ' lit' : ''}`} title="urgent alerts — click to acknowledge" onClick={() => setSignal({ lit: false, label: 'signal' })}>
             <span className="lamp-dot" /><span id="signal-label">{signal.label}</span>
           </button>
@@ -1084,15 +1130,17 @@ export function App() {
       </header>
 
       <main className="deck">
-        <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} />
+        <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel={L.explore} />
 
         <section className="stage panel" aria-label="view">
           <div className="panel-head">
             <h2 id="stage-title">{stageTitle}</h2>
-            <div id="agent-tabs" className="tabs" role="tablist" hidden={sel.kind !== 'agent'}>
-              {['converse', 'sessions', 'telemetry', 'configure'].map((tab) => (
-                <button key={tab} data-tab={tab} className={sel.kind === 'agent' && sel.tab === tab ? 'on' : ''} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>{tab}</button>
-              ))}
+            <div id="agent-tabs" className="tabs" aria-label={`${sel.agent} views`} hidden={sel.kind !== 'agent'}>
+              {(['converse', 'sessions', 'telemetry', 'configure'] as const).map((tab) => {
+                const on = sel.kind === 'agent' && sel.tab === tab;
+                const display = tab === 'sessions' ? L.history : tab === 'telemetry' ? L.telemetry : tab;
+                return <button key={tab} data-tab={tab} className={on ? 'on' : ''} aria-pressed={on} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>{display}</button>;
+              })}
             </div>
             <span id="stage-note" className="panel-note">{stageNote}</span>
           </div>
@@ -1158,6 +1206,7 @@ export function App() {
             newAgentNote={newAgentNote}
             createAgent={createAgent}
             modelsHint={modelsHint}
+            modelOptions={modelOptions}
             loadSetup={loadSetup}
             selectAgent={selectAgent}
           />
@@ -1187,7 +1236,7 @@ export function App() {
   );
 }
 
-function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversation, selectSignals, selectSetup, selectCodeSessions }: any) {
+function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversation, selectSignals, selectSetup, selectCodeSessions, navOpen, setNavOpen, exploreLabel }: any) {
   const items = [...agents.keys()].sort();
   const isWorkerItem = (name: string) => {
     const a = agents.get(name);
@@ -1204,13 +1253,21 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
     const i = active ? navItems.indexOf(active) : -1;
     navItems[(i + (e.key === 'ArrowDown' ? 1 : -1) + navItems.length) % navItems.length]?.focus();
   };
+  const stageLabel = sel.kind === 'welcome' ? 'welcome'
+    : sel.kind === 'agent' ? sel.agent
+      : sel.kind === 'signals' ? 'signals'
+        : sel.kind === 'code-sessions' ? 'workers'
+          : 'setup';
   return (
-    <nav className="nav panel" aria-label="explorer">
-      <div className="panel-head"><h2>instruments</h2></div>
+    <nav className={`nav panel${navOpen ? ' nav-open' : ''}`} aria-label="explorer">
+      <div className="panel-head">
+        <h2>{exploreLabel}</h2>
+        <button id="nav-toggle" type="button" aria-label={navOpen ? 'collapse navigation' : 'expand navigation'} aria-expanded={navOpen} onClick={() => setNavOpen(!navOpen)}><span aria-hidden="true">{navOpen ? '✕' : '≡'}{!navOpen ? ` ${stageLabel}` : ''}</span></button>
+      </div>
       <div id="nav-list" className="nav-list" onKeyDown={onKey}>
-        <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" onClick={selectSignals}><span className="nav-sigil">◮</span> signals</button>
-        <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
-        <button className={`nav-item nav-workers${sel.kind === 'code-sessions' ? ' on' : ''}`} data-sel="code-sessions" onClick={() => selectCodeSessions && selectCodeSessions()}><span className="nav-sigil">⚙</span> workers</button>
+        <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" title="live activity across every agent and topic" onClick={selectSignals}><span className="nav-sigil">◮</span> signals</button>
+        <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" title="health check, agent setup, capabilities, and trust footprint" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
+        <button className={`nav-item nav-workers${sel.kind === 'code-sessions' ? ' on' : ''}`} data-sel="code-sessions" title="coding runs and the workers they spawned" onClick={() => selectCodeSessions && selectCodeSessions()}><span className="nav-sigil">⚙</span> runs</button>
         <div className="nav-label">agents</div>
         <div id="nav-agents">
           {chatItems.map((name) => {
@@ -1219,8 +1276,8 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
             const convos = convoState.list ?? [];
             return (
               <div key={name}>
-                <button className={`nav-item nav-agent${sel.kind === 'agent' && sel.agent === name ? ' on' : ''}`} data-sel={`agent:${name}`} onClick={() => selectAgent(name)}>
-                  <span className="nav-sigil">⟁</span> {name}{a.live && <span className="nav-live">·live</span>}
+                <button className={`nav-item nav-agent${sel.kind === 'agent' && sel.agent === name ? ' on' : ''}`} data-sel={`agent:${name}`} title={`open ${name}`} onClick={() => selectAgent(name)}>
+                  <AgentChip name={name} /> <span className="nav-agent-name">{name}</span>{a.live && <span className="nav-live">·live</span>}
                 </button>
                 {convos.slice(0, 8).map((c: any) => (
                   <button key={c.session} className="nav-item nav-conversation" title={c.session} onClick={() => openConversation(name, c.session)}>
@@ -1266,6 +1323,7 @@ function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, se
             <>
               <div className="welcome-agent-label">your agent</div>
               <div className="welcome-agent-row">
+                <AgentChip name={primary} size="md" />
                 <span className="welcome-agent-name">{primary}</span>
                 <button onClick={() => selectAgent(primary, 'converse')}>converse with {primary}</button>
                 <button className="ghost" onClick={() => selectAgent(primary, 'configure')}>configure</button>
@@ -1275,16 +1333,15 @@ function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, se
         </div>
         <div className="welcome-actions">
           <button id="welcome-new" className="ghost" onClick={() => selectSetup()}>＋ guided setup</button>
-          <button id="welcome-kits" className="ghost" onClick={() => selectSetup()}>⚒ capabilities</button>
           <button id="welcome-signals" className="ghost" onClick={selectSignals}>◮ live signals</button>
         </div>
-        <p id="welcome-hint" className="dim-note">{historyOk === false ? 'transcripts are unavailable until the history view is on.' : ''}</p>
+        {historyOk === false && <p id="welcome-hint" className="dim-note">transcripts are unavailable until the history view is on.</p>}
       </div>
     </div>
   );
 }
 
-function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent, setNewAgent, newAgentNote, createAgent, modelsHint, loadSetup, selectAgent }: any) {
+function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent, setNewAgent, newAgentNote, createAgent, modelsHint, modelOptions, loadSetup, selectAgent }: any) {
   const kits = setup.kits;
   const pkgs = setup.packages;
   const proposals = setup.proposals;
@@ -1322,24 +1379,26 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
         <section className="setup-block setup-wizard">
           <h3>guided new agent</h3>
           <p className="dim-note">Name it, give it a purpose, choose where it works, and put a visible run budget on day one.</p>
-          <div className="wizard-grid">
-            <label><span>1. name</span><input id="na-name" placeholder="kestrel" spellCheck={false} value={newAgent.name} onChange={(e) => setNewAgent({ ...newAgent, name: e.target.value })} /></label>
-            <label><span>2. purpose</span><input id="na-purpose" placeholder="watch launches, draft briefs, triage issues..." spellCheck={false} value={newAgent.purpose} onChange={(e) => setNewAgent({ ...newAgent, purpose: e.target.value })} /></label>
-            <label><span>3. home / workdir</span><input id="na-workdir" placeholder="optional path where tools should run" spellCheck={false} value={newAgent.workdir} onChange={(e) => setNewAgent({ ...newAgent, workdir: e.target.value })} /></label>
-            <label><span>4. model</span><input id="na-model" placeholder="model (default: claude-sonnet-4-6)" spellCheck={false} list="model-suggestions" value={newAgent.model} onChange={(e) => setNewAgent({ ...newAgent, model: e.target.value })} /></label>
-            <label><span>5. run-step cap</span><input id="na-turns" type="number" min="1" max="200" value={newAgent.turns} onChange={(e) => setNewAgent({ ...newAgent, turns: e.target.value })} /></label>
-            <label><span>6. autonomy</span><select id="na-autonomy" value={newAgent.autonomy} onChange={(e) => setNewAgent({ ...newAgent, autonomy: e.target.value })}>{['off', 'manual', 'assisted', 'autonomous'].map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
-            <label><span>starting capability</span><select id="na-capability" value={newAgent.capability} onChange={(e) => setNewAgent({ ...newAgent, capability: e.target.value })}><option value="">none yet</option>{capabilityOptions.map((k: any) => <option key={k.name} value={k.name}>{k.name}</option>)}</select></label>
-          </div>
-          <div className="setup-row">
-            <button id="na-create" onClick={createAgent}>create agent</button>
-            <span id="na-note" className="dim-note">{newAgentNote || 'Creates a normal profile; advanced settings remain inspectable.'}</span>
-          </div>
-          <p id="models-hint" className="dim-note" hidden={!modelsHint}>{modelsHint}</p>
+          <form className="wizard-form" onSubmit={(e) => { e.preventDefault(); void createAgent(); }}>
+            <div className="wizard-grid">
+              <label><span>1. name</span><input id="na-name" placeholder="kestrel" spellCheck={false} value={newAgent.name} onChange={(e) => setNewAgent({ ...newAgent, name: e.target.value })} /></label>
+              <label><span>2. purpose</span><input id="na-purpose" placeholder="watch launches, draft briefs, triage issues..." spellCheck={false} value={newAgent.purpose} onChange={(e) => setNewAgent({ ...newAgent, purpose: e.target.value })} /></label>
+              <label><span>3. home / workdir</span><WorkdirInput id="na-workdir" placeholder="optional path where tools should run" value={newAgent.workdir} onChange={(v) => setNewAgent({ ...newAgent, workdir: v })} /></label>
+              <label><span>4. model</span><ModelField id="na-model" value={newAgent.model} onChange={(v) => setNewAgent({ ...newAgent, model: v })} models={modelOptions} /></label>
+              <label><span>5. run-step cap</span><input id="na-turns" type="number" min="1" max="200" value={newAgent.turns} onChange={(e) => setNewAgent({ ...newAgent, turns: e.target.value })} /></label>
+              <label><span>6. autonomy</span><select id="na-autonomy" value={newAgent.autonomy} onChange={(e) => setNewAgent({ ...newAgent, autonomy: e.target.value })}>{['off', 'manual', 'assisted', 'autonomous'].map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
+              <label><span>starting capability</span><select id="na-capability" value={newAgent.capability} onChange={(e) => setNewAgent({ ...newAgent, capability: e.target.value })}><option value="">none yet</option>{capabilityOptions.map((k: any) => <option key={k.name} value={k.name}>{k.name}</option>)}</select></label>
+            </div>
+            <div className="setup-row">
+              <button id="na-create" type="submit" disabled={!newAgent.name.trim()}>create agent</button>
+              <span id="na-note" className="dim-note">{newAgentNote || (!newAgent.name.trim() ? 'Name it to enable Create.' : 'Creates a normal profile; advanced settings remain inspectable.')}</span>
+            </div>
+            <p id="models-hint" className="dim-note" hidden={!modelsHint}>{modelsHint}</p>
+          </form>
         </section>
 
-        <section className="setup-block setup-cost">
-          <h3>cost visibility</h3>
+        <details className="setup-block setup-cost setup-fold">
+          <summary><h3>cost visibility</h3><span className="dim-note">how spend is bounded — model, autonomy, hard caps</span></summary>
           <p className="dim-note">Showing {primaryProfile?.agent || primaryProfile?.profile || 'the default agent'}.</p>
           <div className="cost-grid">
             <div><span>model</span><strong>{cost.model}</strong></div>
@@ -1348,7 +1407,7 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
           </div>
           <p className="dim-note">Run-step caps are hard activation limits. Dollar estimates are not shown until provider pricing is known; unknown is better than fake precision.</p>
           {!!cost.hardCaps.length && <div className="risk-badges">{cost.hardCaps.map((cap: string) => <span key={cap} className="badge">{cap}</span>)}</div>}
-        </section>
+        </details>
 
         <section className="setup-block">
           <h3>capability catalog</h3>
@@ -1359,17 +1418,17 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
                 : kits.kits.map((k: any) => <SetupKit key={k.name} kit={k} installed={provenance.has(k.name)} loadSetup={loadSetup} />)}</>}
           </div>
         </section>
-        <section className="setup-block">
-          <h3>installed capabilities</h3>
+        <details className="setup-block setup-fold" open>
+          <summary><h3>installed capabilities</h3><span className="dim-note">add-ons already on this installation and their trust state</span></summary>
           <p className="dim-note">Installed is not the same as approved/running. Use the badges to see current trust state.</p>
           <div id="setup-configs">
             {setup.loading || !pkgs ? 'checking…' : pkgs.ok === false ? <div className="dim-note">could not load installed capabilities: {pkgs.error ?? 'unknown error'}</div>
               : !(pkgs.packages ?? []).length ? <div className="dim-note">nothing added yet</div>
                 : pkgs.packages.map((p: any) => <SetupPackageConfig key={p.name} pkg={p} loadSetup={loadSetup} />)}
           </div>
-        </section>
-        <section className="setup-block setup-trust">
-          <h3>trust and footprint</h3>
+        </details>
+        <details className="setup-block setup-trust setup-fold">
+          <summary><h3>trust and footprint</h3><span className="dim-note">where data lives, what is local, what creates risk</span></summary>
           <p className="dim-note">A cheap security summary for Ganesh: what is local, where data lives, and which capabilities create risk.</p>
           <div className="trust-grid">
             <div><span>active principal</span><strong>{systemStatus?.owner ?? 'owner'}</strong></div>
@@ -1389,16 +1448,16 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
               `config: ${systemStatus?.paths?.config?.path ?? 'unknown'}`,
             ].join('\n')}</pre>
           </details>
-        </section>
-        <section className="setup-block">
-          <h3>agent requests</h3>
+        </details>
+        <details className="setup-block setup-fold" open={(proposals?.proposals ?? []).length > 0}>
+          <summary><h3>agent requests</h3><span className="dim-note">{(proposals?.proposals ?? []).length ? `${(proposals.proposals).length} waiting on you` : 'none right now'}</span></summary>
           <p className="dim-note">when an agent suggests a settings change, accept or decline it here.</p>
           <div id="setup-pending">
             {setup.loading || !proposals ? 'checking…' : proposals.ok === false ? <div className="dim-note">could not load agent requests: {proposals.error ?? 'unknown error'}</div>
               : !(proposals.proposals ?? []).length ? <div className="dim-note">no agent requests</div>
                 : proposals.proposals.map((p: any) => <ProposalCard key={p.proposal} proposal={p} loadSetup={loadSetup} />)}
           </div>
-        </section>
+        </details>
       </div>
     </div>
   );
@@ -1516,7 +1575,7 @@ function SetupPackageConfig({ pkg, loadSetup }: any) {
         <button className="ghost" onClick={loadRows}>settings</button>
         <span className="dim-note">{note}</span>
       </div>
-      <div className="cfg-package-config-panel setup-config-panel" hidden={rows === null}>{rows === null ? null : !rows.length ? <div className="dim-note">no configurable settings declared</div> : rows.map((row, idx) => <ConfigInputRow key={row.param.key} param={row.param} value={row.value} setValue={(v: string) => setRows(rows.map((r, i) => i === idx ? { ...r, value: v } : r))} save={<><IconButton label={`save ${pkg.name}.${row.param.key} for every agent`} onClick={() => saveRow(idx)}>save</IconButton><span className="dim-note">{row.note}</span></>} />)}</div>
+      <div className="cfg-package-config-panel setup-config-panel" hidden={rows === null}>{rows === null ? null : !rows.length ? <div className="dim-note">no configurable settings declared</div> : rows.map((row, idx) => <ConfigInputRow key={row.param.key} param={row.param} value={row.value} setValue={(v: string) => setRows(rows.map((r, i) => i === idx ? { ...r, value: v } : r))} save={<><IconButton label={`save ${pkg.name}.${row.param.key} for every agent — affects every agent using this add-on`} className="cfg-icon-btn cfg-shared-save" onClick={() => saveRow(idx)}>⚑ save</IconButton><span className="dim-note">{row.note}</span></>} />)}</div>
       <details onToggle={(e) => e.currentTarget.open && raw === 'not loaded' && void loadRaw()}>
         <summary className="dim-note">current settings</summary>
         <pre className="setup-readme">{raw}</pre>
@@ -1584,28 +1643,17 @@ function ConfigureView(props: any) {
             <p className="dim-note">These settings apply to {agentName} only. Edits land in <code id="cfg-file">{cfgProfile ? `${cfgProfile} settings` : "this agent's settings file"}</code> and apply on the agent's next run.</p>
             <div className="cfg-cost-summary">
               <div><span>model</span><strong>{cost.model}</strong><em>{modelCostHint(form.model)}</em></div>
-              <div><span>spend ceiling</span><strong>{cost.hardCaps.includes(`${Number(form.turns || 0)} run steps`) ? `${form.turns || 'no'} run steps` : cost.label}</strong><em>hard cap for one activation</em></div>
-              <div><span>autonomy</span><strong>{cost.autonomy}</strong><em>{autonomyConsequence(form.autonomy)}</em></div>
+              <div><span>autonomy</span><strong>{cost.autonomy}</strong><em id="cfg-autonomy-consequence">{autonomyConsequence(form.autonomy)}</em></div>
             </div>
             <div className="cfg-grid">
               <label id="cfg-section-agent">name <input id="cfg-agent" disabled={disabled} spellCheck={false} value={form.agent} onChange={(e) => setForm({ agent: e.target.value })} /></label>
-              <label id="cfg-section-model">model <input id="cfg-model" disabled={disabled} spellCheck={false} list="model-suggestions" value={form.model} onChange={(e) => setForm({ model: e.target.value })} /><span className="cfg-field-hint">{modelCostHint(form.model)}</span></label>
+              <label id="cfg-section-model">model <ModelField id="cfg-model" disabled={disabled} value={form.model} onChange={(v) => setForm({ model: v })} models={modelOptions} hint={modelCostHint(form.model)} /></label>
               <label>max run steps <input id="cfg-turns" disabled={disabled} type="number" min="1" max="200" value={form.turns} onChange={(e) => setForm({ turns: e.target.value })} /><span className="cfg-field-hint">hard ceiling for one activation's model/tool loop</span></label>
               <label>autonomy <select id="cfg-autonomy" disabled={disabled} value={form.autonomy} onChange={(e) => setForm({ autonomy: e.target.value })}>{['off', 'manual', 'assisted', 'autonomous'].map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
-              <label>working directory <input id="cfg-workdir" disabled={disabled} spellCheck={false} placeholder="(elanus root)" value={form.workdir} onChange={(e) => setForm({ workdir: e.target.value })} /></label>
+              <label>working directory <WorkdirInput id="cfg-workdir" disabled={disabled} placeholder="(elanus root)" value={form.workdir} onChange={(v) => setForm({ workdir: v })} /></label>
             </div>
-            <p id="cfg-autonomy-consequence" className="cfg-consequence">{autonomyConsequence(form.autonomy)}</p>
             <div className="setup-row"><button id="cfg-save" disabled={disabled} onClick={saveConfigure}>save</button><span id="cfg-note" className="dim-note">{cfgNote}</span></div>
             <p className="dim-note">renaming changes where future messages go; old messages and history stay under the old name.</p>
-            <datalist id="model-suggestions">
-              {(modelOptions.length ? modelOptions.map((m: any) => ({ value: m.id, label: m.display_name })) : [
-                { value: 'claude-fable-5' }, { value: 'claude-sonnet-4-6' }, { value: 'claude-haiku-4-5-20251001' }, { value: 'anthropic::deepseek-chat' },
-              ]).map((m: any) => {
-                const hint = modelCostHint(m.value).replace('cost/performance: ', '');
-                const label = [m.label, hint].filter(Boolean).join(' - ');
-                return <option key={m.value} value={m.value} label={label} />;
-              })}
-            </datalist>
           </section>
 
           <section className="setup-block" id="cfg-section-packages">
@@ -1819,7 +1867,7 @@ function PackageCard({ pkg, disabled, canConfigure, toggle, sharedRows, setCfgSh
     <details className={`cfg-package-card${disabled ? ' is-disabled' : ''}`} data-package={pkg.name}>
       <summary className="cfg-package-head"><span className="cfg-disclosure">▸</span><span className={`cfg-source-icon source-${source.kind}`} title={`${source.kind}: ${source.label}`}>{source.icon}</span><span className="cfg-package-title"><span className="setup-kit-name">{pkg.name}</span><span className="cfg-pkg-desc">{packageDescription(pkg)}</span>{canConfigure && <span className="cfg-pkg-desc">{packageHasAgentScopedSettings(pkg) ? `settings can be saved for every agent or for ${cfgParsed.agent || cfgProfile || 'this agent'} only` : 'settings save for every agent'}</span>}</span></summary>
       <div className="cfg-package-body"><div className="cfg-package-detail">{actorDetail(pkg)}</div><div className="cfg-package-meta">{packageBadges(pkg).map((b) => <span key={b.text} className={b.cls}>{b.text}</span>)}{riskBadges(pkg).map((b) => <span key={`risk-${b}`} className="badge badge-wait">{b}</span>)}</div><div className="cfg-package-controls"><span className="dim-note">{disabled ? 'disabled for this agent' : 'enabled for this agent'} · {grantState(pkg)}</span><button className={disabled ? 'ghost cfg-package-disable' : 'cfg-package-disable'} title={disabled ? `remove ${pkg.name} from skills.exclude` : `add ${pkg.name} to skills.exclude`} onClick={(e) => { e.preventDefault(); toggle(); }}>{disabled ? 'enable' : 'disable'}</button><button className="ghost cfg-package-config-toggle" hidden={!canConfigure} onClick={(e) => { e.preventDefault(); load(); }}>settings</button></div>
-        <div className="cfg-package-config-panel" hidden={!panelOpen}>{rows === null ? 'loading...' : !rows.length ? <div className="dim-note">no configurable settings declared</div> : rows.map((row, idx) => <ConfigInputRow key={row.param.key} param={row.param} value={row.value} setValue={(v: string) => setRows(rows.map((r, i) => i === idx ? { ...r, value: v } : r))} save={<><IconButton label={`save ${pkg.name}.${row.param.key} for every agent`} onClick={() => saveRow(idx)}>every agent</IconButton><span className="dim-note">{row.note}</span></>} secondarySave={row.param.agentScoped ? <><IconButton label={`save ${pkg.name}.${row.param.key} for ${cfgParsed.agent || cfgProfile || 'this agent'}`} onClick={() => saveAgentRow(idx)}>this agent</IconButton><span className="dim-note">{row.agentNote}</span></> : null} />)}</div>
+        <div className="cfg-package-config-panel" hidden={!panelOpen}>{rows === null ? 'loading...' : !rows.length ? <div className="dim-note">no configurable settings declared</div> : rows.map((row, idx) => <ConfigInputRow key={row.param.key} param={row.param} value={row.value} setValue={(v: string) => setRows(rows.map((r, i) => i === idx ? { ...r, value: v } : r))} save={<><IconButton label={`save ${pkg.name}.${row.param.key} for every agent — affects every agent using this add-on`} className="cfg-icon-btn cfg-shared-save" onClick={() => saveRow(idx)}>⚑ every agent</IconButton><span className="dim-note">{row.note}</span></>} secondarySave={row.param.agentScoped ? <><IconButton label={`save ${pkg.name}.${row.param.key} for ${cfgParsed.agent || cfgProfile || 'this agent'} only`} className="cfg-icon-btn cfg-agent-save" onClick={() => saveAgentRow(idx)}>this agent</IconButton><span className="dim-note">{row.agentNote}</span></> : null} />)}</div>
       </div>
     </details>
   );
@@ -1854,6 +1902,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
   return (
     <div id="view-converse" className="view" hidden={hidden}>
       <div id="conv-configure-hint" className="conv-configure-hint">
+        <AgentChip name={agent} size="md" />
         <span>Tune {agent} anytime in configure.</span>
         <button id="conv-new" className="ghost" type="button" onClick={() => newConversation(agent)}>＋ new conversation</button>
         <button className="ghost" type="button" onClick={() => selectAgent(agent, 'configure')}>configure</button>
@@ -1876,12 +1925,12 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
         </div>
       </div>
       <div id="conv-holder" className="conv-feed-holder">
-        <div className="conv-feed">
-          {!messages.length && <div className="conv-empty"><p className="conv-empty-mark">⟁</p><p>nothing yet — say something below.<br />asks and replies stay in this conversation.</p></div>}
+        <div className="conv-feed" role="log" aria-live="polite" aria-label={`conversation with ${agent}`}>
+          {!messages.length && <div className="conv-empty"><p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p><p>Start a conversation with {agent}. Replies and asks stay in this thread.</p></div>}
           {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `correlation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : m.text}</div></div>)}
         </div>
       </div>
-      <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><button type="submit" id="compose-send">transmit</button></form>
+      <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><button type="submit" id="compose-send">Send</button></form>
     </div>
   );
 }
@@ -1897,10 +1946,20 @@ function AskMessage({ agent, message, answerAsk }: any) {
 
 function RailView({ hidden, filter, setFilter, paused, setPaused, rows }: any) {
   const verbClass = (topic: string) => topic.startsWith('signal/') ? 'v-signal' : topic.startsWith('in/') ? 'v-in' : /^obs\/[^/]+\/[^/]+\/[^/]+\/tool\//.test(topic) ? 'v-tool' : 'v-obs';
+  const empty = !paused && rows.length === 0;
+  const filtered = filter !== 'all';
   return (
     <div id="view-rail" className="view" hidden={hidden}>
-      <div className="rail-bar"><div className="tele-filters" role="tablist">{['all', 'work', 'tools', 'signals'].map((f) => <button key={f} data-f={f} className={filter === f ? 'on' : ''} onClick={() => setFilter(f)}>{f}</button>)}<button id="tele-pause" title="pause the feed" onClick={() => setPaused(!paused)}>{paused ? '▶' : '⏸'}</button></div></div>
-      <div id="tele-feed" className="tele-feed">{!paused && rows.map((m: any, i: number) => <div key={`${i}-${m.topic}-${m.env?.id ?? ''}`} className={`row ${verbClass(m.topic)}`}><span className="t">{timeOf(m.env)}</span><span><span className="topic">{m.topic} </span><span className="pay">{summarize(m.env?.payload)}</span></span></div>)}</div>
+      <div className="rail-bar"><div className="tele-filters" aria-label="activity filters">{['all', 'work', 'tools', 'signals'].map((f) => <button key={f} data-f={f} aria-pressed={filter === f} className={filter === f ? 'on' : ''} onClick={() => setFilter(f)}>{f}</button>)}<button id="tele-pause" title="pause the feed" aria-pressed={paused} onClick={() => setPaused(!paused)}>{paused ? '▶' : '⏸'}</button></div></div>
+      <div id="tele-feed" className="tele-feed" aria-live="off" aria-label="live activity stream">
+        {empty && (
+          <div className="rail-empty">
+            <p className="rail-empty-mark" aria-hidden="true">≡</p>
+            <p>{paused ? 'feed paused — press ▶ to resume.' : filtered ? `nothing has arrived on ${filter} yet. this view updates as the agent works.` : 'nothing has arrived yet. this view updates as the agent runs — tool calls, replies, and signals land here live.'}</p>
+          </div>
+        )}
+        {!paused && rows.map((m: any, i: number) => <div key={`${i}-${m.topic}-${m.env?.id ?? ''}`} className={`row ${verbClass(m.topic)}`}><span className="t">{timeOf(m.env)}</span><span><span className="topic">{m.topic} </span><span className="pay">{summarize(m.env?.payload)}</span></span></div>)}
+      </div>
     </div>
   );
 }

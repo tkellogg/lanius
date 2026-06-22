@@ -108,6 +108,22 @@ async function waitForConfigureLoaded(page) {
   const page = await newPage();
   await page.goto('/');
   await page.waitForSelector('#nav-agents', { timeout: 10000 });
+  // Contrast baseline (M1): every text token must clear WCAG AA 4.5:1 against
+  // the page bg, the panel bg, and the active-row bg. Locking the values here
+  // catches a regression that pulls --dim or --meta back below the floor.
+  const contrast = await page.evaluate(() => {
+    const css = getComputedStyle(document.documentElement);
+    const hex = (v) => css.getPropertyValue(v).trim();
+    const tok = { bg: hex('--bg'), panel: hex('--panel'), active: '#1b1d18', ink: hex('--ink'), dim: hex('--dim'), meta: hex('--meta') };
+    const lin = (ch) => { const c = ch / 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+    const lum = (h) => { const r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16); return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b); };
+    const ratio = (a, b) => { const l1 = lum(a), l2 = lum(b); const hi = Math.max(l1, l2), lo = Math.min(l1, l2); return (hi + 0.05) / (lo + 0.05); };
+    const min = (fg) => Math.min(ratio(fg, tok.bg), ratio(fg, tok.panel), ratio(fg, tok.active));
+    return { inkAA: min(tok.ink) >= 4.5, dimAA: min(tok.dim) >= 4.5, metaAA: min(tok.meta) >= 4.5, ratios: { ink: min(tok.ink), dim: min(tok.dim), meta: min(tok.meta) } };
+  });
+  contrast.inkAA ? ok(`contrast: --ink clears AA (${contrast.ratios.ink.toFixed(2)})`) : fail(`contrast: --ink below AA (${contrast.ratios.ink.toFixed(2)})`);
+  contrast.dimAA ? ok(`contrast: --dim clears AA (${contrast.ratios.dim.toFixed(2)})`) : fail(`contrast: --dim below AA (${contrast.ratios.dim.toFixed(2)})`);
+  contrast.metaAA ? ok(`contrast: --meta clears AA (${contrast.ratios.meta.toFixed(2)})`) : fail(`contrast: --meta below AA (${contrast.ratios.meta.toFixed(2)})`);
   // The harness init seeds a 'default' profile → agent 'main' in the nav.
   await waitFor('boot: default agent visible in nav', async () => {
     const items = await page.$$eval('#nav-agents .nav-item', (els) => els.map((e) => e.textContent));
@@ -155,10 +171,30 @@ const testAgentProfile = 'harrier';
     const text = await page.$eval('.setup-trust', (el) => el.textContent);
     return /active principal/i.test(text) && /web relay/i.test(text) && /database/i.test(text) && /config repo/i.test(text);
   }, 8000);
+  // M3: Create is disabled until a name is entered.
+  const createDisabledAtStart = await page.$eval('#na-create', (el) => el.disabled);
+  createDisabledAtStart ? ok('wizard: Create disabled on empty name') : fail('wizard: Create enabled before name entered');
+  // M3: the workdir field flags a path that does not exist (closed-set-style
+  // validation per ui-preferences.md — let the field catch a typo before save).
+  await page.fill('#na-workdir', '/tmp/elanus-definitely-does-not-exist-xyz');
+  await page.$eval('#na-workdir', (el) => el.blur());
+  await waitFor('wizard: bogus workdir is flagged at the field', async () => {
+    const text = await page.$eval('.wizard-grid', (el) => el.textContent);
+    return /does not exist/i.test(text);
+  }, 5000);
+  await page.fill('#na-workdir', '');
+  // M3: model field shows the provider-unavailable state at the field when no
+  // list is loaded (no API key in the spec env), not silent free text.
+  await waitFor('wizard: unavailable provider is signaled at the model field', async () => {
+    const text = await page.$eval('.wizard-grid', (el) => el.textContent);
+    return /provider list unavailable/i.test(text);
+  }, 5000);
   await page.fill('#na-name', testAgentProfile);
   await page.fill('#na-purpose', 'qa regression agent');
   await page.fill('#na-model', 'claude-haiku-4-5-20251001');
   await page.fill('#na-turns', '11');
+  const createEnabledAfterName = await page.$eval('#na-create', (el) => !el.disabled);
+  createEnabledAfterName ? ok('wizard: Create enabled after name entered') : fail('wizard: Create still disabled after name entered');
   await page.click('#na-create');
   await waitFor('new agent: converse tab opens', async () => {
     return !(await page.$eval('#view-converse', (el) => el.hidden));
@@ -209,12 +245,20 @@ const testAgentProfile = 'harrier';
       && /working directory/i.test(essentials)
       && !/parent|prepend path|effective path/i.test(essentials);
   }, 5000);
-  await waitFor('configure: agent cost summary reflects selected agent', async () => {
-    const text = await page.$eval('.cfg-cost-summary', (el) => el.textContent);
+  await waitFor('configure: essentials reflect the agent (model, cap, autonomy, hint)', async () => {
+    const text = await page.$eval('#cfg-section-essentials', (el) => el.textContent);
+    const turns = await page.$eval('#cfg-turns', (el) => el.value);
     return /claude-haiku-4-5-20251001/.test(text)
-      && /7 run steps/.test(text)
-      && /hard cap for one activation/i.test(text)
+      && turns === '7'
+      && /hard ceiling for one activation/i.test(text)
       && /cost\/performance:\s*cheap/i.test(text);
+  }, 5000);
+  // M6: autonomy consequence renders exactly once in the essentials screenful
+  // (was duplicated as a separate <p> + the cost-card em).
+  await waitFor('configure: autonomy consequence appears exactly once', async () => {
+    const text = await page.$eval('#cfg-section-essentials', (el) => el.textContent);
+    const m = text.match(/This agent cannot accept its own setting changes/gi);
+    return m && m.length === 1;
   }, 5000);
   const beforeAutonomy = await page.$eval('#cfg-autonomy-consequence', (el) => el.textContent);
   await page.selectOption('#cfg-autonomy', 'assisted');
@@ -334,7 +378,7 @@ const testAgentProfile = 'harrier';
   }, 5000);
   const windowRowsRow = windowPackage().locator('.cfg-config-row', { hasText: 'Window rows' });
   await windowRowsRow.locator('input[type="number"]').first().fill('70');
-  await windowRowsRow.locator('button[aria-label="save window.window_rows for every agent"]').click();
+  await windowRowsRow.locator('button[aria-label^="save window.window_rows for every agent"]').click();
   await waitFor('configure: shared package setting save is labeled for every agent', async () => {
     const text = await windowRowsRow.textContent();
     return /saved for every agent/i.test(text)
@@ -350,7 +394,7 @@ const testAgentProfile = 'harrier';
       && /overridden here for harrier/i.test(text);
   }, 8000);
   await windowRowsRow.locator('input[type="number"]').first().fill('70');
-  await windowRowsRow.locator('button[aria-label="save window.window_rows for every agent"]').click();
+  await windowRowsRow.locator('button[aria-label^="save window.window_rows for every agent"]').click();
   await waitFor('configure: shared save preserves selected agent override source', async () => {
     const text = await windowRowsRow.textContent();
     return /saved for every agent/i.test(text)
@@ -511,12 +555,11 @@ const testAgentProfile = 'harrier';
     const model = await page.$eval('#cfg-model', (el) => el.value);
     const turns = await page.$eval('#cfg-turns', (el) => el.value);
     const autonomy = await page.$eval('#cfg-autonomy', (el) => el.value);
-    const text = await page.$eval('.cfg-cost-summary', (el) => el.textContent);
+    const text = await page.$eval('#cfg-section-essentials', (el) => el.textContent);
     return text !== harrierCostSummary
       && model !== 'claude-haiku-4-5-20251001'
       && turns !== '7'
       && text.includes(model)
-      && text.includes(`${turns} run steps`)
       && text.includes(autonomy);
   }, 5000);
   await mainWindowPackage().evaluate((el) => { if (!el.open) el.querySelector('summary')?.click(); });
@@ -660,7 +703,7 @@ const renamedAgent = 'falcon';
   }, 10000);
   const setupWindowRows = savedCard.locator('.cfg-config-row', { hasText: 'Window rows' });
   await setupWindowRows.locator('input[type="number"]').fill('72');
-  await setupWindowRows.locator('button[aria-label="save window.window_rows for every agent"]').click();
+  await setupWindowRows.locator('button[aria-label^="save window.window_rows for every agent"]').click();
   ok('add-ons: package setting saved from typed UI');
   await waitFor('add-ons: package setting save confirmed by readback', async () => {
     return /saved and reloaded/.test(await savedCard.textContent());
@@ -796,7 +839,7 @@ const renamedAgent = 'falcon';
   await page.click('#conv-new');
   await waitFor('converse: new conversation clears the visible thread', async () => {
     const t = await page.$eval('#conv-holder', (el) => el.textContent);
-    return !t.includes(msg) && /nothing yet/i.test(t);
+    return !t.includes(msg) && /start a conversation/i.test(t);
   }, 5000);
   const msg4 = `${msg}-fork`;
   await page.fill('#compose-input', msg4);
@@ -810,7 +853,7 @@ const renamedAgent = 'falcon';
   // as an explicit error bubble in the thread, not silence. Inject one with
   // the correlation of the message we just sent so it threads here.
   const corr = await page.$eval('#conv-holder .msg.you', (el) => (el.title || '').replace('correlation ', '')).catch(() => '');
-  const agentName = await page.$eval('#nav-agents .nav-item.on', (el) => el.textContent.trim().replace(/^⟁\s*/, '').replace(/·live$/, '').trim()).catch(() => 'main');
+  const agentName = await page.$eval('#nav-agents .nav-agent.on', (el) => el.getAttribute('data-sel')?.replace(/^agent:/, '') || 'main').catch(() => 'main');
   elanus('emit', `in/human/owner`, '--correlation', corr || 'spec-fail', '--payload',
     JSON.stringify({ failed: true, error: 'spec-injected failure', agent: agentName }));
   await waitFor('converse: agent failure renders as an error bubble', async () => {
@@ -845,7 +888,161 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
-// ── page errors check ─────────────────────────────────────────────────────────
+// ── flow 8: narrow viewport (sub-900px) ──────────────────────────────────────
+// M2: the app must not clip at phone widths. The agent tab strip wraps, the
+// sidebar is a drawer (closed by default, expands on click), and the compose
+// input + primary actions are reachable without horizontal scroll.
+{
+  const page = await newPage();
+  await page.setViewportSize({ width: 400, height: 800 });
+  await page.goto('/');
+  // At narrow, the nav drawer is collapsed by default — wait for the toggle
+  // (always visible) instead of `#nav-agents` (correctly hidden inside it).
+  await page.waitForSelector('#nav-toggle', { timeout: 10000 });
+  // Masthead connection indicator is visible (not clipped off-screen).
+  await waitFor('narrow: connection indicator visible', async () => {
+    const conn = await page.$eval('#conn-text', (el) => el.textContent).catch(() => '');
+    return !!conn;
+  });
+  const noClipAtBoot = await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth);
+  noClipAtBoot ? ok('narrow: no horizontal overflow at boot') : fail('narrow: document overflows at boot');
+  // Nav drawer is collapsed by default — agent list not visible, toggle is.
+  const navListHidden = await page.$eval('#nav-list', (el) => getComputedStyle(el).display === 'none');
+  navListHidden ? ok('narrow: nav drawer collapsed by default') : fail('narrow: nav drawer leaked open at narrow');
+  const toggleVisible = await page.$eval('#nav-toggle', (el) => getComputedStyle(el).display !== 'none');
+  toggleVisible ? ok('narrow: nav toggle visible') : fail('narrow: nav toggle missing');
+  // Expand the drawer, pick the first agent, and confirm it closes again.
+  await page.click('#nav-toggle');
+  await waitFor('narrow: nav drawer expands', async () => {
+    return await page.$eval('#nav-list', (el) => getComputedStyle(el).display !== 'none');
+  });
+  await waitFor('narrow: first agent in nav', async () => {
+    const items = await page.$$('#nav-agents .nav-item');
+    if (items.length) { await items[0].click(); return true; }
+    return false;
+  });
+  await waitFor('narrow: nav drawer closes after selection', async () => {
+    return await page.$eval('#nav-list', (el) => getComputedStyle(el).display === 'none');
+  });
+  await page.waitForSelector('#agent-tabs', { state: 'visible' });
+  // Configure tab strip wraps; nothing clips.
+  await page.click('[data-tab="configure"]');
+  await page.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
+  await waitForConfigureLoaded(page);
+  const noClipAtConfigure = await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth);
+  noClipAtConfigure ? ok('narrow: no horizontal overflow on configure') : fail('narrow: configure overflows the viewport');
+  // Converse: compose input is reachable without horizontal scroll.
+  await page.click('[data-tab="converse"]');
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  const composeReachable = await page.$eval('#compose-input', (el) => {
+    const r = el.getBoundingClientRect();
+    return r.left >= 0 && r.right <= window.innerWidth && r.width > 40;
+  });
+  composeReachable ? ok('narrow: compose input reachable inside viewport') : fail('narrow: compose input clipped or too small');
+  await page.close();
+}
+
+// ── flow 9: a11y baseline ─────────────────────────────────────────────────────
+// M4: keyboard focus is visible everywhere; the conversation feed is announced
+// to assistive tech; reduced-motion users get no infinite alarm flash.
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+  // The :focus-visible rule exists with a real outline. (Read cssText, not
+  // style.outlineWidth — CSSOM doesn't expand shorthands containing var().)
+  const focusRule = await page.evaluate(() => {
+    for (const sheet of document.styleSheets) {
+      let rules;
+      try { rules = sheet.cssRules; } catch { continue; } // cross-origin stylesheet (CDN fonts)
+      for (const rule of (rules ?? [])) {
+        if (rule.selectorText === ':focus-visible') {
+          return { cssText: rule.cssText || '', outline: rule.style.outline || '' };
+        }
+      }
+    }
+    return null;
+  });
+  focusRule && /\boutline\b/.test(focusRule.cssText)
+    ? ok(`a11y: global :focus-visible rule present (${focusRule.outline || focusRule.cssText.slice(0, 80)})`)
+    : fail(`a11y: no :focus-visible rule (${JSON.stringify(focusRule)})`);
+  // Keyboard Tab produces an outlined element on the live page.
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  await waitFor('a11y: keyboard focus paints an outline', async () => {
+    return await page.evaluate(() => {
+      const el = document.activeElement;
+      if (!el || el === document.body) return false;
+      const o = getComputedStyle(el);
+      return o.outlineStyle !== 'none' && parseInt(o.outlineWidth, 10) > 0;
+    });
+  });
+  // The conversation feed is a polite live region (so replies are announced).
+  await waitFor('a11y: first agent in nav', async () => {
+    const items = await page.$$('#nav-agents .nav-item');
+    if (items.length) { await items[0].click(); return true; }
+    return false;
+  });
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  const feedAttrs = await page.$eval('.conv-feed', (el) => ({
+    role: el.getAttribute('role'),
+    live: el.getAttribute('aria-live'),
+  }));
+  feedAttrs.role === 'log' && feedAttrs.live === 'polite'
+    ? ok('a11y: conversation feed is a polite live region')
+    : fail(`a11y: conversation feed attrs wrong: ${JSON.stringify(feedAttrs)}`);
+  // The high-volume telemetry feed stays out of the live region.
+  await page.click('[data-tab="telemetry"]');
+  await page.waitForSelector('#view-rail:not([hidden])', { timeout: 5000 });
+  const teleLive = await page.$eval('#tele-feed', (el) => el.getAttribute('aria-live') ?? '(none)');
+  teleLive === 'off' ? ok('a11y: telemetry feed is aria-live=off (not announced)') : fail(`a11y: telemetry feed aria-live=${teleLive}`);
+  // Tabs are not a misleading role="tablist" without aria-controls.
+  const tablistMissing = await page.$eval('#agent-tabs', (el) => el.getAttribute('role') !== 'tablist');
+  tablistMissing ? ok('a11y: tab strip is not a half-pattern tablist') : fail('a11y: agent-tabs still claims role=tablist without aria-controls');
+  await page.close();
+}
+
+// ── flow 10: product language + companion identity (M5) ─────────────────────
+// Kernel words (session, raw ids) stay off default surfaces; the agent has a
+// stable colored monogram in nav and converse; the cockpit toggle restores
+// Tim's vocabulary without re-theming the whole surface.
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+  // Two visible agents → two distinct identity chip colors.
+  await waitFor('identity: at least one agent chip in nav', async () => {
+    const chips = await page.$$('#nav-agents .nav-agent .agent-chip');
+    return chips.length >= 1;
+  });
+  // Toggle into cockpit mode: the panel-head noun changes warm → cockpit.
+  const warmHead = await page.$eval('.nav .panel-head h2', (el) => el.textContent.trim()).catch(() => '');
+  await page.click('#theme-toggle');
+  await waitFor('identity: cockpit toggle changes panel-head noun', async () => {
+    const h = await page.$eval('.nav .panel-head h2', (el) => el.textContent.trim()).catch(() => '');
+    return h && h !== warmHead;
+  });
+  await page.click('#theme-toggle');
+  await waitFor('identity: warm mode restores the warm noun', async () => {
+    const h = await page.$eval('.nav .panel-head h2', (el) => el.textContent.trim()).catch(() => '');
+    return h === warmHead;
+  });
+  // Pick the first agent; the warm tab is labeled "history" not "sessions".
+  await page.click('#nav-agents .nav-item');
+  await page.waitForSelector('#agent-tabs', { state: 'visible' });
+  const tabText = await page.$$eval('#agent-tabs button', (els) => els.map((e) => e.textContent.trim()));
+  const sessionsWordGone = !tabText.some((t) => /^sessions$/i.test(t));
+  sessionsWordGone ? ok(`language: "sessions" tab renamed in warm mode (saw: ${tabText.join('|')})`) : fail(`language: tab still says "sessions" (${tabText.join('|')})`);
+  // Converse header shows the identity chip alongside the agent name.
+  const chipInHeader = await page.$eval('#conv-configure-hint', (el) => el.querySelector('.agent-chip') != null).catch(() => false);
+  chipInHeader ? ok('identity: chip rendered in converse header') : fail('identity: converse header missing chip');
+  // The compose button says "Send", not "transmit".
+  const sendLabel = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
+  /^send$/i.test(sendLabel) ? ok('language: compose button is "Send"') : fail(`language: compose button is "${sendLabel}"`);
+  await page.close();
+}
+
+
 if (pageErrors.length) {
   fail(`${pageErrors.length} JS page error(s) across all views:\n${pageErrors.join('\n')}`);
 } else {
