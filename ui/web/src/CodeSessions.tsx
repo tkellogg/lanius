@@ -27,6 +27,13 @@ type Stat = {
   output_tokens: number;
   updated_at: string | null;
   duration_ms: number | null;
+  // TG3: thread-grouping fields. Optional so older payloads still render.
+  // incarnations = constituent elanus_session ids (newest first);
+  // relaunches = manual re-launches (incarnations - 1);
+  // driven_resumes = daemon-driven resume_count sum.
+  incarnations?: string[];
+  relaunches?: number;
+  driven_resumes?: number;
 };
 
 type Ev = { id: number; ts: string | null; kind: string | null; summary: string | null };
@@ -74,25 +81,53 @@ function SessionNode({
   onSelect: (id: string) => void;
   depth: number;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const kids = (childrenOf.get(stat.elanus_session) ?? [])
     .slice()
     .sort((a, b) => statusRank(a.last_status) - statusRank(b.last_status) || (b.started_at ?? '').localeCompare(a.started_at ?? ''));
+  const incarnations = stat.incarnations ?? [];
+  const isThread = incarnations.length > 1;
   return (
     <div className="cs-node" style={{ marginLeft: depth ? 16 : 0 }}>
       <div
         className={`cs-row${selected === stat.elanus_session ? ' cs-sel' : ''}`}
         onClick={() => onSelect(stat.elanus_session)}
       >
+        {isThread && (
+          <span
+            className="cs-toggle"
+            role="button"
+            aria-expanded={expanded}
+            title={`${incarnations.length} incarnations (click to ${expanded ? 'collapse' : 'expand'})`}
+            onClick={(e) => {
+              e.stopPropagation();
+              setExpanded((v) => !v);
+            }}
+          >
+            {expanded ? '▾' : '▸'}
+          </span>
+        )}
         <span className="cs-id">{stat.elanus_session}</span>
         <span className="cs-tool">{stat.tool ?? '?'}</span>
         <span className="cs-dim">{(stat.model ?? '?') + ' / ' + (stat.effort ?? '?')}</span>
         <StatusBadge status={stat.last_status} />
         <span className="cs-dim">{humanDuration(stat.duration_ms)}</span>
         {stat.resume_count > 0 && <span className="cs-dim">↻{stat.resume_count}</span>}
+        {isThread && <span className="cs-dim cs-thread" title="incarnations in this thread">×{incarnations.length}</span>}
         <span className="cs-dim">
           {humanTokens(stat.input_tokens)}↓ {humanTokens(stat.output_tokens)}↑
         </span>
       </div>
+      {isThread && expanded && (
+        <div className="cs-incs">
+          {incarnations.map((id, i) => (
+            <div key={id} className="cs-inc">
+              <span className="cs-inc-i">{i === 0 ? 'newest' : i === incarnations.length - 1 ? 'oldest' : `-${i}`}</span>
+              <span className="cs-id">{id}</span>
+            </div>
+          ))}
+        </div>
+      )}
       {kids.map((k) => (
         <SessionNode
           key={k.elanus_session}
@@ -209,7 +244,16 @@ export default function CodeSessions() {
             <span>status</span><b><StatusBadge status={detail.session.last_status} /></b>
             <span>duration</span><b>{humanDuration(detail.session.duration_ms)}</b>
             <span>tokens</span><b>{humanTokens(detail.session.input_tokens)} in / {humanTokens(detail.session.output_tokens)} out</b>
-            <span>resumes</span><b>{detail.session.resume_count}</b>
+            {detail.session.relaunches != null || detail.session.driven_resumes != null ? (
+              <>
+                <span>relaunches</span>
+                <b>{detail.session.relaunches ?? 0} <span className="cs-dim">manual</span></b>
+                <span>driven resumes</span>
+                <b>{detail.session.driven_resumes ?? 0} <span className="cs-dim">daemon</span></b>
+              </>
+            ) : (
+              <><span>resumes</span><b>{detail.session.resume_count}</b></>
+            )}
             {detail.session.parent && (<><span>parent</span><b className="cs-id">{detail.session.parent}</b></>)}
             {detail.session.workdir && (<><span>workdir</span><b className="cs-id">{detail.session.workdir}</b></>)}
           </div>
@@ -276,4 +320,10 @@ const CS_STYLE = `
 .cs-ev { display: flex; gap: 8px; padding: 1px 0; }
 .cs-evkind { font-family: ui-monospace, monospace; }
 .cs-evsum { color: #8a8a8a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cs-toggle { cursor: pointer; user-select: none; width: 12px; text-align: center; color: #8a8a8a; }
+.cs-toggle:hover { color: #ddd; }
+.cs-thread { cursor: help; }
+.cs-incs { margin: 2px 0 4px 18px; padding: 2px 0 2px 8px; border-left: 1px solid #333; display: flex; flex-direction: column; gap: 1px; font-size: 11px; }
+.cs-inc { display: flex; gap: 8px; align-items: baseline; color: #8a8a8a; }
+.cs-inc-i { font-size: 9px; min-width: 48px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.8; }
 `;
