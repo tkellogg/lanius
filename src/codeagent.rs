@@ -271,13 +271,33 @@ enum Capture {
     RolloutImport,
     /// The bracketed no-op floor: the harness runs as an interactive TUI with
     /// inherited stdio and the launcher captures ONLY the session/start + stop
-    /// brackets it already emits — no per-turn detail at all. This is the honest
-    /// floor for a TUI we can launch but cannot yet faithfully capture: opencode's
-    /// TUI (HM3 makes opencode honor a bare → Tui launch) has no live hook bridge
-    /// and no rollout reader is in scope here, so its Tui cell is bracketed-only
-    /// rather than silently pretending to live-capture. (Codex's TUI does NOT use
-    /// this floor — it has `RolloutImport`.)
+    /// brackets it already emits — no per-turn detail at all. The honest floor for a
+    /// TUI we can launch but cannot faithfully capture. No harness currently selects
+    /// it (opencode's Tui cell was promoted from this floor to `ServerEvents` in OC3,
+    /// codex's is `RolloutImport`), but the variant + its `run_tui_lifecycle` arm are
+    /// kept as the declared fallback a future harness with no live/rollout capture can
+    /// drop to rather than silently pretending to live-capture.
+    #[allow(dead_code)]
     Lifecycle,
+    /// LIVE capture off a harness server's SSE event stream (OC3). opencode is
+    /// client/server: `opencode serve` exposes an HTTP + SSE `/event` stream and
+    /// `opencode attach <url>` runs the TUI against it. The launcher starts its own
+    /// `opencode serve` on a free port (basic-auth'd via `OPENCODE_SERVER_PASSWORD`),
+    /// subscribes the SSE stream in a background thread, launches the human's TUI via
+    /// `opencode attach <url>` with inherited stdio, and projects each SSE event into
+    /// the obs grammar LIVE as it arrives — capturing opencode's native session id off
+    /// the same stream (so resume still works). On TUI exit the launcher kills the
+    /// served instance and closes the stream cleanly.
+    ///
+    /// FIDELITY: a `ServerEvents` cell is **LIVE** (per-event, as it happens), unlike
+    /// `RolloutImport`'s post-hoc on-disk import. Its projected events carry an explicit
+    /// `"fidelity":"server-events-live"` / `"source":"sse"` marker (see
+    /// `opencode_sse_publish`) so a consumer knows it is live SSE capture, distinct from
+    /// codex's post-hoc rollout import and from a Claude live hook bridge. Best-effort
+    /// where noted: the SSE subscriber is advisory telemetry — if the stream drops, the
+    /// TUI keeps running uncaptured and the launcher records the gap honestly rather than
+    /// killing the human's session.
+    ServerEvents,
 }
 
 /// The shared, harness-agnostic bits the launch envelope assembles, passed to a
@@ -361,6 +381,17 @@ trait Harness: Sync {
         _ctx: StreamLaunch<'_>,
     ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
         unreachable!("run_tui_lifecycle called on a non-Lifecycle harness")
+    }
+    /// Run an interactive TUI launch wired to a harness server the launcher observes,
+    /// subscribing the server's SSE event stream and projecting each event into the obs
+    /// grammar LIVE (the `Capture::ServerEvents` arm, OC3). Default: unreachable — only
+    /// the opencode harness overrides it, and the envelope only calls it for
+    /// `Capture::ServerEvents`.
+    fn run_tui_server_events(
+        &self,
+        _ctx: StreamLaunch<'_>,
+    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+        unreachable!("run_tui_server_events called on a non-ServerEvents harness")
     }
     /// Read this harness's daemon-resume stdout stream (the spawned child) into the
     /// obs grammar + capture summary, under the resumed elanus session. Each harness
@@ -577,19 +608,22 @@ impl Harness for OpenCode {
     fn capture(&self, mode: Mode) -> Capture {
         // opencode `run --format json` prints a JSONL event stream on stdout (no
         // hooks, no home pollution) — same StreamJson strategy as Codex for the
-        // Headless cell. The Tui cell (HM3) launches opencode's interactive TUI
-        // with inherited stdio; opencode has no live hook bridge and no rollout
-        // reader is in scope (HM2 is codex-only), so its Tui capture is the honest
-        // bracketed `Lifecycle` floor, not a pretend live capture.
+        // Headless cell. The Tui cell (OC3) exploits opencode being client/server:
+        // the launcher starts its OWN `opencode serve`, subscribes the server's SSE
+        // `/event` stream, and runs the human's TUI via `opencode attach <url>` —
+        // so the TUI is captured LIVE off the event stream (a strictly nicer cell
+        // than codex's post-hoc RolloutImport). This replaced the earlier
+        // bracket-only Lifecycle floor now that the SSE capture exists.
         match mode {
             Mode::Headless => Capture::StreamJson,
-            Mode::Tui => Capture::Lifecycle,
+            Mode::Tui => Capture::ServerEvents,
         }
     }
     fn mode_for(&self, headless: bool) -> Mode {
         // HM3: opencode now honors both cells. Bare `elanus code opencode` → its
-        // interactive TUI (Lifecycle-bracketed); `--headless`/`--worker` →
-        // `opencode run --format json` (the live StreamJson worker, unchanged).
+        // interactive TUI (OC3 live SSE capture via a served instance);
+        // `--headless`/`--worker` → `opencode run --format json` (the live
+        // StreamJson worker, unchanged).
         if headless { Mode::Headless } else { Mode::Tui }
     }
     fn settings(&self, _self_exe: &Path, _root: &Root) -> Option<Value> {
@@ -639,17 +673,26 @@ impl Harness for OpenCode {
             ctx.worker_timeout,
         )
     }
-    fn run_tui_lifecycle(
+    fn run_tui_server_events(
         &self,
         ctx: StreamLaunch<'_>,
     ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        // HM3: opencode's Tui cell. Launch the interactive `opencode` TUI with
-        // inherited stdio; the ONLY capture is the launcher's session/start+stop
-        // brackets (the Lifecycle floor) — opencode has no live hook bridge and no
-        // rollout reader is in scope (HM2 is codex-only), so this honestly captures
-        // nothing per-turn rather than pretending to. Returns an empty summary.
-        run_opencode_tui_lifecycle(
-            ctx.root, ctx.agent, ctx.session, ctx.workdir, ctx.args, ctx.brief,
+        // OC3: opencode's Tui cell — LIVE capture off a served instance's SSE
+        // `/event` stream. The launcher starts its own `opencode serve`, subscribes
+        // the stream in a background thread (projecting each event into the obs
+        // grammar live via `opencode_map_event`), runs the human's TUI via `opencode
+        // attach <url>` with inherited stdio, and on TUI exit kills the server and
+        // closes the stream. The native session id is harvested off the same stream
+        // (so OC2 resume keeps working from a TUI session).
+        run_opencode_tui_server_events(
+            ctx.root,
+            ctx.principal,
+            ctx.bus_token,
+            ctx.agent,
+            ctx.session,
+            ctx.workdir,
+            ctx.args,
+            ctx.brief,
         )
     }
     fn resume_stream_capture(
@@ -2417,9 +2460,29 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                 worker_timeout,
             }),
             // ── Lifecycle: interactive TUI, bracket-only capture ──────────────
-            // opencode's Tui cell (HM3). Inherited stdio; the only capture is the
-            // session/start + session/stop brackets the launcher already emits.
+            // The honest no-op floor for a TUI we can launch but not faithfully
+            // capture. No harness currently selects it (opencode's Tui cell was
+            // promoted to ServerEvents in OC3); kept as the declared floor a future
+            // harness can fall back to.
             Capture::Lifecycle => tool.run_tui_lifecycle(StreamLaunch {
+                root,
+                principal: &principal,
+                bus_token: &bus_token,
+                agent: &agent,
+                session: &session,
+                workdir: &workdir,
+                args,
+                brief: brief_text.as_deref(),
+                worker,
+                worker_timeout,
+            }),
+            // ── ServerEvents: interactive TUI captured LIVE off a server's SSE ─
+            // opencode's Tui cell (OC3). The launcher starts its own `opencode
+            // serve`, subscribes the server's SSE `/event` stream in a background
+            // thread (projecting each event into the obs grammar live), and runs the
+            // human's TUI via `opencode attach <url>` with inherited stdio. On TUI
+            // exit it kills the server and closes the stream.
+            Capture::ServerEvents => tool.run_tui_server_events(StreamLaunch {
                 root,
                 principal: &principal,
                 bus_token: &bus_token,
@@ -3372,27 +3435,210 @@ fn run_opencode_capture(
     Ok((status, summary))
 }
 
-/// HM3: launch opencode's interactive TUI (inherited stdio) — the `Capture::Lifecycle`
-/// floor. Bare `opencode` opens the TUI; `opencode "<prompt>"` seeds it. opencode has
-/// no --append-system-prompt, so the launch-envelope briefing is folded into the seed
-/// positional (same approach as the codex TUI). The launcher captures NOTHING per-turn
-/// (no live hook bridge, no rollout reader in scope); the only obs are the
-/// session/start + session/stop brackets the envelope already emits. Returns an empty
-/// summary. (A future opencode rollout/storage reader would promote this to a
-/// RolloutImport cell; deferred.)
-fn run_opencode_tui_lifecycle(
+// ── OC3: opencode TUI via a LIVE server SSE capture (Capture::ServerEvents) ────
+//
+// OBSERVED SSE CONTRACT — `opencode serve` + GET `/event` (v1.17.9).
+// Discovered 2026-06-22 from the installed binary (no model call needed to read the
+// shape; one trivial `opencode run --attach` confirmed the live content frames):
+//
+//   * `opencode serve` prints the listen URL on STDOUT:
+//       `opencode server listening on http://127.0.0.1:<port>`
+//     If `OPENCODE_SERVER_PASSWORD` is unset it warns "server is unsecured"; we set
+//     a fresh random password so the loopback server requires basic auth (user
+//     `opencode`, the default `OPENCODE_SERVER_USERNAME`).
+//   * GET `/event` is a `text/event-stream`: frames are `data: <json>\n\n`. Each
+//     decoded JSON is `{ "id": "evt_…", "type": "<dotted.kind>", "properties": {…} }`
+//     — a DIFFERENT vocabulary from `opencode run --format json` (which emits settled
+//     `{type:"text"|"tool_use"|…, part}` lines). The relevant SSE kinds:
+//       - "server.connected" / "server.heartbeat"  → keepalives (ignored)
+//       - "session.created"  → properties.info.id   = the native session id
+//       - "message.part.updated" → properties.part  = a Part (the SAME Part shapes
+//         that `run --format json` wraps): {type:"text"|"reasoning"|"tool"|
+//         "step-start"|"step-finish", …}. A text/reasoning part is SETTLED when its
+//         `time.end` is set; a tool part is settled when state.status is
+//         completed/error.
+//       - "session.idle"   → properties.sessionID   = the turn finished
+//       - "session.error"  → properties.error
+//   * `opencode attach <url>` runs the human's TUI against that server; its turns
+//     flow through the SAME `/event` stream the launcher subscribes.
+//
+// REUSE: rather than write a second event mapper, the subscriber TRANSLATES a
+// settled `message.part.updated` into the exact `{type, sessionID, part}` envelope
+// `opencode_map_event` / `opencode_collect_summary` already consume (the Part shapes
+// are identical), then reuses those. So the SSE projection and the headless stream
+// projection share one mapping — the live cell and the headless cell land the SAME
+// obs leaf vocabulary, differing only in the honest fidelity stamp.
+
+/// OC3: launch opencode's interactive TUI captured LIVE off a served instance's SSE
+/// stream (the `Capture::ServerEvents` cell). Steps:
+///   1. Start our OWN `opencode serve` on a free port, basic-auth'd with a fresh
+///      random `OPENCODE_SERVER_PASSWORD`, read its listen URL off stdout.
+///   2. Spawn a background thread subscribing GET `/event` (SSE), projecting each
+///      event into the obs grammar LIVE (`opencode_sse_publish` → `opencode_map_event`),
+///      harvesting the native session id (→ durable record, so OC2 resume works) and
+///      the legible summary.
+///   3. Launch the human's TUI via `opencode attach <url>` with INHERITED stdio
+///      inside the cage + the envelope briefing folded into the seed positional.
+///   4. On TUI exit, kill the served instance (which EOFs the SSE stream) and join
+///      the subscriber thread, returning the harvested summary.
+///
+/// FIDELITY: the SSE projection is LIVE (per-event) and stamped
+/// `fidelity:"server-events-live"` / `source:"sse"` (see `opencode_sse_publish`),
+/// distinct from codex's post-hoc `rollout-import`. Best-effort: the subscriber is
+/// advisory telemetry — if `serve` fails to start or the stream drops, the TUI still
+/// runs (uncaptured) and the launcher records the gap on the bus rather than killing
+/// the human's session.
+///
+/// CONSTRUCTION-ONLY vs LIVE-TESTED: a real interactive `opencode attach` with a
+/// human at a terminal cannot run headless, so the inherited-stdio TUI ergonomics are
+/// verified by construction/inspection. The SSE CAPTURE MECHANISM itself is
+/// live-testable headless (serve + drive a non-interactive `opencode run --attach`
+/// against it + confirm the subscriber projects the events); the projection +
+/// session-id harvest are also unit-tested on captured SSE samples.
+#[allow(clippy::too_many_arguments)]
+fn run_opencode_tui_server_events(
     root: &Root,
+    principal: &str,
+    bus_token: &str,
     agent: &str,
     session: &str,
     workdir: &Path,
     args: &[String],
     brief: Option<&str>,
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+    use std::process::{Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // 1. Start our own served instance. A fresh per-launch password fences the
+    //    loopback server (basic auth: user `opencode`, default username). `--port 0`
+    //    asks opencode for a free port (it prints the resolved URL on stdout).
+    let password = opencode_server_password();
+    let mut serve = Command::new("opencode");
+    serve
+        .arg("serve")
+        .arg("--port")
+        .arg("0")
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    scrub_provider_creds(&mut serve);
+    scrub_launch_control_env(&mut serve);
+    serve
+        .env_remove("ELANUS_PACKAGE")
+        .env_remove("ELANUS_BUS_TOKEN")
+        .env("OPENCODE_SERVER_PASSWORD", &password)
+        .env(ENV_SESSION, session)
+        .env(ENV_AGENT, agent)
+        .env("ELANUS_ROOT", &root.dir);
+
+    let mut serve_child = serve
+        .spawn()
+        .with_context(|| "launching `opencode serve` (is opencode installed and on PATH?)")?;
+
+    // Read the listen URL off the server's stdout (it prints
+    // "opencode server listening on http://127.0.0.1:<port>"). We take stdout here
+    // and keep the reader alive past the URL line so the pipe never fills and blocks
+    // the server.
+    let url = match serve_child
+        .stdout
+        .take()
+        .and_then(opencode_read_serve_url)
+    {
+        Some(u) => u,
+        None => {
+            // serve never announced a URL — degrade honestly: kill the half-started
+            // server and fall back to a bracket-only TUI launch (no live capture),
+            // recording the gap on the bus rather than aborting the human's session.
+            let _ = serve_child.kill();
+            let _ = serve_child.wait();
+            publish_obs(
+                root,
+                principal,
+                bus_token,
+                &obs_topic(agent, session, "session/idle"),
+                json!({
+                    "ts": now_iso(),
+                    "event": "server_events_unavailable",
+                    "detail": "opencode serve did not announce a listen URL; TUI ran uncaptured",
+                    "fidelity": "server-events-live",
+                    "source": "sse",
+                }),
+            );
+            eprintln!(
+                "[code] opencode serve did not announce a URL; launching TUI WITHOUT live capture"
+            );
+            return run_opencode_attach_tui(
+                root, agent, session, workdir, args, brief, None, &password,
+            );
+        }
+    };
+    eprintln!("[code] opencode served at {url} (session {session}); subscribing SSE /event");
+
+    // 2. Background SSE subscriber. `stop` lets us close the reqwest stream loop
+    //    promptly once the TUI exits even if no more events arrive. The summary +
+    //    native session id are harvested on the thread and returned on join.
+    let stop = Arc::new(AtomicBool::new(false));
+    let sub = {
+        let root = root.clone();
+        let principal = principal.to_string();
+        let bus_token = bus_token.to_string();
+        let agent = agent.to_string();
+        let session = session.to_string();
+        let workdir = workdir.to_path_buf();
+        let url = url.clone();
+        let password = password.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            opencode_subscribe_sse(
+                &root, &principal, &bus_token, &agent, &session, &workdir, &url, &password, &stop,
+            )
+        })
+    };
+
+    // 3. The human's TUI, attached to the server we observe (inherited stdio).
+    let tui = run_opencode_attach_tui(
+        root,
+        agent,
+        session,
+        workdir,
+        args,
+        brief,
+        Some(&url),
+        &password,
+    );
+
+    // 4. Tear down: stop the subscriber loop, kill the served instance (EOFs the
+    //    stream), join the subscriber for its harvested summary.
+    stop.store(true, Ordering::SeqCst);
+    let _ = serve_child.kill();
+    let _ = serve_child.wait();
+    let summary = sub.join().unwrap_or_default();
+
+    let (status, _) = tui?;
+    print_codex_worker_result(session, &summary);
+    Ok((status, summary))
+}
+
+/// Launch `opencode attach <url>` (or a bare `opencode` TUI when `url` is None — the
+/// degraded no-capture fallback) with inherited stdio inside the cage, the envelope
+/// briefing folded into the seed positional (opencode has no `--append-system-prompt`).
+/// Returns an empty summary — the live capture (when present) is harvested by the SSE
+/// subscriber thread, not here.
+#[allow(clippy::too_many_arguments)]
+fn run_opencode_attach_tui(
+    root: &Root,
+    agent: &str,
+    session: &str,
+    workdir: &Path,
+    args: &[String],
+    brief: Option<&str>,
+    url: Option<&str>,
+    password: &str,
+) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::process::Command;
 
-    // opencode's bare TUI takes a leading message argument; fold the briefing into
-    // it. opencode_task_from_args returns the user's task (Ok) or errors when none —
-    // for the TUI a missing task is fine (a bare TUI), so tolerate that.
     let task = opencode_task_from_args(args).unwrap_or_default();
     let seed = match (brief, task.trim().is_empty()) {
         (Some(b), false) => Some(opencode_message_with_brief(Some(b), &task)),
@@ -3402,6 +3648,9 @@ fn run_opencode_tui_lifecycle(
     };
 
     let mut cmd = Command::new("opencode");
+    if let Some(url) = url {
+        cmd.arg("attach").arg(url);
+    }
     if let Some(seed) = seed {
         cmd.arg(seed);
     }
@@ -3412,15 +3661,414 @@ fn run_opencode_tui_lifecycle(
     scrub_provider_creds(&mut cmd);
     scrub_launch_control_env(&mut cmd);
     cmd.env_remove("ELANUS_PACKAGE").env_remove("ELANUS_BUS_TOKEN");
+    // attach reads the same basic-auth password to reach the server.
+    cmd.env("OPENCODE_SERVER_PASSWORD", password);
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir);
-    eprintln!("[code] launching opencode TUI as session {session} (lifecycle-bracket capture only)");
+    match url {
+        Some(u) => eprintln!("[code] launching opencode attach {u} as session {session} (live SSE capture)"),
+        None => eprintln!("[code] launching opencode TUI as session {session} (no live capture)"),
+    }
 
     let status = cmd
         .status()
         .with_context(|| "launching opencode (is it installed and on PATH?)".to_string())?;
     Ok((status, CaptureSummary::default()))
+}
+
+/// A fresh per-launch basic-auth password for our served instance: prefer an
+/// operator-provided `OPENCODE_SERVER_PASSWORD` (honor the user's setting), else mint
+/// a random one so the loopback server is never the "unsecured" default.
+fn opencode_server_password() -> String {
+    if let Ok(p) = std::env::var("OPENCODE_SERVER_PASSWORD") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    // A nonce from the clock + pid — enough to fence a short-lived loopback server.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("elanus-{}-{}", std::process::id(), nanos)
+}
+
+/// Read `opencode serve`'s stdout until it announces its listen URL
+/// (`… listening on http://127.0.0.1:<port>`); return that URL. Returns None if the
+/// stream ends first (server failed to start). Drains remaining stdout in a detached
+/// thread so the server's stdout pipe never fills and blocks it.
+fn opencode_read_serve_url(out: std::process::ChildStdout) -> Option<String> {
+    let mut reader = std::io::BufReader::new(out);
+    let mut url = None;
+    loop {
+        let mut line = String::new();
+        match std::io::BufRead::read_line(&mut reader, &mut line) {
+            Ok(0) => break, // EOF before any URL
+            Ok(_) => {
+                if let Some(u) = opencode_extract_url(&line) {
+                    url = Some(u);
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if url.is_some() {
+        // Keep draining so the server's stdout pipe never blocks it.
+        std::thread::spawn(move || {
+            let mut sink = String::new();
+            let _ = std::io::Read::read_to_string(&mut reader, &mut sink);
+        });
+    }
+    url
+}
+
+/// Extract the `http://host:port` URL from an `opencode serve` announcement line.
+fn opencode_extract_url(line: &str) -> Option<String> {
+    let idx = line.find("http://").or_else(|| line.find("https://"))?;
+    let tail = &line[idx..];
+    let end = tail
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(tail.len());
+    let url = tail[..end].trim_end_matches('/').to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+/// Subscribe `opencode serve`'s SSE `/event` stream, projecting each event into the
+/// obs grammar LIVE. Runs on a background thread with its own current-thread tokio
+/// runtime (reqwest is async; the rest of `codeagent` is blocking). Reads the
+/// `text/event-stream` chunk-by-chunk, splits `data: …\n\n` frames, and routes each
+/// decoded event through `opencode_sse_publish`. Stops when the server EOFs the
+/// stream (TUI torn down) or `stop` is set. Returns the harvested `CaptureSummary`.
+/// Best-effort: any error (connect/read) records the gap on the bus and returns the
+/// summary harvested so far rather than propagating.
+#[allow(clippy::too_many_arguments)]
+fn opencode_subscribe_sse(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    workdir: &Path,
+    url: &str,
+    password: &str,
+    stop: &std::sync::atomic::AtomicBool,
+) -> CaptureSummary {
+    use std::sync::atomic::Ordering;
+
+    let mut summary = CaptureSummary::default();
+    let mut recorded = false;
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("[code] opencode SSE: building runtime failed ({e}); TUI uncaptured");
+            return summary;
+        }
+    };
+
+    rt.block_on(async {
+        let client = reqwest::Client::new();
+        let resp = match client
+            .get(format!("{url}/event"))
+            .basic_auth("opencode", Some(password))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[code] opencode SSE subscribe failed ({e}); TUI runs uncaptured");
+                publish_obs(
+                    root,
+                    principal,
+                    bus_token,
+                    &obs_topic(agent, session, "session/idle"),
+                    json!({
+                        "ts": now_iso(),
+                        "event": "server_events_unavailable",
+                        "detail": format!("SSE subscribe failed: {e}"),
+                        "fidelity": "server-events-live",
+                        "source": "sse",
+                    }),
+                );
+                return;
+            }
+        };
+
+        let mut resp = resp;
+        // Accumulate bytes and split on the SSE frame terminator `\n\n`.
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    buf.extend_from_slice(&chunk);
+                    while let Some(pos) = find_frame_end(&buf) {
+                        let frame: Vec<u8> = buf.drain(..pos).collect();
+                        // Drop the trailing `\n\n` separator from the buffer.
+                        let drop = if buf.starts_with(b"\r\n\r\n") {
+                            4
+                        } else {
+                            2
+                        };
+                        buf.drain(..drop.min(buf.len()));
+                        if let Some(event) = parse_sse_frame(&frame) {
+                            opencode_sse_publish(
+                                root,
+                                principal,
+                                bus_token,
+                                agent,
+                                session,
+                                workdir,
+                                &event,
+                                &mut summary,
+                                &mut recorded,
+                            );
+                        }
+                    }
+                }
+                Ok(None) => break, // server EOF (TUI torn down)
+                Err(_) => break,
+            }
+        }
+    });
+
+    summary
+}
+
+/// Find the byte offset of the end of the first complete SSE frame in `buf` (the
+/// index just before the `\n\n` or `\r\n\r\n` terminator). None if no complete frame
+/// is buffered yet.
+fn find_frame_end(buf: &[u8]) -> Option<usize> {
+    let lf = find_subslice(buf, b"\n\n");
+    let crlf = find_subslice(buf, b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
+/// Parse one raw SSE frame (the bytes of `data: …` lines, terminator already
+/// stripped) into the decoded event JSON. An SSE frame may carry multiple `data:`
+/// lines (concatenated with `\n` per the spec); opencode emits one. Lines that are
+/// not `data:` (e.g. `event:`/`id:`/comments) are ignored. Returns None for a frame
+/// with no JSON `data` or unparseable JSON (a heartbeat comment, a partial frame).
+fn parse_sse_frame(frame: &[u8]) -> Option<Value> {
+    let text = String::from_utf8_lossy(frame);
+    let mut data = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            // SSE allows an optional single leading space after the colon.
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest);
+        }
+    }
+    if data.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(&data).ok()
+}
+
+/// Project ONE decoded SSE event into the obs grammar LIVE, harvesting the native
+/// session id (→ durable record) and the legible summary as it goes. Reuses the
+/// headless mappers: a `message.part.updated` is TRANSLATED into the same
+/// `{type, sessionID, part}` envelope `opencode_map_event`/`opencode_collect_summary`
+/// consume (the Part shapes are identical), so the live cell lands the SAME obs leaf
+/// vocabulary as the headless cell. Every published body is stamped
+/// `fidelity:"server-events-live"` / `source:"sse"` so a consumer never mistakes the
+/// live SSE capture for codex's post-hoc rollout import or a Claude hook bridge.
+#[allow(clippy::too_many_arguments)]
+fn opencode_sse_publish(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    workdir: &Path,
+    event: &Value,
+    summary: &mut CaptureSummary,
+    recorded: &mut bool,
+) {
+    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+    // Keepalives and pure transport frames carry nothing for the bus.
+    if matches!(kind, "server.connected" | "server.heartbeat") {
+        return;
+    }
+
+    // Harvest the native session id (OC2 resume). It arrives on `session.created`
+    // (properties.info.id) and is also present on every content event's part
+    // (part.sessionID) — take the first we see and persist the durable record.
+    if !*recorded {
+        let sid = opencode_sse_native_id(event);
+        if let Some(sid) = sid {
+            if !sid.is_empty() {
+                let rec = codesession::SessionRecord {
+                    elanus_session: session.to_string(),
+                    native_session: sid,
+                    tool: "opencode".to_string(),
+                    agent_noun: agent.to_string(),
+                    workdir: workdir.display().to_string(),
+                    room: None,
+                };
+                if let Err(e) = codesession::upsert_record(root, &rec) {
+                    eprintln!("[code] recording opencode TUI session (continuing): {e:#}");
+                }
+                *recorded = true;
+            }
+        }
+    }
+
+    // Translate the SSE event into the headless `run --format json` envelope shape,
+    // then reuse the existing mappers so the live and headless cells share one
+    // projection. `None` = an SSE-only control frame we surface directly below.
+    if let Some(run_event) = opencode_sse_to_run_event(event) {
+        opencode_collect_summary(&run_event, summary);
+        for (leaf, body) in opencode_map_event(&run_event) {
+            publish_obs(
+                root,
+                principal,
+                bus_token,
+                &obs_topic(agent, session, &leaf),
+                stamp_sse_fidelity(body),
+            );
+        }
+        return;
+    }
+
+    // SSE-only control frames with no headless analog: surface them on the idle leaf
+    // so the live stream is legible (session boundaries / errors), nothing dropped.
+    match kind {
+        "session.idle" => publish_obs(
+            root,
+            principal,
+            bus_token,
+            &obs_topic(agent, session, "session/idle"),
+            stamp_sse_fidelity(json!({ "ts": now_iso(), "event": "session.idle" })),
+        ),
+        "session.error" => publish_obs(
+            root,
+            principal,
+            bus_token,
+            &obs_topic(agent, session, "session/idle"),
+            stamp_sse_fidelity(json!({
+                "ts": now_iso(),
+                "event": "session.error",
+                "error": clip_value(event.get("properties").and_then(|p| p.get("error")), 4000),
+            })),
+        ),
+        // session.created etc. already harvested the id above; nothing else to file.
+        _ => {}
+    }
+}
+
+/// The native opencode session id carried by an SSE event, if any: `session.created`
+/// puts it under `properties.info.id`; content events carry it under
+/// `properties.sessionID` (and on the nested part).
+fn opencode_sse_native_id(event: &Value) -> Option<String> {
+    let props = event.get("properties")?;
+    if let Some(id) = props
+        .get("info")
+        .and_then(|i| i.get("id"))
+        .and_then(Value::as_str)
+    {
+        return Some(id.to_string());
+    }
+    props
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Translate a settled SSE `message.part.updated` event into the `{type, sessionID,
+/// part}` envelope the headless `opencode_map_event`/`opencode_collect_summary`
+/// consume, so the live SSE cell reuses the headless projection verbatim. Returns
+/// None for events with no headless analog (handled directly by `opencode_sse_publish`)
+/// and for UNSETTLED parts (a text/reasoning part with no `time.end`, a tool part not
+/// yet completed/error) — matching the headless stream, which only emits SETTLED
+/// parts. The Part `type` is remapped to the headless `type` value:
+///   text → "text", reasoning → "reasoning", tool → "tool_use",
+///   step-start → "step_start", step-finish → "step_finish".
+fn opencode_sse_to_run_event(event: &Value) -> Option<Value> {
+    if event.get("type").and_then(Value::as_str)? != "message.part.updated" {
+        return None;
+    }
+    let part = event.get("properties").and_then(|p| p.get("part"))?;
+    let ptype = part.get("type").and_then(Value::as_str)?;
+    let session_id = part
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let run_type = match ptype {
+        "text" | "reasoning" => {
+            // Settled only: the headless stream emits a text/reasoning event only
+            // once part.time.end is set. Mirror that so a live partial isn't filed
+            // (and re-filed) as a final message.
+            let settled = part
+                .get("time")
+                .and_then(|t| t.get("end"))
+                .is_some();
+            if !settled {
+                return None;
+            }
+            if ptype == "text" { "text" } else { "reasoning" }
+        }
+        "tool" => {
+            // Settled only: completed or error (matches the headless `tool_use`).
+            let status = part
+                .get("state")
+                .and_then(|s| s.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if status != "completed" && status != "error" {
+                return None;
+            }
+            "tool_use"
+        }
+        "step-start" => "step_start",
+        "step-finish" => "step_finish",
+        // Other part kinds (file/snapshot/patch/agent/…) have no headless analog.
+        _ => return None,
+    };
+
+    Some(json!({
+        "type": run_type,
+        "sessionID": session_id,
+        "part": part.clone(),
+    }))
+}
+
+/// Stamp a projected body with the LIVE-SSE fidelity markers so a consumer knows the
+/// capture is live per-event (distinct from codex's post-hoc `rollout-import` and a
+/// Claude hook bridge). A no-op for a non-object body (never happens for our maps).
+fn stamp_sse_fidelity(mut body: Value) -> Value {
+    if let Value::Object(m) = &mut body {
+        m.insert("fidelity".into(), json!("server-events-live"));
+        m.insert("source".into(), json!("sse"));
+    }
+    body
 }
 
 /// Read an opencode `run --format json` child's JSONL stdout line-by-line, mapping
@@ -5015,12 +5663,12 @@ mod tests {
         assert_eq!(codex.agent_noun(), "codex");
         assert_eq!(codex.binary(), "codex");
 
-        // HM3: opencode now honors both cells. bare → Tui (Lifecycle floor —
-        // inherited stdio, bracket-only capture); --headless → Headless (StreamJson,
-        // unchanged).
+        // OC3: opencode now honors both cells. bare → Tui (ServerEvents — live SSE
+        // capture off a served instance, inherited-stdio TUI via `opencode attach`);
+        // --headless → Headless (StreamJson, unchanged).
         assert_eq!(opencode.mode_for(false), Mode::Tui);
         assert_eq!(opencode.mode_for(true), Mode::Headless);
-        assert!(matches!(opencode.capture(Mode::Tui), Capture::Lifecycle));
+        assert!(matches!(opencode.capture(Mode::Tui), Capture::ServerEvents));
         assert!(matches!(
             opencode.capture(Mode::Headless),
             Capture::StreamJson
@@ -5894,6 +6542,175 @@ mod tests {
             opencode_message_with_brief(None, "do the thing"),
             "do the thing"
         );
+    }
+
+    // ── OC3: opencode TUI live SSE capture (Capture::ServerEvents) ─────────────
+
+    #[test]
+    fn opencode_tui_capture_is_server_events_live() {
+        // OC3: opencode's Tui cell is the LIVE SSE capture, not the bracket-only
+        // Lifecycle floor it replaced.
+        assert!(matches!(OpenCode.capture(Mode::Tui), Capture::ServerEvents));
+        // Headless is unchanged (the OC1 StreamJson worker).
+        assert!(matches!(OpenCode.capture(Mode::Headless), Capture::StreamJson));
+    }
+
+    #[test]
+    fn opencode_serve_url_is_extracted_from_the_announce_line() {
+        // The exact line `opencode serve` prints on stdout (v1.17.9, captured live).
+        assert_eq!(
+            opencode_extract_url("opencode server listening on http://127.0.0.1:4096\n"),
+            Some("http://127.0.0.1:4096".to_string())
+        );
+        // A trailing slash is trimmed (so `{url}/event` is well-formed).
+        assert_eq!(
+            opencode_extract_url("listening on http://127.0.0.1:51234/"),
+            Some("http://127.0.0.1:51234".to_string())
+        );
+        // A line with no URL yields None.
+        assert_eq!(opencode_extract_url("warming up..."), None);
+    }
+
+    #[test]
+    fn sse_frames_split_on_the_blank_line_and_parse_data_json() {
+        // Two complete SSE frames (`data: <json>\n\n`) plus a trailing partial.
+        let stream = b"data: {\"type\":\"server.connected\",\"properties\":{}}\n\ndata: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_a\"}}\n\ndata: {\"type\":\"partial\"";
+        let mut buf = stream.to_vec();
+        let mut frames = Vec::new();
+        while let Some(pos) = find_frame_end(&buf) {
+            let frame: Vec<u8> = buf.drain(..pos).collect();
+            buf.drain(..2); // the `\n\n` terminator
+            if let Some(ev) = parse_sse_frame(&frame) {
+                frames.push(ev);
+            }
+        }
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["type"], "server.connected");
+        assert_eq!(frames[1]["type"], "session.idle");
+        // The trailing partial frame stays buffered (no complete frame yet).
+        assert!(find_frame_end(&buf).is_none());
+        // An optional single leading space after `data:` is tolerated.
+        assert_eq!(
+            parse_sse_frame(b"data:{\"type\":\"x\"}").unwrap()["type"],
+            "x"
+        );
+    }
+
+    #[test]
+    fn sse_message_part_text_translates_to_the_headless_run_event() {
+        // A captured-live SSE `message.part.updated` with a SETTLED text part
+        // (time.end set) translates into the same `{type:"text", part}` envelope the
+        // headless mapper consumes, then reuses opencode_map_event verbatim.
+        let sse = json!({
+            "id": "evt_1",
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_a",
+                "part": {
+                    "id": "prt_1", "messageID": "msg_1", "sessionID": "ses_a",
+                    "type": "text", "text": "Hi! 👋",
+                    "time": { "start": 1, "end": 2 }
+                }
+            }
+        });
+        let run = opencode_sse_to_run_event(&sse).expect("settled text translates");
+        assert_eq!(run["type"], "text");
+        // Reusing the headless projection lands the SAME obs leaf as the OC1 path.
+        let evs = opencode_map_event(&run);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].0, "assistant/message");
+        assert_eq!(evs[0].1["text"], "Hi! 👋");
+
+        // An UNSETTLED text part (no time.end — a streaming partial) is NOT projected
+        // (mirrors the headless stream, which only emits settled parts).
+        let partial = json!({
+            "type": "message.part.updated",
+            "properties": { "part": {
+                "type": "text", "text": "Hi", "sessionID": "ses_a",
+                "time": { "start": 1 }
+            }}
+        });
+        assert!(opencode_sse_to_run_event(&partial).is_none());
+    }
+
+    #[test]
+    fn sse_message_part_tool_translates_to_call_and_result() {
+        // A settled tool part (state.status completed) translates to `tool_use`, which
+        // the headless mapper projects as BOTH tool/<n>/call and tool/<n>/result.
+        let sse = json!({
+            "type": "message.part.updated",
+            "properties": { "part": {
+                "type": "tool", "tool": "bash", "callID": "call_1",
+                "sessionID": "ses_a",
+                "state": { "status": "completed", "input": { "command": "ls" }, "output": "f.txt" }
+            }}
+        });
+        let run = opencode_sse_to_run_event(&sse).expect("settled tool translates");
+        assert_eq!(run["type"], "tool_use");
+        let evs = opencode_map_event(&run);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].0, "tool/bash/call");
+        assert_eq!(evs[1].0, "tool/bash/result");
+        assert_eq!(evs[1].1["output"], "f.txt");
+
+        // A tool part still RUNNING (status:"running") is not yet projected.
+        let running = json!({
+            "type": "message.part.updated",
+            "properties": { "part": {
+                "type": "tool", "tool": "bash", "callID": "c",
+                "state": { "status": "running", "input": {} }
+            }}
+        });
+        assert!(opencode_sse_to_run_event(&running).is_none());
+
+        // reasoning + step parts remap to their headless type values.
+        let reasoning = json!({
+            "type": "message.part.updated",
+            "properties": { "part": {
+                "type": "reasoning", "text": "thinking", "sessionID": "ses_a",
+                "time": { "start": 1, "end": 2 }
+            }}
+        });
+        assert_eq!(opencode_sse_to_run_event(&reasoning).unwrap()["type"], "reasoning");
+        let step = json!({
+            "type": "message.part.updated",
+            "properties": { "part": { "type": "step-finish", "tokens": {}, "cost": 0 } }
+        });
+        assert_eq!(opencode_sse_to_run_event(&step).unwrap()["type"], "step_finish");
+
+        // A non-content SSE event has no headless analog → None (handled directly).
+        let idle = json!({ "type": "session.idle", "properties": { "sessionID": "ses_a" } });
+        assert!(opencode_sse_to_run_event(&idle).is_none());
+    }
+
+    #[test]
+    fn sse_native_session_id_is_harvested_from_the_stream() {
+        // `session.created` carries the native id under properties.info.id — the same
+        // id the headless `run` stream carries on `sessionID`, so OC2 resume works
+        // from a TUI session.
+        let created = json!({
+            "type": "session.created",
+            "properties": { "sessionID": "ses_z", "info": { "id": "ses_z", "slug": "x" } }
+        });
+        assert_eq!(opencode_sse_native_id(&created).as_deref(), Some("ses_z"));
+        // Content events also carry it under properties.sessionID (the fallback).
+        let part = json!({
+            "type": "message.part.updated",
+            "properties": { "sessionID": "ses_y", "part": { "type": "text" } }
+        });
+        assert_eq!(opencode_sse_native_id(&part).as_deref(), Some("ses_y"));
+        // A frame with no session id (server.connected) yields None.
+        let conn = json!({ "type": "server.connected", "properties": {} });
+        assert_eq!(opencode_sse_native_id(&conn), None);
+    }
+
+    #[test]
+    fn sse_fidelity_is_stamped_live() {
+        // Every projected SSE body is stamped LIVE so a consumer never mistakes it for
+        // codex's post-hoc rollout import or a Claude hook bridge.
+        let body = stamp_sse_fidelity(json!({ "ts": "t", "text": "x" }));
+        assert_eq!(body["fidelity"], "server-events-live");
+        assert_eq!(body["source"], "sse");
     }
 
     #[test]
