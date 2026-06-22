@@ -98,7 +98,7 @@ const MAX_SPAWN_DEPTH: u32 = 8;
 
 /// One-turn teaching nudge surfaced only when the user's submitted prompt is
 /// plausibly asking for delegation, parallelism, or another coding agent.
-const DISPATCH_HINT: &str = "[elanus] Tip: you can dispatch coding workers yourself - run `elanus code help` for all verbs. Live/blocking: `elanus code codex \"<task>\"` runs a Codex worker and returns its result inline; `elanus code claude --worker \"<task>\"` runs a headless Claude worker.";
+const DISPATCH_HINT: &str = "[elanus] Tip: you can dispatch coding workers yourself - run `elanus code help` for all verbs. Live/blocking: `elanus code codex \"<task>\"` runs a Codex worker and returns its result inline; `elanus code opencode \"<task>\"` runs an opencode worker; `elanus code claude --worker \"<task>\"` runs a headless Claude worker.";
 
 /// The session-local Claude Code skill body written under the run scratch. Claude
 /// discovers it through `--add-dir <scratch>/skillroot` loading
@@ -115,6 +115,7 @@ Use this cheatsheet when you need another coding worker:
 
 - Full help: `elanus code help`
 - Live/blocking Codex worker: `elanus code codex "<task>"`
+- Live/blocking opencode worker: `elanus code opencode "<task>"`
 - Live/blocking Claude worker: `elanus code claude --worker "<task>"`
 - Async spawn: `elanus code spawn <tool> "<task>"`
 - Async deliver to an existing worker: `elanus code deliver <worker> "<msg>"`
@@ -186,6 +187,7 @@ Launch tools:
   elanus code claude [args...]          launch Claude Code
   elanus code claude --worker \"<task>\"   run Claude headless and print its result
   elanus code codex \"<task>\"           launch Codex; the task is positional
+  elanus code opencode \"<task>\"        launch opencode; the task is positional
 
 Commands:
   elanus code deliver <worker-session> \"<message>\"  dispatch work to a worker session
@@ -208,14 +210,17 @@ Commands:
 pub fn print_tools() {
     println!("claude");
     println!("codex");
+    println!("opencode");
 }
 
-/// The supported adapters: Claude Code (hook bridge) and Codex (`exec --json`
-/// stdout stream). They share the envelope; only the capture mechanism differs.
+/// The supported adapters: Claude Code (hook bridge), Codex (`exec --json` stdout
+/// stream), and opencode (`run --format json` stdout stream). They share the
+/// envelope; only the capture mechanism differs.
 #[derive(Clone, Copy)]
 enum Tool {
     ClaudeCode,
     Codex,
+    OpenCode,
 }
 
 /// How the launcher captures a session's activity — the per-tool seam.
@@ -233,7 +238,8 @@ impl Tool {
         match s {
             "claude" | "claude-code" | "cc" => Ok(Tool::ClaudeCode),
             "codex" => Ok(Tool::Codex),
-            other => bail!("unknown coding tool {other:?} (supported: claude, codex)"),
+            "opencode" | "oc" => Ok(Tool::OpenCode),
+            other => bail!("unknown coding tool {other:?} (supported: claude, codex, opencode)"),
         }
     }
     /// The agent noun this tool's sessions publish under: obs/agent/<noun>/...
@@ -241,6 +247,7 @@ impl Tool {
         match self {
             Tool::ClaudeCode => "claude-code",
             Tool::Codex => "codex",
+            Tool::OpenCode => "opencode",
         }
     }
     /// Recover the adapter from the agent noun the launcher recorded in the
@@ -251,6 +258,7 @@ impl Tool {
         match noun {
             "claude-code" => Some(Tool::ClaudeCode),
             "codex" => Some(Tool::Codex),
+            "opencode" => Some(Tool::OpenCode),
             _ => None,
         }
     }
@@ -259,6 +267,7 @@ impl Tool {
         match self {
             Tool::ClaudeCode => "claude",
             Tool::Codex => "codex",
+            Tool::OpenCode => "opencode",
         }
     }
     /// How the launcher captures this adapter's activity (the capture seam).
@@ -268,6 +277,9 @@ impl Tool {
             // Codex 0.141 hooks are a plugin/managed-config dead end; capture the
             // `codex exec --json` stdout stream in-process instead (Appendix B).
             Tool::Codex => Capture::StreamJson,
+            // opencode `run --format json` prints a JSONL event stream on stdout
+            // (no hooks, no home pollution) — same StreamJson strategy as Codex.
+            Tool::OpenCode => Capture::StreamJson,
         }
     }
     /// The generated tool config that routes this adapter's hook events through
@@ -278,6 +290,8 @@ impl Tool {
         match self {
             Tool::ClaudeCode => Some(claude_settings(self_exe, root)),
             Tool::Codex => None,
+            // opencode is a StreamJson adapter: no hooks, no generated settings.
+            Tool::OpenCode => None,
         }
     }
     /// Map one of this adapter's hook events + its payload to an obs/ topic leaf
@@ -290,6 +304,9 @@ impl Tool {
             // Codex never reaches the hook bridge (no hooks); file generically if
             // it somehow does, so nothing is dropped.
             Tool::Codex => generic_event(event, payload),
+            // opencode is also a StreamJson adapter (no hooks); the hook bridge is
+            // never reached for it. File generically if it somehow is.
+            Tool::OpenCode => generic_event(event, payload),
         }
     }
 }
@@ -967,7 +984,8 @@ fn briefing(session: &str) -> String {
         "You are coding session `{session}` under elanus supervision \
 (an orchestration layer around you).\n\
 \n\
-- To create a Codex worker, run `elanus code codex \"<prompt>\"`; the prompt is a \
+- To create a Codex or opencode worker, run `elanus code codex \"<prompt>\"` or \
+`elanus code opencode \"<prompt>\"`; the prompt is a \
 positional argument. Async dispatch: use \
 `elanus code deliver <worker-session> \"<message>\"` or \
 `elanus code spawn <tool> \"<task>\"`. `elanus code help` lists every verb.\n\
@@ -1817,20 +1835,39 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                     Ok((status, CaptureSummary::default()))
                 }
             }
-            // ── Codex: stdout JSONL stream ────────────────────────────────────
-            // No hooks. Run `codex exec --json`, pipe stdout, and parse+publish
-            // each event in-process as the session principal.
-            Capture::StreamJson => run_codex_capture(
-                root,
-                &principal,
-                &bus_token,
-                &agent,
-                &session,
-                &workdir,
-                args,
-                brief_text.as_deref(),
-                worker_timeout,
-            ),
+            // ── StreamJson: stdout JSONL stream ───────────────────────────────
+            // No hooks. Run the tool's headless JSON mode, pipe stdout, and
+            // parse+publish each event in-process as the session principal. The
+            // Capture strategy is per-strategy (not per-tool), so dispatch on the
+            // concrete Tool here: Codex (`exec --json`) vs opencode
+            // (`run --format json`). Both fill the same envelope.
+            Capture::StreamJson => match tool {
+                Tool::OpenCode => run_opencode_capture(
+                    root,
+                    &principal,
+                    &bus_token,
+                    &agent,
+                    &session,
+                    &workdir,
+                    args,
+                    brief_text.as_deref(),
+                    worker,
+                    worker_timeout,
+                ),
+                // Codex (the original StreamJson tool). ClaudeCode never reaches
+                // here (it is HookBridge), so the default is Codex.
+                _ => run_codex_capture(
+                    root,
+                    &principal,
+                    &bus_token,
+                    &agent,
+                    &session,
+                    &workdir,
+                    args,
+                    brief_text.as_deref(),
+                    worker_timeout,
+                ),
+            },
         }
     })();
 
@@ -2020,6 +2057,434 @@ fn run_codex_capture(
 
     let status = child.wait().context("waiting for codex exec to finish")?;
     Ok((status, summary))
+}
+
+// ── opencode adapter (StreamJson) ─────────────────────────────────────────────
+//
+// OBSERVED EVENT SCHEMA — `opencode run --format json` (v1.17.9).
+// Pinned 2026-06-21 from the installed binary: the run loop emits ONE JSON object
+// PER LINE (JSONL) on stdout via `process.stdout.write(JSON.stringify({type,
+// timestamp, sessionID, ...rest}) + "\n")`. Every line therefore has:
+//   { "type": <string>, "timestamp": <ms>, "sessionID": "ses_…", …rest }
+// The `sessionID` (opencode's native, resumable session id) is on EVERY event and
+// is known before the first model token (it comes from the resolved session).
+// The emitted `type` values + their `rest` payloads (from the run handler's
+// `p(type, rest)` call sites):
+//   "text"        → { part: <TextPart> }   — only when part.time.end is set (the
+//                    SETTLED assistant text). The LAST one is the final answer.
+//   "tool_use"    → { part: <ToolPart> }   — only when state.status is "completed"
+//                    or "error". Carries `tool` (name), `callID`, and `state`
+//                    ({status, input, output|error, title, metadata, time}).
+//                    NOTE: a single combined event per tool (the SETTLED tool),
+//                    NOT separate call/result — so we project BOTH a tool/<n>/call
+//                    (from state.input) and a tool/<n>/result (from state.output).
+//   "reasoning"   → { part: <ReasoningPart> } — settled reasoning text.
+//   "step_start"  → { part: <StepStartPart> }   — a model step boundary.
+//   "step_finish" → { part: <StepFinishPart> }  — carries tokens/cost.
+//   "error"       → { error: <…> }              — a session/stream error.
+// There is NO explicit "done"/"end" event: the run loop breaks on the server's
+// `session.status` idle and the process exits (stdout EOF). The TERMINAL signal is
+// EOF; the final answer is the last "text" event's part.text.
+// Part shapes (from the server OpenAPI `/doc`, same vocabulary):
+//   TextPart      { id, sessionID, messageID, type:"text", text, time:{start,end?} }
+//   ToolPart      { id, sessionID, messageID, type:"tool", callID, tool, state }
+//   ToolState(completed) { status:"completed", input:{}, output:"", title, time }
+//   ToolState(error)     { status:"error", input:{}, error:"", time }
+//   Session       { id:"ses_…", title, directory, … }
+//
+// DEFERRED (see the onboard-opencode handoff): OC3 — the live SSE/ServerEvents
+// capture variant (opencode is client/server; `serve` exposes an SSE stream) — and
+// OC5 — folding all three adapters into the HM1 `Harness` trait. This adapter is
+// the headless `run --format json` path only (OC1/OC2/OC4).
+
+/// Compose the opencode run message: opencode's `run` has no out-of-band
+/// system-prompt flag, so the launch-envelope briefing rides the prompt positional
+/// as a leading `[elanus]` block ahead of the task (the same shape codex uses on
+/// stdin, but folded into the positional here since opencode reads its prompt as
+/// argv). Returned verbatim when there is no briefing.
+fn opencode_message_with_brief(brief: Option<&str>, task: &str) -> String {
+    match brief {
+        Some(b) => format!("[elanus operating envelope — read before acting]\n{b}\n\n{task}"),
+        None => task.to_string(),
+    }
+}
+
+/// Build the opencode `run` positional task from the launcher args (everything
+/// after flag-stripping). Joins multiple tokens with spaces (the normal launch
+/// shape is a single quoted task). If no task token was supplied, promote the
+/// launcher's stdin (non-terminal) to the task — symmetric with codex — so
+/// `elanus code opencode` from a pipe still works; a terminal/empty stdin fails
+/// loudly rather than hanging.
+fn opencode_task_from_args(args: &[String]) -> Result<String> {
+    let task = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !task.trim().is_empty() {
+        return Ok(task);
+    }
+    use std::io::IsTerminal as _;
+    let mut prompt = String::new();
+    if !std::io::stdin().is_terminal() {
+        std::io::stdin()
+            .read_to_string(&mut prompt)
+            .context("reading the opencode prompt from stdin")?;
+    }
+    if prompt.trim().is_empty() {
+        bail!(
+            "no prompt provided: pass it as an argument (elanus code opencode \"<task>\") \
+             or pipe it on stdin"
+        );
+    }
+    Ok(prompt)
+}
+
+/// Launch `opencode run --format json` headless, pipe its JSONL stdout, and
+/// parse+publish each event in-process as the session principal (the StreamJson
+/// envelope, mirroring `run_codex_capture`). `--pure` runs without external plugins
+/// (the analog of Claude's `--setting-sources ''`); `--dangerously-skip-permissions`
+/// is opencode's headless auto-approve (a worker can't answer interactive prompts) —
+/// it is passed for worker/headless launches. opencode brings its OWN provider auth
+/// (`opencode auth`), so we scrub elanus's provider creds (PROVIDER_CRED_VARS) — none
+/// of which opencode reads — leaving its own login intact.
+#[allow(clippy::too_many_arguments)]
+fn run_opencode_capture(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    workdir: &Path,
+    args: &[String],
+    brief: Option<&str>,
+    worker: bool,
+    worker_timeout: Option<u64>,
+) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+    use std::process::{Command, Stdio};
+
+    let task = opencode_task_from_args(args)?;
+    let message = opencode_message_with_brief(brief, &task);
+
+    let mut oc_args = vec![
+        "run".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "--pure".to_string(),
+    ];
+    // Headless auto-approve: a captured worker can't answer interactive permission
+    // prompts. Passed for worker/headless launches (opencode keeps its OWN sandbox
+    // active either way — this only skips the interactive gate).
+    if worker {
+        oc_args.push("--dangerously-skip-permissions".to_string());
+    }
+    oc_args.push(message);
+
+    let timeout_suffix;
+    let (program, oc_args) = if let Some(secs) = worker_timeout {
+        timeout_suffix = format!(" [timeout {secs}s]");
+        timeout_wrap("opencode", &oc_args, secs)
+    } else {
+        timeout_suffix = String::new();
+        ("opencode".to_string(), oc_args)
+    };
+
+    let mut cmd = Command::new(&program);
+    cmd.args(&oc_args);
+    // No briefing on stdin (it rode the positional); null stdin so the child never
+    // blocks. Piped stdout (we parse the JSONL), inherited stderr (the human sees
+    // opencode's own progress/errors / `--print-logs` if the user enabled it).
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    // Scrub elanus's provider credentials so opencode uses its OWN login rather than
+    // inheriting elanus's DeepSeek/ANTHROPIC_*/OPENAI_* env. opencode does not read
+    // any PROVIDER_CRED_VARS as its own auth (it stores creds in its auth.json), so
+    // the scrub never removes opencode's login. The ELANUS_* vars set below are NOT
+    // scrubbed.
+    scrub_provider_creds(&mut cmd);
+    scrub_launch_control_env(&mut cmd);
+    cmd.env_remove("ELANUS_PACKAGE")
+        .env_remove("ELANUS_BUS_TOKEN");
+    // The session's own identity, carried to anything the opencode session spawns
+    // (crucially `elanus code deliver`, which reads ELANUS_CODE_SESSION/AGENT).
+    cmd.env(ENV_SESSION, session)
+        .env(ENV_AGENT, agent)
+        .env("ELANUS_ROOT", &root.dir);
+    eprintln!("[code] launching opencode run --format json as session {session}{timeout_suffix}");
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("launching {program} (is it installed and on PATH?)"))?;
+
+    // Capture the stream: persist the durable record on the first event carrying
+    // opencode's native `sessionID` (so resume works after the launcher exits), and
+    // harvest the legible result (final text + changed files) for routed completion.
+    let summary = capture_opencode_stream(
+        root,
+        principal,
+        bus_token,
+        agent,
+        session,
+        &mut child,
+        Some(workdir),
+    );
+    print_codex_worker_result(session, &summary);
+
+    let status = child.wait().context("waiting for opencode run to finish")?;
+    Ok((status, summary))
+}
+
+/// Read an opencode `run --format json` child's JSONL stdout line-by-line, mapping
+/// each event to an obs record and publishing it as the session principal. Shared
+/// by launch and resume. When `record_workdir` is `Some`, the FIRST event carrying
+/// a native `sessionID` persists/refreshes the durable `code_sessions` record (the
+/// launch path); resume already has a record and passes `None`. A malformed line
+/// files generically (nothing dropped); a read error stops the loop but never
+/// aborts. Returns the worker's verbatim final text (the last settled `text`) + the
+/// file paths it reported writing — the legible result for the routed completion.
+fn capture_opencode_stream(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    child: &mut std::process::Child,
+    record_workdir: Option<&Path>,
+) -> CaptureSummary {
+    let mut summary = CaptureSummary::default();
+    let mut recorded = false;
+    let Some(out) = child.stdout.take() else {
+        return summary;
+    };
+    let reader = std::io::BufReader::new(out);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                // A non-JSON line (opencode shouldn't emit one under --format json,
+                // but be defensive): record it generically rather than drop it.
+                let (leaf, body) = generic_event("opencode_nonjson_line", &Value::Null);
+                publish_obs(
+                    root,
+                    principal,
+                    bus_token,
+                    &obs_topic(agent, session, &leaf),
+                    body,
+                );
+                continue;
+            }
+        };
+        // Harvest the legible result alongside publishing obs.
+        opencode_collect_summary(&event, &mut summary);
+        // The DURABLE session record (OC2): opencode's native `sessionID` is on
+        // every event. Persist the record the moment we first see it, so the
+        // session is resumable even after this launcher exits. Best-effort: a
+        // record-write failure never breaks the live session.
+        if let Some(workdir) = record_workdir {
+            if !recorded {
+                if let Some(sid) = event.get("sessionID").and_then(Value::as_str) {
+                    if !sid.is_empty() {
+                        let rec = codesession::SessionRecord {
+                            elanus_session: session.to_string(),
+                            native_session: sid.to_string(),
+                            tool: "opencode".to_string(),
+                            agent_noun: agent.to_string(),
+                            workdir: workdir.display().to_string(),
+                            // The room (if any) was set at launch via set_room;
+                            // room:None preserves it (upsert COALESCE).
+                            room: None,
+                        };
+                        if let Err(e) = codesession::upsert_record(root, &rec) {
+                            eprintln!("[code] recording opencode session (continuing): {e:#}");
+                        }
+                        recorded = true;
+                    }
+                }
+            }
+        }
+        for (leaf, body) in opencode_map_event(&event) {
+            publish_obs(
+                root,
+                principal,
+                bus_token,
+                &obs_topic(agent, session, &leaf),
+                body,
+            );
+        }
+    }
+    summary
+}
+
+/// Harvest the legible result from one opencode stream event into `summary`: the
+/// text of each settled `text` event (so the LAST one wins — the verbatim final
+/// answer, capped/marked) and the file path of each settled file-writing
+/// `tool_use`. opencode's built-in `edit`/`write` tools declare their argument as
+/// `path` (verified against the binary's tool Input structs + the server OpenAPI
+/// `/doc` — the `state.input` in the JSON stream is the model's raw tool arguments,
+/// which key the file as `path`, NOT `filePath`). Reads the SAME settled events
+/// `opencode_map_event` files as obs; collecting here keeps that mapping untouched.
+fn opencode_collect_summary(event: &Value, summary: &mut CaptureSummary) {
+    match event.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            if let Some(text) = event
+                .get("part")
+                .and_then(|p| p.get("text"))
+                .and_then(Value::as_str)
+            {
+                // Last settled text wins (the worker's final word).
+                summary.final_text = Some(clip(text, FINAL_TEXT_CAP));
+            }
+        }
+        Some("tool_use") => {
+            let part = event.get("part");
+            let tool = part
+                .and_then(|p| p.get("tool"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if opencode_is_file_writer(tool) {
+                // The changed path is in the tool input under `path` (the field name
+                // the built-in edit/write tool schemas declare; the JSON stream's
+                // `state.input` is the model's raw tool arguments).
+                if let Some(path) = part
+                    .and_then(|p| p.get("state"))
+                    .and_then(|s| s.get("input"))
+                    .and_then(|i| i.get("path"))
+                    .and_then(Value::as_str)
+                {
+                    summary.note_change(path);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// opencode's built-in tools that write a single file via a top-level `path`
+/// argument (so a settled `tool_use` for one carries a `path` input the worker
+/// changed on disk). Matched against the `tool` name in the stream's tool part.
+/// `apply_patch` is deliberately excluded: it takes a multi-file patch blob (no
+/// single `path`/`filePath`), so its changed paths live inside the patch text, not
+/// a top-level input field.
+fn opencode_is_file_writer(tool: &str) -> bool {
+    matches!(tool, "edit" | "write")
+}
+
+/// Map one opencode `run --format json` stream event to obs/ topic leaves + bodies,
+/// matching the exec.rs grammar (`tool/<name>/{call,result}`, `assistant/message`,
+/// `session/idle`). Returns a `Vec` because a single settled `tool_use` projects
+/// BOTH a `tool/<n>/call` (the input) and a `tool/<n>/result` (the output) — opencode
+/// emits one combined settled tool event, but the obs grammar is call→result like
+/// the other adapters. Anything unmodeled still lands via `generic_event` (nothing
+/// dropped). Event `type` values pinned against opencode 1.17.9 (see the schema
+/// comment above): `text`, `tool_use`, `reasoning`, `step_start`, `step_finish`,
+/// `error`.
+fn opencode_map_event(event: &Value) -> Vec<(String, Value)> {
+    let ts = now_iso();
+    let etype = event.get("type").and_then(Value::as_str).unwrap_or("");
+    let part = event.get("part");
+    match etype {
+        // The assistant's settled message to the user.
+        "text" => vec![(
+            "assistant/message".into(),
+            json!({
+                "ts": ts,
+                "text": clip_opt(part.and_then(|p| p.get("text")), 4000),
+            }),
+        )],
+        // The model's settled reasoning trace.
+        "reasoning" => vec![(
+            "assistant/reasoning".into(),
+            json!({
+                "ts": ts,
+                "text": clip_opt(part.and_then(|p| p.get("text")), 4000),
+            }),
+        )],
+        // A settled tool use. opencode emits one combined event (input + output) on
+        // completed/error; project it as call→result like the other adapters so a
+        // tool reads consistently across harnesses.
+        "tool_use" => {
+            let tool = part
+                .and_then(|p| p.get("tool"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let tool_seg = topic::encode_segment(tool);
+            let state = part.and_then(|p| p.get("state"));
+            let call_id = part
+                .and_then(|p| p.get("callID"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let status = state
+                .and_then(|s| s.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let failed = status == "error";
+            let call = (
+                format!("tool/{tool_seg}/call"),
+                json!({
+                    "ts": ts,
+                    "call_id": call_id,
+                    "tool": tool,
+                    "input": clip_value(state.and_then(|s| s.get("input")), 2000),
+                }),
+            );
+            let result_body = if failed {
+                json!({
+                    "ts": ts,
+                    "call_id": call_id,
+                    "tool": tool,
+                    "failed": true,
+                    "error": clip_value(state.and_then(|s| s.get("error")), 4000),
+                })
+            } else {
+                json!({
+                    "ts": ts,
+                    "call_id": call_id,
+                    "tool": tool,
+                    "failed": false,
+                    "output": clip_value(state.and_then(|s| s.get("output")), 4000),
+                })
+            };
+            let result = (format!("tool/{tool_seg}/result"), result_body);
+            vec![call, result]
+        }
+        // Step boundaries: file step-finish (carries token usage / cost) as an idle
+        // signal; skip the bare step-start (no useful payload).
+        "step_start" => vec![],
+        "step_finish" => vec![(
+            "session/idle".into(),
+            json!({
+                "ts": ts,
+                "event": "step_finish",
+                "tokens": part.and_then(|p| p.get("tokens")).cloned().unwrap_or(Value::Null),
+                "cost": part.and_then(|p| p.get("cost")).cloned().unwrap_or(Value::Null),
+            }),
+        )],
+        // A session/stream error.
+        "error" => vec![(
+            "session/idle".into(),
+            json!({
+                "ts": ts,
+                "event": "error",
+                "error": clip_value(event.get("error"), 4000),
+            }),
+        )],
+        // Anything else still lands, tagged by its event type, so nothing is
+        // silently dropped.
+        other => {
+            let (leaf, mut body) = generic_event(other, event);
+            if let Value::Object(m) = &mut body {
+                m.insert("opencode_event".into(), json!(other));
+            }
+            vec![(leaf, body)]
+        }
+    }
 }
 
 /// The legible result of one capture pass — the worker's REAL output, harvested
@@ -2481,6 +2946,26 @@ fn resume_command(rec: &codesession::SessionRecord, message: &str) -> (String, V
                 message.to_string(),
             ],
         ),
+        // opencode resume = `opencode run --session <id> --format json --pure
+        // --dangerously-skip-permissions "<msg>"` (confirmed flags against opencode
+        // 1.17.9: `opencode run --session <id> "<msg>"` resumes a durable session;
+        // --format json gives the same JSONL stream the launch path parses; --pure
+        // drops external plugins; --dangerously-skip-permissions is the headless
+        // auto-approve a driven resume needs). The workdir is applied by the caller
+        // as the child cwd.
+        "opencode" => (
+            "opencode".to_string(),
+            vec![
+                "run".to_string(),
+                "--session".to_string(),
+                rec.native_session.clone(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--pure".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                message.to_string(),
+            ],
+        ),
         // Default to the claude shape for "claude" (and any CC-noun record).
         _ => (
             "claude".to_string(),
@@ -2683,14 +3168,22 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
         })?;
 
         match rec.tool.as_str() {
-            // Both adapters' resume emit a JSONL stream on stdout. Codex's `exec
-            // resume --json` is identical to the launch stream (thread.started for
-            // the resumed thread, item.*; record_thread=false — we already have a
-            // record). Claude's `-p --output-format stream-json` is a DIFFERENT
-            // JSONL grammar; map it via the CC stream mapper.
+            // Each adapter's resume emits a JSONL stream on stdout. Codex's `exec
+            // resume --json` and opencode's `run --session --format json` are
+            // identical to their launch streams (record_workdir=None — we already
+            // have a record). Claude's `-p --output-format stream-json` is a
+            // DIFFERENT JSONL grammar; map it via the CC stream mapper.
             "codex" => {
                 // record_workdir = None: the record already exists (we read it).
                 summary = capture_codex_stream(
+                    root, &principal, &bus_token, &agent, &session, &mut child, None,
+                );
+            }
+            "opencode" => {
+                // opencode `run --session <id> --format json` emits the SAME JSONL
+                // stream the launch path parses. record_workdir = None (the record
+                // already exists). The resume targets the recorded native session.
+                summary = capture_opencode_stream(
                     root, &principal, &bus_token, &agent, &session, &mut child, None,
                 );
             }
@@ -3202,6 +3695,8 @@ mod tests {
         assert!(matches!(Tool::parse("claude"), Ok(Tool::ClaudeCode)));
         assert!(matches!(Tool::parse("cc"), Ok(Tool::ClaudeCode)));
         assert!(matches!(Tool::parse("codex"), Ok(Tool::Codex)));
+        assert!(matches!(Tool::parse("opencode"), Ok(Tool::OpenCode)));
+        assert!(matches!(Tool::parse("oc"), Ok(Tool::OpenCode)));
         assert!(Tool::parse("nonsense").is_err());
     }
 
@@ -3214,9 +3709,22 @@ mod tests {
         assert_eq!(Tool::Codex.agent_noun(), "codex");
         assert_eq!(Tool::Codex.binary(), "codex");
         assert!(matches!(Tool::from_agent_noun("codex"), Some(Tool::Codex)));
+        // opencode is also a StreamJson adapter (no hooks, no settings).
+        assert!(matches!(Tool::OpenCode.capture(), Capture::StreamJson));
+        assert_eq!(Tool::OpenCode.agent_noun(), "opencode");
+        assert_eq!(Tool::OpenCode.binary(), "opencode");
+        assert!(matches!(
+            Tool::from_agent_noun("opencode"),
+            Some(Tool::OpenCode)
+        ));
         let dummy_root = Root {
             dir: PathBuf::from("/tmp/fake-root"),
         };
+        assert!(
+            Tool::OpenCode
+                .settings(Path::new("/usr/local/bin/elanus"), &dummy_root)
+                .is_none()
+        );
         assert!(
             Tool::Codex
                 .settings(Path::new("/usr/local/bin/elanus"), &dummy_root)
@@ -3606,6 +4114,167 @@ mod tests {
         // The thread id is positional right after `resume` — the resume targets THE
         // recorded thread, not --last.
         assert_eq!(args[2], rec.native_session);
+    }
+
+    #[test]
+    fn resume_command_opencode_targets_the_recorded_session() {
+        // opencode resume = `opencode run --session <id> --format json --pure
+        // --dangerously-skip-permissions "<msg>"` (confirmed flags against opencode
+        // 1.17.9). The recorded native session id is the resume target; the workdir
+        // is applied by the caller as the child cwd.
+        let rec = codesession::SessionRecord {
+            elanus_session: "code-cccc3333".to_string(),
+            native_session: "ses_112e4b951ffeKBRlwfWTyi0a7A".to_string(),
+            tool: "opencode".to_string(),
+            agent_noun: "opencode".to_string(),
+            workdir: "/tmp/proj".to_string(),
+            room: None,
+        };
+        let (prog, args) = resume_command(&rec, "carry on");
+        assert_eq!(prog, "opencode");
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--session",
+                "ses_112e4b951ffeKBRlwfWTyi0a7A",
+                "--format",
+                "json",
+                "--pure",
+                "--dangerously-skip-permissions",
+                "carry on",
+            ]
+        );
+        // The session id is positional right after `--session` — the resume targets
+        // THE recorded session.
+        assert_eq!(args[2], rec.native_session);
+    }
+
+    #[test]
+    fn opencode_map_event_projects_the_obs_grammar() {
+        // A settled assistant text → assistant/message.
+        let evs = opencode_map_event(&json!({
+            "type": "text",
+            "sessionID": "ses_a",
+            "part": { "type": "text", "text": "pong" }
+        }));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].0, "assistant/message");
+        assert_eq!(evs[0].1["text"], "pong");
+
+        // A settled tool_use → BOTH tool/<n>/call (input) and tool/<n>/result
+        // (output), like the other adapters.
+        let evs = opencode_map_event(&json!({
+            "type": "tool_use",
+            "sessionID": "ses_a",
+            "part": {
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call_1",
+                "state": {
+                    "status": "completed",
+                    "input": { "command": "ls" },
+                    "output": "file.txt"
+                }
+            }
+        }));
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].0, "tool/bash/call");
+        assert_eq!(evs[0].1["input"], "{\"command\":\"ls\"}");
+        assert_eq!(evs[1].0, "tool/bash/result");
+        assert_eq!(evs[1].1["failed"], false);
+        assert_eq!(evs[1].1["output"], "file.txt");
+
+        // An errored tool_use marks failed + carries the error.
+        let evs = opencode_map_event(&json!({
+            "type": "tool_use",
+            "sessionID": "ses_a",
+            "part": {
+                "type": "tool",
+                "tool": "edit",
+                "callID": "call_2",
+                "state": { "status": "error", "input": {}, "error": "nope" }
+            }
+        }));
+        assert_eq!(evs[1].0, "tool/edit/result");
+        assert_eq!(evs[1].1["failed"], true);
+        assert_eq!(evs[1].1["error"], "nope");
+    }
+
+    #[test]
+    fn opencode_unknown_event_type_lands_generically_nothing_dropped() {
+        // An event type this binary doesn't model still lands, tagged by type.
+        let evs = opencode_map_event(&json!({ "type": "future.kind", "sessionID": "ses_a" }));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].0, "event/future.kind");
+        assert_eq!(evs[0].1["opencode_event"], "future.kind");
+    }
+
+    #[test]
+    fn opencode_collect_summary_harvests_final_text_and_changed_files() {
+        let mut summary = CaptureSummary::default();
+        opencode_collect_summary(
+            &json!({ "type": "text", "part": { "text": "first" } }),
+            &mut summary,
+        );
+        opencode_collect_summary(
+            &json!({ "type": "text", "part": { "text": "final" } }),
+            &mut summary,
+        );
+        // Last settled text wins.
+        assert_eq!(summary.final_text.as_deref(), Some("final"));
+
+        // A file-writing tool reports its path. opencode's built-in write/edit
+        // tools key the file under `path` (verified against the binary's tool Input
+        // structs + the server OpenAPI `/doc`), NOT `filePath`.
+        opencode_collect_summary(
+            &json!({
+                "type": "tool_use",
+                "part": {
+                    "tool": "write",
+                    "state": { "status": "completed", "input": { "path": "/tmp/x.rs", "content": "x" } }
+                }
+            }),
+            &mut summary,
+        );
+        assert_eq!(summary.file_changes, vec!["/tmp/x.rs"]);
+        // The `edit` tool also keys its target under `path`.
+        opencode_collect_summary(
+            &json!({
+                "type": "tool_use",
+                "part": {
+                    "tool": "edit",
+                    "state": { "status": "completed",
+                               "input": { "path": "/tmp/y.rs", "oldString": "a", "newString": "b" } }
+                }
+            }),
+            &mut summary,
+        );
+        assert_eq!(summary.file_changes, vec!["/tmp/x.rs", "/tmp/y.rs"]);
+
+        // A non-writing tool does not add a change.
+        opencode_collect_summary(
+            &json!({
+                "type": "tool_use",
+                "part": { "tool": "bash", "state": { "status": "completed", "input": {} } }
+            }),
+            &mut summary,
+        );
+        assert_eq!(summary.file_changes, vec!["/tmp/x.rs", "/tmp/y.rs"]);
+    }
+
+    #[test]
+    fn opencode_message_folds_the_brief_into_the_positional() {
+        // With a brief, it rides ahead of the task (opencode has no out-of-band
+        // system-prompt flag).
+        let m = opencode_message_with_brief(Some("be careful"), "do the thing");
+        assert!(m.contains("be careful"));
+        assert!(m.ends_with("do the thing"));
+        // Without a brief, the task is verbatim.
+        assert_eq!(
+            opencode_message_with_brief(None, "do the thing"),
+            "do the thing"
+        );
     }
 
     #[test]
