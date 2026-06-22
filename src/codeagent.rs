@@ -34,8 +34,8 @@
 //!
 //! **Two adapters, two capture mechanisms (one envelope).** The shared envelope —
 //! launch, per-session grant-scoped identity, the obs grammar, the reaper — is
-//! tool-agnostic; only the *capture mechanism* differs, and that is the `Tool`
-//! seam (`Tool::capture`):
+//! tool-agnostic; only the *capture mechanism* differs, and that is the `Harness`
+//! adapter seam (`Harness::capture`, HM1 of docs/handoffs/harness-modes.md):
 //!
 //! - **Claude Code — a hook bridge.** The launcher inherits the child's stdio and
 //!   the child's own *hooks* (a generated `--settings` config) call
@@ -213,102 +213,393 @@ pub fn print_tools() {
     println!("opencode");
 }
 
-/// The supported adapters: Claude Code (hook bridge), Codex (`exec --json` stdout
-/// stream), and opencode (`run --format json` stdout stream). They share the
-/// envelope; only the capture mechanism differs.
-#[derive(Clone, Copy)]
-enum Tool {
-    ClaudeCode,
-    Codex,
-    OpenCode,
+// ── The harness adapter seam (HM1) ────────────────────────────────────────────
+//
+// HM1 of docs/handoffs/harness-modes.md: replace the hard-coded `Tool` enum +
+// scattered `match self`/`match tool`/`match rec.tool` with a `Harness` adapter
+// registry. The envelope (launch / resume / spawn / briefing / front door) is
+// harness-agnostic and parameterized by `(Harness, Mode)`; a new harness is one
+// `impl Harness` + a line in `HARNESSES`, and touches nothing else.
+//
+// This is a refactor with NO behavior change: every per-(harness, mode) detail —
+// argv, flags, stdio, the provider-cred scrub, the `--worker` gating, the resume
+// shapes, the obs mapping — is reproduced exactly as before, just behind the
+// trait. The three structs below ARE the three adapters that used to be `Tool`
+// variants (opencode is the real third adapter that already proves "a third
+// adapter compiles against the seam", so HM5's checklist target is satisfied in
+// code; per the handoff we do NOT write the checklist doc here).
+
+/// The launch mode of a harness *process* (harness-modes.md axis 1). Today only
+/// Claude has both cells (Tui interactive vs Headless `-p`); codex/opencode are
+/// Headless-only. HM2/HM3 wire the missing TUI cells and the uniform `--headless`
+/// flag — HM1 just names the axis and routes today's behavior through it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// The harness's native interactive terminal UI (inherited stdio, human-pumped).
+    Tui,
+    /// Non-interactive, fully captured (one task in → result out).
+    Headless,
 }
 
-/// How the launcher captures a session's activity — the per-tool seam.
+/// How the launcher captures a session's activity — the per-(harness, mode) seam.
+/// Only the two variants actually used today are introduced here. HM2 adds the
+/// `RolloutImport` (codex TUI) and `Lifecycle` (start/stop-only floor) variants;
+/// adding them now would be dead code, so they land with the cells that use them.
 enum Capture {
     /// The child's own hooks call `elanus code hook` (Claude Code): the launcher
     /// inherits stdio and parses nothing.
     HookBridge,
     /// The launcher pipes the child's stdout and parses its JSONL event stream
-    /// in-process (Codex `exec --json`): no hooks, no home pollution.
+    /// in-process (Codex `exec --json`, opencode `run --format json`): no hooks,
+    /// no home pollution.
     StreamJson,
 }
 
-impl Tool {
-    fn parse(s: &str) -> Result<Tool> {
-        match s {
-            "claude" | "claude-code" | "cc" => Ok(Tool::ClaudeCode),
-            "codex" => Ok(Tool::Codex),
-            "opencode" | "oc" => Ok(Tool::OpenCode),
-            other => bail!("unknown coding tool {other:?} (supported: claude, codex, opencode)"),
-        }
-    }
-    /// The agent noun this tool's sessions publish under: obs/agent/<noun>/...
-    fn agent_noun(self) -> &'static str {
-        match self {
-            Tool::ClaudeCode => "claude-code",
-            Tool::Codex => "codex",
-            Tool::OpenCode => "opencode",
-        }
-    }
-    /// Recover the adapter from the agent noun the launcher recorded in the
-    /// session env — so the hook bridge routes event-mapping through the right
-    /// adapter without re-parsing the tool name. None for an unknown noun (a
-    /// future adapter whose launcher set a noun this binary doesn't know).
-    fn from_agent_noun(noun: &str) -> Option<Tool> {
-        match noun {
-            "claude-code" => Some(Tool::ClaudeCode),
-            "codex" => Some(Tool::Codex),
-            "opencode" => Some(Tool::OpenCode),
-            _ => None,
-        }
-    }
+/// The shared, harness-agnostic bits the launch envelope assembles, passed to a
+/// StreamJson harness so it can build + run its capture without the envelope
+/// branching on the concrete harness. (The HookBridge harness — Claude — builds
+/// its own `Command` inline in the launcher because it needs the generated
+/// settings path + skill root + the `--worker` split; threading those through
+/// here would obscure rather than simplify, so the seam routes by `Capture` and
+/// the StreamJson harnesses share this context.)
+struct StreamLaunch<'a> {
+    root: &'a Root,
+    principal: &'a str,
+    bus_token: &'a str,
+    agent: &'a str,
+    session: &'a str,
+    workdir: &'a Path,
+    args: &'a [String],
+    brief: Option<&'a str>,
+    /// Worker/headless launch (gates opencode's `--dangerously-skip-permissions`).
+    worker: bool,
+    worker_timeout: Option<u64>,
+}
+
+/// A coding-agent adapter. Implementing this trait + registering in `HARNESSES`
+/// is the entire surface for adding a harness; the envelope never matches on a
+/// concrete harness. `&'static dyn` trait objects (the structs are zero-sized).
+trait Harness: Sync {
+    /// The canonical CLI id (`"claude"` | `"codex"` | `"opencode"`).
+    fn id(&self) -> &'static str;
+    /// All accepted CLI verbs/aliases that resolve to this harness (includes `id`).
+    fn aliases(&self) -> &'static [&'static str];
+    /// The agent noun this harness's sessions publish under: `obs/agent/<noun>/…`.
+    fn agent_noun(&self) -> &'static str;
     /// The real binary to launch.
-    fn binary(self) -> &'static str {
-        match self {
-            Tool::ClaudeCode => "claude",
-            Tool::Codex => "codex",
-            Tool::OpenCode => "opencode",
-        }
+    fn binary(&self) -> &'static str;
+    /// How the launcher captures this harness's activity in `mode` (the matrix cell).
+    fn capture(&self, mode: Mode) -> Capture;
+    /// Pick the launch mode from the `--worker` flag, preserving today's behavior:
+    /// Claude bare→Tui / `--worker`→Headless; codex/opencode are Headless-only.
+    /// (HM3 makes this the uniform `--headless` flag across all harnesses.)
+    fn mode_for(&self, worker: bool) -> Mode;
+    /// The generated tool config that routes hook events through `elanus code hook`
+    /// (only the HookBridge harness generates one; StreamJson harnesses return None
+    /// and write nothing to the tool home).
+    fn settings(&self, self_exe: &Path, root: &Root) -> Option<Value>;
+    /// Map one hook event + payload to an `obs/` leaf + trimmed body (HookBridge
+    /// only; StreamJson harnesses map their stream directly and never reach here, so
+    /// they file generically as a safety net if a hook somehow arrives).
+    fn map_event(&self, event: &str, payload: &Value) -> (String, Value);
+    /// The native daemon-resume command (program + args) for a recorded session +
+    /// message — exactly today's `resume_command`. Pure; the caller sets the cwd.
+    fn resume_command(&self, rec: &codesession::SessionRecord, message: &str)
+    -> (String, Vec<String>);
+    /// Run a StreamJson capture in the launch envelope (the `Capture::StreamJson`
+    /// arm). Default: unreachable — only StreamJson harnesses override it, and the
+    /// envelope only calls it for `Capture::StreamJson`, so it is never invoked on a
+    /// HookBridge harness.
+    fn run_stream_capture(
+        &self,
+        _ctx: StreamLaunch<'_>,
+    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+        unreachable!("run_stream_capture called on a non-StreamJson harness")
     }
-    /// How the launcher captures this adapter's activity (the capture seam).
-    fn capture(self) -> Capture {
-        match self {
-            Tool::ClaudeCode => Capture::HookBridge,
-            // Codex 0.141 hooks are a plugin/managed-config dead end; capture the
-            // `codex exec --json` stdout stream in-process instead (Appendix B).
-            Tool::Codex => Capture::StreamJson,
-            // opencode `run --format json` prints a JSONL event stream on stdout
-            // (no hooks, no home pollution) — same StreamJson strategy as Codex.
-            Tool::OpenCode => Capture::StreamJson,
-        }
+    /// Read this harness's daemon-resume stdout stream (the spawned child) into the
+    /// obs grammar + capture summary, under the resumed elanus session. Each harness
+    /// owns its stream grammar: codex/opencode reuse their launch-stream readers;
+    /// Claude's `-p --output-format stream-json` is a different JSONL grammar
+    /// (`capture_claude_stream`). Routes by the recorded `tool` (the daemon already
+    /// resolved the harness via `harness_for_record`).
+    #[allow(clippy::too_many_arguments)]
+    fn resume_stream_capture(
+        &self,
+        root: &Root,
+        principal: &str,
+        bus_token: &str,
+        agent: &str,
+        session: &str,
+        child: &mut std::process::Child,
+    ) -> CaptureSummary;
+}
+
+struct ClaudeCode;
+struct Codex;
+struct OpenCode;
+
+impl Harness for ClaudeCode {
+    fn id(&self) -> &'static str {
+        "claude"
     }
-    /// The generated tool config that routes this adapter's hook events through
-    /// `elanus code hook <Event>` to the bus. Only the hook-bridge adapter
-    /// (Claude Code) generates one; the stream-parse adapter (Codex) does not use
-    /// hooks at all, so it has no settings (and writes nothing to the tool home).
-    fn settings(self, self_exe: &Path, root: &Root) -> Option<Value> {
-        match self {
-            Tool::ClaudeCode => Some(claude_settings(self_exe, root)),
-            Tool::Codex => None,
-            // opencode is a StreamJson adapter: no hooks, no generated settings.
-            Tool::OpenCode => None,
-        }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["claude", "claude-code", "cc"]
     }
-    /// Map one of this adapter's hook events + its payload to an obs/ topic leaf
-    /// and a trimmed body. Adapter-specific (the hook event names and payload
-    /// shapes differ per tool). Only the hook-bridge adapter routes through here;
-    /// Codex maps its own JSONL stream events directly in the launcher.
-    fn map_event(self, event: &str, payload: &Value) -> (String, Value) {
-        match self {
-            Tool::ClaudeCode => claude_map_event(event, payload),
-            // Codex never reaches the hook bridge (no hooks); file generically if
-            // it somehow does, so nothing is dropped.
-            Tool::Codex => generic_event(event, payload),
-            // opencode is also a StreamJson adapter (no hooks); the hook bridge is
-            // never reached for it. File generically if it somehow is.
-            Tool::OpenCode => generic_event(event, payload),
-        }
+    fn agent_noun(&self) -> &'static str {
+        "claude-code"
     }
+    fn binary(&self) -> &'static str {
+        "claude"
+    }
+    fn capture(&self, _mode: Mode) -> Capture {
+        Capture::HookBridge
+    }
+    fn mode_for(&self, worker: bool) -> Mode {
+        // Claude has both cells: bare/interactive → Tui; `--worker` → Headless `-p`.
+        if worker { Mode::Headless } else { Mode::Tui }
+    }
+    fn settings(&self, self_exe: &Path, root: &Root) -> Option<Value> {
+        Some(claude_settings(self_exe, root))
+    }
+    fn map_event(&self, event: &str, payload: &Value) -> (String, Value) {
+        claude_map_event(event, payload)
+    }
+    fn resume_command(
+        &self,
+        rec: &codesession::SessionRecord,
+        message: &str,
+    ) -> (String, Vec<String>) {
+        // `claude -p --resume <session_id> --output-format stream-json --verbose
+        // "<msg>"` — headless print, resuming the recorded native session id,
+        // capturing the JSONL result stream (the generated hooks are NOT reloaded on
+        // a bare `-p --resume`, so resume parses the stream like codex rather than
+        // relying on hooks). Confirmed flags against Claude Code 2.1.183.
+        (
+            "claude".to_string(),
+            vec![
+                "-p".to_string(),
+                "--resume".to_string(),
+                rec.native_session.clone(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                message.to_string(),
+            ],
+        )
+    }
+    fn resume_stream_capture(
+        &self,
+        root: &Root,
+        principal: &str,
+        bus_token: &str,
+        agent: &str,
+        session: &str,
+        child: &mut std::process::Child,
+    ) -> CaptureSummary {
+        // Claude's `-p --output-format stream-json` is a DIFFERENT JSONL grammar;
+        // map it via the CC stream mapper.
+        capture_claude_stream(root, principal, bus_token, agent, session, child)
+    }
+}
+
+impl Harness for Codex {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["codex"]
+    }
+    fn agent_noun(&self) -> &'static str {
+        "codex"
+    }
+    fn binary(&self) -> &'static str {
+        "codex"
+    }
+    fn capture(&self, _mode: Mode) -> Capture {
+        // Codex 0.141 hooks are a plugin/managed-config dead end; capture the
+        // `codex exec --json` stdout stream in-process instead (Appendix B).
+        Capture::StreamJson
+    }
+    fn mode_for(&self, _worker: bool) -> Mode {
+        // Codex is Headless-only today (bare `elanus code codex` errors before this
+        // is reached; a prompt runs `codex exec --json`). HM2 wires the TUI cell.
+        Mode::Headless
+    }
+    fn settings(&self, _self_exe: &Path, _root: &Root) -> Option<Value> {
+        None
+    }
+    fn map_event(&self, event: &str, payload: &Value) -> (String, Value) {
+        // Codex never reaches the hook bridge (no hooks); file generically if it
+        // somehow does, so nothing is dropped.
+        generic_event(event, payload)
+    }
+    fn resume_command(
+        &self,
+        rec: &codesession::SessionRecord,
+        message: &str,
+    ) -> (String, Vec<String>) {
+        // `codex exec resume <thread_id> --json --skip-git-repo-check "<msg>"` —
+        // confirmed against codex-cli 0.141.0. `codex exec resume` has NO `--cd`, so
+        // the workdir is set as the child cwd by the caller.
+        (
+            "codex".to_string(),
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                rec.native_session.clone(),
+                "--json".to_string(),
+                "--skip-git-repo-check".to_string(),
+                message.to_string(),
+            ],
+        )
+    }
+    fn run_stream_capture(
+        &self,
+        ctx: StreamLaunch<'_>,
+    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+        run_codex_capture(
+            ctx.root,
+            ctx.principal,
+            ctx.bus_token,
+            ctx.agent,
+            ctx.session,
+            ctx.workdir,
+            ctx.args,
+            ctx.brief,
+            ctx.worker_timeout,
+        )
+    }
+    fn resume_stream_capture(
+        &self,
+        root: &Root,
+        principal: &str,
+        bus_token: &str,
+        agent: &str,
+        session: &str,
+        child: &mut std::process::Child,
+    ) -> CaptureSummary {
+        // Codex's `exec resume --json` emits the same JSONL stream as its launch
+        // (record_workdir = None — the record already exists).
+        capture_codex_stream(root, principal, bus_token, agent, session, child, None)
+    }
+}
+
+impl Harness for OpenCode {
+    fn id(&self) -> &'static str {
+        "opencode"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["opencode", "oc"]
+    }
+    fn agent_noun(&self) -> &'static str {
+        "opencode"
+    }
+    fn binary(&self) -> &'static str {
+        "opencode"
+    }
+    fn capture(&self, _mode: Mode) -> Capture {
+        // opencode `run --format json` prints a JSONL event stream on stdout (no
+        // hooks, no home pollution) — same StreamJson strategy as Codex.
+        Capture::StreamJson
+    }
+    fn mode_for(&self, _worker: bool) -> Mode {
+        // opencode is Headless-only today (`run --format json`). HM3 unifies modes.
+        Mode::Headless
+    }
+    fn settings(&self, _self_exe: &Path, _root: &Root) -> Option<Value> {
+        None
+    }
+    fn map_event(&self, event: &str, payload: &Value) -> (String, Value) {
+        // opencode is also a StreamJson adapter (no hooks); the hook bridge is never
+        // reached for it. File generically if it somehow is.
+        generic_event(event, payload)
+    }
+    fn resume_command(
+        &self,
+        rec: &codesession::SessionRecord,
+        message: &str,
+    ) -> (String, Vec<String>) {
+        // `opencode run --session <id> --format json --pure
+        // --dangerously-skip-permissions "<msg>"` — confirmed flags against opencode
+        // 1.17.9. The workdir is applied by the caller as the child cwd.
+        (
+            "opencode".to_string(),
+            vec![
+                "run".to_string(),
+                "--session".to_string(),
+                rec.native_session.clone(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--pure".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                message.to_string(),
+            ],
+        )
+    }
+    fn run_stream_capture(
+        &self,
+        ctx: StreamLaunch<'_>,
+    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+        run_opencode_capture(
+            ctx.root,
+            ctx.principal,
+            ctx.bus_token,
+            ctx.agent,
+            ctx.session,
+            ctx.workdir,
+            ctx.args,
+            ctx.brief,
+            ctx.worker,
+            ctx.worker_timeout,
+        )
+    }
+    fn resume_stream_capture(
+        &self,
+        root: &Root,
+        principal: &str,
+        bus_token: &str,
+        agent: &str,
+        session: &str,
+        child: &mut std::process::Child,
+    ) -> CaptureSummary {
+        // opencode `run --session <id> --format json` emits the SAME JSONL stream the
+        // launch path parses (record_workdir = None — the record already exists).
+        capture_opencode_stream(root, principal, bus_token, agent, session, child, None)
+    }
+}
+
+/// The harness registry: the only place that enumerates the adapters. Adding a
+/// harness is one `impl Harness` above + one line here.
+static HARNESSES: &[&dyn Harness] = &[&ClaudeCode, &Codex, &OpenCode];
+
+/// Resolve a harness by any of its CLI aliases (`claude`/`cc`, `codex`,
+/// `opencode`/`oc`). The registry replaces the old `Tool::parse` match.
+fn harness(name: &str) -> Option<&'static dyn Harness> {
+    HARNESSES
+        .iter()
+        .copied()
+        .find(|h| h.aliases().contains(&name))
+}
+
+/// Resolve a harness by the agent NOUN the launcher recorded in the session env
+/// (`claude-code` / `codex` / `opencode`) — so the hook bridge routes event-mapping
+/// through the right adapter without re-parsing the tool name. None for an unknown
+/// noun (a future adapter this binary predates). Replaces `Tool::from_agent_noun`.
+fn harness_by_noun(noun: &str) -> Option<&'static dyn Harness> {
+    HARNESSES.iter().copied().find(|h| h.agent_noun() == noun)
+}
+
+/// Resolve a harness by a recorded session's `tool` field (used by daemon resume).
+/// Falls back to Claude for any CC-noun/unknown record, matching the old
+/// `resume_command`'s default arm (which keyed on `rec.tool.as_str()`).
+fn harness_for_record(tool: &str) -> &'static dyn Harness {
+    harness(tool).unwrap_or(&ClaudeCode)
+}
+
+/// Parse a CLI tool token to a harness, erroring like the old `Tool::parse`.
+fn parse_harness(s: &str) -> Result<&'static dyn Harness> {
+    harness(s)
+        .ok_or_else(|| anyhow::anyhow!("unknown coding tool {s:?} (supported: claude, codex, opencode)"))
 }
 
 // ── Inbound delivery: mailbox → resume (M2-B) ────────────────────────────────
@@ -815,7 +1106,7 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str) -> Result<()> {
         bail!("usage: elanus code spawn <tool> \"<task>\"");
     }
 
-    let parsed = Tool::parse(tool)?;
+    let parsed = parse_harness(tool)?;
     let spawn_depth = std::env::var(ENV_SPAWN_DEPTH)
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
@@ -829,10 +1120,13 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str) -> Result<()> {
         std::env::current_exe().context("locating the elanus binary for background spawn")?;
 
     let mut cmd = std::process::Command::new(self_exe);
-    cmd.arg("code").arg(parsed.binary());
-    if matches!(parsed, Tool::ClaudeCode) {
-        // Claude's interactive TUI cannot run with detached stdio; force the
-        // headless worker shape (`claude -p`) in the background wrapper.
+    cmd.arg("code").arg(parsed.id());
+    if parsed.mode_for(false) == Mode::Tui {
+        // A harness whose bare launch is the interactive TUI (Claude today) cannot
+        // run with detached stdio; force the headless worker shape (`--worker` →
+        // `claude -p`) in the background wrapper. Codex/opencode are already
+        // Headless-only, so they need no flag (byte-identical to the old
+        // `matches!(parsed, Tool::ClaudeCode)` check).
         cmd.arg("--worker");
     }
     cmd.arg(prompt)
@@ -1773,7 +2067,8 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
         .filter(|s| !s.is_empty())
         .map(|_| spawn_timeout_secs());
 
-    let tool = Tool::parse(tool)?;
+    let tool = parse_harness(tool)?;
+    let mode = tool.mode_for(worker);
     let session = launch_session_id(root);
     let agent = tool.agent_noun().to_string();
     let brief_text = want_brief.then(|| briefing(&session));
@@ -1853,7 +2148,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
             }),
         );
 
-        match tool.capture() {
+        match tool.capture(mode) {
             // ── Claude Code: hook bridge ──────────────────────────────────────
             // The child's own generated hooks call `elanus code hook`; the
             // launcher inherits stdio and parses nothing.
@@ -1973,38 +2268,23 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                 }
             }
             // ── StreamJson: stdout JSONL stream ───────────────────────────────
-            // No hooks. Run the tool's headless JSON mode, pipe stdout, and
+            // No hooks. Run the harness's headless JSON mode, pipe stdout, and
             // parse+publish each event in-process as the session principal. The
-            // Capture strategy is per-strategy (not per-tool), so dispatch on the
-            // concrete Tool here: Codex (`exec --json`) vs opencode
-            // (`run --format json`). Both fill the same envelope.
-            Capture::StreamJson => match tool {
-                Tool::OpenCode => run_opencode_capture(
-                    root,
-                    &principal,
-                    &bus_token,
-                    &agent,
-                    &session,
-                    &workdir,
-                    args,
-                    brief_text.as_deref(),
-                    worker,
-                    worker_timeout,
-                ),
-                // Codex (the original StreamJson tool). ClaudeCode never reaches
-                // here (it is HookBridge), so the default is Codex.
-                _ => run_codex_capture(
-                    root,
-                    &principal,
-                    &bus_token,
-                    &agent,
-                    &session,
-                    &workdir,
-                    args,
-                    brief_text.as_deref(),
-                    worker_timeout,
-                ),
-            },
+            // harness owns the concrete capture (Codex `exec --json` vs opencode
+            // `run --format json`) via `run_stream_capture`; the envelope no longer
+            // branches on the concrete harness. Both fill the same envelope.
+            Capture::StreamJson => tool.run_stream_capture(StreamLaunch {
+                root,
+                principal: &principal,
+                bus_token: &bus_token,
+                agent: &agent,
+                session: &session,
+                workdir: &workdir,
+                args,
+                brief: brief_text.as_deref(),
+                worker,
+                worker_timeout,
+            }),
         }
     })();
 
@@ -3077,52 +3357,10 @@ fn command_succeeded(item: &Value) -> bool {
 ///   bare `-p --resume`, so resume parses the stream like codex rather than relying
 ///   on hooks). Confirmed flags against Claude Code 2.1.183.
 fn resume_command(rec: &codesession::SessionRecord, message: &str) -> (String, Vec<String>) {
-    match rec.tool.as_str() {
-        "codex" => (
-            "codex".to_string(),
-            vec![
-                "exec".to_string(),
-                "resume".to_string(),
-                rec.native_session.clone(),
-                "--json".to_string(),
-                "--skip-git-repo-check".to_string(),
-                message.to_string(),
-            ],
-        ),
-        // opencode resume = `opencode run --session <id> --format json --pure
-        // --dangerously-skip-permissions "<msg>"` (confirmed flags against opencode
-        // 1.17.9: `opencode run --session <id> "<msg>"` resumes a durable session;
-        // --format json gives the same JSONL stream the launch path parses; --pure
-        // drops external plugins; --dangerously-skip-permissions is the headless
-        // auto-approve a driven resume needs). The workdir is applied by the caller
-        // as the child cwd.
-        "opencode" => (
-            "opencode".to_string(),
-            vec![
-                "run".to_string(),
-                "--session".to_string(),
-                rec.native_session.clone(),
-                "--format".to_string(),
-                "json".to_string(),
-                "--pure".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                message.to_string(),
-            ],
-        ),
-        // Default to the claude shape for "claude" (and any CC-noun record).
-        _ => (
-            "claude".to_string(),
-            vec![
-                "-p".to_string(),
-                "--resume".to_string(),
-                rec.native_session.clone(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                message.to_string(),
-            ],
-        ),
-    }
+    // Route to the recorded harness's adapter (codex / opencode / claude-default).
+    // `harness_for_record` reproduces the old match's default-to-claude arm for any
+    // CC-noun or unknown `rec.tool`.
+    harness_for_record(&rec.tool).resume_command(rec, message)
 }
 
 /// Wall-clock ceiling on a single resume's native model turn. A resume is one
@@ -3310,32 +3548,12 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
             format!("launching {program} resume (is it installed and on PATH?)")
         })?;
 
-        match rec.tool.as_str() {
-            // Each adapter's resume emits a JSONL stream on stdout. Codex's `exec
-            // resume --json` and opencode's `run --session --format json` are
-            // identical to their launch streams (record_workdir=None — we already
-            // have a record). Claude's `-p --output-format stream-json` is a
-            // DIFFERENT JSONL grammar; map it via the CC stream mapper.
-            "codex" => {
-                // record_workdir = None: the record already exists (we read it).
-                summary = capture_codex_stream(
-                    root, &principal, &bus_token, &agent, &session, &mut child, None,
-                );
-            }
-            "opencode" => {
-                // opencode `run --session <id> --format json` emits the SAME JSONL
-                // stream the launch path parses. record_workdir = None (the record
-                // already exists). The resume targets the recorded native session.
-                summary = capture_opencode_stream(
-                    root, &principal, &bus_token, &agent, &session, &mut child, None,
-                );
-            }
-            _ => {
-                summary = capture_claude_stream(
-                    root, &principal, &bus_token, &agent, &session, &mut child,
-                );
-            }
-        }
+        // Each adapter's resume emits a JSONL stream on stdout; the harness owns
+        // reading it (codex/opencode reuse their launch-stream readers, claude uses
+        // the CC `-p --output-format stream-json` mapper). The daemon resolved the
+        // harness via `harness_for_record`, the same key the resume command used.
+        summary = harness_for_record(&rec.tool)
+            .resume_stream_capture(root, &principal, &bus_token, &agent, &session, &mut child);
         child.wait().context("waiting for the resume to finish")
     })();
 
@@ -3597,8 +3815,8 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // Route event-mapping through the adapter the launcher recorded as the
     // session's agent noun. An unknown noun (a future adapter this binary
     // predates) still files the event generically rather than dropping it.
-    let (leaf, body) = match Tool::from_agent_noun(&agent) {
-        Some(tool) => tool.map_event(event, &payload),
+    let (leaf, body) = match harness_by_noun(&agent) {
+        Some(h) => h.map_event(event, &payload),
         None => generic_event(event, &payload),
     };
     publish_obs(
@@ -3619,7 +3837,7 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // subtree, never recorded-by-default. Advisory/honest-agent tier only — see
     // `claude_read_fs_events`. Codex/opencode are NOT projected here (Codex reads
     // are shell-buried → M2; opencode is out of M1's Claude-Code-only scope).
-    if event == "PreToolUse" && matches!(Tool::from_agent_noun(&agent), Some(Tool::ClaudeCode)) {
+    if event == "PreToolUse" && agent == ClaudeCode.agent_noun() {
         for (topic_name, fs_body) in claude_read_fs_events(&payload, &session) {
             publish_obs(root, &principal, &token, &topic_name, fs_body);
         }
@@ -3669,7 +3887,7 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
 /// `tool/<name>/{call,result}` for the tool loop, plus session/turn leaves.
 /// The hook stdin payload includes `session_id`, `cwd`, `permission_mode`,
 /// `hook_event_name`, plus event-specific fields (Appendix A). The Codex adapter
-/// adds a sibling `codex_map_event` and an arm in `Tool::map_event`.
+/// adds a sibling `codex_map_event` and its own `Harness::map_event` impl.
 fn claude_map_event(event: &str, payload: &Value) -> (String, Value) {
     let ts = json!(now_iso());
     let cc_session = payload.get("session_id").cloned().unwrap_or(Value::Null);
@@ -3970,49 +4188,75 @@ mod tests {
 
     #[test]
     fn tool_parse() {
-        assert!(matches!(Tool::parse("claude"), Ok(Tool::ClaudeCode)));
-        assert!(matches!(Tool::parse("cc"), Ok(Tool::ClaudeCode)));
-        assert!(matches!(Tool::parse("codex"), Ok(Tool::Codex)));
-        assert!(matches!(Tool::parse("opencode"), Ok(Tool::OpenCode)));
-        assert!(matches!(Tool::parse("oc"), Ok(Tool::OpenCode)));
-        assert!(Tool::parse("nonsense").is_err());
+        // The registry resolves every CLI alias to a harness, and rejects unknowns
+        // (the old `Tool::parse` match, now `harness(name)`).
+        assert_eq!(harness("claude").unwrap().id(), "claude");
+        assert_eq!(harness("claude-code").unwrap().id(), "claude");
+        assert_eq!(harness("cc").unwrap().id(), "claude");
+        assert_eq!(harness("codex").unwrap().id(), "codex");
+        assert_eq!(harness("opencode").unwrap().id(), "opencode");
+        assert_eq!(harness("oc").unwrap().id(), "opencode");
+        assert!(harness("nonsense").is_none());
+        assert!(parse_harness("nonsense").is_err());
+        assert_eq!(parse_harness("cc").unwrap().id(), "claude");
+    }
+
+    #[test]
+    fn harness_registry_holds_the_three_adapters() {
+        // The registry enumerates exactly the three adapters; "adding a harness" is
+        // a single `impl Harness` + one line in `HARNESSES` (the HM5 payoff, proven
+        // by opencode being a real third adapter behind the seam).
+        let ids: Vec<&str> = HARNESSES.iter().map(|h| h.id()).collect();
+        assert_eq!(ids, vec!["claude", "codex", "opencode"]);
+        // Every harness round-trips through both lookups (alias + agent noun).
+        for h in HARNESSES {
+            assert_eq!(harness(h.id()).unwrap().id(), h.id());
+            assert_eq!(harness_by_noun(h.agent_noun()).unwrap().id(), h.id());
+        }
+        // An unknown agent noun resolves to no harness (a future adapter this binary
+        // predates) — the hook bridge then files generically.
+        assert!(harness_by_noun("future-harness").is_none());
+        // A recorded `tool` with no matching harness defaults to Claude (the old
+        // `resume_command` default arm).
+        assert_eq!(harness_for_record("claude").id(), "claude");
+        assert_eq!(harness_for_record("anything-else").id(), "claude");
     }
 
     #[test]
     fn capture_strategy_and_agent_noun_per_tool() {
-        // CC uses the hook bridge and generates settings; Codex uses the JSONL
-        // stream and generates NO settings (no hooks, no home pollution).
-        assert!(matches!(Tool::ClaudeCode.capture(), Capture::HookBridge));
-        assert!(matches!(Tool::Codex.capture(), Capture::StreamJson));
-        assert_eq!(Tool::Codex.agent_noun(), "codex");
-        assert_eq!(Tool::Codex.binary(), "codex");
-        assert!(matches!(Tool::from_agent_noun("codex"), Some(Tool::Codex)));
-        // opencode is also a StreamJson adapter (no hooks, no settings).
-        assert!(matches!(Tool::OpenCode.capture(), Capture::StreamJson));
-        assert_eq!(Tool::OpenCode.agent_noun(), "opencode");
-        assert_eq!(Tool::OpenCode.binary(), "opencode");
+        // CC uses the hook bridge and generates settings; Codex/opencode use the
+        // JSONL stream and generate NO settings (no hooks, no home pollution).
+        let claude = harness("claude").unwrap();
+        let codex = harness("codex").unwrap();
+        let opencode = harness("opencode").unwrap();
+
+        // Claude has both cells: bare → Tui (hook bridge), --worker → Headless.
+        assert_eq!(claude.mode_for(false), Mode::Tui);
+        assert_eq!(claude.mode_for(true), Mode::Headless);
+        assert!(matches!(claude.capture(Mode::Tui), Capture::HookBridge));
+        assert!(matches!(claude.capture(Mode::Headless), Capture::HookBridge));
+
+        // Codex/opencode are Headless-only StreamJson today.
+        assert_eq!(codex.mode_for(false), Mode::Headless);
+        assert!(matches!(codex.capture(Mode::Headless), Capture::StreamJson));
+        assert_eq!(codex.agent_noun(), "codex");
+        assert_eq!(codex.binary(), "codex");
+
+        assert_eq!(opencode.mode_for(false), Mode::Headless);
         assert!(matches!(
-            Tool::from_agent_noun("opencode"),
-            Some(Tool::OpenCode)
+            opencode.capture(Mode::Headless),
+            Capture::StreamJson
         ));
+        assert_eq!(opencode.agent_noun(), "opencode");
+        assert_eq!(opencode.binary(), "opencode");
+
         let dummy_root = Root {
             dir: PathBuf::from("/tmp/fake-root"),
         };
-        assert!(
-            Tool::OpenCode
-                .settings(Path::new("/usr/local/bin/elanus"), &dummy_root)
-                .is_none()
-        );
-        assert!(
-            Tool::Codex
-                .settings(Path::new("/usr/local/bin/elanus"), &dummy_root)
-                .is_none()
-        );
-        assert!(
-            Tool::ClaudeCode
-                .settings(Path::new("/usr/local/bin/elanus"), &dummy_root)
-                .is_some()
-        );
+        let exe = Path::new("/usr/local/bin/elanus");
+        assert!(opencode.settings(exe, &dummy_root).is_none());
+        assert!(codex.settings(exe, &dummy_root).is_none());
+        assert!(claude.settings(exe, &dummy_root).is_some());
     }
 
     #[test]
@@ -4042,7 +4286,7 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": { "command": "ls -la" },
         });
-        let (leaf, body) = Tool::ClaudeCode.map_event("PreToolUse", &payload);
+        let (leaf, body) = ClaudeCode.map_event("PreToolUse", &payload);
         assert_eq!(leaf, "tool/Bash/call");
         assert_eq!(body["tool"], "Bash");
         assert_eq!(body["cc_session"], "cc-123");
@@ -4060,7 +4304,7 @@ mod tests {
             "tool_input": { "file_path": "/x" },
             "tool_response": "permission denied",
         });
-        let (leaf, body) = Tool::ClaudeCode.map_event("PostToolUseFailure", &payload);
+        let (leaf, body) = ClaudeCode.map_event("PostToolUseFailure", &payload);
         assert_eq!(leaf, "tool/Write/result");
         assert_eq!(body["failed"], true);
         assert!(
@@ -4176,20 +4420,20 @@ mod tests {
 
     #[test]
     fn map_user_prompt_and_stop() {
-        let (leaf, body) = Tool::ClaudeCode.map_event(
+        let (leaf, body) = ClaudeCode.map_event(
             "UserPromptSubmit",
             &json!({ "prompt": "fix the bug", "session_id": "cc" }),
         );
         assert_eq!(leaf, "user/message");
         assert_eq!(body["prompt"], "fix the bug");
 
-        let (leaf, _) = Tool::ClaudeCode.map_event("Stop", &json!({ "session_id": "cc" }));
+        let (leaf, _) = ClaudeCode.map_event("Stop", &json!({ "session_id": "cc" }));
         assert_eq!(leaf, "session/idle");
     }
 
     #[test]
     fn unknown_event_still_lands() {
-        let (leaf, body) = Tool::ClaudeCode.map_event("PreCompact", &json!({ "session_id": "cc" }));
+        let (leaf, body) = ClaudeCode.map_event("PreCompact", &json!({ "session_id": "cc" }));
         assert_eq!(leaf, "event/PreCompact");
         assert_eq!(body["event"], "PreCompact");
     }
