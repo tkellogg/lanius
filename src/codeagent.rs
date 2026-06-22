@@ -98,7 +98,7 @@ const MAX_SPAWN_DEPTH: u32 = 8;
 
 /// One-turn teaching nudge surfaced only when the user's submitted prompt is
 /// plausibly asking for delegation, parallelism, or another coding agent.
-const DISPATCH_HINT: &str = "[elanus] Tip: you can dispatch coding workers yourself - run `elanus code help` for all verbs. Live/blocking: `elanus code codex \"<task>\"` runs a Codex worker and returns its result inline; `elanus code opencode \"<task>\"` runs an opencode worker; `elanus code claude --worker \"<task>\"` runs a headless Claude worker.";
+const DISPATCH_HINT: &str = "[elanus] Tip: you can dispatch coding workers yourself - run `elanus code help` for all verbs. Live/blocking headless workers: `elanus code codex --headless \"<task>\"` runs a Codex worker and returns its result inline; `elanus code opencode --headless \"<task>\"` runs an opencode worker; `elanus code claude --headless \"<task>\"` runs a headless Claude worker. (Bare `elanus code <tool>` opens that tool's interactive TUI. `--worker` is the deprecated alias for `--headless`.)";
 
 /// The session-local Claude Code skill body written under the run scratch. Claude
 /// discovers it through `--add-dir <scratch>/skillroot` loading
@@ -114,9 +114,10 @@ description: Shows how to dispatch coding workers from this elanus-launched Clau
 Use this cheatsheet when you need another coding worker:
 
 - Full help: `elanus code help`
-- Live/blocking Codex worker: `elanus code codex "<task>"`
-- Live/blocking opencode worker: `elanus code opencode "<task>"`
-- Live/blocking Claude worker: `elanus code claude --worker "<task>"`
+- Live/blocking Codex worker: `elanus code codex --headless "<task>"`
+- Live/blocking opencode worker: `elanus code opencode --headless "<task>"`
+- Live/blocking Claude worker: `elanus code claude --headless "<task>"`
+  (bare `elanus code <tool>` opens the interactive TUI; `--worker` = deprecated alias for `--headless`)
 - Async spawn: `elanus code spawn <tool> "<task>"`
 - Async deliver to an existing worker: `elanus code deliver <worker> "<msg>"`
 - Check your own mailbox: `elanus code inbox`
@@ -183,11 +184,13 @@ pub fn print_help() {
         "\
 Usage: elanus code <verb> [args...]
 
-Launch tools:
-  elanus code claude [args...]          launch Claude Code
-  elanus code claude --worker \"<task>\"   run Claude headless and print its result
-  elanus code codex \"<task>\"           launch Codex; the task is positional
-  elanus code opencode \"<task>\"        launch opencode; the task is positional
+Launch tools (bare invocation / a prompt opens the tool's interactive TUI;
+add --headless to run the captured headless worker cell instead):
+  elanus code claude [args...]              launch Claude Code (TUI)
+  elanus code codex [\"<task>\"]             launch Codex (TUI)
+  elanus code opencode [\"<task>\"]          launch opencode (TUI)
+  elanus code <tool> --headless \"<task>\"   run the tool headless and print its result
+                                           (--worker is the deprecated alias for --headless)
 
 Commands:
   elanus code deliver <worker-session> \"<message>\"  dispatch work to a worker session
@@ -242,9 +245,11 @@ enum Mode {
 }
 
 /// How the launcher captures a session's activity — the per-(harness, mode) seam.
-/// Only the two variants actually used today are introduced here. HM2 adds the
-/// `RolloutImport` (codex TUI) and `Lifecycle` (start/stop-only floor) variants;
-/// adding them now would be dead code, so they land with the cells that use them.
+/// HM2 adds `RolloutImport` (the codex TUI floor). `Lifecycle` (a bracketed
+/// start/stop-only no-op floor) is deliberately NOT added: nothing uses it, and
+/// the handoff says add it ONLY if genuinely used. `RolloutImport` already gives
+/// the codex TUI real (post-hoc) granularity, so the unused-variant floor is dead
+/// code we don't introduce.
 enum Capture {
     /// The child's own hooks call `elanus code hook` (Claude Code): the launcher
     /// inherits stdio and parses nothing.
@@ -253,6 +258,26 @@ enum Capture {
     /// in-process (Codex `exec --json`, opencode `run --format json`): no hooks,
     /// no home pollution.
     StreamJson,
+    /// POST-HOC import (HM2): the harness ran as an interactive TUI with inherited
+    /// stdio (the launcher parsed NOTHING live), and at session STOP the launcher
+    /// resolves the rollout JSONL the TUI wrote and projects its turns into the obs
+    /// grammar. This is the codex-TUI cell: codex has no live hook bridge, so the
+    /// only faithful TUI capture is reading its on-disk rollout afterwards.
+    ///
+    /// FIDELITY: a `RolloutImport` cell is **not** live. Its projected events carry
+    /// an explicit `"fidelity":"rollout-import"` / `"source":"rollout"` marker (see
+    /// `rollout_map_*`) so a consumer never mistakes post-hoc, coarse rollout import
+    /// for the live, per-event granularity of a hook-bridged TUI.
+    RolloutImport,
+    /// The bracketed no-op floor: the harness runs as an interactive TUI with
+    /// inherited stdio and the launcher captures ONLY the session/start + stop
+    /// brackets it already emits — no per-turn detail at all. This is the honest
+    /// floor for a TUI we can launch but cannot yet faithfully capture: opencode's
+    /// TUI (HM3 makes opencode honor a bare → Tui launch) has no live hook bridge
+    /// and no rollout reader is in scope here, so its Tui cell is bracketed-only
+    /// rather than silently pretending to live-capture. (Codex's TUI does NOT use
+    /// this floor — it has `RolloutImport`.)
+    Lifecycle,
 }
 
 /// The shared, harness-agnostic bits the launch envelope assembles, passed to a
@@ -290,10 +315,11 @@ trait Harness: Sync {
     fn binary(&self) -> &'static str;
     /// How the launcher captures this harness's activity in `mode` (the matrix cell).
     fn capture(&self, mode: Mode) -> Capture;
-    /// Pick the launch mode from the `--worker` flag, preserving today's behavior:
-    /// Claude bare→Tui / `--worker`→Headless; codex/opencode are Headless-only.
-    /// (HM3 makes this the uniform `--headless` flag across all harnesses.)
-    fn mode_for(&self, worker: bool) -> Mode;
+    /// Pick the launch mode from the uniform `--headless` flag (HM3). `headless`
+    /// is true when the user passed `--headless` (or its deprecated alias
+    /// `--worker`), false for a bare/prompt invocation. Every harness now honors
+    /// both cells: bare → `Tui`, `--headless` → `Headless`.
+    fn mode_for(&self, headless: bool) -> Mode;
     /// The generated tool config that routes hook events through `elanus code hook`
     /// (only the HookBridge harness generates one; StreamJson harnesses return None
     /// and write nothing to the tool home).
@@ -315,6 +341,26 @@ trait Harness: Sync {
         _ctx: StreamLaunch<'_>,
     ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
         unreachable!("run_stream_capture called on a non-StreamJson harness")
+    }
+    /// Run an interactive TUI launch (inherited stdio) and capture it POST-HOC by
+    /// importing the rollout it wrote (the `Capture::RolloutImport` arm). Default:
+    /// unreachable — only the codex harness overrides it, and the envelope only
+    /// calls it for `Capture::RolloutImport`.
+    fn run_tui_rollout_import(
+        &self,
+        _ctx: StreamLaunch<'_>,
+    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+        unreachable!("run_tui_rollout_import called on a non-RolloutImport harness")
+    }
+    /// Run an interactive TUI launch (inherited stdio) with ONLY the launcher's
+    /// session/start+stop brackets for capture (the `Capture::Lifecycle` floor).
+    /// Default: unreachable — only a Lifecycle harness (opencode's Tui cell)
+    /// overrides it, and the envelope only calls it for `Capture::Lifecycle`.
+    fn run_tui_lifecycle(
+        &self,
+        _ctx: StreamLaunch<'_>,
+    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+        unreachable!("run_tui_lifecycle called on a non-Lifecycle harness")
     }
     /// Read this harness's daemon-resume stdout stream (the spawned child) into the
     /// obs grammar + capture summary, under the resumed elanus session. Each harness
@@ -354,9 +400,9 @@ impl Harness for ClaudeCode {
     fn capture(&self, _mode: Mode) -> Capture {
         Capture::HookBridge
     }
-    fn mode_for(&self, worker: bool) -> Mode {
-        // Claude has both cells: bare/interactive → Tui; `--worker` → Headless `-p`.
-        if worker { Mode::Headless } else { Mode::Tui }
+    fn mode_for(&self, headless: bool) -> Mode {
+        // Claude has both cells: bare/interactive → Tui; `--headless` → Headless `-p`.
+        if headless { Mode::Headless } else { Mode::Tui }
     }
     fn settings(&self, self_exe: &Path, root: &Root) -> Option<Value> {
         Some(claude_settings(self_exe, root))
@@ -415,15 +461,28 @@ impl Harness for Codex {
     fn binary(&self) -> &'static str {
         "codex"
     }
-    fn capture(&self, _mode: Mode) -> Capture {
-        // Codex 0.141 hooks are a plugin/managed-config dead end; capture the
-        // `codex exec --json` stdout stream in-process instead (Appendix B).
-        Capture::StreamJson
+    fn capture(&self, mode: Mode) -> Capture {
+        // Codex 0.141 hooks are a plugin/managed-config dead end, so codex never
+        // uses a live hook bridge (Appendix B). The two cells:
+        //  - Headless: `codex exec --json` prints a JSONL stream we parse live.
+        //  - Tui (HM2): the interactive `codex` TUI writes a rollout JSONL; we
+        //    import it POST-HOC at stop. We choose rollout-import over the
+        //    alternative (forcing codex's headless hooks/JSON onto an interactive
+        //    session via a bypass) because the rollout is codex's own first-class,
+        //    documented on-disk record of the exact turns — no fragile flag
+        //    coupling, no home pollution, and it survives a launcher crash. The
+        //    cost is honestly declared: it is post-hoc and coarser than live
+        //    (marked `fidelity=rollout-import`).
+        match mode {
+            Mode::Headless => Capture::StreamJson,
+            Mode::Tui => Capture::RolloutImport,
+        }
     }
-    fn mode_for(&self, _worker: bool) -> Mode {
-        // Codex is Headless-only today (bare `elanus code codex` errors before this
-        // is reached; a prompt runs `codex exec --json`). HM2 wires the TUI cell.
-        Mode::Headless
+    fn mode_for(&self, headless: bool) -> Mode {
+        // HM3: codex now honors both cells. Bare `elanus code codex` → the
+        // interactive TUI (HM2's RolloutImport); `--headless`/`--worker` →
+        // `codex exec --json` (the live StreamJson worker, unchanged).
+        if headless { Mode::Headless } else { Mode::Tui }
     }
     fn settings(&self, _self_exe: &Path, _root: &Root) -> Option<Value> {
         None
@@ -469,6 +528,24 @@ impl Harness for Codex {
             ctx.worker_timeout,
         )
     }
+    fn run_tui_rollout_import(
+        &self,
+        ctx: StreamLaunch<'_>,
+    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+        // HM2: the codex TUI cell — launch the interactive TUI (inherited stdio),
+        // then import the rollout it wrote post-hoc. No worker timeout: a TUI is a
+        // human-pumped live session and may run as long as needed (like Claude's).
+        run_codex_tui_import(
+            ctx.root,
+            ctx.principal,
+            ctx.bus_token,
+            ctx.agent,
+            ctx.session,
+            ctx.workdir,
+            ctx.args,
+            ctx.brief,
+        )
+    }
     fn resume_stream_capture(
         &self,
         root: &Root,
@@ -497,14 +574,23 @@ impl Harness for OpenCode {
     fn binary(&self) -> &'static str {
         "opencode"
     }
-    fn capture(&self, _mode: Mode) -> Capture {
+    fn capture(&self, mode: Mode) -> Capture {
         // opencode `run --format json` prints a JSONL event stream on stdout (no
-        // hooks, no home pollution) — same StreamJson strategy as Codex.
-        Capture::StreamJson
+        // hooks, no home pollution) — same StreamJson strategy as Codex for the
+        // Headless cell. The Tui cell (HM3) launches opencode's interactive TUI
+        // with inherited stdio; opencode has no live hook bridge and no rollout
+        // reader is in scope (HM2 is codex-only), so its Tui capture is the honest
+        // bracketed `Lifecycle` floor, not a pretend live capture.
+        match mode {
+            Mode::Headless => Capture::StreamJson,
+            Mode::Tui => Capture::Lifecycle,
+        }
     }
-    fn mode_for(&self, _worker: bool) -> Mode {
-        // opencode is Headless-only today (`run --format json`). HM3 unifies modes.
-        Mode::Headless
+    fn mode_for(&self, headless: bool) -> Mode {
+        // HM3: opencode now honors both cells. Bare `elanus code opencode` → its
+        // interactive TUI (Lifecycle-bracketed); `--headless`/`--worker` →
+        // `opencode run --format json` (the live StreamJson worker, unchanged).
+        if headless { Mode::Headless } else { Mode::Tui }
     }
     fn settings(&self, _self_exe: &Path, _root: &Root) -> Option<Value> {
         None
@@ -551,6 +637,19 @@ impl Harness for OpenCode {
             ctx.brief,
             ctx.worker,
             ctx.worker_timeout,
+        )
+    }
+    fn run_tui_lifecycle(
+        &self,
+        ctx: StreamLaunch<'_>,
+    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+        // HM3: opencode's Tui cell. Launch the interactive `opencode` TUI with
+        // inherited stdio; the ONLY capture is the launcher's session/start+stop
+        // brackets (the Lifecycle floor) — opencode has no live hook bridge and no
+        // rollout reader is in scope (HM2 is codex-only), so this honestly captures
+        // nothing per-turn rather than pretending to. Returns an empty summary.
+        run_opencode_tui_lifecycle(
+            ctx.root, ctx.agent, ctx.session, ctx.workdir, ctx.args, ctx.brief,
         )
     }
     fn resume_stream_capture(
@@ -1121,14 +1220,13 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str) -> Result<()> {
 
     let mut cmd = std::process::Command::new(self_exe);
     cmd.arg("code").arg(parsed.id());
-    if parsed.mode_for(false) == Mode::Tui {
-        // A harness whose bare launch is the interactive TUI (Claude today) cannot
-        // run with detached stdio; force the headless worker shape (`--worker` →
-        // `claude -p`) in the background wrapper. Codex/opencode are already
-        // Headless-only, so they need no flag (byte-identical to the old
-        // `matches!(parsed, Tool::ClaudeCode)` check).
-        cmd.arg("--worker");
-    }
+    // HM3: a detached spawn ALWAYS runs headless — a background worker has no TTY
+    // and routes its completion to the spawner mailbox. Every harness now defaults
+    // bare → Tui (which needs inherited stdio), so the wrapper must force the
+    // uniform `--headless` flag for ALL harnesses (not just Claude as before) so
+    // codex/opencode run their captured headless cell rather than trying to open a
+    // TUI with detached (null) stdio.
+    cmd.arg("--headless");
     cmd.arg(prompt)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1360,21 +1458,31 @@ fn take_room_flag(args: &[String]) -> (Option<String>, Vec<String>) {
     (room, out)
 }
 
-/// Should Claude Code launch in headless worker mode? A `--worker` flag anywhere
-/// in the user args selects `claude -p`, captures stdout, and prints a marked
-/// result for a parent agent to read. The flag is stripped before the real tool
-/// sees argv, matching the other elanus-only launch flags.
-fn take_worker_flag(args: &[String]) -> (bool, Vec<String>) {
-    let mut worker = false;
+/// Should the harness launch in HEADLESS mode? (HM3) The uniform `--headless`
+/// flag anywhere in the user args selects the harness's non-interactive cell
+/// (`claude -p` / `codex exec --json` / `opencode run --format json`), captures
+/// the result, and prints a marked result for a parent agent to read. `--worker`
+/// is the DEPRECATED ALIAS (the pre-HM3 spelling) and still works, with a one-line
+/// stderr deprecation notice. Either flag is stripped before the real tool sees
+/// argv, matching the other elanus-only launch flags.
+fn take_headless_flag(args: &[String]) -> (bool, Vec<String>) {
+    let mut headless = false;
+    let mut saw_worker_alias = false;
     let mut out = Vec::with_capacity(args.len());
     for a in args {
-        if a == "--worker" {
-            worker = true;
+        if a == "--headless" {
+            headless = true;
+        } else if a == "--worker" {
+            headless = true;
+            saw_worker_alias = true;
         } else {
             out.push(a.clone());
         }
     }
-    (worker, out)
+    if saw_worker_alias {
+        eprintln!("[code] note: --worker is deprecated; use --headless (it still works for now)");
+    }
+    (headless, out)
 }
 
 /// Best-effort model / reasoning-effort metadata from explicit launch flags
@@ -2059,7 +2167,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     // worker shape rides `--worker`. Strip all before the args reach the tool.
     let (want_brief, args) = take_brief_flag(args);
     let (room, args) = take_room_flag(&args);
-    let (worker, args) = take_worker_flag(&args);
+    let (headless, args) = take_headless_flag(&args);
     let args = &args[..];
     let (model, effort) = extract_model_effort(args);
     let worker_timeout = std::env::var(ENV_REPLY_TO)
@@ -2068,7 +2176,13 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
         .map(|_| spawn_timeout_secs());
 
     let tool = parse_harness(tool)?;
-    let mode = tool.mode_for(worker);
+    // HM3: the launcher routes purely on Mode. `mode_for(headless)` maps the
+    // uniform `--headless` flag (false → Tui, true → Headless) for every harness;
+    // the capture/command path then branches on `tool.capture(mode)`, never on a
+    // raw `worker` bool. `worker` below is just the Headless predicate the legacy
+    // StreamJson/HookBridge code paths still read (worker == headless == Mode::Headless).
+    let mode = tool.mode_for(headless);
+    let worker = mode == Mode::Headless;
     let session = launch_session_id(root);
     let agent = tool.agent_noun().to_string();
     let brief_text = want_brief.then(|| briefing(&session));
@@ -2285,6 +2399,38 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                 worker,
                 worker_timeout,
             }),
+            // ── RolloutImport: interactive TUI + post-hoc rollout import ───────
+            // The codex TUI cell (HM2). The launcher inherits stdio (a real,
+            // human-pumped session, like Claude's TUI) and parses NOTHING live;
+            // after the TUI exits, the harness resolves the rollout JSONL it wrote
+            // and projects its turns into the obs grammar, marked as post-hoc.
+            Capture::RolloutImport => tool.run_tui_rollout_import(StreamLaunch {
+                root,
+                principal: &principal,
+                bus_token: &bus_token,
+                agent: &agent,
+                session: &session,
+                workdir: &workdir,
+                args,
+                brief: brief_text.as_deref(),
+                worker,
+                worker_timeout,
+            }),
+            // ── Lifecycle: interactive TUI, bracket-only capture ──────────────
+            // opencode's Tui cell (HM3). Inherited stdio; the only capture is the
+            // session/start + session/stop brackets the launcher already emits.
+            Capture::Lifecycle => tool.run_tui_lifecycle(StreamLaunch {
+                root,
+                principal: &principal,
+                bus_token: &bus_token,
+                agent: &agent,
+                session: &session,
+                workdir: &workdir,
+                args,
+                brief: brief_text.as_deref(),
+                worker,
+                worker_timeout,
+            }),
         }
     })();
 
@@ -2476,6 +2622,579 @@ fn run_codex_capture(
     Ok((status, summary))
 }
 
+// ── HM2: codex TUI (Capture::RolloutImport) ───────────────────────────────────
+//
+// The codex TUI cell. Codex 0.141 has NO live hook bridge (Appendix B) and its
+// interactive TUI prints nothing parseable to stdout, so the only faithful way to
+// capture an interactive codex session is to read the rollout JSONL the TUI writes
+// to `~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<thread_id>.jsonl` AFTER it exits,
+// and project its turns into the obs grammar.
+//
+// WHY rollout-import rather than hooks-via-bypass: the alternative — forcing
+// codex's headless `--json` event stream (or a managed-config hook) onto an
+// interactive TUI via a bypass — is fragile (couples to undocumented flag
+// interplay), pollutes `~/.codex`, and dies if the launcher crashes. The rollout
+// is codex's OWN first-class, documented on-disk record of the exact turns; it
+// survives a launcher crash and needs no flag coupling. The cost — it is post-hoc
+// and coarser than a live hook bridge — is declared honestly: every projected
+// event is marked `fidelity=rollout-import` (see `rollout_map_record`).
+//
+// !!! FLAGGED GAP (accepted, NOT hidden) !!!
+// This path is built + unit-tested against the REAL on-disk rollout schema (a
+// trimmed fixture captured from `~/.codex/sessions`, `ROLLOUT_FIXTURE` below), but
+// the LIVE codex TUI launch + import of a FRESH rollout is UNVERIFIED end-to-end:
+// running a real interactive codex TUI needs codex credits + a TTY, which this
+// environment does not have. The reader is exercised by the fixture test; the
+// command construction is exercised by the mode/arg tests; the live round trip is
+// the only unproven link and is gated on codex credits.
+//
+// SCOPE: HM2 + HM3 only. HM4 (the briefing-prose rewrite + doc sweep) and HM5 (the
+// adapter checklist doc) are a SEPARATE task and are deliberately NOT done here.
+#[allow(clippy::too_many_arguments)]
+fn run_codex_tui_import(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    workdir: &Path,
+    args: &[String],
+    brief: Option<&str>,
+) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+    use std::process::Command;
+
+    // Build the interactive `codex` invocation. Bare `codex` (no prompt) opens the
+    // TUI; `codex "<prompt>"` opens the TUI seeded with that prompt. Codex has no
+    // --append-system-prompt, so the launch-envelope briefing is PREPENDED to the
+    // seed prompt positional (codex's documented seed channel): we fold the brief
+    // and the user's seed prompt (if any) into one positional. With no user prompt
+    // AND no brief, we pass nothing → a bare TUI.
+    let mut codex_args: Vec<String> = Vec::new();
+    // Pass through any non-prompt flags the user supplied (e.g. -m/--model) before
+    // the seed positional; the prompt itself, if present, is the LAST positional.
+    let (flags, user_prompt) = split_codex_seed_prompt(args);
+    codex_args.extend(flags);
+    let seed = match (brief, user_prompt.as_deref()) {
+        (Some(b), Some(p)) => Some(format!("{}\n\n{}", codex_briefing_block(b), p)),
+        (Some(b), None) => Some(codex_briefing_block(b)),
+        (None, Some(p)) => Some(p.to_string()),
+        (None, None) => None,
+    };
+    if let Some(seed) = seed {
+        codex_args.push(seed);
+    }
+
+    let mut cmd = Command::new("codex");
+    cmd.args(&codex_args);
+    cmd.current_dir(workdir);
+    // The TUI is a real, human-pumped interactive session: inherit ALL of stdio so
+    // it is fully usable (exactly like Claude's TUI). The launcher parses NOTHING
+    // live — capture is the post-hoc rollout import below.
+    cmd.stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    scrub_provider_creds(&mut cmd);
+    scrub_launch_control_env(&mut cmd);
+    cmd.env_remove("ELANUS_PACKAGE").env_remove("ELANUS_BUS_TOKEN");
+    cmd.env(ENV_SESSION, session)
+        .env(ENV_AGENT, agent)
+        .env("ELANUS_ROOT", &root.dir);
+    eprintln!("[code] launching codex TUI as session {session} (rollout import on exit)");
+
+    // Remember the newest rollout that already exists, so after the TUI exits we
+    // can pick the rollout it CREATED (a strictly newer mtime) rather than an old
+    // one from a prior session. Best-effort: if we can't read the dir, the
+    // post-exit resolver simply takes the global newest match.
+    let before = newest_rollout_mtime();
+
+    let status = cmd
+        .status()
+        .with_context(|| "launching codex (is it installed and on PATH?)".to_string())?;
+
+    // Post-hoc import: resolve the rollout the TUI just wrote and project it. We
+    // find the freshest rollout created during this launch by the mtime watermark
+    // (at launch we don't yet know codex's thread id — it's INSIDE the rollout),
+    // then re-resolve by the thread id in its session_meta via the handoff-specified
+    // `rollout-*-<thread_id>.jsonl` resolver so the authoritative selection keys on
+    // the native thread id (and a same-second sibling can't shadow it).
+    let resolved = resolve_codex_rollout(before).map(|path| {
+        rollout_thread_id(&path)
+            .and_then(|tid| resolve_codex_rollout_by_thread(&tid))
+            .unwrap_or(path)
+    });
+    let summary = match resolved {
+        Some(path) => {
+            eprintln!("[code] importing codex rollout {}", path.display());
+            import_codex_rollout(root, principal, bus_token, agent, session, &path, Some(workdir))
+        }
+        None => {
+            eprintln!(
+                "[code] no codex rollout found to import for session {session} \
+                 (the TUI may have written none); recorded only the lifecycle brackets"
+            );
+            CaptureSummary::default()
+        }
+    };
+    Ok((status, summary))
+}
+
+/// Split a codex launch argv into (pass-through flags, the user's seed prompt).
+/// Mirrors `codex_args_have_prompt`'s conservative flag model: skip values for the
+/// common value-taking flags, honor `--`, and treat the first remaining non-flag
+/// token as the seed prompt (everything else stays as flags). Used to fold the
+/// briefing into the seed positional for the TUI without a full codex clap parse.
+fn split_codex_seed_prompt(args: &[String]) -> (Vec<String>, Option<String>) {
+    let value_flags = [
+        "-c", "--config", "-m", "--model", "--model-provider", "-s", "--sandbox", "-a",
+        "--ask-for-approval", "--approval-policy", "-C", "--cd", "--profile",
+    ];
+    let mut flags = Vec::new();
+    let mut prompt = None;
+    let mut after_dash_dash = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if after_dash_dash {
+            // Everything after `--` is the prompt (join with spaces if several).
+            let rest = args[i..].join(" ");
+            prompt = Some(rest);
+            break;
+        }
+        if arg == "--" {
+            after_dash_dash = true;
+            i += 1;
+            continue;
+        }
+        if value_flags.iter().any(|f| arg == f) {
+            flags.push(arg.clone());
+            if let Some(v) = args.get(i + 1) {
+                flags.push(v.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            flags.push(arg.clone());
+            i += 1;
+            continue;
+        }
+        // First non-flag token: the seed prompt.
+        prompt = Some(arg.clone());
+        break;
+    }
+    (flags, prompt)
+}
+
+/// The codex sessions root (`~/.codex/sessions`). Honors `CODEX_HOME` (codex's own
+/// override) and falls back to `$HOME/.codex`. Returns None if neither is set.
+fn codex_sessions_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))?;
+    Some(home.join("sessions"))
+}
+
+/// The mtime of the newest `rollout-*.jsonl` anywhere under the codex sessions
+/// dir, or None if there is none / the dir is unreadable. Used as a watermark so
+/// the post-exit resolver can prefer a rollout created DURING this launch.
+fn newest_rollout_mtime() -> Option<std::time::SystemTime> {
+    let dir = codex_sessions_dir()?;
+    walk_rollouts(&dir)
+        .into_iter()
+        .filter_map(|p| std::fs::metadata(&p).and_then(|m| m.modified()).ok())
+        .max()
+}
+
+/// Resolve the rollout file the just-exited codex TUI wrote. Prefer the newest
+/// rollout strictly newer than `watermark` (the one this launch created); if none
+/// is strictly newer (clock granularity, or the only rollout IS this one), fall
+/// back to the global newest. None if there are no rollouts at all.
+fn resolve_codex_rollout(watermark: Option<std::time::SystemTime>) -> Option<PathBuf> {
+    let dir = codex_sessions_dir()?;
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = walk_rollouts(&dir)
+        .into_iter()
+        .filter_map(|p| {
+            let m = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+            Some((m, p))
+        })
+        .collect();
+    candidates.sort_by_key(|(m, _)| *m);
+    if let Some(wm) = watermark {
+        if let Some((_, p)) = candidates.iter().rev().find(|(m, _)| *m > wm) {
+            return Some(p.clone());
+        }
+    }
+    candidates.pop().map(|(_, p)| p)
+}
+
+/// Resolve a rollout file by its native thread id (the UUID in the filename),
+/// globbing `rollout-*-<thread_id>.jsonl` under the codex sessions dir and picking
+/// the newest match — the handoff-specified resolver. Used by the TUI import path
+/// to confirm/select the rollout once the recorded `native_session` (codex thread
+/// id) is known, and available to any future re-import (resume) caller. None if no
+/// file matches.
+fn resolve_codex_rollout_by_thread(thread_id: &str) -> Option<PathBuf> {
+    let dir = codex_sessions_dir()?;
+    find_rollout_by_thread(&dir, thread_id)
+}
+
+/// Pure thread-id rollout resolver over an explicit sessions dir (unit-testable):
+/// the newest `rollout-*-<thread_id>.jsonl` under `dir`, or None.
+fn find_rollout_by_thread(dir: &Path, thread_id: &str) -> Option<PathBuf> {
+    let needle = format!("-{thread_id}.jsonl");
+    let mut matches: Vec<(std::time::SystemTime, PathBuf)> = walk_rollouts(dir)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&needle))
+        })
+        .filter_map(|p| {
+            let m = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+            Some((m, p))
+        })
+        .collect();
+    matches.sort_by_key(|(m, _)| *m);
+    matches.pop().map(|(_, p)| p)
+}
+
+/// Read codex's native thread id from a rollout file: the `session_meta`'s
+/// `payload.id` on the first line. None if the file is unreadable or has no
+/// session_meta header. (The id is also the UUID in the filename, but reading the
+/// header is authoritative and tolerates a renamed file.)
+fn rollout_thread_id(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let first = text.lines().find(|l| !l.trim().is_empty())?;
+    let rec: Value = serde_json::from_str(first).ok()?;
+    if rec.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    rec.get("payload")
+        .and_then(|p| p.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Recursively collect every `rollout-*.jsonl` under `dir` (codex nests by
+/// `<Y>/<M>/<D>/`). Bounded, best-effort; an unreadable subdir is skipped.
+fn walk_rollouts(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Read a codex TUI rollout JSONL and project its turns into the obs grammar under
+/// the elanus session, publishing each as the session principal — the POST-HOC
+/// counterpart to `capture_codex_stream`'s live parse. Every projected body is
+/// marked `fidelity=rollout-import` so a consumer never mistakes it for live
+/// granularity. When `record_workdir` is Some, the `session_meta`'s codex thread id
+/// persists the durable `code_sessions` record so the imported TUI session is
+/// resumable. Returns the legible summary (final agent text + changed paths).
+fn import_codex_rollout(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    rollout_path: &Path,
+    record_workdir: Option<&Path>,
+) -> CaptureSummary {
+    let text = match std::fs::read_to_string(rollout_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "[code] reading codex rollout {} failed (continuing): {e:#}",
+                rollout_path.display()
+            );
+            return CaptureSummary::default();
+        }
+    };
+    project_codex_rollout(root, principal, bus_token, agent, session, &text, record_workdir)
+}
+
+/// The pure projection core (separated from file IO so it is unit-testable against
+/// a fixture string). Parses each JSONL record, persists the durable record from
+/// `session_meta`, maps each record to an obs leaf+body via `rollout_map_record`,
+/// and harvests the legible summary. A malformed line is skipped (never dropped
+/// silently to obs — a parse error is just not a record).
+fn project_codex_rollout(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    rollout: &str,
+    record_workdir: Option<&Path>,
+) -> CaptureSummary {
+    let mut summary = CaptureSummary::default();
+    for line in rollout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let rec: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Persist the durable session record from session_meta (the thread id is
+        // the rollout's `payload.id`), so an imported TUI session is resumable.
+        if let Some(workdir) = record_workdir {
+            if rec.get("type").and_then(Value::as_str) == Some("session_meta") {
+                if let Some(thread_id) = rec
+                    .get("payload")
+                    .and_then(|p| p.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    let srec = codesession::SessionRecord {
+                        elanus_session: session.to_string(),
+                        native_session: thread_id.to_string(),
+                        tool: "codex".to_string(),
+                        agent_noun: agent.to_string(),
+                        workdir: workdir.display().to_string(),
+                        room: None,
+                    };
+                    if let Err(e) = codesession::upsert_record(root, &srec) {
+                        eprintln!(
+                            "[code] recording imported codex session (continuing): {e:#}"
+                        );
+                    }
+                }
+            }
+        }
+        rollout_collect_summary(&rec, &mut summary);
+        if let Some((leaf, body)) = rollout_map_record(&rec) {
+            publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
+        }
+    }
+    summary
+}
+
+/// The post-hoc import provenance marker stamped on EVERY projected rollout body.
+/// `fidelity=rollout-import` (NOT live) + `source=rollout` is the honest signal a
+/// consumer reads to know this cell is post-hoc and coarser than a hook-bridged TUI.
+fn mark_rollout(body: &mut Value) {
+    if let Value::Object(m) = body {
+        m.insert("fidelity".into(), json!("rollout-import"));
+        m.insert("source".into(), json!("rollout"));
+    }
+}
+
+/// Map one codex TUI rollout record to an obs leaf + trimmed body, reusing the same
+/// leaf vocabulary the live stream maps into (`assistant/message`,
+/// `assistant/reasoning`, `tool/<n>/{call,result}`, `session/...`). Returns None
+/// for records we deliberately drop (synthetic env/permissions context, redundant
+/// `event_msg` mirrors of `response_item`s we already projected). Every returned
+/// body carries the rollout-import provenance marker.
+///
+/// SCHEMA (verified against real `~/.codex/sessions` TUI rollouts, codex 0.140/0.141):
+///   {type:"session_meta", payload:{id,cwd,originator,cli_version,...}}
+///   {type:"event_msg",     payload:{type:"task_started"|"task_complete"|
+///                                        "user_message"|"agent_message"|"token_count", ...}}
+///   {type:"response_item", payload:{type:"message", role, content:[{type,text}]}}
+///   {type:"response_item", payload:{type:"reasoning", summary:[], encrypted_content}}
+///   {type:"response_item", payload:{type:"function_call", name, arguments, call_id}}
+///   {type:"response_item", payload:{type:"function_call_output", call_id, output}}
+///   {type:"turn_context",  payload:{...}}   (dropped — config echo, no obs value)
+fn rollout_map_record(rec: &Value) -> Option<(String, Value)> {
+    let ts = now_iso();
+    let rtype = rec.get("type").and_then(Value::as_str).unwrap_or("");
+    let payload = rec.get("payload").unwrap_or(&Value::Null);
+    let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    let mut out = match (rtype, ptype) {
+        // The codex thread id — file as session/thread (NOT a second session/start;
+        // the launcher already emitted session/start), exactly like the live stream.
+        ("session_meta", _) => Some((
+            "session/thread".to_string(),
+            json!({
+                "ts": ts,
+                "codex_thread": payload.get("id").cloned().unwrap_or(Value::Null),
+                "cli_version": payload.get("cli_version").cloned().unwrap_or(Value::Null),
+            }),
+        )),
+        // The genuine user prompt. event_msg/user_message is the CLEAN prompt (the
+        // response_item message role=user carries the synthetic env/permissions
+        // blocks too), so we project from event_msg and drop the role=user/developer
+        // response_items below.
+        ("event_msg", "user_message") => Some((
+            "user/message".to_string(),
+            json!({ "ts": ts, "text": clip_opt(payload.get("message"), 4000) }),
+        )),
+        // turn lifecycle / cost.
+        ("event_msg", "task_started") => {
+            Some(("session/idle".to_string(), json!({ "ts": ts, "event": "task_started" })))
+        }
+        ("event_msg", "task_complete") => Some((
+            "session/idle".to_string(),
+            json!({
+                "ts": ts,
+                "event": "task_complete",
+                "last_agent_message": clip_opt(payload.get("last_agent_message"), 4000),
+            }),
+        )),
+        ("event_msg", "token_count") => Some((
+            "session/idle".to_string(),
+            json!({ "ts": ts, "event": "token_count", "usage": clip_value(payload.get("info"), 2000) }),
+        )),
+        // event_msg/agent_message MIRRORS the response_item message role=assistant we
+        // project below — drop it to avoid a duplicate assistant/message.
+        ("event_msg", "agent_message") => None,
+        // The assistant's settled message.
+        ("response_item", "message") => {
+            let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
+            if role != "assistant" {
+                // role=user / role=developer are synthetic env/permissions/context
+                // (or the dup of the clean user_message) — drop.
+                return None;
+            }
+            Some((
+                "assistant/message".to_string(),
+                json!({ "ts": ts, "text": clip(&rollout_message_text(payload), 4000) }),
+            ))
+        }
+        // Reasoning trace. The TUI rollout usually carries ONLY encrypted_content
+        // (no plaintext); project the summary text if any, else mark it redacted so
+        // the bus shows a reasoning step happened without leaking ciphertext.
+        ("response_item", "reasoning") => {
+            let summary_text = rollout_reasoning_text(payload);
+            Some((
+                "assistant/reasoning".to_string(),
+                json!({
+                    "ts": ts,
+                    "text": if summary_text.is_empty() { Value::Null } else { json!(clip(&summary_text, 4000)) },
+                    "redacted": summary_text.is_empty(),
+                }),
+            ))
+        }
+        // A tool (shell/exec) call.
+        ("response_item", "function_call") => {
+            let name = payload.get("name").and_then(Value::as_str).unwrap_or("tool");
+            Some((
+                format!("tool/{}/call", topic::encode_segment(name)),
+                json!({
+                    "ts": ts,
+                    "tool": name,
+                    "call_id": payload.get("call_id").cloned().unwrap_or(Value::Null),
+                    "arguments": clip_value(payload.get("arguments"), 2000),
+                }),
+            ))
+        }
+        // Its result. The rollout does not repeat the tool name on the output record
+        // (only call_id), so file under a generic `tool/result` leaf carrying the
+        // call_id to correlate with the matching call.
+        ("response_item", "function_call_output") => Some((
+            "tool/result".to_string(),
+            json!({
+                "ts": ts,
+                "call_id": payload.get("call_id").cloned().unwrap_or(Value::Null),
+                "output": clip_value(payload.get("output"), 4000),
+            }),
+        )),
+        // turn_context is a per-turn config echo (cwd, approval/sandbox policy) — no
+        // obs value; drop it.
+        ("turn_context", _) => None,
+        // Anything unmodeled still lands, tagged, so nothing is silently dropped.
+        _ => {
+            let tag = if ptype.is_empty() { rtype } else { ptype };
+            Some((
+                format!("rollout/{}", topic::encode_segment(tag)),
+                json!({ "ts": ts, "rollout_type": rtype, "payload_type": ptype }),
+            ))
+        }
+    };
+    if let Some((_, body)) = out.as_mut() {
+        mark_rollout(body);
+    }
+    out
+}
+
+/// Extract the plain text of a rollout `message` payload (concatenating its
+/// content parts' `text`). Handles both `input_text` (user) and `output_text`
+/// (assistant) parts.
+fn rollout_message_text(payload: &Value) -> String {
+    let Some(content) = payload.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut s = String::new();
+    for part in content {
+        if let Some(t) = part.get("text").and_then(Value::as_str) {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(t);
+        }
+    }
+    s
+}
+
+/// Extract any plaintext reasoning summary from a rollout `reasoning` payload. The
+/// TUI rollout's `summary` is usually an empty array (the trace lives in
+/// `encrypted_content`, which we never decrypt), so this is usually empty.
+fn rollout_reasoning_text(payload: &Value) -> String {
+    let Some(summary) = payload.get("summary").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut s = String::new();
+    for part in summary {
+        let t = part
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| part.as_str());
+        if let Some(t) = t {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(t);
+        }
+    }
+    s
+}
+
+/// Harvest the legible summary from one rollout record: the LAST settled assistant
+/// message wins as `final_text` (the `task_complete.last_agent_message` is the
+/// authoritative final word and overrides), and every shell/apply_patch the model
+/// ran is left to the obs (the rollout does not carry a discrete file-change item
+/// the way the live stream does, so we conservatively collect no paths here —
+/// changed files still appear in the projected tool calls).
+fn rollout_collect_summary(rec: &Value, summary: &mut CaptureSummary) {
+    let payload = rec.get("payload").unwrap_or(&Value::Null);
+    let rtype = rec.get("type").and_then(Value::as_str).unwrap_or("");
+    let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    match (rtype, ptype) {
+        ("response_item", "message")
+            if payload.get("role").and_then(Value::as_str) == Some("assistant") =>
+        {
+            let text = rollout_message_text(payload);
+            if !text.trim().is_empty() {
+                summary.final_text = Some(clip(&text, FINAL_TEXT_CAP));
+            }
+        }
+        // The authoritative final word — overrides any trailing assistant message.
+        ("event_msg", "task_complete") => {
+            if let Some(t) = payload.get("last_agent_message").and_then(Value::as_str) {
+                if !t.trim().is_empty() {
+                    summary.final_text = Some(clip(t, FINAL_TEXT_CAP));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 // ── opencode adapter (StreamJson) ─────────────────────────────────────────────
 //
 // OBSERVED EVENT SCHEMA — `opencode run --format json` (v1.17.9).
@@ -2651,6 +3370,57 @@ fn run_opencode_capture(
 
     let status = child.wait().context("waiting for opencode run to finish")?;
     Ok((status, summary))
+}
+
+/// HM3: launch opencode's interactive TUI (inherited stdio) — the `Capture::Lifecycle`
+/// floor. Bare `opencode` opens the TUI; `opencode "<prompt>"` seeds it. opencode has
+/// no --append-system-prompt, so the launch-envelope briefing is folded into the seed
+/// positional (same approach as the codex TUI). The launcher captures NOTHING per-turn
+/// (no live hook bridge, no rollout reader in scope); the only obs are the
+/// session/start + session/stop brackets the envelope already emits. Returns an empty
+/// summary. (A future opencode rollout/storage reader would promote this to a
+/// RolloutImport cell; deferred.)
+fn run_opencode_tui_lifecycle(
+    root: &Root,
+    agent: &str,
+    session: &str,
+    workdir: &Path,
+    args: &[String],
+    brief: Option<&str>,
+) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+    use std::process::Command;
+
+    // opencode's bare TUI takes a leading message argument; fold the briefing into
+    // it. opencode_task_from_args returns the user's task (Ok) or errors when none —
+    // for the TUI a missing task is fine (a bare TUI), so tolerate that.
+    let task = opencode_task_from_args(args).unwrap_or_default();
+    let seed = match (brief, task.trim().is_empty()) {
+        (Some(b), false) => Some(opencode_message_with_brief(Some(b), &task)),
+        (Some(b), true) => Some(opencode_message_with_brief(Some(b), "")),
+        (None, false) => Some(task),
+        (None, true) => None,
+    };
+
+    let mut cmd = Command::new("opencode");
+    if let Some(seed) = seed {
+        cmd.arg(seed);
+    }
+    cmd.current_dir(workdir);
+    cmd.stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    scrub_provider_creds(&mut cmd);
+    scrub_launch_control_env(&mut cmd);
+    cmd.env_remove("ELANUS_PACKAGE").env_remove("ELANUS_BUS_TOKEN");
+    cmd.env(ENV_SESSION, session)
+        .env(ENV_AGENT, agent)
+        .env("ELANUS_ROOT", &root.dir);
+    eprintln!("[code] launching opencode TUI as session {session} (lifecycle-bracket capture only)");
+
+    let status = cmd
+        .status()
+        .with_context(|| "launching opencode (is it installed and on PATH?)".to_string())?;
+    Ok((status, CaptureSummary::default()))
 }
 
 /// Read an opencode `run --format json` child's JSONL stdout line-by-line, mapping
@@ -4230,19 +5000,27 @@ mod tests {
         let codex = harness("codex").unwrap();
         let opencode = harness("opencode").unwrap();
 
-        // Claude has both cells: bare → Tui (hook bridge), --worker → Headless.
+        // Claude has both cells: bare → Tui (hook bridge), --headless → Headless.
         assert_eq!(claude.mode_for(false), Mode::Tui);
         assert_eq!(claude.mode_for(true), Mode::Headless);
         assert!(matches!(claude.capture(Mode::Tui), Capture::HookBridge));
         assert!(matches!(claude.capture(Mode::Headless), Capture::HookBridge));
 
-        // Codex/opencode are Headless-only StreamJson today.
-        assert_eq!(codex.mode_for(false), Mode::Headless);
+        // HM2/HM3: codex now honors both cells. bare → Tui (RolloutImport, the
+        // post-hoc rollout reader); --headless → Headless (StreamJson, unchanged).
+        assert_eq!(codex.mode_for(false), Mode::Tui);
+        assert_eq!(codex.mode_for(true), Mode::Headless);
+        assert!(matches!(codex.capture(Mode::Tui), Capture::RolloutImport));
         assert!(matches!(codex.capture(Mode::Headless), Capture::StreamJson));
         assert_eq!(codex.agent_noun(), "codex");
         assert_eq!(codex.binary(), "codex");
 
-        assert_eq!(opencode.mode_for(false), Mode::Headless);
+        // HM3: opencode now honors both cells. bare → Tui (Lifecycle floor —
+        // inherited stdio, bracket-only capture); --headless → Headless (StreamJson,
+        // unchanged).
+        assert_eq!(opencode.mode_for(false), Mode::Tui);
+        assert_eq!(opencode.mode_for(true), Mode::Headless);
+        assert!(matches!(opencode.capture(Mode::Tui), Capture::Lifecycle));
         assert!(matches!(
             opencode.capture(Mode::Headless),
             Capture::StreamJson
@@ -4257,6 +5035,222 @@ mod tests {
         assert!(opencode.settings(exe, &dummy_root).is_none());
         assert!(codex.settings(exe, &dummy_root).is_none());
         assert!(claude.settings(exe, &dummy_root).is_some());
+    }
+
+    // ── HM3: uniform --headless flag → Mode per (harness, flag) ──────────────
+
+    #[test]
+    fn headless_flag_selects_mode_for_every_harness() {
+        // Bare (no flag) → Tui for ALL harnesses; --headless → Headless for ALL.
+        for id in ["claude", "codex", "opencode"] {
+            let h = harness(id).unwrap();
+            // bare invocation: no --headless, no --worker.
+            let (headless, rest) = take_headless_flag(&["a-prompt".to_string()]);
+            assert!(!headless, "{id}: bare must not be headless");
+            assert_eq!(rest, vec!["a-prompt".to_string()]);
+            assert_eq!(h.mode_for(headless), Mode::Tui, "{id}: bare → Tui");
+
+            // --headless anywhere → Headless, flag stripped from argv.
+            let (headless, rest) =
+                take_headless_flag(&["--headless".to_string(), "a-prompt".to_string()]);
+            assert!(headless, "{id}: --headless must be headless");
+            assert_eq!(rest, vec!["a-prompt".to_string()], "{id}: flag stripped");
+            assert_eq!(h.mode_for(headless), Mode::Headless, "{id}: --headless → Headless");
+        }
+    }
+
+    #[test]
+    fn worker_flag_is_a_deprecated_alias_for_headless() {
+        // --worker still selects Headless (back-compat) and is stripped from argv.
+        let (headless, rest) =
+            take_headless_flag(&["--worker".to_string(), "task".to_string()]);
+        assert!(headless);
+        assert_eq!(rest, vec!["task".to_string()]);
+        // Every harness maps the alias to Headless exactly like --headless.
+        for id in ["claude", "codex", "opencode"] {
+            assert_eq!(harness(id).unwrap().mode_for(headless), Mode::Headless);
+        }
+    }
+
+    #[test]
+    fn bare_codex_selects_the_tui_cell_not_an_error() {
+        // HM3 regression guard: bare `elanus code codex` must resolve to the TUI
+        // (RolloutImport) cell — NOT the old headless-only path that errored on a
+        // missing prompt. We assert the mode/capture arg path (not a live launch).
+        let codex = harness("codex").unwrap();
+        let (headless, rest) = take_headless_flag(&[]); // bare: no args at all
+        assert!(!headless);
+        assert!(rest.is_empty());
+        let mode = codex.mode_for(headless);
+        assert_eq!(mode, Mode::Tui);
+        assert!(matches!(codex.capture(mode), Capture::RolloutImport));
+    }
+
+    #[test]
+    fn split_codex_seed_prompt_separates_flags_from_prompt() {
+        // Plain prompt, no flags.
+        let (flags, prompt) = split_codex_seed_prompt(&["do a thing".to_string()]);
+        assert!(flags.is_empty());
+        assert_eq!(prompt.as_deref(), Some("do a thing"));
+        // Value-taking flag passed through; prompt still found.
+        let (flags, prompt) = split_codex_seed_prompt(&[
+            "-m".to_string(),
+            "gpt-5".to_string(),
+            "the task".to_string(),
+        ]);
+        assert_eq!(flags, vec!["-m".to_string(), "gpt-5".to_string()]);
+        assert_eq!(prompt.as_deref(), Some("the task"));
+        // No prompt at all (bare TUI).
+        let (flags, prompt) = split_codex_seed_prompt(&[]);
+        assert!(flags.is_empty());
+        assert!(prompt.is_none());
+    }
+
+    // ── HM2: codex rollout import — reader against a real-schema fixture ──────
+
+    /// A SMALL, TRIMMED, SANITIZED copy of a real codex TUI rollout JSONL captured
+    /// (read-only) from `~/.codex/sessions` — the exact on-disk schema codex 0.140/
+    /// 0.141 writes (`session_meta` / `event_msg` / `response_item` / `turn_context`
+    /// records). Secrets and real paths are scrubbed; the event SHAPES are verbatim
+    /// so the reader is tested against the format it must parse in the field.
+    const ROLLOUT_FIXTURE: &str = r#"{"timestamp":"2026-06-17T02:20:30.640Z","type":"session_meta","payload":{"id":"019ed361-4fd2-7793-9ea6-a1add8ca3d4f","timestamp":"2026-06-17T02:20:30.572Z","cwd":"/work/proj","originator":"codex-tui","cli_version":"0.140.0","source":"tui"}}
+{"timestamp":"2026-06-17T02:20:30.640Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}
+{"timestamp":"2026-06-17T02:20:32.147Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions instructions>...synthetic...</permissions instructions>"}]}}
+{"timestamp":"2026-06-17T02:20:32.147Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context><cwd>/work/proj</cwd></environment_context>"}]}}
+{"timestamp":"2026-06-17T02:20:32.154Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"List the files in this directory."}]}}
+{"timestamp":"2026-06-17T02:20:32.154Z","type":"event_msg","payload":{"type":"user_message","message":"List the files in this directory.","images":[]}}
+{"timestamp":"2026-06-17T02:20:35.201Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/work/proj","approval_policy":"never","sandbox_policy":{"type":"read-only"}}}
+{"timestamp":"2026-06-17T02:20:35.201Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"REDACTED_CIPHERTEXT"}}
+{"timestamp":"2026-06-17T02:20:36.221Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I'll list the directory now."}],"phase":"commentary"}}
+{"timestamp":"2026-06-17T02:20:37.528Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls\",\"workdir\":\"/work/proj\"}","call_id":"call_ABC"}}
+{"timestamp":"2026-06-17T02:20:37.613Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_ABC","output":"Process exited with code 0\nOutput:\nCargo.toml\nsrc\n"}}
+{"timestamp":"2026-06-17T02:20:37.613Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":27434}}}}
+{"timestamp":"2026-06-17T02:20:40.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"There are two entries: Cargo.toml and src."}],"phase":"final_answer"}}
+{"timestamp":"2026-06-17T02:21:04.266Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"There are two entries: Cargo.toml and src."}}
+"#;
+
+    /// Project a rollout record to its (leaf, body) WITHOUT publishing — the pure
+    /// mapper, for assertions.
+    fn map_line(line: &str) -> Option<(String, Value)> {
+        rollout_map_record(&serde_json::from_str(line).unwrap())
+    }
+
+    #[test]
+    fn rollout_reader_projects_fixture_into_obs_grammar_with_provenance() {
+        // Collect every projected (leaf, body) from the fixture, in order.
+        let projected: Vec<(String, Value)> = ROLLOUT_FIXTURE
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(map_line)
+            .collect();
+        let leaves: Vec<&str> = projected.iter().map(|(l, _)| l.as_str()).collect();
+
+        // The synthetic developer/env user messages and the turn_context are DROPPED;
+        // the redundant event_msg/agent_message mirror is absent (there is none here,
+        // but the role=user response_items are dropped in favor of the clean
+        // user_message). The projected sequence reuses the live leaf vocabulary.
+        assert_eq!(
+            leaves,
+            vec![
+                "session/thread",          // session_meta → thread id
+                "session/idle",            // task_started
+                "user/message",            // event_msg/user_message (the clean prompt)
+                "assistant/reasoning",     // reasoning (redacted ciphertext)
+                "assistant/message",       // assistant commentary
+                "tool/exec_command/call",  // function_call
+                "tool/result",             // function_call_output
+                "session/idle",            // token_count
+                "assistant/message",       // assistant final answer
+                "session/idle",            // task_complete
+            ],
+            "projected leaves: {leaves:?}"
+        );
+
+        // EVERY projected body carries the honest post-hoc provenance marker so a
+        // consumer never mistakes rollout import for live granularity.
+        for (leaf, body) in &projected {
+            assert_eq!(
+                body.get("fidelity").and_then(Value::as_str),
+                Some("rollout-import"),
+                "{leaf} missing fidelity marker"
+            );
+            assert_eq!(
+                body.get("source").and_then(Value::as_str),
+                Some("rollout"),
+                "{leaf} missing source marker"
+            );
+        }
+
+        // The synthetic context records are genuinely dropped (None), not projected.
+        let dev = r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"x"}]}}"#;
+        let env = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"x"}]}}"#;
+        let tc = r#"{"type":"turn_context","payload":{"turn_id":"t1"}}"#;
+        let agentmsg = r#"{"type":"event_msg","payload":{"type":"agent_message","message":"dup"}}"#;
+        assert!(map_line(dev).is_none(), "developer message must be dropped");
+        assert!(map_line(env).is_none(), "env/user response_item must be dropped");
+        assert!(map_line(tc).is_none(), "turn_context must be dropped");
+        assert!(map_line(agentmsg).is_none(), "agent_message mirror must be dropped");
+
+        // Spot-check field projection: the user prompt, the tool call, its result.
+        let user = projected.iter().find(|(l, _)| l == "user/message").unwrap();
+        assert_eq!(
+            user.1.get("text").and_then(Value::as_str),
+            Some("List the files in this directory.")
+        );
+        let call = projected
+            .iter()
+            .find(|(l, _)| l == "tool/exec_command/call")
+            .unwrap();
+        assert_eq!(call.1.get("call_id").and_then(Value::as_str), Some("call_ABC"));
+        assert_eq!(call.1.get("tool").and_then(Value::as_str), Some("exec_command"));
+        let result = projected.iter().find(|(l, _)| l == "tool/result").unwrap();
+        assert_eq!(result.1.get("call_id").and_then(Value::as_str), Some("call_ABC"));
+        // Reasoning is redacted (only encrypted_content in the rollout).
+        let reasoning = projected
+            .iter()
+            .find(|(l, _)| l == "assistant/reasoning")
+            .unwrap();
+        assert_eq!(reasoning.1.get("redacted").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn rollout_summary_takes_the_final_agent_message() {
+        let mut summary = CaptureSummary::default();
+        for line in ROLLOUT_FIXTURE.lines().filter(|l| !l.trim().is_empty()) {
+            let rec: Value = serde_json::from_str(line).unwrap();
+            rollout_collect_summary(&rec, &mut summary);
+        }
+        // task_complete's last_agent_message is the authoritative final word.
+        assert_eq!(
+            summary.final_text.as_deref(),
+            Some("There are two entries: Cargo.toml and src.")
+        );
+    }
+
+    #[test]
+    fn rollout_thread_id_and_thread_resolver() {
+        // Write the fixture into a temp `<dir>/2026/06/17/rollout-<ts>-<id>.jsonl`
+        // and confirm both the header reader and the thread-id resolver find it.
+        let thread = "019ed361-4fd2-7793-9ea6-a1add8ca3d4f";
+        let base = std::env::temp_dir().join(format!(
+            "elanus-rollout-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let day = base.join("2026").join("06").join("17");
+        std::fs::create_dir_all(&day).unwrap();
+        let file = day.join(format!("rollout-2026-06-17T02-20-30-{thread}.jsonl"));
+        std::fs::write(&file, ROLLOUT_FIXTURE).unwrap();
+        // Decoy with a different thread id should NOT match.
+        let decoy = day.join("rollout-2026-06-17T01-00-00-0000ffff-0000-0000-0000-000000000000.jsonl");
+        std::fs::write(&decoy, ROLLOUT_FIXTURE).unwrap();
+
+        assert_eq!(rollout_thread_id(&file).as_deref(), Some(thread));
+        let found = find_rollout_by_thread(&base, thread).unwrap();
+        assert_eq!(found, file);
+        assert!(find_rollout_by_thread(&base, "no-such-thread").is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -5707,7 +6701,7 @@ mod tests {
         let skill = std::fs::read_to_string(&skill_path).unwrap();
         assert!(skill.contains("name: elanus"));
         assert!(skill.contains("elanus code help"));
-        assert!(skill.contains("elanus code claude --worker"));
+        assert!(skill.contains("elanus code claude --headless"));
         assert_eq!(skill_root, dir.join("skillroot"));
         assert!(!skill_root.join("settings.json").exists());
 
