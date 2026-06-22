@@ -1888,6 +1888,104 @@ editing it; nothing is locked)"
     Ok(())
 }
 
+// ── SA3 (write half): touching a file IS the claim ───────────────────────────
+//
+// docs/handoffs/sibling-awareness.md SA3 + coding-agent-tails.md SA3. The
+// acceptance: an agent that EDITS a file without ever running `elanus code claim`
+// must still appear, for that path, in a roommate's `claims` and per-turn
+// injection — so coordination stops depending on an agent remembering to claim.
+//
+// SOURCE DECISION (settled): we DO NOT drive auto-claims from an `obs/fs/#`
+// subscriber. The obs/fs WRITE camera (src/exec.rs emit_fs_delta) only brackets
+// CAGED actors (the kernel shell/exec + package actors via Cage::shell_command /
+// Cage::command). Coding agents (claude/codex/opencode) are NOT in elanus's cage
+// — each keeps its own tool sandbox; the cage bypass is a deferred milestone
+// (coding-agents.md) — so an obs/fs subscriber would NEVER witness a coding
+// agent's edits and would NOT satisfy SA3's acceptance. Instead we auto-claim
+// from each coding agent's OWN file-write TOOL events — the same per-session
+// capture/projection locus where read-provenance M1 projects Read/Grep/Glob
+// (the Claude PreToolUse hook) and where codex/opencode already harvest changed
+// paths (codex_collect_summary `file_change`, opencode_collect_summary
+// edit|write). This is the honest-agent tier and it meets SA3's acceptance for
+// all three harnesses NOW; the authoritative cage-based version arrives with the
+// coding-agent cage bypass (then read-provenance M2 / SA3's READ half follow).
+//
+// Advisory, NEVER authorization (homogeneous-authority doctrine, security.md):
+// the auto-claim is information a sibling routes around — it never blocks a
+// write, gates nothing, mints/checks no token. Dedupe is structural: add_claim
+// upserts per (room, session, path) PRIMARY KEY, so re-editing the same file just
+// refreshes the timestamp — never a duplicate, never per-syscall.
+
+/// Resolve the room an auto-claim for `session` lands in: the explicit `--room`
+/// recorded at launch if any, else the SA1 workdir-derived room from the session's
+/// recorded canonical workdir — the SAME resolution `session_room_identity` uses
+/// for the `claim` CLI, so the auto-claim lands in the room siblings read.
+fn session_auto_claim_room(root: &Root, session: &str) -> Option<String> {
+    let rec = codesession::read_record(root, session).ok().flatten()?;
+    Some(match rec.room.filter(|r| !r.is_empty()) {
+        Some(r) => r,
+        None => resolve_room(None, Path::new(&rec.workdir)),
+    })
+}
+
+/// SA3 write-half mechanism: record an advisory edit-claim for `session` on the
+/// path it just wrote via a file-write tool event, in the session's room. Called
+/// from each harness's write-tool detection (claude PreToolUse Write/Edit/...,
+/// codex `file_change`, opencode `edit`/`write`). Canonicalizes the path to an
+/// absolute, canonical form (resolving a relative path against `cwd` when given)
+/// so the claimed path matches the convention the fs cameras and a roommate's view
+/// use — NOT the raw lexical string. A blank/empty path is a no-op (never panics,
+/// never claims an empty path). ADVISORY: every failure is swallowed (logged at
+/// most) — recording a claim must never break or block the coding session.
+fn auto_claim_write(root: &Root, session: &str, raw_path: &str, cwd: Option<&str>) {
+    let raw_path = raw_path.trim();
+    if raw_path.is_empty() {
+        // No/blank path (e.g. a malformed tool event): nothing honest to claim.
+        return;
+    }
+    let Some(room) = session_auto_claim_room(root, session) else {
+        // No durable record yet (native session id not observed) — can't resolve
+        // the room. Skip silently; the next write after the record lands will claim.
+        return;
+    };
+    // Key on the canonical absolute path, matching the fs cameras (emit_fs_delta /
+    // claude_read_fs_events both key `obs/fs/<canonical>`): resolve a relative path
+    // against the tool's cwd, then canonicalize best-effort, falling back to the
+    // lexical path when canonicalize fails (a path the write just created, then
+    // removed, still keys deterministically).
+    let p = PathBuf::from(raw_path);
+    let abs = if p.is_absolute() {
+        p
+    } else if let Some(c) = cwd {
+        Path::new(c).join(&p)
+    } else {
+        p
+    };
+    let canon = std::fs::canonicalize(&abs).unwrap_or(abs);
+    let claim_path = canon.to_string_lossy();
+    // add_claim is idempotent per (room, session, path): re-editing the same file
+    // refreshes the timestamp, never duplicates — the dedupe guarantee SA3 needs.
+    if let Err(e) = codesession::add_claim(root, &room, session, &claim_path) {
+        eprintln!("[code] auto-claim (advisory, continuing): {e:#}");
+    }
+}
+
+/// The Claude-Code tool names that write a single file via a `file_path` input.
+/// MultiEdit edits ONE file (multiple hunks) and still carries a single top-level
+/// `file_path`; NotebookEdit carries `notebook_path`. These are the SA3 write
+/// signals on the same PreToolUse hook that M1 reads for Read/Grep/Glob.
+fn claude_write_tool_path<'a>(tool: &str, input: Option<&'a Value>) -> Option<&'a str> {
+    let key = match tool {
+        "Write" | "Edit" | "MultiEdit" => "file_path",
+        "NotebookEdit" => "notebook_path",
+        _ => return None,
+    };
+    input
+        .and_then(|i| i.get(key))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
 /// `elanus code unclaim <path>` — release THIS session's advisory claim on <path>
 /// (e.g. when it has finished). Only the session's OWN claim is cleared; it can
 /// never clear a peer's. Idempotent (unclaiming a path it doesn't hold is a no-op).
@@ -4118,6 +4216,19 @@ fn capture_opencode_stream(
         };
         // Harvest the legible result alongside publishing obs.
         opencode_collect_summary(&event, &mut summary);
+        // SA3 (write half): a settled `edit`/`write` tool_use is a file write —
+        // auto-claim its `path` for this session in its room, so a roommate sees it
+        // without this agent running `elanus code claim`. Reuses the SAME
+        // edit|write + state.input.path detection opencode_collect_summary uses;
+        // advisory + idempotent.
+        if let Some(path) = opencode_file_write_path(&event) {
+            auto_claim_write(
+                root,
+                session,
+                path,
+                record_workdir.map(|w| w.to_string_lossy()).as_deref(),
+            );
+        }
         // The DURABLE session record (OC2): opencode's native `sessionID` is on
         // every event. Persist the record the moment we first see it, so the
         // session is resumable even after this launcher exits. Best-effort: a
@@ -4199,6 +4310,30 @@ fn opencode_collect_summary(event: &Value, summary: &mut CaptureSummary) {
         }
         _ => {}
     }
+}
+
+/// SA3 (write half): the file path of a settled opencode `edit`/`write` `tool_use`
+/// (the same `type:"tool_use"` → file-writer tool → `state.input.path` shape
+/// `opencode_collect_summary` harvests), for auto-claiming. `None` for any other
+/// event. Kept separate from the summary harvest so the obs/summary mapping is
+/// untouched.
+fn opencode_file_write_path(event: &Value) -> Option<&str> {
+    if event.get("type").and_then(Value::as_str) != Some("tool_use") {
+        return None;
+    }
+    let part = event.get("part");
+    let tool = part
+        .and_then(|p| p.get("tool"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !opencode_is_file_writer(tool) {
+        return None;
+    }
+    part.and_then(|p| p.get("state"))
+        .and_then(|s| s.get("input"))
+        .and_then(|i| i.get("path"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 /// opencode's built-in tools that write a single file via a top-level `path`
@@ -4438,6 +4573,18 @@ fn capture_codex_stream(
         // `file_change` reports the paths it wrote. (Codex settles both on
         // `item.completed`.)
         codex_collect_summary(&event, &mut summary);
+        // SA3 (write half): each settled `file_change` is a write — auto-claim the
+        // path(s) for this session in its room, so a roommate sees them without
+        // this agent running `elanus code claim`. Reuses the SAME `file_change`
+        // detection codex_collect_summary uses; advisory + idempotent.
+        for path in codex_file_change_paths(&event) {
+            auto_claim_write(
+                root,
+                session,
+                &path,
+                record_workdir.map(|w| w.to_string_lossy()).as_deref(),
+            );
+        }
         // The DURABLE session record (M2-A): codex announces its own native
         // resumable session id via `thread.started` → `thread_id`. Persist the
         // record (no secret) the moment we see it, so the session is resumable
@@ -4506,6 +4653,34 @@ fn codex_collect_summary(event: &Value, summary: &mut CaptureSummary) {
         }
         _ => {}
     }
+}
+
+/// SA3 (write half): extract the file paths of a settled codex `file_change` item
+/// (the same `item.completed` → `file_change` → `changes[].path` shape
+/// `codex_collect_summary` harvests), for auto-claiming. Empty for any other
+/// event. Kept separate from the summary harvest so the obs/summary mapping is
+/// untouched.
+fn codex_file_change_paths(event: &Value) -> Vec<String> {
+    if event.get("type").and_then(Value::as_str) != Some("item.completed") {
+        return Vec::new();
+    }
+    let Some(item) = event.get("item") else {
+        return Vec::new();
+    };
+    if item.get("type").and_then(Value::as_str) != Some("file_change") {
+        return Vec::new();
+    }
+    item.get("changes")
+        .and_then(Value::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(|c| c.get("path").and_then(Value::as_str))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Map one Codex `exec --json` stream event to an obs/ topic leaf and a trimmed
@@ -5258,6 +5433,22 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     if event == "PreToolUse" && agent == ClaudeCode.agent_noun() {
         for (topic_name, fs_body) in claude_read_fs_events(&payload, &session) {
             publish_obs(root, &principal, &token, &topic_name, fs_body);
+        }
+    }
+
+    // SA3 (write half) — touching a file IS the claim. On a Claude-Code
+    // file-write tool call (Write/Edit/MultiEdit/NotebookEdit), record an advisory
+    // edit-claim for this session on that path in its room, so a roommate sees it
+    // WITHOUT this agent ever running `elanus code claim`. Same PreToolUse hook the
+    // M1 read camera rides; advisory + idempotent (see auto_claim_write). The READ
+    // half (auto-claim on Read/Grep/Glob) is DEFERRED: it rides the authoritative
+    // read camera (read-provenance M2), not built — claiming every file an agent
+    // merely READS would be a firehose and the M1 read tier is honest-agent-only.
+    if event == "PreToolUse" && agent == ClaudeCode.agent_noun() {
+        let tool = tool_name(&payload);
+        if let Some(path) = claude_write_tool_path(&tool, payload.get("tool_input")) {
+            let cwd = payload.get("cwd").and_then(Value::as_str);
+            auto_claim_write(root, &session, path, cwd);
         }
     }
 
@@ -8052,5 +8243,254 @@ mod tests {
                 "child must inherit {kept}; saw env:\n{text}"
             );
         }
+    }
+
+    // ── SA3 (write half): touching a file IS the claim ───────────────────────
+
+    /// Record a session in `root`'s ledger with a workdir-derived (default) room,
+    /// returning its (session, room) so a test can assert what a roommate sees.
+    fn sa3_record_session(root: &Root, session: &str, workdir: &str) -> String {
+        codesession::upsert_record(
+            root,
+            &codesession::SessionRecord {
+                elanus_session: session.into(),
+                native_session: format!("native-{session}"),
+                tool: "claude".into(),
+                agent_noun: ClaudeCode.agent_noun().into(),
+                workdir: workdir.into(),
+                room: None,
+            },
+        )
+        .unwrap();
+        // Mirror the resolution auto_claim_write uses (no explicit room → workdir).
+        resolve_room(None, Path::new(workdir))
+    }
+
+    #[test]
+    fn sa3_write_auto_claims_in_session_room_and_a_peer_sees_it() {
+        let root = delivery_tmp_root();
+        let workdir = "/tmp/sa3-proj";
+        let room = sa3_record_session(&root, "code-aaaa1111", workdir);
+
+        // Agent A writes a file via a tool — NO `elanus code claim` is ever run.
+        auto_claim_write(&root, "code-aaaa1111", "src/foo.rs", Some(workdir));
+
+        // A roommate B in the SAME workdir-derived room sees A's claim as a peer,
+        // for the canonical path (acceptance: "appears, for that path, in a
+        // roommate's claims").
+        let want = std::fs::canonicalize(Path::new(workdir).join("src/foo.rs"))
+            .unwrap_or_else(|_| Path::new(workdir).join("src/foo.rs"))
+            .to_string_lossy()
+            .to_string();
+        let peers = codesession::peer_claims(&root, &room, "code-bbbb2222").unwrap();
+        assert!(
+            peers.iter().any(|c| c.session == "code-aaaa1111" && c.path == want),
+            "roommate must see A's auto-claim on {want}; saw {peers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa3_re_editing_the_same_path_does_not_duplicate() {
+        let root = delivery_tmp_root();
+        let workdir = "/tmp/sa3-dedupe";
+        let room = sa3_record_session(&root, "code-cccc3333", workdir);
+
+        // Same file written three times (the common re-edit case) → ONE claim.
+        for _ in 0..3 {
+            auto_claim_write(&root, "code-cccc3333", "lib.rs", Some(workdir));
+        }
+        let peers = codesession::peer_claims(&root, &room, "code-dddd4444").unwrap();
+        assert_eq!(
+            peers.iter().filter(|c| c.session == "code-cccc3333").count(),
+            1,
+            "re-editing the same path must not spam claims (idempotent upsert)"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa3_blank_path_is_a_noop() {
+        let root = delivery_tmp_root();
+        let workdir = "/tmp/sa3-blank";
+        let room = sa3_record_session(&root, "code-eeee5555", workdir);
+
+        // A blank/whitespace path (a malformed tool event) records nothing and
+        // never panics.
+        auto_claim_write(&root, "code-eeee5555", "", Some(workdir));
+        auto_claim_write(&root, "code-eeee5555", "   ", Some(workdir));
+        let peers = codesession::peer_claims(&root, &room, "code-ffff6666").unwrap();
+        assert!(peers.is_empty(), "a blank path must claim nothing; saw {peers:?}");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa3_no_record_yet_is_a_noop() {
+        // Before the native session id is observed there is no durable record, so
+        // the room can't be resolved — auto-claim skips silently (no panic).
+        let root = delivery_tmp_root();
+        auto_claim_write(&root, "code-99999999", "src/x.rs", Some("/tmp/whatever"));
+        // Nothing recorded under any room (the workdir-room of the would-be path).
+        let room = resolve_room(None, Path::new("/tmp/whatever"));
+        let peers = codesession::peer_claims(&root, &room, "code-other000").unwrap();
+        assert!(peers.is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa3_explicit_room_on_record_wins() {
+        // A session launched with `--room` has that room on its record; the
+        // auto-claim must land THERE (not the workdir-room), matching the CLI.
+        let root = delivery_tmp_root();
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-room1111".into(),
+                native_session: "native-room".into(),
+                tool: "claude".into(),
+                agent_noun: ClaudeCode.agent_noun().into(),
+                workdir: "/tmp/sa3-explicit".into(),
+                room: Some("planner-room".into()),
+            },
+        )
+        .unwrap();
+        auto_claim_write(&root, "code-room1111", "/tmp/sa3-explicit/a.rs", None);
+        let peers = codesession::peer_claims(&root, "planner-room", "code-peer0000").unwrap();
+        assert_eq!(peers.len(), 1, "auto-claim must land in the explicit room");
+        // And NOT in the workdir-room.
+        let wd_room = resolve_room(None, Path::new("/tmp/sa3-explicit"));
+        assert!(codesession::peer_claims(&root, &wd_room, "code-peer0000")
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa3_claude_write_tool_path_detects_the_write_tools() {
+        // The PreToolUse write signals: Write/Edit/MultiEdit carry file_path;
+        // NotebookEdit carries notebook_path; read/other tools are NOT writes.
+        let wr = json!({ "file_path": "/x/a.rs" });
+        assert_eq!(claude_write_tool_path("Write", Some(&wr)), Some("/x/a.rs"));
+        assert_eq!(claude_write_tool_path("Edit", Some(&wr)), Some("/x/a.rs"));
+        assert_eq!(claude_write_tool_path("MultiEdit", Some(&wr)), Some("/x/a.rs"));
+        let nb = json!({ "notebook_path": "/x/n.ipynb" });
+        assert_eq!(
+            claude_write_tool_path("NotebookEdit", Some(&nb)),
+            Some("/x/n.ipynb")
+        );
+        // Read/Grep/Bash are not write signals (the read half is deferred).
+        assert_eq!(claude_write_tool_path("Read", Some(&wr)), None);
+        assert_eq!(claude_write_tool_path("Bash", Some(&wr)), None);
+        // A blank or missing path is no write.
+        assert_eq!(
+            claude_write_tool_path("Write", Some(&json!({ "file_path": "" }))),
+            None
+        );
+        assert_eq!(claude_write_tool_path("Write", Some(&json!({}))), None);
+        assert_eq!(claude_write_tool_path("Write", None), None);
+    }
+
+    #[test]
+    fn sa3_codex_file_change_paths_extracts_changed_files() {
+        // A settled codex `file_change` carries changes[].path — the SA3 write
+        // signal reused from codex_collect_summary.
+        let ev = json!({
+            "type": "item.completed",
+            "item": {
+                "type": "file_change",
+                "status": "completed",
+                "changes": [
+                    { "path": "src/a.rs", "kind": "modified" },
+                    { "path": "src/b.rs", "kind": "added" },
+                ]
+            }
+        });
+        assert_eq!(
+            codex_file_change_paths(&ev),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+        // A non-file_change item, or an in-progress one, yields nothing.
+        let other = json!({
+            "type": "item.completed",
+            "item": { "type": "agent_message", "text": "done" }
+        });
+        assert!(codex_file_change_paths(&other).is_empty());
+        let inprog = json!({
+            "type": "item.started",
+            "item": { "type": "file_change", "changes": [{ "path": "x" }] }
+        });
+        assert!(codex_file_change_paths(&inprog).is_empty());
+
+        // And the extracted path auto-claims for a roommate (shared add_claim path).
+        let root = delivery_tmp_root();
+        let workdir = "/tmp/sa3-codex";
+        let room = sa3_record_session(&root, "code-cdx00001", workdir);
+        for p in codex_file_change_paths(&ev) {
+            auto_claim_write(&root, "code-cdx00001", &p, Some(workdir));
+        }
+        let peers = codesession::peer_claims(&root, &room, "code-peerc000").unwrap();
+        assert_eq!(peers.len(), 2, "both changed files claimed; saw {peers:?}");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa3_opencode_file_write_path_extracts_edit_and_write() {
+        // A settled opencode edit/write tool_use carries state.input.path.
+        let edit = json!({
+            "type": "tool_use",
+            "part": { "tool": "edit", "state": { "input": { "path": "/p/a.rs" } } }
+        });
+        assert_eq!(opencode_file_write_path(&edit), Some("/p/a.rs"));
+        let write = json!({
+            "type": "tool_use",
+            "part": { "tool": "write", "state": { "input": { "path": "/p/b.rs" } } }
+        });
+        assert_eq!(opencode_file_write_path(&write), Some("/p/b.rs"));
+        // A non-writer tool (read), a non-tool_use event, or a missing path: None.
+        let read = json!({
+            "type": "tool_use",
+            "part": { "tool": "read", "state": { "input": { "path": "/p/c.rs" } } }
+        });
+        assert_eq!(opencode_file_write_path(&read), None);
+        let text = json!({ "type": "text", "part": { "text": "hi" } });
+        assert_eq!(opencode_file_write_path(&text), None);
+
+        // And the extracted path auto-claims for a roommate (shared add_claim path).
+        let root = delivery_tmp_root();
+        let workdir = "/tmp/sa3-oc";
+        let room = sa3_record_session(&root, "code-oc000001", workdir);
+        if let Some(p) = opencode_file_write_path(&edit) {
+            auto_claim_write(&root, "code-oc000001", p, Some(workdir));
+        }
+        let peers = codesession::peer_claims(&root, &room, "code-peero000").unwrap();
+        assert_eq!(peers.len(), 1, "the edited file is claimed; saw {peers:?}");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa3_auto_claimed_path_surfaces_in_a_siblings_turn_injection() {
+        // SA2's per-turn injection reads peer_claims; confirm an AUTO-claim (no
+        // `elanus code claim`) surfaces for a sibling in the same room.
+        let root = delivery_tmp_root();
+        let workdir = "/tmp/sa3-inject";
+        // Two sessions in the same checkout (same default workdir-room).
+        let _room_a = sa3_record_session(&root, "code-inja0001", workdir);
+        let _room_b = sa3_record_session(&root, "code-injb0002", workdir);
+
+        // A writes a file via a tool (never claims).
+        auto_claim_write(&root, "code-inja0001", "App.tsx", Some(workdir));
+
+        // B's turn injection mentions A's auto-claimed path.
+        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-injb0002")
+            .expect("B should see a sibling/peer-claim line");
+        let want = std::fs::canonicalize(Path::new(workdir).join("App.tsx"))
+            .unwrap_or_else(|_| Path::new(workdir).join("App.tsx"))
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            inj.contains(&want) || inj.contains("App.tsx"),
+            "B's injection must surface A's auto-claimed path; got:\n{inj}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
     }
 }
