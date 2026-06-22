@@ -1354,6 +1354,20 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
     { label: 'owner credential', value: systemStatus?.credential ?? 'checking...', state: systemStatus?.credential === 'present' ? 'ok' : 'bad' },
     { label: 'broker', value: systemStatus?.broker_connected ? 'connected' : 'not connected', state: systemStatus?.broker_connected ? 'ok' : 'bad' },
     { label: 'history', value: systemStatus?.history?.available ? 'available' : 'live-only', state: systemStatus?.history?.available ? 'ok' : 'warn' },
+    // Read camera (read-provenance M3) — make all three states legible:
+    // available & on (ok), available & off (warn — a real "off" state, not an
+    // error), and the authoritative tier "unavailable here" (warn/neutral — an
+    // ACCEPTED platform gap on non-Linux, reported honestly, NOT alarmed as bad).
+    {
+      label: 'read camera (advisory)',
+      value: systemStatus?.read_camera?.advisory?.enabled ? 'on' : 'off',
+      state: systemStatus?.read_camera?.advisory?.enabled ? 'ok' : 'warn',
+    },
+    {
+      label: 'read camera (authoritative)',
+      value: systemStatus?.read_camera?.authoritative?.available ? 'available' : 'unavailable here',
+      state: systemStatus?.read_camera?.authoritative?.available ? 'ok' : 'warn',
+    },
   ];
   return (
     <div id="view-setup" className="view" hidden={hidden}>

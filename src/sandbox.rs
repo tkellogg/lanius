@@ -314,6 +314,95 @@ pub fn diff(before: &Snapshot, after: &Snapshot) -> Vec<Change> {
     out
 }
 
+// ── Read camera status (read-provenance M3) ──────────────────────────────────
+//
+// The read camera is HONESTLY TWO-TIER (read-provenance handoff, sandbox.md):
+//
+//   ADVISORY    (M1, shipping): the tool-stream read events — Claude Code's
+//               Read/Grep/Glob projected into the spatial `obs/fs/<path>` read
+//               flavor. Available on EVERY platform (it rides events already on
+//               the bus); on/off is the `sandbox.read_camera` config toggle.
+//               Honest-agent tier only — a `Bash`+`cat` walks around it.
+//
+//   AUTHORITATIVE (M2, NOT BUILT — deferred): the cage/syscall read camera that
+//               sits below the shell and catches shell-buried reads. The only
+//               unprivileged authoritative mechanism is Linux seccomp
+//               user-notification (SECCOMP_USER_NOTIF); macOS has no free option
+//               (needs the Endpoint-Security entitlement + a signed system
+//               extension) and is an ACCEPTED GAP. So this tier is UNAVAILABLE
+//               here on macOS, and reported as such — never a silent no-op. We do
+//               not build M2 in M3; M3 only reports its availability honestly.
+//
+// This mirrors how the cage detects write-enforcement availability above
+// (`enforce && cfg!(target_os = "macos") && /usr/bin/sandbox-exec exists`): the
+// authoritative read tier's availability is a platform + mechanism-presence
+// probe, here `cfg!(target_os = "linux") && seccomp_unotify_present()`.
+
+/// One tier of the read camera: whether the mechanism is available on this
+/// platform/build, and (when available) whether it is currently enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierStatus {
+    /// Does the mechanism exist on this platform/privilege/build at all?
+    pub available: bool,
+    /// When available, is it switched on? (Meaningless when `available` is
+    /// false — an unavailable tier is never "on".)
+    pub enabled: bool,
+}
+
+/// The full read-camera status surfaced on the trust/status surface (M3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadCameraStatus {
+    /// M1 — the advisory tool-stream tier. Available everywhere; `enabled`
+    /// reflects `sandbox.read_camera`.
+    pub advisory: TierStatus,
+    /// M2 — the authoritative cage/syscall tier. NOT BUILT; reported only.
+    pub authoritative: TierStatus,
+}
+
+impl ReadCameraStatus {
+    /// Can a READ-flavor subscription be honored right now? True when the
+    /// advisory tier is ON (events flow today) OR the authoritative tier is
+    /// available on this platform (M2 — not built, so this only becomes true on
+    /// Linux and still publishes nothing today, but the predicate is honest about
+    /// platform availability for when M2 lands). When this is FALSE, the broker
+    /// fast-fails a read-flavor subscribe with SUBACK 0x87 rather than returning a
+    /// silently-empty subscription (the history-503 lesson, read-provenance M3).
+    pub fn read_flavor_honorable(&self) -> bool {
+        self.advisory.enabled || self.authoritative.available
+    }
+}
+
+/// Detect whether the authoritative (M2) read camera mechanism could run here.
+///
+/// M2 is NOT BUILT — this is purely the availability probe M3 reports. The only
+/// unprivileged authoritative path is Linux seccomp user-notification, so the
+/// mechanism is "present" only on Linux. (Even on Linux M2's code does not exist
+/// yet, so `enabled` stays false; this reports the *platform capability*, which
+/// is what "unavailable here" on macOS is honestly distinguishing.)
+fn authoritative_read_available() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// Compute the read-camera status from the active sandbox config.
+///
+/// - advisory:      available everywhere; enabled = `cfg.read_camera`.
+/// - authoritative: available only where the mechanism exists (Linux);
+///                  enabled = false always (M2 unbuilt — the deferred tier).
+pub fn read_camera_status(cfg: &SandboxCfg) -> ReadCameraStatus {
+    ReadCameraStatus {
+        advisory: TierStatus {
+            available: true,
+            enabled: cfg.read_camera,
+        },
+        authoritative: TierStatus {
+            available: authoritative_read_available(),
+            // M2 is the deferred authoritative tier — not built here, so it can
+            // never be on even where the platform could host it.
+            enabled: false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +421,74 @@ mod tests {
             exclude: vec!["run/".into(), "elanus.db".into()],
             sbpl: None,
         }
+    }
+
+    #[test]
+    fn read_camera_status_two_tiers() {
+        // The advisory tier (M1) is available on EVERY platform — it rides events
+        // already on the bus — and its `enabled` mirrors the config toggle.
+        let on = read_camera_status(&SandboxCfg {
+            read_camera: true,
+            ..Default::default()
+        });
+        assert!(on.advisory.available, "advisory tier available everywhere");
+        assert!(on.advisory.enabled, "toggle ON ⇒ advisory enabled");
+
+        let off = read_camera_status(&SandboxCfg {
+            read_camera: false,
+            ..Default::default()
+        });
+        assert!(off.advisory.available, "advisory still AVAILABLE when off");
+        assert!(!off.advisory.enabled, "toggle OFF ⇒ advisory disabled");
+
+        // The authoritative tier (M2) is platform-gated and NOT BUILT: never
+        // enabled, and only "available" where the unprivileged mechanism could run
+        // (Linux seccomp-unotify). On macOS — the dev machine, the accepted gap —
+        // it is "unavailable here", reported honestly, never a silent no-op.
+        assert!(!on.authoritative.enabled, "M2 unbuilt ⇒ never enabled");
+        assert_eq!(
+            on.authoritative.available,
+            cfg!(target_os = "linux"),
+            "authoritative available iff Linux"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            !on.authoritative.available,
+            "non-Linux (e.g. macOS) ⇒ authoritative unavailable here"
+        );
+    }
+
+    #[test]
+    fn read_flavor_honorable_predicate() {
+        // The exact broker fast-fail predicate (read-provenance M3). A read-flavor
+        // subscribe is honorable when advisory is ON or authoritative is available.
+        let advisory_on = ReadCameraStatus {
+            advisory: TierStatus { available: true, enabled: true },
+            authoritative: TierStatus { available: false, enabled: false },
+        };
+        assert!(advisory_on.read_flavor_honorable(), "advisory on ⇒ honorable");
+
+        // Advisory OFF and authoritative unavailable here (the macOS-off case): NOT
+        // honorable ⇒ the broker fast-fails rather than returning empty.
+        let both_off = ReadCameraStatus {
+            advisory: TierStatus { available: true, enabled: false },
+            authoritative: TierStatus { available: false, enabled: false },
+        };
+        assert!(
+            !both_off.read_flavor_honorable(),
+            "advisory off + authoritative unavailable ⇒ NOT honorable (fast-fail)"
+        );
+
+        // Advisory off but authoritative AVAILABLE (a future Linux M2): honorable —
+        // the platform can serve reads even with the advisory tier switched off.
+        let auth_avail = ReadCameraStatus {
+            advisory: TierStatus { available: true, enabled: false },
+            authoritative: TierStatus { available: true, enabled: false },
+        };
+        assert!(
+            auth_avail.read_flavor_honorable(),
+            "authoritative available ⇒ honorable even with advisory off"
+        );
     }
 
     #[test]
@@ -419,6 +576,7 @@ mod tests {
             fs_write: vec![root.dir.display().to_string()],
             capture_exclude: vec![],
             workdir: None,
+            ..Default::default()
         };
         let cage = Cage::from_profile(&root, &cfg);
         assert!(cage.enforcing());

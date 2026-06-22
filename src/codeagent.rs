@@ -5430,7 +5430,12 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // subtree, never recorded-by-default. Advisory/honest-agent tier only — see
     // `claude_read_fs_events`. Codex/opencode are NOT projected here (Codex reads
     // are shell-buried → M2; opencode is out of M1's Claude-Code-only scope).
-    if event == "PreToolUse" && agent == ClaudeCode.agent_noun() {
+    // GATED on the advisory read-camera toggle (sandbox.read_camera, default ON):
+    // when OFF, M1 STOPS publishing read events — "off" is a real, legible state
+    // (read-provenance M3), not cosmetic — and the broker fast-fails any subscribe
+    // to the read flavor so a consumer never reads silence as "no reads happened".
+    // The AUTHORITATIVE tier (M2, the cage/syscall read camera) stays deferred.
+    if event == "PreToolUse" && agent == ClaudeCode.agent_noun() && read_camera_enabled(root) {
         for (topic_name, fs_body) in claude_read_fs_events(&payload, &session) {
             publish_obs(root, &principal, &token, &topic_name, fs_body);
         }
@@ -5550,6 +5555,19 @@ fn claude_map_event(event: &str, payload: &Value) -> (String, Value) {
             (leaf, common(body))
         }
     }
+}
+
+/// Is the ADVISORY read camera (M1) enabled? Reads the system `sandbox.read_camera`
+/// toggle (default ON) off the `default` profile — the same whole-system config home
+/// `profile::mailboxes` reads. When OFF, the M1 read-event projection is suppressed at
+/// the call site so "off" is a real, observable state (read-provenance M3): no read
+/// events on the bus, and the broker fast-fails read-flavor subscribes. A failure to
+/// load the profile falls back to the default (ON) — the toggle is a deliberate opt-OUT,
+/// not a fragile opt-in.
+fn read_camera_enabled(root: &Root) -> bool {
+    crate::profile::load(root, "default")
+        .map(|(p, _)| p.sandbox.read_camera)
+        .unwrap_or(true)
 }
 
 /// READ CAMERA — M1 (read-provenance handoff). Project Claude Code's read-shaped
@@ -6250,6 +6268,52 @@ mod tests {
     // The read flavor's default-none recorder property (it inherits obs/fs/#) is
     // asserted in recorder.rs::tests::read_camera_flavor_inherits_default_none,
     // where the recorder internals are in scope.
+
+    #[test]
+    fn read_camera_off_suppresses_m1_projection() {
+        // M3's "off is a real state": when sandbox.read_camera = false, the M1
+        // read-event projection is GATED OFF at the call site (read_camera_enabled),
+        // so a Read tool call publishes NO obs/fs read event — a consumer can't
+        // misread silence as "no reads happened" because the broker also fast-fails
+        // the read-flavor subscribe (asserted in broker.rs).
+        let dir = std::env::temp_dir().join(format!("elanus-rcam-{}", uuid::Uuid::new_v4()));
+        let root = Root { dir: dir.clone() };
+        std::fs::create_dir_all(root.profile_dir("default")).unwrap();
+
+        // Default (no toggle written) ⇒ ON: the projection runs.
+        assert!(read_camera_enabled(&root), "absent toggle ⇒ camera ON (default)");
+
+        // Explicitly OFF ⇒ the gate is closed.
+        std::fs::write(
+            root.profile_dir("default").join("profile.toml"),
+            "[sandbox]\nread_camera = false\n",
+        )
+        .unwrap();
+        assert!(!read_camera_enabled(&root), "read_camera=false ⇒ camera OFF");
+
+        // The payload still PROJECTS a read locus in isolation — the suppression is
+        // the call-site gate, not the projector — so the off-state is a single,
+        // legible switch (read_camera_enabled) rather than scattered logic.
+        let payload = json!({
+            "cwd": "/tmp/proj",
+            "tool_name": "Read",
+            "tool_use_id": "toolu_OFF",
+            "tool_input": { "file_path": "/tmp/proj/x.md" },
+        });
+        assert_eq!(claude_read_fs_events(&payload, "s").len(), 1);
+        // But with the gate closed, the hook handler would publish none: the gate is
+        // `if … && read_camera_enabled(root)`, here proven false.
+        assert!(!read_camera_enabled(&root));
+
+        // Flip it back ON and confirm the gate reopens.
+        std::fs::write(
+            root.profile_dir("default").join("profile.toml"),
+            "[sandbox]\nread_camera = true\n",
+        )
+        .unwrap();
+        assert!(read_camera_enabled(&root), "read_camera=true ⇒ camera ON");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn map_user_prompt_and_stop() {

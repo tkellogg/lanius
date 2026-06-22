@@ -653,6 +653,39 @@ function existsKind(file) {
   }
 }
 
+// READ CAMERA status (read-provenance M3) — the legibility surface. Mirrors
+// the backend `crate::sandbox::read_camera_status`: an HONESTLY TWO-TIER model.
+//   advisory (M1): the tool-stream read events — available on EVERY platform
+//     (it rides events already on the bus); on/off is the `sandbox.read_camera`
+//     profile toggle (default ON). This is the only tier that delivers today.
+//   authoritative (M2): the cage/syscall read camera — NOT BUILT (deferred).
+//     The only unprivileged authoritative mechanism is Linux seccomp
+//     user-notification; macOS has no free option (Endpoint-Security
+//     entitlement + signed extension) and is an ACCEPTED GAP. So this tier is
+//     "unavailable here" on non-Linux — reported honestly, never an error.
+// The advisory toggle is read from the `default` profile's [sandbox] table the
+// same regex way the rest of this file reads profile.toml; absent ⇒ default ON
+// (it is a deliberate opt-OUT, matching the backend's load(...).unwrap_or(true)).
+function readCameraStatus() {
+  let enabled = true; // default ON, matching default_read_camera()
+  try {
+    const raw = fs.readFileSync(profileTomlPath('default'), 'utf8');
+    const m = raw.match(/^\s*read_camera\s*=\s*(true|false)\b/m);
+    if (m) enabled = m[1] === 'true';
+  } catch {
+    // no default profile / unreadable ⇒ keep the default (ON)
+  }
+  // M2's authoritative tier is platform-gated: only Linux can host the
+  // unprivileged seccomp-unotify mechanism. (Even on Linux M2 is unbuilt, so it
+  // is never `enabled` — this reports the PLATFORM capability, which is what
+  // "unavailable here" on macOS honestly distinguishes.)
+  const authoritativeAvailable = os.platform() === 'linux';
+  return {
+    advisory: { available: true, enabled },
+    authoritative: { available: authoritativeAvailable, enabled: false },
+  };
+}
+
 function systemStatus() {
   const history = historyEndpoint();
   const rootExists = ROOT ? existsKind(ROOT) === 'dir' : false;
@@ -673,6 +706,7 @@ function systemStatus() {
     agent: AGENT,
     binary: ELANUS_BIN,
     history: { available: !!history, endpoint: history },
+    read_camera: readCameraStatus(),
     paths: {
       bus: busFile ? { path: busFile, exists: !!existsKind(busFile) } : null,
       database: dbFile ? { path: dbFile, exists: !!existsKind(dbFile) } : null,

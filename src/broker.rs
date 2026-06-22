@@ -560,6 +560,35 @@ async fn protocol_msg(
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             let wants_blocking = props.get("mode").map(|m| m == "blocking").unwrap_or(false);
+            // READ-CAMERA FAST-FAIL PRE-CHECK (read-provenance M3). The read and
+            // write cameras SHARE the `obs/fs/<path>` noun — a flavor is told apart
+            // by the event body's `op` ("read" vs "create|modify|unlink"), NOT by the
+            // topic — so a bare `obs/fs/#` subscribe spans BOTH flavors and must keep
+            // behaving exactly as today (it still receives writes). A consumer that
+            // wants the READ flavor specifically signals it with the packet-level
+            // user property `flavor=read` (alongside the `mode=blocking` convention
+            // already read above). ONLY such an explicit read-flavor subscribe is a
+            // candidate for the fast-fail: this keeps the change NARROW and ADDITIVE
+            // and can never reject an unrelated write-camera or other obs/fs subscribe.
+            let wants_read_flavor = props.get("flavor").map(|f| f == "read").unwrap_or(false);
+            // Decide ONCE per packet whether a read-flavor subscribe can be honored:
+            // the advisory tier must be ON, OR the authoritative tier available. When
+            // neither holds, a read-flavor subscribe FAILS LOUD (SUBACK 0x87) rather
+            // than returning a silently-empty subscription that reads as "no file
+            // reads happened" (the history-503 lesson). The reason is reported so the
+            // consumer sees WHY (off vs unavailable-here). Computed from the same
+            // whole-system `default` profile config the M1 publisher gates on.
+            let read_status = {
+                let cfg = crate::profile::load(&st.root, "default")
+                    .map(|(p, _)| p.sandbox)
+                    .unwrap_or_default();
+                crate::sandbox::read_camera_status(&cfg)
+            };
+            // Honorable when the advisory tier is on (events flow) OR the
+            // authoritative tier is available here (M2 — not built, so today this is
+            // only true on Linux and still publishes nothing, but the predicate is
+            // honest about platform availability for when M2 lands).
+            let read_flavor_honorable = read_status.read_flavor_honorable();
             for mut sub in s.iter_mut() {
                 let filter = sub.topic().to_string();
                 // $share/<group>/<filter> (§4.8.2): competing consumers —
@@ -573,6 +602,38 @@ async fn protocol_msg(
                 };
                 if !topic::valid_filter(&inner) {
                     sub.fail(v5::codec::SubscribeAckReason::TopicFilterInvalid);
+                    continue;
+                }
+                // READ-CAMERA FAST-FAIL (read-provenance M3). A subscribe that
+                // explicitly asks for the read flavor (`flavor=read`) AND whose filter
+                // targets the shared `obs/fs/` noun, when the read camera is OFF (config
+                // off) OR only the unavailable authoritative tier could serve it, FAILS
+                // FAST with the SAME per-filter SUBACK 0x87 path the ACL uses below —
+                // never a silently-empty subscription. This is ADDITIVE and conservative:
+                // it fires only when the consumer opted into the read flavor by property,
+                // so a normal/write `obs/fs` subscribe (no `flavor=read`) and any
+                // non-`obs/fs` subscribe are completely unaffected (no regression). When
+                // the camera is ENABLED (the default) `read_flavor_honorable` is true and
+                // this whole block is skipped — behaviour is exactly as today.
+                if wants_read_flavor && targets_fs_camera(&inner) && !read_flavor_honorable {
+                    sub.fail(v5::codec::SubscribeAckReason::NotAuthorized);
+                    trace::write(
+                        &st.root,
+                        "obs/fs/denied",
+                        &trace::Ids::default(),
+                        json!({
+                            "kind": "subscribe",
+                            "value": filter,
+                            "flavor": "read",
+                            // Tell the consumer WHY it failed, honestly: the advisory
+                            // tier is off, and the authoritative tier is unavailable
+                            // here (the accepted macOS gap) — not an error, but a real
+                            // "you cannot observe reads right now" the consumer can see.
+                            "reason": "read-camera-unavailable",
+                            "advisory_enabled": read_status.advisory.enabled,
+                            "authoritative_available": read_status.authoritative.available,
+                        }),
+                    );
                     continue;
                 }
                 // Blocking registration attempt. Blocking is a granted
@@ -1178,6 +1239,23 @@ fn parse_share(filter: &str) -> Option<(Option<String>, String)> {
     Some((Some(group.to_string()), inner.to_string()))
 }
 
+/// Does this subscribe filter target the shared `obs/fs/` camera noun (where the
+/// read flavor lives, alongside the write flavor)? — read-provenance M3.
+///
+/// Conservative by construction: it answers "could this filter ever receive an
+/// `obs/fs/<path>` event." True for a filter that wildcards down into the subtree
+/// (`#`, `obs/#`, `obs/fs/#`, `obs/fs/+`, …) — caught by matching a representative
+/// read topic — OR a deeper literal/wildcarded filter rooted under `obs/fs/`
+/// (`obs/fs/repo/src/#`) — caught by the prefix test. This predicate ONLY narrows
+/// the fast-fail; it is reached solely when the consumer already opted into the
+/// read flavor with `flavor=read`, so a false positive cannot affect a write or
+/// non-`obs/fs` subscribe (those never set the property).
+fn targets_fs_camera(inner: &str) -> bool {
+    // A representative read-flavor topic: any concrete `obs/fs/<encoded-path>`.
+    const SAMPLE: &str = "obs/fs/sample";
+    topic::matches(inner, SAMPLE) || inner == "obs/fs" || inner.starts_with("obs/fs/")
+}
+
 /// Deliver to every session with a matching subscription, once per session at
 /// the strongest granted QoS. Shared subscriptions deliver to exactly one
 /// member per (group, filter), round-robin; a session holding both a normal
@@ -1305,8 +1383,9 @@ fn delivery_complete(st: &Rc<Broker>, topic_name: &str, line: &str, subscribers:
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_share, Broker};
+    use super::{parse_share, targets_fs_camera, Broker};
     use crate::paths::Root;
+    use crate::sandbox::{ReadCameraStatus, TierStatus};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn tmp_root() -> Root {
@@ -1390,5 +1469,70 @@ mod tests {
         assert_eq!(parse_share("$share//in/x"), None);
         // "$share/g/" has an empty inner filter.
         assert_eq!(parse_share("$share/g/"), None);
+    }
+
+    // ── Read-camera fast-fail subscribe (read-provenance M3) ─────────────────
+    //
+    // The subscribe pre-check fires iff ALL THREE hold:
+    //   wants_read_flavor (the packet set `flavor=read`)
+    //   && targets_fs_camera(inner)   (the filter touches the shared obs/fs noun)
+    //   && !read_status.read_flavor_honorable()  (camera off AND M2 unavailable)
+    // These two tests pin the two pure pieces of that predicate; the honorable
+    // half itself is covered in sandbox.rs::tests::read_flavor_honorable_predicate.
+
+    #[test]
+    fn fs_camera_filter_predicate_is_conservative() {
+        // Matches the shared read/write camera noun: a wildcard catch-all, the bare
+        // noun, and any literal/wildcarded filter rooted under obs/fs/.
+        assert!(targets_fs_camera("#"));
+        assert!(targets_fs_camera("obs/#"));
+        assert!(targets_fs_camera("obs/fs/#"));
+        assert!(targets_fs_camera("obs/fs/+"));
+        assert!(targets_fs_camera("obs/fs"));
+        assert!(targets_fs_camera("obs/fs/tmp/proj/#"));
+        assert!(targets_fs_camera("obs/fs/tmp/proj/notes.md"));
+        // Does NOT match unrelated nouns — so a non-obs/fs read-flavor subscribe is
+        // never a fast-fail candidate (it just falls through to the ACL).
+        assert!(!targets_fs_camera("obs/agent/claude-code/s/tool/Read/call"));
+        assert!(!targets_fs_camera("in/human/owner"));
+        assert!(!targets_fs_camera("obs/package/x/status"));
+    }
+
+    /// The exact subscribe-time decision, reproduced from the broker's inline
+    /// pre-check, asserting the three required outcomes with NO regression:
+    ///  - a read-flavor obs/fs subscribe FAILS when the camera is off/unavailable,
+    ///  - the SAME subscribe is ALLOWED when the advisory camera is enabled,
+    ///  - a normal/WRITE obs/fs subscribe (no flavor=read) is ALLOWED in BOTH
+    ///    states — the no-regression assertion that the change is additive.
+    fn fast_fails(wants_read_flavor: bool, inner: &str, status: &ReadCameraStatus) -> bool {
+        wants_read_flavor && targets_fs_camera(inner) && !status.read_flavor_honorable()
+    }
+
+    #[test]
+    fn read_flavor_subscribe_fast_fails_only_when_off_and_unavailable() {
+        let off = ReadCameraStatus {
+            advisory: TierStatus { available: true, enabled: false },
+            authoritative: TierStatus { available: false, enabled: false },
+        };
+        let on = ReadCameraStatus {
+            advisory: TierStatus { available: true, enabled: true },
+            authoritative: TierStatus { available: false, enabled: false },
+        };
+
+        // Read-flavor obs/fs subscribe, camera OFF + authoritative unavailable: FAIL.
+        assert!(fast_fails(true, "obs/fs/tmp/proj/#", &off));
+        // Same subscribe, camera ENABLED (the default): ALLOWED (no fast-fail).
+        assert!(!fast_fails(true, "obs/fs/tmp/proj/#", &on));
+
+        // NO REGRESSION: a normal/write obs/fs subscribe never sets flavor=read, so
+        // it is NEVER a fast-fail candidate — in BOTH camera states it falls through
+        // to the ACL exactly as today.
+        assert!(!fast_fails(false, "obs/fs/tmp/proj/#", &off));
+        assert!(!fast_fails(false, "obs/fs/tmp/proj/#", &on));
+        assert!(!fast_fails(false, "obs/fs/#", &off));
+
+        // NO REGRESSION: a read-flavor subscribe to an UNRELATED noun is not an
+        // obs/fs camera filter, so it is never fast-failed here either.
+        assert!(!fast_fails(true, "in/human/owner", &off));
     }
 }

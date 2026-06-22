@@ -144,7 +144,8 @@ impl Default for SkillsCfg {
 /// diff → obs/fs/ events) runs either way, over root + fs_write.
 /// This lives in the profile until the grants ledger lands in migration
 /// step 5; it then hoists into the approval ledger with package grants.
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
 pub struct SandboxCfg {
     #[serde(default)]
     pub fs_write: Vec<String>, // absolute, or relative to the harness root
@@ -159,6 +160,32 @@ pub struct SandboxCfg {
     /// error rather than silently falling back to the harness root.
     #[serde(default)]
     pub workdir: Option<String>,
+    /// The READ camera's advisory tier (read-provenance M3). When on (the
+    /// default), Claude Code's Read/Grep/Glob tool calls project into the
+    /// spatial `obs/fs/<path>` read flavor (`op:"read"`, M1). When OFF, M1
+    /// stops publishing read events — "off" is a real, legible state, not
+    /// cosmetic — and a subscribe to the read flavor FAST-FAILS (SUBACK 0x87)
+    /// rather than silently returning empty (the history-503 lesson). This is
+    /// ONLY the advisory tier's switch; the AUTHORITATIVE tier (M2, the
+    /// cage/syscall read camera) is platform-gated and not built here —
+    /// availability is reported by `crate::sandbox::read_camera_status`.
+    #[serde(default = "default_read_camera")]
+    pub read_camera: bool,
+}
+
+fn default_read_camera() -> bool {
+    true
+}
+
+impl Default for SandboxCfg {
+    fn default() -> Self {
+        SandboxCfg {
+            fs_write: Vec::new(),
+            capture_exclude: default_capture_exclude(),
+            workdir: None,
+            read_camera: default_read_camera(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -465,4 +492,32 @@ pub fn mailboxes(root: &Root) -> &'static Mailboxes {
 pub fn skill_visible(p: &Profile, skill: &str) -> bool {
     let hit = |pats: &[String]| pats.iter().any(|pat| crate::topic::matches(pat, skill));
     hit(&p.skills.include) && !hit(&p.skills.exclude)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Read-camera toggle (read-provenance M3): the advisory tier's switch parses
+    // from [sandbox] and defaults ON (a deliberate opt-OUT, not a fragile opt-in).
+
+    #[test]
+    fn read_camera_defaults_on_when_absent() {
+        // A profile with no [sandbox] table at all ⇒ read_camera ON.
+        let p: Profile = toml::from_str("owner = \"owner\"\nagent = \"kestrel\"\n").unwrap();
+        assert!(p.sandbox.read_camera, "absent ⇒ default ON");
+        // An explicit [sandbox] table that omits the key ⇒ still ON.
+        let p2: Profile = toml::from_str("[sandbox]\nfs_write = []\n").unwrap();
+        assert!(p2.sandbox.read_camera, "omitted in [sandbox] ⇒ default ON");
+        // SandboxCfg's own Default mirrors this.
+        assert!(SandboxCfg::default().read_camera);
+    }
+
+    #[test]
+    fn read_camera_toggle_parses_both_ways() {
+        let off: Profile = toml::from_str("[sandbox]\nread_camera = false\n").unwrap();
+        assert!(!off.sandbox.read_camera, "explicit false ⇒ OFF");
+        let on: Profile = toml::from_str("[sandbox]\nread_camera = true\n").unwrap();
+        assert!(on.sandbox.read_camera, "explicit true ⇒ ON");
+    }
 }
