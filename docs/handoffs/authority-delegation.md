@@ -1,3 +1,7 @@
+---
+status: completed
+author: Opus 4.8 in Claude Code
+---
 # Handoff: delegated authority is a subset of the spawner
 
 Make authority **narrow monotonically down a spawn chain**: a thing the kernel

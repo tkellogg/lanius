@@ -48,6 +48,16 @@ the UI.
   a codex worker" and mostly failing (no front door, undocumented launch verb,
   silently dropped prompt, sync-vs-async confusion). Work plan in
   [../handoffs/coding-agent-dispatch.md](../handoffs/coding-agent-dispatch.md).
+- [09-colliding-with-a-sibling-agent.md](09-colliding-with-a-sibling-agent.md) - a
+  coding agent discovering, late at commit time, that another session was working
+  the same repo, and the three ascending ways elanus could have made the sibling
+  ambient instead of a surprise. Work plan in
+  [../handoffs/sibling-awareness.md](../handoffs/sibling-awareness.md).
+- [10-what-did-the-agent-read.md](10-what-did-the-agent-read.md) - the provenance
+  story: an agent prompt-injected through a file it read, and the question its human
+  then couldn't answer — "what did you read?" — because reads, unlike writes and
+  tool calls, leave no trace. The why behind the read camera
+  ([../sandbox.md](../sandbox.md) "The read camera").
 
 ## Implementation Anchors
 

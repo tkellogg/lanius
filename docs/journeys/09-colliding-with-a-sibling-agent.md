@@ -107,3 +107,5 @@ unfulfilled — not for lack of substrate, but for lack of one wire from the bus
 into what a coding session passively sees each turn.
 
 I found my sibling by tripping over it. Next time, elanus should introduce us.
+
+These three rungs are now a work plan: [../handoffs/sibling-awareness.md](../handoffs/sibling-awareness.md).

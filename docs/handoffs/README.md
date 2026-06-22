@@ -9,6 +9,20 @@ design records — the design lives in the docs/ files each handoff cites.
 Distinct from the repo-root `HANDOFF.md`, which is gitignored local working
 context for the pass currently in flight.
 
+## Instructions
+Please include a frontmatter at the top of each file and keep it up to date.
+Something like:
+
+```
+---
+status: planned
+author: Claude Opus 4.8 in Claude Code on Elanus
+last-updated: 2026-05-21
+---
+
+statuses: planned | in-progress | verifying | done
+```
+
 ## Contents
 
 - [coding-agents.md](coding-agents.md) - launch and supervise Codex and Claude
@@ -26,6 +40,17 @@ context for the pass currently in flight.
 - [configuration-ux.md](configuration-ux.md) - the configuration-UX altitude and
   scope pass on the web UI (instance vs agent config, essentials vs advanced,
   the off switch). Backed by [../journeys/06-configuration.md](../journeys/06-configuration.md).
+- [web-ui-fidelity.md](web-ui-fidelity.md) - **not started**: the cross-cutting
+  product-fidelity pass that sits on top of the configuration-UX work — contrast
+  (two AA-failing color tokens, highest leverage), responsive/narrow, control
+  fidelity (closed-set model + path pickers), accessibility (focus, tab ARIA,
+  live-region conversation feed, hit targets, reduced-motion), product-language
+  kernel-word eviction ("transmit"/"sessions"/"telemetry") + Lily's companion
+  identity chip, and visual-consistency polish. From a live multi-lens UX review;
+  the journey-specific structure is built, this is the layer on top. Backed by
+  [../journeys/ui-preferences.md](../journeys/ui-preferences.md),
+  [../journeys/characters.md](../journeys/characters.md), and
+  [../journeys/07-chatting.md](../journeys/07-chatting.md).
 - [coding-agent-dispatch.md](coding-agent-dispatch.md) - the agent-facing seam of
   worker dispatch: a front door (CLI help + honest briefing), the two dispatch
   modes (blocking-foreground for a live orchestrator vs async `spawn` for a
@@ -53,6 +78,55 @@ context for the pass currently in flight.
   surface. The nav-split counterpart to
   [coding-agent-observability.md](coding-agent-observability.md). Backed by
   [../journeys/07-chatting.md](../journeys/07-chatting.md).
+- [sibling-awareness.md](sibling-awareness.md) - the **agent-facing** coordination
+  work plan: make a coding session know who else is in its working tree *by default*
+  instead of tripping over them at commit time. Turns the three rungs of
+  [../journeys/09-colliding-with-a-sibling-agent.md](../journeys/09-colliding-with-a-sibling-agent.md)
+  into milestones — workdir-as-room (ambient claims, no `--room` flag), live siblings
+  in the per-turn injection, and touch-is-claim (auto-claims off the fs cameras). The
+  primitives already ship (dispatch handoff M5); this makes them ambient and default.
+  Answers the "agents are bumping into each other" item in
+  [../_questions.md](../_questions.md).
+- [session-thread-grouping.md](session-thread-grouping.md) - **planned**: collapse
+  the N elanus sessions a manual `elanus code <tool> --resume` mints (fresh id per
+  launch) back into one logical **thread** keyed by `native_session`, so the
+  `elanus code sessions` listing + web tree + history reassemble instead of
+  shattering. Read-model fold in `code_projection.rs` (`list_sessions` /
+  `session_detail`) — **no identity/token/mailbox change**; the daemon resume path
+  already reuses the id, so only manual relaunches need regrouping. Falls out of the
+  `--resume` verification (hooks *do* fire on resume; the only real impact was
+  audit/history fragmentation). Extends
+  [coding-agent-observability.md](coding-agent-observability.md).
+- [onboard-opencode.md](onboard-opencode.md) - **planned**: make `opencode` a third
+  first-class coding harness (`elanus code opencode`). Onboards like Codex —
+  `opencode run --format json` is a raw-JSON-event stream (`Capture::StreamJson`, no
+  hooks, no home pollution), `--session`/`--continue` give first-class durable
+  resume, `--pure` is the no-plugins analog of Claude's `--setting-sources ''`. Key
+  finding: opencode is **client/server** (`serve` + SSE, `attach`), so its TUI
+  captures **live** — a better cell than codex's post-hoc rollout-import, warranting a
+  new `ServerEvents` capture variant. The crux decision: do it *now* against the
+  `Tool` enum (recommended — ships fast, becomes the real third case that de-risks
+  the refactor) vs. fold into [harness-modes.md](harness-modes.md) HM1's `Harness`
+  trait first (opencode is literally HM5's named validation harness). Answers the
+  "onboard opencode" item in [../_questions.md](../_questions.md).
+- [read-provenance.md](read-provenance.md) - **planned**: make "what did this agent
+  read" a subscription, the injection-provenance companion to the write camera.
+  Answers the "detecting files read" item in [../_questions.md](../_questions.md) —
+  but reframes it: the `_questions.md` deny→catch→allow→retry sketch is a worse
+  seccomp-unotify (the cage is static, elanus isn't in the syscall path), and
+  `sandbox.md` already settled on allow-and-notify. The catch: an *authoritative*
+  ("can't be bypassed by `Bash`+`cat`") read camera is intrinsically a
+  syscall/FS-boundary problem — **authoritative + macOS + no-root/no-entitlement,
+  pick two**. **M1** projects the `Read`/`Grep`/`Glob` tool calls *already on the
+  bus* (Claude Code's `PreToolUse:*` hook) into a path-keyed `obs/fs` view — but it's
+  **advisory/bypassable**, not the answer; **M2** is the authoritative cage camera
+  that sits below the shell (seccomp-unotify on Linux = the only authoritative *and*
+  unprivileged box; macOS needs root `fs_usage`/DTrace or a signed ES extension —
+  accepted-gap for now), gated on coding agents actually being caged
+  ([coding-agents.md](coding-agents.md)); **M3** status/config legibility +
+  fast-fail subscribe. Backed by
+  [../journeys/10-what-did-the-agent-read.md](../journeys/10-what-did-the-agent-read.md)
+  and the "read camera" section of [../sandbox.md](../sandbox.md).
 - [authority-delegation.md](authority-delegation.md) - the **delegation** half of
   the identity model: a spawned actor's authority must be a strict subset (≤) of
   its spawner's, reconstructed at spawn and enforced at mint (`child.grants ⊆
