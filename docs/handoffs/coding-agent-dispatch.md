@@ -97,18 +97,23 @@ Two independent footguns in `run_codex_capture` / `launch`:
 or fails with a clear message; no invocation starts a worker with an empty or
 substituted prompt.
 
-## Two dispatch modes — and the briefing must teach both
+## Two dispatch modes (= the drive-pattern axis) — and the briefing must teach both
 
-> **Axis note (2026-06-20):** the "two dispatch modes" here are the
-> **drive-pattern** axis — *blocking one-shot* (the caller waits) vs *async*
-> (the daemon resumes the caller later). That is distinct from the **launch-mode**
-> axis (a harness running as an interactive `tui` vs a `headless` process), whose
-> canonical, harness-uniform model is [harness-modes.md](harness-modes.md). Both
-> compose: blocking/async is *how the result returns*; tui/headless is *how the
-> process runs*. The uniform `--headless` flag and the bare-`elanus code <h>` → TUI
-> behavior described in harness-modes.md supersede the per-tool invocation quirks
-> this handoff assumed (codex positional = headless, claude `--worker`); the
-> briefing must teach **both** axes once HM3/HM4 land.
+> **Axis note (2026-06-20; HM3/HM4 landed 2026-06-22):** the "two dispatch modes"
+> here ARE the **drive-pattern** axis of [harness-modes.md](harness-modes.md) —
+> *live/blocking one-shot* (the caller waits and reads the result inline) vs *async*
+> (the daemon resumes the caller later via `spawn`/`deliver`/`resume`). That is
+> distinct from the **launch-mode** axis (a harness running as an interactive `tui`
+> vs a `headless` process), whose canonical, harness-uniform model is harness-modes.md.
+> Both compose: drive pattern (blocking/async) is *how the result returns*; launch
+> mode (tui/headless) is *how the process runs*. The uniform `--headless` flag and the
+> bare-`elanus code <h>` → TUI behavior in harness-modes.md **superseded** the per-tool
+> invocation quirks this handoff assumed (codex positional = headless, claude
+> `--worker`): every harness now takes `--headless` (`--worker` a deprecated alias) and
+> a bare/prompt invocation opens that harness's TUI. As of HM4 the `briefing()` teaches
+> **both** axes by these names; read it and harness-modes.md for the live model — the
+> per-tool blocking instructions below are the original (now-superseded) framing, kept
+> for the D-milestone history.
 
 - **Blocking foreground (a LIVE orchestrator).** A caller that is itself driven
   turn-by-turn — a human in a TUI, or a tool-using agent like Claude Code running

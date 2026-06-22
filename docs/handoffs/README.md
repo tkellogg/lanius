@@ -67,8 +67,9 @@ statuses: planned | in-progress | verifying | done
 - [harness-modes.md](harness-modes.md) - **the canonical mode model**: make every
   coding harness (Claude Code, Codex, future) launchable in *both* modes — `tui`
   and `headless` — with uniform CLI and semantics, via a `Harness` adapter seam and
-  a per-(harness, mode) capture matrix (Codex TUI via rollout import is the missing
-  cell). Separates the **launch-mode** axis (tui/headless) from the **drive-pattern**
+  a per-(harness, mode) capture matrix. HM1–HM3 + OC3 landed: all three harnesses
+  (claude, codex, opencode) now have both cells, bare → TUI, uniform `--headless`
+  (`--worker` deprecated alias). Separates the **launch-mode** axis (tui/headless) from the **drive-pattern**
   axis (blocking/async) the other coding-agent handoffs use; they defer to this for
   the mode model. Backed by [../journeys/02-claude-code.md](../journeys/02-claude-code.md).
 - [chat-conversations.md](chat-conversations.md) - the human's chat seat: turn raw

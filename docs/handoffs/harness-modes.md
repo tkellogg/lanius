@@ -7,11 +7,15 @@ in a small adapter, not reinventing the surface. This is the abstraction the
 coding-agent envelope was always reaching for; today it's lopsided (Claude has
 both modes, Codex only headless) and the CLI/briefing express it inconsistently.
 
-> **Status: design + work plan. Not implemented.** Written 2026-06-20 from Tim's
-> directive: "both claude and codex need to run in both modes, headless and TUI …
-> the semantics for both modes should be the same across the board, or at least it
-> should operate how you expect that harness to operate in that mode. We really
-> need to make this smooth — I'll probably add other harnesses too."
+> **Status: HM1–HM4 landed; HM5 = [adding-a-harness.md](../adding-a-harness.md).**
+> Written 2026-06-20 from Tim's directive: "both claude and codex need to run in
+> both modes, headless and TUI … the semantics for both modes should be the same
+> across the board, or at least it should operate how you expect that harness to
+> operate in that mode. We really need to make this smooth — I'll probably add
+> other harnesses too." As of 2026-06-22 the uniform model ships: all three
+> harnesses (claude, codex, opencode) have both launch cells, bare `elanus code
+> <tool>` → TUI, `--headless` is the uniform flag (`--worker` a deprecated alias),
+> and the briefing/help/journeys teach the two-axis model. See the Log.
 
 ## Read these first
 
@@ -67,8 +71,9 @@ harness and mode**. The obs grammar (`obs/agent/<noun>/<session>/…`,
 | harness | `tui` | `headless` |
 |---|---|---|
 | **Claude Code** | **HookBridge** — generated `--settings` hooks call `elanus code hook`; inherited stdio. *(built)* | **StreamJson** — `claude -p --output-format stream-json`, parse stdout. *(built, `--worker`)* |
-| **Codex** | **RolloutImport** *(new)* — launch the real `codex` TUI (inherited stdio) and project its own rollout transcript `~/.codex/sessions/<…>/rollout-*-<thread_id>.jsonl` (the filename embeds the `thread_id` we already capture). Full fidelity, no hooks, no config pollution. *(Alt: HookBridge via a generated hook config + `--dangerously-bypass-hook-trust` — viable per Appendix B, but rollout-import is cleaner; pick during HM2.)* | **StreamJson** — `codex exec --json`, parse stdout. *(built)* |
-| **future harness** | declared by its adapter (HookBridge / RolloutImport / Lifecycle) | declared by its adapter (StreamJson / Lifecycle) |
+| **Codex** | **RolloutImport** *(built, HM2)* — launches the real `codex` TUI (inherited stdio) and projects its own rollout transcript `~/.codex/sessions/<…>/rollout-*-<thread_id>.jsonl` (the filename embeds the `thread_id` we already capture). Full fidelity, no hooks, no config pollution. Post-hoc, so declared visibly distinct from a live hook-bridged TUI. | **StreamJson** — `codex exec --json`, parse stdout. *(built)* |
+| **opencode** | **ServerEvents** *(built, OC3)* — TUI wired to an `opencode serve` elanus observes; the SSE event stream projects into the obs grammar **live** (a strictly nicer cell than codex's post-hoc import). | **StreamJson** — `opencode run --format json`, parse stdout. *(built, OC1)* |
+| **future harness** | declared by its adapter (HookBridge / RolloutImport / ServerEvents / Lifecycle) | declared by its adapter (StreamJson / Lifecycle) |
 
 **Capture fidelity is a first-class, declared property** — not every cell is
 hooks-grade. The floor is **Lifecycle** (just `session/start`+`session/stop`,
@@ -138,21 +143,21 @@ no-op-but-bracketed floor).
 
 ## Current state → target
 
-| | claude tui | claude headless | codex tui | codex headless |
-|---|---|---|---|---|
-| **today** | ✅ | ✅ (`--worker`) | ❌ (errors / n/a) | ✅ (positional) |
-| **target** | ✅ | ✅ (`--headless`) | ✅ (real TUI + rollout import) | ✅ (`--headless`) |
+| | claude tui | claude headless | codex tui | codex headless | opencode tui | opencode headless |
+|---|---|---|---|---|---|---|
+| **at writing (2026-06-20)** | ✅ | ✅ (`--worker`) | ❌ (errors / n/a) | ✅ (positional) | — | — |
+| **now (HM1–HM3 + OC3 landed)** | ✅ | ✅ (`--headless`) | ✅ (real TUI + rollout import) | ✅ (`--headless`) | ✅ (live SSE) | ✅ (`--headless`) |
 
 ## Milestones
 
-### HM1 — the adapter seam (refactor, no behavior change)
+### HM1 — the adapter seam (refactor, no behavior change) — LANDED
 Introduce `Harness` + `Mode` + the `Capture` variants; move the two existing
 adapters (Claude, Codex) behind it; the envelope calls `harness(name)` and
 `capture(mode)`/`command(mode, ctx)`. Net behavior identical; the point is the
 seam. **Acceptance:** all current `elanus code …` paths work unchanged; the
 `Tool` match sites are gone; adding a harness is implementing one trait.
 
-### HM2 — Codex TUI (the missing cell)
+### HM2 — Codex TUI (the missing cell) — LANDED
 Wire `codex` in `tui` mode: launch the real interactive `codex` with inherited
 stdio (like Claude's TUI), inside the cage, with the envelope briefing (Codex has
 no `--append-system-prompt`; inject via the documented system/developer channel or
@@ -163,7 +168,7 @@ and record why. **Acceptance:** `elanus code codex` opens a usable codex TUI; th
 session and its turns appear on the bus / in `elanus code sessions` with real
 (not just lifecycle) fidelity.
 
-### HM3 — the uniform CLI + mode flag
+### HM3 — the uniform CLI + mode flag — LANDED
 `--headless` (with `--worker` as a deprecated alias) across all harnesses; bare /
 prompt → TUI for all harnesses; bare `codex` no longer errors. Migrate
 `spawn`/worker internals to select headless via the new flag for both harnesses.
@@ -171,19 +176,20 @@ Update `print_help`. **Acceptance:** the same invocation grammar works for claud
 and codex; `spawn codex` / `spawn claude` both run headless and route completions;
 nothing regresses in M1–M4 obs or the dispatch tests.
 
-### HM4 — briefing + docs reflect the uniform model
+### HM4 — briefing + docs reflect the uniform model — LANDED
 Rewrite `briefing()` to teach the uniform model (launch mode vs drive pattern; the
 `--headless` flag; bare → TUI), and reconcile the dispatch handoff's "two dispatch
 modes" vocabulary with this handoff's two axes. **Acceptance:** the briefing, help,
 journeys, and handoffs all describe one model; no doc says "codex is exec-only" or
 implies only Claude has a TUI.
 
-### HM5 — "add a harness" readiness (the payoff)
+### HM5 — "add a harness" readiness (the payoff) — LANDED as [adding-a-harness.md](../adding-a-harness.md)
 A short template/checklist: implement `Harness`, declare the capture per mode,
-register it, add the rollout/stream reader if novel. Validate by sketching a third
-harness (e.g. an aider/opencode-style tool) against the trait without touching the
-envelope. **Acceptance:** the checklist exists and a dry-run third adapter compiles
-against the seam.
+register it, add the rollout/stream reader if novel. The runtime payoff already
+exists — opencode is a real third `Harness` impl, so "a third adapter compiles
+against the seam" is met; the written checklist lives in
+[adding-a-harness.md](../adding-a-harness.md). **Acceptance:** the checklist exists
+and a dry-run third adapter compiles against the seam.
 
 ## Honesty / guardrails
 
@@ -224,3 +230,20 @@ against the seam.
   framing (coding-agents.md) is the seed but assumes a codex TUI that was never
   built — this handoff makes it real and uniform, and is the canonical mode model
   the other coding-agent docs should defer to.
+- 2026-06-22 — **HM1–HM4 landed; HM5 = [adding-a-harness.md](../adding-a-harness.md).**
+  HM1 (the `Harness`/`Mode`/`Capture` seam, `Tool` enum gone), HM2 (codex TUI via
+  `Capture::RolloutImport`, declared post-hoc), HM3 (the uniform `--headless` flag
+  across all harnesses with `--worker` a deprecated alias; bare/prompt → TUI for all;
+  bare `elanus code codex` no longer errors; the launcher routes on `Mode`), and OC3
+  (opencode TUI via live `Capture::ServerEvents` SSE) all shipped. HM4 (this change)
+  rewrote `briefing()` to teach the two-axis model — LAUNCH MODE (tui vs `--headless`,
+  per-(harness,mode)) vs DRIVE PATTERN (live/blocking vs async spawn/deliver/resume) —
+  and named the `--headless` flag + bare → TUI; `print_help`/`print_tools`/`DISPATCH_HINT`
+  were already updated by HM3. Reconciled vocabulary: the dispatch handoff's "two
+  dispatch modes" = this handoff's drive-pattern axis; launch mode is the separate
+  axis. Swept stale statements: coding-agents.md's "codex shipped headless-only / a
+  codex TUI is planned" admonition and handoffs/README.md's "(Codex TUI … is the
+  missing cell)" both corrected to as-built-for-all-three. Journey 08 left intact (it
+  is a historical lived-failure record, not a current-state claim). The briefing test
+  was strengthened to assert both axes are taught (and its concision cap bumped 1200→1300
+  to fit the second axis). `cargo build` warning-free; `cargo test` green.

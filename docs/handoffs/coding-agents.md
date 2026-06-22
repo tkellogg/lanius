@@ -122,9 +122,11 @@ tools, not guess.
 > vs a `headless` process). The two compose, and the canonical, uniform model —
 > *both* launch modes for *every* harness, with consistent CLI and a per-(harness,
 > mode) capture matrix — now lives in [harness-modes.md](harness-modes.md). Note in
-> particular that this section's "a human sits at the real TUI … for both tools" is
-> **aspirational, not as-built**: the Codex adapter shipped headless-only (`codex
-> exec --json`); a Codex TUI is the work planned in harness-modes.md (HM2). Read
+> particular that this section's "a human sits at the real TUI … for both tools"
+> **is now as-built for all three harnesses**: when this section was written the
+> Codex adapter shipped headless-only (`codex exec --json`), but harness-modes.md
+> HM2/HM3 (and opencode OC3) since wired the TUI cell for every harness, so a bare
+> `elanus code <codex|opencode|claude>` opens that tool's interactive TUI. Read
 > that handoff for the authoritative mode model; this section remains the rationale
 > for the planner/worker symmetry.
 

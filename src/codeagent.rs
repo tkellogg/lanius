@@ -1419,15 +1419,15 @@ fn briefing(session: &str) -> String {
         "You are coding session `{session}` under elanus supervision \
 (an orchestration layer around you).\n\
 \n\
-- To create a Codex or opencode worker, run `elanus code codex \"<prompt>\"` or \
-`elanus code opencode \"<prompt>\"`; the prompt is a \
-positional argument. Async dispatch: use \
-`elanus code deliver <worker-session> \"<message>\"` or \
-`elanus code spawn <tool> \"<task>\"`. `elanus code help` lists every verb.\n\
-- Dispatch modes: if you are live/interactive, run a worker in the foreground and \
-read its command output. For async dispatch, use `elanus code deliver` or \
-`elanus code spawn <tool> \"<task>\"`, then END YOUR TURN cleanly — do NOT poll, \
-sleep, or wait; elanus wakes you later with the result.\n\
+- Two independent axes. LAUNCH MODE = how a harness runs: bare \
+`elanus code <tool>` (claude/codex/opencode) opens its interactive TUI; \
+`elanus code <tool> --headless \"<task>\"` runs it non-interactively and captures it \
+(`--worker` = deprecated alias). DRIVE PATTERN = how the result returns: live/blocking — \
+run a `--headless` worker in the foreground, read its result as the command's output; or \
+async — `elanus code spawn <tool> \"<task>\"` / `elanus code deliver <worker> \"<msg>\"`. \
+`elanus code help` lists every verb.\n\
+- For async dispatch (`spawn`/`deliver`), END YOUR TURN cleanly — do NOT poll, sleep, or \
+wait; elanus wakes you later with the result. Live/blocking workers return inline.\n\
 - Things addressed to you arrive as a resumed turn with the content in your prompt; \
 you can also pull your own inbox with `elanus code inbox` (only YOUR mailbox). Each \
 turn elanus injects an `[elanus]` note with your inbox status and any memory note. \
@@ -7470,9 +7470,16 @@ mod tests {
         assert!(b.to_lowercase().contains("end your turn"));
         assert!(b.to_lowercase().contains("do not")); // do not poll/sleep/wait
         assert!(b.to_lowercase().contains("human"));
-        // Short — a launch briefing, not a manual.
+        // It teaches the two-axis model (launch mode vs drive pattern) crisply:
+        // names the --headless flag, bare → TUI, and the live/async split.
+        assert!(b.contains("--headless"));
+        assert!(b.to_lowercase().contains("tui"));
+        let bl = b.to_lowercase();
+        assert!(bl.contains("launch mode") && bl.contains("drive pattern"));
+        // Short — a launch briefing, not a manual. (Teaching both axes costs a
+        // little over the old single-axis text; the cap stays tight.)
         assert!(
-            b.len() < 1200,
+            b.len() < 1300,
             "briefing should be concise, was {} chars",
             b.len()
         );
