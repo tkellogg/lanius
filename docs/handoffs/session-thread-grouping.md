@@ -1,7 +1,7 @@
 ---
-status: planned
+status: done — TG1/TG2 (read-model fold) + TG3 (web thread rendering) shipped
 author: Claude Opus 4.8 in Claude Code on Elanus
-last-updated: 2026-06-21
+last-updated: 2026-06-23
 ---
 
 # Handoff: group resume-incarnations into one logical thread (read-model only)

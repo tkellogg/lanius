@@ -1,3 +1,9 @@
+---
+status: in-progress — M1–M3 shipped (src/web.rs ntex server, embedded SPA, Node-free runtime verified by the full ui.spec.mjs); M4 (retire server.mjs/config.mjs) deferred — both kept as fallback during soak
+author: Claude Opus 4.8 in Claude Code on Elanus
+last-updated: 2026-06-23
+---
+
 # Handoff: ship the web UI inside the Rust binary (`cargo install elanus`)
 
 Make `cargo install elanus` produce a binary that serves the web UI with **no

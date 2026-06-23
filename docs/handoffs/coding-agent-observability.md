@@ -1,3 +1,9 @@
+---
+status: done — M1 (materializer) + M2 (read API) + M3 (live SSE feed) + M4 (session list/detail/subagent tree) shipped; the explainer agent is out of scope / deferred by design
+author: Claude Opus 4.8 in Claude Code on Elanus
+last-updated: 2026-06-23
+---
+
 # Handoff: coding-session observability in the web UI
 
 Make a running coding session — and the tree of subagents it spawns — legible

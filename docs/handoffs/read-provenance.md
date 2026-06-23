@@ -1,7 +1,7 @@
 ---
-status: planned
+status: in-progress — M1 (advisory read camera) + M3 (legibility/fast-fail subscribe) shipped; M2 (authoritative cage camera) deferred, Linux seccomp / macOS-ES gated
 author: Claude Opus 4.8 in Claude Code on Elanus
-last-updated: 2026-06-21
+last-updated: 2026-06-23
 ---
 
 # Handoff: read provenance — make "what did this agent read" a subscription

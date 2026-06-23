@@ -88,7 +88,7 @@ statuses: planned | in-progress | verifying | done
   primitives already ship (dispatch handoff M5); this makes them ambient and default.
   Answers the "agents are bumping into each other" item in
   [../_questions.md](../_questions.md).
-- [session-thread-grouping.md](session-thread-grouping.md) - **planned**: collapse
+- [session-thread-grouping.md](session-thread-grouping.md) - **done** (TG1–TG3): collapse
   the N elanus sessions a manual `elanus code <tool> --resume` mints (fresh id per
   launch) back into one logical **thread** keyed by `native_session`, so the
   `elanus code sessions` listing + web tree + history reassemble instead of
@@ -98,7 +98,7 @@ statuses: planned | in-progress | verifying | done
   `--resume` verification (hooks *do* fire on resume; the only real impact was
   audit/history fragmentation). Extends
   [coding-agent-observability.md](coding-agent-observability.md).
-- [onboard-opencode.md](onboard-opencode.md) - **planned**: make `opencode` a third
+- [onboard-opencode.md](onboard-opencode.md) - **done** (OC1–OC5): make `opencode` a third
   first-class coding harness (`elanus code opencode`). Onboards like Codex —
   `opencode run --format json` is a raw-JSON-event stream (`Capture::StreamJson`, no
   hooks, no home pollution), `--session`/`--continue` give first-class durable
@@ -110,7 +110,7 @@ statuses: planned | in-progress | verifying | done
   the refactor) vs. fold into [harness-modes.md](harness-modes.md) HM1's `Harness`
   trait first (opencode is literally HM5's named validation harness). Answers the
   "onboard opencode" item in [../_questions.md](../_questions.md).
-- [read-provenance.md](read-provenance.md) - **planned**: make "what did this agent
+- [read-provenance.md](read-provenance.md) - **in-progress** (M1+M3 done; M2 deferred): make "what did this agent
   read" a subscription, the injection-provenance companion to the write camera.
   Answers the "detecting files read" item in [../_questions.md](../_questions.md) —
   but reframes it: the `_questions.md` deny→catch→allow→retry sketch is a worse

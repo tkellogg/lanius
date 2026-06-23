@@ -1,6 +1,7 @@
 ---
-status: planned
+status: done — SA1/SA2/SA4 + SA3 write-half shipped; SA3 read-half deferred (rides read-provenance M2)
 author: Opus 4.8 in Claude Code on elanus
+last-updated: 2026-06-23
 ---
 # Handoff: ambient sibling-awareness (introduce the agents on turn one)
 

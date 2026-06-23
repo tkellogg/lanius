@@ -1,3 +1,9 @@
+---
+status: done — HM1–HM5 shipped (Harness trait registry; codex TUI via RolloutImport; uniform --headless; briefing/docs; add-a-harness checklist). One flagged gap: the live codex-TUI smoke test is unverified pending codex credits
+author: Claude Opus 4.8 in Claude Code on Elanus
+last-updated: 2026-06-23
+---
+
 # Handoff: uniform launch modes (TUI + headless) across coding harnesses
 
 Make **every** coding harness (Claude Code, Codex, and the ones to come)

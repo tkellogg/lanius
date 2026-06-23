@@ -1,7 +1,7 @@
 ---
-status: planned
+status: done — OC1–OC5 shipped (OC3 opencode live-SSE TUI verified on GLM); now behind the harness-modes HM1 trait registry
 author: Claude Opus 4.8 in Claude Code on Elanus
-last-updated: 2026-06-21
+last-updated: 2026-06-23
 ---
 
 # Handoff: onboard opencode as a third coding agent
