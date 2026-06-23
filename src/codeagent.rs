@@ -2777,7 +2777,7 @@ fn run_codex_capture(
         &mut child,
         Some(workdir),
     );
-    print_codex_worker_result(session, &summary);
+    print_stream_worker_result(agent, session, &summary);
 
     let status = child.wait().context("waiting for codex exec to finish")?;
     Ok((status, summary))
@@ -3527,7 +3527,7 @@ fn run_opencode_capture(
         &mut child,
         Some(workdir),
     );
-    print_codex_worker_result(session, &summary);
+    print_stream_worker_result(agent, session, &summary);
 
     let status = child.wait().context("waiting for opencode run to finish")?;
     Ok((status, summary))
@@ -3715,7 +3715,7 @@ fn run_opencode_tui_server_events(
     let summary = sub.join().unwrap_or_default();
 
     let (status, _) = tui?;
-    print_codex_worker_result(session, &summary);
+    print_stream_worker_result(agent, session, &summary);
     Ok((status, summary))
 }
 
@@ -4271,11 +4271,11 @@ fn capture_opencode_stream(
 /// Harvest the legible result from one opencode stream event into `summary`: the
 /// text of each settled `text` event (so the LAST one wins — the verbatim final
 /// answer, capped/marked) and the file path of each settled file-writing
-/// `tool_use`. opencode's built-in `edit`/`write` tools declare their argument as
-/// `path` (verified against the binary's tool Input structs + the server OpenAPI
-/// `/doc` — the `state.input` in the JSON stream is the model's raw tool arguments,
-/// which key the file as `path`, NOT `filePath`). Reads the SAME settled events
-/// `opencode_map_event` files as obs; collecting here keeps that mapping untouched.
+/// `tool_use`. opencode's built-in `edit`/`write` tools key the changed file under
+/// `state.input.filePath` (VERIFIED against a real `opencode run --format json`
+/// stream, opencode 1.17.9 — see `opencode_tool_file_path`). Reads the SAME settled
+/// events `opencode_map_event` files as obs; collecting here keeps that mapping
+/// untouched.
 fn opencode_collect_summary(event: &Value, summary: &mut CaptureSummary) {
     match event.get("type").and_then(Value::as_str) {
         Some("text") => {
@@ -4289,39 +4289,24 @@ fn opencode_collect_summary(event: &Value, summary: &mut CaptureSummary) {
             }
         }
         Some("tool_use") => {
-            let part = event.get("part");
-            let tool = part
-                .and_then(|p| p.get("tool"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if opencode_is_file_writer(tool) {
-                // The changed path is in the tool input under `path` (the field name
-                // the built-in edit/write tool schemas declare; the JSON stream's
-                // `state.input` is the model's raw tool arguments).
-                if let Some(path) = part
-                    .and_then(|p| p.get("state"))
-                    .and_then(|s| s.get("input"))
-                    .and_then(|i| i.get("path"))
-                    .and_then(Value::as_str)
-                {
-                    summary.note_change(path);
-                }
+            if let Some(path) = opencode_tool_file_path(event.get("part")) {
+                summary.note_change(path);
             }
         }
         _ => {}
     }
 }
 
-/// SA3 (write half): the file path of a settled opencode `edit`/`write` `tool_use`
-/// (the same `type:"tool_use"` → file-writer tool → `state.input.path` shape
-/// `opencode_collect_summary` harvests), for auto-claiming. `None` for any other
-/// event. Kept separate from the summary harvest so the obs/summary mapping is
-/// untouched.
-fn opencode_file_write_path(event: &Value) -> Option<&str> {
-    if event.get("type").and_then(Value::as_str) != Some("tool_use") {
-        return None;
-    }
-    let part = event.get("part");
+/// The changed file path carried by a settled opencode `edit`/`write` tool part, or
+/// `None` for any other tool / a missing path. opencode's real headless stream keys
+/// the file under `state.input.filePath` (VERIFIED against opencode 1.17.9 — the
+/// read/edit/write tools all carry `state.input.filePath`); a legacy `path` is
+/// accepted as a fallback so an older binary still harvests. Shared by the summary
+/// harvest and the SA3 auto-claim so the two never drift on the field name. The
+/// headless `run --format json` envelope and the SSE-normalized envelope
+/// (`opencode_sse_to_run_event` clones `part` verbatim) are identical here, so this
+/// one extractor fixes both the headless and the live SSE/TUI projection.
+fn opencode_tool_file_path(part: Option<&Value>) -> Option<&str> {
     let tool = part
         .and_then(|p| p.get("tool"))
         .and_then(Value::as_str)
@@ -4329,11 +4314,26 @@ fn opencode_file_write_path(event: &Value) -> Option<&str> {
     if !opencode_is_file_writer(tool) {
         return None;
     }
-    part.and_then(|p| p.get("state"))
-        .and_then(|s| s.get("input"))
-        .and_then(|i| i.get("path"))
+    let input = part
+        .and_then(|p| p.get("state"))
+        .and_then(|s| s.get("input"))?;
+    input
+        .get("filePath")
+        .or_else(|| input.get("path"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
+}
+
+/// SA3 (write half): the file path of a settled opencode `edit`/`write` `tool_use`
+/// (the same `type:"tool_use"` → file-writer tool → `state.input.filePath` shape
+/// `opencode_collect_summary` harvests, via the shared `opencode_tool_file_path`),
+/// for auto-claiming. `None` for any other event. Kept separate from the summary
+/// harvest so the obs/summary mapping is untouched.
+fn opencode_file_write_path(event: &Value) -> Option<&str> {
+    if event.get("type").and_then(Value::as_str) != Some("tool_use") {
+        return None;
+    }
+    opencode_tool_file_path(event.get("part"))
 }
 
 /// opencode's built-in tools that write a single file via a top-level `path`
@@ -4485,8 +4485,8 @@ impl CaptureSummary {
 /// The same summary has already been harvested while publishing obs; this is the
 /// in-band surface a live parent can read without any bus authority. Keep the
 /// format marked and plain so another tool can scrape it if needed.
-fn print_codex_worker_result(session: &str, summary: &CaptureSummary) {
-    println!("=== codex worker result (session {session}) ===");
+fn print_stream_worker_result(tool: &str, session: &str, summary: &CaptureSummary) {
+    println!("=== {tool} worker result (session {session}) ===");
     match summary.final_text.as_deref() {
         Some(text) if !text.trim().is_empty() => {
             println!("{text}");
@@ -6746,33 +6746,52 @@ mod tests {
         // Last settled text wins.
         assert_eq!(summary.final_text.as_deref(), Some("final"));
 
-        // A file-writing tool reports its path. opencode's built-in write/edit
-        // tools key the file under `path` (verified against the binary's tool Input
-        // structs + the server OpenAPI `/doc`), NOT `filePath`.
+        // A file-writing tool reports its path. REAL opencode 1.17.9 keys the changed
+        // file under `state.input.filePath` (this is a trimmed line captured from an
+        // actual `opencode run --format json` write tool event — Bug2). If someone
+        // reverts the extractor to the old inferred `path` key, this MUST fail.
         opencode_collect_summary(
             &json!({
                 "type": "tool_use",
+                "sessionID": "ses_real",
                 "part": {
+                    "type": "tool",
                     "tool": "write",
-                    "state": { "status": "completed", "input": { "path": "/tmp/x.rs", "content": "x" } }
+                    "callID": "call_55fb8c75401547ee94fd5223",
+                    "state": { "status": "completed", "input": { "filePath": "/tmp/x.rs", "content": "x" } }
                 }
             }),
             &mut summary,
         );
         assert_eq!(summary.file_changes, vec!["/tmp/x.rs"]);
-        // The `edit` tool also keys its target under `path`.
+        // The REAL `edit` tool event likewise keys its target under `filePath`.
         opencode_collect_summary(
             &json!({
                 "type": "tool_use",
+                "sessionID": "ses_real",
                 "part": {
+                    "type": "tool",
                     "tool": "edit",
+                    "callID": "call_35aad0e169ba4e55bbdce02d",
                     "state": { "status": "completed",
-                               "input": { "path": "/tmp/y.rs", "oldString": "a", "newString": "b" } }
+                               "input": { "filePath": "/tmp/y.rs", "oldString": "a", "newString": "b" } }
                 }
             }),
             &mut summary,
         );
         assert_eq!(summary.file_changes, vec!["/tmp/x.rs", "/tmp/y.rs"]);
+        // Legacy fallback: an older binary keying the file under `path` still harvests.
+        opencode_collect_summary(
+            &json!({
+                "type": "tool_use",
+                "part": {
+                    "tool": "write",
+                    "state": { "status": "completed", "input": { "path": "/tmp/z.rs" } }
+                }
+            }),
+            &mut summary,
+        );
+        assert_eq!(summary.file_changes, vec!["/tmp/x.rs", "/tmp/y.rs", "/tmp/z.rs"]);
 
         // A non-writing tool does not add a change.
         opencode_collect_summary(
@@ -6782,7 +6801,7 @@ mod tests {
             }),
             &mut summary,
         );
-        assert_eq!(summary.file_changes, vec!["/tmp/x.rs", "/tmp/y.rs"]);
+        assert_eq!(summary.file_changes, vec!["/tmp/x.rs", "/tmp/y.rs", "/tmp/z.rs"]);
     }
 
     #[test]
@@ -8499,21 +8518,41 @@ mod tests {
 
     #[test]
     fn sa3_opencode_file_write_path_extracts_edit_and_write() {
-        // A settled opencode edit/write tool_use carries state.input.path.
+        // A settled opencode edit/write tool_use carries state.input.filePath
+        // (REAL opencode 1.17.9 envelope, trimmed from a live `run --format json`
+        // stream — Bug2). A revert to the old inferred `path` key MUST fail here.
         let edit = json!({
             "type": "tool_use",
-            "part": { "tool": "edit", "state": { "input": { "path": "/p/a.rs" } } }
+            "sessionID": "ses_10e1f5066ffeqleVO7g1PDWk74",
+            "part": {
+                "type": "tool",
+                "tool": "edit",
+                "callID": "call_35aad0e169ba4e55bbdce02d",
+                "state": { "status": "completed", "input": { "filePath": "/p/a.rs" } }
+            }
         });
         assert_eq!(opencode_file_write_path(&edit), Some("/p/a.rs"));
         let write = json!({
             "type": "tool_use",
-            "part": { "tool": "write", "state": { "input": { "path": "/p/b.rs" } } }
+            "sessionID": "ses_10e1f5066ffeqleVO7g1PDWk74",
+            "part": {
+                "type": "tool",
+                "tool": "write",
+                "callID": "call_55fb8c75401547ee94fd5223",
+                "state": { "status": "completed", "input": { "filePath": "/p/b.rs", "content": "brand new" } }
+            }
         });
         assert_eq!(opencode_file_write_path(&write), Some("/p/b.rs"));
-        // A non-writer tool (read), a non-tool_use event, or a missing path: None.
+        // Legacy `path` fallback still resolves (older opencode binary).
+        let legacy = json!({
+            "type": "tool_use",
+            "part": { "tool": "edit", "state": { "input": { "path": "/p/legacy.rs" } } }
+        });
+        assert_eq!(opencode_file_write_path(&legacy), Some("/p/legacy.rs"));
+        // A non-writer tool (read) carries filePath too but is NOT a write: None.
         let read = json!({
             "type": "tool_use",
-            "part": { "tool": "read", "state": { "input": { "path": "/p/c.rs" } } }
+            "part": { "tool": "read", "state": { "input": { "filePath": "/p/c.rs" } } }
         });
         assert_eq!(opencode_file_write_path(&read), None);
         let text = json!({ "type": "text", "part": { "text": "hi" } });
