@@ -36,7 +36,7 @@ pub fn run(root: &Root, interval_ms: u64, web_port: u16, vite_port: u16) -> Resu
     let mut services = vec![
         Service::new(
             "daemon",
-            CommandSpec::new(cargo, &repo)
+            CommandSpec::new(cargo.clone(), &repo)
                 .arg("run")
                 .arg("--quiet")
                 .arg("--")
@@ -47,21 +47,27 @@ pub fn run(root: &Root, interval_ms: u64, web_port: u16, vite_port: u16) -> Resu
                 .env("PATH", &path),
         )
         .with_watch(RustInputs::new(&repo)?),
+        // The web relay is the same Rust server `serve` ships (`elanus web`,
+        // src/web.rs), built via `cargo run` so a change to src/web.rs hot-restarts
+        // it in the dev loop. ui/web/server.mjs is kept on disk as a fallback (M4
+        // — retiring it — is DEFERRED) but is no longer wired into dev/serve. Vite
+        // still serves the SPA with HMR and proxies /api here (ELANUS_WEB_BACKEND).
         Service::new(
             "web",
-            CommandSpec::new("node", &web_dir)
-                .arg("--watch")
-                .arg("--watch-path=server.mjs")
-                .arg("--watch-path=config.mjs")
-                .arg("server.mjs")
-                .arg("--root")
+            CommandSpec::new(cargo, &repo)
+                .arg("run")
+                .arg("--quiet")
+                .arg("--")
+                .arg("-C")
                 .arg(&root_s)
+                .arg("web")
                 .arg("--port")
                 .arg(&web_port_s)
                 .env("ELANUS_ROOT", &root_s)
                 .env("ELANUS_WEB_PORT", &web_port_s)
                 .env("PATH", &path),
-        ),
+        )
+        .with_watch(RustInputs::new(&repo)?),
         Service::new(
             "vite",
             CommandSpec::new("npm", &web_dir)
@@ -124,25 +130,25 @@ pub fn run(root: &Root, interval_ms: u64, web_port: u16, vite_port: u16) -> Resu
 /// - **The daemon** is the CURRENTLY RUNNING binary (`current_exe`), re-invoked as
 ///   `<self> -C <root> daemon --interval-ms <n>`. `serve` is itself launched from a
 ///   built binary, so there is no `cargo` and nothing to compile — just run it.
-/// - **The web server** is `node ui/web/server.mjs --root <root> --port <web-port>`
-///   with NO `--watch` and NO Vite: server.mjs serves the built SPA from
-///   `ui/web/dist/` (its `DIST`/`PUB`), which is the production path.
-/// - **The built SPA** must exist before the web server starts. If
-///   `ui/web/dist/index.html` is missing (or `--rebuild` forces it), `serve` runs
-///   `npm run build` in `ui/web` first and surfaces a clear message.
+/// - **The web server** is THIS binary again, `<self> -C <root> web --port
+///   <web-port>` (src/web.rs): an in-process ntex server serving the SPA that is
+///   **embedded in the binary** (`include_dir!` over ui/web/dist). No Node, no npm,
+///   no `ui/web` source tree at runtime — the whole point of the packaging work
+///   (docs/handoffs/web-packaging.md). `elanus dev` keeps Vite + npm for hot reload.
+///   (ui/web/server.mjs stays on disk as a fallback; M4 — retiring it — is DEFERRED.)
 ///
 /// Supervision (signals, restart-with-backoff, combined logging, group teardown,
 /// root-scoped cleanup) reuses the same Service/CommandSpec/Log machinery as `dev`.
 /// There is no file-watch and no restart-on-source-change: a packaged service runs
-/// the artifact as-is. The `repo` here is the build tree the binary was built from
-/// (CARGO_MANIFEST_DIR) — that is where `ui/web` and its `dist/` live; the daemon
-/// itself is the installed binary, not a repo path.
+/// the artifact as-is. Everything is rooted at `<root>` — no build tree
+/// (CARGO_MANIFEST_DIR) is consulted, so an installed binary with no checkout works.
 pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Result<()> {
     install_signal_handlers();
 
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let web_dir = repo.join("ui/web");
-    let log_path = repo.join("target/elanus-serve.log");
+    // Everything is rooted at <root>: no build tree is consulted, so an installed
+    // binary with no checkout serves fine. The web UI is embedded in the binary
+    // (src/web.rs), so there is no dist/ to locate or build.
+    let log_path = root.dir.join("elanus-serve.log");
     let log = Log::create(&log_path)?;
     let root_s = root.dir.display().to_string();
     let web_port_s = web_port.to_string();
@@ -152,14 +158,14 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
     // `<self> -C <root> daemon` so the daemon targets the same root explicitly.
     let self_exe = std::env::current_exe().context("locating the running elanus binary")?;
 
-    // Build the SPA if it's missing (or forced). server.mjs serves ui/web/dist/ as
-    // the prod static root; without a built index.html it would 404 the app.
-    ensure_dist_built(&web_dir, rebuild, &log)?;
+    if rebuild {
+        log.line("[serve] --rebuild ignored: the web UI is embedded in the binary (nothing to npm-build at serve time; use `elanus dev` for the Vite hot-reload loop)");
+    }
 
     let mut services = vec![
         Service::new(
             "daemon",
-            CommandSpec::new(self_exe.clone(), &repo)
+            CommandSpec::new(self_exe.clone(), &root.dir)
                 .arg("-C")
                 .arg(&root_s)
                 .arg("daemon")
@@ -167,12 +173,16 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
                 .arg(interval_ms.to_string())
                 .env("ELANUS_ROOT", &root_s),
         ),
+        // The web server is THIS binary again (`elanus web`, src/web.rs): the SPA
+        // is embedded via include_dir!, so no Node, no npm, no ui/web checkout is
+        // needed at runtime. ui/web/server.mjs remains on disk as a fallback only
+        // (M4 deferred).
         Service::new(
             "web",
-            CommandSpec::new("node", &web_dir)
-                .arg("server.mjs")
-                .arg("--root")
+            CommandSpec::new(self_exe.clone(), &root.dir)
+                .arg("-C")
                 .arg(&root_s)
+                .arg("web")
                 .arg("--port")
                 .arg(&web_port_s)
                 .env("ELANUS_ROOT", &root_s)
@@ -183,7 +193,7 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
     log.line(format!("[serve] root={}", root.dir.display()));
     log.line(format!("[serve] log={}", log_path.display()));
     log.line(format!("[serve] daemon={}", self_exe.display()));
-    log.line(format!("[serve] web UI: http://127.0.0.1:{web_port} (built SPA from {}/dist)", web_dir.display()));
+    log.line(format!("[serve] web UI: http://127.0.0.1:{web_port} (embedded SPA, served in-process)"));
     log.line("[serve] ctrl-c stops the whole stack");
 
     for service in &mut services {
@@ -213,52 +223,6 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
         service.stop(Duration::from_secs(3));
     }
     cleanup_root_processes(root, &log);
-    Ok(())
-}
-
-/// Ensure `ui/web/dist/index.html` exists before the web server starts. Builds it
-/// with `npm run build` (run in `web_dir`, output streamed to the combined log) when
-/// it is missing, or always when `rebuild` is set. A build failure aborts serve
-/// (the web server would otherwise serve a 404 app). When the build is already
-/// present and not forced, this is a no-op with a one-line note.
-fn ensure_dist_built(web_dir: &Path, rebuild: bool, log: &Log) -> Result<()> {
-    let index = web_dir.join("dist/index.html");
-    if index.exists() && !rebuild {
-        log.line(format!("[serve] using existing built SPA at {}", index.display()));
-        return Ok(());
-    }
-    if rebuild {
-        log.line("[serve] --rebuild: rebuilding the web UI (npm run build)…");
-    } else {
-        log.line(format!(
-            "[serve] built SPA missing ({}); building it (npm run build)…",
-            index.display()
-        ));
-    }
-    let status = Command::new("npm")
-        .arg("run")
-        .arg("build")
-        .current_dir(web_dir)
-        .status()
-        .with_context(|| {
-            format!(
-                "running `npm run build` in {} (is node/npm installed and on PATH?)",
-                web_dir.display()
-            )
-        })?;
-    if !status.success() {
-        anyhow::bail!(
-            "`npm run build` failed ({status}) in {} — cannot serve the web UI without a built dist/",
-            web_dir.display()
-        );
-    }
-    if !index.exists() {
-        anyhow::bail!(
-            "`npm run build` succeeded but {} is still missing — check the Vite build config",
-            index.display()
-        );
-    }
-    log.line(format!("[serve] built SPA ready at {}", index.display()));
     Ok(())
 }
 

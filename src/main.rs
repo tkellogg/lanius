@@ -32,6 +32,7 @@ mod sandbox;
 mod secrets;
 mod topic;
 mod trace;
+mod web;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -149,19 +150,34 @@ enum Cmd {
         #[arg(long, default_value_t = 5173)]
         vite_port: u16,
     },
-    /// Run the packaged stack: the daemon (this binary) + the web server serving
-    /// the built SPA from ui/web/dist/, supervised. The prod counterpart of `dev`
-    /// — no cargo, no `--watch`, no Vite. Builds ui/web/dist/ if it's missing.
+    /// Run the packaged stack: the daemon (this binary) + the web server (also
+    /// this binary, `elanus web`), supervised. The prod counterpart of `dev` —
+    /// no cargo, no `--watch`, no Vite, no Node: the SPA is embedded in the binary
+    /// (src/web.rs `include_dir!`), so an installed `cargo install elanus` works
+    /// off any host with no checkout.
     Serve {
         /// Dispatcher poll interval for the daemon child.
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
-        /// Port for the web server (serves the built SPA).
+        /// Port for the web server (serves the embedded SPA).
         #[arg(long, default_value_t = 7180)]
         web_port: u16,
-        /// Force a fresh `npm run build` even when ui/web/dist/ already exists.
+        /// Ignored — the SPA is embedded in the binary (nothing to npm-build at
+        /// serve time). Kept for flag compatibility; use `elanus dev` for the
+        /// Vite hot-reload loop.
         #[arg(long)]
         rebuild: bool,
+    },
+    /// Serve the web dashboard in-process: the embedded SPA + the SSE bus relay +
+    /// the JSON API (the Rust port of ui/web/server.mjs — no Node at runtime). Run
+    /// standalone beside the daemon, or supervised by `serve`/`dev`.
+    Web {
+        /// Port for the web server (serves the embedded SPA).
+        #[arg(long, default_value_t = 7180)]
+        port: u16,
+        /// Agent the dashboard targets by default.
+        #[arg(long, default_value = "main")]
+        agent: String,
     },
     /// Emit an event — the universal entry point
     Emit {
@@ -497,6 +513,21 @@ fn run(cli: Cli) -> Result<()> {
             web_port,
             rebuild,
         } => dev::serve(&root, interval_ms, web_port, rebuild)?,
+        Cmd::Web { port, agent } => {
+            // server.mjs parity: ELANUS_WEB_PORT overrides the default when no
+            // explicit --port is on the command line. clap can't tell a default
+            // from an explicit equal value, so honor the env var only when --port
+            // is left at the default; supervisors (serve/dev) pass --port anyway.
+            let port = if port == 7180 {
+                std::env::var("ELANUS_WEB_PORT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(port)
+            } else {
+                port
+            };
+            web::serve_web(&root, port, &agent)?
+        }
         Cmd::Emit {
             r#type,
             payload,

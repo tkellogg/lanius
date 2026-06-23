@@ -4,6 +4,27 @@ version = "0.1.0"
 edition = "2021"
 description = "elanus: a minimal event-driven agent harness (inetd + cron + git hooks + sqlite + a flight recorder)"
 
+# What ships in the published crate. `include` is an explicit allowlist (it
+# overrides .gitignore), so it MUST cover everything the binary compiles against:
+# `src`, the `include_str!` roots in src/initcmd.rs (`packages/`, `kits/`), and
+# the web UI that src/web.rs embeds via `include_dir!` (`ui/web/dist`, a build
+# output that is gitignored — the publish step below builds it first). Miss one
+# and `cargo install` fails to compile on the user's machine.
+#
+# BUILD/PUBLISH ORDER (see docs/handoffs/web-packaging.md): ui/web/dist must
+# EXIST before `cargo build`/`cargo publish`, because include_dir! embeds it at
+# COMPILE time:
+#   1. (cd ui/web && npm ci && npm run build)   # produce ui/web/dist
+#   2. cargo build  /  cargo publish            # embeds dist, ships the allowlist
+include = [
+    "src/**/*",
+    "packages/**/*",
+    "kits/**/*",
+    "templates/**/*",
+    "ui/web/dist/**/*",
+    "Cargo.toml",
+]
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -23,3 +44,4 @@ toml = "1"
 uuid = { version = "1", features = ["v4"] }
 toml_edit = "0.25.12"
 reqwest = { version = "0.13.4", features = ["json"] }
+include_dir = "0.7"
