@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+# Computed-block stage: push a `clock` entry onto doc.system. This is the whole
+# mechanism — a stage is a Doc->Doc transform, and a "computed block" is just a
+# stage that appends to system. No special block type, no kernel API: the same
+# {name, text} shape every static/persisted block uses.
+import json
+import sys
+
+doc = json.load(sys.stdin)
+doc.setdefault("system", []).append({
+    "name": "clock",
+    "text": "The session clock reads: TICK-0001 (a computed block).",
+})
+json.dump(doc, sys.stdout)

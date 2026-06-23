@@ -1,5 +1,5 @@
 ---
-status: planned
+status: in-progress
 author: Claude Opus 4.8 in Claude Code on Elanus
 last-updated: 2026-06-23
 ---
@@ -104,6 +104,10 @@ Add `elanus block set/get/list/append/rm <name> [--scope …] [--placement …]
 `context_blocks`. Add the seed-once default path: a profile `blocks/<name>.md` or
 a package manifest default seeds a row on first render if none exists; a `set`
 thereafter wins. Re-point `elanus code note` at the `note` block (alias, M-decision 5).
+**[DEFERRED with M4]** — the note *read* lives in `turn_injection()` in the
+in-flight `src/codeagent.rs`, so the aliasing ships with the coding-agent
+projection. M1–M3 landed without it; `elanus code note` and `code_notes` are
+unchanged and still work.
 
 **Acceptance:** `elanus block set identity "I am Lily."` persists; next
 `context render` shows it. A shipped default block appears on first render, and a
@@ -164,6 +168,18 @@ silent drop.
   (`src/codeagent.rs:5463`).
 
 ## Log
+- **2026-06-23 — M1–M3 shipped** (impl on Opus medium → adversarial verify on
+  Opus high, 2 rounds, `pass`). Native keystone landed: durable `context_blocks`
+  rows seed `Doc.system` ordered by priority (`src/render.rs` `load_system_blocks`
+  / `seed_defaults`, fed into `assemble_detailed`); the `elanus block
+  set/get/list/append/rm` CLI (`src/blockcli.rs` + `src/context_store.rs`, wired in
+  `src/main.rs`); seed-once-then-stored-wins default-that-evolves; and a
+  `kits/memory-blocks-demo` package proving computed-block-as-a-vanilla-stage with
+  `context_build_log` attribution. `cargo test` 251 pass. **Deferred** (all touch
+  the in-flight `src/codeagent.rs`): M4 (coding-agent projection), the M2 `code
+  note`→block alias (decision 5). Residual minors accepted: `--owner` is a
+  self-attested label (sound under homogeneous-authority; isolation proven), and
+  the build-log opens a second SQLite connection per assembly (best-effort/safe).
 - **2026-06-23 — cross-harness injection spike (run live, this session).** The
   load-bearing question for M4 — "can elanus inject context *mid-turn*?" —
   answered empirically per harness:

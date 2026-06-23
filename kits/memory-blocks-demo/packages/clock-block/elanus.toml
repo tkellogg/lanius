@@ -1,0 +1,25 @@
+# clock-block — the memory-blocks M3 demonstration (docs/handoffs/memory-blocks.md).
+#
+# Proves the core claim: a COMPUTED block is just a vanilla stage. The `clock`
+# stage pushes a `clock` entry onto doc.system; the `clock-reader` stage (a
+# trivial DOWNSTREAM stage, higher order so it runs after) reads doc.system,
+# finds the computed `clock` entry with NO special-casing — exactly as it would
+# find a static profile block or a persisted memory block — and pushes a
+# `clock-echo` entry proving it saw it. The kernel records an `add` row in
+# context_build_log per stage, attributed to this package, so "which component
+# added which block" stays reconstructable.
+#
+# Ships pending like every stage (discovery is not authority): approve both
+# stages to activate.
+
+[[stage]]
+name  = "clock"
+run   = "scripts/clock"
+order = 30
+mode  = "exec"
+
+[[stage]]
+name  = "clock-reader"
+run   = "scripts/clock-reader"
+order = 40
+mode  = "exec"

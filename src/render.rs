@@ -1,3 +1,4 @@
+use crate::context_store;
 use crate::envcompat::EnvDual;
 use crate::packages;
 use crate::paths::Root;
@@ -28,30 +29,97 @@ pub fn render(root: &Root, conn: &Connection, profile_name: &str, session: &str)
 /// joined — byte-identical to render() (the golden parity gate).
 pub fn render_parts(
     root: &Root,
-    _conn: &Connection,
+    conn: &Connection,
     profile_name: &str,
     session: &str,
 ) -> Result<Vec<(String, String)>> {
     let (prof, pdir) = profile::load(root, profile_name)?;
     let mut parts: Vec<(String, String)> = Vec::new();
 
-    // 1. Static blocks with computed-register substitution.
+    // 1. Static + durable system blocks, merged by priority (memory-blocks
+    // M1/M2). Static `blocks/*.md` files carry an IMPLICIT priority 0 and sort
+    // by filename (the long-standing order); durable `context_blocks` rows
+    // (scope agent/global, this owner/agent, bound to no session or this one)
+    // carry an EXPLICIT priority, so a block at priority -10 lands before the
+    // static blocks and one at +10 after. The renderer stays
+    // Doc::system_text() — this only decides seed ORDER, not rendering.
     let blocks_dir = pdir.join("blocks");
-    if blocks_dir.exists() {
-        let mut files: Vec<_> = std::fs::read_dir(&blocks_dir)?
+    let mut static_files: Vec<std::path::PathBuf> = if blocks_dir.exists() {
+        std::fs::read_dir(&blocks_dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
-            .collect();
-        files.sort();
-        for f in files {
-            let raw = std::fs::read_to_string(&f)?;
-            let name = f
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            parts.push((name, substitute(&raw, root, profile_name, session, &prof)));
+            .collect()
+    } else {
+        Vec::new()
+    };
+    static_files.sort();
+
+    // M2 "default that evolves": a profile's `blocks/<name>.md` is BOTH the
+    // legacy static block AND a seed-once fallback for a durable block of the
+    // same stem (e.g. `00-identity.md` -> block `identity`). On first render,
+    // if no stored row exists, seed one from the file; thereafter the stored
+    // (possibly agent-edited) row wins and the file is no longer rendered for
+    // that stem. A file with no matching durable stem renders as before.
+    let mut defaults: Vec<(String, String, i32)> = Vec::new();
+    for f in &static_files {
+        if let Some(stem) = block_stem(f) {
+            let raw = std::fs::read_to_string(f)?;
+            let text = substitute(&raw, root, profile_name, session, &prof);
+            defaults.push((stem, text, file_priority(f)));
         }
+    }
+    let seeded = match context_store::seed_defaults(conn, &prof, &defaults, profile_name, session) {
+        Ok(s) => s,
+        Err(e) => {
+            // Best-effort seeding, but a persistent DB failure here would silently
+            // render defaults from the file forever (looking like it works) without
+            // ever evolving — make it observable instead of masking it as "nothing
+            // to seed".
+            eprintln!("warning: seeding default memory blocks failed: {e:#}");
+            Vec::new()
+        }
+    };
+
+    // The set of durable block names that now exist for this profile — their
+    // stem-matched static files defer to the stored row (stored-wins).
+    let durable = context_store::load_system_blocks(conn, &prof, session).unwrap_or_default();
+    let durable_names: std::collections::HashSet<String> =
+        durable.iter().map(|b| b.name.clone()).collect();
+
+    // Build the merged, priority-ordered system seed. Each entry is
+    // (priority, sub_order, name, text); sub_order keeps stable order within a
+    // priority (durable rows already sorted by the store; static files keep
+    // filename order).
+    let mut ordered: Vec<(i32, usize, String, String)> = Vec::new();
+    let mut sub = 0usize;
+    for f in &static_files {
+        let stem = block_stem(f);
+        // A static file whose stem is now a durable block defers to that row,
+        // UNLESS we just seeded it this very call (then the durable row IS the
+        // file's content and we render it via the durable list, not twice).
+        if let Some(s) = &stem {
+            if durable_names.contains(s) {
+                continue;
+            }
+        }
+        let raw = std::fs::read_to_string(f)?;
+        let name = f
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let text = substitute(&raw, root, profile_name, session, &prof);
+        ordered.push((file_priority(f), sub, name, text));
+        sub += 1;
+    }
+    let _ = seeded; // seeded names already surface via the durable list below
+    for b in &durable {
+        ordered.push((b.priority, sub, b.name.clone(), b.content.clone()));
+        sub += 1;
+    }
+    ordered.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    for (_, _, name, text) in ordered {
+        parts.push((name, text));
     }
 
     // 2. Render providers: the read seam of the memory contract. Any
@@ -108,6 +176,38 @@ pub fn render_parts(
     }
 
     Ok(parts)
+}
+
+/// The durable block name a static `blocks/<file>.md` seeds: the file stem with
+/// any leading `NN-` numeric prefix stripped (`00-identity.md` -> `identity`,
+/// `ctx.md` -> `ctx`). Returns None if the resulting name is not a valid block
+/// name (whitespace/slash/empty) — that file is a pure static block with no
+/// durable counterpart.
+fn block_stem(path: &std::path::Path) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy();
+    let trimmed = match stem.split_once('-') {
+        Some((prefix, rest)) if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) => {
+            rest.to_string()
+        }
+        _ => stem.to_string(),
+    };
+    if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(trimmed)
+}
+
+/// The implicit priority of a static block file: its leading `NN-` numeric
+/// prefix if present (so `10-ctx.md` -> 10), else 0. This makes the historical
+/// filename sort equal the priority sort, so a durable block with an explicit
+/// priority slots into the same order relative to the static blocks.
+fn file_priority(path: &std::path::Path) -> i32 {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.split_once('-'))
+        .filter(|(p, _)| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .and_then(|(p, _)| p.parse::<i32>().ok())
+        .unwrap_or(0)
 }
 
 fn substitute(
@@ -180,5 +280,129 @@ fn run_provider(
             anyhow::bail!("provider timed out after 10s");
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context_blocks::{ContextBlock, Scope};
+    use crate::context_store;
+
+    fn scratch(tag: &str) -> Root {
+        let dir = std::env::temp_dir().join(format!("el-render-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("profiles/default/blocks")).unwrap();
+        std::fs::write(
+            dir.join("profiles/default/profile.toml"),
+            "agent = \"lily\"\nowner = \"owner\"\n",
+        )
+        .unwrap();
+        Root { dir }
+    }
+
+    fn names(root: &Root, conn: &Connection, session: &str) -> Vec<String> {
+        render_parts(root, conn, "default", session)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    #[test]
+    fn block_stem_strips_numeric_prefix() {
+        assert_eq!(
+            block_stem(std::path::Path::new("00-identity.md")).as_deref(),
+            Some("identity")
+        );
+        assert_eq!(
+            block_stem(std::path::Path::new("ctx.md")).as_deref(),
+            Some("ctx")
+        );
+        // A non-numeric prefix is kept whole (it is part of the name).
+        assert_eq!(
+            block_stem(std::path::Path::new("agent-card.md")).as_deref(),
+            Some("agent-card")
+        );
+        assert_eq!(file_priority(std::path::Path::new("10-ctx.md")), 10);
+        assert_eq!(file_priority(std::path::Path::new("ctx.md")), 0);
+    }
+
+    // M1 acceptance: a durable context_blocks row (scope=agent, owner=<agent>,
+    // name=identity, placement=system) shows in the rendered system text,
+    // positioned by priority relative to the profile's static blocks.
+    #[test]
+    fn m1_durable_block_seeds_system_by_priority() {
+        let root = scratch("m1");
+        std::fs::write(
+            root.dir.join("profiles/default/blocks/50-body.md"),
+            "Body block.",
+        )
+        .unwrap();
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+
+        // A block at priority -10 must land BEFORE the static block (file
+        // priority 50); a block at +99 must land after.
+        for (name, content, prio) in [("identity", "I am Lily.", -10), ("footer", "bye", 99)] {
+            let mut b = ContextBlock::new(name, content, "lily");
+            b.scope = Scope::Agent;
+            b.priority = prio;
+            context_store::upsert_block(&conn, "default", &b, "s1", None).unwrap();
+        }
+        let ns = names(&root, &conn, "s1");
+        let id = ns.iter().position(|n| n == "identity").unwrap();
+        let body = ns.iter().position(|n| n == "body").unwrap();
+        let foot = ns.iter().position(|n| n == "footer").unwrap();
+        assert!(id < body, "priority -10 block precedes the static block");
+        assert!(body < foot, "priority +99 block follows the static block");
+
+        let text = render(&root, &conn, "default", "s1").unwrap();
+        assert!(text.contains("I am Lily."));
+        assert!(text.contains("Body block."));
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    // M2 acceptance: a shipped default (blocks/<name>.md) seeds a row on first
+    // render; a subsequent `set` overrides it AND survives a re-render (it
+    // evolved).
+    #[test]
+    fn m2_default_seeds_then_evolves() {
+        let root = scratch("m2");
+        std::fs::write(
+            root.dir.join("profiles/default/blocks/00-identity.md"),
+            "default identity",
+        )
+        .unwrap();
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+
+        // First render seeds the default into the store and shows it.
+        let t1 = render(&root, &conn, "default", "s1").unwrap();
+        assert!(t1.contains("default identity"));
+        let mut b = ContextBlock::new("identity", "x", "lily");
+        b.scope = Scope::Agent;
+        assert!(
+            context_store::get_block(&conn, &b, "s1", None)
+                .unwrap()
+                .is_some(),
+            "the default seeded a durable row"
+        );
+
+        // A `set` wins over the default.
+        b.content = "evolved identity".into();
+        context_store::upsert_block(&conn, "default", &b, "s1", None).unwrap();
+        let t2 = render(&root, &conn, "default", "s1").unwrap();
+        assert!(t2.contains("evolved identity"));
+        assert!(
+            !t2.contains("default identity"),
+            "the file no longer wins once the row evolved"
+        );
+
+        // And it survives a re-render — the default never overwrites.
+        let t3 = render(&root, &conn, "default", "s1").unwrap();
+        assert!(t3.contains("evolved identity"));
+        assert!(!t3.contains("default identity"));
+        std::fs::remove_dir_all(&root.dir).ok();
     }
 }

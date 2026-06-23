@@ -1,3 +1,4 @@
+mod blockcli;
 mod broker;
 mod bus;
 mod buscli;
@@ -7,6 +8,8 @@ mod codesession;
 mod config_repo;
 mod configcli;
 mod context;
+mod context_blocks;
+mod context_store;
 mod db;
 mod dev;
 mod dispatcher;
@@ -132,6 +135,13 @@ enum Cmd {
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
+    },
+    /// Memory blocks (docs/handoffs/memory-blocks.md): named, durable, editable
+    /// chunks of prompt. set / get / list / append / rm — owner-scoped, upserted
+    /// into context_blocks, seeded into the system context by priority.
+    Block {
+        #[command(subcommand)]
+        cmd: BlockCmd,
     },
     /// Run the dispatcher: poll events, fork handlers, record exits
     Daemon {
@@ -362,6 +372,82 @@ enum ConfigCmd {
     Accept { id: String },
     /// Decline a proposal: drop it without applying
     Decline { id: String },
+}
+
+/// Block-addressing flags shared by every `elanus block` verb (clap flattens
+/// them into each subcommand).
+#[derive(clap::Args)]
+struct BlockArgs {
+    /// The profile whose agent owns the block (also the render context).
+    #[arg(long, default_value = "default")]
+    profile: String,
+    /// The session a session/run-scoped block binds to.
+    #[arg(long, default_value = "render-preview")]
+    session: String,
+    /// global | agent | session | run (run is stage-only).
+    #[arg(long, default_value = "agent")]
+    scope: String,
+    /// system | before_messages | after_messages | user | scratch (M1 renders
+    /// system only).
+    #[arg(long, default_value = "system")]
+    placement: String,
+    /// Render order relative to the profile's static blocks (negative = before).
+    #[arg(long, allow_hyphen_values = true)]
+    priority: Option<i32>,
+    /// Override the owner identity: a SELF-ATTESTED label, not an authenticated
+    /// identity (this local-trusted CLI has no broker session to verify it).
+    /// Defaults to the profile's agent noun. A mismatched value only writes a
+    /// different owner row — it cannot read or overwrite another owner's blocks.
+    #[arg(long)]
+    owner: Option<String>,
+}
+
+impl BlockArgs {
+    fn opts(&self) -> blockcli::BlockOpts {
+        blockcli::BlockOpts {
+            profile: self.profile.clone(),
+            session: self.session.clone(),
+            scope: self.scope.clone(),
+            placement: self.placement.clone(),
+            priority: self.priority,
+            owner: self.owner.clone(),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum BlockCmd {
+    /// Set (upsert) a block: elanus block set identity "I am Lily."
+    Set {
+        name: String,
+        content: String,
+        #[command(flatten)]
+        args: BlockArgs,
+    },
+    /// Append to a block (creating it if absent; a newline joins prior content)
+    Append {
+        name: String,
+        content: String,
+        #[command(flatten)]
+        args: BlockArgs,
+    },
+    /// Print one block's content
+    Get {
+        name: String,
+        #[command(flatten)]
+        args: BlockArgs,
+    },
+    /// The system-placement blocks visible to a profile, one JSON line each
+    List {
+        #[command(flatten)]
+        args: BlockArgs,
+    },
+    /// Remove a block
+    Rm {
+        name: String,
+        #[command(flatten)]
+        args: BlockArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -851,6 +937,21 @@ fn run(cli: Cli) -> Result<()> {
                 let by = secrets::owner_name(&root);
                 configcli::decline(&root, &conn, &id, &by)?;
             }
+        },
+        Cmd::Block { cmd } => match cmd {
+            BlockCmd::Set {
+                name,
+                content,
+                args,
+            } => blockcli::set(&root, &name, &content, &args.opts())?,
+            BlockCmd::Append {
+                name,
+                content,
+                args,
+            } => blockcli::append(&root, &name, &content, &args.opts())?,
+            BlockCmd::Get { name, args } => blockcli::get(&root, &name, &args.opts())?,
+            BlockCmd::List { args } => blockcli::list(&root, &args.opts())?,
+            BlockCmd::Rm { name, args } => blockcli::rm(&root, &name, &args.opts())?,
         },
         Cmd::Approve { name, by } => {
             let conn = open(&root)?;

@@ -235,6 +235,13 @@ pub fn assemble_detailed(
         }
     }
     validate(&doc).context("seed transcript invalid (kernel bug)")?;
+    // Open the build-log connection ONCE for the whole assembly rather than per
+    // stage. Best-effort: a failure here just disables build-log attribution for
+    // this render (the trace camera already recorded the deltas), so it stays an
+    // Option threaded into log_block_mutations.
+    let build_log_conn: Option<Connection> = crate::db::open(root)
+        .ok()
+        .filter(|c| crate::db::init_schema(c).is_ok());
     let mut summaries = Vec::new();
     for s in stages {
         let before = (doc.system.len(), doc.messages.len(), doc_bytes(&doc));
@@ -278,6 +285,16 @@ pub fn assemble_detailed(
             });
             continue;
         }
+        // Snapshot system blocks (name -> content) BEFORE the stage runs, so we
+        // can attribute each add/rewrite to this stage's package in the durable
+        // build log (memory-blocks M3). A stage is just a Doc->Doc transform; the
+        // build log is how "which component added/edited which block" stays
+        // reconstructable without storing the prompt itself.
+        let before_blocks: std::collections::HashMap<String, String> = doc
+            .system
+            .iter()
+            .map(|b| (b.name.clone(), b.text.clone()))
+            .collect();
         doc = run_stage(root, s, &doc)
             .with_context(|| format!("stage {}/{} failed", s.package, s.name))?;
         if doc.v != 1 {
@@ -290,6 +307,7 @@ pub fn assemble_detailed(
         }
         validate(&doc)
             .with_context(|| format!("stage {}/{} broke a wire invariant", s.package, s.name))?;
+        log_block_mutations(build_log_conn.as_ref(), &doc, s, &before_blocks);
         let after = (doc.system.len(), doc.messages.len(), doc_bytes(&doc));
         let summary = StageSummary {
             package: s.package.clone(),
@@ -334,6 +352,48 @@ pub fn assemble_detailed(
         doc,
         stages: summaries,
     })
+}
+
+/// Record this stage's system-block adds/rewrites in `context_build_log`
+/// (memory-blocks M3), attributed to the stage's package. A computed block is a
+/// vanilla stage: it only pushes/edits `doc.system` entries — the kernel diffs
+/// the before/after system map and logs the mutation, so a downstream stage sees
+/// the entry through `doc.system` with no special-casing, and the provenance is
+/// still reconstructable. Best-effort: a build-log write failure must never
+/// brick assembly, so errors are swallowed (the trace camera already recorded
+/// the delta).
+fn log_block_mutations(
+    conn: Option<&Connection>,
+    doc: &Doc,
+    s: &StageRef,
+    before: &std::collections::HashMap<String, String>,
+) {
+    let Some(conn) = conn else {
+        return;
+    };
+    for b in &doc.system {
+        let (action, before_sha) = match before.get(&b.name) {
+            None => (crate::context_blocks::BuildAction::Add, None),
+            Some(prev) if prev != &b.text => (
+                crate::context_blocks::BuildAction::Rewrite,
+                Some(crate::context_blocks::sha256_hex(prev.as_bytes())),
+            ),
+            Some(_) => continue, // unchanged — not a mutation by this stage
+        };
+        let _ = crate::context_store::write_build_log(
+            conn,
+            &doc.meta.profile,
+            &doc.meta.agent,
+            &doc.meta.session,
+            None,
+            &s.package,
+            &action,
+            Some(&b.name),
+            before_sha,
+            Some(crate::context_blocks::sha256_hex(b.text.as_bytes())),
+            Some(&s.name),
+        );
+    }
 }
 
 fn obs_topic(meta: &Meta, stage: &str) -> String {
@@ -739,6 +799,102 @@ default = false
         assert_eq!(assembly.doc.meta.vars.get("rows").unwrap(), "50");
         assert_eq!(assembly.doc.meta.vars.get("mode").unwrap(), "compact");
         assert_eq!(assembly.doc.meta.vars.get("flag").unwrap(), "true");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // M3 acceptance: a package [[stage]] that writes a block to doc.system is
+    // indistinguishable downstream from any other block, and the kernel records
+    // an `add` row in context_build_log attributed to the stage's package.
+    #[cfg(unix)]
+    #[test]
+    fn m3_computed_block_is_a_vanilla_stage_and_is_logged() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("el-ctx-m3-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let root = crate::paths::Root { dir: dir.clone() };
+        let pkg = dir.join("packages/clockpkg/scripts");
+        std::fs::create_dir_all(&pkg).unwrap();
+        // Stage A: append a `clock` block. Stage B (downstream): read doc.system,
+        // find `clock` by name with no special-casing, append `clock-echo`.
+        let writer = pkg.join("clock");
+        std::fs::write(
+            &writer,
+            "#!/usr/bin/env python3\nimport json,sys\nd=json.load(sys.stdin)\n\
+             d['system'].append({'name':'clock','text':'TICK'})\njson.dump(d,sys.stdout)\n",
+        )
+        .unwrap();
+        let reader = pkg.join("reader");
+        std::fs::write(
+            &reader,
+            "#!/usr/bin/env python3\nimport json,sys\nd=json.load(sys.stdin)\n\
+             seen=[b['text'] for b in d['system'] if b['name']=='clock']\n\
+             if seen:\n  d['system'].append({'name':'clock-echo','text':'saw '+seen[0]})\n\
+             json.dump(d,sys.stdout)\n",
+        )
+        .unwrap();
+        for f in [&writer, &reader] {
+            let mut perms = std::fs::metadata(f).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(f, perms).unwrap();
+        }
+
+        let stages = vec![
+            StageRef {
+                package: "clockpkg".into(),
+                name: "clock".into(),
+                script: writer,
+                order: 10,
+                mode: "exec".into(),
+                timeout_ms: 5000,
+                config_vars: Default::default(),
+                approved: true,
+            },
+            StageRef {
+                package: "clockpkg".into(),
+                name: "reader".into(),
+                script: reader,
+                order: 20,
+                mode: "exec".into(),
+                timeout_ms: 5000,
+                config_vars: Default::default(),
+                approved: true,
+            },
+        ];
+        let assembly = assemble_detailed(
+            &root,
+            &[],
+            vec![json!({"role":"user","text":"hi"})],
+            Value::Null,
+            meta(),
+            &stages,
+            None,
+        )
+        .unwrap();
+        let names: Vec<_> = assembly.doc.system.iter().map(|b| b.name.as_str()).collect();
+        assert!(names.contains(&"clock"), "the computed block is present");
+        assert!(
+            names.contains(&"clock-echo"),
+            "the downstream stage saw it via doc.system"
+        );
+        let echo = assembly
+            .doc
+            .system
+            .iter()
+            .find(|b| b.name == "clock-echo")
+            .unwrap();
+        assert_eq!(echo.text, "saw TICK");
+
+        // The build log has an `add` row for `clock` attributed to clockpkg.
+        let conn = crate::db::open(&root).unwrap();
+        let (component, action): (String, String) = conn
+            .query_row(
+                "SELECT component, action FROM context_build_log WHERE block_name='clock'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(component, "clockpkg");
+        assert_eq!(action, "add");
         std::fs::remove_dir_all(&dir).ok();
     }
 

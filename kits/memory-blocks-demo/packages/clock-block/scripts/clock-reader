@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+# Downstream stage: read doc.system and prove the computed `clock` block is
+# indistinguishable from any other entry. We look it up BY NAME in the merged
+# system map — the exact same way we'd find a static profile block or a persisted
+# memory block — with no flag, no type tag, no special path. If we see it, we
+# push a `clock-echo` entry quoting it.
+import json
+import sys
+
+doc = json.load(sys.stdin)
+system = doc.get("system", [])
+seen = next((b["text"] for b in system if b.get("name") == "clock"), None)
+if seen is not None:
+    doc["system"].append({
+        "name": "clock-echo",
+        "text": f"clock-reader observed the computed block via doc.system: {seen!r}",
+    })
+json.dump(doc, sys.stdout)
