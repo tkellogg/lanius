@@ -58,6 +58,15 @@ the UI.
   then couldn't answer — "what did you read?" — because reads, unlike writes and
   tool calls, leave no trace. The why behind the read camera
   ([../sandbox.md](../sandbox.md) "The read camera").
+- [11-profiles.md](11-profiles.md) - profiles as bundles of capabilities you bolt
+  onto an agent, and the three capabilities the journey actually wants on top of the
+  profile machinery that already ships: **memory blocks** (named, editable,
+  evolving prompt chunks — the keystone), **inter-agent comms** (computed blocks +
+  priority injection over the existing mailbox/rooms), and **work estimation**
+  (estimate-after-plan → retro → adjust a block). Work plans decomposed into
+  [../handoffs/memory-blocks.md](../handoffs/memory-blocks.md),
+  [../handoffs/agent-comms-package.md](../handoffs/agent-comms-package.md), and
+  [../handoffs/work-estimation.md](../handoffs/work-estimation.md).
 
 ## Implementation Anchors
 
