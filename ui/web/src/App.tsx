@@ -539,6 +539,12 @@ export function App() {
     setSel((prev: any) => ({ kind: 'agent', agent, tab: tab ?? (prev.kind === 'agent' && prev.agent === agent ? prev.tab : 'converse') }));
   };
 
+  // Conversation persist/fork/resume (M2). M5 (the agent-driven conversation
+  // selector) is DEFERRED: it is not built here, but the controls below are
+  // routed through this state + the M3/M4 API (rememberConversation /
+  // loadConversation / openConversation / newConversation read the same
+  // /api/conversations endpoints) — not UI-only — so an agent can later drive
+  // the same persist/fork/resume calls without a UI rewrite.
   const conversationStateFor = (agent: string) => conversations.get(agent) ?? { status: 'idle', list: [], error: '' };
   const currentConversation = (agent: string) => agentSessions.current.get(agent) ?? localStorage.getItem(conversationStorageKey(agent)) ?? '';
   const rememberConversation = (agent: string, session: string) => {
