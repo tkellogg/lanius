@@ -1880,9 +1880,18 @@ pub fn claim_cmd(root: &Root, path: &str) -> Result<()> {
         bail!("usage: elanus code claim <path>");
     }
     let (session, room) = session_room_identity(root)?;
-    codesession::add_claim(root, &room, &session, path)?;
+    // Canonicalize to the SAME absolute form auto_claim_write uses (BUG B): a manual
+    // `claim src/foo.rs` and the SA3 auto-claim of that file must collapse to ONE row
+    // per session, not a lexical row plus a canonical one double-listing it for a
+    // roommate. A relative manual path resolves against the session's recorded
+    // workdir, mirroring auto-claim's base. Fall back to the trimmed input if the
+    // record/workdir is somehow unavailable (still advisory, never a panic).
+    let workdir = session_auto_claim_room_and_workdir(root, &session).map(|(_, wd)| wd);
+    let claim_path =
+        canonicalize_claim_path(path, workdir.as_deref()).unwrap_or_else(|| path.to_string());
+    codesession::add_claim(root, &room, &session, &claim_path)?;
     println!(
-        "claimed {path} in room {room} (advisory — your peers will see you are \
+        "claimed {claim_path} in room {room} (advisory — your peers will see you are \
 editing it; nothing is locked)"
     );
     Ok(())
@@ -1916,16 +1925,48 @@ editing it; nothing is locked)"
 // upserts per (room, session, path) PRIMARY KEY, so re-editing the same file just
 // refreshes the timestamp — never a duplicate, never per-syscall.
 
-/// Resolve the room an auto-claim for `session` lands in: the explicit `--room`
-/// recorded at launch if any, else the SA1 workdir-derived room from the session's
-/// recorded canonical workdir — the SAME resolution `session_room_identity` uses
-/// for the `claim` CLI, so the auto-claim lands in the room siblings read.
-fn session_auto_claim_room(root: &Root, session: &str) -> Option<String> {
+/// Resolve the room an auto-claim for `session` lands in AND the session's durable
+/// recorded workdir, both read from the session's OWN record in a single load. The
+/// room is the explicit `--room` recorded at launch if any, else the SA1
+/// workdir-derived room from the recorded canonical workdir — the SAME resolution
+/// `session_room_identity` uses for the `claim` CLI, so the auto-claim lands in the
+/// room siblings read. The workdir is returned so a relative claim path can be
+/// resolved against it even on a RESUMED session, where the live `cwd` is `None`
+/// (BUG A): resume then claims the same absolute path launch would.
+fn session_auto_claim_room_and_workdir(root: &Root, session: &str) -> Option<(String, String)> {
     let rec = codesession::read_record(root, session).ok().flatten()?;
-    Some(match rec.room.filter(|r| !r.is_empty()) {
+    let workdir = rec.workdir.clone();
+    let room = match rec.room.filter(|r| !r.is_empty()) {
         Some(r) => r,
-        None => resolve_room(None, Path::new(&rec.workdir)),
-    })
+        None => resolve_room(None, Path::new(&workdir)),
+    };
+    Some((room, workdir))
+}
+
+/// Resolve a claim path to its canonical absolute form, the SAME convention the fs
+/// cameras key on (emit_fs_delta / claude_read_fs_events both key
+/// `obs/fs/<canonical>`) — so a MANUAL `claim` and an AUTO-claim of one file
+/// collapse to ONE row per session (BUG B), and an auto-claim matches a roommate's
+/// view. A relative `raw_path` is resolved against `base` (the tool's live cwd when
+/// known, else the session's recorded workdir), then canonicalized best-effort,
+/// falling back to the joined lexical path when canonicalize fails (e.g. a file the
+/// write just created then removed still keys deterministically). `base` empty/None
+/// leaves a relative path lexical. Returns `None` only for a blank input.
+fn canonicalize_claim_path(raw_path: &str, base: Option<&str>) -> Option<String> {
+    let raw_path = raw_path.trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(raw_path);
+    let abs = if p.is_absolute() {
+        p
+    } else if let Some(b) = base.filter(|b| !b.is_empty()) {
+        Path::new(b).join(&p)
+    } else {
+        p
+    };
+    let canon = std::fs::canonicalize(&abs).unwrap_or(abs);
+    Some(canon.to_string_lossy().into_owned())
 }
 
 /// SA3 write-half mechanism: record an advisory edit-claim for `session` on the
@@ -1938,31 +1979,25 @@ fn session_auto_claim_room(root: &Root, session: &str) -> Option<String> {
 /// never claims an empty path). ADVISORY: every failure is swallowed (logged at
 /// most) — recording a claim must never break or block the coding session.
 fn auto_claim_write(root: &Root, session: &str, raw_path: &str, cwd: Option<&str>) {
-    let raw_path = raw_path.trim();
-    if raw_path.is_empty() {
+    if raw_path.trim().is_empty() {
         // No/blank path (e.g. a malformed tool event): nothing honest to claim.
         return;
     }
-    let Some(room) = session_auto_claim_room(root, session) else {
+    let Some((room, workdir)) = session_auto_claim_room_and_workdir(root, session) else {
         // No durable record yet (native session id not observed) — can't resolve
         // the room. Skip silently; the next write after the record lands will claim.
         return;
     };
-    // Key on the canonical absolute path, matching the fs cameras (emit_fs_delta /
-    // claude_read_fs_events both key `obs/fs/<canonical>`): resolve a relative path
-    // against the tool's cwd, then canonicalize best-effort, falling back to the
-    // lexical path when canonicalize fails (a path the write just created, then
-    // removed, still keys deterministically).
-    let p = PathBuf::from(raw_path);
-    let abs = if p.is_absolute() {
-        p
-    } else if let Some(c) = cwd {
-        Path::new(c).join(&p)
-    } else {
-        p
+    // Resolve a relative path against the tool's LIVE cwd when known, else fall back
+    // to the session's recorded workdir (BUG A): on a RESUMED codex/opencode session
+    // capture is called with record_workdir=None → cwd=None here, and canonicalizing
+    // a relative path against the launcher's process cwd would yield a WRONG claim.
+    // The recorded workdir is the same base launch resolved against, so resume now
+    // claims the identical absolute path. An absolute path ignores the base.
+    let base = cwd.filter(|c| !c.is_empty()).unwrap_or(workdir.as_str());
+    let Some(claim_path) = canonicalize_claim_path(raw_path, Some(base)) else {
+        return;
     };
-    let canon = std::fs::canonicalize(&abs).unwrap_or(abs);
-    let claim_path = canon.to_string_lossy();
     // add_claim is idempotent per (room, session, path): re-editing the same file
     // refreshes the timestamp, never duplicates — the dedupe guarantee SA3 needs.
     if let Err(e) = codesession::add_claim(root, &room, session, &claim_path) {
@@ -8445,6 +8480,102 @@ mod tests {
         assert!(codesession::peer_claims(&root, &wd_room, "code-peer0000")
             .unwrap()
             .is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa3_resumed_session_relative_path_resolves_against_recorded_workdir() {
+        // BUG A: on a RESUMED codex/opencode session the capture is called with
+        // record_workdir=None → auto_claim_write gets cwd=None. A RELATIVE harness
+        // path must resolve against the session's RECORDED workdir (what launch used)
+        // — NOT the launcher process cwd — so resume claims the identical absolute
+        // path launch would. Use a real temp dir + file so canonicalize succeeds and
+        // the assertion is independent of the test process's own cwd.
+        let root = delivery_tmp_root();
+        let workdir = root.dir.join("resumed-proj");
+        std::fs::create_dir_all(workdir.join("src")).unwrap();
+        std::fs::write(workdir.join("src/foo.rs"), b"// x").unwrap();
+        let workdir = std::fs::canonicalize(&workdir).unwrap();
+        let workdir = workdir.to_string_lossy().to_string();
+        let room = sa3_record_session(&root, "code-resume01", &workdir);
+
+        // Resume: cwd=None, a RELATIVE path from the harness.
+        auto_claim_write(&root, "code-resume01", "src/foo.rs", None);
+
+        let want = std::fs::canonicalize(Path::new(&workdir).join("src/foo.rs"))
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        // Sanity: the recorded workdir is NOT the test process cwd, so a process-cwd
+        // resolution would have produced a different (wrong) path.
+        assert_ne!(
+            std::env::current_dir().unwrap().to_string_lossy(),
+            workdir,
+            "test precondition: recorded workdir must differ from process cwd"
+        );
+        let peers = codesession::peer_claims(&root, &room, "code-resviewer").unwrap();
+        assert!(
+            peers
+                .iter()
+                .any(|c| c.session == "code-resume01" && c.path == want),
+            "resumed (cwd=None) relative path must claim {want} (resolved against the \
+             recorded workdir); saw {peers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa3_manual_and_auto_claim_of_one_file_collapse_to_one_row() {
+        // BUG B: a manual `claim src/foo.rs` (was stored VERBATIM) and the SA3
+        // auto-claim of the same file (stored CANONICAL) used to land as TWO rows,
+        // double-listing one file for a roommate. Both now canonicalize against the
+        // session workdir, so they collapse to ONE row per (room, session, path).
+        let root = delivery_tmp_root();
+        let workdir = root.dir.join("collapse-proj");
+        std::fs::create_dir_all(workdir.join("src")).unwrap();
+        std::fs::write(workdir.join("src/foo.rs"), b"// x").unwrap();
+        let workdir = std::fs::canonicalize(&workdir).unwrap();
+        let workdir = workdir.to_string_lossy().to_string();
+        let room = sa3_record_session(&root, "code-collapse1", &workdir);
+
+        // Manual claim path: claim_cmd canonicalizes a relative path against the
+        // recorded workdir before add_claim — exercise that exact shared resolution.
+        let manual = canonicalize_claim_path("src/foo.rs", Some(&workdir)).unwrap();
+        codesession::add_claim(&root, &room, "code-collapse1", &manual).unwrap();
+        // Auto-claim of the SAME file (relative, resolved against workdir).
+        auto_claim_write(&root, "code-collapse1", "src/foo.rs", Some(&workdir));
+
+        let peers = codesession::peer_claims(&root, &room, "code-collapsevw").unwrap();
+        let n = peers
+            .iter()
+            .filter(|c| c.session == "code-collapse1")
+            .count();
+        assert_eq!(
+            n, 1,
+            "manual + auto claim of one file must be ONE row, not two; saw {peers:?}"
+        );
+        let want = std::fs::canonicalize(Path::new(&workdir).join("src/foo.rs"))
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(peers[0].path, want, "the one row must be the canonical path");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn sa3_blank_and_no_record_paths_stay_safe_noops() {
+        // Guardrail (unchanged): blank/whitespace paths and a missing record both
+        // record nothing and never panic — on BOTH the cwd=Some and cwd=None paths.
+        let root = delivery_tmp_root();
+        let workdir = "/tmp/sa3-safe";
+        let room = sa3_record_session(&root, "code-safe0001", workdir);
+        auto_claim_write(&root, "code-safe0001", "", None);
+        auto_claim_write(&root, "code-safe0001", "   ", Some(workdir));
+        assert!(canonicalize_claim_path("   ", Some(workdir)).is_none());
+        // No record at all (native id not observed) is a no-op even with cwd=None.
+        auto_claim_write(&root, "code-norecord0", "src/x.rs", None);
+        let peers = codesession::peer_claims(&root, &room, "code-safeview0").unwrap();
+        assert!(peers.is_empty(), "blank/no-record must claim nothing; saw {peers:?}");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
