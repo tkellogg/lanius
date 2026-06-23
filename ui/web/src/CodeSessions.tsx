@@ -7,7 +7,8 @@
 // event timeline. Kept in its own file (and styled with a scoped <style> block)
 // so it can be dropped into whatever nav/"Workers" surface owns it without
 // colliding with the rest of App.tsx.
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { openLiveStream } from './live';
 
 type Stat = {
   elanus_session: string;
@@ -142,15 +143,220 @@ function SessionNode({
   );
 }
 
+// ---------------------------------------------------------------------------
+// M3 live fold. The materializer (src/code_projection.rs) folds coding obs into
+// the sqlite projection; here we mirror that fold over the live bus tail so a
+// session that started before the page loaded (sqlite backfill) and one that
+// starts while watching (live) render identically.
+//
+// A LivePatch is the accumulated effect of the live events seen for one
+// elanus_session since the last sqlite backfill that already reflected them.
+// Idempotency: the obs envelope on the bus carries NO per-event id, but the web
+// relay stamps every formed SSE message with a server-side monotonic `seq`
+// (server.mjs) that is stable across the ring-buffer replay it sends to each
+// (re)connecting EventSource. We apply each seq at most once (seenSeqs ref-set,
+// mirroring App.tsx seenAsks/seenFailures), so an at-least-once / replayed
+// delivery — e.g. the whole ring re-broadcast on a transient SSE reconnect —
+// never double-counts tokens, resumes, or status. On every backfill we DROP the
+// live patches AND clear seenSeqs — the fresh sqlite row is the authority for
+// everything the materializer has already folded, and only events newer than
+// that backfill survive (re-folded from the still-open stream going forward).
+// Live is strictly additive on top of sqlite.
+type LivePatch = {
+  elanus_session: string;
+  agent_noun?: string | null;
+  tool?: string | null;
+  workdir?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  parent?: string | null;
+  native_session?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  exit_code?: number | null;
+  last_status?: string | null;
+  input_tokens: number; // delta accumulated from live session/idle events
+  output_tokens: number; // delta
+  resume_count: number; // delta from live session/resume events
+  updated_at?: string | null;
+  saw_event: boolean; // a non-lifecycle leaf (tool/assistant/...) bumps activity
+};
+
+// Parse a coding-session obs topic: obs/agent/<noun>/<elanus_session>/<leaf>.
+// Mirrors parsed_topic() in the materializer (codex | claude-code; code-* id).
+function parseCodingTopic(topic: string): { noun: string; session: string; leaf: string } | null {
+  const rest = topic.startsWith('obs/agent/') ? topic.slice('obs/agent/'.length) : null;
+  if (!rest) return null;
+  const slash1 = rest.indexOf('/');
+  if (slash1 < 0) return null;
+  const noun = rest.slice(0, slash1);
+  if (noun !== 'codex' && noun !== 'claude-code') return null;
+  const slash2 = rest.indexOf('/', slash1 + 1);
+  if (slash2 < 0) return null;
+  const session = rest.slice(slash1 + 1, slash2);
+  if (!session.startsWith('code-')) return null;
+  const leaf = rest.slice(slash2 + 1);
+  if (!leaf) return null;
+  return { noun, session, leaf };
+}
+
+function num(v: any): number {
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// Fold one live obs event into the patch map (mutating a fresh copy). Returns the
+// next map. Token/resume effects accumulate as deltas; lifecycle leaves set the
+// terminal status; everything else just marks activity (keeps a card "running").
+function foldLive(prev: Map<string, LivePatch>, topic: string, env: any): Map<string, LivePatch> {
+  const parsed = parseCodingTopic(topic);
+  if (!parsed) return prev;
+  const { noun, session, leaf } = parsed;
+  const payload = env?.payload && typeof env.payload === 'object' ? env.payload : {};
+  const ts: string | null = (typeof payload.ts === 'string' ? payload.ts : null) ?? env?.ts ?? null;
+  const next = new Map(prev);
+  const p: LivePatch = {
+    ...(next.get(session) ?? {
+      elanus_session: session,
+      input_tokens: 0,
+      output_tokens: 0,
+      resume_count: 0,
+      saw_event: false,
+    }),
+  };
+  p.agent_noun = p.agent_noun ?? noun;
+  if (ts) p.updated_at = ts;
+  switch (leaf) {
+    case 'session/start':
+      p.tool = p.tool ?? (typeof payload.tool === 'string' ? payload.tool : null);
+      p.workdir = p.workdir ?? (typeof payload.workdir === 'string' ? payload.workdir : null);
+      p.model = p.model ?? (typeof payload.model === 'string' ? payload.model : null);
+      p.effort = p.effort ?? (typeof payload.effort === 'string' ? payload.effort : null);
+      p.parent = p.parent ?? (typeof payload.parent === 'string' ? payload.parent : null);
+      p.started_at = p.started_at ?? ts;
+      p.last_status = 'running';
+      break;
+    case 'session/thread':
+      if (noun === 'codex' && typeof payload.codex_thread === 'string') p.native_session = payload.codex_thread;
+      break;
+    case 'session/started':
+      if (noun === 'claude-code' && typeof payload.cc_session === 'string') p.native_session = payload.cc_session;
+      break;
+    case 'session/resume':
+      p.resume_count += 1;
+      p.last_status = 'running';
+      break;
+    case 'session/idle':
+      p.input_tokens += num(payload?.usage?.input_tokens);
+      p.output_tokens += num(payload?.usage?.output_tokens);
+      p.last_status = 'idle';
+      break;
+    case 'session/stop':
+      p.ended_at = ts;
+      if (payload.exit_code != null) p.exit_code = num(payload.exit_code);
+      p.last_status = 'done';
+      break;
+    default:
+      // tool/<...>, assistant/message, tokens, etc. — activity only.
+      p.saw_event = true;
+      if (p.last_status == null || p.last_status === 'done') p.last_status = 'running';
+      break;
+  }
+  next.set(session, p);
+  return next;
+}
+
+// Merge the sqlite backfill with the live patches. Idempotent by construction:
+// the backfill row is the base; a patch only ADDS token/resume deltas it has
+// accumulated since that row and advances status/lifecycle fields. A session
+// seen only live (started while watching, not yet in sqlite) is synthesized from
+// its patch alone, so it renders the same shape as a backfilled row.
+function mergeLive(backfill: Stat[], patches: Map<string, LivePatch>): Stat[] {
+  const byId = new Map<string, Stat>();
+  for (const s of backfill) byId.set(s.elanus_session, { ...s });
+  for (const [id, p] of patches) {
+    const base = byId.get(id);
+    if (base) {
+      const merged: Stat = { ...base };
+      merged.input_tokens = base.input_tokens + p.input_tokens;
+      merged.output_tokens = base.output_tokens + p.output_tokens;
+      merged.resume_count = base.resume_count + p.resume_count;
+      if (p.native_session && !merged.native_session) merged.native_session = p.native_session;
+      if (p.parent && !merged.parent) merged.parent = p.parent;
+      // Lifecycle: 'done' is terminal and wins; otherwise the live status (the
+      // newer signal) takes precedence over the backfill's older status.
+      if (p.last_status) {
+        if (p.last_status === 'done') {
+          merged.last_status = 'done';
+          merged.ended_at = p.ended_at ?? merged.ended_at;
+          if (p.exit_code != null) merged.exit_code = p.exit_code;
+        } else if (merged.last_status !== 'done') {
+          merged.last_status = p.last_status;
+        }
+      }
+      if (p.updated_at && (!merged.updated_at || p.updated_at > merged.updated_at)) merged.updated_at = p.updated_at;
+      merged.duration_ms = computeDuration(merged);
+      byId.set(id, merged);
+    } else {
+      // Live-only session not yet in sqlite — synthesize a full row.
+      const syn: Stat = {
+        elanus_session: id,
+        tool: p.tool ?? null,
+        agent_noun: p.agent_noun ?? null,
+        native_session: p.native_session ?? null,
+        workdir: p.workdir ?? null,
+        model: p.model ?? null,
+        effort: p.effort ?? null,
+        parent: p.parent ?? null,
+        started_at: p.started_at ?? null,
+        ended_at: p.ended_at ?? null,
+        exit_code: p.exit_code ?? null,
+        last_status: p.last_status ?? (p.saw_event ? 'running' : null),
+        resume_count: p.resume_count,
+        input_tokens: p.input_tokens,
+        output_tokens: p.output_tokens,
+        updated_at: p.updated_at ?? null,
+        duration_ms: null,
+      };
+      syn.duration_ms = computeDuration(syn);
+      byId.set(id, syn);
+    }
+  }
+  return [...byId.values()];
+}
+
+// Derive duration the same way the read API does (start→end, or start→now while
+// running) so a live-only card shows a ticking duration consistent with sqlite.
+function computeDuration(s: Stat): number | null {
+  if (!s.started_at) return s.duration_ms ?? null;
+  const start = Date.parse(s.started_at);
+  if (!Number.isFinite(start)) return s.duration_ms ?? null;
+  const endRef = s.ended_at ? Date.parse(s.ended_at) : Date.now();
+  if (!Number.isFinite(endRef)) return s.duration_ms ?? null;
+  return Math.max(0, endRef - start);
+}
+
 export default function CodeSessions() {
-  const [sessions, setSessions] = useState<Stat[]>([]);
+  const [backfill, setBackfill] = useState<Stat[]>([]);
+  const [livePatches, setLivePatches] = useState<Map<string, LivePatch>>(new Map());
   const [error, setError] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<Detail | null>(null);
   const [copied, setCopied] = useState(false);
+  // The newest updated_at across the live patches, captured at backfill time so
+  // we know the projection has caught up. Used only to gate detail refresh.
+  const liveSeq = useRef(0);
+  // Per-delivery dedup: the set of server SSE `seq` values already folded since
+  // the last backfill. The ring buffer is re-broadcast on every EventSource
+  // reconnect, so without this the same session/idle / session/resume frames
+  // would be re-folded and double-count tokens/resumes on live cards.
+  const seenSeqs = useRef<Set<number>>(new Set());
 
-  // Poll the list every 5s — a simple stand-in for a live feed until an SSE
-  // relay of obs/agent/+/+/# is wired (M3).
+  // Backfill from sqlite (M2). This is the source of truth for HISTORY — on first
+  // mount and on an infrequent repair tick (the live feed carries the fast path
+  // now, so this is just reconciliation, not the 5s stand-in poll). Each backfill
+  // CLEARS the live patches: the fresh sqlite row already folds every event the
+  // materializer has processed, so replaying those patches would double-count.
   useEffect(() => {
     let alive = true;
     const load = async () => {
@@ -159,7 +365,12 @@ export default function CodeSessions() {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = (await r.json()) as Stat[];
         if (alive) {
-          setSessions(Array.isArray(data) ? data : []);
+          setBackfill(Array.isArray(data) ? data : []);
+          // Reconcile: drop accumulated live deltas now reflected in sqlite, and
+          // forget the seqs we deduped against — they are folded into this row
+          // now, and seqs newer than this backfill will be applied fresh.
+          setLivePatches(new Map());
+          seenSeqs.current = new Set();
           setError('');
         }
       } catch (e) {
@@ -167,14 +378,50 @@ export default function CodeSessions() {
       }
     };
     load();
-    const t = setInterval(load, 5000);
+    const t = setInterval(load, 30000);
     return () => {
       alive = false;
       clearInterval(t);
     };
   }, []);
 
-  // Load detail when a session is selected (and refresh it with the list tick).
+  // M3: subscribe to the SAME live SSE feed App.tsx uses (/api/stream via
+  // openLiveStream). Fold coding obs deltas into livePatches; ignore everything
+  // else. Shares the relay transport — no new endpoint, no new socket protocol.
+  useEffect(() => {
+    const es = openLiveStream(
+      (m: any) => {
+        if (m.kind !== 'message' || typeof m.topic !== 'string') return;
+        if (!parseCodingTopic(m.topic)) return;
+        // Apply each server `seq` at most once. The ring is re-broadcast on every
+        // SSE reconnect; without this guard the additive token/resume deltas in
+        // foldLive would be re-applied and inflate live cards. (Frames lacking a
+        // seq fall through and are folded — the relay always stamps one today.)
+        if (typeof m.seq === 'number') {
+          if (seenSeqs.current.has(m.seq)) return;
+          seenSeqs.current.add(m.seq);
+        }
+        setLivePatches((prev) => {
+          const next = foldLive(prev, m.topic, m.env);
+          if (next !== prev) liveSeq.current += 1;
+          return next;
+        });
+      },
+      () => {
+        /* transient relay drop — the backfill tick still reconciles state */
+      },
+    );
+    return () => es.close();
+  }, []);
+
+  // The rendered set: sqlite history with live deltas merged on top.
+  const sessions = mergeLive(backfill, livePatches);
+
+  // Load detail (from sqlite M2) when a session is selected, and refresh it when
+  // the backfill changes OR the selected session sees new live activity. We key
+  // on the selected patch's updated_at (a primitive) rather than the `sessions`
+  // array identity — which is fresh every render and would refetch in a loop.
+  const selectedLiveStamp = selected ? livePatches.get(selected)?.updated_at ?? '' : '';
   useEffect(() => {
     if (!selected) {
       setDetail(null);
@@ -188,7 +435,7 @@ export default function CodeSessions() {
     return () => {
       alive = false;
     };
-  }, [selected, sessions]);
+  }, [selected, backfill, selectedLiveStamp]);
 
   // Roots: sessions with no parent, or whose parent is not in the set.
   const ids = new Set(sessions.map((s) => s.elanus_session));
@@ -235,27 +482,33 @@ export default function CodeSessions() {
         ))}
       </div>
 
-      {detail && (
+      {detail && (() => {
+        // Overlay the live-folded row (status/tokens/duration/resumes) onto the
+        // sqlite detail so the header badge stays consistent with the live card
+        // even between backfills — same merge the list uses, keyed by id.
+        const live = sessions.find((s) => s.elanus_session === detail.session.elanus_session);
+        const ds: Stat = live ? { ...detail.session, ...live, relaunches: detail.session.relaunches, driven_resumes: detail.session.driven_resumes, incarnations: detail.session.incarnations } : detail.session;
+        return (
         <div className="cs-detail">
-          <h3 className="cs-h">{detail.session.elanus_session}</h3>
+          <h3 className="cs-h">{ds.elanus_session}</h3>
           <div className="cs-kv">
-            <span>tool</span><b>{detail.session.tool ?? '?'}</b>
-            <span>model / effort</span><b>{(detail.session.model ?? '?') + ' / ' + (detail.session.effort ?? '?')}</b>
-            <span>status</span><b><StatusBadge status={detail.session.last_status} /></b>
-            <span>duration</span><b>{humanDuration(detail.session.duration_ms)}</b>
-            <span>tokens</span><b>{humanTokens(detail.session.input_tokens)} in / {humanTokens(detail.session.output_tokens)} out</b>
-            {detail.session.relaunches != null || detail.session.driven_resumes != null ? (
+            <span>tool</span><b>{ds.tool ?? '?'}</b>
+            <span>model / effort</span><b>{(ds.model ?? '?') + ' / ' + (ds.effort ?? '?')}</b>
+            <span>status</span><b><StatusBadge status={ds.last_status} /></b>
+            <span>duration</span><b>{humanDuration(ds.duration_ms)}</b>
+            <span>tokens</span><b>{humanTokens(ds.input_tokens)} in / {humanTokens(ds.output_tokens)} out</b>
+            {ds.relaunches != null || ds.driven_resumes != null ? (
               <>
                 <span>relaunches</span>
-                <b>{detail.session.relaunches ?? 0} <span className="cs-dim">manual</span></b>
+                <b>{ds.relaunches ?? 0} <span className="cs-dim">manual</span></b>
                 <span>driven resumes</span>
-                <b>{detail.session.driven_resumes ?? 0} <span className="cs-dim">daemon</span></b>
+                <b>{ds.driven_resumes ?? 0} <span className="cs-dim">daemon</span></b>
               </>
             ) : (
-              <><span>resumes</span><b>{detail.session.resume_count}</b></>
+              <><span>resumes</span><b>{ds.resume_count}</b></>
             )}
-            {detail.session.parent && (<><span>parent</span><b className="cs-id">{detail.session.parent}</b></>)}
-            {detail.session.workdir && (<><span>workdir</span><b className="cs-id">{detail.session.workdir}</b></>)}
+            {ds.parent && (<><span>parent</span><b className="cs-id">{ds.parent}</b></>)}
+            {ds.workdir && (<><span>workdir</span><b className="cs-id">{ds.workdir}</b></>)}
           </div>
 
           <div className="cs-resume">
@@ -289,7 +542,8 @@ export default function CodeSessions() {
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
