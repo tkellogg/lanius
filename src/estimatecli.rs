@@ -98,7 +98,7 @@ fn pricing_path(root: &Root, opts: &EstimateOpts) -> PathBuf {
     }
     let candidates = [
         root.packages().join("estimation").join("pricing.toml"),
-        root.dir.join("kits/stdlib/packages/estimation/pricing.toml"),
+        root.dir.join("kits/core/packages/estimation/pricing.toml"),
     ];
     candidates
         .iter()

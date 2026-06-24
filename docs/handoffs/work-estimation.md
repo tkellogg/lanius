@@ -5,11 +5,16 @@ last-updated: 2026-06-23
 ---
 
 > **Status:** E1–E3 shipped. The no-kernel-data-model constraint held — state
-> lives in `context_blocks` + `obs/estimate` events (no estimation tables). Open
-> placement question for Tim: the package landed in `kits/stdlib/` (protected,
-> auto-approved → always-on), which sits awkwardly with the journey's
-> "additive/optional bolt-on" framing; consider moving it to a non-protected kit.
-> LLM "why it missed" reflection and the live mid-session watcher remain documented
+> lives in `context_blocks` + `obs/estimate` events (no estimation tables). The
+> placement question is **resolved**: the package now lives in `kits/core/`
+> (non-protected), so estimation is an **additive, revoke-guarded bolt-on** —
+> `elanus revoke estimation` turns off the cron sweep without `--force` (it is
+> not in `protected_packages`), matching the journey's "additive/optional"
+> framing instead of being protected/always-on under `kits/stdlib`. Note that
+> `kit add` is a human install gesture, so estimation's grant is auto-approved
+> on install (the sweep runs immediately); `elanus kit add core --pending`
+> stages it for `elanus approve estimation` if you want to review first. LLM
+> "why it missed" reflection and the live mid-session watcher remain documented
 > follow-ons.
 
 # Work estimation
@@ -134,7 +139,7 @@ M2).
   high, 1 round, `pass`; `cargo test` 274, 8 estimation tests). Delivered as a thin
   `elanus estimate` CLI (`src/estimate.rs`, `src/estimatecli.rs`, wired in
   `src/main.rs`) + a Stop-hook retro wire (`src/codeagent.rs`) + a package
-  (`kits/stdlib/packages/estimation/` — `elanus.toml`, `pricing.toml`, `SKILL.md`,
+  (`kits/core/packages/estimation/` — `elanus.toml`, `pricing.toml`, `SKILL.md`,
   `scripts/sweep` cron backstop). **No estimation kernel data model** (verified: no
   new table in `db.rs`) — state is `estimate` / `estimate-vs-actual` / `estimation`
   blocks + `obs/estimate/<session>` events.
@@ -154,8 +159,28 @@ M2).
     vary against — `Estimate` has no tool_calls field); (2) a retro-timing edge (if
     Stop fires before the final obs folds, a miss could record 0s and is sticky) —
     mitigated because `report()` flushes the trace first; acceptable for the MVP.
-  - **For Tim:** the package is in `kits/stdlib` (protected/always-on) — likely
-    belongs in a non-protected kit given the "additive/optional" framing.
+  - **2026-06-24 — placement resolved:** moved `kits/stdlib/packages/estimation/`
+    → `kits/core/packages/estimation/` (core has no `kit.toml protected=true`).
+    Estimation is now **non-protected → revoke-guarded**: `elanus revoke
+    estimation` turns off the cron sweep without `--force` (it is not in
+    `protected_packages`), matching the "additive/optional" framing. Note the
+    grant axis is separate: `kit add` (and `init --kit core`) is a human install
+    gesture, so estimation's cron grant is **auto-approved** on install and the
+    sweep runs immediately — `elanus approve estimation` is a no-op unless you
+    installed with the explicit `--pending` flag. The only load-bearing code change
+    was the `pricing.toml` fallback lookup in `src/estimatecli.rs::pricing_path`
+    (`kits/stdlib/...` → `kits/core/...`); the primary lookup is already the
+    profile package-path (`root.packages()/estimation/pricing.toml`), so an
+    installed copy resolves dynamically and dollars still compute.
+    - **Accepted minors (relocation verify):** (1) the relocated `pricing.toml`
+      fallback path has no PERMANENT unit test — the changed line is behaviorally
+      proven (a throwaway test confirmed dollars resolve from the `kits/core` fallback)
+      but the shipped suite only exercises the primary package-path lookup; optional
+      follow-on. (2) PRE-EXISTING, not this move: `STOCK_KIT_FILES` (`src/initcmd.rs`)
+      embeds only escalate/harness-doctrine/self-modify into a binary `init`, NOT
+      estimation — so a binary-installed root never materializes the estimation package
+      or its pricing fallback; dev/repo builds resolve it from the repo `kits/` dir.
+      Worth a separate task if estimation should ship to binary installs.
 - **2026-06-23 — planning.** Confirmed with Tim: estimation is a **package**, no
   kernel data-model representation; dollars are the cross-model normalizer but
   estimate every dimension. Identified the live risk: **dollars have no source**

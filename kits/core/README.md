@@ -18,13 +18,26 @@ running inside it, plus the escalation path to a stronger model.
   mid-cycle), shared-room edit claims and the opt-in channel block, and the
   failure-mail contract. Read before dispatching work or coordinating with
   siblings.
+- **estimation** — work estimation as an additive bolt-on: `elanus estimate
+  set/actual/retro`, the per-model `pricing.toml` that turns token usage into
+  dollars, and a cron `sweep` backstop for the retro. No kernel data model —
+  state rides `estimate`/`estimation` blocks + `obs/estimate` events. Like any
+  non-protected package it is **revoke-guarded** — `elanus revoke estimation`
+  turns off the cron sweep without `--force`. The CLI verbs work regardless of
+  the cron.
 - **profiles/architect** — the strong-model identity the escalation
   targets: high turn budget, full skill visibility. Point its `[model]`
   at the strongest model you have credentials for.
 
 Install: `elanus kit add core`. The skills are content-only (no grants to
 approve); the architect profile is yours to edit — especially the model
-line and any `[sandbox]` policy you want it caged by.
+line and any `[sandbox]` policy you want it caged by. The one package that
+*does* carry a grant is **estimation** (its cron `sweep`): `kit add` is a human
+install gesture, so that grant is auto-approved (`kit:core`) and the sweep runs
+immediately. If you'd rather review before it goes live, install with
+`elanus kit add core --pending` and run `elanus approve estimation` when ready.
+Because core is non-protected, `elanus revoke estimation` later turns the sweep
+back off without `--force`.
 
 Try it: `elanus emit in/agent/architect --payload \
 '{"prompt":"introduce yourself and read your skills","profile":"architect"}'`
