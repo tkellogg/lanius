@@ -362,6 +362,10 @@ pub struct InboxItem {
     pub created_at: String,
     /// Whether this session has already pulled this delivery via `code inbox`.
     pub seen: bool,
+    /// The delivery's `events.priority` (C3 — agent-comms). A higher number is
+    /// more urgent; it drives the inbox block's injection vector (HIGH-priority
+    /// unseen mail reaches the model mid-cycle on Claude Code). Default 0.
+    pub priority: i32,
 }
 
 /// Read a session's OWN inbox: the deliveries on ITS mailbox topic
@@ -397,7 +401,7 @@ pub fn inbox_for_session(
     // flag is THIS session's read state, never another's.
     let mut stmt = conn.prepare(
         "SELECT e.id, COALESCE(e.payload,''), e.sender, e.correlation_id, e.state, e.created_at,
-                (s.event_id IS NOT NULL) AS seen
+                (s.event_id IS NOT NULL) AS seen, COALESCE(e.priority, 0) AS priority
          FROM events e
          LEFT JOIN code_inbox_seen s
            ON s.session = ?1 AND s.event_id = e.id
@@ -416,11 +420,12 @@ pub fn inbox_for_session(
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 seen,
+                r.get::<_, i32>(7)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut items = Vec::new();
-    for (event_id, payload, from, correlation, state, created_at, seen) in rows {
+    for (event_id, payload, from, correlation, state, created_at, seen, priority) in rows {
         if unseen_only && seen {
             continue;
         }
@@ -436,6 +441,7 @@ pub fn inbox_for_session(
             state,
             created_at,
             seen,
+            priority,
         });
     }
     Ok(items)
@@ -461,6 +467,58 @@ pub fn mark_inbox_seen(root: &Root, session: &str, event_ids: &[i64]) -> Result<
         )?;
     }
     Ok(())
+}
+
+/// C3 (agent-comms) — claim the unseen, HIGH-priority inbox messages that have
+/// not yet been handed to this session MID-CYCLE, recording each as delivered so
+/// it is not re-injected on the next tool call. A message qualifies when it is
+/// unseen (not yet pulled via `code inbox`) AND its `events.priority >= threshold`.
+/// Returns the newly-claimed items (newest last). This MUTATES the dedup table —
+/// call it only from the emitting hook arm, never as a pure read, or a message
+/// would be marked delivered without being shown.
+///
+/// This deliberately does NOT mark the messages `seen`: the agent has not pulled
+/// them, so they still count in the next-turn inbox block; this only suppresses the
+/// louder mid-cycle re-injection of the SAME message every tool call. Mirrors
+/// `context_store::take_pending_mid_cycle` for blocks, but keyed by the immutable
+/// event id (mail is not edited in place, so one delivery per message).
+pub fn take_pending_mid_cycle_mail(
+    root: &Root,
+    agent_noun: &str,
+    session: &str,
+    threshold: i32,
+) -> Result<Vec<InboxItem>> {
+    if !is_session_principal(session) {
+        return Ok(Vec::new());
+    }
+    let unseen = inbox_for_session(root, agent_noun, session, true)?;
+    let conn = crate::db::open(root).context("opening the ledger for mid-cycle mail")?;
+    crate::db::init_schema(&conn)?;
+    let mut out = Vec::new();
+    for item in unseen {
+        if item.priority < threshold {
+            continue; // normal mail rides the next-turn inbox block only
+        }
+        // Already handed mid-cycle? (per (session, event_id)) → skip.
+        let already: bool = conn
+            .query_row(
+                "SELECT 1 FROM code_mail_delivered WHERE session = ?1 AND event_id = ?2",
+                rusqlite::params![session, item.event_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if already {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO code_mail_delivered (session, event_id) VALUES (?1, ?2)
+             ON CONFLICT(session, event_id) DO NOTHING",
+            rusqlite::params![session, item.event_id],
+        )?;
+        out.push(item);
+    }
+    Ok(out)
 }
 
 /// The owner (agent noun) a session's memory `note` block is stored under. The
@@ -678,6 +736,67 @@ pub fn peer_claims(root: &Root, room: &str, viewer: &str) -> Result<Vec<Claim>> 
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// One recent message seen on a shared channel (C4 — agent-comms): a room's
+/// (`in/group/<id>`) traffic, surfaced advisory in the `channel:<id>` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelMsg {
+    /// The broker-verified sender, if recorded.
+    pub from: Option<String>,
+    /// The message text (the delivery's prompt/text field).
+    pub message: String,
+    /// When it was recorded.
+    pub created_at: String,
+}
+
+/// C4 (agent-comms) — the most recent `recent_n` messages on a room's shared
+/// channel (`in/group/<id>`), newest last. Advisory: this is the channel block's
+/// source. The `room` is the session's OWN room (derived from its record/workdir
+/// by the caller), never an argument a peer supplies — a session can only ever see
+/// the channel of a room it belongs to. An empty room or zero bound yields nothing
+/// (a session not in any room sees no channel). Bounded by `recent_n` so a busy
+/// channel cannot flood the turn. Best-effort: a ledger error yields an empty list.
+pub fn room_recent(root: &Root, room: &str, recent_n: usize) -> Result<Vec<ChannelMsg>> {
+    if room.is_empty() || recent_n == 0 {
+        return Ok(Vec::new());
+    }
+    let topic = format!("in/group/{}", crate::topic::encode_segment(room));
+    let conn = crate::db::open(root).context("opening the ledger for the channel")?;
+    crate::db::init_schema(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT e.sender, COALESCE(e.payload,''), e.created_at
+           FROM events e
+          WHERE e.type = ?1
+          ORDER BY e.id DESC
+          LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![topic, recent_n as i64], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The query returns newest first (bounded); reverse to newest-LAST for the
+    // chronological render the injection uses elsewhere.
+    let mut out: Vec<ChannelMsg> = rows
+        .into_iter()
+        .map(|(from, payload, created_at)| {
+            let pv: serde_json::Value =
+                serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+            let message = crate::codeagent::delivery_message(&pv).unwrap_or_default();
+            ChannelMsg {
+                from,
+                message,
+                created_at,
+            }
+        })
+        .collect();
+    out.reverse();
+    Ok(out)
 }
 
 /// List a session's OWN current claims in a room (what it has announced). For the

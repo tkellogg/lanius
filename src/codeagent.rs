@@ -2205,6 +2205,31 @@ fn mid_cycle_injection(root: &Root, agent_noun: &str, session: &str) -> Option<S
     Some(out)
 }
 
+/// C3 (agent-comms) — compose the mid-cycle injection text for HIGH-priority
+/// UNSEEN inbox mail (Claude Code): the not-yet-delivered-mid-cycle messages whose
+/// `events.priority >= high_priority_threshold` (config). `None` when there is no
+/// such mail (the dedup'd common case). MUTATES the dedup table
+/// (`code_mail_delivered`) — call only from the emitting hook arm. The message is
+/// NOT marked seen: it still shows in the next-turn inbox block until the agent
+/// pulls it; this vector only makes the urgent ones arrive sooner, once each.
+fn mid_cycle_mail_injection(root: &Root, agent_noun: &str, session: &str) -> Option<String> {
+    let threshold = high_priority_threshold(root);
+    let pending =
+        codesession::take_pending_mid_cycle_mail(root, agent_noun, session, threshold)
+            .unwrap_or_default();
+    if pending.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "[elanus] Urgent mail arrived mid-task (high-priority — run `elanus code inbox` to read):",
+    );
+    for m in &pending {
+        let from = m.from.as_deref().unwrap_or("?");
+        out.push_str(&format!("\n  From {from}: {}", clip(&m.message, 400)));
+    }
+    Some(out)
+}
+
 /// M4 degradation — when a MID-CYCLE block is visible to a session whose harness
 /// CANNOT push mid-cycle (Codex; opencode-headless until the served path lands), it
 /// is delivered on the next-turn vector instead. Log that downgrade once per
@@ -2227,6 +2252,130 @@ has no live mid-cycle vector; DEGRADED to next-turn (delivered in this turn's in
             );
         }
     }
+}
+
+/// The package the agent-comms config lives under (config/packages/agent-comms.toml).
+/// C3's high-priority threshold and C4's channel opt-in are read from here so they
+/// are owner-tunable (per docs/config.md), not hardcoded.
+const COMMS_PACKAGE: &str = "agent-comms";
+
+/// C3 (agent-comms) — the `events.priority` at or above which an UNSEEN inbox
+/// message is HIGH-priority and must reach the model mid-cycle (Claude Code), not
+/// just next-turn. Read from `agent-comms.high_priority_threshold`; defaults to 5
+/// when unset/unparseable (mail priority is 0 by default, so the louder vector is
+/// reserved for explicitly-elevated deliveries). Best-effort: any config error
+/// falls back to the default rather than breaking the (telemetry-tier) injection.
+fn high_priority_threshold(root: &Root) -> i32 {
+    const DEFAULT: i32 = 5;
+    crate::config_repo::get_key(root, COMMS_PACKAGE, "high_priority_threshold")
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<i32>().ok())
+        .unwrap_or(DEFAULT)
+}
+
+/// C4 (agent-comms) — the rooms a profile has OPTED IN to surfacing as
+/// `channel:<id>` blocks (`agent-comms.channels`, a TOML array of room ids), and
+/// the recent-N bound on each (`agent-comms.channel_recent_n`, default 5). A room
+/// is surfaced only when (a) it is in this opt-in list AND (b) the session is
+/// actually in that room — the gate is the AND of config + membership, so opting in
+/// never widens a session beyond rooms it already belongs to. Empty by default (no
+/// channel block at all unless explicitly configured).
+fn channel_optin(root: &Root) -> (Vec<String>, usize) {
+    let rooms = crate::config_repo::get_key(root, COMMS_PACKAGE, "channels")
+        .ok()
+        .flatten()
+        .and_then(|raw| {
+            // The value comes back as a TOML fragment (e.g. `["a","b"]`); parse it
+            // directly as a TOML value (toml 1.0 `Value: FromStr` parses one value).
+            raw.trim()
+                .parse::<toml::Value>()
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+        })
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let recent_n = crate::config_repo::get_key(root, COMMS_PACKAGE, "channel_recent_n")
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(5);
+    (rooms, recent_n)
+}
+
+// NOTED FOLLOW-ON (agent-comms, intentionally NOT built here): the NATIVE-agent
+// stage variants. C2/C4 say a native agent surfaces the inbox/channel as a STAGE
+// that adds to `doc.system` (rather than the coding-agent per-turn injection). That
+// path requires a native agent to HAVE a per-agent inbox/room, which only the
+// CODING-AGENT surface has today (`inbox_for_session`, `code_room_members` are all
+// `code-*`-session-scoped). When native agents grow a mailbox/room identity, add a
+// context stage that calls `inbox_block`/`channel_block` and folds them into
+// `doc.system` — the producers above are deliberately harness-agnostic so that
+// stage can reuse them. Deferred until the native-agent mailbox exists.
+
+/// C2 (agent-comms) — build the EPHEMERAL `inbox` computed block for a coding
+/// session: the unseen-mail count + a preview of the latest, in the same
+/// `{name, content}` block shape the durable memory blocks use. Computed each turn
+/// from `inbox_for_session` (NOT written to `context_blocks` — the inbox changes
+/// every turn). Returns `None` when the inbox has no unseen mail, so a quiet turn
+/// produces no block. This is the ONE producer of the inbox surface — the old
+/// hardcoded `[elanus] You have N new message(s)` text in `turn_injection` is now
+/// just this block's content.
+fn inbox_block(unseen: &[codesession::InboxItem]) -> Option<crate::context_store::LoadedBlock> {
+    if unseen.is_empty() {
+        return None;
+    }
+    let mut content = format!(
+        "You have {} new message(s) in your inbox. Run `elanus code inbox` to read them.",
+        unseen.len()
+    );
+    if let Some(latest) = unseen.last() {
+        let from = latest.from.as_deref().unwrap_or("?");
+        content.push_str(&format!("\nLatest from {from}: {}", clip(&latest.message, 200)));
+    }
+    Some(crate::context_store::LoadedBlock {
+        name: "inbox".to_string(),
+        content,
+        // Ordering/placement only matter for the render order alongside durable
+        // blocks; the inbox is a high-signal status line, so keep it near the top.
+        priority: -10,
+        placement: crate::context_blocks::Placement::System,
+        owner: String::new(),
+        scope: crate::context_blocks::Scope::Session,
+    })
+}
+
+/// C4 (agent-comms) — build the EPHEMERAL `channel:<id>` block for one room the
+/// session is in AND the profile opted into: the recent-N shared-channel messages,
+/// advisory. `None` when the channel has no recent traffic. Like `inbox_block`,
+/// computed each turn, never persisted.
+fn channel_block(
+    msgs: &[codesession::ChannelMsg],
+    room: &str,
+) -> Option<crate::context_store::LoadedBlock> {
+    if msgs.is_empty() {
+        return None;
+    }
+    let mut content = format!(
+        "Recent traffic on shared channel {room} (advisory — what others in this room are saying):"
+    );
+    for m in msgs {
+        let from = m.from.as_deref().unwrap_or("?");
+        content.push_str(&format!("\n  {from}: {}", clip(&m.message, 200)));
+    }
+    Some(crate::context_store::LoadedBlock {
+        name: format!("channel:{room}"),
+        content,
+        priority: 50, // advisory — render after the agent's own blocks
+        placement: crate::context_blocks::Placement::System,
+        owner: String::new(),
+        scope: crate::context_blocks::Scope::Session,
+    })
 }
 
 pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<String> {
@@ -2291,11 +2440,33 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
         codesession::live_siblings(root, session, &workdir)
     };
 
-    if unseen.is_empty()
+    // C2 (agent-comms) — the inbox is now a COMPUTED block, the one producer of the
+    // inbox surface (replacing the old hardcoded `[elanus] You have N message(s)`
+    // text). Ephemeral: computed from the unseen mail each turn, never persisted.
+    // None when there is no unseen mail, so a quiet inbox adds no block.
+    let inbox_blk = inbox_block(&unseen);
+
+    // C4 (agent-comms) — the OPT-IN shared-channel blocks. A room's recent traffic
+    // is surfaced as a `channel:<id>` computed block ONLY when the profile opted the
+    // room in (config) AND this session is actually in that room. The session's room
+    // is its OWN (record/workdir-derived `room` above); opting in a room the session
+    // is not in surfaces nothing — the gate is config AND membership.
+    let (optin_rooms, channel_recent_n) = channel_optin(root);
+    let mut channel_blocks: Vec<crate::context_store::LoadedBlock> = Vec::new();
+    if !room.is_empty() && optin_rooms.iter().any(|r| r == &room) {
+        if let Ok(msgs) = codesession::room_recent(root, &room, channel_recent_n) {
+            if let Some(b) = channel_block(&msgs, &room) {
+                channel_blocks.push(b);
+            }
+        }
+    }
+
+    if inbox_blk.is_none()
         && note.is_none()
         && blocks.is_empty()
         && peer_claims.is_empty()
         && live_siblings.is_empty()
+        && channel_blocks.is_empty()
     {
         return None;
     }
@@ -2351,32 +2522,35 @@ collision (advisory).",
         out.push('\n');
     }
 
-    out.push_str("[elanus] ");
-    if unseen.is_empty() {
-        out.push_str("Your inbox has no new messages.");
-    } else {
-        out.push_str(&format!(
-            "You have {} new message(s) in your inbox. Run `elanus code inbox` to read them.",
-            unseen.len()
-        ));
-        // A brief preview of the most recent one or two (clipped), so the agent
-        // has a hint without pulling — but the authoritative read is the command.
-        if let Some(latest) = unseen.last() {
-            let from = latest.from.as_deref().unwrap_or("?");
-            out.push_str(&format!(
-                "\n  Latest from {from}: {}",
-                clip(&latest.message, 200)
-            ));
-        }
+    // C2 (agent-comms): the inbox is rendered as its computed block in the same
+    // `[elanus block: …]` shape the memory blocks use — one producer, one path. An
+    // empty inbox produced no block above, so nothing is emitted here (the quiet
+    // turn is preserved). The old hardcoded "[elanus] You have N message(s)" text is
+    // gone; its content moved into `inbox_block`.
+    if let Some(b) = &inbox_blk {
+        out.push_str(&format!("[elanus block: {}] {}", b.name, clip(&b.content, 2000)));
     }
     if let Some(note) = note {
-        out.push_str(&format!("\n[elanus note] {}", clip(&note, 2000)));
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("[elanus note] {}", clip(&note, 2000)));
     }
     // M4: render the session's memory blocks, in priority order, reusing the
     // built-in {name, text} block shape. One labeled line per block so the agent
     // reads each as a distinct, named chunk of durable context.
     for b in &blocks {
-        out.push_str(&format!("\n[elanus block: {}] {}", b.name, clip(&b.content, 2000)));
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("[elanus block: {}] {}", b.name, clip(&b.content, 2000)));
+    }
+    // C4 (agent-comms): the opt-in shared-channel blocks, same block shape. Advisory.
+    for b in &channel_blocks {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("[elanus block: {}] {}", b.name, clip(&b.content, 2000)));
     }
     // M5: surface peers' claims as advisory routing info — "code-X is editing
     // src/foo.rs" — so this session can route around them. Advisory only; nothing
@@ -5717,11 +5891,25 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     {
         // Sanity: this IS the achievable mid-cycle vector for Claude Code.
         if achievable_vector(&agent, InjectionVector::MidCycle) == InjectionVector::MidCycle {
+            let mut ctx_parts: Vec<String> = Vec::new();
             if let Some(ctx) = mid_cycle_injection(root, &agent, &session) {
+                ctx_parts.push(ctx);
+            }
+            // C3 (agent-comms) — HIGH-priority UNSEEN inbox mail reaches the model
+            // mid-cycle too, not just next-turn. Threshold from config. De-duped by
+            // event id (`code_mail_delivered`) so the same message is injected ONCE,
+            // not on every tool call — and NOT marked seen (the agent has not pulled
+            // it, so it still counts in the next-turn inbox block). Codex/opencode
+            // have no live hook bridge, so this arm is reached only for Claude Code;
+            // there the mail simply stays next-turn via the inbox block.
+            if let Some(mail) = mid_cycle_mail_injection(root, &agent, &session) {
+                ctx_parts.push(mail);
+            }
+            if !ctx_parts.is_empty() {
                 let out = json!({
                     "hookSpecificOutput": {
                         "hookEventName": event,
-                        "additionalContext": ctx,
+                        "additionalContext": ctx_parts.join("\n"),
                     }
                 });
                 println!("{out}");
@@ -8176,7 +8364,8 @@ mod tests {
         // Deliver one message → the injection reports it (system-note style).
         m3_deliver(&root, "codex", "code-inj00001", "owner", "fix the parser");
         let one = turn_injection(&root, "codex", "code-inj00001").unwrap();
-        assert!(one.starts_with("[elanus]"));
+        // C2 (agent-comms): the inbox is now the computed `inbox` block.
+        assert!(one.starts_with("[elanus block: inbox]"));
         assert!(one.contains("1 new message"));
         assert!(one.contains("elanus code inbox")); // tells the agent how to read
         assert!(one.contains("fix the parser")); // a brief preview
@@ -8241,7 +8430,10 @@ mod tests {
         // is kept under its own marker.
         codesession::set_note(&root, "code-bld00001", "remember X").unwrap();
         let injected = build_resume_message(&root, "codex", "code-bld00001", "do the work");
-        assert!(injected.starts_with("[elanus]"));
+        // C2 (agent-comms): with only a note (empty inbox), the injection leads with
+        // the note line; the inbox text is now a block that only appears when mail
+        // is waiting. The point stands: the injection is prepended.
+        assert!(injected.starts_with("[elanus note]"));
         assert!(injected.contains("remember X"));
         assert!(injected.contains("do the work"));
         assert!(injected.contains("message you were resumed with"));
@@ -8508,7 +8700,8 @@ mod tests {
         // Give it an inbox message: the block appears but carries NO siblings line.
         m3_deliver(&root, "codex", "code-alone001", "owner", "hi");
         let inj = turn_injection(&root, "codex", "code-alone001").unwrap();
-        assert!(inj.starts_with("[elanus]"), "solo block is unchanged: {inj}");
+        // C2 (agent-comms): the inbox now renders as the `inbox` block.
+        assert!(inj.starts_with("[elanus block: inbox]"), "solo block is unchanged: {inj}");
         assert!(
             !inj.contains("[elanus siblings]"),
             "a solo session must have no siblings line: {inj}"
@@ -9162,6 +9355,202 @@ mod tests {
         let inj = turn_injection(&root, Codex.agent_noun(), "code-cdx00001")
             .expect("the high-pri block must land next-turn for codex");
         assert!(inj.contains("urgent for codex"), "degraded delivery must include the block; got:\n{inj}");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── agent-comms (C2/C3/C4) ────────────────────────────────────────────────
+
+    /// Insert an inbox delivery directly on a session's mailbox topic with a given
+    /// priority, mirroring what a `deliver`/emit would record. Returns the event id.
+    fn comms_mail(
+        root: &Root,
+        agent_noun: &str,
+        session: &str,
+        from: &str,
+        message: &str,
+        priority: i32,
+    ) -> i64 {
+        let conn = crate::db::open(root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let mailbox = format!(
+            "in/agent/{}/{}",
+            topic::encode_segment(agent_noun),
+            topic::encode_segment(session),
+        );
+        let payload = json!({ "prompt": message }).to_string();
+        conn.execute(
+            "INSERT INTO events (type, payload, priority, sender, state)
+             VALUES (?1, ?2, ?3, ?4, 'pending')",
+            rusqlite::params![mailbox, payload, priority, from],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Insert a message on a room's shared channel topic (`in/group/<id>`).
+    fn comms_channel_msg(root: &Root, room: &str, from: &str, message: &str) {
+        let conn = crate::db::open(root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let topic = format!("in/group/{}", topic::encode_segment(room));
+        let payload = json!({ "prompt": message }).to_string();
+        conn.execute(
+            "INSERT INTO events (type, payload, sender, state)
+             VALUES (?1, ?2, ?3, 'pending')",
+            rusqlite::params![topic, payload, from],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn c2_inbox_computed_block_present_with_mail_absent_when_empty() {
+        let root = delivery_tmp_root();
+        m4_record(&root, "code-inbx0001");
+        // Empty inbox → no injection at all (the quiet turn is preserved).
+        assert!(
+            turn_injection(&root, ClaudeCode.agent_noun(), "code-inbx0001").is_none(),
+            "an empty inbox must produce no inbox block (quiet turn)"
+        );
+        // Deliver one normal-priority message.
+        comms_mail(&root, ClaudeCode.agent_noun(), "code-inbx0001", "scout", "please review PR 7", 0);
+        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-inbx0001")
+            .expect("unseen mail must produce an inbox block");
+        // Rendered in the block shape (C2), with the count + a preview of the latest.
+        assert!(inj.contains("[elanus block: inbox]"), "got:\n{inj}");
+        assert!(inj.contains("1 new message(s)"), "got:\n{inj}");
+        assert!(inj.contains("Latest from scout: please review PR 7"), "got:\n{inj}");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn c3_high_priority_mail_emits_mid_cycle_once_then_dedups() {
+        let root = delivery_tmp_root();
+        m4_record(&root, "code-hipr0001");
+        // A high-priority (>= default threshold 5) unseen delivery.
+        comms_mail(&root, ClaudeCode.agent_noun(), "code-hipr0001", "lily", "STOP: API changed", 9);
+        // A normal one too — it must NOT ride the mid-cycle vector.
+        comms_mail(&root, ClaudeCode.agent_noun(), "code-hipr0001", "lily", "fyi later", 0);
+
+        // First tool boundary: the high-pri mail is injected mid-cycle, once.
+        let first = mid_cycle_mail_injection(&root, ClaudeCode.agent_noun(), "code-hipr0001")
+            .expect("high-priority unseen mail must reach mid-cycle");
+        assert!(first.contains("Urgent mail"), "got:\n{first}");
+        assert!(first.contains("STOP: API changed"), "got:\n{first}");
+        assert!(!first.contains("fyi later"), "a normal message must not ride mid-cycle; got:\n{first}");
+
+        // Second tool boundary (unchanged): nothing — the same message is not
+        // re-injected, and it was NOT marked seen, so it still shows next-turn.
+        assert!(
+            mid_cycle_mail_injection(&root, ClaudeCode.agent_noun(), "code-hipr0001").is_none(),
+            "the same high-pri message must not re-inject on the next tool call"
+        );
+        // Not marked seen: both deliveries still count in the next-turn inbox block.
+        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-hipr0001")
+            .expect("unseen mail still shows next-turn");
+        assert!(inj.contains("2 new message(s)"), "mid-cycle delivery must not mark mail seen; got:\n{inj}");
+
+        // Codex degrades: it has no mid-cycle hook, so its high-pri mail rides the
+        // next-turn inbox block instead (achievable_vector). Verify the matrix gate.
+        assert_eq!(
+            achievable_vector(Codex.agent_noun(), InjectionVector::MidCycle),
+            InjectionVector::NextTurn,
+            "Codex degrades mid-cycle mail to next-turn"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn c3_below_threshold_mail_does_not_go_mid_cycle() {
+        let root = delivery_tmp_root();
+        m4_record(&root, "code-lopr0001");
+        // priority 4 < default threshold 5 → next-turn only, never mid-cycle.
+        comms_mail(&root, ClaudeCode.agent_noun(), "code-lopr0001", "lily", "routine handoff", 4);
+        assert!(
+            mid_cycle_mail_injection(&root, ClaudeCode.agent_noun(), "code-lopr0001").is_none(),
+            "below-threshold mail must not ride the mid-cycle vector"
+        );
+        // But it still shows next-turn (the inbox block).
+        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-lopr0001").unwrap();
+        assert!(inj.contains("[elanus block: inbox]"), "got:\n{inj}");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn c4_room_channel_block_is_room_scoped_and_bounded() {
+        let root = delivery_tmp_root();
+        crate::config_repo::init(&root).unwrap();
+        // Opt the room "team-1" in, with a recent-N bound of 2.
+        crate::config_repo::set_key(&root, COMMS_PACKAGE, "channels", r#"["team-1"]"#).unwrap();
+        crate::config_repo::set_key(&root, COMMS_PACKAGE, "channel_recent_n", "2").unwrap();
+
+        // An in-room session.
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-room0001".into(),
+                native_session: "native-room1".into(),
+                tool: "claude".into(),
+                agent_noun: ClaudeCode.agent_noun().into(),
+                workdir: String::new(),
+                room: Some("team-1".into()),
+            },
+        )
+        .unwrap();
+        // Three channel messages; the recent-N=2 bound must keep only the last two.
+        comms_channel_msg(&root, "team-1", "scout", "msg one");
+        comms_channel_msg(&root, "team-1", "scout", "msg two");
+        comms_channel_msg(&root, "team-1", "lily", "msg three");
+
+        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-room0001")
+            .expect("an in-room session with channel traffic gets a channel block");
+        assert!(inj.contains("[elanus block: channel:team-1]"), "got:\n{inj}");
+        assert!(inj.contains("msg three"), "newest must be present; got:\n{inj}");
+        assert!(inj.contains("msg two"), "second-newest within the bound; got:\n{inj}");
+        assert!(!inj.contains("msg one"), "the recent-N bound must drop the oldest; got:\n{inj}");
+
+        // A session in a DIFFERENT room sees nothing of team-1's channel.
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-room0002".into(),
+                native_session: "native-room2".into(),
+                tool: "claude".into(),
+                agent_noun: ClaudeCode.agent_noun().into(),
+                workdir: String::new(),
+                room: Some("other-room".into()),
+            },
+        )
+        .unwrap();
+        let inj2 = turn_injection(&root, ClaudeCode.agent_noun(), "code-room0002");
+        assert!(
+            inj2.as_deref().map_or(true, |s| !s.contains("channel:team-1")),
+            "an out-of-room session must not see the channel; got:\n{inj2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn c4_channel_requires_opt_in() {
+        let root = delivery_tmp_root();
+        crate::config_repo::init(&root).unwrap();
+        // No opt-in: a session in a room with traffic still sees no channel block.
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-noopt0001".into(),
+                native_session: "native-noopt".into(),
+                tool: "claude".into(),
+                agent_noun: ClaudeCode.agent_noun().into(),
+                workdir: String::new(),
+                room: Some("team-1".into()),
+            },
+        )
+        .unwrap();
+        comms_channel_msg(&root, "team-1", "scout", "hello room");
+        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-noopt0001");
+        assert!(
+            inj.as_deref().map_or(true, |s| !s.contains("channel:team-1")),
+            "a room not opted in must surface no channel block; got:\n{inj:?}"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

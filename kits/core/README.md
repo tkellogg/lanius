@@ -13,13 +13,18 @@ running inside it, plus the escalation path to a stronger model.
   kernel debugging, designs with tradeoffs), dispatch it to the
   `architect` profile instead of grinding: one `emit_event`, deliberately
   uncorrelated.
+- **comms-etiquette** — how agents talk to each other: `deliver`/`spawn`/
+  `inbox`, when to set priority (and what high-priority mail does
+  mid-cycle), shared-room edit claims and the opt-in channel block, and the
+  failure-mail contract. Read before dispatching work or coordinating with
+  siblings.
 - **profiles/architect** — the strong-model identity the escalation
   targets: high turn budget, full skill visibility. Point its `[model]`
   at the strongest model you have credentials for.
 
-Install: `elanus kit add core`. The three skills are content-only (no
-grants to approve); the architect profile is yours to edit — especially
-the model line and any `[sandbox]` policy you want it caged by.
+Install: `elanus kit add core`. The skills are content-only (no grants to
+approve); the architect profile is yours to edit — especially the model
+line and any `[sandbox]` policy you want it caged by.
 
 Try it: `elanus emit in/agent/architect --payload \
 '{"prompt":"introduce yourself and read your skills","profile":"architect"}'`

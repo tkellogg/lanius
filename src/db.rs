@@ -479,6 +479,25 @@ CREATE TABLE IF NOT EXISTS code_block_delivered (
   delivered_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (session, block_name)
 );
+
+-- High-priority mail mid-cycle delivery dedup (agent-comms C3). A HIGH-priority
+-- unseen inbox message is injected BETWEEN tool calls (Claude Code's
+-- Pre/PostToolUse hook), so the agent learns of urgent mail without waiting for
+-- its next turn. Without dedup the same message would re-inject on EVERY tool
+-- call until the agent pulls its inbox. This records which inbox EVENT a session
+-- has already been handed mid-cycle, keyed by the immutable event id (mail is not
+-- edited in place, so unlike a block there is no content-sha re-arm — one delivery
+-- per message). Crucially this is NOT marking the message "seen": the agent has
+-- not pulled it via `code inbox`, so it still counts in the next-turn inbox block;
+-- this table only suppresses the LOUDER mid-cycle re-injection. Mirrors
+-- code_block_delivered / code_inbox_seen: a session only ever writes its OWN rows
+-- (the hook runs as the session's env-derived identity).
+CREATE TABLE IF NOT EXISTS code_mail_delivered (
+  session      TEXT NOT NULL,    -- the coding session handed the mail (code-<id>)
+  event_id     INTEGER NOT NULL, -- the inbox delivery's ledger event id
+  delivered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (session, event_id)
+);
 "#,
     )?;
     // M5: the room a coding session belongs to, stored on the durable record so a

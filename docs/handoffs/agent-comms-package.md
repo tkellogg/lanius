@@ -1,8 +1,16 @@
 ---
-status: planned
+status: done
 author: Claude Opus 4.8 in Claude Code on Elanus
 last-updated: 2026-06-23
 ---
+
+> **Status:** C1–C4 shipped for the **coding-agent surface** (where the inbox/room
+> primitives live). The C2/C4 acceptance text mentions a *native-agent stage*
+> variant — that half is a documented follow-on (`src/codeagent.rs` ~2311: native
+> agents have no per-agent mailbox/room identity yet), not an unmet clause. C3/C4
+> config (`agent-comms.high_priority_threshold`, `agent-comms.channels`) is read
+> via the config repo and falls back to safe defaults (threshold 5, no channels) on
+> a root whose config repo isn't initialized.
 
 # Agent-comms package
 
@@ -115,6 +123,27 @@ in the room sees nothing; the recent-N bound is enforced (no flooding).
   [sibling-awareness.md](sibling-awareness.md) (workdir-as-room).
 
 ## Log
+- **2026-06-23 — C1–C4 shipped** (impl on Opus medium → adversarial verify on Opus
+  high, 1 round, `pass`; `cargo test` 266). Comms landed as a package on the
+  memory-blocks substrate:
+  - **C1:** `kits/core/packages/comms-etiquette/SKILL.md` — a content-only package
+    (no manifest) naming the real verbs (deliver/spawn/inbox/note/claim), the
+    priority discipline, shared-channel etiquette, and the failure-mail contract;
+    shows in the skills inventory.
+  - **C2:** the inbox is now a single EPHEMERAL `inbox` computed block
+    (`inbox_block`, `src/codeagent.rs`) — the old hardcoded inbox text is gone; an
+    empty inbox renders nothing.
+  - **C3:** `take_pending_mid_cycle_mail` (`src/codesession.rs`) routes HIGH-priority
+    unseen mail (`priority >= agent-comms.high_priority_threshold`, default 5) to
+    the M4 mid-cycle vector on Claude Code, de-duped by a new `code_mail_delivered`
+    table (event-id keyed) and crucially WITHOUT marking it seen (it still counts
+    next-turn until the agent runs `elanus code inbox`). Degrades to next-turn on
+    Codex/opencode via `achievable_vector`.
+  - **C4:** `room_recent` + `channel_block` surface a room's recent-N traffic as a
+    `channel:<id>` block, opt-in via `agent-comms.channels`; room membership is
+    structural (derived from the session's own record/workdir, never a peer arg), so
+    it can never widen a session into a room it isn't in.
+  - Deferred (documented): the native-agent stage variants of C2/C4.
 - **2026-06-23 — planning.** Reframed from "inter-agent comms subsystem" to "a
   package on blocks." The transport (mailbox, rooms, failure-mail, inbox) is
   already shipped; the new value is (a) the etiquette skill, (b) inbox as a
