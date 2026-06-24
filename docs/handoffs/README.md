@@ -137,7 +137,7 @@ statuses: planned | in-progress | verifying | done
   "more-authority-than-warranted" class (security.md entries 13/16/20/21). Backed by
   [../identity.md](../identity.md) ("Delegation") and
   [../security.md](../security.md) entry 22.
-- [memory-blocks.md](memory-blocks.md) - **planned**, the **keystone** of the
+- [memory-blocks.md](memory-blocks.md) - **done** (M1–M4), the **keystone** of the
   profiles journey: make memory blocks a first-class, built-in part of the context
   pipeline — named, durable, agent-editable kv chunks with a default that
   *evolves*, rendered by a built-in block→text step so a "computed block" is just a
@@ -149,8 +149,8 @@ statuses: planned | in-progress | verifying | done
   a live cross-harness spike** (Claude Code `Pre/PostToolUse` ✓, opencode
   `prompt_async` ✓, Codex degrades). Backed by
   [../journeys/11-profiles.md](../journeys/11-profiles.md) and [../context.md](../context.md).
-- [agent-comms-package.md](agent-comms-package.md) - **planned**: inter-agent comms
-  as a **package that rides on blocks**, not a subsystem — per Tim, "just have
+- [agent-comms-package.md](agent-comms-package.md) - **done** (C1–C4): inter-agent
+  comms as a **package that rides on blocks**, not a subsystem — per Tim, "just have
   blocks." The transport (mailbox, rooms/`in/group`, failure-mail, inbox) already
   ships; this adds a comms-etiquette **skill** (no block dependency, ships now), the
   "unread from agent Y" surface as a **computed block** (generalizing
@@ -158,8 +158,8 @@ statuses: planned | in-progress | verifying | done
   mail lands mid-turn), and a **shared channel as a block** (a room's recent traffic,
   the journey's per-repo channel). Depends on [memory-blocks.md](memory-blocks.md).
   Backed by [../journeys/11-profiles.md](../journeys/11-profiles.md).
-- [work-estimation.md](work-estimation.md) - **planned**: an agent estimates its
-  work right after planning, actuals are counted against it, and a retro adjusts a
+- [work-estimation.md](work-estimation.md) - **done** (E1–E3): an agent estimates
+  its work right after planning, actuals are counted against it, and a retro adjusts a
   memory block so the next estimate improves. A **package** with **no kernel
   data-model representation** (Tim's constraint) — state lives in blocks + obs
   events, actuals read from the obs stream (`src/code_projection.rs`). Estimates are
