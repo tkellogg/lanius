@@ -1,0 +1,40 @@
+# estimation — work estimation as a PACKAGE (docs/handoffs/work-estimation.md).
+#
+# Estimation has NO kernel data model: there is no estimation table and no
+# estimation type. All state rides existing substrates — the running estimate is
+# an `estimate` memory BLOCK, the boundary is an `obs/estimate/<session>` event,
+# actuals are read from the obs projection, and the learned heuristic is a durable
+# `estimation` block. The verbs are the kernel CLI `elanus estimate set/actual/
+# retro` (each reuses the block + obs primitives, not a new model). This package
+# ships the two userland pieces the kernel deliberately does NOT own:
+#
+#   1. pricing.toml — the per-model $/token map (E2). Dollars are otherwise
+#      unknown (src/models.rs has no prices; cost-visibility says so). The kernel
+#      reads this file from the package path; editing it is how you keep dollars
+#      honest.
+#   2. a cron BACKSTOP for the retro (E3). The primary retro runs on the coding
+#      Stop/SessionEnd hook (in the kernel). This cron is the safety net for
+#      sessions whose hook never fired (a crash): it sweeps finished sessions and
+#      runs `elanus estimate retro` for any that still carry an estimate. `retro`
+#      is once-per-session (it sets a marker block), so the cron and the hook
+#      never double-record.
+#
+# Ships pending like every package — approve to activate the cron sweep
+# (`elanus approve estimation`). The CLI verbs work without approving anything;
+# only the cron backstop is a granted capability.
+
+[request]
+# The sweep emits an internal kick event it also subscribes to (the cron→exec
+# wiring pattern). It publishes nothing onto in/agent/human topics.
+subscribe = ["in/package/estimation/sweep"]
+publish   = ["in/package/estimation/sweep"]
+
+[process]
+mode = "exec"
+run  = "scripts/sweep"
+order = 50
+
+[[cron]]
+# Every 10 minutes: a retro backstop for sessions whose Stop hook never fired.
+schedule = "*/10 * * * *"
+emit     = "in/package/estimation/sweep"

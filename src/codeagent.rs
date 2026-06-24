@@ -5953,7 +5953,37 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
             println!("{out}");
         }
     }
+
+    // E3 (work-estimation handoff) — RETRO on session end. When a session declared
+    // an estimate (E1), close the loop: compute the actual-vs-estimate variance and
+    // append the dated miss to the durable `estimation` block (agent scope), the
+    // default-that-evolves memory a future E1 reads. This is the Stop-driven retro
+    // (the spec's MVP — the LLM "why it missed" reflection is the documented
+    // follow-on). Best-effort and once-per-session: a session with no estimate is
+    // skipped, and `estimate_retro_once` guards against the several Stop/SessionEnd
+    // events one run can emit so the block gains exactly one entry per session. Any
+    // failure here is swallowed — the retro must never break the coding session.
+    if matches!(event, "Stop" | "StopFailure" | "SessionEnd") {
+        estimate_retro_once(root, &agent, &session);
+    }
     Ok(())
+}
+
+/// E3 — run the work-estimation retro for this coding session. `estimatecli::retro`
+/// is itself once-per-session (it sets a `estimation-retro-done` marker), so the
+/// several Stop/SessionEnd events one run emits record exactly one miss, and a cron
+/// backstop calling the same path stays idempotent. Everything is best-effort: a
+/// missing estimate, an absent projection, or any error simply leaves the durable
+/// `estimation` block untouched — the retro is advisory and must never break the
+/// coding session.
+fn estimate_retro_once(root: &Root, agent: &str, session: &str) {
+    let opts = crate::estimatecli::EstimateOpts {
+        profile: "default".into(),
+        session: session.to_string(),
+        owner: Some(agent.to_string()),
+        pricing: None,
+    };
+    let _ = crate::estimatecli::retro(root, &opts);
 }
 
 /// Map a Claude Code hook event + its stdin payload to an obs/ topic leaf and a

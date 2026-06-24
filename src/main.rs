@@ -15,6 +15,8 @@ mod dev;
 mod dispatcher;
 mod dotenv;
 mod envcompat;
+mod estimate;
+mod estimatecli;
 mod events;
 mod exec;
 mod hooks;
@@ -142,6 +144,15 @@ enum Cmd {
     Block {
         #[command(subcommand)]
         cmd: BlockCmd,
+    },
+    /// Work estimation (docs/handoffs/work-estimation.md): an agent records a
+    /// multi-dimensional estimate (dollars/turns/tokens/wall-clock) right after it
+    /// plans (set), the package counts actuals from that boundary and reports the
+    /// variance (actual), and a retro appends the miss to a durable learned block
+    /// (retro). No kernel data model — state lives in memory blocks + obs events.
+    Estimate {
+        #[command(subcommand)]
+        cmd: EstimateCmd,
     },
     /// Run the dispatcher: poll events, fork handlers, record exits
     Daemon {
@@ -447,6 +458,71 @@ enum BlockCmd {
         name: String,
         #[command(flatten)]
         args: BlockArgs,
+    },
+}
+
+/// Shared addressing for the estimate verbs (the agent/session a block belongs to).
+#[derive(clap::Args)]
+struct EstimateArgs {
+    /// The profile whose agent owns the estimate blocks (also the render context).
+    #[arg(long, default_value = "default")]
+    profile: String,
+    /// The coding session the estimate counts against.
+    #[arg(long, default_value = "render-preview")]
+    session: String,
+    /// Override the owner identity (the agent noun). Defaults to the profile's
+    /// agent noun — a self-attested label, like `elanus block --owner`.
+    #[arg(long)]
+    owner: Option<String>,
+    /// Override the pricing.toml path (model id -> $/token). Defaults to the
+    /// estimation package's shipped copy under the root's package path.
+    #[arg(long)]
+    pricing: Option<PathBuf>,
+}
+
+impl EstimateArgs {
+    fn opts(&self) -> estimatecli::EstimateOpts {
+        estimatecli::EstimateOpts {
+            profile: self.profile.clone(),
+            session: self.session.clone(),
+            owner: self.owner.clone(),
+            pricing: self.pricing.clone(),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum EstimateCmd {
+    /// E1 — record the multi-dimensional estimate (latest wins). Writes the
+    /// `estimate` block + emits obs/estimate/<session> (the count-from boundary).
+    Set {
+        /// Headline dollars (the cross-model normalizer).
+        #[arg(long)]
+        dollars: Option<f64>,
+        /// Estimated agent turns.
+        #[arg(long)]
+        turns: Option<i64>,
+        /// Estimated total tokens.
+        #[arg(long)]
+        tokens: Option<i64>,
+        /// Estimated wall-clock, in milliseconds.
+        #[arg(long = "wall-clock", alias = "wall-clock-ms")]
+        wall_clock_ms: Option<i64>,
+        #[command(flatten)]
+        args: EstimateArgs,
+    },
+    /// E2 — compute actuals from the obs projection (from the boundary onward),
+    /// price tokens via pricing.toml, write the `estimate-vs-actual` block, print
+    /// the report. A session with no estimate is skipped.
+    Actual {
+        #[command(flatten)]
+        args: EstimateArgs,
+    },
+    /// E3 — append the dated miss to the durable `estimation` block (agent scope),
+    /// so the next estimate reads the prior misses. Skips when no estimate exists.
+    Retro {
+        #[command(flatten)]
+        args: EstimateArgs,
     },
 }
 
@@ -952,6 +1028,17 @@ fn run(cli: Cli) -> Result<()> {
             BlockCmd::Get { name, args } => blockcli::get(&root, &name, &args.opts())?,
             BlockCmd::List { args } => blockcli::list(&root, &args.opts())?,
             BlockCmd::Rm { name, args } => blockcli::rm(&root, &name, &args.opts())?,
+        },
+        Cmd::Estimate { cmd } => match cmd {
+            EstimateCmd::Set {
+                dollars,
+                turns,
+                tokens,
+                wall_clock_ms,
+                args,
+            } => estimatecli::set(&root, dollars, turns, tokens, wall_clock_ms, &args.opts())?,
+            EstimateCmd::Actual { args } => estimatecli::actual(&root, &args.opts())?,
+            EstimateCmd::Retro { args } => estimatecli::retro_cmd(&root, &args.opts())?,
         },
         Cmd::Approve { name, by } => {
             let conn = open(&root)?;

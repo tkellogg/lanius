@@ -1,8 +1,16 @@
 ---
-status: planned
+status: done
 author: Claude Opus 4.8 in Claude Code on Elanus
 last-updated: 2026-06-23
 ---
+
+> **Status:** E1–E3 shipped. The no-kernel-data-model constraint held — state
+> lives in `context_blocks` + `obs/estimate` events (no estimation tables). Open
+> placement question for Tim: the package landed in `kits/stdlib/` (protected,
+> auto-approved → always-on), which sits awkwardly with the journey's
+> "additive/optional bolt-on" framing; consider moving it to a non-protected kit.
+> LLM "why it missed" reflection and the live mid-session watcher remain documented
+> follow-ons.
 
 # Work estimation
 
@@ -122,6 +130,32 @@ M2).
   stream this reads).
 
 ## Log
+- **2026-06-23 — E1–E3 shipped** (impl on Opus medium → adversarial verify on Opus
+  high, 1 round, `pass`; `cargo test` 274, 8 estimation tests). Delivered as a thin
+  `elanus estimate` CLI (`src/estimate.rs`, `src/estimatecli.rs`, wired in
+  `src/main.rs`) + a Stop-hook retro wire (`src/codeagent.rs`) + a package
+  (`kits/stdlib/packages/estimation/` — `elanus.toml`, `pricing.toml`, `SKILL.md`,
+  `scripts/sweep` cron backstop). **No estimation kernel data model** (verified: no
+  new table in `db.rs`) — state is `estimate` / `estimate-vs-actual` / `estimation`
+  blocks + `obs/estimate/<session>` events.
+  - **E1:** `elanus estimate set --dollars/--turns/--tokens/--wall-clock` writes the
+    `estimate` block (session scope) + emits `obs/estimate/<session>` with a
+    boundary timestamp; latest-wins.
+  - **E2:** actuals come from the obs projection (turns/tool-calls/wall-clock) ×
+    `pricing.toml` ($/token) for dollars (the headline). ABSENT token usage is
+    graceful — `dollars_unavailable:true`, other dims still reported; an unpriced
+    model yields no dollars rather than a fabricated one; a no-estimate session is
+    skipped.
+  - **E3:** the Stop hook (cron `sweep` as backstop) appends a dated miss to a
+    durable agent-scope `estimation` block, once-per-session via a marker block; a
+    new session reads prior misses via `load_session_blocks` — the
+    future-estimate-improves loop closes.
+  - **Accepted minors:** (1) the tool-calls dimension is actual-only (no estimate to
+    vary against — `Estimate` has no tool_calls field); (2) a retro-timing edge (if
+    Stop fires before the final obs folds, a miss could record 0s and is sticky) —
+    mitigated because `report()` flushes the trace first; acceptable for the MVP.
+  - **For Tim:** the package is in `kits/stdlib` (protected/always-on) — likely
+    belongs in a non-protected kit given the "additive/optional" framing.
 - **2026-06-23 — planning.** Confirmed with Tim: estimation is a **package**, no
   kernel data-model representation; dollars are the cross-model normalizer but
   estimate every dimension. Identified the live risk: **dollars have no source**

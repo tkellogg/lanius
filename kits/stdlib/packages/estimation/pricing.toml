@@ -1,0 +1,46 @@
+# pricing.toml — the package-local per-model price map for work estimation
+# (docs/handoffs/work-estimation.md, E2). Dollars are the cross-model normalizer,
+# but NOTHING in the kernel sources them: src/models.rs has no price data and the
+# cost-visibility journey (docs/journeys/03-cost-visibility.md) is explicit that
+# dollars are "unknown until real pricing data exists". THIS FILE is that data,
+# owned by the estimation package — not a kernel table.
+#
+# Units: dollars per SINGLE token (so $5 / 1M tokens = 0.000005). Kept in $/token
+# (not $/Mtok) so the multiply in src/estimate.rs is unit-clean. Edit these as
+# prices change — estimation reads whatever is here; a model absent from this map
+# yields NO dollar figure (the report says "dollars unavailable" rather than
+# fabricating a cost).
+#
+# Verified against the Anthropic pricing table cached 2026-06 (Opus 4.8 $5/$25,
+# Sonnet 4.6 $3/$15, Haiku 4.5 $1/$5 per MTok). Update on the next price change.
+
+[models."claude-opus-4-8"]
+input  = 0.000005
+output = 0.000025
+
+[models."claude-opus-4-7"]
+input  = 0.000005
+output = 0.000025
+
+[models."claude-opus-4-6"]
+input  = 0.000005
+output = 0.000025
+
+[models."claude-sonnet-4-6"]
+input  = 0.000003
+output = 0.000015
+
+[models."claude-haiku-4-5"]
+input  = 0.000001
+output = 0.000005
+
+[models."claude-fable-5"]
+input  = 0.000010
+output = 0.000050
+
+# Non-Claude harnesses (codex/opencode) report their own model ids; add the ones
+# your fleet uses. Placeholder example — replace with the real rate before relying
+# on dollars for these models.
+[models."gpt-5"]
+input  = 0.000005
+output = 0.000015
