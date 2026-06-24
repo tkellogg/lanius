@@ -25,3 +25,6 @@ purpose for Elanus is so they just know and self-navigate and negotiate. I'm thi
 to have memory blocks injected by default that let them know what else is going on. Like which agent, what the 
 agent is trying to do, etc. I'm imagining this just happens by default. I'm not sure why any agent needs to have
 this turned off, just feels like a basic functionality of elanus that most agents all get injected.
+
+
+How does it work when we have a list of 5 kits and 10 skills and we wire it into claude code? codex? ...
