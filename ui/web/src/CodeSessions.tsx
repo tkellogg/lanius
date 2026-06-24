@@ -336,13 +336,87 @@ function computeDuration(s: Stat): number | null {
   return Math.max(0, endRef - start);
 }
 
-export default function CodeSessions() {
+// agent-comms-ui M5: render one estimate-vs-actual dimension. Dollars are
+// best-effort: when `unavailable`, the actual + variance render "unknown", NEVER a
+// fabricated number (matching the setup view's "no dollars until pricing is
+// known" stance). The non-dollar dims (turns/tokens/wall-clock) lead.
+function EstimateRow({
+  label,
+  v,
+  unit,
+  wall,
+  unavailable,
+}: {
+  label: string;
+  v: { estimate?: number | null; actual?: number | null; delta?: number | null };
+  unit?: string;
+  wall?: boolean;
+  unavailable?: boolean;
+}) {
+  const fmt = (n: number | null | undefined): string => {
+    if (n == null) return '—';
+    if (wall) return humanDuration(n);
+    if (unit === '$') return `$${n.toFixed(2)}`;
+    return Number.isInteger(n) ? String(n) : n.toFixed(1);
+  };
+  // For dollars with no pricing source, never invent a figure (decision 4).
+  const actualUnknown = unit === '$' && unavailable;
+  const delta = v.delta;
+  const overUnder = delta == null ? '' : delta > 0 ? ' over' : delta < 0 ? ' under' : ' on';
+  const deltaCls = delta == null ? 'cs-dim' : delta > 0 ? 'cs-over' : delta < 0 ? 'cs-under' : 'cs-dim';
+  return (
+    <>
+      <span className="cs-evt-label">{label}</span>
+      <span>{fmt(v.estimate)}</span>
+      <span>{actualUnknown ? <span className="cs-dim">unknown</span> : fmt(v.actual)}</span>
+      <span className={deltaCls}>
+        {actualUnknown || delta == null ? '—' : `${delta > 0 ? '+' : ''}${fmt(delta)}${overUnder}`}
+      </span>
+    </>
+  );
+}
+
+// agent-comms-ui M5: one estimate-vs-actual dimension as the route returns it.
+type Variance = { estimate?: number | null; actual?: number | null; delta?: number | null };
+type EstimateReport = {
+  session: string;
+  dollars: Variance;
+  turns: Variance;
+  tool_calls: Variance;
+  tokens: Variance;
+  wall_clock_ms: Variance;
+  dollars_unavailable: boolean;
+};
+
+// agent-comms-ui M4: one block as the inspector route returns it.
+type BlockRow = {
+  name: string;
+  scope: string;
+  placement: string;
+  priority: number;
+  owner: string;
+  content: string;
+  ephemeral: boolean;
+};
+
+export default function CodeSessions({ focus }: { focus?: string } = {}) {
   const [backfill, setBackfill] = useState<Stat[]>([]);
   const [livePatches, setLivePatches] = useState<Map<string, LivePatch>>(new Map());
   const [error, setError] = useState('');
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(focus ?? null);
   const [detail, setDetail] = useState<Detail | null>(null);
   const [copied, setCopied] = useState(false);
+  // M5: the estimate-vs-actual report for the selected session, or null when it
+  // recorded no estimate (the group is simply omitted — no crash).
+  const [estimate, setEstimate] = useState<EstimateReport | null>(null);
+  // M4: the selected session's memory blocks (durable + recomputed ephemeral).
+  const [blocks, setBlocks] = useState<BlockRow[]>([]);
+
+  // M2 cross-link: when the runs view is opened focused on a comms participant,
+  // select that session (and re-select if the focus changes).
+  useEffect(() => {
+    if (focus) setSelected(focus);
+  }, [focus]);
   // The newest updated_at across the live patches, captured at backfill time so
   // we know the projection has caught up. Used only to gate detail refresh.
   const liveSeq = useRef(0);
@@ -437,6 +511,30 @@ export default function CodeSessions() {
     };
   }, [selected, backfill, selectedLiveStamp]);
 
+  // M5 + M4: load the estimate-vs-actual report and the memory blocks for the
+  // selected session. Both are read routes that shell the CLI (no new transport);
+  // a session with no estimate returns `null` (group omitted), a session with no
+  // blocks returns `[]`. Refreshed alongside the detail (on selection + backfill).
+  useEffect(() => {
+    if (!selected) {
+      setEstimate(null);
+      setBlocks([]);
+      return;
+    }
+    let alive = true;
+    fetch(`/api/estimate/${encodeURIComponent(selected)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => alive && setEstimate(d && typeof d === 'object' && 'session' in d ? (d as EstimateReport) : null))
+      .catch(() => alive && setEstimate(null));
+    fetch(`/api/blocks?session=${encodeURIComponent(selected)}`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then((d) => alive && setBlocks(Array.isArray(d) ? d : []))
+      .catch(() => alive && setBlocks([]));
+    return () => {
+      alive = false;
+    };
+  }, [selected, backfill, selectedLiveStamp]);
+
   // Roots: sessions with no parent, or whose parent is not in the set.
   const ids = new Set(sessions.map((s) => s.elanus_session));
   const childrenOf = new Map<string, Stat[]>();
@@ -516,6 +614,46 @@ export default function CodeSessions() {
             <button className="cs-btn" onClick={() => copyResume(detail.resume_command)}>{copied ? 'copied' : 'copy'}</button>
           </div>
 
+          {/* M5: estimate vs actual — only when the session recorded an estimate. */}
+          {estimate && estimate.session === detail.session.elanus_session && (
+            <div className="cs-sub cs-estimate" id="cs-estimate">
+              <div className="cs-dim">estimate vs actual:</div>
+              <div className="cs-evt-grid">
+                <span className="cs-evt-h" />
+                <span className="cs-evt-h">est</span>
+                <span className="cs-evt-h">actual</span>
+                <span className="cs-evt-h">variance</span>
+                <EstimateRow label="dollars" v={estimate.dollars} unit="$" unavailable={estimate.dollars_unavailable} />
+                <EstimateRow label="turns" v={estimate.turns} />
+                <EstimateRow label="tool calls" v={estimate.tool_calls} />
+                <EstimateRow label="tokens" v={estimate.tokens} />
+                <EstimateRow label="wall-clock" v={estimate.wall_clock_ms} wall />
+              </div>
+            </div>
+          )}
+
+          {/* M4: memory-block inspector (read-only). Durable identity/learned
+              blocks + the recomputed ephemeral inbox/channel (clearly labeled
+              "live, not stored" — they are session-computed and owner-less). */}
+          {blocks.length > 0 && (
+            <div className="cs-sub cs-blocks" id="cs-blocks">
+              <div className="cs-dim">memory blocks ({blocks.length}):</div>
+              {blocks.map((b, i) => (
+                <div key={`${b.name}:${i}`} className={`cs-block${b.ephemeral ? ' cs-block-eph' : ''}`} data-block={b.name}>
+                  <div className="cs-block-head">
+                    <span className="cs-block-name">{b.name}</span>
+                    <span className="cs-block-scope">{b.scope}/{b.placement}</span>
+                    <span className="cs-dim">p{b.priority}</span>
+                    {b.ephemeral
+                      ? <span className="cs-block-tag" title="computed each turn, never written to context_blocks">live, not stored</span>
+                      : b.owner && <span className="cs-dim">{b.owner}</span>}
+                  </div>
+                  <div className="cs-block-content">{b.content}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
           {detail.children.length > 0 && (
             <div className="cs-sub">
               <div className="cs-dim">spawned workers:</div>
@@ -580,4 +718,16 @@ const CS_STYLE = `
 .cs-incs { margin: 2px 0 4px 18px; padding: 2px 0 2px 8px; border-left: 1px solid #333; display: flex; flex-direction: column; gap: 1px; font-size: 11px; }
 .cs-inc { display: flex; gap: 8px; align-items: baseline; color: #8a8a8a; }
 .cs-inc-i { font-size: 9px; min-width: 48px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.8; }
+.cs-evt-grid { display: grid; grid-template-columns: auto auto auto auto; gap: 2px 14px; font-size: 11px; margin-top: 3px; align-items: baseline; }
+.cs-evt-h { color: #8a8a8a; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+.cs-evt-label { color: #c8c8c8; }
+.cs-over { color: #ffb27a; }
+.cs-under { color: #8fe0a0; }
+.cs-block { border: 1px solid #2a2a2a; border-radius: 5px; padding: 5px 7px; margin: 3px 0; font-size: 11px; }
+.cs-block-eph { border-style: dashed; border-color: #4a3f6a; }
+.cs-block-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.cs-block-name { font-family: ui-monospace, monospace; font-weight: 600; }
+.cs-block-scope { color: #8a8a8a; font-size: 10px; }
+.cs-block-tag { font-size: 9px; padding: 1px 5px; border-radius: 7px; background: #3a2f5a; color: #d8c8ff; }
+.cs-block-content { color: #b8b8b8; white-space: pre-wrap; margin-top: 2px; max-height: 120px; overflow-y: auto; }
 `;

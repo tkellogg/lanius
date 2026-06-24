@@ -192,6 +192,10 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
                     .route("/api/conversations/{session}", web::get().to(conversation))
                     .route("/api/code/sessions", web::get().to(code_sessions))
                     .route("/api/code/sessions/{id}", web::get().to(code_session))
+                    .route("/api/comms/mail", web::get().to(comms_mail))
+                    .route("/api/comms/rooms", web::get().to(comms_rooms))
+                    .route("/api/blocks", web::get().to(blocks))
+                    .route("/api/estimate/{session}", web::get().to(estimate_report))
                     .route("/api/publish", web::post().to(publish))
                     .service(
                         web::resource("/api/history")
@@ -491,6 +495,130 @@ async fn code_session(
         Ok(r) => json_resp(500, json!({ "ok": false, "error": cli_err(&r) })),
         Err(_) => json_resp(500, json!({ "ok": false, "error": "code projection unavailable" })),
     }
+}
+
+// ---- comms / blocks / estimate (agent-comms-ui read routes) ---------------
+
+/// Run a CLI projection on the blocking pool and map its stdout to a `(code,
+/// Value)`. `empty_default` is the JSON text used when stdout is empty (`[]` for
+/// the array projections, `null` for the estimate report) so an empty projection
+/// is data, not an error — mirroring `code_sessions`. Returns a Send-safe tuple
+/// (NOT an HttpResponse, which is `!Send` and cannot cross `web::block`).
+fn cli_json(root: &Root, args: &[&str], empty_default: &str) -> (u16, Value) {
+    match cli(root, args) {
+        Ok(r) if r.ok => map_cli_json(&r.stdout, empty_default),
+        Ok(r) => (500, json!({ "ok": false, "error": cli_err(&r) })),
+        Err(_) => (500, json!({ "ok": false, "error": "projection unavailable" })),
+    }
+}
+
+/// Map a successful CLI projection's stdout to `(code, Value)`: empty stdout maps
+/// to `empty_default` (so an empty projection is data, not an error), valid JSON
+/// passes through as 200, and unparseable output is a 500. Factored out so the
+/// mapping the comms/blocks/estimate routes rely on is unit-testable without
+/// spinning the ntex server (the shell-out itself is exercised by ui.spec.mjs).
+fn map_cli_json(stdout: &str, empty_default: &str) -> (u16, Value) {
+    let trimmed = stdout.trim();
+    let text = if trimmed.is_empty() { empty_default } else { trimmed };
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) => (200, v),
+        Err(_) => (500, json!({ "ok": false, "error": "bad projection output" })),
+    }
+}
+
+/// Await a `cli_json` call and build the response on the ntex thread (the
+/// `!Send` HttpResponse is constructed here, never inside `web::block`).
+async fn cli_json_resp(root: Root, args: Vec<String>, empty_default: &str) -> HttpResponse {
+    let def = empty_default.to_string();
+    let out = web::block(move || -> Result<(u16, Value)> {
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        Ok(cli_json(&root, &refs, &def))
+    })
+    .await;
+    match out {
+        Ok((code, v)) => json_resp(code, v),
+        Err(_) => json_resp(500, json!({ "ok": false, "error": "projection unavailable" })),
+    }
+}
+
+/// M1 — the agent-to-agent mail projection. Shells `elanus code mail --json`
+/// (a pure ledger read over `in/agent/%`, threaded by correlation), exactly the
+/// `code_sessions` shell-out shape. A root with no mail returns `[]`.
+async fn comms_mail(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
+    cli_json_resp(
+        hub.root.clone(),
+        vec!["code".into(), "mail".into(), "--json".into()],
+        "[]",
+    )
+    .await
+}
+
+/// M3 — the coordination-rooms projection. Shells `elanus code rooms --json`.
+async fn comms_rooms(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
+    cli_json_resp(
+        hub.root.clone(),
+        vec!["code".into(), "rooms".into(), "--json".into()],
+        "[]",
+    )
+    .await
+}
+
+/// Validate a session id the same way `conversation` does before it is handed to
+/// the CLI (no `%`/`\`/`"`/NUL — no real session id contains them).
+fn valid_session_id(session: &str) -> bool {
+    !session.is_empty()
+        && session.len() <= 160
+        && !session.contains(['\\', '"', '%'])
+        && !session.contains('\0')
+}
+
+/// M4 — the memory-block inspector (read-only). `?session=<code-id>` shells
+/// `elanus code blocks --session <id> --json` (durable + recomputed ephemeral).
+async fn blocks(hub: web::types::State<Arc<Hub>>, req: HttpRequest) -> HttpResponse {
+    let Some(session) = query_param(&req, "session") else {
+        return json_resp(400, json!({ "ok": false, "error": "need ?session=<code-id>" }));
+    };
+    if !valid_session_id(&session) {
+        return json_resp(400, json!({ "ok": false, "error": "bad session" }));
+    }
+    cli_json_resp(
+        hub.root.clone(),
+        vec![
+            "code".into(),
+            "blocks".into(),
+            "--session".into(),
+            session,
+            "--json".into(),
+        ],
+        "[]",
+    )
+    .await
+}
+
+/// M5 — the estimate-vs-actual report for one session. Shells
+/// `elanus estimate actual --session <id> --json`, which prints the `Report` JSON
+/// or `null` when the session has no recorded estimate. `null` → 200 with body
+/// `null` so the runs view simply omits the estimate group (no crash, no 404).
+async fn estimate_report(
+    hub: web::types::State<Arc<Hub>>,
+    path: web::types::Path<String>,
+) -> HttpResponse {
+    let session = path.into_inner();
+    if !valid_session_id(&session) {
+        return json_resp(400, json!({ "ok": false, "error": "bad session" }));
+    }
+    cli_json_resp(
+        hub.root.clone(),
+        vec![
+            "estimate".into(),
+            "actual".into(),
+            "--session".into(),
+            session,
+            "--json".into(),
+        ],
+        "null",
+    )
+    .await
 }
 
 /// `/api/history` → POST <history endpoint>/query. The endpoint is re-read per
@@ -1882,5 +2010,70 @@ fn truthy(v: &Value) -> bool {
         Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
         Value::String(s) => !s.is_empty(),
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    // M1/M3/M4: the comms/blocks read routes shell a CLI projection that prints a
+    // JSON array; `map_cli_json` is the mapping the route bodies rely on. Empty
+    // stdout → the `[]` default (an empty projection is data, never an error),
+    // mirroring how `code_sessions` treats an empty list. Valid JSON passes
+    // through verbatim so the CLI's `MailRow`/`RoomRow`/`BlockRow` shape reaches
+    // the browser unchanged.
+    #[test]
+    fn array_route_maps_cli_json_through() {
+        // Empty → the array default.
+        let (code, v) = map_cli_json("", "[]");
+        assert_eq!(code, 200);
+        assert_eq!(v, json!([]));
+        // Whitespace-only is still empty.
+        let (_, v) = map_cli_json("   \n", "[]");
+        assert_eq!(v, json!([]));
+        // A real mail projection passes through unchanged (from/to/priority/state/
+        // failed threaded by the CLI).
+        let mail = r#"[{"id":7,"from":"code-a","to":"code-b","to_noun":"claude-code","correlation":"c1","priority":9,"state":"pending","failed":true,"mid_cycle":true,"preview":"urgent","ts":"2026-06-24T00:00:00Z"}]"#;
+        let (code, v) = map_cli_json(mail, "[]");
+        assert_eq!(code, 200);
+        assert_eq!(v[0]["from"], "code-a");
+        assert_eq!(v[0]["priority"], 9);
+        assert_eq!(v[0]["failed"], true);
+        assert_eq!(v[0]["mid_cycle"], true);
+        // Garbage stdout is a 500 (bad projection output), not a silent pass.
+        let (code, _) = map_cli_json("not json", "[]");
+        assert_eq!(code, 500);
+    }
+
+    // M5: the estimate route uses the `null` default so a session with no estimate
+    // returns 200 with body `null` (the runs view then omits the estimate group),
+    // never a 404 or a crash. A real Report passes through.
+    #[test]
+    fn estimate_route_null_default_and_passthrough() {
+        let (code, v) = map_cli_json("null", "null");
+        assert_eq!(code, 200);
+        assert_eq!(v, Value::Null);
+        let (code, v) = map_cli_json("", "null");
+        assert_eq!(code, 200);
+        assert_eq!(v, Value::Null);
+        let report = r#"{"session":"code-x","dollars":{"estimate":0.4,"actual":0.6,"delta":0.2},"turns":{"estimate":8.0,"actual":13.0,"delta":5.0},"tool_calls":{"actual":20.0},"tokens":{},"wall_clock_ms":{},"dollars_unavailable":false}"#;
+        let (code, v) = map_cli_json(report, "null");
+        assert_eq!(code, 200);
+        assert_eq!(v["session"], "code-x");
+        assert_eq!(v["dollars"]["delta"], 0.2);
+        assert_eq!(v["dollars_unavailable"], false);
+    }
+
+    // The session-id guard the blocks/estimate routes apply before shelling the
+    // CLI (no `%`/`\`/`"`/NUL — the same gate `conversation` uses).
+    #[test]
+    fn session_id_guard_rejects_unsafe_names() {
+        assert!(valid_session_id("code-2af51b7e"));
+        assert!(!valid_session_id(""));
+        assert!(!valid_session_id("code-..%2Fowner"));
+        assert!(!valid_session_id("code\"x"));
+        assert!(!valid_session_id("code\\x"));
+        assert!(!valid_session_id(&"x".repeat(200)));
     }
 }

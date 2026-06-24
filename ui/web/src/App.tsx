@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import CodeSessions from './CodeSessions';
+import CommsView from './CommsView';
 import { adminGet, adminPost, adminPut, history, publish, status as fetchStatus } from './api';
 import { openLiveStream } from './live';
 import { Button, IconButton, ModelField, WorkdirInput } from './components/primitives';
@@ -9,6 +10,10 @@ import { Button, IconButton, ModelField, WorkdirInput } from './components/primi
 // docs/ui-flows/README.md and docs/ui-flows/configuration.md.
 const BUFFER_CAP = 2000;
 const PARENT_PATH = '$parent';
+// M6 (agent-comms-ui): the priority at/above which an agent-to-agent delivery is
+// "urgent" and lights the global signal lamp. Mirrors the backend default
+// (agent-comms.high_priority_threshold = 5).
+const HIGH_PRIORITY_THRESHOLD = 5;
 
 const arr = (v: unknown) => String(v ?? '').split(',').map((x) => x.trim()).filter(Boolean);
 const csv = (values: unknown) => Array.isArray(values) ? values.join(', ') : '';
@@ -437,6 +442,9 @@ export function App() {
   const sentCorrs = useRef(new Set());
   const seenAsks = useRef(new Set());
   const seenFailures = useRef(new Set());
+  // M6 (agent-comms-ui): event ids that have already lit the lamp, so the same
+  // delivery (re-broadcast on an SSE reconnect) cannot strobe it.
+  const seenLampEvents = useRef(new Set());
   const agentSessions = useRef(new Map());
   const kitModalRef = useRef<HTMLDialogElement | null>(null);
 
@@ -531,6 +539,10 @@ export function App() {
   // Observability M4: the coding-session tree (a "workers" surface). Minimal mount
   // — final placement belongs in the Workers nav the chat track is building.
   const selectCodeSessions = () => setSel({ kind: 'code-sessions' });
+  // agent-comms-ui M2: the cross-agent comms plane (agent-to-agent mail + rooms).
+  const selectComms = () => setSel({ kind: 'comms' });
+  // agent-comms-ui M2: cross-link a comms participant to its run in the runs view.
+  const selectCodeSession = (session: string) => setSel({ kind: 'code-sessions', focus: session });
   const selectSetup = (status?: any) => {
     setSel({ kind: 'setup' });
     void loadSetup(status);
@@ -619,10 +631,12 @@ export function App() {
     : sel.kind === 'signals' ? 'signals'
       : sel.kind === 'setup' ? 'setup'
         : sel.kind === 'code-sessions' ? 'workers'
-          : sel.agent;
+          : sel.kind === 'comms' ? 'comms'
+            : sel.agent;
   const stageNote = sel.kind === 'welcome' ? 'orient, then dive in'
     : sel.kind === 'signals' ? 'a live view of everything happening — orange means something needs your attention'
       : sel.kind === 'code-sessions' ? 'coding runs and the workers they spawned — tool, model, effort, duration, and a resume command'
+      : sel.kind === 'comms' ? 'the cross-agent comms plane — agent-to-agent mail (priority, state, failures) and the coordination rooms'
       : sel.kind === 'setup' ? 'first-run health, agent setup, capabilities, and trust'
         : sel.tab === 'converse' ? `messages with ${sel.agent}`
           : sel.tab === 'sessions' ? 'your agent’s past conversations'
@@ -990,6 +1004,24 @@ export function App() {
       if (agent) void loadConversations(agent);
       return;
     }
+    if (topic.startsWith('in/agent/')) {
+      // M6 (agent-comms-ui): the algedonic tell. Light the global signal lamp
+      // when a HIGH-priority agent-to-agent delivery (or a failure-mail) crosses
+      // the stream, so a human watching ANY view gets the cue. Keyed on the EVENT
+      // (deduped by event_id), NOT a hook firing — a flaky tool re-emitting cannot
+      // strobe the lamp. Priority rides the announced line / payload when present;
+      // absent, only failures and the >=threshold deliveries light it.
+      const evId = env.event_id ?? env.id;
+      const prio = typeof env.priority === 'number' ? env.priority : (typeof p.priority === 'number' ? p.priority : 0);
+      const isUrgent = prio >= HIGH_PRIORITY_THRESHOLD || p.failed === true;
+      // Require an event id to light the lamp. Real deliveries (record_delivery /
+      // failure-mail) always carry one, so this only suppresses the idless edge —
+      // an idless stream of re-emissions can't strobe the lamp (no dedup key).
+      if (isUrgent && evId != null && !seenLampEvents.current.has(evId)) {
+        seenLampEvents.current.add(evId);
+        setSignal({ lit: true, label: p.failed === true ? `failure: ${topic}` : `urgent: ${topic}` });
+      }
+    }
     if (noun && topic.startsWith('in/agent/')) {
       const session = sessionFromPayload(p, env);
       if (env.correlation_id) {
@@ -1136,7 +1168,7 @@ export function App() {
       </header>
 
       <main className="deck">
-        <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel={L.explore} />
+        <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} selectComms={selectComms} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel={L.explore} />
 
         <section className="stage panel" aria-label="view">
           <div className="panel-head">
@@ -1200,7 +1232,8 @@ export function App() {
             setKitPackagesExcluded={setKitPackagesExcluded}
             openKitModal={openKitModal}
           />
-          {sel.kind === 'code-sessions' && <CodeSessions />}
+          {sel.kind === 'code-sessions' && <CodeSessions focus={sel.focus} />}
+          {sel.kind === 'comms' && <CommsView onSelectSession={selectCodeSession} />}
           <SetupView
             hidden={sel.kind !== 'setup'}
             setup={setup}
@@ -1242,7 +1275,7 @@ export function App() {
   );
 }
 
-function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversation, selectSignals, selectSetup, selectCodeSessions, navOpen, setNavOpen, exploreLabel }: any) {
+function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversation, selectSignals, selectSetup, selectCodeSessions, selectComms, navOpen, setNavOpen, exploreLabel }: any) {
   const items = [...agents.keys()].sort();
   const isWorkerItem = (name: string) => {
     const a = agents.get(name);
@@ -1263,7 +1296,8 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
     : sel.kind === 'agent' ? sel.agent
       : sel.kind === 'signals' ? 'signals'
         : sel.kind === 'code-sessions' ? 'workers'
-          : 'setup';
+          : sel.kind === 'comms' ? 'comms'
+            : 'setup';
   return (
     <nav className={`nav panel${navOpen ? ' nav-open' : ''}`} aria-label="explorer">
       <div className="panel-head">
@@ -1274,6 +1308,7 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
         <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" title="live activity across every agent and topic" onClick={selectSignals}><span className="nav-sigil">◮</span> signals</button>
         <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" title="health check, agent setup, capabilities, and trust footprint" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
         <button className={`nav-item nav-workers${sel.kind === 'code-sessions' ? ' on' : ''}`} data-sel="code-sessions" title="coding runs and the workers they spawned" onClick={() => selectCodeSessions && selectCodeSessions()}><span className="nav-sigil">⚙</span> runs</button>
+        <button className={`nav-item nav-comms${sel.kind === 'comms' ? ' on' : ''}`} data-sel="comms" title="the cross-agent comms plane — what the agents are saying to each other" onClick={() => selectComms && selectComms()}><span className="nav-sigil">⇄</span> comms</button>
         <div className="nav-label">agents</div>
         <div id="nav-agents">
           {chatItems.map((name) => {

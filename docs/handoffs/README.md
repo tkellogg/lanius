@@ -168,8 +168,8 @@ statuses: planned | in-progress | verifying | done
   [../journeys/03-cost-visibility.md](../journeys/03-cost-visibility.md)), so it
   ships with a package-local pricing map. Depends on [memory-blocks.md](memory-blocks.md).
   Backed by [../journeys/11-profiles.md](../journeys/11-profiles.md).
-- [agent-comms-ui.md](agent-comms-ui.md) - **planned**: the **human's seat** for the
-  three just-shipped agent-facing capabilities — they are CLI + per-turn injection
+- [agent-comms-ui.md](agent-comms-ui.md) - **done** (M1–M6): the **human's seat** for
+  the three just-shipped agent-facing capabilities — they are CLI + per-turn injection
   only, so a human can't *see* the cross-agent traffic. Comms-first: M1 a `code mail
   --json` ledger projection + `GET /api/comms/mail` (deliveries threaded by
   correlation, with priority/state/failure-mail — the data is already `in/agent/*`

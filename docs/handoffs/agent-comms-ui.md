@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Claude Opus 4.8 in Claude Code on Elanus
 last-updated: 2026-06-24
 ---
@@ -68,7 +68,7 @@ each.
   (`admin_dispatch`, ~573): `models`, `agents`, `kits`, `packages`, `configs`,
   `proposals`, `path-check`, `profile`. **Every admin verb is `cli(root, …)` →
   this binary.** A new read route that shells `elanus block list --json` /
-  `elanus estimate report --json` fits this exact pattern with no new transport.
+  `elanus estimate actual --json` fits this exact pattern with no new transport.
 
 **The backend data the agents just gained (all real, all queryable):**
 
@@ -84,7 +84,7 @@ each.
   `code_block_delivered` dedup tables.
 - Blocks: `elanus block list --json` already prints one JSON line per block
   (`name/owner/scope/placement/priority/content`, `src/blockcli.rs:132`).
-- Estimation: `elanus estimate report` yields a `Report` (dollars/turns/tokens/
+- Estimation: `elanus estimate actual` yields a `Report` (dollars/turns/tokens/
   wall_clock variance + `dollars_unavailable`, `src/estimate.rs`); `obs/estimate/
   <session>` carries the boundary event.
 
@@ -228,9 +228,9 @@ In `CodeSessions` detail (`ui/web/src/CodeSessions.tsx`, the `cs-kv` stats grid
 estimate: the headline dollars (or "—/unknown" when `dollars_unavailable`,
 decision 4), turns, tokens, wall-clock, each with the committed estimate, the
 actual, and the signed variance (over/under). Backed by `GET /api/estimate/
-{session}` shelling a new `elanus estimate report --session <id> --json` (the
-`Report` already exists, `src/estimate.rs`; add a `--json` arm to
-`src/estimatecli.rs::report`). A session with no estimate simply omits the group
+{session}` shelling `elanus estimate actual --session <id> --json` (the
+`Report` already exists, `src/estimate.rs`; the JSON arm is
+`src/estimatecli.rs::actual_json`). A session with no estimate simply omits the group
 (no crash — the report path already skips cleanly).
 
 **Acceptance:** a finished run that recorded an estimate shows, in its detail
@@ -265,7 +265,7 @@ streamed in (reuse the live-stream test harness).
 | Room roster / channel / claims | `live_siblings`/`room_recent`/`peer_claims` exist (Rust-only) | `elanus code rooms --json` + route (M3) |
 | Durable blocks | `elanus block list --json` already JSON | `GET /api/blocks` thin shell (M4) |
 | Ephemeral inbox/channel blocks | Computed per-turn, **never persisted** | Recompute route (M4, decision 2) |
-| Estimate report | `Report` struct exists | `estimate report --json` + `GET /api/estimate/{id}` (M5) |
+| Estimate report | `Report` struct exists | `estimate actual --json` + `GET /api/estimate/{id}` (M5) |
 | Mid-cycle fact | In `code_*_delivered` dedup tables | Join in M1 / lamp off `/api/stream` (M6) |
 | Live overlay | `/api/stream` already streams all of it | Reuse `foldLive` pattern (M2/M3) |
 
@@ -324,6 +324,22 @@ shell-out shape so there is no new transport, auth, or subprocess toolchain.
   `live_siblings`), `src/blockcli.rs`, `src/estimate.rs`/`src/estimatecli.rs`.
 
 ## Log
+- **2026-06-24 — M1–M6 shipped** (impl on Opus medium → adversarial verify on Opus
+  **xhigh**, 1 round `pass`, + a focused fixup pass). All six milestones landed:
+  the agent-mail read route (`src/mailcli.rs` `elanus code mail`/`rooms --json` +
+  `GET /api/comms/mail|rooms` in `src/web.rs`), the `CommsView` traffic view
+  (`ui/web/src/CommsView.tsx`, live-folded like `CodeSessions`, **deduped by
+  `event_id`** so a double-channel delivery is one row), rooms & channels, the
+  read-only block inspector + the recomputed-ephemeral path, estimate-vs-actual in
+  the runs detail (`estimate actual --session --json` → `/api/estimate/{id}`, honest
+  "unknown" dollars), and the event-keyed signal lamp. The six shipped-code concerns
+  were respected. **Tests:** `cargo test` 283 (new `mailcli` + `web.rs` route tests);
+  the full `ui.spec.mjs` suite **ALL PASS against the Rust `elanus web` server**
+  (`ELANUS_UI_SPEC_RUST=1`), incl. the new flow-11. Fixups: hardened the M2 browser
+  assertion (was self-masking — it now requires rendered rows + the high chip, not
+  the empty-state fallback), guarded the signal lamp against idless events, and
+  aligned the M5 doc verb to the shipped `estimate actual --json`. Follow-on: the
+  block-inspector inline EDITOR (M4 shipped read-only).
 - **2026-06-24 — planned.** Reviewed the three just-shipped agent-facing
   handoffs (`d4c4646` agent-comms, `4cb6bb7`/`6e06dd9` memory-blocks, `fbba3bc`
   work-estimation) against the real code, and surveyed the current web UI

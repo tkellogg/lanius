@@ -50,9 +50,16 @@ function createConfigProposal(id, pkg, toml) {
 elanus('init');
 fs.writeFileSync(path.join(TMP, 'bus.toml'), `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\n`);
 const daemon = spawn(path.join(BIN, 'elanus'), ['daemon', '--interval-ms', '200'], { env: ENV, stdio: 'ignore' });
-const server = spawn('node', [path.join(REPO, 'ui/web/server.mjs'), '--root', TMP, '--port', String(WEB_PORT)], {
-  env: ENV, stdio: ['ignore', 'pipe', 'inherit'],
-});
+// The server under test: node server.mjs by default, or the Rust `elanus web`
+// (the embedded SPA, src/web.rs) when ELANUS_UI_SPEC_RUST=1. The agent-comms-ui
+// routes (/api/comms/*, /api/blocks, /api/estimate/*) live ONLY in web.rs, so
+// they are exercised against the Rust server in that mode.
+const USE_RUST = process.env.ELANUS_UI_SPEC_RUST === '1';
+const server = USE_RUST
+  ? spawn(path.join(BIN, 'elanus'), ['web', '--port', String(WEB_PORT)], { env: ENV, stdio: ['ignore', 'pipe', 'inherit'] })
+  : spawn('node', [path.join(REPO, 'ui/web/server.mjs'), '--root', TMP, '--port', String(WEB_PORT)], {
+      env: ENV, stdio: ['ignore', 'pipe', 'inherit'],
+    });
 await waitFor('web server up', async () => {
   try { return (await fetch(`${BASE}/`)).ok; } catch { return false; }
 }, 20000);
@@ -81,6 +88,14 @@ async function newPage() {
     if (/model list unavailable/i.test(t)) return;
     // history probe returns 503 before the package is installed — expected.
     if (/503|Service Unavailable/i.test(t)) return;
+    // The agent-comms-ui read routes (/api/comms/*, /api/blocks, /api/estimate/*)
+    // exist only in the Rust web.rs server; against the node server.mjs fallback
+    // they 404. The CommsView fetches them on mount and handles the 404
+    // gracefully, but the browser logs a generic "Failed to load resource: 404"
+    // (no URL in the text). The rest of the node suite produces no 404s, so in the
+    // node-fallback mode a bare 404 is the expected comms-route miss — not a regression.
+    if (!USE_RUST && /\/api\/(comms|blocks|estimate)/i.test(t)) return;
+    if (!USE_RUST && /Failed to load resource.*404/i.test(t)) return;
     consoleErrors.push(`[console.error] ${t}`);
     console.error(`BROWSER CONSOLE ERR: ${t}`);
   });
@@ -1039,6 +1054,132 @@ const renamedAgent = 'falcon';
   // The compose button says "Send", not "transmit".
   const sendLabel = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
   /^send$/i.test(sendLabel) ? ok('language: compose button is "Send"') : fail(`language: compose button is "${sendLabel}"`);
+  await page.close();
+}
+
+
+// ── flow 11: agent-comms-ui — comms view, blocks, estimate, signal lamp ─────
+// The human's seat for the cross-agent comms plane (docs/handoffs/agent-comms-ui.md).
+// M2 comms traffic, M3 rooms panel, M4 block inspector, M5 estimate-vs-actual,
+// M6 signal lamp. These routes (/api/comms/*, /api/blocks, /api/estimate/*) are
+// web.rs-only, so this flow is most meaningful in ELANUS_UI_SPEC_RUST=1 mode; it
+// degrades to empty-state assertions against the node server.
+{
+  // Seed agent-to-agent mail: a normal delivery and a high-priority one (the
+  // projection threads `in/agent/<noun>/<code-session>` events). `elanus emit`
+  // writes them to the same ledger the projection reads.
+  try {
+    elanus('emit', 'in/agent/claude-code/code-uimail01', '--payload', JSON.stringify({ prompt: 'please run the tests' }));
+    elanus('emit', 'in/agent/claude-code/code-uimail02', '--payload', JSON.stringify({ prompt: 'URGENT: prod is down' }), '--priority', '9');
+  } catch (e) { fail(`seeding comms mail failed: ${e.message ?? e}`); }
+  // Seed a durable session-scope block the inspector should list (owner code-agent
+  // is the inspector's fallback owner when a session has no record).
+  try {
+    elanus('block', 'set', 'identity', 'I am the worker.', '--owner', 'code-agent', '--session', 'code-uiblk01', '--scope', 'session');
+  } catch (e) { fail(`seeding a block failed: ${e.message ?? e}`); }
+  // Seed an estimate for a session so the runs detail shows the estimate group.
+  try {
+    elanus('estimate', 'set', '--session', 'code-uiest01', '--dollars', '0.40', '--turns', '8', '--tokens', '1000');
+  } catch (e) { fail(`seeding an estimate failed: ${e.message ?? e}`); }
+
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents', { timeout: 10000 });
+
+  // M2 — open the comms view from the nav.
+  await page.click('[data-sel="comms"]');
+  await page.waitForSelector('#view-comms:not([hidden])', { timeout: 5000 });
+  ok('comms: view opens from the nav');
+
+  // The mail list shows at least one row with a priority chip (against seeded
+  // mail), or the documented empty-state copy (node server, no routes). The
+  // /api/comms/mail fetch is async — wait until the view has settled to EITHER
+  // a rendered row or the empty-state, so we never read the transient pre-fetch
+  // state (which would self-mask by landing on the empty branch every time).
+  await page.waitForFunction(() => document.querySelector('.comms-row') || document.querySelector('.cm-empty'), null, { timeout: 8000 });
+  const commsState = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('.comms-row')];
+    const chips = rows.map((r) => !!r.querySelector('.cm-chip'));
+    const high = !!document.querySelector('.cm-high');
+    const empty = !!document.querySelector('.cm-empty');
+    return { rowCount: rows.length, anyChip: chips.some(Boolean), high, empty };
+  });
+  if (USE_RUST) {
+    // The Rust server serves the seeded-mail projection (/api/comms/mail), so M2
+    // MUST render rows here — the empty-state fallback is NOT acceptable. Require
+    // rows with chips AND the high-priority chip from the seeded priority-9 mail.
+    commsState.rowCount > 0 && commsState.anyChip
+      ? ok(`comms: ${commsState.rowCount} mail row(s) with priority chips render`)
+      : fail(`comms: seeded mail did not render rows with chips (${JSON.stringify(commsState)})`);
+    commsState.high
+      ? ok('comms: a high-priority delivery shows the high chip')
+      : fail('comms: seeded high-priority mail did not show a high chip');
+  } else if (commsState.rowCount > 0 && commsState.anyChip) {
+    ok(`comms: ${commsState.rowCount} mail row(s) with priority chips render`);
+  } else if (commsState.empty) {
+    ok('comms: empty-state copy renders (server without /api/comms routes)');
+  } else {
+    fail(`comms: neither mail rows nor empty-state rendered (${JSON.stringify(commsState)})`);
+  }
+
+  // M3 — the rooms panel is present (empty-state or a .comms-room). Seeding live
+  // room membership needs a real session, so this asserts the panel renders; the
+  // roster/claim shape is covered by the Rust recent_rooms unit test.
+  const roomsPanel = await page.$eval('.cm-rooms', (el) => el.querySelector('h3')?.textContent ?? '').catch(() => '');
+  /rooms/i.test(roomsPanel) ? ok('comms: rooms & shared channels panel renders') : fail('comms: rooms panel missing');
+
+  // M6 — the signal lamp lights when a high-priority in/agent delivery crosses the
+  // live stream. Publish one over /api/publish (the lamp is wired in App.tsx and
+  // clears on click) and assert it gains the `lit` class.
+  await page.evaluate(async () => {
+    await fetch('/api/publish', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ topic: 'in/agent/claude-code/code-uilamp01', payload: { prompt: 'urgent live', priority: 9, event_id: 99001 } }),
+    });
+  });
+  const lampLit = await waitFor('comms: signal lamp lights on a high-priority in/agent event', async () =>
+    page.$eval('#signal-lamp', (el) => el.classList.contains('lit')).catch(() => false), 8000);
+  if (lampLit) {
+    await page.click('#signal-lamp');
+    const cleared = await page.$eval('#signal-lamp', (el) => !el.classList.contains('lit')).catch(() => false);
+    cleared ? ok('comms: signal lamp clears on click') : fail('comms: signal lamp did not clear on click');
+  }
+
+  // M4 + M5 — the block inspector and the estimate group live in the runs detail.
+  // Open runs and select a seeded session; the projection only shows sessions the
+  // daemon has observed, so we assert the panels render when the session is
+  // present, and tolerate its absence (no projected run) without failing the suite.
+  await page.click('[data-sel="code-sessions"]');
+  await page.waitForSelector('#view-comms', { state: 'hidden', timeout: 5000 }).catch(() => {});
+  // Drive the block/estimate routes directly to confirm the web layer serves them
+  // (the projection-gated UI panels depend on a projected run row, which the spec
+  // does not stand up). These assertions are skipped on the node server.
+  if (USE_RUST) {
+    const blocks = await page.evaluate(async () => {
+      const r = await fetch('/api/blocks?session=code-uiblk01');
+      return r.ok ? await r.json() : null;
+    });
+    Array.isArray(blocks) && blocks.some((b) => b.name === 'identity')
+      ? ok('blocks: /api/blocks lists the seeded durable block by name with its scope')
+      : fail(`blocks: inspector route did not return the seeded block (${JSON.stringify(blocks)})`);
+
+    const est = await page.evaluate(async () => {
+      const r = await fetch('/api/estimate/code-uiest01');
+      return r.ok ? await r.json() : null;
+    });
+    est && est.session === 'code-uiest01' && est.turns && est.turns.estimate === 8
+      ? ok('estimate: /api/estimate returns the seeded estimate with a variance')
+      : fail(`estimate: report route did not return the seeded estimate (${JSON.stringify(est)})`);
+
+    const none = await page.evaluate(async () => {
+      const r = await fetch('/api/estimate/code-noestimate');
+      return { status: r.status, body: await r.json().catch(() => undefined) };
+    });
+    none.status === 200 && none.body === null
+      ? ok('estimate: a session with no estimate returns 200 null (group omitted, no crash)')
+      : fail(`estimate: no-estimate session did not return null (${JSON.stringify(none)})`);
+  }
   await page.close();
 }
 

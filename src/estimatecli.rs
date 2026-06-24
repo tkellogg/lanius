@@ -207,6 +207,18 @@ pub fn actual(root: &Root, opts: &EstimateOpts) -> Result<()> {
     Ok(())
 }
 
+/// `elanus estimate actual --json`: E2 as a machine-readable command — print the
+/// `Report` as JSON, or `null` when the session has no recorded estimate (so the
+/// web /api/estimate/{session} route can distinguish "no estimate" from an error
+/// and simply omit the estimate group). Never crashes on a missing estimate.
+pub fn actual_json(root: &Root, opts: &EstimateOpts) -> Result<()> {
+    match report(root, opts)? {
+        Some(r) => println!("{}", serde_json::to_string_pretty(&r)?),
+        None => println!("null"),
+    }
+    Ok(())
+}
+
 /// E3 — the retro: compute the variance and append a dated miss to the durable
 /// `estimation` block (agent scope), the default-that-evolves loop. A session with
 /// no estimate is skipped. Returns the appended note (for the caller/hook to log),

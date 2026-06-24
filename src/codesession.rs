@@ -1322,6 +1322,12 @@ fn pid_alive(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// Public liveness probe (same signal-0 semantics as `pid_alive`) for the
+/// human-facing rooms projection, which renders a member's liveness honestly.
+pub fn pid_alive_pub(pid: i32) -> bool {
+    pid_alive(pid)
+}
+
 fn write_0600(path: &Path, contents: &str) -> std::io::Result<()> {
     // ATOMIC WRITE: write to a sibling temp file, set 0600, then rename into
     // place. On POSIX, rename(2) within a single filesystem is atomic — a

@@ -23,6 +23,7 @@ mod hooks;
 mod human;
 mod initcmd;
 mod kit;
+mod mailcli;
 mod manifest;
 mod mcp;
 mod models;
@@ -515,6 +516,10 @@ enum EstimateCmd {
     /// price tokens via pricing.toml, write the `estimate-vs-actual` block, print
     /// the report. A session with no estimate is skipped.
     Actual {
+        /// Emit the report as JSON (the `Report` struct) instead of the
+        /// block-content text. Backs the web /api/estimate/{session} route.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         args: EstimateArgs,
     },
@@ -1037,7 +1042,13 @@ fn run(cli: Cli) -> Result<()> {
                 wall_clock_ms,
                 args,
             } => estimatecli::set(&root, dollars, turns, tokens, wall_clock_ms, &args.opts())?,
-            EstimateCmd::Actual { args } => estimatecli::actual(&root, &args.opts())?,
+            EstimateCmd::Actual { json, args } => {
+                if json {
+                    estimatecli::actual_json(&root, &args.opts())?
+                } else {
+                    estimatecli::actual(&root, &args.opts())?
+                }
+            }
             EstimateCmd::Retro { args } => estimatecli::retro_cmd(&root, &args.opts())?,
         },
         Cmd::Approve { name, by } => {
@@ -1174,6 +1185,29 @@ fn run(cli: Cli) -> Result<()> {
                     // arg — so it can only ever read its own mailbox. Flags: --all
                     // (full inbox, non-destructive), --json (machine-readable).
                     codeagent::inbox_cmd(&root, rest)?;
+                }
+                "mail" => {
+                    // The human-facing projection of agent-to-agent message
+                    // traffic (agent-comms-ui M1). `elanus code mail [--json]
+                    // [--limit N]`. A pure ledger read over `in/agent/%` events,
+                    // threaded by correlation, failure-mail flagged. Backs the web
+                    // /api/comms/mail route.
+                    mailcli::mail_cmd(&root, rest)?;
+                }
+                "blocks" => {
+                    // The human-facing memory-block inspector projection
+                    // (agent-comms-ui M4, read-only). `elanus code blocks
+                    // --session <code-id> [--json]`. Durable blocks (context_blocks,
+                    // keyed by the session's agent noun) + recomputed ephemeral
+                    // inbox/channel blocks (never stored). Backs /api/blocks.
+                    mailcli::blocks_cmd(&root, rest)?;
+                }
+                "rooms" => {
+                    // The human-facing projection of coordination rooms
+                    // (agent-comms-ui M3). `elanus code rooms [--json] [--recent
+                    // N]`. Roster (liveness honest), claims, and recent channel
+                    // traffic per room. Backs the web /api/comms/rooms route.
+                    mailcli::rooms_cmd(&root, rest)?;
                 }
                 "note" => {
                     // Leave a per-session memory note (M3), surfaced by the per-turn
