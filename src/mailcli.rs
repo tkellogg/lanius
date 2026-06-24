@@ -241,6 +241,10 @@ pub struct RoomMessage {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RoomRow {
     pub room: String,
+    /// Human-readable name: a wd-room's working-directory basename, else the id.
+    pub label: String,
+    /// The resolved working directory path (for a UI tooltip), or None.
+    pub workdir: Option<String>,
     pub members: Vec<RoomMember>,
     pub claims: Vec<RoomClaim>,
     pub channel: Vec<RoomMessage>,
@@ -279,6 +283,8 @@ pub fn recent_rooms(root: &Root, recent_n: usize) -> Result<Vec<RoomRow>> {
             order.push(room.clone());
             RoomRow {
                 room: room.clone(),
+                label: room.clone(),
+                workdir: None,
                 members: Vec::new(),
                 claims: Vec::new(),
                 channel: Vec::new(),
@@ -305,6 +311,42 @@ pub fn recent_rooms(root: &Root, recent_n: usize) -> Result<Vec<RoomRow>> {
                     created_at: m.created_at,
                 })
                 .collect();
+        }
+    }
+
+    // Derive a human-readable label (+ workdir tooltip) per room. A `wd-` room is
+    // workdir-derived: its label is the directory basename, found via the first
+    // member whose session record carries a non-empty workdir (all members of a
+    // wd- room share the same canonical workdir by construction). Other rooms are
+    // explicit `--room` names — already human-meaningful, no single workdir.
+    for room in &order {
+        if let Some(rr) = rooms.get_mut(room) {
+            if room.starts_with("wd-") {
+                let resolved = rr.members.iter().find_map(|m| {
+                    match crate::codesession::read_record(root, &m.session) {
+                        Ok(Some(rec)) if !rec.workdir.is_empty() => Some(rec.workdir),
+                        _ => None,
+                    }
+                });
+                match resolved {
+                    Some(path) => {
+                        let base = std::path::Path::new(&path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+                        rr.label = base.unwrap_or_else(|| room.clone());
+                        rr.workdir = Some(path);
+                    }
+                    None => {
+                        rr.label = room.clone();
+                        rr.workdir = None;
+                    }
+                }
+            } else {
+                rr.label = room.clone();
+                rr.workdir = None;
+            }
         }
     }
 
@@ -341,7 +383,13 @@ pub fn rooms_cmd(root: &Root, rest: &[String]) -> Result<()> {
         println!("(no coordination rooms with members)");
     } else {
         for r in &rows {
-            println!("room {} ({} member(s), {} claim(s))", r.room, r.members.len(), r.claims.len());
+            println!(
+                "room {} {}({} member(s), {} claim(s))",
+                r.label,
+                if r.label != r.room { format!("[{}] ", r.room) } else { String::new() },
+                r.members.len(),
+                r.claims.len()
+            );
             for m in &r.members {
                 println!("  member {} ({}) {}", m.session, m.agent_noun, if m.live { "live" } else { "stale" });
             }
@@ -678,6 +726,35 @@ mod tests {
         // The recent channel message is surfaced.
         assert_eq!(r.channel.len(), 1);
         assert_eq!(r.channel[0].message, "anyone on the parser?");
+        // An explicit `--room` name is its own label, with no workdir tooltip.
+        assert_eq!(r.label, "room-1");
+        assert_eq!(r.workdir, None);
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    // ── label derivation: a wd- room takes its name from the workdir basename ────
+    #[test]
+    fn wd_room_label_is_workdir_basename() {
+        let root = temp_root("wdlabel");
+        // A session whose recorded workdir is a directory named "myproject".
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-wdsess01".into(),
+                native_session: "n1".into(),
+                tool: "claude".into(),
+                agent_noun: "claude-code".into(),
+                workdir: "/some/dir/myproject".into(),
+                room: None,
+            },
+        )
+        .unwrap();
+        crate::codesession::join_room(&root, "wd-deadbeef", "code-wdsess01", "claude-code", std::process::id() as i32).unwrap();
+
+        let rooms = recent_rooms(&root, 5).unwrap();
+        let r = rooms.iter().find(|r| r.room == "wd-deadbeef").unwrap();
+        assert_eq!(r.label, "myproject", "wd- room label is the workdir basename");
+        assert_eq!(r.workdir, Some("/some/dir/myproject".to_string()));
         std::fs::remove_dir_all(&root.dir).ok();
     }
 

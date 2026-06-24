@@ -38,7 +38,7 @@ type Mail = {
 type RoomMember = { session: string; agent_noun: string; live: boolean };
 type RoomClaim = { session: string; path: string; created_at: string };
 type RoomMessage = { from: string | null; message: string; created_at: string };
-type Room = { room: string; members: RoomMember[]; claims: RoomClaim[]; channel: RoomMessage[] };
+type Room = { room: string; label?: string; workdir?: string | null; members: RoomMember[]; claims: RoomClaim[]; channel: RoomMessage[] };
 
 function relTime(ts: string | null): string {
   if (!ts) return '';
@@ -206,7 +206,8 @@ export default function CommsView({ onSelectSession }: { onSelectSession?: (id: 
         {rooms.map((r) => (
           <div key={r.room} className="comms-room cm-room">
             <div className="cm-room-head">
-              <span className="cm-room-name">{r.room}</span>
+              <span className="cm-room-name" title={r.workdir ?? undefined}>{r.label || r.room}</span>
+              {r.label && r.label !== r.room && <span className="cm-room-id">{r.room}</span>}
               <span className="cm-room-count">{r.members.length} member{r.members.length === 1 ? '' : 's'}</span>
             </div>
             <div className="cm-room-members">
@@ -289,6 +290,7 @@ const CM_STYLE = `
 .cm-room { border: 1px solid #2a2a2a; border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; font-size: 12px; }
 .cm-room-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 4px; }
 .cm-room-name { font-family: ui-monospace, monospace; font-weight: 600; }
+.cm-room-id { font-family: ui-monospace, monospace; color: #6a6a6a; font-size: 11px; }
 .cm-room-count { color: #8a8a8a; font-size: 11px; }
 .cm-room-members { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
 .cm-member { display: inline-flex; gap: 5px; align-items: baseline; padding: 1px 6px; border-radius: 8px; }
