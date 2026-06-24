@@ -3756,7 +3756,15 @@ fn run_opencode_tui_server_events(
 
 /// Launch `opencode attach <url>` (or a bare `opencode` TUI when `url` is None — the
 /// degraded no-capture fallback) with inherited stdio inside the cage, the envelope
-/// briefing folded into the seed positional (opencode has no `--append-system-prompt`).
+/// briefing delivered as the session's opening prompt.
+///
+/// `opencode attach <url>` takes ONLY the `url` positional — it has no initial-message
+/// argument (unlike the bare `opencode <message>` TUI). So in attach mode we can't fold
+/// the seed into a positional; doing so makes opencode reject the extra arg and print
+/// its usage. Instead we pre-create a session on the served instance and queue the seed
+/// as its opening prompt over the server API, then `attach --session <id>` onto it. The
+/// bare-TUI fallback (`url` = None) keeps using the positional, which it accepts.
+///
 /// Returns an empty summary — the live capture (when present) is harvested by the SSE
 /// subscriber thread, not here.
 #[allow(clippy::too_many_arguments)]
@@ -3781,11 +3789,29 @@ fn run_opencode_attach_tui(
     };
 
     let mut cmd = Command::new("opencode");
-    if let Some(url) = url {
-        cmd.arg("attach").arg(url);
-    }
-    if let Some(seed) = seed {
-        cmd.arg(seed);
+    match url {
+        Some(url) => {
+            // Attach mode: deliver the seed over the server API (attach has no
+            // initial-message positional), then continue that session in the TUI.
+            cmd.arg("attach").arg(url);
+            if let Some(seed) = seed.as_deref() {
+                match opencode_seed_session(url, password, seed) {
+                    Some(sid) => {
+                        eprintln!("[code] opencode: seeded session {sid} with the opening prompt");
+                        cmd.arg("--session").arg(sid);
+                    }
+                    None => eprintln!(
+                        "[code] opencode: could not pre-seed session via API; attaching without the brief"
+                    ),
+                }
+            }
+        }
+        None => {
+            // Degraded fallback: bare `opencode <seed>` accepts an opening-message positional.
+            if let Some(seed) = seed {
+                cmd.arg(seed);
+            }
+        }
     }
     cmd.current_dir(workdir);
     cmd.stdin(std::process::Stdio::inherit())
@@ -3808,6 +3834,43 @@ fn run_opencode_attach_tui(
         .status()
         .with_context(|| "launching opencode (is it installed and on PATH?)".to_string())?;
     Ok((status, CaptureSummary::default()))
+}
+
+/// Pre-create a session on the served opencode instance and queue `seed` (the envelope
+/// brief folded with any task) as its opening prompt, returning the native session id so
+/// the TUI can `attach --session <id>` onto it. `opencode attach <url>` has no
+/// initial-message positional, so the seed must travel over the server API. Reaches the
+/// loopback server with the same basic-auth password the TUI uses. Best-effort: returns
+/// None on any failure (the caller then attaches to a fresh, un-seeded session).
+fn opencode_seed_session(url: &str, password: &str, seed: &str) -> Option<String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        let client = reqwest::Client::new();
+        let created = client
+            .post(format!("{url}/api/session"))
+            .basic_auth("opencode", Some(password))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .ok()?;
+        let body: serde_json::Value = created.json().await.ok()?;
+        let sid = body.get("data")?.get("id")?.as_str()?.to_string();
+        // Queue the seed so it survives even if the session is momentarily busy; admitted
+        // immediately on a fresh session.
+        let prompt = json!({ "prompt": { "text": seed }, "delivery": "queue" });
+        let _ = client
+            .post(format!("{url}/api/session/{sid}/prompt"))
+            .basic_auth("opencode", Some(password))
+            .header("content-type", "application/json")
+            .body(prompt.to_string())
+            .send()
+            .await;
+        Some(sid)
+    })
 }
 
 /// A fresh per-launch basic-auth password for our served instance: prefer an
@@ -5788,7 +5851,22 @@ fn publish_obs(root: &Root, principal: &str, token: &str, topic_name: &str, body
     // unconditionally keeps both call sites correct.
     std::env::set_var("ELANUS_PACKAGE", principal);
     std::env::set_var("ELANUS_BUS_TOKEN", token);
-    if let Err(e) = buscli::publish(root, topic_name, Some(&body.to_string()), 0, false, None) {
+    let payload = body.to_string();
+    // buscli::publish builds its own current-thread runtime and `block_on`s it. If we
+    // are ALREADY inside a tokio runtime — e.g. the opencode SSE subscriber projecting a
+    // live event off its `block_on` loop — nesting another `block_on` panics ("Cannot
+    // start a runtime from within a runtime"). Offload to a fresh OS thread, which has no
+    // runtime entered, so the publish's own runtime is the only one on that thread.
+    let result = if tokio::runtime::Handle::try_current().is_ok() {
+        let root = root.clone();
+        let topic = topic_name.to_string();
+        std::thread::spawn(move || buscli::publish(&root, &topic, Some(&payload), 0, false, None))
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("obs publish thread panicked")))
+    } else {
+        buscli::publish(root, topic_name, Some(&payload), 0, false, None)
+    };
+    if let Err(e) = result {
         eprintln!("[code] obs publish to {topic_name} failed (continuing): {e:#}");
     }
 }
@@ -6705,6 +6783,31 @@ mod tests {
         // The session id is positional right after `--session` — the resume targets
         // THE recorded session.
         assert_eq!(args[2], rec.native_session);
+    }
+
+    #[test]
+    fn publish_obs_from_within_a_runtime_does_not_panic() {
+        // Regression: the opencode SSE subscriber projects live events from INSIDE its
+        // own `block_on` loop. publish_obs → buscli::publish builds a current-thread
+        // runtime and `block_on`s it; nesting that inside an existing runtime used to
+        // panic ("Cannot start a runtime from within a runtime"). It must now offload to
+        // a fresh thread and fail-soft (no daemon here) rather than abort the process.
+        let root = Root {
+            dir: PathBuf::from("/tmp/elanus-test-no-such-root"),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            publish_obs(
+                &root,
+                "owner",
+                "tok",
+                "obs/agent/x/y/session/idle",
+                json!({ "ok": true }),
+            );
+        });
     }
 
     #[test]
