@@ -1164,6 +1164,97 @@ const renamedAgent = 'falcon';
       ? ok('blocks: /api/blocks lists the seeded durable block by name with its scope')
       : fail(`blocks: inspector route did not return the seeded block (${JSON.stringify(blocks)})`);
 
+    // The block-inspector INLINE EDITOR (the documented follow-on to M4). A DURABLE
+    // block (it carries an owner) is editable: a save POSTs `/api/blocks`, which —
+    // through the origin_ok CSRF guard — shells `elanus block set ... --by ui` and
+    // re-reads the persisted value. Drive the editor's exact POST and confirm the
+    // new content persists on a fresh read.
+    const durable = blocks.find((b) => b.name === 'identity');
+    const editRes = await page.evaluate(async (blk) => {
+      const r = await fetch('/api/blocks', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          session: 'code-uiblk01',
+          name: blk.name,
+          owner: blk.owner,
+          scope: blk.scope,
+          placement: blk.placement,
+          priority: blk.priority,
+          content: 'I am the worker. (edited from the UI)',
+        }),
+      });
+      const body = await r.json().catch(() => ({}));
+      return { status: r.status, body };
+    }, durable);
+    editRes.status === 200 && editRes.body && editRes.body.ok === true
+      ? ok('blocks: editing a durable block POSTs through the origin_ok guard and succeeds')
+      : fail(`blocks: durable-block edit did not succeed (${JSON.stringify(editRes)})`);
+
+    // The edit persists: a fresh read shows the new content (the route re-read the
+    // durable blocks and the write went through `elanus block set --by ui`).
+    const afterEdit = await page.evaluate(async () => {
+      const r = await fetch('/api/blocks?session=code-uiblk01');
+      return r.ok ? await r.json() : null;
+    });
+    Array.isArray(afterEdit) && afterEdit.some((b) => b.name === 'identity' && /edited from the UI/.test(b.content))
+      ? ok('blocks: the edited durable-block content persists on a fresh read')
+      : fail(`blocks: the edit did not persist (${JSON.stringify(afterEdit)})`);
+
+    // A cross-origin POST to the write route is refused by origin_ok (CSRF guard) —
+    // the same boundary every /api/admin mutation enforces. The browser forbids
+    // overriding the `Origin` header on a same-page fetch, so this is driven from
+    // the Node side (a hostile-page / rebinding request): a request whose Origin
+    // host does NOT match the local Host must be rejected (403), never written.
+    const crossOriginRes = await fetch(`${BASE}/api/blocks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Origin': 'http://evil.example' },
+      body: JSON.stringify({ session: 'code-uiblk01', name: 'identity', owner: 'code-agent', scope: 'session', content: 'pwned' }),
+    });
+    crossOriginRes.status === 403
+      ? ok('blocks: a cross-origin write POST is refused by the origin_ok guard (403)')
+      : fail(`blocks: cross-origin write was not refused (status ${crossOriginRes.status})`);
+    // (The non-local-Host / DNS-rebinding leg of origin_ok can't be exercised here —
+    // undici forbids overriding the Host header — so it's covered by the Rust
+    // `origin_guard_rejects_cross_origin_post` unit test instead.)
+    // And the rejected write left no trace — the content is still the edited value.
+    const stillEdited = await page.evaluate(async () => {
+      const r = await fetch('/api/blocks?session=code-uiblk01');
+      const rows = r.ok ? await r.json() : [];
+      return rows.find((b) => b.name === 'identity')?.content ?? '';
+    });
+    /edited from the UI/.test(stillEdited) && !/pwned/.test(stillEdited)
+      ? ok('blocks: the refused cross-origin write did not mutate the block')
+      : fail(`blocks: cross-origin write may have leaked through (${stillEdited})`);
+
+    // An EPHEMERAL block is owner-less (computed each turn, never stored) and is NOT
+    // editable: the write route rejects it. Seed unseen mail so the live inbox block
+    // appears, confirm it is ephemeral with no owner, and confirm a write is refused.
+    try {
+      elanus('emit', 'in/agent/code-agent/code-uiblk01', '--payload', JSON.stringify({ prompt: 'a message for the worker' }));
+    } catch (e) { fail(`seeding inbox mail failed: ${e.message ?? e}`); }
+    const withEph = await page.evaluate(async () => {
+      const r = await fetch('/api/blocks?session=code-uiblk01');
+      return r.ok ? await r.json() : [];
+    });
+    const eph = withEph.find((b) => b.ephemeral === true);
+    eph && !eph.owner
+      ? ok('blocks: the ephemeral inbox block is owner-less and marked ephemeral (no editor)')
+      : fail(`blocks: expected an owner-less ephemeral inbox block (${JSON.stringify(withEph.map((b) => ({ name: b.name, ephemeral: b.ephemeral, owner: b.owner })))})`);
+    if (eph) {
+      // Driven from the Node side so the intentional 400 doesn't surface as a
+      // browser console.error (the UI never POSTs an ephemeral block — there is no
+      // editor on it — so this probes the server guard directly).
+      const ephWrite = await fetch(`${BASE}/api/blocks`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ session: 'code-uiblk01', name: eph.name, owner: eph.owner, scope: eph.scope, placement: eph.placement, content: 'should not persist' }),
+      });
+      ephWrite.status === 400
+        ? ok('blocks: writing an ephemeral (owner-less) block is refused (400, not editable)')
+        : fail(`blocks: an ephemeral-block write was not refused (status ${ephWrite.status})`);
+    }
+
     const est = await page.evaluate(async () => {
       const r = await fetch('/api/estimate/code-uiest01');
       return r.ok ? await r.json() : null;

@@ -324,6 +324,19 @@ shell-out shape so there is no new transport, auth, or subprocess toolchain.
   `live_siblings`), `src/blockcli.rs`, `src/estimate.rs`/`src/estimatecli.rs`.
 
 ## Log
+- **2026-06-24 — block-inspector inline EDITOR shipped** (the M4 follow-on; impl Opus
+  medium → adversarial verify Opus xhigh, 1 round `pass`). `POST /api/blocks`
+  (`src/web.rs` `block_set`) behind the `origin_ok` CSRF/DNS-rebind guard shells
+  `elanus block set … --by ui` (new blockcli `--by` arg → an attribution row in
+  `context_build_log`) and re-reads the persisted value; the inspector
+  (`CodeSessions.tsx`) gains an inline editor for **durable** blocks only — ephemeral
+  inbox/channel blocks stay read-only (owner-less write → 400). Verifier proved the
+  guard live (cross-origin & DNS-rebind → 403, local → 200, rejected writes left no
+  trace) plus edit-persist + attribution. `cargo test` 286, `ui.spec.mjs` 152 ALL PASS.
+  Accepted minor: a hand-crafted POST (not reachable via the UI) could create a durable
+  block *named* `inbox`/`channel:*` — a cosmetic namesake within homogeneous-authority
+  (CLI parity), no bypass; optional hardening = reserve that ephemeral namespace at
+  session scope.
 - **2026-06-24 — M1–M6 shipped** (impl on Opus medium → adversarial verify on Opus
   **xhigh**, 1 round `pass`, + a focused fixup pass). All six milestones landed:
   the agent-mail read route (`src/mailcli.rs` `elanus code mail`/`rooms --json` +

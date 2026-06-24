@@ -195,6 +195,7 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
                     .route("/api/comms/mail", web::get().to(comms_mail))
                     .route("/api/comms/rooms", web::get().to(comms_rooms))
                     .route("/api/blocks", web::get().to(blocks))
+                    .route("/api/blocks", web::post().to(block_set))
                     .route("/api/estimate/{session}", web::get().to(estimate_report))
                     .route("/api/publish", web::post().to(publish))
                     .service(
@@ -593,6 +594,122 @@ async fn blocks(hub: web::types::State<Arc<Hub>>, req: HttpRequest) -> HttpRespo
         "[]",
     )
     .await
+}
+
+/// The documented follow-on to M4: a GUARDED human write to a DURABLE memory block.
+/// Build the `elanus block set` argv from a validated edit request. Only DURABLE
+/// blocks are writable (the ephemeral inbox/channel blocks are owner-less, computed
+/// each turn, and never persisted — decision 2/3); the route rejects them before
+/// reaching here. The block's KEY (scope/owner/name) is preserved; only the content
+/// (and optionally priority/placement) changes. Always stamps `--by ui` so the edit
+/// is attributable in `context_build_log`. Returns `Err` with a human reason on a
+/// bad request. Factored out so it is unit-testable without spinning the server.
+fn block_set_args(body: &Value) -> Result<Vec<String>, String> {
+    let s = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("").trim();
+    let session = s("session");
+    let name = s("name");
+    let owner = s("owner");
+    let scope = s("scope");
+    if session.is_empty() {
+        return Err("need session".into());
+    }
+    if !valid_session_id(session) {
+        return Err("bad session".into());
+    }
+    if name.is_empty() {
+        return Err("need block name".into());
+    }
+    // The ephemeral inbox/channel blocks (decision 2) are owner-less, session-computed,
+    // and never stored — they are not editable. A durable block always carries an owner.
+    if owner.is_empty() {
+        return Err("ephemeral blocks are not editable (no owner)".into());
+    }
+    // content may be empty (clearing a block is a legitimate edit); it is required
+    // to be present so a malformed request can't silently write an empty block.
+    let content = match body.get("content").and_then(Value::as_str) {
+        Some(c) => c,
+        None => return Err("need content".into()),
+    };
+    let mut args = vec![
+        "block".to_string(),
+        "set".to_string(),
+        name.to_string(),
+        content.to_string(),
+        "--session".to_string(),
+        session.to_string(),
+        "--owner".to_string(),
+        owner.to_string(),
+        // Attribution: a UI edit is decided-by `ui`, recorded in context_build_log.
+        "--by".to_string(),
+        "ui".to_string(),
+    ];
+    // scope defaults to the block's own key; the inspector echoes it back so the
+    // (scope, owner, name) key is preserved across the edit.
+    if !scope.is_empty() {
+        args.push("--scope".to_string());
+        args.push(scope.to_string());
+    }
+    if let Some(p) = body.get("placement").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        args.push("--placement".to_string());
+        args.push(p.to_string());
+    }
+    if let Some(p) = body.get("priority").and_then(Value::as_i64) {
+        args.push("--priority".to_string());
+        args.push(p.to_string());
+    }
+    Ok(args)
+}
+
+/// `POST /api/blocks` — the guarded inline-editor write. Mirrors the `/api/admin`
+/// POST contract: a cross-origin POST is refused by `origin_ok` (CSRF/DNS-rebind),
+/// the body is shelled to `elanus block set ... --by ui`, and the persisted value is
+/// re-read so the editor reflects what was actually stored. Only DURABLE blocks are
+/// writable (ephemeral blocks have no owner and are rejected by `block_set_args`).
+async fn block_set(
+    hub: web::types::State<Arc<Hub>>,
+    req: HttpRequest,
+    body: Bytes,
+) -> HttpResponse {
+    if !origin_ok(&req) {
+        return json_resp(403, json!({ "ok": false, "error": "cross-origin request refused (CSRF/DNS-rebinding guard)" }));
+    }
+    let body_json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return text_resp(400, "bad json"),
+    };
+    let args = match block_set_args(&body_json) {
+        Ok(a) => a,
+        Err(e) => return json_resp(400, json!({ "ok": false, "error": e })),
+    };
+    let root = hub.root.clone();
+    let session = body_json
+        .get("session")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let out = web::block(move || -> Result<(u16, Value)> {
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let r = cli(&root, &refs)?;
+        if !r.ok {
+            return Ok((500, json!({ "ok": false, "error": cli_err(&r) })));
+        }
+        // Re-read the durable blocks so the editor reflects the persisted value.
+        let (code, blocks) = cli_json(
+            &root,
+            &["code", "blocks", "--session", &session, "--json"],
+            "[]",
+        );
+        if code == 200 {
+            Ok((200, json!({ "ok": true, "blocks": blocks })))
+        } else {
+            Ok((200, json!({ "ok": true })))
+        }
+    })
+    .await;
+    match out {
+        Ok((code, v)) => json_resp(code, v),
+        Err(_) => json_resp(500, json!({ "ok": false, "error": "block write failed" })),
+    }
 }
 
 /// M5 — the estimate-vs-actual report for one session. Shells
@@ -2075,5 +2192,68 @@ mod route_tests {
         assert!(!valid_session_id("code\"x"));
         assert!(!valid_session_id("code\\x"));
         assert!(!valid_session_id(&"x".repeat(200)));
+    }
+
+    // agent-comms-ui follow-on: the guarded block-editor write. `block_set_args`
+    // builds the `elanus block set ... --by ui` argv a valid edit shells, preserving
+    // the (scope, owner, name) key and stamping the `--by ui` attribution trail.
+    #[test]
+    fn block_set_args_builds_attributed_write() {
+        let body = json!({
+            "session": "code-2af51b7e",
+            "name": "note",
+            "owner": "claude-code",
+            "scope": "agent",
+            "content": "edited from the UI",
+            "priority": 5
+        });
+        let args = block_set_args(&body).expect("valid durable edit");
+        // The verb + key are preserved.
+        assert_eq!(&args[0..4], &["block", "set", "note", "edited from the UI"]);
+        // The write is attributed `--by ui` (the decided-by trail for context_build_log).
+        let mut it = args.iter();
+        assert!(it.any(|a| a == "--by"));
+        assert!(args.iter().any(|a| a == "ui"));
+        // The key fields ride through so (scope, owner, name) is unchanged.
+        assert!(args.windows(2).any(|w| w == ["--owner", "claude-code"]));
+        assert!(args.windows(2).any(|w| w == ["--scope", "agent"]));
+        assert!(args.windows(2).any(|w| w == ["--session", "code-2af51b7e"]));
+        assert!(args.windows(2).any(|w| w == ["--priority", "5"]));
+    }
+
+    // EPHEMERAL inbox/channel blocks are owner-less (decision 2) — the write path
+    // refuses them, and the bad-input cases are rejected before any shell-out.
+    #[test]
+    fn block_set_args_rejects_ephemeral_and_bad_input() {
+        // Owner-less (ephemeral inbox/channel) block — not editable.
+        let eph = json!({ "session": "code-1", "name": "inbox", "owner": "", "content": "x" });
+        assert!(block_set_args(&eph).is_err());
+        // Missing content (a malformed request must not silently write empty).
+        let no_content = json!({ "session": "code-1", "name": "note", "owner": "a" });
+        assert!(block_set_args(&no_content).is_err());
+        // Unsafe session id is rejected by the same guard the read routes use.
+        let bad_sess = json!({ "session": "code\"x", "name": "note", "owner": "a", "content": "y" });
+        assert!(block_set_args(&bad_sess).is_err());
+        // Empty content IS allowed (clearing a block is a legitimate edit).
+        let ok = json!({ "session": "code-1", "name": "note", "owner": "a", "content": "" });
+        assert!(block_set_args(&ok).is_ok());
+    }
+
+    // The CSRF/DNS-rebinding guard the POST route enforces, exercised through the
+    // same `host_is_local`/`origin_host` predicates `origin_ok` is built from: a
+    // same-origin local POST passes; a cross-origin Origin (an attacker page) is
+    // refused even when the Host is local.
+    #[test]
+    fn origin_guard_rejects_cross_origin_post() {
+        // Local host, no Origin (curl / local agent) → allowed.
+        assert!(host_is_local("127.0.0.1:8080"));
+        // Same-origin browser POST → allowed.
+        assert_eq!(origin_host("http://127.0.0.1:8080/").as_deref(), Some("127.0.0.1:8080"));
+        // Cross-origin: the attacker's Origin host does not match the local Host.
+        let host = "127.0.0.1:8080";
+        let evil = origin_host("http://evil.example/page").unwrap();
+        assert_ne!(evil, host);
+        // A non-local Host is refused outright.
+        assert!(!host_is_local("evil.example"));
     }
 }

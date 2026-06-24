@@ -412,6 +412,11 @@ struct BlockArgs {
     /// different owner row — it cannot read or overwrite another owner's blocks.
     #[arg(long)]
     owner: Option<String>,
+    /// Decided-by attribution: who drove this write (e.g. `ui` for a human edit
+    /// through the web inspector). Recorded in `context_build_log` so a UI write is
+    /// attributable — mirrors the `--by ui` trail every `/api/admin` mutation stamps.
+    #[arg(long)]
+    by: Option<String>,
 }
 
 impl BlockArgs {
@@ -423,6 +428,7 @@ impl BlockArgs {
             placement: self.placement.clone(),
             priority: self.priority,
             owner: self.owner.clone(),
+            by: self.by.clone(),
         }
     }
 }

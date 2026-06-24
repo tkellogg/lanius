@@ -36,6 +36,11 @@ pub struct BlockOpts {
     pub placement: String,
     pub priority: Option<i32>,
     pub owner: Option<String>,
+    /// Decided-by attribution: who drove this write. The web UI passes `ui` so a
+    /// human edit through `POST /api/blocks` is attributable in `context_build_log`
+    /// (mirroring the `--by ui` trail every `/api/admin` mutation stamps). `None`
+    /// for a plain agent/CLI write — the build log already records the owner/agent.
+    pub by: Option<String>,
 }
 
 /// Resolve the owner identity for a write: explicit `--owner` (a self-attested
@@ -82,6 +87,27 @@ pub fn set(root: &Root, name: &str, content: &str, opts: &BlockOpts) -> Result<(
     db::init_schema(&conn)?;
     let block = build_block(root, name, content, opts)?;
     let action = context_store::upsert_block(&conn, &opts.profile, &block, &opts.session, None)?;
+    // Decided-by attribution (e.g. `--by ui`): record a `validate`-action build-log
+    // row whose summary names the driver, so a human edit through the web UI is
+    // attributable in `context_build_log` next to the upsert it accompanies. A bare
+    // agent/CLI write passes `None` and skips this — the upsert row already carries
+    // owner/agent. The summary holds only the attribution label, never block content.
+    if let Some(by) = &opts.by {
+        let summary = format!("by {by}");
+        context_store::write_build_log(
+            &conn,
+            &opts.profile,
+            &block.owner,
+            &opts.session,
+            None,
+            "block-cli",
+            &crate::context_blocks::BuildAction::Validate,
+            Some(name),
+            None,
+            None,
+            Some(&summary),
+        )?;
+    }
     println!(
         "{:?} block {} (owner {}, scope {}, placement {}, priority {})",
         action,
@@ -171,6 +197,7 @@ impl Default for BlockOpts {
             placement: "system".into(),
             priority: None,
             owner: None,
+            by: None,
         }
     }
 }

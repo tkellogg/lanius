@@ -399,6 +399,124 @@ type BlockRow = {
   ephemeral: boolean;
 };
 
+// The block-inspector inline editor (the documented follow-on to M4's read-only
+// inspector). A DURABLE block (identity/learned/note — it carries an owner) gets an
+// edit affordance: a textarea + save that POSTs the new content to `/api/blocks`
+// (through the origin_ok CSRF guard, stamping `--by ui` server-side) and reflects
+// the persisted value. An EPHEMERAL inbox/channel block is owner-less, computed each
+// turn, and never stored — it renders read-only with NO editor (decision 2/3).
+function BlockCard({
+  block,
+  session,
+  onSaved,
+}: {
+  block: BlockRow;
+  session: string;
+  onSaved: (rows: BlockRow[]) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(block.content);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
+  // Only durable blocks are editable. Ephemeral blocks have no owner and are
+  // session-computed, so there is nothing to persist — show them read-only.
+  const editable = !block.ephemeral && !!block.owner;
+
+  const save = async () => {
+    setSaving(true);
+    setErr('');
+    try {
+      const r = await fetch('/api/blocks', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          session,
+          name: block.name,
+          owner: block.owner,
+          scope: block.scope,
+          placement: block.placement,
+          priority: block.priority,
+          content: draft,
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.ok === false) {
+        throw new Error(d.error ?? `HTTP ${r.status}`);
+      }
+      // The route re-reads the durable blocks so the panel reflects the persisted
+      // value; fall back to a local content patch if the route didn't echo them.
+      if (Array.isArray(d.blocks)) {
+        onSaved(d.blocks as BlockRow[]);
+      }
+      setEditing(false);
+    } catch (e) {
+      setErr(String((e as Error).message ?? e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className={`cs-block${block.ephemeral ? ' cs-block-eph' : ''}`} data-block={block.name}>
+      <div className="cs-block-head">
+        <span className="cs-block-name">{block.name}</span>
+        <span className="cs-block-scope">{block.scope}/{block.placement}</span>
+        <span className="cs-dim">p{block.priority}</span>
+        {block.ephemeral
+          ? <span className="cs-block-tag" title="computed each turn, never written to context_blocks">live, not stored</span>
+          : block.owner && <span className="cs-dim">{block.owner}</span>}
+        {editable && !editing && (
+          <button
+            className="cs-btn cs-block-edit"
+            data-block-edit={block.name}
+            onClick={() => {
+              setDraft(block.content);
+              setEditing(true);
+              setErr('');
+            }}
+          >
+            edit
+          </button>
+        )}
+      </div>
+      {editing ? (
+        <div className="cs-block-editor">
+          <textarea
+            className="cs-block-textarea"
+            data-block-textarea={block.name}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={5}
+          />
+          <div className="cs-block-actions">
+            <button
+              className="cs-btn cs-block-save"
+              data-block-save={block.name}
+              disabled={saving}
+              onClick={save}
+            >
+              {saving ? 'saving…' : 'save'}
+            </button>
+            <button
+              className="cs-btn"
+              disabled={saving}
+              onClick={() => {
+                setEditing(false);
+                setErr('');
+              }}
+            >
+              cancel
+            </button>
+            {err && <span className="cs-err" data-block-error={block.name}>{err}</span>}
+          </div>
+        </div>
+      ) : (
+        <div className="cs-block-content">{block.content}</div>
+      )}
+    </div>
+  );
+}
+
 export default function CodeSessions({ focus }: { focus?: string } = {}) {
   const [backfill, setBackfill] = useState<Stat[]>([]);
   const [livePatches, setLivePatches] = useState<Map<string, LivePatch>>(new Map());
@@ -639,17 +757,12 @@ export default function CodeSessions({ focus }: { focus?: string } = {}) {
             <div className="cs-sub cs-blocks" id="cs-blocks">
               <div className="cs-dim">memory blocks ({blocks.length}):</div>
               {blocks.map((b, i) => (
-                <div key={`${b.name}:${i}`} className={`cs-block${b.ephemeral ? ' cs-block-eph' : ''}`} data-block={b.name}>
-                  <div className="cs-block-head">
-                    <span className="cs-block-name">{b.name}</span>
-                    <span className="cs-block-scope">{b.scope}/{b.placement}</span>
-                    <span className="cs-dim">p{b.priority}</span>
-                    {b.ephemeral
-                      ? <span className="cs-block-tag" title="computed each turn, never written to context_blocks">live, not stored</span>
-                      : b.owner && <span className="cs-dim">{b.owner}</span>}
-                  </div>
-                  <div className="cs-block-content">{b.content}</div>
-                </div>
+                <BlockCard
+                  key={`${b.name}:${i}`}
+                  block={b}
+                  session={selected!}
+                  onSaved={(rows) => setBlocks(rows)}
+                />
               ))}
             </div>
           )}
@@ -730,4 +843,8 @@ const CS_STYLE = `
 .cs-block-scope { color: #8a8a8a; font-size: 10px; }
 .cs-block-tag { font-size: 9px; padding: 1px 5px; border-radius: 7px; background: #3a2f5a; color: #d8c8ff; }
 .cs-block-content { color: #b8b8b8; white-space: pre-wrap; margin-top: 2px; max-height: 120px; overflow-y: auto; }
+.cs-block-edit { margin-left: auto; font-size: 10px; padding: 1px 7px; }
+.cs-block-editor { margin-top: 4px; }
+.cs-block-textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: 11px; background: #141414; color: #ddd; border: 1px solid #3a3a3a; border-radius: 4px; padding: 5px 6px; resize: vertical; }
+.cs-block-actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
 `;
