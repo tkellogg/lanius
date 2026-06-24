@@ -74,6 +74,9 @@ impl ContextBlock {
     }
 }
 
+// Substrate landed ahead of use (see module docstring): the named-register
+// component is not yet wired into the assembly/build-log path.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Register {
     pub name: String,
@@ -85,6 +88,7 @@ pub struct Register {
 }
 
 impl Register {
+    #[allow(dead_code)] // kept with the Register substrate above
     pub fn validate(&self) -> Result<()> {
         validate_name("register", &self.name)?;
         validate_name("register owner", &self.owner)?;
@@ -106,6 +110,9 @@ pub enum BuildAction {
     Validate,
 }
 
+// Substrate landed ahead of use (see module docstring): the durable build-log
+// record schema is not yet emitted by the assembly path.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildLogRecord {
     pub session_id: String,
@@ -127,6 +134,7 @@ pub struct BuildLogRecord {
 }
 
 impl BuildLogRecord {
+    #[allow(dead_code)] // kept with the BuildLogRecord substrate above
     pub fn validate(&self) -> Result<()> {
         validate_name("build-log component", &self.component)?;
         if let Some(block_name) = &self.block_name {
