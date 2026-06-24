@@ -168,3 +168,17 @@ statuses: planned | in-progress | verifying | done
   [../journeys/03-cost-visibility.md](../journeys/03-cost-visibility.md)), so it
   ships with a package-local pricing map. Depends on [memory-blocks.md](memory-blocks.md).
   Backed by [../journeys/11-profiles.md](../journeys/11-profiles.md).
+- [agent-comms-ui.md](agent-comms-ui.md) - **planned**: the **human's seat** for the
+  three just-shipped agent-facing capabilities — they are CLI + per-turn injection
+  only, so a human can't *see* the cross-agent traffic. Comms-first: M1 a `code mail
+  --json` ledger projection + `GET /api/comms/mail` (deliveries threaded by
+  correlation, with priority/state/failure-mail — the data is already `in/agent/*`
+  events on `/api/stream`, so it's a projection, not new capture), M2 a `CommsView`
+  traffic view (FROM→TO, priority chips, live-folded like `CodeSessions`), M3 rooms
+  & shared channels (roster/`room_recent`/`peer_claims`); then M4 a memory-block
+  inspector (read-only first), M5 estimate-vs-actual in the runs detail, M6 the
+  mid-cycle/priority signal lamp. Also records six correctness/UX concerns in the
+  shipped code to respect while building. From a clean xhigh review; extends
+  [coding-agent-observability.md](coding-agent-observability.md) and
+  [chat-conversations.md](chat-conversations.md). Backed by
+  [../journeys/11-profiles.md](../journeys/11-profiles.md).
