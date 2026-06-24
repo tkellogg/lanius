@@ -463,47 +463,52 @@ pub fn mark_inbox_seen(root: &Root, session: &str, event_ids: &[i64]) -> Result<
     Ok(())
 }
 
+/// The owner (agent noun) a session's memory `note` block is stored under. The
+/// note block is session-scoped and owned by the session's agent noun (the coding
+/// agent's identity the launcher recorded). Read it off the durable record; fall
+/// back to a stable generic owner when the record is not yet observed, so a note
+/// set before SessionStart still round-trips by the same key. The agent noun is a
+/// name (no slash/whitespace), valid as a block owner.
+fn note_owner(root: &Root, session: &str) -> String {
+    read_record(root, session)
+        .ok()
+        .flatten()
+        .map(|r| r.agent_noun)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "code-agent".to_string())
+}
+
 /// Set (or replace) a session's memory note — the small editable block a planner
-/// leaves a worker, surfaced by the per-turn injection. One row per session; the
-/// latest text wins. An empty note clears it (a deliberate way to remove a stale
-/// reminder). The session must be a valid `code-*` id.
+/// leaves a worker, surfaced by the per-turn injection. An empty note clears it (a
+/// deliberate way to remove a stale reminder). The session must be a valid `code-*`
+/// id.
+///
+/// M2 decision 5 (memory-blocks handoff): the note IS a well-known session-scope
+/// `note` block in the `context_blocks` substrate — this is a thin alias that
+/// writes that block. `elanus code note` keeps working; the next-turn injection
+/// reads the block, not a separate `code_notes` path. (`code_notes` remains in the
+/// schema as legacy; nothing live reads it anymore.)
 pub fn set_note(root: &Root, session: &str, note: &str) -> Result<()> {
     if !is_session_principal(session) {
         bail!("note session {session:?} is not a valid code-* identity name");
     }
     let conn = crate::db::open(root).context("opening the ledger to set the note")?;
     crate::db::init_schema(&conn)?;
-    let note = note.trim();
-    if note.is_empty() {
-        conn.execute("DELETE FROM code_notes WHERE session = ?1", [session])?;
-        return Ok(());
-    }
-    conn.execute(
-        "INSERT INTO code_notes (session, note) VALUES (?1, ?2)
-         ON CONFLICT(session) DO UPDATE SET
-           note = excluded.note,
-           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-        rusqlite::params![session, note],
-    )?;
-    Ok(())
+    let owner = note_owner(root, session);
+    crate::context_store::set_session_note(&conn, "default", &owner, session, note)
 }
 
 /// Read a session's memory note, if one is set. None when there is no note (the
-/// per-turn injection omits the note line in that case).
+/// per-turn injection omits the note line in that case). Reads the `note` block
+/// (M2 decision 5), the same key `set_note` writes.
 pub fn get_note(root: &Root, session: &str) -> Result<Option<String>> {
     if !is_session_principal(session) {
         return Ok(None);
     }
     let conn = crate::db::open(root).context("opening the ledger to read the note")?;
     crate::db::init_schema(&conn)?;
-    let note = conn
-        .query_row(
-            "SELECT note FROM code_notes WHERE session = ?1",
-            [session],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?;
-    Ok(note)
+    let owner = note_owner(root, session);
+    crate::context_store::get_session_note(&conn, &owner, session)
 }
 
 // ── M5: coordination room membership + advisory edit claims ───────────────────

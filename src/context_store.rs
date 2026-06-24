@@ -10,10 +10,13 @@
 //! surface (`elanus block …`) plus the seed-once "default that evolves"; M3
 //! records every mutation in `context_build_log`.
 //!
-//! What this module does NOT do (deferred, by handoff): the coding-agent
-//! projection / turn_injection wiring (M4 — `src/codeagent.rs` is off-limits)
-//! and re-pointing `elanus code note` at a `note` block (note-aliasing, M-decision
-//! 5). `code_notes` is left exactly as it is.
+//! M4 adds the coding-agent projection surface here: `load_session_blocks`
+//! (blocks visible to a coding session keyed by agent noun + session, no Profile),
+//! the `note`-block alias (`set_session_note`/`get_session_note`, M-decision 5 —
+//! the memory note IS a session-scope block now), and the mid-cycle vector
+//! (`is_mid_cycle`/`take_pending_mid_cycle`, content-addressed dedup). The
+//! `turn_injection`/hook wiring that consumes these lives in `src/codeagent.rs`.
+//! `code_notes` remains in the schema as legacy but nothing live reads it.
 
 use crate::context_blocks::{sha256_hex, BuildAction, ContextBlock, Placement, Scope};
 use crate::profile::Profile;
@@ -134,6 +137,169 @@ pub fn load_system_blocks(
             owner,
             scope: parse_scope(&scope).unwrap_or(Scope::Agent),
         });
+    }
+    Ok(out)
+}
+
+/// The well-known name of the per-session memory note block (M2 decision 5). The
+/// memory note `elanus code note` writes/reads is just a session-scope block under
+/// this name — one substrate, no separate `code_notes` read path in the live
+/// injection.
+pub const NOTE_BLOCK: &str = "note";
+
+/// M4 — load the blocks visible to a CODING session, which is keyed by its agent
+/// noun + session id rather than a full `Profile` (a coding agent has no profile
+/// document; its identity is the agent noun the launcher recorded). Returns the
+/// `system`-placement blocks owned by `owner` (the agent noun) that are either
+/// unbound (agent/global scope) OR bound to THIS session, ordered by `priority`
+/// (then name, then id) — the same order `load_system_blocks` uses for profiles.
+/// This is the next-turn projection's source: the session's own agent-scope and
+/// session-scope blocks, nobody else's.
+pub fn load_session_blocks(
+    conn: &Connection,
+    owner: &str,
+    session: &str,
+) -> Result<Vec<LoadedBlock>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, content, priority, placement, owner, scope
+           FROM context_blocks
+          WHERE placement = 'system'
+            AND owner = ?1
+            AND (session_id IS NULL OR session_id = ?2)
+          ORDER BY priority ASC, name ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![owner, session], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i32>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (name, content, priority, placement, owner, scope) = row?;
+        out.push(LoadedBlock {
+            name,
+            content,
+            priority,
+            placement: parse_placement(&placement).unwrap_or(Placement::System),
+            owner,
+            scope: parse_scope(&scope).unwrap_or(Scope::Agent),
+        });
+    }
+    Ok(out)
+}
+
+/// Build the well-known `note` block for a coding session: session-scope, owned by
+/// the session's agent noun, at a neutral priority. The single home for both the
+/// `set`/`get` alias and the next-turn projection so the memory note IS a block.
+fn note_block(owner: &str, content: &str) -> ContextBlock {
+    let mut b = ContextBlock::new(NOTE_BLOCK, content, owner);
+    b.scope = Scope::Session;
+    b.placement = Placement::System;
+    b
+}
+
+/// M2 decision 5 — write the per-session memory note as the well-known `note`
+/// block (session scope, owner = agent noun). A blank note CLEARS it (removes the
+/// block), preserving today's `elanus code note <session> ""` behavior. This is the
+/// alias `set_note` re-points at: identical semantics, one substrate.
+pub fn set_session_note(
+    conn: &Connection,
+    profile: &str,
+    owner: &str,
+    session: &str,
+    note: &str,
+) -> Result<()> {
+    let note = note.trim();
+    let block = note_block(owner, note);
+    if note.is_empty() {
+        remove_block(conn, profile, &block, session, None)?;
+        return Ok(());
+    }
+    upsert_block(conn, profile, &block, session, None)?;
+    Ok(())
+}
+
+/// M2 decision 5 — read the per-session memory note back out of the `note` block.
+/// `None` when no note is set (the per-turn injection then omits the note line).
+pub fn get_session_note(
+    conn: &Connection,
+    owner: &str,
+    session: &str,
+) -> Result<Option<String>> {
+    let block = note_block(owner, "");
+    Ok(get_block(conn, &block, session, None)?.map(|b| b.content))
+}
+
+/// The priority threshold at or below which a block is a MID-CYCLE block (M4). A
+/// block qualifies for the mid-cycle injection vector — delivered between tool
+/// calls, not just on the next turn — when its `priority <= MID_CYCLE_PRIORITY`.
+///
+/// Priority orders blocks ASCENDING (smaller = earlier/more important; see
+/// `load_system_blocks` `ORDER BY priority ASC`), so "high priority" is a LOW
+/// number. A normal block (the default `priority = 0`) is NOT mid-cycle — it lands
+/// next-turn. A deliberately elevated block (`priority < 0`, e.g. an urgent note a
+/// planner pushes mid-run) is mid-cycle. This keeps the common case (notes,
+/// identity) next-turn and reserves the louder vector for explicitly-prioritized
+/// content.
+pub const MID_CYCLE_PRIORITY: i32 = -1;
+
+/// Whether a loaded block qualifies for the mid-cycle vector (see
+/// `MID_CYCLE_PRIORITY`).
+pub fn is_mid_cycle(b: &LoadedBlock) -> bool {
+    b.priority <= MID_CYCLE_PRIORITY
+}
+
+/// M4 mid-cycle vector — find the mid-cycle blocks (see `is_mid_cycle`) visible to
+/// this coding session that have NOT yet been delivered mid-cycle at their current
+/// content, mark them delivered, and return them. The dedup is content-addressed
+/// (`code_block_delivered` keyed by `(session, block_name)`, carrying the delivered
+/// `content_sha256`): an unchanged block is returned ONCE and not again on the next
+/// tool call; editing the block changes its sha and re-arms a single redelivery.
+/// The `note` block is excluded — it rides the next-turn vector (`[elanus note]`),
+/// not the louder mid-cycle one, regardless of priority.
+///
+/// Caller contract: this MUTATES the dedup table (records delivery) — call it only
+/// when actually about to emit the block (the Claude Code Pre/PostToolUse hook),
+/// never as a pure read, or a block would be marked delivered without being shown.
+pub fn take_pending_mid_cycle(
+    conn: &Connection,
+    owner: &str,
+    session: &str,
+) -> Result<Vec<LoadedBlock>> {
+    let visible = load_session_blocks(conn, owner, session)?;
+    let mut out = Vec::new();
+    for b in visible {
+        if b.name == NOTE_BLOCK || !is_mid_cycle(&b) {
+            continue;
+        }
+        let sha = sha256_hex(b.content.as_bytes());
+        // Already delivered at THIS exact content? (same name + sha) → skip.
+        let already: bool = conn.query_row(
+            "SELECT 1 FROM code_block_delivered
+              WHERE session = ?1 AND block_name = ?2 AND content_sha256 = ?3",
+            params![session, b.name, sha],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+        if already {
+            continue;
+        }
+        // Record the delivery (last content wins per (session, block_name)) and emit.
+        conn.execute(
+            "INSERT INTO code_block_delivered (session, block_name, content_sha256)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session, block_name) DO UPDATE SET
+               content_sha256 = excluded.content_sha256,
+               delivered_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            params![session, b.name, sha],
+        )?;
+        out.push(b);
     }
     Ok(out)
 }
@@ -523,6 +689,121 @@ mod tests {
                 .content,
             "evolved"
         );
+    }
+
+    #[test]
+    fn note_alias_round_trips_as_a_block() {
+        // M2 decision 5: the note IS a session-scope `note` block.
+        let c = conn();
+        assert!(get_session_note(&c, "claude-code", "code-n1").unwrap().is_none());
+        set_session_note(&c, "default", "claude-code", "code-n1", "  do the migration  ").unwrap();
+        // Trimmed, like the old code_notes path.
+        assert_eq!(
+            get_session_note(&c, "claude-code", "code-n1").unwrap().as_deref(),
+            Some("do the migration")
+        );
+        // It is a real `note` block under the session.
+        let blocks = load_session_blocks(&c, "claude-code", "code-n1").unwrap();
+        assert!(blocks.iter().any(|b| b.name == NOTE_BLOCK && b.content == "do the migration"));
+        // A blank note clears it (removes the block).
+        set_session_note(&c, "default", "claude-code", "code-n1", "   ").unwrap();
+        assert!(get_session_note(&c, "claude-code", "code-n1").unwrap().is_none());
+    }
+
+    #[test]
+    fn load_session_blocks_is_owner_and_session_scoped() {
+        let c = conn();
+        // An agent-scope block (no session) and a session-scope block, both owned by
+        // claude-code, are visible to code-s1.
+        let mut agentb = block("identity", "I am Lily.", "claude-code");
+        agentb.scope = Scope::Agent;
+        upsert_block(&c, "default", &agentb, "code-s1", None).unwrap();
+        let mut sessb = ContextBlock::new("focus", "ship M4", "claude-code");
+        sessb.scope = Scope::Session;
+        upsert_block(&c, "default", &sessb, "code-s1", None).unwrap();
+        // A DIFFERENT session's session-block is not visible.
+        let mut other = ContextBlock::new("focus", "other work", "claude-code");
+        other.scope = Scope::Session;
+        upsert_block(&c, "default", &other, "code-s2", None).unwrap();
+        // A peer harness's block is not visible (owner filter).
+        upsert_block(&c, "default", &block("identity", "peer", "codex"), "code-s1", None).unwrap();
+
+        let names: Vec<String> = load_session_blocks(&c, "claude-code", "code-s1")
+            .unwrap()
+            .into_iter()
+            .map(|b| b.content)
+            .collect();
+        assert!(names.contains(&"I am Lily.".to_string()));
+        assert!(names.contains(&"ship M4".to_string()));
+        assert!(!names.contains(&"other work".to_string()), "s2's block leaked into s1");
+        assert!(!names.contains(&"peer".to_string()), "codex's block leaked to claude-code");
+    }
+
+    #[test]
+    fn mid_cycle_is_priority_gated() {
+        let mut normal = block("n", "x", "claude-code");
+        normal.priority = 0;
+        let loaded_normal = LoadedBlock {
+            name: normal.name.clone(),
+            content: normal.content.clone(),
+            priority: normal.priority,
+            placement: Placement::System,
+            owner: normal.owner.clone(),
+            scope: Scope::Agent,
+        };
+        assert!(!is_mid_cycle(&loaded_normal), "priority 0 is next-turn, not mid-cycle");
+        let mut hi = loaded_normal.clone();
+        hi.priority = MID_CYCLE_PRIORITY;
+        assert!(is_mid_cycle(&hi), "priority <= MID_CYCLE_PRIORITY is mid-cycle");
+    }
+
+    #[test]
+    fn take_pending_mid_cycle_dedups_until_content_changes() {
+        let c = conn();
+        // A high-priority (mid-cycle) session block.
+        let mut b = ContextBlock::new("alert", "STOP: API changed", "claude-code");
+        b.scope = Scope::Session;
+        b.priority = MID_CYCLE_PRIORITY;
+        upsert_block(&c, "default", &b, "code-mc1", None).unwrap();
+
+        // First take: delivered once.
+        let first = take_pending_mid_cycle(&c, "claude-code", "code-mc1").unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name, "alert");
+
+        // Second take (unchanged): NOT redelivered.
+        let second = take_pending_mid_cycle(&c, "claude-code", "code-mc1").unwrap();
+        assert!(second.is_empty(), "an unchanged mid-cycle block must not re-inject");
+
+        // Edit the block → its sha changes → re-armed once.
+        let mut b2 = b.clone();
+        b2.content = "STOP: API changed AGAIN".into();
+        upsert_block(&c, "default", &b2, "code-mc1", None).unwrap();
+        let third = take_pending_mid_cycle(&c, "claude-code", "code-mc1").unwrap();
+        assert_eq!(third.len(), 1, "editing the block re-arms a single redelivery");
+
+        // A NORMAL-priority block never rides the mid-cycle vector.
+        upsert_block(&c, "default", &{
+            let mut nb = ContextBlock::new("calm", "fyi", "claude-code");
+            nb.scope = Scope::Session;
+            nb // priority 0 default
+        }, "code-mc1", None).unwrap();
+        // Drain the alert's re-arm first, then assert calm never appears.
+        let _ = take_pending_mid_cycle(&c, "claude-code", "code-mc1").unwrap();
+        let none = take_pending_mid_cycle(&c, "claude-code", "code-mc1").unwrap();
+        assert!(none.iter().all(|x| x.name != "calm"), "a normal block must not go mid-cycle");
+    }
+
+    #[test]
+    fn note_block_never_rides_mid_cycle() {
+        let c = conn();
+        // Even a note forced to mid-cycle priority stays on the next-turn vector.
+        let mut n = ContextBlock::new(NOTE_BLOCK, "urgent note", "claude-code");
+        n.scope = Scope::Session;
+        n.priority = MID_CYCLE_PRIORITY;
+        upsert_block(&c, "default", &n, "code-mc2", None).unwrap();
+        let pending = take_pending_mid_cycle(&c, "claude-code", "code-mc2").unwrap();
+        assert!(pending.iter().all(|b| b.name != NOTE_BLOCK), "note rides next-turn only");
     }
 
     #[test]

@@ -1,8 +1,13 @@
 ---
-status: in-progress
+status: done
 author: Claude Opus 4.8 in Claude Code on Elanus
 last-updated: 2026-06-23
 ---
+
+> **Status:** M1–M4 shipped. Two M4 follow-ons remain (documented in the Log + a
+> code comment at the mid-cycle hook arm): opencode SERVED mid-cycle push
+> (`prompt_async` from the SSE subscriber) and the algedonic/`signal/`-plane
+> interrupt (opencode `abort` + inject).
 
 # Memory blocks
 
@@ -104,10 +109,9 @@ Add `elanus block set/get/list/append/rm <name> [--scope …] [--placement …]
 `context_blocks`. Add the seed-once default path: a profile `blocks/<name>.md` or
 a package manifest default seeds a row on first render if none exists; a `set`
 thereafter wins. Re-point `elanus code note` at the `note` block (alias, M-decision 5).
-**[DEFERRED with M4]** — the note *read* lives in `turn_injection()` in the
-in-flight `src/codeagent.rs`, so the aliasing ships with the coding-agent
-projection. M1–M3 landed without it; `elanus code note` and `code_notes` are
-unchanged and still work.
+**[SHIPPED with M4]** — `set_note`/`get_note` are now thin aliases over a
+session-scope `note` block; `turn_injection()` reads the block. `code_notes`
+remains in the schema (legacy) but nothing live reads it.
 
 **Acceptance:** `elanus block set identity "I am Lily."` persists; next
 `context render` shows it. A shipped default block appears on first render, and a
@@ -168,6 +172,52 @@ silent drop.
   (`src/codeagent.rs:5463`).
 
 ## Log
+- **2026-06-23 — M4 + the M2 note→block alias shipped.** The coding-agent
+  projection landed on the spike-proven, cleanly-shippable slice:
+  - **next-turn vector (all harnesses):** `turn_injection()` (`src/codeagent.rs`)
+    now also renders the durable memory blocks visible to the session — its
+    agent-noun-owned agent-scope + session-scope blocks, priority-ordered, in the
+    built-in `[elanus block: <name>] <text>` shape. Coding agents have no Profile,
+    so a new `context_store::load_session_blocks(conn, owner=agent_noun, session)`
+    loads them without one.
+  - **note→block alias (decision 5):** `code_notes` is retired from the live read
+    path. `codesession::set_note`/`get_note` are thin aliases over a well-known
+    session-scope `note` block (`context_store::set_session_note`/`get_session_note`,
+    owner = the session's recorded agent noun). `elanus code note` and all its
+    existing tests pass unchanged; the note renders as the same `[elanus note]` line
+    (excluded from the generic block lines so it never double-renders).
+  - **mid-cycle vector (Claude Code, spike-proven):** the hook bridge now emits
+    `hookSpecificOutput.additionalContext` on `PreToolUse`/`PostToolUse` for any
+    pending HIGH-PRIORITY block. **Qualification rule:** a block is mid-cycle iff
+    `priority <= MID_CYCLE_PRIORITY` (= -1); priority is ASCending (low = louder),
+    so the default `priority 0` stays next-turn and an explicitly-elevated block
+    (`priority < 0`) goes mid-cycle. The `note` block never rides mid-cycle. **Dedup:**
+    a new `code_block_delivered(session, block_name, content_sha256)` table mirrors
+    `code_inbox_seen` — an unchanged block emits ONCE; editing it changes the sha and
+    re-arms a single redelivery (`context_store::take_pending_mid_cycle`).
+  - **capability matrix + degradation:** `achievable_vector(agent_noun, desired)` →
+    Claude Code does next-turn + mid-cycle; Codex + opencode-headless DEGRADE a
+    mid-cycle request to next-turn (no live hook bridge / served path not wired),
+    delivered in the normal turn injection with a legible `eprintln!` downgrade
+    (`log_mid_cycle_degradation`) — never an error, never a silent drop.
+  - **Deferred** (code comment at the mid-cycle hook arm): opencode SERVED
+    mid-cycle push (`POST /session/{id}/prompt_async` from the SSE subscriber) and
+    the algedonic/signal-plane interrupt (opencode `abort` + inject). Both are M4
+    follow-ons; M4 ships next-turn-everywhere + Claude-Code mid-cycle + the matrix.
+  - Files: `src/context_store.rs` (load_session_blocks, set/get_session_note,
+    is_mid_cycle/MID_CYCLE_PRIORITY, take_pending_mid_cycle), `src/codesession.rs`
+    (note aliases), `src/codeagent.rs` (turn_injection block rendering,
+    InjectionVector/achievable_vector, mid_cycle_injection, hook emit), `src/db.rs`
+    (code_block_delivered). `cargo test` 261 pass (10 new).
+  - **Accepted residuals (verify minors, all defensible):** (1) on Claude Code a
+    high-priority block is delivered on BOTH channels — mid-cycle (loud, immediate)
+    AND next-turn (persistent). **Kept intentionally:** suppressing the next-turn
+    copy would make a *durable* urgent block vanish from context after its single
+    mid-cycle delivery (dedup), which is worse than mild redundancy. (2) The
+    mid-cycle arm also fires on `PostToolUseFailure` (still a tool boundary; dedup
+    makes it safe) — an urgent block should reach the model even when a tool errors.
+    (3) `note_owner`'s absent-record fallback is latent-only (the supported `elanus
+    code note` path persists the session record first).
 - **2026-06-23 — M1–M3 shipped** (impl on Opus medium → adversarial verify on
   Opus high, 2 rounds, `pass`). Native keystone landed: durable `context_blocks`
   rows seed `Doc.system` ordered by priority (`src/render.rs` `load_system_blocks`

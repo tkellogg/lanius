@@ -2116,11 +2116,136 @@ pub fn note_cmd(root: &Root, session: &str, text: &str) -> Result<()> {
 ///
 /// The inbox read is the same own-inbox-only scoped query the CLI uses — built
 /// from the session's own `agent_noun`/`session`, never a caller-supplied id.
+/// The injection VECTORS a memory block can reach a coding session through (M4).
+/// Ordered from quietest to loudest; a harness that cannot do a louder vector
+/// DEGRADES down this ladder (see `achievable_vector`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionVector {
+    /// Lands at the start of the next turn (all harnesses, today).
+    NextTurn,
+    /// Lands BETWEEN tool calls, mid-turn (Claude Code via Pre/PostToolUse
+    /// `additionalContext`; spike-proven). opencode served/TUI is a NOTED future
+    /// path (deferred). Codex has no live hook bridge → degrades to next-turn.
+    MidCycle,
+}
+
+/// M4 capability matrix — given a harness agent noun and the DESIRED vector for a
+/// block, return the vector that harness can actually achieve, degrading down the
+/// ladder rather than erroring or dropping. This is the per-(harness, capability)
+/// shape the harness-modes work uses, kept tiny and total:
+///
+/// | harness            | next-turn | mid-cycle                       |
+/// |--------------------|-----------|---------------------------------|
+/// | claude-code        | yes       | yes (Pre/PostToolUse hook)      |
+/// | codex              | yes       | DEGRADES → next-turn (no hooks) |
+/// | opencode           | yes       | DEGRADES → next-turn (headless)*|
+///
+/// *opencode SERVED/TUI mid-cycle (server `prompt_async`) is a real future vector
+/// (see the spike) but is DEFERRED — M4 ships next-turn-everywhere + Claude-Code
+/// mid-cycle. Until then opencode degrades mid-cycle to next-turn, same as Codex.
+pub fn achievable_vector(agent_noun: &str, desired: InjectionVector) -> InjectionVector {
+    match desired {
+        InjectionVector::NextTurn => InjectionVector::NextTurn,
+        InjectionVector::MidCycle => {
+            if agent_noun == ClaudeCode.agent_noun() {
+                InjectionVector::MidCycle
+            } else {
+                // Codex (no live hook bridge) and opencode-headless (no served
+                // control plane wired for blocks yet) cannot push mid-cycle →
+                // degrade to next-turn. The caller logs the downgrade legibly.
+                InjectionVector::NextTurn
+            }
+        }
+    }
+}
+
+/// Load the durable memory blocks to render in this coding session's per-turn
+/// injection: its agent-noun-owned agent-scope blocks + its session-scope blocks,
+/// ordered by priority — EXCLUDING the well-known `note` block (rendered separately
+/// as `[elanus note]`). Best-effort: a ledger error yields no blocks rather than
+/// breaking the (telemetry-tier) injection.
+fn session_memory_blocks(
+    root: &Root,
+    agent_noun: &str,
+    session: &str,
+) -> Vec<crate::context_store::LoadedBlock> {
+    let Ok(conn) = crate::db::open(root) else {
+        return Vec::new();
+    };
+    if crate::db::init_schema(&conn).is_err() {
+        return Vec::new();
+    }
+    crate::context_store::load_session_blocks(&conn, agent_noun, session)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| b.name != crate::context_store::NOTE_BLOCK)
+        .collect()
+}
+
+/// M4 — compose the mid-cycle injection text (Claude Code): the pending,
+/// not-yet-delivered mid-cycle blocks for this session, rendered in the same
+/// `[elanus block: …]` shape the next-turn vector uses, bracketed so the model
+/// reads them as a system note. `None` when nothing is pending (the dedup'd common
+/// case), so a quiet tool call emits nothing. MUTATES the dedup table — call only
+/// from the emitting hook arm.
+fn mid_cycle_injection(root: &Root, agent_noun: &str, session: &str) -> Option<String> {
+    let conn = crate::db::open(root).ok()?;
+    crate::db::init_schema(&conn).ok()?;
+    let pending = crate::context_store::take_pending_mid_cycle(&conn, agent_noun, session)
+        .unwrap_or_default();
+    if pending.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "[elanus] Urgent context delivered mid-task (priority block(s) — read before continuing):",
+    );
+    for b in &pending {
+        out.push_str(&format!("\n[elanus block: {}] {}", b.name, clip(&b.content, 2000)));
+    }
+    Some(out)
+}
+
+/// M4 degradation — when a MID-CYCLE block is visible to a session whose harness
+/// CANNOT push mid-cycle (Codex; opencode-headless until the served path lands), it
+/// is delivered on the next-turn vector instead. Log that downgrade once per
+/// rendering, LEGIBLY (a downgrade, not an error, not a silent drop), so an
+/// operator can see "this block wanted mid-cycle, the harness degraded it." Quiet
+/// when the harness CAN do mid-cycle (Claude Code) or no block wanted it.
+fn log_mid_cycle_degradation(
+    agent_noun: &str,
+    blocks: &[crate::context_store::LoadedBlock],
+) {
+    if achievable_vector(agent_noun, InjectionVector::MidCycle) == InjectionVector::MidCycle {
+        return; // the harness can do mid-cycle — nothing to degrade.
+    }
+    for b in blocks {
+        if crate::context_store::is_mid_cycle(b) {
+            eprintln!(
+                "[code] block {:?} requested mid-cycle delivery but harness {agent_noun:?} \
+has no live mid-cycle vector; DEGRADED to next-turn (delivered in this turn's injection)",
+                b.name
+            );
+        }
+    }
+}
+
 pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<String> {
     let unseen = codesession::inbox_for_session(root, agent_noun, session, true)
         .ok()
         .unwrap_or_default();
     let note = codesession::get_note(root, session).ok().flatten();
+
+    // M4 (memory-blocks handoff) — the durable memory blocks visible to THIS coding
+    // session: its agent-noun-owned agent-scope blocks + its session-scope blocks,
+    // ordered by priority. The coding agent has no profile document, so blocks are
+    // keyed by agent noun + session (`load_session_blocks`), not a Profile. The
+    // `note` block is rendered separately above (as `[elanus note]`) so it is
+    // excluded here to avoid showing it twice.
+    let blocks = session_memory_blocks(root, agent_noun, session);
+    // If any visible block wanted the louder mid-cycle vector but this harness can't
+    // push it (Codex; opencode-headless), it is delivered HERE on the next-turn
+    // vector — log that legible downgrade rather than dropping or erroring (M4).
+    log_mid_cycle_degradation(agent_noun, &blocks);
 
     // M5/SA1: the session's roommates' current advisory edit claims (excluding its
     // own). The room comes from the session's OWN durable record — never an
@@ -2166,7 +2291,12 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
         codesession::live_siblings(root, session, &workdir)
     };
 
-    if unseen.is_empty() && note.is_none() && peer_claims.is_empty() && live_siblings.is_empty() {
+    if unseen.is_empty()
+        && note.is_none()
+        && blocks.is_empty()
+        && peer_claims.is_empty()
+        && live_siblings.is_empty()
+    {
         return None;
     }
 
@@ -2241,6 +2371,12 @@ collision (advisory).",
     }
     if let Some(note) = note {
         out.push_str(&format!("\n[elanus note] {}", clip(&note, 2000)));
+    }
+    // M4: render the session's memory blocks, in priority order, reusing the
+    // built-in {name, text} block shape. One labeled line per block so the agent
+    // reads each as a distinct, named chunk of durable context.
+    for b in &blocks {
+        out.push_str(&format!("\n[elanus block: {}] {}", b.name, clip(&b.content, 2000)));
     }
     // M5: surface peers' claims as advisory routing info — "code-X is editing
     // src/foo.rs" — so this session can route around them. Advisory only; nothing
@@ -5555,6 +5691,44 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
         }
     }
 
+    // DEFERRED (memory-blocks M4 follow-ons, intentionally NOT built here):
+    //   1. opencode SERVED mid-cycle push — the spike proved `POST
+    //      /session/{id}/prompt_async` can inject mid-turn from the SSE subscriber
+    //      (the same server API `opencode_seed_session` POSTs to). When wired,
+    //      `achievable_vector("opencode", MidCycle)` would return MidCycle for the
+    //      served/TUI cell. Until then opencode-headless degrades to next-turn.
+    //   2. the ALGEDONIC / signal-plane interrupt — opencode `POST /session/{id}/abort`
+    //      + inject is a true drop-everything interrupt onto the existing `signal/`
+    //      plane. Out of M4's scope: M4 ships next-turn-everywhere + Claude-Code
+    //      mid-cycle + the degradation matrix.
+    //
+    // M4 MID-CYCLE block vector (memory-blocks handoff) — Claude Code only, the
+    // spike-proven path: on PreToolUse/PostToolUse, emit any pending HIGH-PRIORITY
+    // (mid-cycle) memory block for this session as `hookSpecificOutput`
+    // `additionalContext`, so a louder block reaches the model BETWEEN tool calls,
+    // not just next-turn. De-duped content-addressably (`take_pending_mid_cycle`):
+    // an unchanged block emits ONCE, not on every tool call; editing it re-arms a
+    // single redelivery. Codex/opencode have no live hook bridge → a mid-cycle
+    // block DEGRADES to next-turn there (achievable_vector), surfaced by the normal
+    // turn_injection — this arm is reached only for Claude Code (the only harness
+    // whose hook fires). The dedup write makes this safe to call every tool event.
+    if matches!(event, "PreToolUse" | "PostToolUse" | "PostToolUseFailure")
+        && agent == ClaudeCode.agent_noun()
+    {
+        // Sanity: this IS the achievable mid-cycle vector for Claude Code.
+        if achievable_vector(&agent, InjectionVector::MidCycle) == InjectionVector::MidCycle {
+            if let Some(ctx) = mid_cycle_injection(root, &agent, &session) {
+                let out = json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": event,
+                        "additionalContext": ctx,
+                    }
+                });
+                println!("{out}");
+            }
+        }
+    }
+
     // M3 per-turn injection (Claude Code): on UserPromptSubmit (and SessionStart),
     // return the session's inbox status + memory note as `additionalContext` — the
     // SYSTEM-REMINDER layer (Appendix A: stdout of these hooks lands as an
@@ -8828,6 +9002,166 @@ mod tests {
             inj.contains(&want) || inj.contains("App.tsx"),
             "B's injection must surface A's auto-claimed path; got:\n{inj}"
         );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M4: coding-agent memory-block projection ─────────────────────────────
+
+    /// Record a Claude-Code session so turn_injection/note_owner can resolve it.
+    fn m4_record(root: &Root, session: &str) {
+        codesession::upsert_record(
+            root,
+            &codesession::SessionRecord {
+                elanus_session: session.into(),
+                native_session: format!("native-{session}"),
+                tool: "claude".into(),
+                agent_noun: ClaudeCode.agent_noun().into(),
+                workdir: String::new(),
+                room: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Upsert a memory block for a coding session via the live store.
+    fn m4_block(root: &Root, session: &str, name: &str, content: &str, priority: i32, session_scope: bool) {
+        let conn = crate::db::open(root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let mut b = crate::context_blocks::ContextBlock::new(name, content, ClaudeCode.agent_noun());
+        b.scope = if session_scope {
+            crate::context_blocks::Scope::Session
+        } else {
+            crate::context_blocks::Scope::Agent
+        };
+        b.priority = priority;
+        crate::context_store::upsert_block(&conn, "default", &b, session, None).unwrap();
+    }
+
+    #[test]
+    fn turn_injection_renders_session_memory_blocks() {
+        let root = delivery_tmp_root();
+        m4_record(&root, "code-blk00001");
+        m4_block(&root, "code-blk00001", "identity", "I am Lily, the worker.", 0, false);
+        m4_block(&root, "code-blk00001", "focus", "Ship memory-blocks M4.", 0, true);
+
+        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-blk00001")
+            .expect("blocks should produce an injection");
+        assert!(inj.contains("[elanus block: identity]"), "got:\n{inj}");
+        assert!(inj.contains("I am Lily, the worker."), "got:\n{inj}");
+        assert!(inj.contains("[elanus block: focus]"), "got:\n{inj}");
+        assert!(inj.contains("Ship memory-blocks M4."), "got:\n{inj}");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn note_alias_shows_in_turn_injection_and_not_as_a_block_line() {
+        // `elanus code note` writes the `note` block; turn_injection reads it as the
+        // [elanus note] line (old behavior), NOT as a generic [elanus block: note].
+        let root = delivery_tmp_root();
+        m4_record(&root, "code-note0009");
+        codesession::set_note(&root, "code-note0009", "remember the rename").unwrap();
+        // Round-trips through the block store.
+        assert_eq!(
+            codesession::get_note(&root, "code-note0009").unwrap().as_deref(),
+            Some("remember the rename")
+        );
+        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-note0009")
+            .expect("a note should produce an injection");
+        assert!(inj.contains("[elanus note] remember the rename"), "got:\n{inj}");
+        assert!(
+            !inj.contains("[elanus block: note]"),
+            "the note must not also render as a generic block line; got:\n{inj}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn mid_cycle_injection_emits_once_then_dedups() {
+        let root = delivery_tmp_root();
+        m4_record(&root, "code-mid00001");
+        // A high-priority (mid-cycle) block.
+        m4_block(&root, "code-mid00001", "alert", "STOP: schema migrated", crate::context_store::MID_CYCLE_PRIORITY, true);
+
+        // First tool boundary: emitted.
+        let first = mid_cycle_injection(&root, ClaudeCode.agent_noun(), "code-mid00001")
+            .expect("a fresh high-priority block emits mid-cycle");
+        assert!(first.contains("[elanus block: alert]"), "got:\n{first}");
+        assert!(first.contains("STOP: schema migrated"), "got:\n{first}");
+
+        // Second tool boundary (unchanged): nothing (dedup).
+        assert!(
+            mid_cycle_injection(&root, ClaudeCode.agent_noun(), "code-mid00001").is_none(),
+            "an unchanged mid-cycle block must not re-emit on the next tool call"
+        );
+
+        // A NORMAL block does NOT ride mid-cycle.
+        m4_block(&root, "code-mid00001", "calm", "fyi only", 0, true);
+        assert!(
+            mid_cycle_injection(&root, ClaudeCode.agent_noun(), "code-mid00001").is_none(),
+            "a normal-priority block must not emit mid-cycle"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn capability_matrix_degrades_codex_and_opencode_to_next_turn() {
+        // Claude Code can do both vectors.
+        assert_eq!(
+            achievable_vector(ClaudeCode.agent_noun(), InjectionVector::MidCycle),
+            InjectionVector::MidCycle
+        );
+        assert_eq!(
+            achievable_vector(ClaudeCode.agent_noun(), InjectionVector::NextTurn),
+            InjectionVector::NextTurn
+        );
+        // Codex has no live hook bridge → a mid-cycle request DEGRADES to next-turn.
+        assert_eq!(
+            achievable_vector(Codex.agent_noun(), InjectionVector::MidCycle),
+            InjectionVector::NextTurn,
+            "Codex must degrade mid-cycle to next-turn, not error or drop"
+        );
+        // opencode-headless degrades too (served path deferred).
+        assert_eq!(
+            achievable_vector(OpenCode.agent_noun(), InjectionVector::MidCycle),
+            InjectionVector::NextTurn
+        );
+        // next-turn is always achievable everywhere.
+        for noun in [ClaudeCode.agent_noun(), Codex.agent_noun(), OpenCode.agent_noun()] {
+            assert_eq!(
+                achievable_vector(noun, InjectionVector::NextTurn),
+                InjectionVector::NextTurn
+            );
+        }
+    }
+
+    #[test]
+    fn codex_high_priority_block_lands_next_turn_not_dropped() {
+        // A Codex session with a high-priority block: it has NO mid-cycle vector, so
+        // the block must still appear in the next-turn injection (degraded, not lost).
+        let root = delivery_tmp_root();
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-cdx00001".into(),
+                native_session: "native-cdx".into(),
+                tool: "codex".into(),
+                agent_noun: Codex.agent_noun().into(),
+                workdir: String::new(),
+                room: None,
+            },
+        )
+        .unwrap();
+        // Store the block under the codex agent noun (its identity).
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let mut b = crate::context_blocks::ContextBlock::new("alert", "urgent for codex", Codex.agent_noun());
+        b.scope = crate::context_blocks::Scope::Session;
+        b.priority = crate::context_store::MID_CYCLE_PRIORITY;
+        crate::context_store::upsert_block(&conn, "default", &b, "code-cdx00001", None).unwrap();
+
+        let inj = turn_injection(&root, Codex.agent_noun(), "code-cdx00001")
+            .expect("the high-pri block must land next-turn for codex");
+        assert!(inj.contains("urgent for codex"), "degraded delivery must include the block; got:\n{inj}");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

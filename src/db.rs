@@ -463,6 +463,22 @@ CREATE TABLE IF NOT EXISTS code_claims (
 );
 CREATE INDEX IF NOT EXISTS idx_code_claims_room ON code_claims(room);
 CREATE INDEX IF NOT EXISTS idx_code_claims_session ON code_claims(session);
+
+-- Mid-cycle block delivery dedup (memory-blocks M4). A high-priority memory block
+-- can be injected BETWEEN tool calls (Claude Code's Pre/PostToolUse hook emits it
+-- as additionalContext). Without dedup an unchanged block would re-inject on EVERY
+-- tool call. This records which block CONTENT (by content-sha) a session has
+-- already been handed mid-cycle, so an unchanged block is delivered ONCE; editing
+-- the block changes its sha and re-arms delivery. Mirrors the code_inbox_seen
+-- pattern: keyed by the session + the block identity, a session only ever writes
+-- its OWN rows (the hook runs as the session's own env-derived identity).
+CREATE TABLE IF NOT EXISTS code_block_delivered (
+  session        TEXT NOT NULL,    -- the coding session handed the block (code-<id>)
+  block_name     TEXT NOT NULL,    -- the block's name
+  content_sha256 TEXT NOT NULL,    -- the delivered content's sha; a new sha re-arms
+  delivered_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (session, block_name)
+);
 "#,
     )?;
     // M5: the room a coding session belongs to, stored on the durable record so a
