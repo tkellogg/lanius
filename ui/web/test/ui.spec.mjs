@@ -912,14 +912,32 @@ const renamedAgent = 'falcon';
     elanus('emit', 'in/human/owner', '--correlation', commsCorr, '--payload',
       JSON.stringify({ text: 'hi there — I am here when you need me', session: `web-${commsAgent}-seed` }));
   } catch (e) { fail(`chat-render: seeding comms-plane traffic failed: ${e.message ?? e}`); }
-  // The trace-only agent: a coding worker. The flow-11 comms seed already wrote
-  // in/agent/claude-code/code-* events, but seed here too so this flow stands
-  // alone regardless of ordering. conversation_rows drops worker sessions, so
+  // The trace-only agent: a coding worker. Seed on the EXACT in/agent/<agent>
+  // topic the projection queries, with a bus-derived `code-*` SESSION in the
+  // payload — so this genuinely exercises session-based eviction (not a topic
+  // mismatch). conversation_rows drops `code-*` worker sessions, so
   // /api/conversations?agent=claude-code returns []  →  trace fallback.
   const traceAgent = 'claude-code';
   try {
-    elanus('emit', `in/agent/${traceAgent}/code-chatrender01`, '--payload', JSON.stringify({ prompt: 'run the build' }));
+    elanus('emit', `in/agent/${traceAgent}`, '--payload',
+      JSON.stringify({ prompt: 'run the build', session: 'code-chatrender01' }));
   } catch (e) { fail(`chat-render: seeding trace-only traffic failed: ${e.message ?? e}`); }
+
+  // REGRESSION (codex cross-model verify, 2026-06-25): the comms-vs-trace gate
+  // must key on the `code-*` SESSION, never the agent NOUN. A coding-noun agent
+  // (codex/claude-code) that DID curate a comms-plane conversation on a NON-
+  // `code-*` session MUST still surface as comms. Seed exactly that under the
+  // `codex` noun — an in/agent/codex prompt on a web- session + a correlated
+  // in/human reply — and assert below that the projection keeps it. Without the
+  // fix (noun-gated is_worker_session) this returns 0 and the assertion fails.
+  const nounAgent = 'codex';
+  const nounCorr = `chatrender-noun-${Date.now().toString(36)}`;
+  try {
+    elanus('emit', `in/agent/${nounAgent}`, '--correlation', nounCorr, '--payload',
+      JSON.stringify({ prompt: 'ping from a coding-noun agent', session: `web-${nounAgent}-comms` }));
+    elanus('emit', 'in/human/owner', '--correlation', nounCorr, '--payload',
+      JSON.stringify({ text: 'a coding-noun agent can still hold a conversation', session: `web-${nounAgent}-comms` }));
+  } catch (e) { fail(`chat-render: seeding coding-noun comms traffic failed: ${e.message ?? e}`); }
 
   const page = await newPage();
   await page.goto('/');
@@ -969,6 +987,19 @@ const renamedAgent = 'falcon';
   traceConv.ok && traceConv.count === 0
     ? ok(`chat-render: comms projection returns no conversations for trace-only ${traceAgent}`)
     : fail(`chat-render: trace-only ${traceAgent} unexpectedly has conversations (${JSON.stringify(traceConv)})`);
+
+  // REGRESSION: a coding-NOUN agent with a non-`code-*` comms conversation MUST
+  // surface as comms (the projection keys on session, not noun). This would fail
+  // under the old noun-gated is_worker_session.
+  const nounConv = await page.evaluate(async (name) => {
+    const r = await fetch(`/api/conversations?agent=${encodeURIComponent(name)}`);
+    const j = await r.json().catch(() => ({}));
+    const convs = j.conversations ?? [];
+    return { ok: !!j.ok, count: convs.length, sessions: convs.map((c) => c.session) };
+  }, nounAgent);
+  nounConv.ok && nounConv.count >= 1 && nounConv.sessions.every((s) => !String(s).startsWith('code-'))
+    ? ok(`chat-render: coding-noun ${nounAgent} surfaces its comms conversation (noun does not gate): ${JSON.stringify(nounConv.sessions)}`)
+    : fail(`chat-render: coding-noun ${nounAgent} comms conversation wrongly gated by noun (${JSON.stringify(nounConv)})`);
   // Reach the worker's converse view: it is evicted to the Workers drawer and
   // lands on telemetry; click the converse tab to inspect the decision there.
   const opened = await page.evaluate(async (name) => {

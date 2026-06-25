@@ -1692,10 +1692,17 @@ fn session_for_event(row: &EventRow) -> String {
     }
 }
 
-fn is_worker_session(agent: &str, session: &str) -> bool {
-    agent.eq_ignore_ascii_case("codex")
-        || agent.eq_ignore_ascii_case("claude-code")
-        || (session.starts_with("code-") && session.len() > 5)
+// A conversation is dropped from the comms list only when it is a *worker
+// session* — a coding run, identified by its bus-derived `code-*` session id —
+// NOT by the agent's noun (docs/handoffs/chat-rendering.md M2). Gating on noun
+// (codex/claude-code) wrongly drops a coding-noun agent's genuine comms-plane
+// conversation (an `in/agent/<agent>` prompt on a non-`code-*` session with a
+// correlated `in/human/<owner>` reply); the decision must be derivable from the
+// ledger shape alone so a third-party UI reproduces it. All real coding runs
+// carry `code-*` sessions, so they stay evicted; a curated conversation under
+// any agent (coding-noun or not) on a non-`code-*` session is preserved.
+fn is_worker_session(session: &str) -> bool {
+    session.starts_with("code-") && session.len() > 5
 }
 
 fn source_for(session: &str, sender: &Option<String>, payload: &Value, owner: &str) -> String {
@@ -1809,7 +1816,7 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
     for row in &inbound {
         let payload = parse_payload(&row.payload);
         let session = session_for_event(row);
-        if is_worker_session(agent, &session) {
+        if is_worker_session(&session) {
             continue;
         }
         if let Some(c) = &row.correlation_id {

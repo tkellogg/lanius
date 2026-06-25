@@ -233,6 +233,29 @@ Two deferrals recorded so they stay reachable, not built now:
   `kits/core/packages/comms-etiquette/`.
 
 ## Log
+- **2026-06-25 — cross-model verify (codex / GPT-5.5) caught a real HIGH; fixed.**
+  An independent second verification on a *different model* (codex, since impl +
+  first-verify were both Opus) **promoted residual #2 to a real defect**: the
+  `/api/conversations` projection (`src/web.rs::is_worker_session`) gated the
+  comms-vs-trace decision on the agent **noun** (`codex`/`claude-code`), not on
+  whether comms-plane traffic exists — so a coding-noun agent that *did* curate a
+  comms-plane conversation (an `in/agent/<agent>` prompt on a non-`code-*` session
+  + a correlated `in/human/<owner>` reply) was wrongly dropped to trace. Codex
+  proved it by seeding identical ledger conversations for a `companion` and a
+  `claude-code` agent and observing only the latter skipped. **Fix:**
+  `is_worker_session` now keys on the bus-derived `code-*` **session** alone
+  (noun clauses removed) — all real coding runs carry `code-*` sessions so they
+  stay evicted, but a curated conversation under any agent is preserved; the
+  decision is now genuinely ledger-derivable. Hardened `ui.spec.mjs`: the trace
+  seed now uses the exact `in/agent/<agent>` topic with a `code-*` session (the
+  old subtopic seed never matched the query, so the assertion passed trivially),
+  and a new **regression** asserts a `codex`-noun agent with a `web-` comms
+  conversation *does* surface as comms (fails under the old noun gate). Verified:
+  `cargo test` 292 pass; `ui.spec.mjs` ALL PASS against the Rust server (real
+  chromium). The two test "failures" codex reported (`seatbelt_actually_cages`,
+  `ui.spec` 0 assertions) were its **caged-sandbox artifacts** (`sandbox-exec`/
+  chromium can't run inside the codex cage), not real. Residual #2 is now closed;
+  residual #1 (handler-level vs `emit_message`-direct test) remains LOW/accepted.
 - **2026-06-24 — M1–M3 shipped** (handoff-workflow: impl Opus/medium, one focused
   agent per milestone, sequential → adversarial verify Opus/high, **pass round 1**,
   no fix rounds needed). As built:
