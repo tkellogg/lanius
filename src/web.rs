@@ -22,16 +22,16 @@
 //! binary (`current_exe`, not node — Phase 1 of the handoff), history proxies to
 //! the userland history package over loopback HTTP.
 //!
-//! PARITY: this is web-packaging M1–M3 (M4 — retiring ui/web/server.mjs and
-//! config.mjs — is DEFERRED; those files stay on disk as a working fallback).
-//! The source of truth for REQUIRED behavior is the CURRENT ui/web/server.mjs
-//! (it has evolved past the original web-packaging branch): observability-M3 SSE
-//! seq tagging (each bus message tagged with a MONOTONIC seq, a ring buffer
-//! replayed verbatim with stable seqs on every reconnect — the CodeSessions
-//! live-merge and the chat transcript merge both depend on that seq/ring
-//! contract), the /api/conversations endpoints, and the RP-M3 /api/status
-//! read-camera fields (advisory/authoritative availability + enabled). Every
-//! server.mjs endpoint is reproduced below.
+//! PARITY: web-packaging M1–M4. M4 (retiring ui/web/server.mjs + config.mjs) is
+//! DONE — those files have been removed and this Rust server is the only path,
+//! in production and in the test harness. The behavior the retired server.mjs
+//! had — observability-M3 SSE seq tagging (each bus message tagged with a
+//! MONOTONIC seq, a ring buffer replayed verbatim with stable seqs on every
+//! reconnect — the CodeSessions live-merge and the chat transcript merge both
+//! depend on that seq/ring contract), the /api/conversations endpoints, and the
+//! RP-M3 /api/status read-camera fields (advisory/authoritative availability +
+//! enabled) — is all reproduced here (the "port of server.mjs …" comments below
+//! mark that lineage).
 
 use crate::bus;
 use crate::paths::Root;

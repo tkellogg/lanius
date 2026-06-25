@@ -44,7 +44,7 @@ async function shot(page, name) {
 elanus('init');
 fs.writeFileSync(path.join(TMP, 'bus.toml'), `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\n`);
 const daemon = spawn(path.join(BIN, 'elanus'), ['daemon', '--interval-ms', '200'], { env: ENV, stdio: 'ignore' });
-const server = spawn('node', [path.join(REPO, 'ui/web/server.mjs'), '--root', TMP, '--port', String(WEB_PORT)], {
+const server = spawn(path.join(BIN, 'elanus'), ['web', '--port', String(WEB_PORT)], {
   env: ENV, stdio: ['ignore', 'pipe', 'inherit'],
 });
 await waitFor(async () => { try { return (await fetch(`${BASE}/`)).ok; } catch { return false; } }, 20000);

@@ -43,10 +43,11 @@ const OWNER_NAME_FILE: &str = ".owner-name";
 
 /// A principal name must be a single safe segment: no path separators (so a
 /// username can never traverse out of the store), no leading dot (so the cache
-/// file above is not a principal), non-empty, bounded. The JS surfaces
-/// (ui/web/server.mjs, ui/tui/app.js) replicate this exactly; keep them in
-/// sync — a divergence means a surface presents a principal the broker would
-/// never resolve under that name.
+/// file above is not a principal), non-empty, bounded. Any other surface that
+/// validates a principal name (e.g. ui/tui/app.js) must replicate this exactly;
+/// a divergence means a surface presents a principal the broker would never
+/// resolve under that name. (The web surface no longer has a JS validator —
+/// ui/web/server.mjs was retired in web-packaging M4; src/web.rs is authoritative.)
 pub fn valid_principal(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64

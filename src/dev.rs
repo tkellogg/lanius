@@ -49,9 +49,9 @@ pub fn run(root: &Root, interval_ms: u64, web_port: u16, vite_port: u16) -> Resu
         .with_watch(RustInputs::new(&repo)?),
         // The web relay is the same Rust server `serve` ships (`elanus web`,
         // src/web.rs), built via `cargo run` so a change to src/web.rs hot-restarts
-        // it in the dev loop. ui/web/server.mjs is kept on disk as a fallback (M4
-        // — retiring it — is DEFERRED) but is no longer wired into dev/serve. Vite
-        // still serves the SPA with HMR and proxies /api here (ELANUS_WEB_BACKEND).
+        // it in the dev loop. ui/web/server.mjs was retired (web-packaging M4) —
+        // the Rust server is the only relay. Vite still serves the SPA with HMR
+        // and proxies /api here (ELANUS_WEB_BACKEND).
         Service::new(
             "web",
             CommandSpec::new(cargo, &repo)
@@ -123,8 +123,8 @@ pub fn run(root: &Root, interval_ms: u64, web_port: u16, vite_port: u16) -> Resu
 }
 
 /// `elanus serve` — the PACKAGED counterpart of `elanus dev`. Where `dev`
-/// supervises three DEV services (a `cargo run` debug daemon, `node server.mjs
-/// --watch`, and the Vite dev server), `serve` supervises the PROD stack with no
+/// supervises three DEV services (a `cargo run` debug daemon, a `cargo run … web`
+/// relay, and the Vite dev server), `serve` supervises the PROD stack with no
 /// dev toolchain:
 ///
 /// - **The daemon** is the CURRENTLY RUNNING binary (`current_exe`), re-invoked as
@@ -135,7 +135,7 @@ pub fn run(root: &Root, interval_ms: u64, web_port: u16, vite_port: u16) -> Resu
 ///   **embedded in the binary** (`include_dir!` over ui/web/dist). No Node, no npm,
 ///   no `ui/web` source tree at runtime — the whole point of the packaging work
 ///   (docs/handoffs/web-packaging.md). `elanus dev` keeps Vite + npm for hot reload.
-///   (ui/web/server.mjs stays on disk as a fallback; M4 — retiring it — is DEFERRED.)
+///   (ui/web/server.mjs + config.mjs were retired in web-packaging M4 — gone.)
 ///
 /// Supervision (signals, restart-with-backoff, combined logging, group teardown,
 /// root-scoped cleanup) reuses the same Service/CommandSpec/Log machinery as `dev`.
@@ -175,8 +175,7 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
         ),
         // The web server is THIS binary again (`elanus web`, src/web.rs): the SPA
         // is embedded via include_dir!, so no Node, no npm, no ui/web checkout is
-        // needed at runtime. ui/web/server.mjs remains on disk as a fallback only
-        // (M4 deferred).
+        // needed at runtime. ui/web/server.mjs was retired (web-packaging M4).
         Service::new(
             "web",
             CommandSpec::new(self_exe.clone(), &root.dir)

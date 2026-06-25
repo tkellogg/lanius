@@ -44,8 +44,8 @@ const humanSecret = fs.readFileSync(path.join(TMP, '.secrets', 'owner'), 'utf8')
 const probe = mqtt.connect(`mqtt://127.0.0.1:${BUS_PORT}`, { protocolVersion: 5, reconnectPeriod: 300, username: 'owner', password: humanSecret });
 await waitFor('daemon listener bound', () => new Promise((r) => { probe.connected ? r(true) : probe.once('connect', () => r(true)); setTimeout(() => r(probe.connected), 250); }));
 
-// -- the server under test --
-const server = spawn('node', [path.join(REPO, 'ui/web/server.mjs'), '--root', TMP, '--port', String(WEB_PORT)], {
+// -- the server under test: the Rust `elanus web` (server.mjs retired, M4) --
+const server = spawn(path.join(BIN, 'elanus'), ['web', '--port', String(WEB_PORT)], {
   env: ENV, stdio: ['ignore', 'pipe', 'inherit'],
 });
 const BASE = `http://127.0.0.1:${WEB_PORT}`;
@@ -74,8 +74,10 @@ const reader = sse.body.getReader();
 })();
 await waitFor('SSE status: bus connected', () => events.some((m) => m.kind === 'status' && m.connected));
 
-// 1. bus → page
-elanus('bus', 'pub', 'obs/test/web', '{"msg":"web-smoke"}');
+// 1. bus → page. Publish via the authenticated owner `probe` client (the CLI
+// `elanus bus pub` presents no broker credential from a bare root — a separate
+// pre-existing auth gap, unrelated to the web server under test).
+probe.publish('obs/test/web', JSON.stringify({ msg: 'web-smoke' }));
 await waitFor('bus event relayed over SSE', () =>
   events.some((m) => m.kind === 'message' && m.topic === 'obs/test/web' && m.env?.payload?.msg === 'web-smoke'));
 

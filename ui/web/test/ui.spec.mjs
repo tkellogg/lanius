@@ -50,16 +50,13 @@ function createConfigProposal(id, pkg, toml) {
 elanus('init');
 fs.writeFileSync(path.join(TMP, 'bus.toml'), `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\n`);
 const daemon = spawn(path.join(BIN, 'elanus'), ['daemon', '--interval-ms', '200'], { env: ENV, stdio: 'ignore' });
-// The server under test: node server.mjs by default, or the Rust `elanus web`
-// (the embedded SPA, src/web.rs) when ELANUS_UI_SPEC_RUST=1. The agent-comms-ui
-// routes (/api/comms/*, /api/blocks, /api/estimate/*) live ONLY in web.rs, so
-// they are exercised against the Rust server in that mode.
-const USE_RUST = process.env.ELANUS_UI_SPEC_RUST === '1';
-const server = USE_RUST
-  ? spawn(path.join(BIN, 'elanus'), ['web', '--port', String(WEB_PORT)], { env: ENV, stdio: ['ignore', 'pipe', 'inherit'] })
-  : spawn('node', [path.join(REPO, 'ui/web/server.mjs'), '--root', TMP, '--port', String(WEB_PORT)], {
-      env: ENV, stdio: ['ignore', 'pipe', 'inherit'],
-    });
+// The server under test: the Rust `elanus web` (the embedded SPA, src/web.rs).
+// server.mjs/config.mjs were retired (web-packaging M4) — the Rust server is the
+// only path now.
+const server = spawn(path.join(BIN, 'elanus'), ['web', '--port', String(WEB_PORT)], { env: ENV, stdio: ['ignore', 'pipe', 'inherit'] });
+// server.mjs is retired (M4): the Rust server is always under test now. Kept as a
+// named constant so the Rust-only assertion gates below read intentionally.
+const USE_RUST = true;
 await waitFor('web server up', async () => {
   try { return (await fetch(`${BASE}/`)).ok; } catch { return false; }
 }, 20000);
@@ -88,14 +85,6 @@ async function newPage() {
     if (/model list unavailable/i.test(t)) return;
     // history probe returns 503 before the package is installed — expected.
     if (/503|Service Unavailable/i.test(t)) return;
-    // The agent-comms-ui read routes (/api/comms/*, /api/blocks, /api/estimate/*)
-    // exist only in the Rust web.rs server; against the node server.mjs fallback
-    // they 404. The CommsView fetches them on mount and handles the 404
-    // gracefully, but the browser logs a generic "Failed to load resource: 404"
-    // (no URL in the text). The rest of the node suite produces no 404s, so in the
-    // node-fallback mode a bare 404 is the expected comms-route miss — not a regression.
-    if (!USE_RUST && /\/api\/(comms|blocks|estimate)/i.test(t)) return;
-    if (!USE_RUST && /Failed to load resource.*404/i.test(t)) return;
     consoleErrors.push(`[console.error] ${t}`);
     console.error(`BROWSER CONSOLE ERR: ${t}`);
   });
@@ -1336,23 +1325,15 @@ const renamedAgent = 'falcon';
     const empty = !!document.querySelector('.cm-empty');
     return { rowCount: rows.length, anyChip: chips.some(Boolean), high, empty };
   });
-  if (USE_RUST) {
-    // The Rust server serves the seeded-mail projection (/api/comms/mail), so M2
-    // MUST render rows here — the empty-state fallback is NOT acceptable. Require
-    // rows with chips AND the high-priority chip from the seeded priority-9 mail.
-    commsState.rowCount > 0 && commsState.anyChip
-      ? ok(`comms: ${commsState.rowCount} mail row(s) with priority chips render`)
-      : fail(`comms: seeded mail did not render rows with chips (${JSON.stringify(commsState)})`);
-    commsState.high
-      ? ok('comms: a high-priority delivery shows the high chip')
-      : fail('comms: seeded high-priority mail did not show a high chip');
-  } else if (commsState.rowCount > 0 && commsState.anyChip) {
-    ok(`comms: ${commsState.rowCount} mail row(s) with priority chips render`);
-  } else if (commsState.empty) {
-    ok('comms: empty-state copy renders (server without /api/comms routes)');
-  } else {
-    fail(`comms: neither mail rows nor empty-state rendered (${JSON.stringify(commsState)})`);
-  }
+  // The Rust server serves the seeded-mail projection (/api/comms/mail), so M2
+  // MUST render rows here — the empty-state fallback is NOT acceptable. Require
+  // rows with chips AND the high-priority chip from the seeded priority-9 mail.
+  commsState.rowCount > 0 && commsState.anyChip
+    ? ok(`comms: ${commsState.rowCount} mail row(s) with priority chips render`)
+    : fail(`comms: seeded mail did not render rows with chips (${JSON.stringify(commsState)})`);
+  commsState.high
+    ? ok('comms: a high-priority delivery shows the high chip')
+    : fail('comms: seeded high-priority mail did not show a high chip');
 
   // M3 — the rooms panel is present (empty-state or a .comms-room). Seeding live
   // room membership needs a real session, so this asserts the panel renders; the

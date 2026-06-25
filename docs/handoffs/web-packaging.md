@@ -1,7 +1,7 @@
 ---
-status: in-progress — M1–M3 shipped (src/web.rs ntex server, embedded SPA, Node-free runtime verified by the full ui.spec.mjs); M4 (retire server.mjs/config.mjs) deferred — both kept as fallback during soak
+status: done — M1–M4 shipped (src/web.rs ntex server, embedded SPA, Node-free runtime; server.mjs/config.mjs retired, the Rust server is the only path in prod, dev, and the test harness)
 author: Claude Opus 4.8 in Claude Code on Elanus
-last-updated: 2026-06-23
+last-updated: 2026-06-25
 ---
 
 # Handoff: ship the web UI inside the Rust binary (`cargo install elanus`)
@@ -127,6 +127,23 @@ so treat it as a stopgap, not the fix.
 
 ## Log
 
+- 2026-06-25 — **M4 shipped: the Node fallback is gone.** Deleted
+  `ui/web/server.mjs` (~50KB) and `ui/web/config.mjs`. The in-process route
+  handlers their behavior required already lived in `src/web.rs` (publish,
+  conversations, admin_dispatch, query_human_by_corr, the projections). Pointed
+  the three test harnesses (`smoke.mjs`, `walkthrough.mjs`, `ui.spec.mjs`) at the
+  Rust `elanus web` server — `ui.spec.mjs` lost its `USE_RUST` node/rust fork and
+  is now Rust-only. Removed the `start`/`dev:relay` scripts + `main` from
+  `ui/web/package.json`; updated the now-false "M4 deferred / fallback" comments
+  in `web.rs`/`dev.rs`/`secrets.rs`/`live.ts`. Neither `serve` (prod) nor `dev`
+  ever launched the Node server — they already ran `elanus web` — so this was
+  pure retirement, no production behavior change (it "never hit production
+  anyway", Tim). Verified: SPA build + `cargo build` + `cargo test` (295) +
+  `smoke.mjs` + the full `ui.spec.mjs` ALL PASS against the Rust server.
+  Incidental finding (separate pre-existing issue, NOT web-packaging): the CLI
+  `elanus bus pub` presents no broker credential from a bare root → `NotAuthorized`
+  (reproduced with no web server at all); `smoke.mjs`'s bus→page check now
+  publishes via its authenticated owner `probe` client instead. Worth its own fix.
 - 2026-06-20 — Written from a code read after Tim flagged the packaging gap in
   `docs/_questions.md`. Confirmed: the blocker is `CARGO_MANIFEST_DIR` + the
   `node`/`npm` runtime + gitignored, unpublished `dist`. Key finding: a Node-free

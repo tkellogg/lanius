@@ -1,17 +1,14 @@
 {
   "name": "elanus-web",
   "version": "0.1.0",
-  "description": "elanus web dashboard — a pure MQTT 5 client relayed to the browser over SSE",
+  "description": "elanus web dashboard SPA source — served in production by the Rust `elanus web` (src/web.rs), embedded in the binary",
   "type": "module",
   "private": true,
-  "main": "server.mjs",
   "scripts": {
     "dev": "vite",
-    "dev:relay": "node --watch --watch-path=server.mjs --watch-path=config.mjs server.mjs",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "start": "node server.mjs",
     "test": "npm run build && node test/smoke.mjs",
     "test:ui": "npm run build && node test/ui.spec.mjs",
     "walkthrough": "npm run build && node test/walkthrough.mjs"
