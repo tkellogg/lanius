@@ -652,3 +652,112 @@ session as its spawner is bounded (it cannot forge a fenced token) but is the
 env-as-authority-key seam to close when budget becomes runtime-enforced (M2+,
 marked with a `TODO` at the spawner lookup). The cross-process lock guarantee is
 unix-only by construction (the whole 0600/flock model is POSIX).
+
+**[M2 LANDED 2026-06-21]** The **bus capability dimension** now narrows by
+`child ⊆ spawner`, and the scattered dimensions are unified into one **`Grants`**
+value carried on `SessionToken` via `#[serde(flatten)]` (on-disk JSON unchanged —
+M1 and pre-M1 tokens still deserialize). `mint` gained `requested_publish`/
+`requested_subscribe`; when the spawner token file exists, under the *same* M1
+`flock` it asserts:
+- **subscribe (read authority): strict** — every child filter must be `covers`-ed
+  by some spawner subscribe filter (`child.subscribe ⊆ spawner.subscribe`), else
+  the spawn is refused. (Sessions get empty subscribe today; this is the
+  forward-looking guard.)
+- **publish:** the child may **always** emit its own structural self-telemetry
+  subtree `obs/agent/<agent>/<session>/#` (its own audit trail — disjoint,
+  write-only-own, *not* a widening), plus any filter `covers`-ed by the spawner's
+  publish grants; anything else is refused.
+
+The decision was the design fork M2 raised: entry-20 gives each session a
+*disjoint* obs subtree, so a literal `child ⊆ parent` on publish would forbid a
+child emitting its own telemetry. Resolved as above — read authority narrows
+strictly; self-telemetry is always allowed because it is own-data-only and
+structurally disjoint from everything else (the child's `own_obs` is built from the
+*child's* launcher-set principal/agent, so it cannot name another session's
+subtree). Owner-spawned sessions (no spawner token) get the exact entry-20
+structural scope unconditionally — **zero behavior change** for the common case.
+The broker is unchanged: it already gates `code-*` actors from the token's
+publish/subscribe, and runtime subscribe (exact-match) is *stricter* than the
+mint-time `covers` containment, so no widening.
+
+Soundness rests on **`topic::covers(wide, narrow)`** — a decidable filter-
+containment with a conservative "deny when unsure" bias, including the MQTT
+`$`-topic rule (a root wildcard does not cover a `$`-anchored filter — without it
+`covers("#", "$x/#")` falsely reports ⊆, an overstated guarantee = a defect). It
+is proven by a brute-force soundness oracle (`covers(w,n) ⟹ ∀ topic: matches(n,t)
+⟹ matches(w,t)`) over a generated filter/topic alphabet incl. `$`-cases, plus
+adversarial review with an *extended* oracle outside the shipped alphabet — no
+widening counterexample found. 198 + 2 doctests green; clippy clean on the changed
+files.
+
+Still LATENT after M2 (M3): fs read/write, the tool/command allowlist, and
+`blocking` are still flat per-kind, not `subset(spawner)`. The env-keyed
+spawner-name residual (above) is unchanged — still M2+ follow-up.
+
+**[M3 LANDED 2026-06-21]** The delegation contract is now **complete across every
+named capability dimension** — `Grants` carries `fs_write`, `fs_read`,
+`tool_allowlist`, and `blocking` (each `Option<Vec<String>>`, `#[serde(default)]`,
+`None` = unbounded), and `mint` asserts `child ⊆ spawner` for ALL of them under the
+*same* M1 flock, via one uniform `narrow` contract: budget keeps its fungible
+`Σ ≤ parent`; bus keeps its M2 `covers`; the four capability dims use two decidable,
+deny-when-unsure primitives — **path containment** (`topic::path_covered`:
+component-wise `Path::starts_with` over lexically-normalized absolute paths — no
+`canonicalize`, since grant prefixes need not exist and symlink resolution stays a
+runtime cage concern; `/a/b` covers `/a/b/c` but not `/a/bc`; `..`-escape and
+relative/empty prefixes deny) and **exact set-membership** (tool/blocking). Every
+child entry is checked (loop, not first-only); a child can never flip a bounded dim
+to unbounded. The request side is unified into `RequestedGrants` (retiring the
+`mint` arg-count smell). Scope was deliberately **mint-bound** (Tim's call): the
+contract is recorded and enforced at spawn for all four; *runtime* enforcement is
+unchanged — `fs_write` keeps its existing cage/`acquire_lease` `lease ⊆ grant`
+(profile-driven, untouched), and `fs_read`/`tool_allowlist`/`blocking` are
+mint-bound only, runtime-enforced later (mirroring sandbox.md's read-scoping
+deferral). Owner-spawned sessions get all four dims `None` (unbounded), lock-free —
+zero behavior change. 217 + 2 doctests green; clippy clean on the touched modules.
+
+Adversarial validation (committed-tree, no git-mutation) found one **latent HIGH**
+before finalize: an empty-string `wide` prefix made `path_covered` a silent root
+wildcard (`"/etc".starts_with("")` is true in Rust) — not reachable in shipped M3
+(no production path mints `Some([""])`; sessions get `None`) but a root-wildcard
+escalation the moment fs grants get populated (M4 / deferred runtime). Fixed by
+requiring `wide` prefixes be absolute (rejects empty *and* relative degenerate
+prefixes) + a regression test. Lesson for M4: when the `--grants` CLI populates fs
+grants, **validate prefixes at construction** (absolute, non-empty) too.
+
+Still LATENT after M3: runtime enforcement for `fs_read`/`tool_allowlist`/`blocking`
+(mint-bound only today); and the env-keyed spawner-name residual (unchanged) — the
+`ELANUS_CODE_REPLY_TO` lookup should move onto a capability reference. M4 (optional)
+is the `--grants`/budget CLI surface for deliberate narrowing.
+
+**[M4 LANDED 2026-06-21 — handoff COMPLETE]** Narrowing is now first-class in the
+UX. `elanus code <tool>` accepts `--budget <N>` and repeatable
+`--grant-{publish,subscribe,fs-write,fs-read,tool,blocking}`; `take_grants_flags`
+(src/codeagent.rs) strips them from argv (the rest is forwarded to the tool
+verbatim), **validates at construction** (numeric budget; `topic::valid_filter` for
+bus filters; fs paths must be absolute, non-empty, whitespace-free, contain no `..`,
+and name a real directory below root — `/`, `//`, `/../..` are refused, closing the
+M3 root-wildcard footgun *at the door*; tool/blocking non-empty), and `launch`
+threads the resulting `RequestedGrants` into `mint`. Absent flags ⇒
+`RequestedGrants::default()` ⇒ byte-identical prior behavior. The CLI only checks
+well-formedness; the *bound* is still mint's `child ⊆ spawner` / `Σ ≤ parent`
+(unchanged) — e.g. `--grant-publish '#'` parses fine but a child is refused it
+unless its spawner holds it. Acceptance met (e2e tests asserting refusals): an owner
+`--budget 4` session has remaining 4, and a child requesting >4 (or an fs_write /
+publish outside an owner-set grant) is refused. Adversarial validation found **no
+bypass** (every requested grant is re-checked at mint); residuals were LOW and
+addressed (degenerate-absolute hardening above; a vacuous-pass test made
+unconditional). 241 + 2 doctests green; clippy clean on the touched module.
+
+The `--budget`/`--grant-*` names are a **reserved elanus flag namespace** — they are
+stripped from anywhere in argv before the tool sees them (no `--` end-of-options
+sentinel today), so a future tool adopting one of these names would have it captured
+by elanus. Acceptable now (claude/codex use none of them); revisit if it bites.
+
+Residuals carried past the handoff (all recorded, none blocking): (1) runtime
+enforcement for `fs_read`/`tool_allowlist`/`blocking` is still deferred (mint-bound
+only) — when it lands, the token grant becomes the cage's source instead of the
+profile; (2) the env-keyed spawner-name lookup (`ELANUS_CODE_REPLY_TO`) should move
+onto a capability reference before budget/grants become load-bearing at runtime;
+(3) async `spawn` does not yet forward `--grant-*` flags to detached workers (mint
+still prevents widening — it just can't pass an explicit narrowing request through
+the async path); (4) the cross-process lock is unix-only by construction.

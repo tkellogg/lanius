@@ -224,3 +224,54 @@ see it refused if it tries to exceed it.
   **M2 next**: unify `Grants` + subset the bus ACL from the spawner; also re-key the
   spawner lookup off `ELANUS_CODE_REPLY_TO` (env) onto a capability reference (TODO
   marked at the lookup) before budget becomes runtime-enforced.
+
+- 2026-06-21 — **M2 implemented** (one `Grants` value via `#[serde(flatten)]`; bus
+  scope narrows `child ⊆ spawner` at mint — subscribe strict, publish allows the
+  child's own self-telemetry subtree + the spawner's publish; owner path unchanged).
+  Soundness rests on a new decidable `topic::covers` (filter-containment) proven by a
+  brute-force oracle + adversarial extended oracle; the MQTT `$`-topic hole in
+  `covers` was found and fixed before commit. Acceptance met: a bus-scoped spawner's
+  child cannot subscribe/publish outside the spawner (broker denies; child cannot
+  widen). Design fork resolved: a child may always emit its *own* disjoint obs
+  subtree (own audit trail, not a widening) — recorded in security.md entry 22
+  [M2 LANDED]. **Process note:** the validation workflow stalled once (machine asleep)
+  and a validator agent `git checkout`-discarded the uncommitted tree mid-run; the
+  change was reconstructed and re-verified faithful (production code + topic.rs byte-
+  intact; test module equivalent-not-identical). **M3 next**: fold fs read/write +
+  tool/command allowlist + `blocking` into the same `covers`/`⊆` contract, reusing
+  `lease ⊆ grant`'s prefix machinery for paths.
+
+- 2026-06-21 — **M3 implemented**, scope = **contract-complete, mint-bound** (Tim's
+  call; the four named dims are in different states in the code — only fs_write has
+  runtime enforcement, fs_read/tool-allowlist were never modeled, blocking was
+  package-only). `Grants` now carries `fs_write`/`fs_read`/`tool_allowlist`/
+  `blocking` (`Option<Vec<String>>`, `None`=unbounded); `mint` asserts `child ⊆
+  spawner` for ALL capability dims under the M1 flock via one uniform `narrow` —
+  paths via `topic::path_covered` (component-wise lexical prefix, no canonicalize),
+  tool/blocking via exact membership. Request side unified into `RequestedGrants`
+  (removed the `mint` arg-count allow). Runtime enforcement unchanged (fs_write
+  cage stays; the other three are mint-bound only, deferred). Acceptance met: every
+  capability dimension a spawn confers is `⊆` the spawner's by one decidable check.
+  Validation (committed-tree, no git-mutation this time — process hardened: WIP
+  checkpoint before validate) caught one latent HIGH — an empty-string `wide`
+  prefix was a silent root wildcard in `path_covered` — fixed (require absolute
+  prefixes) + regression test. security.md entry 22 [M3 LANDED]. **M4 (optional,
+  last)**: the `--grants`/budget CLI surface for deliberate narrowing — and it must
+  validate fs-grant prefixes (absolute, non-empty) at construction.
+
+- 2026-06-21 — **M4 implemented — HANDOFF COMPLETE.** `elanus code <tool>` gains
+  `--budget` + repeatable `--grant-{publish,subscribe,fs-write,fs-read,tool,blocking}`
+  (`take_grants_flags`, src/codeagent.rs): strips them from argv, validates at
+  construction (numeric budget; `valid_filter` filters; fs paths absolute +
+  non-empty + no-whitespace + no-`..` + below-root — `/` and `/../..` refused,
+  closing the M3 footgun at the door), threads `RequestedGrants` into `mint`. The CLI
+  only validates well-formedness; the bound stays mint's `child ⊆ spawner` / `Σ ≤
+  parent`. Acceptance met (e2e refusal tests): owner `--budget 4` ⇒ remaining 4; a
+  child exceeding it (or requesting fs/publish outside an owner-set grant) is refused.
+  Validation found NO bypass; LOW residuals addressed (degenerate-absolute hardening,
+  a vacuous-pass test fixed). security.md entry 22 [M4 LANDED]. **All four milestones
+  (M1 budget, M2 bus, M3 capability dims, M4 CLI) are done on branch
+  `authority-delegation-rest` (M1 already on `main`).** Carried residuals (recorded,
+  non-blocking): runtime enforcement of fs_read/tool/blocking still deferred; the
+  env-keyed spawner-name (`ELANUS_CODE_REPLY_TO`) should move to a capability ref;
+  async `spawn` doesn't forward `--grant-*` yet; the lock is unix-only.

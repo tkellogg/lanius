@@ -1415,9 +1415,7 @@ mod tests {
             "claude-code",
             999_999,
             None,
-            None,
-            None,
-            None,
+            crate::codesession::RequestedGrants::default(),
         )
         .unwrap();
         let b = Broker::new(root);
