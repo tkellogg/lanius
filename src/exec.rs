@@ -437,6 +437,15 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     // the array as <server>__<tool>. Failures degrade loudly, never fatal.
     let mcp_pool = crate::mcp::Pool::load(root, &conn, &opts.profile, &prof, &cage);
     let mut tools = tool_defs();
+    // M3 (docs/handoffs/chat-rendering.md): a built-in tool a package "owns"
+    // (declares in `provides_builtin_tools`) is available only when a package
+    // providing it is visible to this profile. So a worker subagent that drops
+    // the comms package (e.g. `inherit_to_subagents = false` under `$parent`)
+    // actually loses `send_message`/`ask_human`, not merely the etiquette text.
+    let withheld = crate::packages::withheld_builtin_tools(root, &opts.profile);
+    if !withheld.is_empty() {
+        tools.retain(|t| !withheld.contains(t.name.as_str()));
+    }
     tools.extend(mcp_pool.tool_defs());
     let root_type = match event_id {
         Some(id) => db::root_type(&conn, id).unwrap_or_else(|_| "cli".into()),
@@ -655,6 +664,7 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
                 &prof,
                 &session,
                 event_id,
+                ids.correlation_id.as_deref(),
                 in_handler,
                 &eff,
                 &mut self_emitted,
@@ -796,6 +806,51 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
 
 fn pending_ask_key(session: &str) -> String {
     format!("session:{session}:pending_ask")
+}
+
+/// A message an actor sends to a channel — the one comms primitive
+/// (docs/handoffs/chat-rendering.md). `send_message` and `ask_human` are the
+/// same emit: write to a channel inbox, threaded by correlation. The only
+/// difference is run-scheduling — `ask` suspends and parks a `pending_ask`,
+/// `send_message` keeps working — so that decision lives in the caller, not
+/// here. This is the single emit path / single correlation discipline the
+/// milestone requires.
+struct OutboundMessage {
+    /// Channel inbox topic (default = the owner's mailbox, in/human/<owner>).
+    topic: String,
+    /// The message body; `text` for a plain message, `question`/`options` for
+    /// an ask. Already shaped by the caller.
+    payload: Value,
+    /// Threading id. An ask mints a fresh correlation (it parks on it); a
+    /// send threads onto the turn's correlation when one exists so the reply
+    /// continues the conversation instead of dead-ending.
+    correlation: Option<String>,
+    /// Ask-only: deadline + default-on-expiry. None for a fire-and-forget send.
+    deadline: Option<String>,
+    default_action: Option<Value>,
+}
+
+/// The shared emit path for the send/ask family. Emits the message to its
+/// channel and returns the new event id. Both verbs route through here so
+/// there is exactly one place that decides how a message reaches a channel.
+fn emit_message(
+    root: &Root,
+    conn: &Connection,
+    cause: Option<i64>,
+    msg: &OutboundMessage,
+) -> Result<i64> {
+    events::emit(
+        root,
+        conn,
+        EmitOpts {
+            payload: Some(msg.payload.clone()),
+            correlation: msg.correlation.clone(),
+            deadline: msg.deadline.clone(),
+            default_action: msg.default_action.clone(),
+            cause,
+            ..EmitOpts::new(&msg.topic)
+        },
+    )
 }
 
 /// Session-scoped observation topic: obs/agent/<agent>/<session>/<rest>.
@@ -1256,6 +1311,23 @@ fn tool_defs() -> Vec<Tool> {
                 },
                 "required": ["path"]
             })),
+        Tool::new("send_message")
+            .with_description(
+                "Send a message to a channel — by default the owner's mailbox (in/human/<owner>). \
+                 Use this to speak UNPROMPTED: surface something worth the human's attention, share \
+                 progress, or report a result, WITHOUT pausing your run. It does NOT suspend and does \
+                 NOT wait for a reply — you keep working. If the human replies it arrives as ordinary \
+                 inbound mail on the same thread. When you actually need an answer before you can \
+                 continue, use `ask_human` instead (that one blocks). Speak to feel alive, not to spam: \
+                 send when it earns the interruption.",
+            )
+            .with_schema(json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "the message to send" }
+                },
+                "required": ["text"]
+            })),
         Tool::new("ask_human")
             .with_description(
                 "Ask the human a question. Interactively this waits for an answer; under the daemon it \
@@ -1284,6 +1356,7 @@ fn run_tool(
     prof: &profile::Profile,
     session: &str,
     event_id: Option<i64>,
+    turn_correlation: Option<&str>,
     in_handler: bool,
     call: &ToolCall,
     self_emitted: &mut HashSet<i64>,
@@ -1367,6 +1440,45 @@ fn run_tool(
                 Err(e) => err(format!("emit failed: {e:#}")),
             }
         }
+        "send_message" => {
+            let Some(text) = args["text"].as_str() else {
+                return err("send_message: missing 'text'".into());
+            };
+            // send = the non-suspending mode of the send family: emit through
+            // the one shared path and KEEP WORKING (no pending_ask, no
+            // ToolOutcome::Suspend). Thread onto the turn's correlation when
+            // there is one so a reply continues the conversation instead of
+            // dead-ending; uncorrelated (CLI-direct) sends just land on the
+            // mailbox. Default channel = the owner's mailbox.
+            let msg_id = match emit_message(
+                root,
+                conn,
+                event_id,
+                &OutboundMessage {
+                    topic: crate::topic::human_mailbox(&prof.owner),
+                    payload: json!({ "text": text, "session": session }),
+                    correlation: turn_correlation.map(String::from),
+                    deadline: None,
+                    default_action: None,
+                },
+            ) {
+                Ok(id) => id,
+                Err(e) => return err(format!("send_message emit failed: {e:#}")),
+            };
+            self_emitted.insert(msg_id);
+            let mut ids = trace::Ids::from_env();
+            ids.session_id = Some(session.to_string());
+            if let Some(c) = turn_correlation {
+                ids.correlation_id = Some(c.to_string());
+            }
+            trace::write(
+                root,
+                &obs_tool(&prof.agent, session, "send_message", "result"),
+                &ids,
+                json!({ "call_id": call.call_id, "name": "send_message", "suspended": false, "message_id": msg_id }),
+            );
+            ToolOutcome::Output(json!({ "sent": true, "message_id": msg_id }).to_string())
+        }
         "ask_human" => {
             let Some(question) = args["question"].as_str() else {
                 return err("ask_human: missing 'question'".into());
@@ -1386,6 +1498,9 @@ fn run_tool(
                 }
             }
             // Daemon context: checkpoint-and-exit, never block.
+            // ask = the suspend=true / expects_reply=true MODE of the send
+            // family: it mints a fresh correlation (it parks on it) and emits
+            // through the one shared path (docs/handoffs/chat-rendering.md).
             let corr = uuid::Uuid::new_v4().to_string();
             let deadline = args["deadline_minutes"].as_f64().map(|m| {
                 (chrono::Utc::now() + chrono::Duration::seconds((m * 60.0) as i64))
@@ -1395,17 +1510,17 @@ fn run_tool(
             if !options.is_empty() {
                 payload["options"] = json!(options);
             }
-            let ask_id = match events::emit(
+            let ask_id = match emit_message(
                 root,
                 conn,
-                EmitOpts {
-                    payload: Some(payload),
+                event_id,
+                &OutboundMessage {
+                    // The ask is mail to the owner (docs/topics.md decided 6).
+                    topic: crate::topic::human_mailbox(&prof.owner),
+                    payload,
                     correlation: Some(corr.clone()),
                     deadline,
                     default_action: args.get("default").filter(|d| !d.is_null()).cloned(),
-                    cause: event_id,
-                    // The ask is mail to the owner (docs/topics.md decided 6).
-                    ..EmitOpts::new(&crate::topic::human_mailbox(&prof.owner))
                 },
             ) {
                 Ok(id) => id,
@@ -1679,6 +1794,82 @@ mod tests {
             .unwrap();
         assert_eq!(got, p);
         std::fs::remove_dir_all(&p).ok();
+    }
+
+    // M1 (docs/handoffs/chat-rendering.md): send_message (no suspend) and
+    // ask_human (suspend) are the SAME emit. This proves both verbs travel the
+    // one shared path `emit_message`, landing on the same channel topic and
+    // threading by correlation — the difference (deadline/default for ask,
+    // none for send) is just the OutboundMessage the caller hands in, and the
+    // suspend/keep-working choice lives in the handler, not the emit.
+    #[test]
+    fn send_and_ask_share_one_emit_path() {
+        let dir = std::env::temp_dir().join(format!("el-sendask-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let owner = "owner";
+        let topic = crate::topic::human_mailbox(owner);
+
+        // send_message: fire-and-forget, threaded onto the turn correlation,
+        // no deadline/default. The handler would NOT suspend after this.
+        let send_id = emit_message(
+            &root,
+            &conn,
+            None,
+            &OutboundMessage {
+                topic: topic.clone(),
+                payload: json!({ "text": "heads up", "session": "s1" }),
+                correlation: Some("turn-corr".to_string()),
+                deadline: None,
+                default_action: None,
+            },
+        )
+        .unwrap();
+
+        // ask_human: same path, but mints its own correlation + carries a
+        // deadline/default. The handler would suspend + park pending_ask.
+        let ask_id = emit_message(
+            &root,
+            &conn,
+            None,
+            &OutboundMessage {
+                topic: topic.clone(),
+                payload: json!({ "question": "ok?", "session": "s1" }),
+                correlation: Some("ask-corr".to_string()),
+                deadline: Some("2099-01-01T00:00:00.000Z".to_string()),
+                default_action: Some(json!("assume yes")),
+            },
+        )
+        .unwrap();
+
+        // Both landed on the SAME channel (the owner's mailbox).
+        let row = |id: i64| -> (String, Option<String>, Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT type, correlation_id, deadline, default_action FROM events WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        let (s_type, s_corr, s_deadline, s_default) = row(send_id);
+        let (a_type, a_corr, a_deadline, a_default) = row(ask_id);
+
+        assert_eq!(s_type, topic, "send lands on the owner mailbox");
+        assert_eq!(a_type, topic, "ask lands on the SAME owner mailbox");
+
+        // send threads onto the turn correlation and carries no ask machinery.
+        assert_eq!(s_corr.as_deref(), Some("turn-corr"));
+        assert!(s_deadline.is_none(), "send is fire-and-forget: no deadline");
+        assert!(s_default.is_none(), "send has no default-on-expiry");
+
+        // ask carries its own correlation + the deadline/default it parks on.
+        assert_eq!(a_corr.as_deref(), Some("ask-corr"));
+        assert!(a_deadline.is_some(), "ask carries a deadline");
+        assert!(a_default.is_some(), "ask carries a default-on-expiry");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

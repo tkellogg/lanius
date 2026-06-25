@@ -67,6 +67,13 @@ the UI.
   [../handoffs/memory-blocks.md](../handoffs/memory-blocks.md),
   [../handoffs/agent-comms-package.md](../handoffs/agent-comms-package.md), and
   [../handoffs/work-estimation.md](../handoffs/work-estimation.md).
+- [reaching-the-user.md](reaching-the-user.md) - **stub**: the human-proxy / EA
+  actor. A person is one identity reachable many ways (elanus, phone, Bluesky,
+  Teams, email) with varying effectiveness; the idea is a rules-engine-or-LLM
+  actor that picks channels, escalates across them, and brokers private comms —
+  the *policy layer* on the already-built phonebook/recall/egress/human-proxy
+  rails ([../identity.md](../identity.md), [../actors.md](../actors.md)). Split
+  out of [../handoffs/chat-rendering.md](../handoffs/chat-rendering.md).
 
 ## Implementation Anchors
 

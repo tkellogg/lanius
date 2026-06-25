@@ -1,6 +1,6 @@
 ---
 name: comms-etiquette
-description: How agents talk to each other on Elanus — deliver/spawn/inbox, when to set priority, shared-channel etiquette, and the failure-mail contract. Read before dispatching work to another agent or coordinating in a shared room.
+description: How agents talk on Elanus — to the human (send_message vs ask_human) and to each other (deliver/spawn/inbox), when to speak unprompted vs stay quiet, when to set priority, shared-channel etiquette, and the failure-mail contract. Read before messaging the human, dispatching work to another agent, or coordinating in a shared room.
 ---
 
 # comms-etiquette
@@ -44,6 +44,39 @@ inbox as an argument — it is derived, so you can only ever act as yourself).
 You see waiting mail *without* asking: each turn an `inbox` block reports the
 unseen count and a preview of the latest. Treat it as a notification — run
 `elanus code inbox` to actually read and act.
+
+## Talking to the human — `send_message` vs `ask_human`
+
+Talking to the human is the same primitive as talking to a peer — *send a
+message to a channel* — and it has exactly two verbs, separated only by
+whether you **block**:
+
+- **`send_message`** — speak **unprompted** and **keep working**. It writes a
+  message to the human's mailbox (`in/human/<owner>` by default) and returns
+  immediately: no suspend, no required reply. Use it to surface something
+  worth attention, share progress, or report a result *as you go*. If the
+  human replies, it arrives later as ordinary inbound mail on the same thread
+  — you do not wait for it.
+
+- **`ask_human`** — ask a question and **block on the answer**. Interactively
+  it waits at the terminal; under the daemon it suspends your run
+  (checkpoint-and-exit) until the human answers or the deadline's default
+  applies. Reach for this **only when you genuinely cannot proceed** without
+  the answer. Prefer enumerated `options` and give a `default` +
+  `deadline_minutes` whenever a sensible assumption exists.
+
+They are the same emit underneath — one channel, one correlation thread, one
+transcript record. The only difference is run-scheduling: **`ask` blocks,
+`send_message` doesn't.** Pick by that question alone — "do I need to stop and
+wait?" If no, `send_message`; if yes, `ask_human`.
+
+**Feel alive, don't spam.** `send_message` exists so you can be present — say
+something when it earns the interruption (a milestone reached, a surprising
+finding, a decision you made and want on the record). It does **not** exist to
+narrate every step; a message per tool call is noise, and a human who learns
+your messages are noise stops reading them. When in doubt, stay quiet: routine
+progress lives in your trace, which any UI can read without you saying a word.
+Speak when a human would want to be told — no more, no less.
 
 ## Priority — when to make mail loud
 

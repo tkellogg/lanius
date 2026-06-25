@@ -168,6 +168,22 @@ statuses: planned | in-progress | verifying | done
   [../journeys/03-cost-visibility.md](../journeys/03-cost-visibility.md)), so it
   ships with a package-local pricing map. Depends on [memory-blocks.md](memory-blocks.md).
   Backed by [../journeys/11-profiles.md](../journeys/11-profiles.md).
+- [chat-rendering.md](chat-rendering.md) - **planned**: how a UI decides what to
+  show for an agent. Reframes the `_questions.md` "`send_message` /
+  configure-how-chat-is-displayed" item: display is **not** per-agent UI config —
+  it's a **read off two bus planes**, generic to any client. Rule: comms-plane
+  traffic with me (`in/human`/`in/dm`/`in/group`) exists → render the
+  conversation; else interpret the obs trace. `ask`/`send_message` unify into one
+  *send to a channel* verb differing only by a **suspend flag** (invisible to
+  UIs — `ask` was mis-factored, not wrong); suppression is at emission, with a
+  pre-human-message bus-interception seam deferred; subagent control via an
+  `inherit_to_subagents` package-manifest flag (default true). Extends
+  [chat-conversations.md](chat-conversations.md) and
+  [coding-agent-observability.md](coding-agent-observability.md); the
+  reach-the-user policy is split to
+  [../journeys/reaching-the-user.md](../journeys/reaching-the-user.md). Backed by
+  [../actors.md](../actors.md), [../identity.md](../identity.md), and
+  [../journeys/07-chatting.md](../journeys/07-chatting.md).
 - [agent-comms-ui.md](agent-comms-ui.md) - **done** (M1–M6): the **human's seat** for
   the three just-shipped agent-facing capabilities — they are CLI + per-turn injection
   only, so a human can't *see* the cross-agent traffic. Comms-first: M1 a `code mail
@@ -182,3 +198,11 @@ statuses: planned | in-progress | verifying | done
   [coding-agent-observability.md](coding-agent-observability.md) and
   [chat-conversations.md](chat-conversations.md). Backed by
   [../journeys/11-profiles.md](../journeys/11-profiles.md).
+- [web-packaging.md](web-packaging.md) - **in-progress** (M1–M3 shipped, M4
+  deferred): make `cargo install elanus` serve the web UI with **no Node.js, no
+  npm, and no source tree at runtime** — fold `server.mjs` into a Rust `src/web.rs`
+  (`ntex::web` + a `rumqttc` SSE relay + direct `elanus.db` reads; no new heavy
+  deps) and embed the built SPA in the crate so `cargo publish` ships it.
+  `server.mjs`/`config.mjs` kept as fallback during soak; admin shell-outs retire
+  to in-process calls in M4. Answers the "Rust + web packaging" item in
+  [../_questions.md](../_questions.md).

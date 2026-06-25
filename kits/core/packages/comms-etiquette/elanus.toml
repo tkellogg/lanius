@@ -1,0 +1,21 @@
+# comms-etiquette — the comms/send_message package
+# (docs/handoffs/chat-rendering.md). It carries the etiquette skill for how an
+# agent talks to the human (send_message vs ask_human) and to other agents.
+#
+# inherit_to_subagents = false (M3): this package does NOT flow down to a
+# subagent that resolves the literal "$parent" in its elanus_path. A worker
+# subagent is valued for its trace, not for a curated conversation — it should
+# not inherit the send_message comms surface just because it pulled the parent
+# scope with "$parent". A child that wants it lists this package (or its kit)
+# explicitly in its own elanus_path. This is VISIBILITY only — it touches no
+# authority/grant (the ⊆ machinery is unaffected).
+inherit_to_subagents = false
+
+# provides_builtin_tools (M3): this package OWNS the comms built-in tools. Their
+# definitions live in the kernel (exec::tool_defs), but their availability is
+# gated on this package being visible to the agent's profile. Excluding the
+# package (the inherit_to_subagents=false case above, for a worker subagent)
+# therefore withholds the tools themselves — not just the etiquette skill text.
+# A child that genuinely needs to speak lists this package in its own
+# elanus_path, which restores both the tools and the guidance together.
+provides_builtin_tools = ["send_message", "ask_human"]

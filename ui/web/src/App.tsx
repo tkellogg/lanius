@@ -565,7 +565,13 @@ export function App() {
     localStorage.setItem(conversationStorageKey(agent), session);
   };
   const loadConversations = async (agent: string) => {
-    if (!agent || isWorkerAgentName(agent)) return;
+    if (!agent) return;
+    // M2 (chat-rendering): even a worker-named agent gets a real (empty) resolved
+    // state so the converse view's comms-plane-vs-trace decision is driven by the
+    // ledger read, not by the name heuristic. The /api/conversations projection
+    // already drops worker sessions (is_worker_session), so this returns [] for a
+    // pure worker — exactly the "no comms-plane traffic" signal we want, and the
+    // same answer any third-party UI gets from the same read.
     setConversations((prev) => new Map(prev).set(agent, { ...(prev.get(agent) ?? {}), status: 'loading', error: '' }));
     try {
       const r = await fetch(`/api/conversations?agent=${encodeURIComponent(agent)}`);
@@ -1195,6 +1201,8 @@ export function App() {
             selectAgent={selectAgent}
             openConversation={openConversation}
             newConversation={newConversation}
+            selectCodeSessions={selectCodeSessions}
+            isTraceAgent={sel.kind === 'agent' && (isWorkerAgentName(sel.agent) || [...(agents.get(sel.agent)?.sessions ?? [])].some((s) => isWorkerSessionId(s)))}
           />
           <SessionsView hidden={!(sel.kind === 'agent' && sel.tab === 'sessions')} state={sessionsState} agent={sel.agent} openTranscript={openTranscript} loadSessions={loadSessions} />
           <ConfigureView
@@ -1951,11 +1959,45 @@ function KitAddRow({ kit, cfgForm, cfgPackages, detail, loadKitDetail, installKi
   );
 }
 
-function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation }: any) {
+function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation, selectCodeSessions, isTraceAgent }: any) {
   const recent = conversations?.list ?? [];
   const active = recent.find((c: any) => c.session === current);
+  // M2 (chat-rendering): decide comms-plane-vs-trace purely from bus/ledger reads.
+  // Comms-plane traffic between the owner and this agent = the conversation list the
+  // ledger projection returns (/api/conversations reads in/agent + correlated
+  // in/human events) is non-empty, OR live comms-plane messages are already in the
+  // thread. The observation plane = the agent's obs trace, which surfaces as worker
+  // sessions (obs/agent/<noun>/code-*/…) in the agents map. Both signals are bus
+  // reads — no per-agent UI flag — so a third-party UI reproduces the same decision.
+  //   - comms-plane traffic exists → render the conversation (below);
+  //   - NO comms-plane traffic but an obs trace exists → the agent is a worker whose
+  //     value is its trace, not a reply → fall back to the runs surface;
+  //   - neither (a fresh chat agent the owner just created) → default to the chat
+  //     surface so the first message can be composed.
+  // `status === 'idle'/'loading'` before the first fetch is "still resolving": keep
+  // the chat surface so we never flash the trace fallback while comms history loads.
+  const resolved = conversations?.status === 'list' || conversations?.status === 'error';
+  const hasComms = recent.length > 0 || messages.length > 0;
+  const traceOnly = resolved && !hasComms && !!isTraceAgent;
+  if (traceOnly) {
+    return (
+      <div id="view-converse" className="view" data-mode="trace" hidden={hidden}>
+        <div id="conv-configure-hint" className="conv-configure-hint">
+          <AgentChip name={agent} size="md" />
+          <span>Tune {agent} anytime in configure.</span>
+          <button className="ghost" type="button" onClick={() => selectAgent(agent, 'configure')}>configure</button>
+        </div>
+        <div id="conv-trace-fallback" className="conv-trace-fallback">
+          <p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p>
+          <p>{agent} hasn’t sent any messages on the comms plane — its work shows up as a trace.</p>
+          <p className="dim-note">There’s no chat conversation here. Watch what it’s doing in the runs surface.</p>
+          <button id="conv-open-runs" className="ghost" type="button" onClick={() => selectCodeSessions && selectCodeSessions()}>open runs ⟶</button>
+        </div>
+      </div>
+    );
+  }
   return (
-    <div id="view-converse" className="view" hidden={hidden}>
+    <div id="view-converse" className="view" data-mode="comms" hidden={hidden}>
       <div id="conv-configure-hint" className="conv-configure-hint">
         <AgentChip name={agent} size="md" />
         <span>Tune {agent} anytime in configure.</span>

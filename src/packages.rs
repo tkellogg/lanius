@@ -69,7 +69,71 @@ pub fn discover(root: &Root) -> Result<Vec<Package>> {
 }
 
 pub fn discover_for_profile(root: &Root, profile_name: &str) -> Result<Vec<Package>> {
-    discover_from_paths(package_path_for_profile(root, profile_name))
+    // M3 (docs/handoffs/chat-rendering.md): a package whose manifest sets
+    // `inherit_to_subagents = false` is dropped from a child's visible set when
+    // it is reachable ONLY because the child resolved the literal "$parent".
+    // Packages the child reaches through its OWN (non-$parent) path entries are
+    // always kept, even if they carry the flag. This is visibility only.
+    let (own, _inherited) = profile::effective_elanus_path_split(root, profile_name)
+        .unwrap_or_else(|_| (vec!["packages".into()], Vec::new()));
+    let own_names: std::collections::BTreeSet<String> =
+        discover_from_paths(paths_from_entries(root, own))?
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+    let all = discover_from_paths(package_path_for_profile(root, profile_name))?;
+    Ok(all
+        .into_iter()
+        .filter(|p| {
+            // Keep unless: inherited-only AND manifest opted out of inheritance.
+            if own_names.contains(&p.name) {
+                return true;
+            }
+            match &p.manifest {
+                Some(lm) => lm.manifest.inherit_to_subagents,
+                // No/broken manifest can't opt out; default is inherit.
+                None => true,
+            }
+        })
+        .collect())
+}
+
+/// Built-in agent tools to WITHHOLD from a profile's tool array (M3,
+/// docs/handoffs/chat-rendering.md). A built-in tool is "gated" when some
+/// package declares it in `provides_builtin_tools`; it is then available only
+/// when a package that provides it is VISIBLE to the profile. The returned set
+/// is the gated tools whose owning package(s) are all invisible to this
+/// profile, so excluding the package (e.g. a worker subagent under `$parent`
+/// dropping the comms package) actually removes the tool. Tools no package
+/// gates are never in this set (they stay always-available). Fail-open on a
+/// discovery error: better to leave a tool present than to silently strip it.
+pub fn withheld_builtin_tools(
+    root: &Root,
+    profile_name: &str,
+) -> std::collections::BTreeSet<String> {
+    let owned = |pkgs: &[Package]| -> std::collections::BTreeSet<String> {
+        pkgs.iter()
+            .filter_map(|p| p.manifest.as_ref())
+            .flat_map(|lm| lm.manifest.provides_builtin_tools.iter().cloned())
+            .collect()
+    };
+    // Universe = packages this profile would reach if the inherit_to_subagents
+    // exclusion were ignored (the full $parent-expanded path, pre-filter). A
+    // tool is "gated" only when such a reachable package owns it — so a tool
+    // whose package isn't installed for this profile at all is never withheld
+    // (it was simply never on offer; M1's default agent keeps send_message even
+    // in a root that didn't link the comms kit). Visible = the post-filter set.
+    let universe = match discover_from_paths(package_path_for_profile(root, profile_name)) {
+        Ok(p) => p,
+        Err(_) => return std::collections::BTreeSet::new(),
+    };
+    let visible = match discover_for_profile(root, profile_name) {
+        Ok(p) => p,
+        Err(_) => return std::collections::BTreeSet::new(),
+    };
+    let gated = owned(&universe);
+    let provided_visible = owned(&visible);
+    gated.difference(&provided_visible).cloned().collect()
 }
 
 fn discover_from_paths(paths: Vec<PathBuf>) -> Result<Vec<Package>> {
@@ -664,6 +728,171 @@ mod tests {
             .collect();
         assert!(names.contains(&"kp".to_string()));
         assert!(names.contains(&"base".to_string()));
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn inherit_to_subagents_false_excluded_under_parent() {
+        // M3 (docs/handoffs/chat-rendering.md): a subagent that resolves the
+        // literal "$parent" does NOT see a package marked
+        // inherit_to_subagents = false, but still sees default-inheriting ones;
+        // an unset flag behaves as before (inherited).
+        let root = scratch_root("inherit-sub");
+        // Parent (default) scope has two packages on its path:
+        //  - "comms"  : inherit_to_subagents = false (the send_message package)
+        //  - "memory" : unset → default true (inherits)
+        write_pkg(
+            &root,
+            "comms",
+            "inherit_to_subagents = false\n[request]\nsubscribe = [\"in/package/comms\"]\n",
+        );
+        write_pkg(
+            &root,
+            "memory",
+            "[request]\nsubscribe = [\"in/package/memory\"]\n",
+        );
+        let default_dir = root.dir.join("profiles/default");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        std::fs::write(
+            default_dir.join("profile.toml"),
+            "elanus_path = [\"packages\"]\n",
+        )
+        .unwrap();
+        // A worker subagent whose path is purely "$parent".
+        let child_dir = root.dir.join("profiles/worker");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(
+            child_dir.join("profile.toml"),
+            "elanus_path = [\"$parent\"]\n",
+        )
+        .unwrap();
+
+        let names: Vec<String> = discover_for_profile(&root, "worker")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(
+            !names.contains(&"comms".to_string()),
+            "inherit_to_subagents=false package must be excluded under $parent (got {names:?})"
+        );
+        assert!(
+            names.contains(&"memory".to_string()),
+            "default-inheriting package must still flow down under $parent (got {names:?})"
+        );
+
+        // The parent itself (no $parent inheritance into it) still sees comms:
+        // the flag only fires for an inheriting child.
+        let parent_names: Vec<String> = discover_for_profile(&root, "default")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(
+            parent_names.contains(&"comms".to_string()),
+            "the owning scope still sees its own package (got {parent_names:?})"
+        );
+
+        // A child that lists the package via its OWN entry (not $parent) keeps
+        // it — the exclusion is for inherited-only visibility.
+        let optin_dir = root.dir.join("profiles/optin");
+        std::fs::create_dir_all(&optin_dir).unwrap();
+        std::fs::write(
+            optin_dir.join("profile.toml"),
+            "elanus_path = [\"packages\"]\n",
+        )
+        .unwrap();
+        let optin_names: Vec<String> = discover_for_profile(&root, "optin")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(
+            optin_names.contains(&"comms".to_string()),
+            "a child reaching the package via its OWN path keeps it (got {optin_names:?})"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn withheld_builtin_tools_follows_package_visibility() {
+        // M3 (docs/handoffs/chat-rendering.md): a built-in tool a package OWNS
+        // via `provides_builtin_tools` is withheld from a profile that can't see
+        // that package. The owning scope keeps it; a $parent worker that drops
+        // the package (inherit_to_subagents=false) has it withheld; a child that
+        // lists the package on its OWN path keeps it.
+        let root = scratch_root("withheld-tools");
+        write_pkg(
+            &root,
+            "comms",
+            "inherit_to_subagents = false\n\
+             provides_builtin_tools = [\"send_message\", \"ask_human\"]\n\
+             [request]\nsubscribe = [\"in/package/comms\"]\n",
+        );
+        let default_dir = root.dir.join("profiles/default");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        std::fs::write(
+            default_dir.join("profile.toml"),
+            "elanus_path = [\"packages\"]\n",
+        )
+        .unwrap();
+        let worker_dir = root.dir.join("profiles/worker");
+        std::fs::create_dir_all(&worker_dir).unwrap();
+        std::fs::write(
+            worker_dir.join("profile.toml"),
+            "elanus_path = [\"$parent\"]\n",
+        )
+        .unwrap();
+        let optin_dir = root.dir.join("profiles/optin");
+        std::fs::create_dir_all(&optin_dir).unwrap();
+        std::fs::write(
+            optin_dir.join("profile.toml"),
+            "elanus_path = [\"packages\"]\n",
+        )
+        .unwrap();
+
+        // Owning scope: nothing withheld — it sees the comms package.
+        assert!(
+            withheld_builtin_tools(&root, "default").is_empty(),
+            "owning scope must keep its own comms tools"
+        );
+        // Worker under $parent: the package is invisible, so BOTH tools are
+        // withheld — the load-bearing M3 outcome (worker has no send_message).
+        let w = withheld_builtin_tools(&root, "worker");
+        assert!(
+            w.contains("send_message") && w.contains("ask_human"),
+            "worker dropping the comms package must have its tools withheld (got {w:?})"
+        );
+        // Opt-in child reaching the package via its OWN path: nothing withheld.
+        assert!(
+            withheld_builtin_tools(&root, "optin").is_empty(),
+            "a child reaching the comms package via its own path keeps the tools"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn withheld_builtin_tools_empty_when_no_package_gates_them() {
+        // M1-safety: if NO package on the profile's path owns a built-in tool,
+        // the tool is never withheld — a default agent in a root that never
+        // installed the comms kit still keeps send_message/ask_human.
+        let root = scratch_root("withheld-none");
+        write_pkg(
+            &root,
+            "memory",
+            "[request]\nsubscribe = [\"in/package/memory\"]\n",
+        );
+        let default_dir = root.dir.join("profiles/default");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        std::fs::write(
+            default_dir.join("profile.toml"),
+            "elanus_path = [\"packages\"]\n",
+        )
+        .unwrap();
+        assert!(
+            withheld_builtin_tools(&root, "default").is_empty(),
+            "no package gates the tools, so none may be withheld"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 

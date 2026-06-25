@@ -877,6 +877,154 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
+// ── flow 6b: chat-rendering M2 — comms-plane-vs-trace decision ────────────────
+// docs/handoffs/chat-rendering.md M2: the converse view decides what to show by
+// WHETHER comms-plane traffic exists between the owner and the agent (a read off
+// the ledger), not by any per-agent flag.
+//  - a comms-plane agent (it has in/agent prompts + correlated in/human replies)
+//    renders #view-converse[data-mode="comms"] with >=1 message in the feed;
+//  - a trace-only agent (a coding worker, no comms-plane traffic) renders
+//    #view-converse[data-mode="trace"] with NO chat feed, and is present in the
+//    runs surface (/api/code/sessions).
+// The decision is derivable purely from bus/ledger reads — the projection
+// (/api/conversations) returns rows for the comms agent and [] for the worker.
+{
+  const commsAgent = 'companion';
+  // The comms-plane agent: create its profile (so nav lists it), then seed a
+  // conversation on the comms plane — an in/agent prompt on a NON-worker (web-)
+  // session plus a correlated in/human reply. conversation_rows threads exactly
+  // this shape; the same read any third-party UI would make.
+  const seedPage = await newPage();
+  await seedPage.goto('/');
+  const created = await seedPage.evaluate(async (name) => {
+    const r = await fetch('/api/admin/agents', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return r.json().catch(() => ({}));
+  }, commsAgent);
+  created.ok ? ok(`chat-render: created comms agent ${commsAgent}`) : fail(`chat-render: could not create ${commsAgent} (${JSON.stringify(created)})`);
+  await seedPage.close();
+  const commsCorr = `chatrender-${Date.now().toString(36)}`;
+  try {
+    elanus('emit', `in/agent/${commsAgent}`, '--correlation', commsCorr, '--payload',
+      JSON.stringify({ prompt: 'hello companion', session: `web-${commsAgent}-seed` }));
+    elanus('emit', 'in/human/owner', '--correlation', commsCorr, '--payload',
+      JSON.stringify({ text: 'hi there — I am here when you need me', session: `web-${commsAgent}-seed` }));
+  } catch (e) { fail(`chat-render: seeding comms-plane traffic failed: ${e.message ?? e}`); }
+  // The trace-only agent: a coding worker. The flow-11 comms seed already wrote
+  // in/agent/claude-code/code-* events, but seed here too so this flow stands
+  // alone regardless of ordering. conversation_rows drops worker sessions, so
+  // /api/conversations?agent=claude-code returns []  →  trace fallback.
+  const traceAgent = 'claude-code';
+  try {
+    elanus('emit', `in/agent/${traceAgent}/code-chatrender01`, '--payload', JSON.stringify({ prompt: 'run the build' }));
+  } catch (e) { fail(`chat-render: seeding trace-only traffic failed: ${e.message ?? e}`); }
+
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+
+  // The comms-plane agent renders the conversation from the comms plane.
+  const commsConv = await page.evaluate(async (name) => {
+    const r = await fetch(`/api/conversations?agent=${encodeURIComponent(name)}`);
+    const j = await r.json().catch(() => ({}));
+    return { ok: !!j.ok, count: (j.conversations ?? []).length };
+  }, commsAgent);
+  commsConv.ok && commsConv.count > 0
+    ? ok(`chat-render: comms projection returns ${commsConv.count} conversation(s) for ${commsAgent}`)
+    : fail(`chat-render: comms projection empty for ${commsAgent} (${JSON.stringify(commsConv)})`);
+  await waitFor(`chat-render: ${commsAgent} in nav`, async () => {
+    const items = await page.$$('#nav-agents .nav-agent');
+    for (const item of items) {
+      if ((await item.getAttribute('data-sel')) === `agent:${commsAgent}`) { await item.click(); return true; }
+    }
+    return false;
+  }, 10000);
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  // The decision lands on the comms plane for this agent.
+  await waitFor('chat-render: comms agent renders the comms-plane chat surface', async () => {
+    const mode = await page.$eval('#view-converse', (el) => el.getAttribute('data-mode')).catch(() => null);
+    return mode === 'comms';
+  }, 10000);
+  // Open the seeded conversation; conversation_messages projects the raw in/agent
+  // prompt + correlated in/human reply (the comms plane) into the feed.
+  await waitFor('chat-render: seeded conversation listed in nav', async () => {
+    const rows = await page.$$('#nav-agents .nav-conversation');
+    if (rows.length) { await rows[0].click(); return true; }
+    return false;
+  }, 10000);
+  await waitFor('chat-render: comms agent shows a comms-plane conversation (>=1 message)', async () => {
+    const mode = await page.$eval('#view-converse', (el) => el.getAttribute('data-mode')).catch(() => null);
+    const msgs = await page.$$eval('.conv-feed .msg', (els) => els.length).catch(() => 0);
+    return mode === 'comms' && msgs >= 1;
+  }, 10000);
+
+  // The trace-only agent shows NO chat conversation; it falls back to the trace.
+  const traceConv = await page.evaluate(async (name) => {
+    const r = await fetch(`/api/conversations?agent=${encodeURIComponent(name)}`);
+    const j = await r.json().catch(() => ({}));
+    return { ok: !!j.ok, count: (j.conversations ?? []).length };
+  }, traceAgent);
+  traceConv.ok && traceConv.count === 0
+    ? ok(`chat-render: comms projection returns no conversations for trace-only ${traceAgent}`)
+    : fail(`chat-render: trace-only ${traceAgent} unexpectedly has conversations (${JSON.stringify(traceConv)})`);
+  // Reach the worker's converse view: it is evicted to the Workers drawer and
+  // lands on telemetry; click the converse tab to inspect the decision there.
+  const opened = await page.evaluate(async (name) => {
+    const drawer = document.querySelector('#nav-workers');
+    if (drawer && !drawer.open) drawer.open = true;
+    const btns = [...document.querySelectorAll('#nav-workers .nav-worker')];
+    const hit = btns.find((b) => (b.textContent || '').includes(name));
+    if (!hit) return false;
+    hit.click();
+    return true;
+  }, traceAgent);
+  if (opened) {
+    await page.waitForSelector('#agent-tabs', { state: 'visible' });
+    await page.click('[data-tab="converse"]');
+    await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+    await waitFor('chat-render: trace-only agent shows NO chat conversation (trace fallback)', async () => {
+      const mode = await page.$eval('#view-converse', (el) => el.getAttribute('data-mode')).catch(() => null);
+      const feed = await page.$('.conv-feed');
+      const runsLink = await page.$('#conv-open-runs');
+      return mode === 'trace' && !feed && !!runsLink;
+    }, 10000);
+    // The trace-only agent IS reachable in the runs/trace surface: it is listed in
+    // the Workers drawer (the UI's entry into the obs-trace surface). `opened`
+    // already located it there. The trace fallback's own "open runs" link routes to
+    // the runs view; click it to confirm the route.
+    ok(`chat-render: trace-only ${traceAgent} is present in the runs/trace surface (Workers drawer)`);
+    // Guard: a missing/late #conv-open-runs must not throw an uncaught TimeoutError
+    // that aborts the whole suite — degrade to a recorded failure for this assertion.
+    const runsLink = await page.$('#conv-open-runs');
+    if (runsLink) {
+      await runsLink.click();
+      await waitFor('chat-render: trace fallback links into the runs surface', async () =>
+        page.$eval('[data-sel="code-sessions"]', (el) => el.classList.contains('on')).catch(() => false), 5000);
+    } else {
+      fail('chat-render: trace fallback #conv-open-runs link missing (cannot route into runs surface)');
+    }
+    // The obs-driven code projection (/api/code/sessions) is populated by flight-
+    // recorder telemetry the spec stack does not stand up (same limitation flow 11
+    // documents); when present it should list the worker, else tolerate its absence.
+    const inRuns = await page.evaluate(async (name) => {
+      const r = await fetch('/api/code/sessions');
+      if (!r.ok) return null;
+      const j = await r.json().catch(() => null);
+      const rows = Array.isArray(j) ? j : (j?.sessions ?? j?.rows ?? []);
+      if (!Array.isArray(rows)) return null;
+      return rows.length === 0 ? null : rows.some((s) => JSON.stringify(s).includes(name));
+    }, traceAgent);
+    inRuns === false
+      ? fail(`chat-render: code projection has runs but not trace-only ${traceAgent}`)
+      : ok(`chat-render: code projection ${inRuns === true ? `lists ${traceAgent}` : 'has no projected runs in this stack — tolerated'}`);
+  } else {
+    fail(`chat-render: could not reach the trace-only agent ${traceAgent} in the Workers drawer`);
+  }
+  await page.close();
+}
+
 // ── flow 7: history works out of the box ──────────────────────────────────────
 // history is stdlib, on at init, so the sessions tab is backed
 // by the real transcript view — NOT the unavailable-transcripts note —

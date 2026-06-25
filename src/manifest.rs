@@ -14,7 +14,7 @@ use std::path::Path;
 /// subscribe = ["#"] and exfiltrate every session. Approval appends to the
 /// grants ledger pinned to the manifest hash; an edited manifest re-enters
 /// pending for the delta (browser-extension re-prompt semantics).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     #[serde(default)]
@@ -34,6 +34,46 @@ pub struct Manifest {
     pub throttle: BTreeMap<String, ThrottleDecl>,
     #[serde(default)]
     pub config: ConfigDecl,
+    /// Whether this package flows down to a subagent that resolves the literal
+    /// `"$parent"` in its `elanus_path` (docs/handoffs/chat-rendering.md M3).
+    /// Default `true`: packages inherit as before. Set `false` to keep a package
+    /// (e.g. the comms/`send_message` package) out of a worker subagent's visible
+    /// set even under `$parent`. This is VISIBILITY only — it does not touch the
+    /// authority/grant (⊆) machinery.
+    #[serde(default = "default_inherit_to_subagents")]
+    pub inherit_to_subagents: bool,
+    /// Built-in agent tools this package "owns": they are present in an agent's
+    /// tool array ONLY when this package is visible to that agent's profile
+    /// (docs/handoffs/chat-rendering.md M3). The tool *definitions* live in the
+    /// kernel (`exec::tool_defs`), but their AVAILABILITY is gated on package
+    /// visibility, so excluding the package (e.g. via `inherit_to_subagents =
+    /// false` for a worker subagent) actually withholds the tool — not merely
+    /// the package's etiquette skill text. A built-in tool named by NO package
+    /// is ungated (always available). Empty (the default) gates nothing.
+    #[serde(default)]
+    pub provides_builtin_tools: Vec<String>,
+}
+
+fn default_inherit_to_subagents() -> bool {
+    true
+}
+
+impl Default for Manifest {
+    fn default() -> Self {
+        Manifest {
+            request: Request::default(),
+            process: None,
+            hook: Vec::new(),
+            cron: Vec::new(),
+            provider: Vec::new(),
+            stage: Vec::new(),
+            mcp: Vec::new(),
+            throttle: BTreeMap::new(),
+            config: ConfigDecl::default(),
+            inherit_to_subagents: default_inherit_to_subagents(),
+            provides_builtin_tools: Vec::new(),
+        }
+    }
 }
 
 /// A package's stance on its own configuration (docs/config.md D4). `agent_tunable`

@@ -465,6 +465,54 @@ pub fn effective_elanus_path(root: &Root, name: &str) -> Result<Vec<String>> {
     inner(root, name, &mut Vec::new())
 }
 
+/// Split an agent's effective path into the portion the profile owns directly
+/// and the portion pulled in by resolving the literal `"$parent"`
+/// (docs/handoffs/chat-rendering.md M3). `own` = the child's own non-`$parent`
+/// entries (always fully expanded for any nested `$parent` they don't write —
+/// i.e. exactly the entries written in THIS profile minus `$parent`).
+/// `inherited` = what `$parent` expands to here, or empty when the profile does
+/// not use `$parent`. The `inherit_to_subagents = false` rule excludes a package
+/// that is visible to the child ONLY via the inherited portion; packages the
+/// child reaches through its own entries are untouched. A profile with no local
+/// `elanus_path` (pure inheritance, no explicit `$parent`) is treated as having
+/// written `["$parent"]`: the whole path is inherited.
+pub fn effective_elanus_path_split(
+    root: &Root,
+    name: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    // The parent scope this profile inherits from.
+    let f = root.profile_dir(name).join("profile.toml");
+    let raw = std::fs::read_to_string(&f).unwrap_or_default();
+    let value: toml::Value = raw
+        .parse()
+        .unwrap_or_else(|_| toml::Value::Table(Default::default()));
+    let parent_name = value
+        .get("parent")
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.is_empty());
+    let parent_path = if name == "default" {
+        default_elanus_path()
+    } else {
+        effective_elanus_path(root, parent_name.unwrap_or("default"))?
+    };
+
+    let local = local_elanus_path(root, name)?;
+    let Some(local) = local else {
+        // Pure inheritance == ["$parent"]: everything is inherited.
+        return Ok((Vec::new(), parent_path));
+    };
+    let mut own = Vec::new();
+    let mut inherited = Vec::new();
+    for entry in local {
+        if entry == PARENT_PATH {
+            inherited.extend(parent_path.clone());
+        } else {
+            own.push(entry);
+        }
+    }
+    Ok((own, inherited))
+}
+
 /// Mailbox topics derived from the "default" profile, cached per process.
 /// Ledger plumbing (dispatcher tick, CLI inbox/answer) needs the v3 nouns
 /// without threading a Profile through every call; a process serves one root,
