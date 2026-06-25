@@ -331,9 +331,10 @@ body {
 }
 .compose-sigil { color: var(--dim); }
 .compose input {
-  flex: 1; background: transparent; border: 0; outline: 0;
+  flex: 1; background: transparent; border: 0;
   color: var(--ink); font: 13.5px var(--mono); caret-color: var(--agent);
 }
+.compose input:focus:not(:focus-visible) { outline: 0; }
 .compose input::placeholder { color: var(--meta); }
 .compose button {
   font: 11px var(--mono); letter-spacing: 0.18em; text-transform: uppercase;
@@ -652,7 +653,9 @@ details.setup-fold > summary .dim-note { padding: 0; flex: 1; min-width: 0; over
 .cfg-grid input,
 .cfg-grid select { background: rgba(0,0,0,0.25); color: inherit; font: inherit; font-size: 13px; border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-sharp); padding: 7px 9px; }
 .cfg-grid input:focus,
-.cfg-grid select:focus { outline: none; border-color: rgba(255,255,255,0.35); }
+.cfg-grid select:focus { border-color: rgba(255,255,255,0.35); }
+.cfg-grid input:focus:not(:focus-visible),
+.cfg-grid select:focus:not(:focus-visible) { outline: none; }
 .cfg-cost-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
@@ -884,7 +887,9 @@ details[open] > summary .cfg-disclosure { transform: rotate(90deg); color: var(-
   border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-sharp); padding: 7px 9px;
 }
 .cfg-config-row input:focus,
-.cfg-config-row select:focus { outline: none; border-color: rgba(255,255,255,0.35); }
+.cfg-config-row select:focus { border-color: rgba(255,255,255,0.35); }
+.cfg-config-row input:focus:not(:focus-visible),
+.cfg-config-row select:focus:not(:focus-visible) { outline: none; }
 .cfg-config-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
 .cfg-effective { color: var(--dim); font-size: 11px; line-height: 1.3; min-width: 0; overflow-wrap: anywhere; }
 .cfg-context-head {

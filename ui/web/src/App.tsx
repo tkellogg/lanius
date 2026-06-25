@@ -68,6 +68,7 @@ const summarize = (p: unknown, max = 110) => {
   const s = typeof p === 'string' ? p : JSON.stringify(p);
   return s.length > max ? s.slice(0, max - 1) + '…' : s;
 };
+const conversationLabel = (s: any) => s?.title || s?.preview || 'conversation';
 const agentOf = (topic: string) => topic.match(/^(?:in|obs)\/agent\/([^/]+)/)?.[1] ?? null;
 const uid = () => Math.random().toString(36).slice(2);
 const newWebConversationId = (agent: string) => `web-${agent}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -1107,7 +1108,7 @@ export function App() {
     void loadConversations(agent);
     btn.textContent = ok ? 'accepted ✓' : 'failed ✕';
     btn.classList.toggle('sent', ok);
-    setTimeout(() => { btn.textContent = 'Send'; btn.classList.remove('sent'); }, 1400);
+    setTimeout(() => { btn.textContent = L.send; btn.classList.remove('sent'); }, 1400);
   };
 
   const loadSessions = async (agent: string) => {
@@ -1121,8 +1122,8 @@ export function App() {
     setSessionsState({ status: 'list', sessions: j.sessions ?? [], transcript: null, error: '' });
   };
 
-  const openTranscript = async (agent: string, session: string, beforeId?: number, prepend = false) => {
-    if (!prepend) setSessionsState({ status: 'transcript-loading', sessions: [], transcript: { session, messages: [], has_more: false }, error: '' });
+  const openTranscript = async (agent: string, session: string, beforeId?: number, prepend = false, label = 'conversation') => {
+    if (!prepend) setSessionsState({ status: 'transcript-loading', sessions: [], transcript: { session, title: label, messages: [], has_more: false }, error: '' });
     const params: any = { kind: 'transcript', session };
     if (beforeId != null) params.before_id = beforeId;
     const j = await history(params);
@@ -1136,6 +1137,7 @@ export function App() {
       transcript: {
         agent,
         session,
+        title: prev.transcript?.title || label,
         messages: prepend ? [...(j.messages ?? []), ...(prev.transcript?.messages ?? [])] : (j.messages ?? []),
         has_more: j.has_more,
       },
@@ -1203,6 +1205,7 @@ export function App() {
             newConversation={newConversation}
             selectCodeSessions={selectCodeSessions}
             isTraceAgent={sel.kind === 'agent' && (isWorkerAgentName(sel.agent) || [...(agents.get(sel.agent)?.sessions ?? [])].some((s) => isWorkerSessionId(s)))}
+            sendLabel={L.send}
           />
           <SessionsView hidden={!(sel.kind === 'agent' && sel.tab === 'sessions')} state={sessionsState} agent={sel.agent} openTranscript={openTranscript} loadSessions={loadSessions} />
           <ConfigureView
@@ -1959,7 +1962,7 @@ function KitAddRow({ kit, cfgForm, cfgPackages, detail, loadKitDetail, installKi
   );
 }
 
-function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation, selectCodeSessions, isTraceAgent }: any) {
+function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation, selectCodeSessions, isTraceAgent, sendLabel }: any) {
   const recent = conversations?.list ?? [];
   const active = recent.find((c: any) => c.session === current);
   // M2 (chat-rendering): decide comms-plane-vs-trace purely from bus/ledger reads.
@@ -2027,7 +2030,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
           {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `correlation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : m.text}</div></div>)}
         </div>
       </div>
-      <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><button type="submit" id="compose-send">Send</button></form>
+      <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><button type="submit" id="compose-send">{sendLabel}</button></form>
     </div>
   );
 }
@@ -2067,7 +2070,7 @@ function SessionsView({ hidden, state, agent, openTranscript, loadSessions }: an
       <div id="sessions-pane" className="sessions-pane">
         {state.status === 'loading' && <div className="dim-note">asking the history view…</div>}
         {state.status === 'error' && <div className="dim-note"><div>transcripts unavailable — live view only.</div>{state.error && <div className="dim-sub">{state.error}</div>}</div>}
-        {state.status === 'list' && (!state.sessions.length ? <div className="dim-note">no recorded sessions for this agent yet.</div> : <div className="sess-list"><div className="sess-row sess-head">{['session', 'first', 'last', 'msgs', 'events'].map((h) => <span key={h}>{h}</span>)}</div>{state.sessions.map((s: any) => <button key={s.session} className="sess-row" onClick={() => openTranscript(agent, s.session)}><span className="sess-id">{s.session}</span><span>{shortTs(s.first_ts)}</span><span>{shortTs(s.last_ts)}</span><span>{String(s.message_count)}</span><span>{String(s.event_count)}</span></button>)}</div>)}
+        {state.status === 'list' && (!state.sessions.length ? <div className="dim-note">no conversations recorded yet.</div> : <div className="sess-list"><div className="sess-row sess-head">{['conversation', 'first', 'last', 'msgs', 'events'].map((h) => <span key={h}>{h}</span>)}</div>{state.sessions.map((s: any) => <button key={s.session} className="sess-row" title={s.session} onClick={() => openTranscript(agent, s.session, undefined, false, conversationLabel(s))}><span className="sess-id">{conversationLabel(s)}</span><span>{shortTs(s.first_ts)}</span><span>{shortTs(s.last_ts)}</span><span>{String(s.message_count)}</span><span>{String(s.event_count)}</span></button>)}</div>)}
         {(state.status === 'transcript-loading' || state.status === 'transcript') && <Transcript agent={agent} state={state} openTranscript={openTranscript} loadSessions={loadSessions} />}
       </div>
     </div>
@@ -2076,10 +2079,11 @@ function SessionsView({ hidden, state, agent, openTranscript, loadSessions }: an
 
 function Transcript({ agent, state, openTranscript, loadSessions }: any) {
   const tr = state.transcript;
-  if (state.status === 'transcript-loading') return <div className="dim-note">reading transcript {tr?.session}…</div>;
+  const label = conversationLabel(tr);
+  if (state.status === 'transcript-loading') return <div className="dim-note" title={tr?.session}>reading conversation…</div>;
   return (
     <>
-      <div className="tr-bar"><button className="tr-back" onClick={() => loadSessions(agent)}>← sessions</button><span className="tr-title">{tr.session}</span></div>
+      <div className="tr-bar"><button className="tr-back" onClick={() => loadSessions(agent)}>← history</button><span className="tr-title" title={tr.session}>{label}</span></div>
       <div className="tr-feed">{tr.has_more && <button className="tr-earlier" onClick={() => openTranscript(agent, tr.session, tr.messages?.[0]?.id, true)}>… load earlier</button>}{!tr.messages.length && <div className="dim-note">empty transcript.</div>}{tr.messages.map((m: any) => <TranscriptMsg key={m.id ?? `${m.role}-${m.created_at}`} m={m} />)}</div>
     </>
   );

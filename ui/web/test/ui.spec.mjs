@@ -1185,6 +1185,34 @@ const renamedAgent = 'falcon';
   feedAttrs.role === 'log' && feedAttrs.live === 'polite'
     ? ok('a11y: conversation feed is a polite live region')
     : fail(`a11y: conversation feed attrs wrong: ${JSON.stringify(feedAttrs)}`);
+  const outlineAfterKeyboardFocus = async (selector) => {
+    await page.keyboard.press('Tab');
+    return await page.$eval(selector, (el) => {
+      el.focus();
+      const o = getComputedStyle(el);
+      return {
+        width: o.outlineWidth,
+        style: o.outlineStyle,
+        visible: o.outlineStyle !== 'none' && parseFloat(o.outlineWidth) > 0,
+      };
+    });
+  };
+  await page.click('[data-tab="configure"]');
+  await page.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
+  await waitForConfigureLoaded(page);
+  await waitFor('a11y: configure model control enabled', async () => {
+    return await page.$eval('#cfg-model', (el) => !el.disabled).catch(() => false);
+  }, 8000);
+  const cfgOutline = await outlineAfterKeyboardFocus('#cfg-model');
+  cfgOutline.visible
+    ? ok(`a11y: configure input keeps keyboard focus outline (${cfgOutline.width} ${cfgOutline.style})`)
+    : fail(`a11y: configure input stripped keyboard focus outline (${JSON.stringify(cfgOutline)})`);
+  await page.click('[data-tab="converse"]');
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  const composeOutline = await outlineAfterKeyboardFocus('#compose-input');
+  composeOutline.visible
+    ? ok(`a11y: compose input keeps keyboard focus outline (${composeOutline.width} ${composeOutline.style})`)
+    : fail(`a11y: compose input stripped keyboard focus outline (${JSON.stringify(composeOutline)})`);
   // The high-volume telemetry feed stays out of the live region.
   await page.click('[data-tab="telemetry"]');
   await page.waitForSelector('#view-rail:not([hidden])', { timeout: 5000 });
@@ -1233,6 +1261,31 @@ const renamedAgent = 'falcon';
   // The compose button says "Send", not "transmit".
   const sendLabel = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
   /^send$/i.test(sendLabel) ? ok('language: compose button is "Send"') : fail(`language: compose button is "${sendLabel}"`);
+  await page.click('#theme-toggle');
+  await waitFor('language: cockpit mode changes compose button to "transmit"', async () => {
+    const label = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
+    return /^transmit$/i.test(label);
+  });
+  await page.click('#theme-toggle');
+  await waitFor('language: warm mode restores compose button to "Send"', async () => {
+    const label = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
+    return /^send$/i.test(label);
+  });
+  await page.click('[data-tab="sessions"]');
+  await page.waitForSelector('#view-sessions:not([hidden])', { timeout: 5000 });
+  await waitFor('language: history view resolved', async () => {
+    const t = await page.$eval('#sessions-pane', (el) => el.textContent);
+    return !/asking the history view/i.test(t);
+  }, 12000);
+  const historyHeaders = await page.$$eval('.sess-head span', (els) => els.map((el) => el.textContent.trim())).catch(() => []);
+  const sessionHeaderGone = !historyHeaders.some((h) => /^session$/i.test(h));
+  sessionHeaderGone
+    ? ok(`language: history column header avoids "session" (${historyHeaders.join('|') || 'no rows'})`)
+    : fail(`language: history column header still says "session" (${historyHeaders.join('|')})`);
+  const visibleHistoryIds = await page.$$eval('.sess-row:not(.sess-head) .sess-id', (els) => els.map((el) => el.textContent.trim()).filter((t) => /^(web|code)-/.test(t))).catch(() => []);
+  visibleHistoryIds.length === 0
+    ? ok('language: history rows do not show raw web-/code- ids')
+    : fail(`language: history rows show raw ids: ${visibleHistoryIds.join(', ')}`);
   await page.close();
 }
 

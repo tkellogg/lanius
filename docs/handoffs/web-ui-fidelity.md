@@ -365,8 +365,41 @@ flow 2).
     "CONNECTED" intact, tab strip wraps, cards `min-width:0`, compose reachable);
     M3 closed-set model value renders; M5 product language + per-agent identity
     chips (distinct colors) present; M6 amber reserved for voices, orange for
-    signals. A GLM-5.2 cross-model code-read review ran in parallel as a second
-    opinion. Status → **done**.
+    signals.
+  - **GLM-5.2 cross-model code-read review caught two real HIGH acceptance
+    violations the automated suite + visual QA structurally missed** (a different
+    model's eyes — cf. codex on chat-rendering):
+    1. **M4 (HIGH):** the global `:focus-visible` ring (specificity 0,1,0) is
+       overridden by higher-specificity `.cfg-grid input:focus{outline:none}` /
+       `.cfg-config-row input:focus` (0,2,1) and `.compose input{outline:0}`, so
+       configure-form inputs and the compose box show NO keyboard-focus ring. The
+       Log's "source order wins" was a specificity error. Flow 9 missed it (only
+       tabs to nav buttons).
+    2. **M5 (HIGH):** SessionsView/history still renders the kernel word
+       "session" as a column header, raw session ids as a visible column, and
+       "← sessions"/"no recorded sessions" copy — the tab label was renamed but
+       the view content was not swept; flow 10 only checked the label.
+    3. **M5 (medium):** the cockpit toggle never restores "transmit" on the
+       compose button (hardcoded "Send"; `LABELS.cockpit.send` unused).
+    Two LOWs accepted/deferred (no emoji/color wizard field; decorative empty-mark
+    glyph contrast — shape bullets, not acceptance). Status → **verifying
+    (reopened)** to fix the HIGHs + medium and harden flows 9/10.
+  - **2026-06-25 — HIGHs + medium fixed and verified (GPT-5.5 impl → uncaged
+    re-verify).** M4: the per-control `outline:none`/`outline:0` on `.cfg-grid`/
+    `.cfg-config-row` inputs and `.compose input` now apply only to
+    `:focus:not(:focus-visible)`, so keyboard focus keeps the global ring (mouse
+    focus still ringless). M5: SessionsView/history header is "conversation" (not
+    "session"), the visible cell shows a friendly label with the raw id only in a
+    `title=`, empty/back/transcript copy de-kerneled; the compose button renders
+    the active `L.send` so the cockpit toggle restores "transmit". Flows 9/10
+    hardened: flow 9 asserts the computed keyboard-focus outline on `#cfg-model`
+    and `#compose-input` (`2px solid`, would fail if stripped); flow 10 asserts
+    the toggle flips Send↔transmit and that history shows no "session" header /
+    no raw `web-`/`code-` ids. Full `ui.spec.mjs` ALL PASS against the Rust server
+    with real chromium (the new assertions green). NOTE: an unrelated **flaky**
+    comms-flow timing race (seeded mail not projected by the 200ms daemon before
+    the assertion) failed once then passed on re-run — pre-existing, not from this
+    work; worth a `waitFor` hardening in flow 11 later. Status → **done**.
 
 - (M1) Measured ratios for the changed tokens, in rest and active states
   (computed against `--bg #0f100e`, `--panel #161814`, active-row `#1b1d18`):
