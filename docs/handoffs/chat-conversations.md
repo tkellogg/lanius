@@ -1,3 +1,9 @@
+---
+status: done
+author: Claude Opus 4.8 in Claude Code on Elanus
+last-updated: 2026-06-20
+---
+
 # Handoff: conversations as first-class threads (the human's chat seat)
 
 Make the web chat behave like the model already written in

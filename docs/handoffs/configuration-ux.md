@@ -1,3 +1,9 @@
+---
+status: done
+author: Claude Opus 4.8 in Claude Code on Elanus
+last-updated: 2026-06-20
+---
+
 # Handoff: configuration UX — altitude and scope
 
 Status: M1-M4 implemented and verified. Intended implementer: Codex.

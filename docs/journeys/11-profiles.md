@@ -48,6 +48,12 @@ value, it evolves over time. So, e.g., the prompting telling the agent how to co
 that would be default prompting that goes into a memory block and the agent is encouraged to add to it to 
 customize to it's own environment.
 
+Ideally memory blocks would feel like they're built-in, so that other arbitrary profiles can include them easily.
+Also, the context program pipeline should probably represent them in the data model, like just key-value pairs,
+then the harness has block->text rendering built in. So a computed memory block is a pretty vanilla context program
+that adds a block. Then a later context program simply sees memory blocks, with no distinction between computed and
+not.
+
 ## Profiles
 Yeah, so back to this, we need one really great way that elanus is better than stock claude code, or codex.
 Technical awe may last a week or two, but ultimately it has to *actually* be better.

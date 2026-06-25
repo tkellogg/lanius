@@ -1,3 +1,9 @@
+---
+status: done
+author: Claude Opus 4.8 in Claude Code on Elanus
+last-updated: 2026-06-22
+---
+
 # Handoff: coding-agent support (Codex & Claude Code)
 
 Status: **M0+M1 landed for BOTH adapters; M2-A (durable resumable sessions + the

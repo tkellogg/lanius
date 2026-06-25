@@ -1,3 +1,9 @@
+---
+status: done
+author: Claude Opus 4.8 in Claude Code on Elanus
+last-updated: 2026-06-22
+---
+
 # Handoff: reliable worker dispatch from inside a coding session
 
 A work plan to close the seam between a coding session and elanus's

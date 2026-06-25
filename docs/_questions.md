@@ -3,28 +3,45 @@ name: Questions
 description: This is stuff from Tim. All sessions are busy, things I want to chase down but can't do it now
 ---
 
-Detecting files read — we said we couldn't detect when files are read in order to send MQTT events. But what if
-we configured the sandbox to disallow all files, fail, then immedietely change the settings to allow, then try again,
-so it's transparent to the agent, but we catch the first access so we can send an MQTT event (and still reference
-when it's used). If you just do it on first access it feels like it might not be too slow. Not sure if you can
-actually do this though, i'm not sure we're actually in the path to catching these OS errors.
-
-
-Rust + web packaging — I think the current `cargo install --path .` ends up using web files from ~/code/elanus, 
-which won't work for anyone who hasn't cloned. Really, we need this to work with `cargo install elanus` (i'll
-probably change the name btw). IIRC the UI can probably be served by only a Rust backend, no node.js which would
-be ideal, to keep dependencies light.
-
-
-If I run `elanus code claude --resume`, it seems to pass on arbitrary args (wonderful!) but does it register the 
-session properly? Since we're resuming an old one... really curious if this works properly.
-
-
-I think the agents are bumping into each other. I have to keep explaining to them who else is there. But the whole
-purpose for Elanus is so they just know and self-navigate and negotiate. I'm thinking that claude/codex agents need
-to have memory blocks injected by default that let them know what else is going on. Like which agent, what the 
-agent is trying to do, etc. I'm imagining this just happens by default. I'm not sure why any agent needs to have
-this turned off, just feels like a basic functionality of elanus that most agents all get injected.
-
-
 How does it work when we have a list of 5 kits and 10 skills and we wire it into claude code? codex? ...
+
+
+In UI have the screen automatically follow the latest message by default, i.e. scroll to the bottom unless the
+user intentionally scrolls away. Like a normal chat app.
+
+
+Routing — in the web UI everything really should have it's own route, so that forward-back buttons work as you'd
+expect. Right now it's all one giant app, lol.
+
+
+model config error: "provider list unavailable — type a model id or set an API key". I should just have a link to
+click to get me to where model providers are setup.
+
+
+I'd really like to be able to set a model provider on a subagent. Like this could get crazy. Use Claude Code using 
+the Claude.AI login, and have that launch a subagent that uses DeepSeek's ANTHROPIC_URL and API key via environment
+variables. That should 100% be possible, it's just annoying af rn.
+
+
+Claude Code session ID 6b197197-21ef-4f2f-a502-83405bdeb580 said that it saw a bunch of changes that another 
+agent did. But I wasn't running another agent. I'm pretty convinced it was it's own subagent or some shit. We
+should brainstorm how to detect file changes, and then what kinds of memory blocks and skills we would tack
+on to the agent in order to make it more aware of what other agents are doing. Also, give it confidence to 
+reach out to the other agent (if possible) to see what it was doing. Alternatively, if it was a coding agent,
+we could launch off a regular elanus agent (or another coding agent) to read the old session file, figure out
+what it was doing with particular files, and explain; it wouldn't be able to change course, but it could at least
+explain the intent.
+
+
+UI nitpicks:
+- Advanced bar should highlight on mouseover, some indication that the whole thing is one button, not separate
+    buttons for each. (configure pane)
+- context steps: I think this needs to be a more visual view, like blocks. Being a visual view, prefer drag-n-drop
+    over up/down arrows. Have it be a very visual walk through of what things are. Then with the "new" part, have
+    it be a single button, just "New" or "+" that opens up a modal wizard. The wizard takes an existing configured 
+    LLM and layers on it's own set of packages for modifying the context. Probably a profile that's system 
+    configured and hidden by default. Dramatically scoped down permissions to just doing that one thing. Also, if
+    existing packages have context programs, offer those as options to enable, as an alternative to the agent.
+
+
+
