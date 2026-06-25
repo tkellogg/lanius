@@ -1409,21 +1409,34 @@ mod tests {
     fn session_actor_is_scoped_by_the_broker_acl() {
         let root = tmp_root();
         // Mint a real scoped session token (the launcher's path).
-        crate::codesession::mint(&root, "code-deadbeef", "claude-code", 999_999, None, None).unwrap();
+        crate::codesession::mint(
+            &root,
+            "code-deadbeef",
+            "claude-code",
+            999_999,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let b = Broker::new(root);
         let actor = "code-deadbeef";
 
         // PUBLISH: its own obs subtree is allowed …
         assert!(b.actor_may_publish(actor, "obs/agent/claude-code/code-deadbeef/session/start"));
-        assert!(b.actor_may_publish(actor, "obs/agent/claude-code/code-deadbeef/tool/Bash/result"));
+        assert!(b.actor_may_publish(
+            actor,
+            "obs/agent/claude-code/code-deadbeef/tool/Bash/result"
+        ));
         // … and the exact attacks the verifier proved must now FAIL:
         assert!(!b.actor_may_publish(actor, "in/human/owner")); // human mailbox
         assert!(!b.actor_may_publish(actor, "work/agent/exec")); // work plane
         assert!(!b.actor_may_publish(actor, "in/agent/kestrel/c1")); // another agent's mailbox
         assert!(!b.actor_may_publish(actor, "obs/agent/claude-code/code-other/x")); // another session
         assert!(!b.actor_may_publish(actor, "signal/anything")); // signals
-        // The status floor that real package actors get is NOT extended to a
-        // session actor — it has no package status subtree to own.
+                                                                 // The status floor that real package actors get is NOT extended to a
+                                                                 // session actor — it has no package status subtree to own.
         assert!(!b.actor_may_publish(actor, "obs/package/code-deadbeef/status"));
 
         // SUBSCRIBE: nothing — not even its own obs (it emits, it doesn't read).
@@ -1511,12 +1524,24 @@ mod tests {
     #[test]
     fn read_flavor_subscribe_fast_fails_only_when_off_and_unavailable() {
         let off = ReadCameraStatus {
-            advisory: TierStatus { available: true, enabled: false },
-            authoritative: TierStatus { available: false, enabled: false },
+            advisory: TierStatus {
+                available: true,
+                enabled: false,
+            },
+            authoritative: TierStatus {
+                available: false,
+                enabled: false,
+            },
         };
         let on = ReadCameraStatus {
-            advisory: TierStatus { available: true, enabled: true },
-            authoritative: TierStatus { available: false, enabled: false },
+            advisory: TierStatus {
+                available: true,
+                enabled: true,
+            },
+            authoritative: TierStatus {
+                available: false,
+                enabled: false,
+            },
         };
 
         // Read-flavor obs/fs subscribe, camera OFF + authoritative unavailable: FAIL.

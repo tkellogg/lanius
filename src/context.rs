@@ -870,7 +870,12 @@ default = false
             None,
         )
         .unwrap();
-        let names: Vec<_> = assembly.doc.system.iter().map(|b| b.name.as_str()).collect();
+        let names: Vec<_> = assembly
+            .doc
+            .system
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
         assert!(names.contains(&"clock"), "the computed block is present");
         assert!(
             names.contains(&"clock-echo"),

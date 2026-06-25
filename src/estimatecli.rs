@@ -139,7 +139,10 @@ pub fn set(
     // (b) the `obs/estimate/<session>` event — the boundary on the bus, materialized
     // by the obs projection like any other obs line. trace::write fans out to the
     // bus and (per the recorder's sink rule) appends to trace.jsonl.
-    let topic = format!("obs/estimate/{}", crate::topic::encode_segment(&opts.session));
+    let topic = format!(
+        "obs/estimate/{}",
+        crate::topic::encode_segment(&opts.session)
+    );
     let mut payload = serde_json::to_value(&est).unwrap_or(serde_json::Value::Null);
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("session".into(), serde_json::json!(opts.session));
@@ -336,11 +339,21 @@ mod tests {
     #[test]
     fn e1_estimate_persists_as_block_and_obs_event_latest_wins() {
         let root = temp_root("e1");
-        set(&root, Some(0.40), Some(8), Some(1000), Some(60_000), &opts("code-e1")).unwrap();
+        set(
+            &root,
+            Some(0.40),
+            Some(8),
+            Some(1000),
+            Some(60_000),
+            &opts("code-e1"),
+        )
+        .unwrap();
 
         // (a) the `estimate` block holds the JSON.
         let conn = db::open(&root).unwrap();
-        let est = load_estimate(&conn, "claude-code", "code-e1").unwrap().unwrap();
+        let est = load_estimate(&conn, "claude-code", "code-e1")
+            .unwrap()
+            .unwrap();
         assert_eq!(est.dollars, Some(0.40));
         assert_eq!(est.turns, Some(8));
         assert!(est.at.is_some(), "boundary timestamp recorded");
@@ -354,7 +367,9 @@ mod tests {
 
         // Latest wins: a second set updates the block (not a second row).
         set(&root, Some(0.99), Some(20), None, None, &opts("code-e1")).unwrap();
-        let est2 = load_estimate(&conn, "claude-code", "code-e1").unwrap().unwrap();
+        let est2 = load_estimate(&conn, "claude-code", "code-e1")
+            .unwrap()
+            .unwrap();
         assert_eq!(est2.dollars, Some(0.99));
         assert_eq!(est2.turns, Some(20));
         // The session-scope estimate block is unique per (session, owner, name).
@@ -393,7 +408,15 @@ mod tests {
             json!({ "tool": "claude", "model": "gpt-5" }),
         );
         // The estimate boundary is t(1): everything from here counts.
-        set(&root, Some(0.40), Some(2), Some(1000), Some(60_000), &opts(s)).unwrap();
+        set(
+            &root,
+            Some(0.40),
+            Some(2),
+            Some(1000),
+            Some(60_000),
+            &opts(s),
+        )
+        .unwrap();
         pin_boundary(&root, "claude-code", s, &t(1));
         for n in 2..=4 {
             append_trace(
@@ -517,7 +540,10 @@ mod tests {
         assert!(note1.contains("estimated $0.40"), "{note1}");
         // Once-per-session: a second retro on the SAME session is a no-op (the Stop
         // hook fires several times; a cron backstop may also run).
-        assert!(retro(&root, &opts(s1)).unwrap().is_none(), "retro is idempotent per session");
+        assert!(
+            retro(&root, &opts(s1)).unwrap().is_none(),
+            "retro is idempotent per session"
+        );
 
         // The durable agent-scope `estimation` block now carries the dated miss.
         let conn = db::open(&root).unwrap();
@@ -529,7 +555,11 @@ mod tests {
         // dates) — assert the YYYY-MM-DD shape is present rather than a fixed date.
         let today = trace::now_iso();
         let today = today.split('T').next().unwrap();
-        assert!(stored.content.contains(today), "dated {today}: {}", stored.content);
+        assert!(
+            stored.content.contains(today),
+            "dated {today}: {}",
+            stored.content
+        );
         assert!(stored.content.contains("estimated $0.40"));
 
         // Session 2 (a DIFFERENT session) retros into the SAME durable block — it

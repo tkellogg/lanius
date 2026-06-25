@@ -463,16 +463,31 @@ mod tests {
         // The exact broker fast-fail predicate (read-provenance M3). A read-flavor
         // subscribe is honorable when advisory is ON or authoritative is available.
         let advisory_on = ReadCameraStatus {
-            advisory: TierStatus { available: true, enabled: true },
-            authoritative: TierStatus { available: false, enabled: false },
+            advisory: TierStatus {
+                available: true,
+                enabled: true,
+            },
+            authoritative: TierStatus {
+                available: false,
+                enabled: false,
+            },
         };
-        assert!(advisory_on.read_flavor_honorable(), "advisory on ⇒ honorable");
+        assert!(
+            advisory_on.read_flavor_honorable(),
+            "advisory on ⇒ honorable"
+        );
 
         // Advisory OFF and authoritative unavailable here (the macOS-off case): NOT
         // honorable ⇒ the broker fast-fails rather than returning empty.
         let both_off = ReadCameraStatus {
-            advisory: TierStatus { available: true, enabled: false },
-            authoritative: TierStatus { available: false, enabled: false },
+            advisory: TierStatus {
+                available: true,
+                enabled: false,
+            },
+            authoritative: TierStatus {
+                available: false,
+                enabled: false,
+            },
         };
         assert!(
             !both_off.read_flavor_honorable(),
@@ -482,8 +497,14 @@ mod tests {
         // Advisory off but authoritative AVAILABLE (a future Linux M2): honorable —
         // the platform can serve reads even with the advisory tier switched off.
         let auth_avail = ReadCameraStatus {
-            advisory: TierStatus { available: true, enabled: false },
-            authoritative: TierStatus { available: true, enabled: false },
+            advisory: TierStatus {
+                available: true,
+                enabled: false,
+            },
+            authoritative: TierStatus {
+                available: true,
+                enabled: false,
+            },
         };
         assert!(
             auth_avail.read_flavor_honorable(),

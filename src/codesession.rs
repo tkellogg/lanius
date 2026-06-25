@@ -209,7 +209,13 @@ pub fn live_siblings(root: &Root, viewer: &str, viewer_workdir: &str) -> Vec<Liv
                 continue; // a SIGKILL'd ghost — drop it
             }
         }
-        out.push((last_secs.unwrap_or(0), LiveSibling { session, agent_noun }));
+        out.push((
+            last_secs.unwrap_or(0),
+            LiveSibling {
+                session,
+                agent_noun,
+            },
+        ));
     }
     // Most-recently-active first.
     out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.session.cmp(&b.1.session)));
@@ -293,12 +299,7 @@ pub fn read_record(root: &Root, elanus_session: &str) -> Result<Option<SessionRe
 /// of the same key+session cannot both win the race, while the same key for a
 /// DIFFERENT session is a distinct row (no cross-victim suppression). Durable:
 /// survives a restart, so the at-least-once replay is caught.
-pub fn claim_delivery_key(
-    root: &Root,
-    key: &str,
-    session: &str,
-    event_id: i64,
-) -> Result<bool> {
+pub fn claim_delivery_key(root: &Root, key: &str, session: &str, event_id: i64) -> Result<bool> {
     let conn = crate::db::open(root).context("opening the ledger for the delivery key")?;
     crate::db::init_schema(&conn)?;
     let inserted = conn.execute(
@@ -429,7 +430,8 @@ pub fn inbox_for_session(
         if unseen_only && seen {
             continue;
         }
-        let pv: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+        let pv: serde_json::Value =
+            serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
         // Reuse the same message extraction the daemon uses to drive a delivery,
         // so the inbox shows exactly what a resume would act on.
         let message = crate::codeagent::delivery_message(&pv).unwrap_or_default();
@@ -840,8 +842,7 @@ pub fn reap_dead_members(root: &Root) -> Vec<(String, String)> {
         return reaped;
     }
     let members: Vec<(String, String, i32)> = {
-        let Ok(mut stmt) =
-            conn.prepare("SELECT room, session, owner_pid FROM code_room_members")
+        let Ok(mut stmt) = conn.prepare("SELECT room, session, owner_pid FROM code_room_members")
         else {
             return reaped;
         };
@@ -975,6 +976,95 @@ fn budget_lock_path(root: &Root) -> PathBuf {
     store_dir(root).join("budget.lock")
 }
 
+fn structural_publish_filter(agent: &str, principal: &str) -> String {
+    // Structural scope: exactly the session's own obs subtree, encoded the same
+    // way codeagent::obs_topic encodes the agent/session segments so the filter
+    // and the published topics agree even for names with reserved characters.
+    format!(
+        "obs/agent/{}/{}/#",
+        crate::topic::encode_segment(agent),
+        crate::topic::encode_segment(principal),
+    )
+}
+
+fn covered_by_any(filters: &[String], requested: &str) -> bool {
+    filters
+        .iter()
+        .any(|filter| crate::topic::matches(filter, requested))
+}
+
+fn push_unique(dst: &mut Vec<String>, value: String) {
+    if !dst.iter().any(|existing| existing == &value) {
+        dst.push(value);
+    }
+}
+
+fn bus_grants_for_child(
+    root: &Root,
+    principal: &str,
+    baseline_publish: Vec<String>,
+    spawner: Option<&str>,
+    requested_pub: Option<Vec<String>>,
+    requested_sub: Option<Vec<String>>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let requested_pub = requested_pub.unwrap_or_default();
+    let requested_sub = requested_sub.unwrap_or_default();
+
+    let mut publish = baseline_publish;
+    let mut subscribe = Vec::new();
+
+    let extra_pub: Vec<String> = requested_pub
+        .iter()
+        .filter(|grant| !covered_by_any(&publish, grant))
+        .cloned()
+        .collect();
+    let extra_sub = requested_sub.clone();
+
+    if !extra_pub.is_empty() || !extra_sub.is_empty() {
+        if let Some(spawner_name) = spawner {
+            let spawner_token_path = token_path(root, spawner_name);
+            let file_exists = spawner_token_path.try_exists().unwrap_or(true);
+            if file_exists {
+                let spawner_tok = read(root, spawner_name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "bus grant refused: spawner token {spawner_name:?} exists on disk \
+                         but could not be parsed — treating as corrupt rather than unbounded \
+                         (fail-closed: docs/security.md entry 22)"
+                    )
+                })?;
+
+                for grant in &extra_pub {
+                    if !covered_by_any(&spawner_tok.publish, grant) {
+                        bail!(
+                            "bus publish grant refused: child {principal:?} requested {grant:?} \
+                             but spawner {spawner_name:?} does not hold a covering publish grant \
+                             (child.grants ⊆ parent.grants — docs/security.md entry 22)"
+                        );
+                    }
+                }
+                for grant in &extra_sub {
+                    if !covered_by_any(&spawner_tok.subscribe, grant) {
+                        bail!(
+                            "bus subscribe grant refused: child {principal:?} requested {grant:?} \
+                             but spawner {spawner_name:?} does not hold a covering subscribe grant \
+                             (child.grants ⊆ parent.grants — docs/security.md entry 22)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    for grant in requested_pub {
+        push_unique(&mut publish, grant);
+    }
+    for grant in requested_sub {
+        push_unique(&mut subscribe, grant);
+    }
+
+    Ok((publish, subscribe))
+}
+
 /// RAII guard that holds an exclusive `flock(LOCK_EX)` on the budget lock file.
 ///
 /// Acquiring: `BudgetLock::acquire(root)` opens (or creates) the lock file and
@@ -1034,8 +1124,9 @@ impl Drop for BudgetLock {
 /// Mint a grant-scoped session token for `principal` publishing `agent`
 /// telemetry. Writes the 0600 token file inside the fenced store and returns
 /// the token (the launcher hands `.secret` to the child as ELANUS_BUS_TOKEN).
-/// The scope is structural: publish only `obs/agent/<agent>/<session>/#`,
-/// subscribe nothing.
+/// The structural baseline is always granted: publish only
+/// `obs/agent/<agent>/<session>/#`, subscribe nothing. Requested bus grants
+/// beyond that baseline must be covered by the spawner's own token grants.
 ///
 /// ## Budget dimension (M1 — docs/handoffs/authority-delegation.md, security.md entry 22)
 ///
@@ -1075,6 +1166,8 @@ pub fn mint(
     owner_pid: i32,
     spawner: Option<&str>,
     requested_budget: Option<u64>,
+    requested_pub: Option<Vec<String>>,
+    requested_sub: Option<Vec<String>>,
 ) -> Result<SessionToken> {
     if !is_session_principal(principal) {
         bail!("session principal {principal:?} is not a valid code-* identity name");
@@ -1088,6 +1181,16 @@ pub fn mint(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
+
+    let own_obs = structural_publish_filter(agent, principal);
+    let (publish, subscribe) = bus_grants_for_child(
+        root,
+        principal,
+        vec![own_obs],
+        spawner,
+        requested_pub,
+        requested_sub,
+    )?;
 
     // ── Budget invariant: Σ children ≤ parent.remaining ─────────────────────
     //
@@ -1228,25 +1331,20 @@ pub fn mint(
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    // Structural scope: exactly the session's own obs subtree, encoded the same
-    // way codeagent::obs_topic encodes the agent/session segments so the filter
-    // and the published topics agree even for names with reserved characters.
-    let own_obs = format!(
-        "obs/agent/{}/{}/#",
-        crate::topic::encode_segment(agent),
-        crate::topic::encode_segment(principal),
-    );
     let token = SessionToken {
         principal: principal.to_string(),
         agent: agent.to_string(),
         secret,
         owner_pid,
-        publish: vec![own_obs],
-        subscribe: Vec::new(),
+        publish,
+        subscribe,
         turn_budget: child_budget,
         remaining_budget: child_budget,
     };
-    write_0600(&token_path(root, principal), &serde_json::to_string(&token)?)?;
+    write_0600(
+        &token_path(root, principal),
+        &serde_json::to_string(&token)?,
+    )?;
     Ok(token)
 }
 
@@ -1343,14 +1441,15 @@ fn write_0600(path: &Path, contents: &str) -> std::io::Result<()> {
     static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "write_0600: path has no parent")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "write_0600: path has no parent",
+        )
     })?;
     let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_name = format!(
         "{}.tmp.{}.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("token"),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("token"),
         std::process::id(),
         seq,
     );
@@ -1407,7 +1506,17 @@ mod tests {
     #[test]
     fn mint_scope_is_only_the_own_obs_subtree() {
         let root = tmp_root();
-        let tok = mint(&root, "code-deadbeef", "claude-code", 999_999, None, None).unwrap();
+        let tok = mint(
+            &root,
+            "code-deadbeef",
+            "claude-code",
+            999_999,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         // Publishes its own obs subtree …
         assert!(tok.may_publish("obs/agent/claude-code/code-deadbeef/session/start"));
         assert!(tok.may_publish("obs/agent/claude-code/code-deadbeef/tool/Bash/call"));
@@ -1427,7 +1536,17 @@ mod tests {
     #[test]
     fn roundtrip_and_retire() {
         let root = tmp_root();
-        let minted = mint(&root, "code-cafef00d", "claude-code", 1234, None, None).unwrap();
+        let minted = mint(
+            &root,
+            "code-cafef00d",
+            "claude-code",
+            1234,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let read_back = read(&root, "code-cafef00d").unwrap();
         assert_eq!(read_back.secret, minted.secret);
         assert_eq!(read_back.agent, "claude-code");
@@ -1464,12 +1583,24 @@ mod tests {
         // a token owned by a definitely-dead pid (pid 1 exists but we use a high
         // unlikely-live pid for the dead case; current pid for the live case)
         let dead_pid = 0x7fff_fffe; // not a live pid on any sane system
-        mint(&root, "code-deadbeef", "claude-code", dead_pid, None, None).unwrap();
+        mint(
+            &root,
+            "code-deadbeef",
+            "claude-code",
+            dead_pid,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let live = mint(
             &root,
             "code-livesess",
             "claude-code",
             std::process::id() as i32,
+            None,
+            None,
             None,
             None,
         )
@@ -1603,7 +1734,17 @@ mod tests {
         assert!(read(&root, "code-resume01").is_none());
 
         // Resume mints a fresh, emit-only token …
-        let token = mint(&root, "code-resume01", "codex", std::process::id() as i32, None, None).unwrap();
+        let token = mint(
+            &root,
+            "code-resume01",
+            "codex",
+            std::process::id() as i32,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(token.may_publish("obs/agent/codex/code-resume01/session/resume"));
         assert!(!token.may_publish("in/human/owner"));
         assert!(token.subscribe.is_empty(), "resume token must be emit-only");
@@ -1697,11 +1838,18 @@ mod tests {
         // can never read another real session's inbox. (There is no parameter that
         // lets `code-mine0001`'s caller read `code-other002`'s rows.)
         let wrong_noun = inbox_for_session(&root, "claude-code", "code-mine0001", false).unwrap();
-        assert!(wrong_noun.is_empty(), "a different noun reads its own empty mailbox, not another session's");
+        assert!(
+            wrong_noun.is_empty(),
+            "a different noun reads its own empty mailbox, not another session's"
+        );
 
         // A non-session name has no inbox at all (no crafted topic).
-        assert!(inbox_for_session(&root, "codex", "owner", false).unwrap().is_empty());
-        assert!(inbox_for_session(&root, "codex", "code-../escape", false).unwrap().is_empty());
+        assert!(inbox_for_session(&root, "codex", "owner", false)
+            .unwrap()
+            .is_empty());
+        assert!(inbox_for_session(&root, "codex", "code-../escape", false)
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -1724,7 +1872,12 @@ mod tests {
         let _id2 = deliver_into(&root, "codex", "code-seen0001", "owner", "two");
 
         // Both start unseen.
-        assert_eq!(inbox_for_session(&root, "codex", "code-seen0001", true).unwrap().len(), 2);
+        assert_eq!(
+            inbox_for_session(&root, "codex", "code-seen0001", true)
+                .unwrap()
+                .len(),
+            2
+        );
         // Mark the first seen — only one remains unseen, idempotently.
         mark_inbox_seen(&root, "code-seen0001", &[id1]).unwrap();
         mark_inbox_seen(&root, "code-seen0001", &[id1]).unwrap(); // re-mark = no-op
@@ -1739,7 +1892,12 @@ mod tests {
         // different session id touches a different (session, event) keyspace and
         // does NOT hide my unseen row.
         mark_inbox_seen(&root, "code-attacker9", &[unseen[0].event_id]).unwrap();
-        assert_eq!(inbox_for_session(&root, "codex", "code-seen0001", true).unwrap().len(), 1);
+        assert_eq!(
+            inbox_for_session(&root, "codex", "code-seen0001", true)
+                .unwrap()
+                .len(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -1748,7 +1906,10 @@ mod tests {
         let root = tmp_root();
         assert!(get_note(&root, "code-note0001").unwrap().is_none());
         set_note(&root, "code-note0001", "  remember the migration  ").unwrap();
-        assert_eq!(get_note(&root, "code-note0001").unwrap().as_deref(), Some("remember the migration"));
+        assert_eq!(
+            get_note(&root, "code-note0001").unwrap().as_deref(),
+            Some("remember the migration")
+        );
         // Replacing the note shows the new text.
         set_note(&root, "code-note0001", "actually do the rename first").unwrap();
         assert_eq!(
@@ -1813,12 +1974,17 @@ mod tests {
 
         // Re-claiming the same path is idempotent (no duplicate row).
         add_claim(&root, "room-1", "code-aaaa0001", "src/foo.rs").unwrap();
-        assert_eq!(own_claims(&root, "room-1", "code-aaaa0001").unwrap().len(), 1);
+        assert_eq!(
+            own_claims(&root, "room-1", "code-aaaa0001").unwrap().len(),
+            1
+        );
 
         // unclaim clears only the holder's own claim; idempotent.
         assert!(remove_claim(&root, "room-1", "code-aaaa0001", "src/foo.rs").unwrap());
         assert!(!remove_claim(&root, "room-1", "code-aaaa0001", "src/foo.rs").unwrap());
-        assert!(peer_claims(&root, "room-1", "code-bbbb0002").unwrap().is_empty());
+        assert!(peer_claims(&root, "room-1", "code-bbbb0002")
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -1882,7 +2048,10 @@ mod tests {
         add_claim(&root, "room-r", "code-doneone1", "b.rs").unwrap();
         add_claim(&root, "room-r", "code-stays002", "c.rs").unwrap();
         // Before: the stayer sees the worker's two claims.
-        assert_eq!(peer_claims(&root, "room-r", "code-stays002").unwrap().len(), 2);
+        assert_eq!(
+            peer_claims(&root, "room-r", "code-stays002").unwrap().len(),
+            2
+        );
         // The worker finishes a.rs and releases it; b.rs is still held.
         assert!(remove_claim(&root, "room-r", "code-doneone1", "a.rs").unwrap());
         let peers = peer_claims(&root, "room-r", "code-stays002").unwrap();
@@ -1909,7 +2078,9 @@ mod tests {
         let live_view = own_claims(&root, "room-z", "code-liveone2").unwrap();
         assert_eq!(live_view.len(), 1);
         // The live session no longer sees the dead peer.
-        assert!(peer_claims(&root, "room-z", "code-liveone2").unwrap().is_empty());
+        assert!(peer_claims(&root, "room-z", "code-liveone2")
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -1954,13 +2125,188 @@ mod tests {
         // unbounded — turn_budget and remaining_budget are both None.
         // This is the existing path; the test proves it is unchanged.
         let root = tmp_root();
-        let tok = mint(&root, "code-budget001", "claude-code", 999_999, None, None).unwrap();
+        let tok = mint(
+            &root,
+            "code-budget001",
+            "claude-code",
+            999_999,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(tok.turn_budget, None, "owner path must be unbounded");
         assert_eq!(tok.remaining_budget, None, "owner path must be unbounded");
         // Roundtrip: the token file deserializes back with None budgets.
         let read_back = read(&root, "code-budget001").unwrap();
         assert_eq!(read_back.turn_budget, None);
         assert_eq!(read_back.remaining_budget, None);
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M2: bus capability dimension + child⊆parent assert ──────────────────
+
+    #[test]
+    fn bus_child_cannot_subscribe_outside_spawner_scope() {
+        let root = tmp_root();
+        let pid = std::process::id() as i32;
+        mint(
+            &root,
+            "code-busparent01",
+            "claude-code",
+            pid,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = mint(
+            &root,
+            "code-buschild01",
+            "claude-code",
+            pid,
+            Some("code-busparent01"),
+            None,
+            None,
+            Some(vec!["obs/#".to_string()]),
+        );
+
+        assert!(
+            result.is_err(),
+            "subscribe widening must be refused at mint"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("bus subscribe grant refused"),
+            "error must name the refusal class: {err}"
+        );
+        assert!(read(&root, "code-buschild01").is_none());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn bus_child_cannot_publish_outside_spawner_scope() {
+        let root = tmp_root();
+        let pid = std::process::id() as i32;
+        mint(
+            &root,
+            "code-busparent02",
+            "claude-code",
+            pid,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = mint(
+            &root,
+            "code-buschild02",
+            "claude-code",
+            pid,
+            Some("code-busparent02"),
+            None,
+            Some(vec!["work/#".to_string()]),
+            None,
+        );
+
+        assert!(result.is_err(), "publish widening must be refused at mint");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("bus publish grant refused"),
+            "error must name the refusal class: {err}"
+        );
+        assert!(read(&root, "code-buschild02").is_none());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn bus_default_is_structural_and_owner_request_passes_vacuously() {
+        let root = tmp_root();
+        let pid = std::process::id() as i32;
+        mint(
+            &root,
+            "code-busparent03",
+            "claude-code",
+            pid,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let child = mint(
+            &root,
+            "code-buschild03",
+            "codex",
+            pid,
+            Some("code-busparent03"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            child.publish,
+            vec!["obs/agent/codex/code-buschild03/#".to_string()],
+            "None,None must grant exactly the child's structural publish baseline"
+        );
+        assert!(
+            child.subscribe.is_empty(),
+            "None,None must preserve the empty structural subscribe baseline"
+        );
+
+        let owner_child = mint(
+            &root,
+            "code-busowner01",
+            "codex",
+            pid,
+            None,
+            None,
+            Some(vec!["work/#".to_string()]),
+            Some(vec!["obs/#".to_string()]),
+        )
+        .unwrap();
+        assert!(owner_child.publish.contains(&"work/#".to_string()));
+        assert!(owner_child.subscribe.contains(&"obs/#".to_string()));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn bus_corrupt_spawner_token_fails_closed_for_scoped_request() {
+        let root = tmp_root();
+        let pid = std::process::id() as i32;
+        let dir = store_dir(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("code-buscorrupt.json");
+        std::fs::write(&path, b"{ THIS IS NOT VALID JSON }").unwrap();
+
+        let result = mint(
+            &root,
+            "code-buschild04",
+            "claude-code",
+            pid,
+            Some("code-buscorrupt"),
+            None,
+            Some(vec!["work/#".to_string()]),
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "corrupt spawner token must fail closed for bus grant requests"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("bus grant refused"),
+            "error must explain the bus fail-closed refusal: {err}"
+        );
+        assert!(read(&root, "code-buschild04").is_none());
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -1972,16 +2318,42 @@ mod tests {
         let root = tmp_root();
         let parent_pid = std::process::id() as i32;
         // Mint the parent with a finite budget (e.g. 100 turns).
-        mint(&root, "code-parent01", "claude-code", parent_pid, None, Some(100)).unwrap();
+        mint(
+            &root,
+            "code-parent01",
+            "claude-code",
+            parent_pid,
+            None,
+            Some(100),
+            None,
+            None,
+        )
+        .unwrap();
         // Child inherits full remaining (100) via inherit-equal.
-        let child = mint(&root, "code-child001", "claude-code", parent_pid,
-                         Some("code-parent01"), None).unwrap();
-        assert_eq!(child.turn_budget, Some(100), "inherit-equal: child gets parent's full remaining");
+        let child = mint(
+            &root,
+            "code-child001",
+            "claude-code",
+            parent_pid,
+            Some("code-parent01"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            child.turn_budget,
+            Some(100),
+            "inherit-equal: child gets parent's full remaining"
+        );
         assert_eq!(child.remaining_budget, Some(100));
         // Parent's remaining is now 0 (the child took the full 100).
         let parent_after = read(&root, "code-parent01").unwrap();
-        assert_eq!(parent_after.remaining_budget, Some(0),
-                   "parent's remaining is decremented by the child's allocation");
+        assert_eq!(
+            parent_after.remaining_budget,
+            Some(0),
+            "parent's remaining is decremented by the child's allocation"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -1992,10 +2364,33 @@ mod tests {
         // of the RLM case ("halve it to pass context down").
         let root = tmp_root();
         let pid = std::process::id() as i32;
-        mint(&root, "code-parent02", "claude-code", pid, None, Some(100)).unwrap();
-        let child = mint(&root, "code-child002", "claude-code", pid,
-                         Some("code-parent02"), Some(40)).unwrap();
-        assert_eq!(child.turn_budget, Some(40), "explicit narrowing: child gets requested 40");
+        mint(
+            &root,
+            "code-parent02",
+            "claude-code",
+            pid,
+            None,
+            Some(100),
+            None,
+            None,
+        )
+        .unwrap();
+        let child = mint(
+            &root,
+            "code-child002",
+            "claude-code",
+            pid,
+            Some("code-parent02"),
+            Some(40),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            child.turn_budget,
+            Some(40),
+            "explicit narrowing: child gets requested 40"
+        );
         assert_eq!(child.remaining_budget, Some(40));
         // Parent's remaining decremented by 40.
         let parent_after = read(&root, "code-parent02").unwrap();
@@ -2011,23 +2406,50 @@ mod tests {
         let root = tmp_root();
         let pid = std::process::id() as i32;
         // Parent has 50 turns remaining.
-        mint(&root, "code-parent03", "claude-code", pid, None, Some(50)).unwrap();
+        mint(
+            &root,
+            "code-parent03",
+            "claude-code",
+            pid,
+            None,
+            Some(50),
+            None,
+            None,
+        )
+        .unwrap();
         // Child requests 51 — one more than the parent has.
-        let result = mint(&root, "code-child003", "claude-code", pid,
-                          Some("code-parent03"), Some(51));
+        let result = mint(
+            &root,
+            "code-child003",
+            "claude-code",
+            pid,
+            Some("code-parent03"),
+            Some(51),
+            None,
+            None,
+        );
         assert!(result.is_err(), "over-allocation must be refused at mint");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("budget allocation refused"),
-                "error must name the refusal class: {err}");
-        assert!(err.contains("code-parent03"),
-                "error must name the spawner: {err}");
+        assert!(
+            err.contains("budget allocation refused"),
+            "error must name the refusal class: {err}"
+        );
+        assert!(
+            err.contains("code-parent03"),
+            "error must name the spawner: {err}"
+        );
         // The refused mint must NOT have written a child token.
-        assert!(read(&root, "code-child003").is_none(),
-                "refused mint must not leave a token file");
+        assert!(
+            read(&root, "code-child003").is_none(),
+            "refused mint must not leave a token file"
+        );
         // The parent's remaining is unchanged — the failed mint must not charge it.
         let parent_after = read(&root, "code-parent03").unwrap();
-        assert_eq!(parent_after.remaining_budget, Some(50),
-                   "failed mint must not decrement the spawner's remaining");
+        assert_eq!(
+            parent_after.remaining_budget,
+            Some(50),
+            "failed mint must not decrement the spawner's remaining"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -2040,33 +2462,77 @@ mod tests {
         let root = tmp_root();
         let pid = std::process::id() as i32;
         // Parent starts with 60 turns.
-        mint(&root, "code-parent04", "claude-code", pid, None, Some(60)).unwrap();
+        mint(
+            &root,
+            "code-parent04",
+            "claude-code",
+            pid,
+            None,
+            Some(60),
+            None,
+            None,
+        )
+        .unwrap();
 
         // First child claims 40: succeeds; parent now has 20 remaining.
-        let c1 = mint(&root, "code-sib001", "claude-code", pid,
-                      Some("code-parent04"), Some(40)).unwrap();
+        let c1 = mint(
+            &root,
+            "code-sib001",
+            "claude-code",
+            pid,
+            Some("code-parent04"),
+            Some(40),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(c1.turn_budget, Some(40));
         let after_c1 = read(&root, "code-parent04").unwrap();
         assert_eq!(after_c1.remaining_budget, Some(20));
 
         // Second child claims 21: would push Σ to 61 > 60 → REFUSED.
-        let result = mint(&root, "code-sib002", "claude-code", pid,
-                          Some("code-parent04"), Some(21));
-        assert!(result.is_err(), "second sibling must be refused when Σ > parent");
-        assert!(read(&root, "code-sib002").is_none(),
-                "refused sibling must not leave a token");
+        let result = mint(
+            &root,
+            "code-sib002",
+            "claude-code",
+            pid,
+            Some("code-parent04"),
+            Some(21),
+            None,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "second sibling must be refused when Σ > parent"
+        );
+        assert!(
+            read(&root, "code-sib002").is_none(),
+            "refused sibling must not leave a token"
+        );
 
         // Parent's remaining is still 20 (the failed mint did not charge it).
         let after_fail = read(&root, "code-parent04").unwrap();
         assert_eq!(after_fail.remaining_budget, Some(20));
 
         // Third sibling that fits (20) succeeds — the partition has exactly 0 left.
-        let c3 = mint(&root, "code-sib003", "claude-code", pid,
-                      Some("code-parent04"), Some(20)).unwrap();
+        let c3 = mint(
+            &root,
+            "code-sib003",
+            "claude-code",
+            pid,
+            Some("code-parent04"),
+            Some(20),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(c3.turn_budget, Some(20));
         let after_c3 = read(&root, "code-parent04").unwrap();
-        assert_eq!(after_c3.remaining_budget, Some(0),
-                   "siblings exactly exhaust the parent's budget — Σ = parent");
+        assert_eq!(
+            after_c3.remaining_budget,
+            Some(0),
+            "siblings exactly exhaust the parent's budget — Σ = parent"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -2091,10 +2557,14 @@ mod tests {
         let path = dir.join("code-legacy01.json");
         std::fs::write(&path, legacy_json).unwrap();
         let tok = read(&root, "code-legacy01").expect("legacy token must be readable");
-        assert_eq!(tok.turn_budget, None,
-                   "missing turn_budget in old token → None (unbounded)");
-        assert_eq!(tok.remaining_budget, None,
-                   "missing remaining_budget in old token → None (unbounded)");
+        assert_eq!(
+            tok.turn_budget, None,
+            "missing turn_budget in old token → None (unbounded)"
+        );
+        assert_eq!(
+            tok.remaining_budget, None,
+            "missing remaining_budget in old token → None (unbounded)"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -2118,8 +2588,8 @@ mod tests {
         //
         // Threads open separate fds, so flock correctly provides mutual exclusion
         // (same as separate processes — lock is per open-file-description, not per-pid).
-        use std::sync::{Arc, Mutex};
         use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+        use std::sync::{Arc, Mutex};
 
         let pid = std::process::id() as i32;
 
@@ -2141,7 +2611,17 @@ mod tests {
             let root = Arc::new(tmp_root());
             let parent_name = format!("code-racep{ctr:04}");
 
-            mint(&root, &parent_name, "claude-code", pid, None, Some(parent_budget)).unwrap();
+            mint(
+                &root,
+                &parent_name,
+                "claude-code",
+                pid,
+                None,
+                Some(parent_budget),
+                None,
+                None,
+            )
+            .unwrap();
 
             let successes: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -2159,6 +2639,8 @@ mod tests {
                             pid,
                             Some(&parent_name),
                             Some(per_child),
+                            None,
+                            None,
                         );
                         if let Ok(tok) = result {
                             let granted = tok.turn_budget.unwrap_or(0);
@@ -2193,7 +2675,8 @@ mod tests {
             // (c) The parent's final persisted remaining equals parent_start − Σgranted.
             let parent_final = read(&root, &parent_name)
                 .expect("parent token must still be readable after concurrent mints");
-            let final_remaining = parent_final.remaining_budget
+            let final_remaining = parent_final
+                .remaining_budget
                 .expect("parent remaining must be Some after finite-budget mints");
             assert_eq!(
                 final_remaining,
@@ -2231,6 +2714,8 @@ mod tests {
             pid,
             Some("code-corruptparent"),
             Some(10),
+            None,
+            None,
         );
         assert!(
             result.is_err(),

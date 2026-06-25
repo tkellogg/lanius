@@ -476,10 +476,7 @@ pub fn effective_elanus_path(root: &Root, name: &str) -> Result<Vec<String>> {
 /// child reaches through its own entries are untouched. A profile with no local
 /// `elanus_path` (pure inheritance, no explicit `$parent`) is treated as having
 /// written `["$parent"]`: the whole path is inherited.
-pub fn effective_elanus_path_split(
-    root: &Root,
-    name: &str,
-) -> Result<(Vec<String>, Vec<String>)> {
+pub fn effective_elanus_path_split(root: &Root, name: &str) -> Result<(Vec<String>, Vec<String>)> {
     // The parent scope this profile inherits from.
     let f = root.profile_dir(name).join("profile.toml");
     let raw = std::fs::read_to_string(&f).unwrap_or_default();

@@ -98,7 +98,8 @@ impl Hub {
     /// A bus message: assign a seq, ring it for late joiners, broadcast it.
     fn ingest(&self, topic: String, env: Value) {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let frame = json!({ "kind": "message", "seq": seq, "topic": topic, "env": env }).to_string();
+        let frame =
+            json!({ "kind": "message", "seq": seq, "topic": topic, "env": env }).to_string();
         {
             let mut ring = self.ring.lock().unwrap();
             ring.push_back(frame.clone());
@@ -170,13 +171,20 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
         let relay_hub = hub.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("elanus-web-bus".into())
-            .spawn(move || match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt.block_on(relay(relay_hub, eventloop)),
-                Err(e) => eprintln!("[web] bus relay runtime failed: {e}"),
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(relay(relay_hub, eventloop)),
+                    Err(e) => eprintln!("[web] bus relay runtime failed: {e}"),
+                }
             })
         {
             ntex::rt::System::current().stop();
-            return Err(std::io::Error::other(format!("spawning bus relay thread: {e}")));
+            return Err(std::io::Error::other(format!(
+                "spawning bus relay thread: {e}"
+            )));
         }
 
         let hub_factory = hub.clone();
@@ -270,7 +278,10 @@ async fn relay(hub: Arc<Hub>, mut eventloop: rumqttc::v5::EventLoop) {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 hub.connected.store(true, Ordering::SeqCst);
                 was_connected = true;
-                eprintln!("[web:bus] connected to {} — subscribing obs/# in/# signal/#", hub.broker);
+                eprintln!(
+                    "[web:bus] connected to {} — subscribing obs/# in/# signal/#",
+                    hub.broker
+                );
                 let _ = hub.client.subscribe("obs/#", QoS::AtMostOnce).await;
                 let _ = hub.client.subscribe("in/#", QoS::AtLeastOnce).await;
                 let _ = hub.client.subscribe("signal/#", QoS::AtLeastOnce).await;
@@ -280,9 +291,9 @@ async fn relay(hub: Arc<Hub>, mut eventloop: rumqttc::v5::EventLoop) {
                 let topic = String::from_utf8_lossy(&p.topic).into_owned();
                 // env = the parsed JSON payload, or {payload:<raw>} if it isn't
                 // JSON (mjs parity).
-                let env = serde_json::from_slice::<Value>(&p.payload).unwrap_or_else(|_| {
-                    json!({ "payload": String::from_utf8_lossy(&p.payload).into_owned() })
-                });
+                let env = serde_json::from_slice::<Value>(&p.payload).unwrap_or_else(
+                    |_| json!({ "payload": String::from_utf8_lossy(&p.payload).into_owned() }),
+                );
                 hub.ingest(topic, env);
             }
             Ok(_) => {}
@@ -302,13 +313,12 @@ async fn relay(hub: Arc<Hub>, mut eventloop: rumqttc::v5::EventLoop) {
 
 // ---- publish --------------------------------------------------------------
 
-async fn publish(
-    hub: web::types::State<Arc<Hub>>,
-    req: HttpRequest,
-    body: Bytes,
-) -> HttpResponse {
+async fn publish(hub: web::types::State<Arc<Hub>>, req: HttpRequest, body: Bytes) -> HttpResponse {
     if !origin_ok(&req) {
-        return json_resp(403, json!({ "ok": false, "error": "cross-origin request refused" }));
+        return json_resp(
+            403,
+            json!({ "ok": false, "error": "cross-origin request refused" }),
+        );
     }
     let j: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -404,16 +414,16 @@ fn read_camera_status(root: &Root) -> Value {
 
 // ---- conversations (read-only sqlite projection) --------------------------
 
-async fn conversations(
-    hub: web::types::State<Arc<Hub>>,
-    req: HttpRequest,
-) -> HttpResponse {
+async fn conversations(hub: web::types::State<Arc<Hub>>, req: HttpRequest) -> HttpResponse {
     let agent = query_param(&req, "agent").unwrap_or_default();
     if !valid_profile_name(&agent) {
         return json_resp(400, json!({ "ok": false, "error": BAD_NAME_MSG }));
     }
     let Some(db) = db_path(&hub.root) else {
-        return json_resp(503, json!({ "ok": false, "error": "conversation history unavailable — no elanus.db for this root" }));
+        return json_resp(
+            503,
+            json!({ "ok": false, "error": "conversation history unavailable — no elanus.db for this root" }),
+        );
     };
     let owner = secrets::owner_name(&hub.root);
     match web::block(move || conversation_rows(&agent, &db, &owner)).await {
@@ -441,7 +451,10 @@ async fn conversation(
         return json_resp(400, json!({ "ok": false, "error": "bad conversation" }));
     }
     let Some(db) = db_path(&hub.root) else {
-        return json_resp(503, json!({ "ok": false, "error": "conversation history unavailable — no elanus.db for this root" }));
+        return json_resp(
+            503,
+            json!({ "ok": false, "error": "conversation history unavailable — no elanus.db for this root" }),
+        );
     };
     let session_out = session.clone();
     match web::block(move || conversation_messages(&session, &db)).await {
@@ -467,11 +480,17 @@ async fn code_sessions(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
             let text = if trimmed.is_empty() { "[]" } else { trimmed };
             match serde_json::from_str::<Value>(text) {
                 Ok(v) => json_resp(200, v),
-                Err(_) => json_resp(500, json!({ "ok": false, "error": "bad projection output" })),
+                Err(_) => json_resp(
+                    500,
+                    json!({ "ok": false, "error": "bad projection output" }),
+                ),
             }
         }
         Ok(r) => json_resp(500, json!({ "ok": false, "error": cli_err(&r) })),
-        Err(_) => json_resp(500, json!({ "ok": false, "error": "code projection unavailable" })),
+        Err(_) => json_resp(
+            500,
+            json!({ "ok": false, "error": "code projection unavailable" }),
+        ),
     }
 }
 
@@ -486,15 +505,24 @@ async fn code_session(
         Ok(r) if r.ok => {
             let trimmed = r.stdout.trim();
             if trimmed.is_empty() || trimmed == "null" {
-                return json_resp(404, json!({ "ok": false, "error": "no such coding session" }));
+                return json_resp(
+                    404,
+                    json!({ "ok": false, "error": "no such coding session" }),
+                );
             }
             match serde_json::from_str::<Value>(trimmed) {
                 Ok(v) => json_resp(200, v),
-                Err(_) => json_resp(500, json!({ "ok": false, "error": "bad projection output" })),
+                Err(_) => json_resp(
+                    500,
+                    json!({ "ok": false, "error": "bad projection output" }),
+                ),
             }
         }
         Ok(r) => json_resp(500, json!({ "ok": false, "error": cli_err(&r) })),
-        Err(_) => json_resp(500, json!({ "ok": false, "error": "code projection unavailable" })),
+        Err(_) => json_resp(
+            500,
+            json!({ "ok": false, "error": "code projection unavailable" }),
+        ),
     }
 }
 
@@ -509,7 +537,10 @@ fn cli_json(root: &Root, args: &[&str], empty_default: &str) -> (u16, Value) {
     match cli(root, args) {
         Ok(r) if r.ok => map_cli_json(&r.stdout, empty_default),
         Ok(r) => (500, json!({ "ok": false, "error": cli_err(&r) })),
-        Err(_) => (500, json!({ "ok": false, "error": "projection unavailable" })),
+        Err(_) => (
+            500,
+            json!({ "ok": false, "error": "projection unavailable" }),
+        ),
     }
 }
 
@@ -520,10 +551,17 @@ fn cli_json(root: &Root, args: &[&str], empty_default: &str) -> (u16, Value) {
 /// spinning the ntex server (the shell-out itself is exercised by ui.spec.mjs).
 fn map_cli_json(stdout: &str, empty_default: &str) -> (u16, Value) {
     let trimmed = stdout.trim();
-    let text = if trimmed.is_empty() { empty_default } else { trimmed };
+    let text = if trimmed.is_empty() {
+        empty_default
+    } else {
+        trimmed
+    };
     match serde_json::from_str::<Value>(text) {
         Ok(v) => (200, v),
-        Err(_) => (500, json!({ "ok": false, "error": "bad projection output" })),
+        Err(_) => (
+            500,
+            json!({ "ok": false, "error": "bad projection output" }),
+        ),
     }
 }
 
@@ -538,7 +576,10 @@ async fn cli_json_resp(root: Root, args: Vec<String>, empty_default: &str) -> Ht
     .await;
     match out {
         Ok((code, v)) => json_resp(code, v),
-        Err(_) => json_resp(500, json!({ "ok": false, "error": "projection unavailable" })),
+        Err(_) => json_resp(
+            500,
+            json!({ "ok": false, "error": "projection unavailable" }),
+        ),
     }
 }
 
@@ -577,7 +618,10 @@ fn valid_session_id(session: &str) -> bool {
 /// `elanus code blocks --session <id> --json` (durable + recomputed ephemeral).
 async fn blocks(hub: web::types::State<Arc<Hub>>, req: HttpRequest) -> HttpResponse {
     let Some(session) = query_param(&req, "session") else {
-        return json_resp(400, json!({ "ok": false, "error": "need ?session=<code-id>" }));
+        return json_resp(
+            400,
+            json!({ "ok": false, "error": "need ?session=<code-id>" }),
+        );
     };
     if !valid_session_id(&session) {
         return json_resp(400, json!({ "ok": false, "error": "bad session" }));
@@ -649,7 +693,11 @@ fn block_set_args(body: &Value) -> Result<Vec<String>, String> {
         args.push("--scope".to_string());
         args.push(scope.to_string());
     }
-    if let Some(p) = body.get("placement").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+    if let Some(p) = body
+        .get("placement")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
         args.push("--placement".to_string());
         args.push(p.to_string());
     }
@@ -671,7 +719,10 @@ async fn block_set(
     body: Bytes,
 ) -> HttpResponse {
     if !origin_ok(&req) {
-        return json_resp(403, json!({ "ok": false, "error": "cross-origin request refused (CSRF/DNS-rebinding guard)" }));
+        return json_resp(
+            403,
+            json!({ "ok": false, "error": "cross-origin request refused (CSRF/DNS-rebinding guard)" }),
+        );
     }
     let body_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -768,14 +819,20 @@ async fn history(hub: web::types::State<Arc<Hub>>, req: HttpRequest, body: Bytes
         );
     }
     let Some(base) = history_endpoint(&hub.root) else {
-        return json_resp(503, json!({ "ok": false, "error": "history view unavailable — is the history package running and approved? (no run/pkg-history/http.json)" }));
+        return json_resp(
+            503,
+            json!({ "ok": false, "error": "history view unavailable — is the history package running and approved? (no run/pkg-history/http.json)" }),
+        );
     };
     let out = web::block(move || proxy_history(&base, &query)).await;
     match out {
         Ok((code, text)) => HttpResponse::build(status_code(code))
             .content_type("application/json")
             .body(text),
-        Err(_) => json_resp(503, json!({ "ok": false, "error": "history view unreachable — approve the history package if it is parked" })),
+        Err(_) => json_resp(
+            503,
+            json!({ "ok": false, "error": "history view unreachable — approve the history package if it is parked" }),
+        ),
     }
 }
 
@@ -791,7 +848,10 @@ async fn admin(
 ) -> HttpResponse {
     let method = req.method().clone();
     if method != ntex::http::Method::GET && !origin_ok(&req) {
-        return json_resp(403, json!({ "ok": false, "error": "cross-origin request refused (CSRF/DNS-rebinding guard)" }));
+        return json_resp(
+            403,
+            json!({ "ok": false, "error": "cross-origin request refused (CSRF/DNS-rebinding guard)" }),
+        );
     }
     let tail = path.into_inner();
     let body_json: Value = if body.is_empty() {
@@ -830,23 +890,34 @@ fn admin_dispatch(
     let r = match (tail, get, post) {
         ("models", true, _) => {
             let r = cli(root, &["models", "--json"])?;
-            return Ok((200, if r.ok {
-                json!({ "ok": true, "models": json_lines(&r.stdout) })
-            } else {
-                json!({ "ok": true, "models": [], "note": cli_err(&r).trim() })
-            }));
+            return Ok((
+                200,
+                if r.ok {
+                    json!({ "ok": true, "models": json_lines(&r.stdout) })
+                } else {
+                    json!({ "ok": true, "models": [], "note": cli_err(&r).trim() })
+                },
+            ));
         }
         ("approve", _, true) | ("revoke", _, true) => {
             let pkg = body.get("package").and_then(Value::as_str).unwrap_or("");
             if !valid_pkg_name(pkg) {
                 return Ok((400, json!({ "ok": false, "error": "need {package}" })));
             }
-            let verb = if tail == "approve" { "approve" } else { "revoke" };
+            let verb = if tail == "approve" {
+                "approve"
+            } else {
+                "revoke"
+            };
             cli(root, &[verb, pkg, "--by", "ui"])?
         }
         ("agents", true, _) => {
             let r = cli(root, &["profile", "list"])?;
-            return Ok(ok_or_err(&r, 500, |s| json!({ "ok": true, "profiles": json_lines(s) })));
+            return Ok(ok_or_err(
+                &r,
+                500,
+                |s| json!({ "ok": true, "profiles": json_lines(s) }),
+            ));
         }
         ("agents", _, true) => {
             let name = body.get("name").and_then(Value::as_str).unwrap_or("");
@@ -872,7 +943,11 @@ fn admin_dispatch(
             if !valid_profile_name(name) {
                 return Ok((400, json!({ "ok": false, "error": BAD_NAME_MSG })));
             }
-            let Some(set) = body.get("set").and_then(Value::as_object).filter(|m| !m.is_empty()) else {
+            let Some(set) = body
+                .get("set")
+                .and_then(Value::as_object)
+                .filter(|m| !m.is_empty())
+            else {
                 return Ok((400, json!({ "ok": false, "error": "need {set}" })));
             };
             let pairs: Vec<String> = set
@@ -903,7 +978,11 @@ fn admin_dispatch(
         }
         ("kits", true, _) => {
             let r = cli(root, &["kit", "list", "--json"])?;
-            return Ok(ok_or_err(&r, 500, |s| json!({ "ok": true, "kits": json_lines(s) })));
+            return Ok(ok_or_err(
+                &r,
+                500,
+                |s| json!({ "ok": true, "kits": json_lines(s) }),
+            ));
         }
         ("kits/add", _, true) => {
             let kit = body.get("kit").and_then(Value::as_str).unwrap_or("");
@@ -929,7 +1008,11 @@ fn admin_dispatch(
                 return Ok((400, json!({ "ok": false, "error": BAD_NAME_MSG })));
             }
             let r = cli(root, &["packages", "--json", "--profile", &profile])?;
-            return Ok(ok_or_err(&r, 500, |s| json!({ "ok": true, "packages": json_lines(s) })));
+            return Ok(ok_or_err(
+                &r,
+                500,
+                |s| json!({ "ok": true, "packages": json_lines(s) }),
+            ));
         }
         ("configs", true, _) => {
             let pkg = q("package");
@@ -940,10 +1023,15 @@ fn admin_dispatch(
             if !r.ok {
                 return Ok((500, json!({ "ok": false, "error": cli_err(&r) })));
             }
-            return Ok((200, match pkg {
-                Some(p) => json!({ "ok": true, "config": json_lines(&r.stdout).into_iter().next().unwrap_or(json!({ "package": p, "toml": "" })) }),
-                None => json!({ "ok": true, "configs": json_lines(&r.stdout) }),
-            }));
+            return Ok((
+                200,
+                match pkg {
+                    Some(p) => {
+                        json!({ "ok": true, "config": json_lines(&r.stdout).into_iter().next().unwrap_or(json!({ "package": p, "toml": "" })) })
+                    }
+                    None => json!({ "ok": true, "configs": json_lines(&r.stdout) }),
+                },
+            ));
         }
         ("configs/set", _, true) => {
             let pkg = body.get("package").and_then(Value::as_str).unwrap_or("");
@@ -988,19 +1076,26 @@ fn admin_dispatch(
                             None => false,
                         }
                     };
-                    (200, json!({
-                        "ok": true,
-                        "exists": true,
-                        "isDir": stat.is_dir(),
-                        "writable": writable,
-                        "path": abs_s,
-                    }))
+                    (
+                        200,
+                        json!({
+                            "ok": true,
+                            "exists": true,
+                            "isDir": stat.is_dir(),
+                            "writable": writable,
+                            "path": abs_s,
+                        }),
+                    )
                 }
             });
         }
         ("proposals", true, _) => {
             let r = cli(root, &["config", "proposals"])?;
-            return Ok(ok_or_err(&r, 500, |s| json!({ "ok": true, "proposals": json_lines(s) })));
+            return Ok(ok_or_err(
+                &r,
+                500,
+                |s| json!({ "ok": true, "proposals": json_lines(s) }),
+            ));
         }
         ("proposals/show", true, _) => {
             let id = q("id").unwrap_or_default();
@@ -1015,13 +1110,22 @@ fn admin_dispatch(
             if !valid_request_id(id) {
                 return Ok((400, json!({ "ok": false, "error": "bad request id" })));
             }
-            let verb = if tail.ends_with("accept") { "accept" } else { "decline" };
+            let verb = if tail.ends_with("accept") {
+                "accept"
+            } else {
+                "decline"
+            };
             cli(root, &["config", verb, id])?
         }
         ("profile", true, _) | ("profile", _, _) if tail == "profile" => {
             return admin_profile(root, method, query, body);
         }
-        _ => return Ok((404, json!({ "ok": false, "error": "unknown admin endpoint" }))),
+        _ => {
+            return Ok((
+                404,
+                json!({ "ok": false, "error": "unknown admin endpoint" }),
+            ))
+        }
     };
     // Shared shape for the simple mutating verbs above (approve/revoke, kits
     // add/unlink, config set, proposals accept/decline): {ok, output, error}.
@@ -1046,32 +1150,45 @@ fn admin_profile(
     if *method == Method::GET {
         let file = profile_toml_path(root, &name);
         let Ok(toml) = std::fs::read_to_string(&file) else {
-            return Ok((404, json!({ "ok": false, "error": format!("no profile.toml for {name}") })));
+            return Ok((
+                404,
+                json!({ "ok": false, "error": format!("no profile.toml for {name}") }),
+            ));
         };
         let parsed = cli(root, &["profile", "get", &name])?;
-        return Ok((200, json!({
-            "ok": true,
-            "name": name,
-            "toml": toml,
-            "profile": if parsed.ok { json_lines(&parsed.stdout).into_iter().next().unwrap_or(Value::Null) } else { Value::Null },
-            "profile_error": if parsed.ok { Value::Null } else { Value::String(human_profile_error(&cli_err(&parsed))) },
-        })));
+        return Ok((
+            200,
+            json!({
+                "ok": true,
+                "name": name,
+                "toml": toml,
+                "profile": if parsed.ok { json_lines(&parsed.stdout).into_iter().next().unwrap_or(Value::Null) } else { Value::Null },
+                "profile_error": if parsed.ok { Value::Null } else { Value::String(human_profile_error(&cli_err(&parsed))) },
+            }),
+        ));
     }
     if *method == Method::PUT {
         let Some(toml) = body.get("toml").and_then(Value::as_str) else {
             return Ok((400, json!({ "ok": false, "error": "need {toml}" })));
         };
-        let tmp = std::env::temp_dir().join(format!("el-profile-candidate-{}.toml", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("el-profile-candidate-{}.toml", std::process::id()));
         std::fs::write(&tmp, toml).context("writing profile candidate")?;
         let v = cli(root, &["profile", "put", &name, &tmp.display().to_string()])?;
         let _ = std::fs::remove_file(&tmp);
         return Ok(if v.ok {
             (200, json!({ "ok": true, "name": name }))
         } else {
-            (400, json!({ "ok": false, "error": human_profile_error(&cli_err(&v)) }))
+            (
+                400,
+                json!({ "ok": false, "error": human_profile_error(&cli_err(&v)) }),
+            )
         });
     }
-    Ok((404, json!({ "ok": false, "error": "unknown admin endpoint" })))
+    Ok((
+        404,
+        json!({ "ok": false, "error": "unknown admin endpoint" }),
+    ))
 }
 
 // ---- kit package summary (port of server.mjs kitPackages/manifestSummary) ----
@@ -1137,12 +1254,19 @@ fn kit_packages(root: &Root, name: &str) -> Result<Option<Value>> {
 /// Parse a leading `---\n…\n---` YAML-ish frontmatter block into key→value.
 fn frontmatter(raw: &str) -> HashMap<String, String> {
     let mut meta = HashMap::new();
-    let Some(rest) = raw.strip_prefix("---\n") else { return meta };
-    let Some(end) = rest.find("\n---") else { return meta };
+    let Some(rest) = raw.strip_prefix("---\n") else {
+        return meta;
+    };
+    let Some(end) = rest.find("\n---") else {
+        return meta;
+    };
     for line in rest[..end].lines() {
         if let Some((k, v)) = line.split_once(':') {
             let k = k.trim();
-            if !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            if !k.is_empty()
+                && k.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
                 let v = v.trim().trim_matches(|c| c == '\'' || c == '"').trim();
                 meta.insert(k.to_string(), v.to_string());
             }
@@ -1168,7 +1292,11 @@ fn manifest_summary(raw: &str) -> Value {
         }
         None
     };
-    let count = |marker: &str| raw.lines().filter(|l| l.trim_start().starts_with(marker)).count();
+    let count = |marker: &str| {
+        raw.lines()
+            .filter(|l| l.trim_start().starts_with(marker))
+            .count()
+    };
     let mode = scalar("mode");
     let run = scalar("run");
     let http = raw.lines().any(|l| {
@@ -1182,7 +1310,11 @@ fn manifest_summary(raw: &str) -> Value {
 
     let mut labels: Vec<String> = Vec::new();
     if let Some(m) = &mode {
-        labels.push(if m == "daemon" { "actor daemon".into() } else { format!("{m} actor") });
+        labels.push(if m == "daemon" {
+            "actor daemon".into()
+        } else {
+            format!("{m} actor")
+        });
     }
     if http {
         labels.push("http service".into());
@@ -1191,12 +1323,22 @@ fn manifest_summary(raw: &str) -> Value {
         labels.push(format!("{hooks} hook{}", if hooks == 1 { "" } else { "s" }));
     }
     if stages > 0 {
-        labels.push(format!("{stages} stage{}", if stages == 1 { "" } else { "s" }));
+        labels.push(format!(
+            "{stages} stage{}",
+            if stages == 1 { "" } else { "s" }
+        ));
     }
     if mcps > 0 {
-        labels.push(format!("{mcps} mcp server{}", if mcps == 1 { "" } else { "s" }));
+        labels.push(format!(
+            "{mcps} mcp server{}",
+            if mcps == 1 { "" } else { "s" }
+        ));
     }
-    let actor = if labels.is_empty() { Value::Null } else { Value::String(labels.join(", ")) };
+    let actor = if labels.is_empty() {
+        Value::Null
+    } else {
+        Value::String(labels.join(", "))
+    };
     let fallback = run
         .as_ref()
         .map(|r| match &mode {
@@ -1204,7 +1346,11 @@ fn manifest_summary(raw: &str) -> Value {
             None => format!("Runs {r}."),
         })
         .unwrap_or_default();
-    let description = if comment.is_empty() { fallback } else { comment };
+    let description = if comment.is_empty() {
+        fallback
+    } else {
+        comment
+    };
 
     json!({
         "actor": actor,
@@ -1238,7 +1384,11 @@ fn leading_comment(raw: &str) -> String {
         }
         lines.push(t.trim_start_matches('#').trim().to_string());
     }
-    lines.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+    lines
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Quoted string values from a single-line TOML array `key = ["a", "b"]`.
@@ -1271,7 +1421,11 @@ fn array_values(raw: &str, key: &str) -> Value {
 
 async fn static_file(req: HttpRequest) -> HttpResponse {
     let raw = req.path();
-    let rel = if raw == "/" { "index.html" } else { raw.trim_start_matches('/') };
+    let rel = if raw == "/" {
+        "index.html"
+    } else {
+        raw.trim_start_matches('/')
+    };
     // include_dir lookups can't traverse out of the embedded tree, but reject
     // obvious traversal so behavior matches the mjs static guard.
     if rel.split('/').any(|seg| seg == "..") {
@@ -1316,7 +1470,11 @@ fn weblog(tag: &str, msg: &str) {
         if !path.is_empty() {
             use std::io::Write as _;
             let line = format!("{} [web:{tag}] {msg}\n", chrono::Utc::now().to_rfc3339());
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
                 let _ = f.write_all(line.as_bytes());
             }
         }
@@ -1369,7 +1527,10 @@ fn action_result(r: &CliOut) -> (u16, Value) {
     if r.ok {
         (200, json!({ "ok": true, "output": r.stdout }))
     } else {
-        (400, json!({ "ok": false, "output": r.stdout, "error": cli_err(r) }))
+        (
+            400,
+            json!({ "ok": false, "output": r.stdout, "error": cli_err(r) }),
+        )
     }
 }
 
@@ -1378,7 +1539,10 @@ fn profile_result(r: &CliOut) -> (u16, Value) {
     if r.ok {
         (200, json!({ "ok": true, "output": r.stdout }))
     } else {
-        (400, json!({ "ok": false, "error": human_profile_error(&cli_err(r)) }))
+        (
+            400,
+            json!({ "ok": false, "error": human_profile_error(&cli_err(r)) }),
+        )
     }
 }
 
@@ -1497,7 +1661,10 @@ fn percent_decode(s: &str) -> String {
 /// local agents send no Origin and pass (entry 3 already owns local processes).
 fn origin_ok(req: &HttpRequest) -> bool {
     let headers = req.headers();
-    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("");
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
     if !host_is_local(host) {
         return false;
     }
@@ -1526,7 +1693,9 @@ fn db_path(root: &Root) -> Option<PathBuf> {
 fn valid_profile_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn valid_pkg_name(name: &str) -> bool {
@@ -1535,8 +1704,7 @@ fn valid_pkg_name(name: &str) -> bool {
         Some(c) if c.is_ascii_alphanumeric() => {}
         _ => return false,
     }
-    name.len() <= 64
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    name.len() <= 64 && chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
 fn valid_request_id(id: &str) -> bool {
@@ -1576,10 +1744,16 @@ fn human_profile_error(raw: &str) -> String {
 /// real TOML arrays, strings get quoted, scalars pass bare.
 fn toml_value(v: &Value) -> String {
     match v {
-        Value::Array(a) => format!("[{}]", a.iter().map(toml_value).collect::<Vec<_>>().join(", ")),
+        Value::Array(a) => format!(
+            "[{}]",
+            a.iter().map(toml_value).collect::<Vec<_>>().join(", ")
+        ),
         Value::Object(o) => format!(
             "{{ {} }}",
-            o.iter().map(|(k, val)| format!("{k} = {}", toml_value(val))).collect::<Vec<_>>().join(", ")
+            o.iter()
+                .map(|(k, val)| format!("{k} = {}", toml_value(val)))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}")),
         other => other.to_string(),
@@ -1658,7 +1832,10 @@ fn message_text(content: &Value) -> String {
             if content.get("truncated") == Some(&Value::Bool(true)) {
                 if let Some(p) = content.get("preview") {
                     if !p.is_null() {
-                        return p.as_str().map(str::to_string).unwrap_or_else(|| p.to_string());
+                        return p
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| p.to_string());
                     }
                 }
             }
@@ -1728,7 +1905,13 @@ fn source_for(session: &str, sender: &Option<String>, payload: &Value, owner: &s
     }
     let cleaned: String = from
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let cleaned: String = cleaned.chars().take(20).collect();
     if cleaned.is_empty() {
@@ -1756,7 +1939,10 @@ struct Convs {
 
 impl Convs {
     fn new() -> Self {
-        Convs { map: HashMap::new(), order: Vec::new() }
+        Convs {
+            map: HashMap::new(),
+            order: Vec::new(),
+        }
     }
 
     fn ensure(&mut self, session: &str, seed_source: Option<&str>, seed_ts: &str) -> &mut Conv {
@@ -1838,20 +2024,33 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
         let corrs: Vec<String> = corr_to_session.keys().cloned().collect();
         let human_rows = query_human_by_corr(&conn, &corrs, 5000)?;
         for row in &human_rows {
-            let Some(corr) = &row.correlation_id else { continue };
-            let Some(session) = corr_to_session.get(corr).cloned() else { continue };
+            let Some(corr) = &row.correlation_id else {
+                continue;
+            };
+            let Some(session) = corr_to_session.get(corr).cloned() else {
+                continue;
+            };
             let payload = parse_payload(&row.payload);
             let created = row.created_at.clone().unwrap_or_default();
             if payload.get("failed").is_some_and(truthy) {
-                let err = payload.get("error").and_then(Value::as_str).unwrap_or("the agent failed");
+                let err = payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the agent failed");
                 convs.touch(&session, "failed", err, true, &created);
             } else if payload.get("question").is_some_and(|v| !v.is_null()) {
-                let q = payload.get("question").and_then(Value::as_str).unwrap_or("");
+                let q = payload
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 convs.touch(&session, "ask", q, true, &created);
             } else if let Some(t) = payload.get("text").and_then(Value::as_str) {
                 convs.touch(&session, "agent", t, true, &created);
             } else if let Some(a) = payload.get("answer").filter(|v| !v.is_null()) {
-                let a = a.as_str().map(str::to_string).unwrap_or_else(|| a.to_string());
+                let a = a
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| a.to_string());
                 convs.touch(&session, "you", &a, true, &created);
             }
         }
@@ -1876,7 +2075,10 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
             })?;
             for r in rows {
                 let (session_id, role, content, created) = r?;
-                let text = content.as_deref().map(|c| message_text(&parse_stored(c))).unwrap_or_default();
+                let text = content
+                    .as_deref()
+                    .map(|c| message_text(&parse_stored(c)))
+                    .unwrap_or_default();
                 let role = normalize_role(&role);
                 // count=false: turns already counted from the in/agent prompt +
                 // in/human reply events; counting messages too double-counts.
@@ -1943,20 +2145,27 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
             if role != "user" && role != "assistant" {
                 continue;
             }
-            let text = content.as_deref().map(|c| message_text(&parse_stored(c))).unwrap_or_default();
+            let text = content
+                .as_deref()
+                .map(|c| message_text(&parse_stored(c)))
+                .unwrap_or_default();
             if text.is_empty() {
                 continue;
             }
             let cls = if role == "user" { "you" } else { "agent" };
-            add_message(&mut messages, &mut seen, json!({
-                "id": format!("m-{id}"),
-                "type": "msg",
-                "who": cls,
-                "cls": cls,
-                "text": text,
-                "ts": created,
-                "event_id": event_id,
-            }));
+            add_message(
+                &mut messages,
+                &mut seen,
+                json!({
+                    "id": format!("m-{id}"),
+                    "type": "msg",
+                    "who": cls,
+                    "cls": cls,
+                    "text": text,
+                    "ts": created,
+                    "event_id": event_id,
+                }),
+            );
         }
     }
 
@@ -1966,14 +2175,18 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
         let mut stmt = conn.prepare(
             "SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type LIKE 'in/agent/%' AND (correlation_id = ? OR id = ?) ORDER BY id ASC LIMIT 4000",
         )?;
-        let rows = stmt.query_map([suffix, suffix], map_event)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt
+            .query_map([suffix, suffix], map_event)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     } else {
         let like = format!("%\"session\":\"{session}\"%");
         let mut stmt = conn.prepare(
             "SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type LIKE 'in/agent/%' AND payload LIKE ? ORDER BY id ASC LIMIT 4000",
         )?;
-        let rows = stmt.query_map([like], map_event)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt
+            .query_map([like], map_event)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
 
@@ -1993,16 +2206,20 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
             .and_then(Value::as_str)
             .or_else(|| payload.get("text").and_then(Value::as_str))
         {
-            add_message(&mut messages, &mut seen, json!({
-                "id": format!("e-{}", row.id),
-                "type": "msg",
-                "who": "you",
-                "cls": "you",
-                "text": text,
-                "corr": row.correlation_id,
-                "ts": row.created_at,
-                "event_id": row.id,
-            }));
+            add_message(
+                &mut messages,
+                &mut seen,
+                json!({
+                    "id": format!("e-{}", row.id),
+                    "type": "msg",
+                    "who": "you",
+                    "cls": "you",
+                    "text": text,
+                    "corr": row.correlation_id,
+                    "ts": row.created_at,
+                    "event_id": row.id,
+                }),
+            );
         }
     }
 
@@ -2011,41 +2228,53 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
         for row in &human_rows {
             let payload = parse_payload(&row.payload);
             if payload.get("failed").is_some_and(truthy) {
-                add_message(&mut messages, &mut seen, json!({
-                    "id": format!("e-{}", row.id),
-                    "key": format!("event:{}:failed", row.id),
-                    "type": "msg",
-                    "who": "agent failed",
-                    "cls": "failed",
-                    "text": payload.get("error").and_then(Value::as_str).unwrap_or("the agent failed with no detail."),
-                    "corr": row.correlation_id,
-                    "failed": true,
-                    "ts": row.created_at,
-                    "event_id": row.id,
-                }));
+                add_message(
+                    &mut messages,
+                    &mut seen,
+                    json!({
+                        "id": format!("e-{}", row.id),
+                        "key": format!("event:{}:failed", row.id),
+                        "type": "msg",
+                        "who": "agent failed",
+                        "cls": "failed",
+                        "text": payload.get("error").and_then(Value::as_str).unwrap_or("the agent failed with no detail."),
+                        "corr": row.correlation_id,
+                        "failed": true,
+                        "ts": row.created_at,
+                        "event_id": row.id,
+                    }),
+                );
             } else if payload.get("question").is_some_and(|v| !v.is_null()) {
-                add_message(&mut messages, &mut seen, json!({
-                    "id": format!("e-{}", row.id),
-                    "key": format!("event:{}:ask", row.id),
-                    "type": "ask",
-                    "corr": row.correlation_id,
-                    "payload": payload,
-                    "answered": Value::Null,
-                    "ts": row.created_at,
-                    "event_id": row.id,
-                }));
+                add_message(
+                    &mut messages,
+                    &mut seen,
+                    json!({
+                        "id": format!("e-{}", row.id),
+                        "key": format!("event:{}:ask", row.id),
+                        "type": "ask",
+                        "corr": row.correlation_id,
+                        "payload": payload,
+                        "answered": Value::Null,
+                        "ts": row.created_at,
+                        "event_id": row.id,
+                    }),
+                );
             } else if let Some(t) = payload.get("text").and_then(Value::as_str) {
-                add_message(&mut messages, &mut seen, json!({
-                    "id": format!("e-{}", row.id),
-                    "key": format!("event:{}:agent", row.id),
-                    "type": "msg",
-                    "who": "agent",
-                    "cls": "agent",
-                    "text": t,
-                    "corr": row.correlation_id,
-                    "ts": row.created_at,
-                    "event_id": row.id,
-                }));
+                add_message(
+                    &mut messages,
+                    &mut seen,
+                    json!({
+                        "id": format!("e-{}", row.id),
+                        "key": format!("event:{}:agent", row.id),
+                        "type": "msg",
+                        "who": "agent",
+                        "cls": "agent",
+                        "text": t,
+                        "corr": row.correlation_id,
+                        "ts": row.created_at,
+                        "event_id": row.id,
+                    }),
+                );
             }
         }
     }
@@ -2058,7 +2287,11 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
     Ok(Value::Array(messages))
 }
 
-fn query_human_by_corr(conn: &rusqlite::Connection, corrs: &[String], limit: i64) -> Result<Vec<EventRow>> {
+fn query_human_by_corr(
+    conn: &rusqlite::Connection,
+    corrs: &[String],
+    limit: i64,
+) -> Result<Vec<EventRow>> {
     if corrs.is_empty() {
         return Ok(Vec::new());
     }
@@ -2080,7 +2313,13 @@ fn conv_key(m: &Value) -> String {
         .get("cls")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| if who == "you" { "you".into() } else { "agent".into() });
+        .unwrap_or_else(|| {
+            if who == "you" {
+                "you".into()
+            } else {
+                "agent".into()
+            }
+        });
     let corr = m.get("corr").and_then(Value::as_str);
     let event_id = m.get("event_id").map(|v| match v {
         Value::String(s) => s.clone(),
@@ -2239,7 +2478,8 @@ mod route_tests {
         let no_content = json!({ "session": "code-1", "name": "note", "owner": "a" });
         assert!(block_set_args(&no_content).is_err());
         // Unsafe session id is rejected by the same guard the read routes use.
-        let bad_sess = json!({ "session": "code\"x", "name": "note", "owner": "a", "content": "y" });
+        let bad_sess =
+            json!({ "session": "code\"x", "name": "note", "owner": "a", "content": "y" });
         assert!(block_set_args(&bad_sess).is_err());
         // Empty content IS allowed (clearing a block is a legitimate edit).
         let ok = json!({ "session": "code-1", "name": "note", "owner": "a", "content": "" });
@@ -2255,7 +2495,10 @@ mod route_tests {
         // Local host, no Origin (curl / local agent) → allowed.
         assert!(host_is_local("127.0.0.1:8080"));
         // Same-origin browser POST → allowed.
-        assert_eq!(origin_host("http://127.0.0.1:8080/").as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(
+            origin_host("http://127.0.0.1:8080/").as_deref(),
+            Some("127.0.0.1:8080")
+        );
         // Cross-origin: the attacker's Origin host does not match the local Host.
         let host = "127.0.0.1:8080";
         let evil = origin_host("http://evil.example/page").unwrap();

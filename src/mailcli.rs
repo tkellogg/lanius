@@ -166,9 +166,8 @@ pub fn recent_mail(root: &Root, limit: usize) -> Result<Vec<MailRow>> {
 /// (`exec::report_agent_failure`); a worker-completion delivery may also carry
 /// `failed`. We scan every event on the correlation for the flag.
 fn correlation_failed(conn: &rusqlite::Connection, correlation: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT COALESCE(payload,'') FROM events WHERE correlation_id = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT COALESCE(payload,'') FROM events WHERE correlation_id = ?1")?;
     let rows = stmt
         .query_map([correlation], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -322,12 +321,13 @@ pub fn recent_rooms(root: &Root, recent_n: usize) -> Result<Vec<RoomRow>> {
     for room in &order {
         if let Some(rr) = rooms.get_mut(room) {
             if room.starts_with("wd-") {
-                let resolved = rr.members.iter().find_map(|m| {
-                    match crate::codesession::read_record(root, &m.session) {
-                        Ok(Some(rec)) if !rec.workdir.is_empty() => Some(rec.workdir),
-                        _ => None,
-                    }
-                });
+                let resolved =
+                    rr.members.iter().find_map(|m| {
+                        match crate::codesession::read_record(root, &m.session) {
+                            Ok(Some(rec)) if !rec.workdir.is_empty() => Some(rec.workdir),
+                            _ => None,
+                        }
+                    });
                 match resolved {
                     Some(path) => {
                         let base = std::path::Path::new(&path)
@@ -386,18 +386,31 @@ pub fn rooms_cmd(root: &Root, rest: &[String]) -> Result<()> {
             println!(
                 "room {} {}({} member(s), {} claim(s))",
                 r.label,
-                if r.label != r.room { format!("[{}] ", r.room) } else { String::new() },
+                if r.label != r.room {
+                    format!("[{}] ", r.room)
+                } else {
+                    String::new()
+                },
                 r.members.len(),
                 r.claims.len()
             );
             for m in &r.members {
-                println!("  member {} ({}) {}", m.session, m.agent_noun, if m.live { "live" } else { "stale" });
+                println!(
+                    "  member {} ({}) {}",
+                    m.session,
+                    m.agent_noun,
+                    if m.live { "live" } else { "stale" }
+                );
             }
             for c in &r.claims {
                 println!("  claim {} <- {}", c.path, c.session);
             }
             for msg in &r.channel {
-                println!("  channel {}: {}", msg.from.as_deref().unwrap_or("?"), msg.message);
+                println!(
+                    "  channel {}: {}",
+                    msg.from.as_deref().unwrap_or("?"),
+                    msg.message
+                );
             }
         }
     }
@@ -489,7 +502,11 @@ pub fn session_blocks(root: &Root, session: &str) -> Result<Vec<BlockRow>> {
     }
 
     // Ephemeral channel block: the room's recent shared-channel traffic, owner-less.
-    if let Some(room) = rec.as_ref().and_then(|r| r.room.clone()).filter(|s| !s.is_empty()) {
+    if let Some(room) = rec
+        .as_ref()
+        .and_then(|r| r.room.clone())
+        .filter(|s| !s.is_empty())
+    {
         let msgs = crate::codesession::room_recent(root, &room, 5).unwrap_or_default();
         if !msgs.is_empty() {
             let mut content =
@@ -532,7 +549,10 @@ pub fn blocks_cmd(root: &Root, rest: &[String]) -> Result<()> {
     } else {
         for b in &rows {
             let tag = if b.ephemeral { " [ephemeral]" } else { "" };
-            println!("{} ({}/{}, p{}){tag}", b.name, b.scope, b.placement, b.priority);
+            println!(
+                "{} ({}/{}, p{}){tag}",
+                b.name, b.scope, b.placement, b.priority
+            );
         }
     }
     Ok(())
@@ -611,7 +631,15 @@ mod tests {
 
     /// Emit a delivery exactly as `record_delivery` does: an `in/agent/<noun>/<session>`
     /// event with sender + correlation + priority + a `{prompt}` payload.
-    fn deliver(root: &Root, from: &str, noun: &str, session: &str, msg: &str, prio: i32, corr: &str) -> i64 {
+    fn deliver(
+        root: &Root,
+        from: &str,
+        noun: &str,
+        session: &str,
+        msg: &str,
+        prio: i32,
+        corr: &str,
+    ) -> i64 {
         let conn = crate::db::open(root).unwrap();
         crate::db::init_schema(&conn).unwrap();
         let mailbox = format!(
@@ -637,9 +665,33 @@ mod tests {
     fn projects_from_to_priority_state_threaded_by_correlation() {
         let root = temp_root("basic");
         // A delivered to B (normal), A to C (high-priority), A to D (will fail).
-        let id_normal = deliver(&root, "code-a0000001", "claude-code", "code-b0000001", "do x", 0, "corr-normal");
-        let id_high = deliver(&root, "code-a0000001", "claude-code", "code-c0000001", "urgent", 9, "corr-high");
-        let id_fail = deliver(&root, "code-a0000001", "claude-code", "code-d0000001", "risky", 0, "corr-fail");
+        let id_normal = deliver(
+            &root,
+            "code-a0000001",
+            "claude-code",
+            "code-b0000001",
+            "do x",
+            0,
+            "corr-normal",
+        );
+        let id_high = deliver(
+            &root,
+            "code-a0000001",
+            "claude-code",
+            "code-c0000001",
+            "urgent",
+            9,
+            "corr-high",
+        );
+        let id_fail = deliver(
+            &root,
+            "code-a0000001",
+            "claude-code",
+            "code-d0000001",
+            "risky",
+            0,
+            "corr-fail",
+        );
 
         // The fail one's correlation gets a {failed:true} reply (failure-mail).
         let conn = crate::db::open(&root).unwrap();
@@ -669,10 +721,16 @@ mod tests {
         assert_eq!(normal.preview, "do x");
 
         let high = rows.iter().find(|r| r.id == id_high).unwrap();
-        assert_eq!(high.priority, 9, "high-priority delivery surfaces its priority");
+        assert_eq!(
+            high.priority, 9,
+            "high-priority delivery surfaces its priority"
+        );
 
         let failed = rows.iter().find(|r| r.id == id_fail).unwrap();
-        assert!(failed.failed, "the failure-mail correlation flags the delivery failed");
+        assert!(
+            failed.failed,
+            "the failure-mail correlation flags the delivery failed"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -684,7 +742,10 @@ mod tests {
         let rooms = recent_rooms(&root, 5).unwrap();
         assert!(rooms.is_empty(), "no rooms with members → empty, not error");
         let blocks = session_blocks(&root, "code-nobody1").unwrap();
-        assert!(blocks.is_empty(), "a session with no blocks → empty, not error");
+        assert!(
+            blocks.is_empty(),
+            "a session with no blocks → empty, not error"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -693,7 +754,14 @@ mod tests {
     fn rooms_project_roster_claims_and_channel() {
         let root = temp_root("rooms");
         // Two members in one room: one live (our own pid), one a dead ghost.
-        crate::codesession::join_room(&root, "room-1", "code-live0001", "claude-code", std::process::id() as i32).unwrap();
+        crate::codesession::join_room(
+            &root,
+            "room-1",
+            "code-live0001",
+            "claude-code",
+            std::process::id() as i32,
+        )
+        .unwrap();
         crate::codesession::join_room(&root, "room-1", "code-dead0001", "codex", i32::MAX).unwrap();
         // The live member holds an edit-claim.
         crate::codesession::add_claim(&root, "room-1", "code-live0001", "src/foo.rs").unwrap();
@@ -715,9 +783,17 @@ mod tests {
         let r = &rooms[0];
         assert_eq!(r.room, "room-1");
         assert_eq!(r.members.len(), 2, "both members in the roster");
-        let live = r.members.iter().find(|m| m.session == "code-live0001").unwrap();
+        let live = r
+            .members
+            .iter()
+            .find(|m| m.session == "code-live0001")
+            .unwrap();
         assert!(live.live, "the live member's pid is alive");
-        let dead = r.members.iter().find(|m| m.session == "code-dead0001").unwrap();
+        let dead = r
+            .members
+            .iter()
+            .find(|m| m.session == "code-dead0001")
+            .unwrap();
         assert!(!dead.live, "the ghost member reads stale (liveness honest)");
         // The claim is attributed to its holder.
         assert_eq!(r.claims.len(), 1);
@@ -749,11 +825,21 @@ mod tests {
             },
         )
         .unwrap();
-        crate::codesession::join_room(&root, "wd-deadbeef", "code-wdsess01", "claude-code", std::process::id() as i32).unwrap();
+        crate::codesession::join_room(
+            &root,
+            "wd-deadbeef",
+            "code-wdsess01",
+            "claude-code",
+            std::process::id() as i32,
+        )
+        .unwrap();
 
         let rooms = recent_rooms(&root, 5).unwrap();
         let r = rooms.iter().find(|r| r.room == "wd-deadbeef").unwrap();
-        assert_eq!(r.label, "myproject", "wd- room label is the workdir basename");
+        assert_eq!(
+            r.label, "myproject",
+            "wd- room label is the workdir basename"
+        );
         assert_eq!(r.workdir, Some("/some/dir/myproject".to_string()));
         std::fs::remove_dir_all(&root.dir).ok();
     }
@@ -783,26 +869,52 @@ mod tests {
         .unwrap();
         // A durable session-scope block owned by the session's agent noun.
         let conn = crate::db::open(&root).unwrap();
-        let mut blk = crate::context_blocks::ContextBlock::new("estimate", "{\"dollars\":0.4}", "claude-code");
+        let mut blk = crate::context_blocks::ContextBlock::new(
+            "estimate",
+            "{\"dollars\":0.4}",
+            "claude-code",
+        );
         blk.scope = crate::context_blocks::Scope::Session;
         crate::context_store::upsert_block(&conn, "default", &blk, "code-insp0001", None).unwrap();
         // An unseen delivery in the session's mailbox → the live ephemeral inbox block.
-        deliver(&root, "code-planner1", "claude-code", "code-insp0001", "ping", 0, "corr-i");
+        deliver(
+            &root,
+            "code-planner1",
+            "claude-code",
+            "code-insp0001",
+            "ping",
+            0,
+            "corr-i",
+        );
 
         let blocks = session_blocks(&root, "code-insp0001").unwrap();
         let durable = blocks.iter().find(|b| b.name == "estimate").unwrap();
         assert!(!durable.ephemeral, "durable block is not ephemeral");
         assert_eq!(durable.scope, "session");
         let inbox = blocks.iter().find(|b| b.name == "inbox").unwrap();
-        assert!(inbox.ephemeral, "the inbox block is ephemeral (live, not stored)");
-        assert_eq!(inbox.owner, "", "ephemeral inbox is owner-less (rendered under the session)");
+        assert!(
+            inbox.ephemeral,
+            "the inbox block is ephemeral (live, not stored)"
+        );
+        assert_eq!(
+            inbox.owner, "",
+            "ephemeral inbox is owner-less (rendered under the session)"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
     #[test]
     fn mid_cycle_is_a_flag_not_a_duplicate_row() {
         let root = temp_root("midcycle");
-        let id = deliver(&root, "code-a0000001", "claude-code", "code-b0000001", "urgent", 9, "corr-mc");
+        let id = deliver(
+            &root,
+            "code-a0000001",
+            "claude-code",
+            "code-b0000001",
+            "urgent",
+            9,
+            "corr-mc",
+        );
         // Record the SAME event as delivered mid-cycle (the double-channel case).
         let conn = crate::db::open(&root).unwrap();
         conn.execute(

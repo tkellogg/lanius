@@ -124,7 +124,11 @@ pub struct SessionEvent {
 pub struct SessionDetail {
     pub session: SessionStat,
     pub events: Vec<SessionEvent>,
-    pub resume_command: String,
+    /// The per-tool INTERACTIVE-resume suggestion (`elanus code <tool> --resume
+    /// <native>`), or None when the tool has no clean managed passthrough (e.g.
+    /// codex/opencode) — the UI then shows no resume hint. Suggestive only; resume
+    /// is not an elanus verb (see `codeagent::interactive_resume_hint`).
+    pub resume_command: Option<String>,
     pub children: Vec<SessionStat>,
 }
 
@@ -155,16 +159,20 @@ fn now_iso() -> String {
 }
 
 fn int_field(payload: &Value, key: &str) -> Option<i64> {
-    payload
-        .get(key)
-        .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok())))
+    payload.get(key).and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+    })
 }
 
 fn usage_field(payload: &Value, key: &str) -> i64 {
     payload
         .get("usage")
         .and_then(|usage| usage.get(key))
-        .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok())))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+        })
         .unwrap_or(0)
 }
 
@@ -333,7 +341,13 @@ fn apply_event(conn: &Connection, topic: &str, payload: &Value) -> rusqlite::Res
                    exit_code=COALESCE(excluded.exit_code, code_session_stats.exit_code),
                    last_status='done',
                    updated_at=excluded.updated_at",
-                params![session, noun, ts, int_field(payload, "exit_code"), updated_at],
+                params![
+                    session,
+                    noun,
+                    ts,
+                    int_field(payload, "exit_code"),
+                    updated_at
+                ],
             )?;
         }
         _ => {
@@ -522,8 +536,10 @@ pub fn list_sessions_raw(root: &Root) -> Result<Vec<SessionStat>> {
         Ok(s) => s,
         Err(_) => return Ok(Vec::new()), // projection table not created yet
     };
-    let mut out: Vec<SessionStat> =
-        stmt.query_map([], row_to_stat)?.filter_map(Result::ok).collect();
+    let mut out: Vec<SessionStat> = stmt
+        .query_map([], row_to_stat)?
+        .filter_map(Result::ok)
+        .collect();
     let overrides = native_overrides(&conn);
     for s in &mut out {
         fill_native(s, &overrides);
@@ -546,9 +562,8 @@ fn native_overrides(conn: &Connection) -> std::collections::HashMap<String, Stri
     ) else {
         return map;
     };
-    let Ok(rows) = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    }) else {
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    else {
         return map;
     };
     for (es, ns) in rows.flatten() {
@@ -560,7 +575,11 @@ fn native_overrides(conn: &Connection) -> std::collections::HashMap<String, Stri
 /// Fill a stat's `native_session` from the durable override when the obs-derived
 /// copy is null/empty (the robustness LEFT JOIN the handoff calls out).
 fn fill_native(s: &mut SessionStat, overrides: &std::collections::HashMap<String, String>) {
-    let empty = s.native_session.as_deref().map(str::is_empty).unwrap_or(true);
+    let empty = s
+        .native_session
+        .as_deref()
+        .map(str::is_empty)
+        .unwrap_or(true);
     if empty {
         if let Some(ns) = overrides.get(&s.elanus_session) {
             s.native_session = Some(ns.clone());
@@ -689,7 +708,9 @@ pub fn session_detail(root: &Root, id: &str) -> Result<Option<SessionDetail>> {
     let conn = crate::db::open(root)?;
     // Confirm the projection exists; an absent table means "no such session".
     if conn
-        .prepare(&format!("SELECT {STATS_COLUMNS} FROM code_session_stats LIMIT 0"))
+        .prepare(&format!(
+            "SELECT {STATS_COLUMNS} FROM code_session_stats LIMIT 0"
+        ))
         .is_err()
     {
         return Ok(None);
@@ -747,14 +768,18 @@ pub fn session_detail(root: &Root, id: &str) -> Result<Option<SessionDetail>> {
         .into_iter()
         .filter(|t| t.parent.as_deref() == Some(session.elanus_session.as_str()))
         .collect();
-    // The resume command targets the LATEST incarnation (the representative wire
-    // id), i.e. the live native thread.
-    let id = session.elanus_session.clone();
+    // The resume hint targets the live native thread of the latest incarnation,
+    // expressed per-tool (managed passthrough). None when the tool has no clean
+    // passthrough resume — the UI then omits the hint entirely.
+    let resume_command = match (session.tool.as_deref(), session.native_session.as_deref()) {
+        (Some(tool), Some(native)) => crate::codeagent::interactive_resume_hint(tool, native),
+        _ => None,
+    };
 
     Ok(Some(SessionDetail {
         session,
         events,
-        resume_command: format!("elanus code resume {id} \"<message>\""),
+        resume_command,
         children,
     }))
 }
@@ -845,12 +870,30 @@ mod tests {
 
         assert_eq!(project_trace(&root).unwrap(), 5);
         let conn = crate::db::open(&root).unwrap();
-        let row: (Option<String>, Option<String>, Option<String>, i64, i64, Option<String>, Option<i64>) = conn
+        let row: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            Option<String>,
+            Option<i64>,
+        ) = conn
             .query_row(
                 "SELECT parent, model, effort, input_tokens, output_tokens, last_status, exit_code
                  FROM code_session_stats WHERE elanus_session='code-test123'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(row.0.as_deref(), Some("code-parent"));
@@ -929,7 +972,11 @@ mod tests {
         if let Some(p) = parent {
             start["parent"] = json!(p);
         }
-        append_trace(root, &format!("obs/agent/claude-code/{elanus}/session/start"), start);
+        append_trace(
+            root,
+            &format!("obs/agent/claude-code/{elanus}/session/start"),
+            start,
+        );
         append_trace(
             root,
             &format!("obs/agent/claude-code/{elanus}/session/started"),
@@ -956,9 +1003,33 @@ mod tests {
     fn tg1_three_incarnations_fold_to_one_thread() {
         let root = temp_root("tg1-fold");
         // Three manual --resume relaunches: fresh elanus id each, SAME cc_session.
-        cc_incarnation(&root, "code-aaa", "cc-thread-1", None, "2026-06-20T00:00:00", 10, 1);
-        cc_incarnation(&root, "code-bbb", "cc-thread-1", None, "2026-06-20T01:00:00", 20, 2);
-        cc_incarnation(&root, "code-ccc", "cc-thread-1", None, "2026-06-20T02:00:00", 30, 3);
+        cc_incarnation(
+            &root,
+            "code-aaa",
+            "cc-thread-1",
+            None,
+            "2026-06-20T00:00:00",
+            10,
+            1,
+        );
+        cc_incarnation(
+            &root,
+            "code-bbb",
+            "cc-thread-1",
+            None,
+            "2026-06-20T01:00:00",
+            20,
+            2,
+        );
+        cc_incarnation(
+            &root,
+            "code-ccc",
+            "cc-thread-1",
+            None,
+            "2026-06-20T02:00:00",
+            30,
+            3,
+        );
         // A second daemon-driven resume on the latest incarnation.
         append_trace(
             &root,
@@ -998,11 +1069,23 @@ mod tests {
             "obs/agent/claude-code/code-nonative/session/start",
             json!({ "ts": "2026-06-20T00:00:00.000Z", "tool": "claude" }),
         );
-        cc_incarnation(&root, "code-withnative", "cc-x", None, "2026-06-20T01:00:00", 5, 1);
+        cc_incarnation(
+            &root,
+            "code-withnative",
+            "cc-x",
+            None,
+            "2026-06-20T01:00:00",
+            5,
+            1,
+        );
         project_trace(&root).unwrap();
 
         let threads = list_sessions(&root).unwrap();
-        assert_eq!(threads.len(), 2, "the null-native incarnation does not fold");
+        assert_eq!(
+            threads.len(),
+            2,
+            "the null-native incarnation does not fold"
+        );
         let null_thread = threads
             .iter()
             .find(|t| t.elanus_session == "code-nonative")
@@ -1015,8 +1098,24 @@ mod tests {
     #[test]
     fn tg1_detail_unions_timeline_by_any_incarnation_id() {
         let root = temp_root("tg1-detail");
-        cc_incarnation(&root, "code-i1", "cc-union", None, "2026-06-20T00:00:00", 1, 1);
-        cc_incarnation(&root, "code-i2", "cc-union", None, "2026-06-20T01:00:00", 1, 1);
+        cc_incarnation(
+            &root,
+            "code-i1",
+            "cc-union",
+            None,
+            "2026-06-20T00:00:00",
+            1,
+            1,
+        );
+        cc_incarnation(
+            &root,
+            "code-i2",
+            "cc-union",
+            None,
+            "2026-06-20T01:00:00",
+            1,
+            1,
+        );
         project_trace(&root).unwrap();
 
         // Resolve by the OLDER incarnation id, the LATEST id, and the native key —
@@ -1025,8 +1124,11 @@ mod tests {
             let d = session_detail(&root, id).unwrap().expect("thread resolves");
             assert_eq!(d.session.elanus_session, "code-i2", "rep is latest");
             // Two tool/edit events, one per incarnation, ts-ordered.
-            let edits: Vec<&SessionEvent> =
-                d.events.iter().filter(|e| e.kind.as_deref() == Some("tool/edit/call")).collect();
+            let edits: Vec<&SessionEvent> = d
+                .events
+                .iter()
+                .filter(|e| e.kind.as_deref() == Some("tool/edit/call"))
+                .collect();
             assert_eq!(edits.len(), 2, "union spans both incarnations for id {id}");
             assert!(
                 edits[0].ts <= edits[1].ts,
@@ -1035,8 +1137,14 @@ mod tests {
             // Each event still labeled by its source incarnation.
             assert_eq!(edits[0].elanus_session, "code-i1");
             assert_eq!(edits[1].elanus_session, "code-i2");
-            // Resume targets the latest incarnation.
-            assert!(d.resume_command.contains("code-i2"));
+            // The resume hint is the per-tool managed relaunch targeting the
+            // (shared) native thread, not an elanus verb — `elanus code claude
+            // --resume <native>`.
+            assert_eq!(
+                d.resume_command.as_deref(),
+                Some("elanus code claude --resume cc-union"),
+                "per-tool interactive-resume hint for id {id}"
+            );
         }
         std::fs::remove_dir_all(&root.dir).ok();
     }
@@ -1046,21 +1154,66 @@ mod tests {
         let root = temp_root("tg2-tree");
         // A planner spawns a worker; the worker is then manually resumed twice
         // (three incarnations, one native thread), each carrying the planner edge.
-        cc_incarnation(&root, "code-planner", "cc-planner", None, "2026-06-20T00:00:00", 1, 1);
-        cc_incarnation(&root, "code-w1", "cc-worker", Some("code-planner"), "2026-06-20T00:10:00", 1, 1);
-        cc_incarnation(&root, "code-w2", "cc-worker", Some("code-planner"), "2026-06-20T00:20:00", 1, 1);
-        cc_incarnation(&root, "code-w3", "cc-worker", Some("code-planner"), "2026-06-20T00:30:00", 1, 1);
+        cc_incarnation(
+            &root,
+            "code-planner",
+            "cc-planner",
+            None,
+            "2026-06-20T00:00:00",
+            1,
+            1,
+        );
+        cc_incarnation(
+            &root,
+            "code-w1",
+            "cc-worker",
+            Some("code-planner"),
+            "2026-06-20T00:10:00",
+            1,
+            1,
+        );
+        cc_incarnation(
+            &root,
+            "code-w2",
+            "cc-worker",
+            Some("code-planner"),
+            "2026-06-20T00:20:00",
+            1,
+            1,
+        );
+        cc_incarnation(
+            &root,
+            "code-w3",
+            "cc-worker",
+            Some("code-planner"),
+            "2026-06-20T00:30:00",
+            1,
+            1,
+        );
         project_trace(&root).unwrap();
 
         let threads = list_sessions(&root).unwrap();
         // Two threads: the planner and the (folded) worker — NOT four.
         assert_eq!(threads.len(), 2);
-        let worker = threads.iter().find(|t| t.native_session.as_deref() == Some("cc-worker")).unwrap();
-        let planner = threads.iter().find(|t| t.native_session.as_deref() == Some("cc-planner")).unwrap();
-        assert_eq!(worker.incarnations.len(), 3, "three resumes fold to one worker node");
+        let worker = threads
+            .iter()
+            .find(|t| t.native_session.as_deref() == Some("cc-worker"))
+            .unwrap();
+        let planner = threads
+            .iter()
+            .find(|t| t.native_session.as_deref() == Some("cc-planner"))
+            .unwrap();
+        assert_eq!(
+            worker.incarnations.len(),
+            3,
+            "three resumes fold to one worker node"
+        );
         // The worker's parent edge points at the planner's representative wire id
         // (an elanus_session the UI already keys on), NOT a raw native id.
-        assert_eq!(worker.parent.as_deref(), Some(planner.elanus_session.as_str()));
+        assert_eq!(
+            worker.parent.as_deref(),
+            Some(planner.elanus_session.as_str())
+        );
 
         // Roots (parentless threads) = just the planner. The worker is NOT a root,
         // and three resumes did NOT produce three roots.
@@ -1069,16 +1222,29 @@ mod tests {
         assert_eq!(roots[0].elanus_session, planner.elanus_session);
 
         // The planner's detail lists the worker THREAD as its child (one, not three).
-        let pdetail = session_detail(&root, &planner.elanus_session).unwrap().unwrap();
+        let pdetail = session_detail(&root, &planner.elanus_session)
+            .unwrap()
+            .unwrap();
         assert_eq!(pdetail.children.len(), 1);
-        assert_eq!(pdetail.children[0].native_session.as_deref(), Some("cc-worker"));
+        assert_eq!(
+            pdetail.children[0].native_session.as_deref(),
+            Some("cc-worker")
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
     #[test]
     fn backward_compat_representative_carries_all_original_fields() {
         let root = temp_root("tg-compat");
-        cc_incarnation(&root, "code-rep", "cc-rep", None, "2026-06-20T00:00:00", 7, 3);
+        cc_incarnation(
+            &root,
+            "code-rep",
+            "cc-rep",
+            None,
+            "2026-06-20T00:00:00",
+            7,
+            3,
+        );
         project_trace(&root).unwrap();
         let threads = list_sessions(&root).unwrap();
         let s = &threads[0];
@@ -1097,11 +1263,23 @@ mod tests {
         assert_eq!(s.output_tokens, 3);
         // Serialized JSON includes both the original and the additive fields.
         let v = serde_json::to_value(s).unwrap();
-        for field in ["elanus_session", "tool", "native_session", "resume_count", "duration_ms"] {
-            assert!(v.get(field).is_some(), "original field {field} present in wire");
+        for field in [
+            "elanus_session",
+            "tool",
+            "native_session",
+            "resume_count",
+            "duration_ms",
+        ] {
+            assert!(
+                v.get(field).is_some(),
+                "original field {field} present in wire"
+            );
         }
         for field in ["incarnations", "relaunches", "driven_resumes"] {
-            assert!(v.get(field).is_some(), "additive field {field} present in wire");
+            assert!(
+                v.get(field).is_some(),
+                "additive field {field} present in wire"
+            );
         }
         std::fs::remove_dir_all(&root.dir).ok();
     }

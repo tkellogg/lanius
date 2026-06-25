@@ -186,7 +186,9 @@ pub fn render_parts(
 fn block_stem(path: &std::path::Path) -> Option<String> {
     let stem = path.file_stem()?.to_string_lossy();
     let trimmed = match stem.split_once('-') {
-        Some((prefix, rest)) if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) => {
+        Some((prefix, rest))
+            if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) =>
+        {
             rest.to_string()
         }
         _ => stem.to_string(),

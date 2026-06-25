@@ -305,8 +305,9 @@ enum Cmd {
     /// directory, observed on the bus (`tool` selects the adapter — `claude` or
     /// `codex`; everything after it is passed through unchanged). Reserved first
     /// words: `hook` is the internal hook bridge the generated hooks invoke
-    /// (`elanus code hook <Event>`); `resume <elanus_session> "<message>"`
-    /// continues a recorded session in its workdir (the M2-A resume primitive);
+    /// (`elanus code hook <Event>`). (To re-attach to a session interactively, just
+    /// relaunch its tool with the tool's own resume flag passed through, e.g.
+    /// `elanus code claude --resume <native_session>`; there is no `resume` verb.)
     /// `deliver <worker-session> "<message>"` (run from inside a session) dispatches
     /// work to a worker and records the running session as the requester (M4-B);
     /// `spawn <tool> "<task>"` (run from inside a session) starts a worker
@@ -1155,12 +1156,21 @@ fn run(cli: Cli) -> Result<()> {
                     codeagent::hook(&root, event)?;
                 }
                 "resume" => {
+                    // `resume` is NOT an elanus verb. Re-attaching interactively is
+                    // a normal managed launch with the tool's own resume flag passed
+                    // through; the daemon's async resume is the in-process
+                    // `resume_capture` primitive, never a human command. Redirect a
+                    // muscle-memory `elanus code resume <id>` to the real form rather
+                    // than silently treating "resume" as a tool name.
                     let session = rest.first().map(String::as_str).unwrap_or("");
-                    if session.is_empty() {
-                        anyhow::bail!("usage: elanus code resume <elanus_session> \"<message>\"");
-                    }
-                    let message = rest.get(1..).unwrap_or(&[]).join(" ");
-                    codeagent::resume(&root, session, &message)?;
+                    let hint = codeagent::session_resume_hint(&root, session);
+                    anyhow::bail!(
+                        "`elanus code resume` is not a command. To re-attach to a \
+                         session, launch its tool with the tool's own resume flag, \
+                         e.g. `elanus code claude --resume <native_session>` (run in \
+                         the session's workdir).{hint}\n\
+                         Find the exact command with `elanus code session <id>`."
+                    );
                 }
                 "deliver" => {
                     // A planner dispatches work to a worker (M4-B). Run from inside
@@ -1330,7 +1340,12 @@ fn run(cli: Cli) -> Result<()> {
                                 s.model.as_deref().unwrap_or("?"),
                                 s.last_status.as_deref().unwrap_or("?"),
                             );
-                            println!("  resume: {}", detail.resume_command);
+                            match &detail.resume_command {
+                                Some(cmd) => println!("  resume: {cmd}"),
+                                None => {
+                                    println!("  resume: (no managed passthrough for this tool)")
+                                }
+                            }
                             if !detail.children.is_empty() {
                                 println!("  children:");
                                 for c in &detail.children {

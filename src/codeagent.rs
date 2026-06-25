@@ -64,8 +64,8 @@ use crate::buscli;
 use crate::codesession;
 use crate::paths::Root;
 use crate::topic;
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
 
@@ -350,8 +350,22 @@ trait Harness: Sync {
     fn map_event(&self, event: &str, payload: &Value) -> (String, Value);
     /// The native daemon-resume command (program + args) for a recorded session +
     /// message — exactly today's `resume_command`. Pure; the caller sets the cwd.
-    fn resume_command(&self, rec: &codesession::SessionRecord, message: &str)
-    -> (String, Vec<String>);
+    fn resume_command(
+        &self,
+        rec: &codesession::SessionRecord,
+        message: &str,
+    ) -> (String, Vec<String>);
+    /// The human-facing INTERACTIVE resume passthrough for a recorded native
+    /// session: the args to append after `elanus code <tool>` so a managed TUI
+    /// re-attaches to that native session, or None when this tool has no stable
+    /// passthrough-resume incantation (e.g. codex/opencode launches treat a
+    /// positional as a seed prompt, mangling a `resume` subcommand). Purely a
+    /// webui/CLI SUGGESTION — nothing in elanus core depends on it, and a tool
+    /// without one simply shows no suggestion. Distinct from `resume_command`, the
+    /// daemon's HEADLESS one-shot primitive. Default None (no clean passthrough).
+    fn interactive_resume_args(&self, _native_session: &str) -> Option<Vec<String>> {
+        None
+    }
     /// Run a StreamJson capture in the launch envelope (the `Capture::StreamJson`
     /// arm). Default: unreachable — only StreamJson harnesses override it, and the
     /// envelope only calls it for `Capture::StreamJson`, so it is never invoked on a
@@ -433,7 +447,11 @@ impl Harness for ClaudeCode {
     }
     fn mode_for(&self, headless: bool) -> Mode {
         // Claude has both cells: bare/interactive → Tui; `--headless` → Headless `-p`.
-        if headless { Mode::Headless } else { Mode::Tui }
+        if headless {
+            Mode::Headless
+        } else {
+            Mode::Tui
+        }
     }
     fn settings(&self, self_exe: &Path, root: &Root) -> Option<Value> {
         Some(claude_settings(self_exe, root))
@@ -463,6 +481,13 @@ impl Harness for ClaudeCode {
                 message.to_string(),
             ],
         )
+    }
+    fn interactive_resume_args(&self, native_session: &str) -> Option<Vec<String>> {
+        // `claude --resume <id>` re-opens the interactive TUI on a prior session.
+        // Claude's TUI launch appends passthrough args verbatim (codeagent.rs
+        // `cmd.args(args)`), so `elanus code claude --resume <id>` flows through
+        // cleanly and stays fully managed (generated hooks, room, obs, cred-scrub).
+        Some(vec!["--resume".to_string(), native_session.to_string()])
     }
     fn resume_stream_capture(
         &self,
@@ -513,7 +538,11 @@ impl Harness for Codex {
         // HM3: codex now honors both cells. Bare `elanus code codex` → the
         // interactive TUI (HM2's RolloutImport); `--headless`/`--worker` →
         // `codex exec --json` (the live StreamJson worker, unchanged).
-        if headless { Mode::Headless } else { Mode::Tui }
+        if headless {
+            Mode::Headless
+        } else {
+            Mode::Tui
+        }
     }
     fn settings(&self, _self_exe: &Path, _root: &Root) -> Option<Value> {
         None
@@ -624,7 +653,11 @@ impl Harness for OpenCode {
         // interactive TUI (OC3 live SSE capture via a served instance);
         // `--headless`/`--worker` → `opencode run --format json` (the live
         // StreamJson worker, unchanged).
-        if headless { Mode::Headless } else { Mode::Tui }
+        if headless {
+            Mode::Headless
+        } else {
+            Mode::Tui
+        }
     }
     fn settings(&self, _self_exe: &Path, _root: &Root) -> Option<Value> {
         None
@@ -731,6 +764,40 @@ fn harness_by_noun(noun: &str) -> Option<&'static dyn Harness> {
     HARNESSES.iter().copied().find(|h| h.agent_noun() == noun)
 }
 
+/// The human-facing interactive-resume SUGGESTION for a recorded session:
+/// `elanus code <tool> <passthrough…>` that re-attaches a MANAGED interactive TUI
+/// to the native session, or None when the tool has no clean passthrough resume
+/// (so the webui simply shows no suggestion). Surfaced by `elanus code session` and
+/// the runs UI as a copy-paste hint — suggestive and per-tool; nothing core depends
+/// on it. Resume itself is NOT an elanus verb: re-attaching is just a normal managed
+/// launch (`elanus code claude --resume <id>`), and the daemon's async one-shot is
+/// the in-process `resume_capture` primitive (M2-B), not a human command.
+pub fn interactive_resume_hint(tool: &str, native_session: &str) -> Option<String> {
+    if native_session.is_empty() {
+        return None;
+    }
+    // Exact resolve (no Claude fallback): an unknown tool gets no suggestion.
+    let h = harness(tool)?;
+    let args = h.interactive_resume_args(native_session)?;
+    Some(format!("elanus code {} {}", h.id(), args.join(" ")))
+}
+
+/// A ready-to-print " → <hint>" suffix for the resume redirect: given an elanus
+/// session id, look up its record and return the per-tool interactive-resume
+/// suggestion, or "" when there's no record / no clean passthrough for the tool.
+/// Best-effort: any lookup error degrades to the generic redirect (empty suffix).
+pub fn session_resume_hint(root: &Root, elanus_session: &str) -> String {
+    if elanus_session.is_empty() {
+        return String::new();
+    }
+    match codesession::read_record(root, elanus_session) {
+        Ok(Some(rec)) => interactive_resume_hint(&rec.tool, &rec.native_session)
+            .map(|cmd| format!("\n  → for {elanus_session}: `{cmd}`"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Resolve a harness by a recorded session's `tool` field (used by daemon resume).
 /// Falls back to Claude for any CC-noun/unknown record, matching the old
 /// `resume_command`'s default arm (which keyed on `rec.tool.as_str()`).
@@ -740,8 +807,9 @@ fn harness_for_record(tool: &str) -> &'static dyn Harness {
 
 /// Parse a CLI tool token to a harness, erroring like the old `Tool::parse`.
 fn parse_harness(s: &str) -> Result<&'static dyn Harness> {
-    harness(s)
-        .ok_or_else(|| anyhow::anyhow!("unknown coding tool {s:?} (supported: claude, codex, opencode)"))
+    harness(s).ok_or_else(|| {
+        anyhow::anyhow!("unknown coding tool {s:?} (supported: claude, codex, opencode)")
+    })
 }
 
 // ── Inbound delivery: mailbox → resume (M2-B) ────────────────────────────────
@@ -2200,7 +2268,11 @@ fn mid_cycle_injection(root: &Root, agent_noun: &str, session: &str) -> Option<S
         "[elanus] Urgent context delivered mid-task (priority block(s) — read before continuing):",
     );
     for b in &pending {
-        out.push_str(&format!("\n[elanus block: {}] {}", b.name, clip(&b.content, 2000)));
+        out.push_str(&format!(
+            "\n[elanus block: {}] {}",
+            b.name,
+            clip(&b.content, 2000)
+        ));
     }
     Some(out)
 }
@@ -2214,9 +2286,8 @@ fn mid_cycle_injection(root: &Root, agent_noun: &str, session: &str) -> Option<S
 /// pulls it; this vector only makes the urgent ones arrive sooner, once each.
 fn mid_cycle_mail_injection(root: &Root, agent_noun: &str, session: &str) -> Option<String> {
     let threshold = high_priority_threshold(root);
-    let pending =
-        codesession::take_pending_mid_cycle_mail(root, agent_noun, session, threshold)
-            .unwrap_or_default();
+    let pending = codesession::take_pending_mid_cycle_mail(root, agent_noun, session, threshold)
+        .unwrap_or_default();
     if pending.is_empty() {
         return None;
     }
@@ -2236,10 +2307,7 @@ fn mid_cycle_mail_injection(root: &Root, agent_noun: &str, session: &str) -> Opt
 /// rendering, LEGIBLY (a downgrade, not an error, not a silent drop), so an
 /// operator can see "this block wanted mid-cycle, the harness degraded it." Quiet
 /// when the harness CAN do mid-cycle (Claude Code) or no block wanted it.
-fn log_mid_cycle_degradation(
-    agent_noun: &str,
-    blocks: &[crate::context_store::LoadedBlock],
-) {
+fn log_mid_cycle_degradation(agent_noun: &str, blocks: &[crate::context_store::LoadedBlock]) {
     if achievable_vector(agent_noun, InjectionVector::MidCycle) == InjectionVector::MidCycle {
         return; // the harness can do mid-cycle — nothing to degrade.
     }
@@ -2336,7 +2404,10 @@ fn inbox_block(unseen: &[codesession::InboxItem]) -> Option<crate::context_store
     );
     if let Some(latest) = unseen.last() {
         let from = latest.from.as_deref().unwrap_or("?");
-        content.push_str(&format!("\nLatest from {from}: {}", clip(&latest.message, 200)));
+        content.push_str(&format!(
+            "\nLatest from {from}: {}",
+            clip(&latest.message, 200)
+        ));
     }
     Some(crate::context_store::LoadedBlock {
         name: "inbox".to_string(),
@@ -2528,7 +2599,11 @@ collision (advisory).",
     // turn is preserved). The old hardcoded "[elanus] You have N message(s)" text is
     // gone; its content moved into `inbox_block`.
     if let Some(b) = &inbox_blk {
-        out.push_str(&format!("[elanus block: {}] {}", b.name, clip(&b.content, 2000)));
+        out.push_str(&format!(
+            "[elanus block: {}] {}",
+            b.name,
+            clip(&b.content, 2000)
+        ));
     }
     if let Some(note) = note {
         if !out.is_empty() {
@@ -2543,14 +2618,22 @@ collision (advisory).",
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&format!("[elanus block: {}] {}", b.name, clip(&b.content, 2000)));
+        out.push_str(&format!(
+            "[elanus block: {}] {}",
+            b.name,
+            clip(&b.content, 2000)
+        ));
     }
     // C4 (agent-comms): the opt-in shared-channel blocks, same block shape. Advisory.
     for b in &channel_blocks {
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&format!("[elanus block: {}] {}", b.name, clip(&b.content, 2000)));
+        out.push_str(&format!(
+            "[elanus block: {}] {}",
+            b.name,
+            clip(&b.content, 2000)
+        ));
     }
     // M5: surface peers' claims as advisory routing info — "code-X is editing
     // src/foo.rs" — so this session can route around them. Advisory only; nothing
@@ -2685,9 +2768,17 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
     // Σ children ≤ parent.remaining at the fenced-store level (never from env).
     // `parent` is None when the owner runs `elanus code` directly → unbounded.
     // No explicit budget request here — inherit-equal is the default policy.
-    let token = codesession::mint(root, &principal, &agent, std::process::id() as i32,
-                                  parent.as_deref(), None)
-        .with_context(|| format!("minting the session credential for {principal}"))?;
+    let token = codesession::mint(
+        root,
+        &principal,
+        &agent,
+        std::process::id() as i32,
+        parent.as_deref(),
+        None,
+        None,
+        None,
+    )
+    .with_context(|| format!("minting the session credential for {principal}"))?;
     let bus_token = token.secret.clone();
 
     // SA1: every session is in a room now. An explicit `--room <id>` wins;
@@ -3201,7 +3292,8 @@ fn run_codex_tui_import(
         .stderr(std::process::Stdio::inherit());
     scrub_provider_creds(&mut cmd);
     scrub_launch_control_env(&mut cmd);
-    cmd.env_remove("ELANUS_PACKAGE").env_remove("ELANUS_BUS_TOKEN");
+    cmd.env_remove("ELANUS_PACKAGE")
+        .env_remove("ELANUS_BUS_TOKEN");
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir);
@@ -3231,7 +3323,15 @@ fn run_codex_tui_import(
     let summary = match resolved {
         Some(path) => {
             eprintln!("[code] importing codex rollout {}", path.display());
-            import_codex_rollout(root, principal, bus_token, agent, session, &path, Some(workdir))
+            import_codex_rollout(
+                root,
+                principal,
+                bus_token,
+                agent,
+                session,
+                &path,
+                Some(workdir),
+            )
         }
         None => {
             eprintln!(
@@ -3251,8 +3351,19 @@ fn run_codex_tui_import(
 /// briefing into the seed positional for the TUI without a full codex clap parse.
 fn split_codex_seed_prompt(args: &[String]) -> (Vec<String>, Option<String>) {
     let value_flags = [
-        "-c", "--config", "-m", "--model", "--model-provider", "-s", "--sandbox", "-a",
-        "--ask-for-approval", "--approval-policy", "-C", "--cd", "--profile",
+        "-c",
+        "--config",
+        "-m",
+        "--model",
+        "--model-provider",
+        "-s",
+        "--sandbox",
+        "-a",
+        "--ask-for-approval",
+        "--approval-policy",
+        "-C",
+        "--cd",
+        "--profile",
     ];
     let mut flags = Vec::new();
     let mut prompt = None;
@@ -3430,7 +3541,15 @@ fn import_codex_rollout(
             return CaptureSummary::default();
         }
     };
-    project_codex_rollout(root, principal, bus_token, agent, session, &text, record_workdir)
+    project_codex_rollout(
+        root,
+        principal,
+        bus_token,
+        agent,
+        session,
+        &text,
+        record_workdir,
+    )
 }
 
 /// The pure projection core (separated from file IO so it is unit-testable against
@@ -3475,16 +3594,20 @@ fn project_codex_rollout(
                         room: None,
                     };
                     if let Err(e) = codesession::upsert_record(root, &srec) {
-                        eprintln!(
-                            "[code] recording imported codex session (continuing): {e:#}"
-                        );
+                        eprintln!("[code] recording imported codex session (continuing): {e:#}");
                     }
                 }
             }
         }
         rollout_collect_summary(&rec, &mut summary);
         if let Some((leaf, body)) = rollout_map_record(&rec) {
-            publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
+            publish_obs(
+                root,
+                principal,
+                bus_token,
+                &obs_topic(agent, session, &leaf),
+                body,
+            );
         }
     }
     summary
@@ -3541,9 +3664,10 @@ fn rollout_map_record(rec: &Value) -> Option<(String, Value)> {
             json!({ "ts": ts, "text": clip_opt(payload.get("message"), 4000) }),
         )),
         // turn lifecycle / cost.
-        ("event_msg", "task_started") => {
-            Some(("session/idle".to_string(), json!({ "ts": ts, "event": "task_started" })))
-        }
+        ("event_msg", "task_started") => Some((
+            "session/idle".to_string(),
+            json!({ "ts": ts, "event": "task_started" }),
+        )),
         ("event_msg", "task_complete") => Some((
             "session/idle".to_string(),
             json!({
@@ -3588,7 +3712,10 @@ fn rollout_map_record(rec: &Value) -> Option<(String, Value)> {
         }
         // A tool (shell/exec) call.
         ("response_item", "function_call") => {
-            let name = payload.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
             Some((
                 format!("tool/{}/call", topic::encode_segment(name)),
                 json!({
@@ -3950,8 +4077,8 @@ fn run_opencode_tui_server_events(
     brief: Option<&str>,
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::process::{Command, Stdio};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     // 1. Start our own served instance. A fresh per-launch password fences the
     //    loopback server (basic auth: user `opencode`, default username). `--port 0`
@@ -3984,11 +4111,7 @@ fn run_opencode_tui_server_events(
     // "opencode server listening on http://127.0.0.1:<port>"). We take stdout here
     // and keep the reader alive past the URL line so the pipe never fills and blocks
     // the server.
-    let url = match serve_child
-        .stdout
-        .take()
-        .and_then(opencode_read_serve_url)
-    {
+    let url = match serve_child.stdout.take().and_then(opencode_read_serve_url) {
         Some(u) => u,
         None => {
             // serve never announced a URL — degrade honestly: kill the half-started
@@ -4129,14 +4252,17 @@ fn run_opencode_attach_tui(
         .stderr(std::process::Stdio::inherit());
     scrub_provider_creds(&mut cmd);
     scrub_launch_control_env(&mut cmd);
-    cmd.env_remove("ELANUS_PACKAGE").env_remove("ELANUS_BUS_TOKEN");
+    cmd.env_remove("ELANUS_PACKAGE")
+        .env_remove("ELANUS_BUS_TOKEN");
     // attach reads the same basic-auth password to reach the server.
     cmd.env("OPENCODE_SERVER_PASSWORD", password);
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir);
     match url {
-        Some(u) => eprintln!("[code] launching opencode attach {u} as session {session} (live SSE capture)"),
+        Some(u) => eprintln!(
+            "[code] launching opencode attach {u} as session {session} (live SSE capture)"
+        ),
         None => eprintln!("[code] launching opencode TUI as session {session} (no live capture)"),
     }
 
@@ -4234,9 +4360,7 @@ fn opencode_read_serve_url(out: std::process::ChildStdout) -> Option<String> {
 fn opencode_extract_url(line: &str) -> Option<String> {
     let idx = line.find("http://").or_else(|| line.find("https://"))?;
     let tail = &line[idx..];
-    let end = tail
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(tail.len());
+    let end = tail.find(|c: char| c.is_whitespace()).unwrap_or(tail.len());
     let url = tail[..end].trim_end_matches('/').to_string();
     (!url.is_empty()).then_some(url)
 }
@@ -4319,11 +4443,7 @@ fn opencode_subscribe_sse(
                     while let Some(pos) = find_frame_end(&buf) {
                         let frame: Vec<u8> = buf.drain(..pos).collect();
                         // Drop the trailing `\n\n` separator from the buffer.
-                        let drop = if buf.starts_with(b"\r\n\r\n") {
-                            4
-                        } else {
-                            2
-                        };
+                        let drop = if buf.starts_with(b"\r\n\r\n") { 4 } else { 2 };
                         buf.drain(..drop.min(buf.len()));
                         if let Some(event) = parse_sse_frame(&frame) {
                             opencode_sse_publish(
@@ -4367,9 +4487,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Parse one raw SSE frame (the bytes of `data: …` lines, terminator already
@@ -4532,14 +4650,15 @@ fn opencode_sse_to_run_event(event: &Value) -> Option<Value> {
             // Settled only: the headless stream emits a text/reasoning event only
             // once part.time.end is set. Mirror that so a live partial isn't filed
             // (and re-filed) as a final message.
-            let settled = part
-                .get("time")
-                .and_then(|t| t.get("end"))
-                .is_some();
+            let settled = part.get("time").and_then(|t| t.get("end")).is_some();
             if !settled {
                 return None;
             }
-            if ptype == "text" { "text" } else { "reasoning" }
+            if ptype == "text" {
+                "text"
+            } else {
+                "reasoning"
+            }
         }
         "tool" => {
             // Settled only: completed or error (matches the headless `tool_use`).
@@ -5412,24 +5531,21 @@ fn timeout_wrap(program: &str, args: &[String], secs: u64) -> (String, Vec<Strin
     ("timeout".to_string(), wrapped)
 }
 
-/// `elanus code resume <elanus_session> "<message>"` — the CLI entry. Runs the
-/// resume in-process and PROPAGATES the tool's exit code via `process::exit` so a
-/// script driving the launcher sees it. The daemon must NEVER use this path (a
-/// worker tool's non-zero exit would kill the whole daemon); it calls
-/// `resume_capture`, which returns the outcome instead of exiting.
-pub fn resume(root: &Root, elanus_session: &str, message: &str) -> Result<()> {
-    let outcome = resume_capture(root, elanus_session, message)?;
-    if !outcome.success {
-        std::process::exit(outcome.exit_code.unwrap_or(1));
-    }
-    Ok(())
-}
+// NOTE: there is deliberately NO human `elanus code resume` verb. "Resume" is not
+// an elanus primitive — re-attaching to a session interactively is just a normal
+// managed launch with the tool's own resume flag passed through, e.g.
+// `elanus code claude --resume <native_session>` (hooks/room/obs all intact). The
+// webui/`elanus code session` surface that per-tool suggestion via
+// `interactive_resume_hint`. The only resume that lives in elanus is the daemon's
+// async one-shot, `resume_capture` below (M2-B), driven IN-PROCESS off a mailbox
+// delivery — never a command a human types.
 
 /// The structured result of one driven/CLI resume — enough for the daemon to
 /// thread a completion obs and settle the delivery event without ever exiting.
 /// `final_text` + `file_changes` are the worker's LEGIBLE result (its verbatim last
 /// message and the files it wrote), harvested from the capture stream so the routed
 /// completion carries the worker's real answer (M4-A follow-on) — not a summary.
+#[derive(Debug)]
 pub struct ResumeOutcome {
     pub success: bool,
     pub exit_code: Option<i32>,
@@ -5480,9 +5596,17 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     // Resume re-mints a credential for the SAME session — it is not a new spawn,
     // so it is not charged against any spawner budget (the budget was consumed
     // at launch time, not at resume). Pass spawner=None, requested_budget=None.
-    let token = codesession::mint(root, &principal, &rec.agent_noun, std::process::id() as i32,
-                                  None, None)
-        .with_context(|| format!("minting the resume credential for {principal}"))?;
+    let token = codesession::mint(
+        root,
+        &principal,
+        &rec.agent_noun,
+        std::process::id() as i32,
+        None,
+        None,
+        None,
+        None,
+    )
+    .with_context(|| format!("minting the resume credential for {principal}"))?;
     let bus_token = token.secret.clone();
     let agent = rec.agent_noun.clone();
     let session = rec.elanus_session.clone();
@@ -6139,10 +6263,7 @@ fn claude_read_fs_events(payload: &Value, session: &str) -> Vec<(String, Value)>
         p
     };
     let canon = std::fs::canonicalize(&abs).unwrap_or(abs);
-    let tool_use_id = payload
-        .get("tool_use_id")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let tool_use_id = payload.get("tool_use_id").cloned().unwrap_or(Value::Null);
     let cc_session = payload.get("session_id").cloned().unwrap_or(Value::Null);
     let topic_name = format!("obs/fs/{}", topic::encode_path(&canon));
     let body = json!({
@@ -6366,7 +6487,10 @@ mod tests {
         assert_eq!(claude.mode_for(false), Mode::Tui);
         assert_eq!(claude.mode_for(true), Mode::Headless);
         assert!(matches!(claude.capture(Mode::Tui), Capture::HookBridge));
-        assert!(matches!(claude.capture(Mode::Headless), Capture::HookBridge));
+        assert!(matches!(
+            claude.capture(Mode::Headless),
+            Capture::HookBridge
+        ));
 
         // HM2/HM3: codex now honors both cells. bare → Tui (RolloutImport, the
         // post-hoc rollout reader); --headless → Headless (StreamJson, unchanged).
@@ -6417,15 +6541,18 @@ mod tests {
                 take_headless_flag(&["--headless".to_string(), "a-prompt".to_string()]);
             assert!(headless, "{id}: --headless must be headless");
             assert_eq!(rest, vec!["a-prompt".to_string()], "{id}: flag stripped");
-            assert_eq!(h.mode_for(headless), Mode::Headless, "{id}: --headless → Headless");
+            assert_eq!(
+                h.mode_for(headless),
+                Mode::Headless,
+                "{id}: --headless → Headless"
+            );
         }
     }
 
     #[test]
     fn worker_flag_is_a_deprecated_alias_for_headless() {
         // --worker still selects Headless (back-compat) and is stripped from argv.
-        let (headless, rest) =
-            take_headless_flag(&["--worker".to_string(), "task".to_string()]);
+        let (headless, rest) = take_headless_flag(&["--worker".to_string(), "task".to_string()]);
         assert!(headless);
         assert_eq!(rest, vec!["task".to_string()]);
         // Every harness maps the alias to Headless exactly like --headless.
@@ -6514,16 +6641,16 @@ mod tests {
         assert_eq!(
             leaves,
             vec![
-                "session/thread",          // session_meta → thread id
-                "session/idle",            // task_started
-                "user/message",            // event_msg/user_message (the clean prompt)
-                "assistant/reasoning",     // reasoning (redacted ciphertext)
-                "assistant/message",       // assistant commentary
-                "tool/exec_command/call",  // function_call
-                "tool/result",             // function_call_output
-                "session/idle",            // token_count
-                "assistant/message",       // assistant final answer
-                "session/idle",            // task_complete
+                "session/thread",         // session_meta → thread id
+                "session/idle",           // task_started
+                "user/message",           // event_msg/user_message (the clean prompt)
+                "assistant/reasoning",    // reasoning (redacted ciphertext)
+                "assistant/message",      // assistant commentary
+                "tool/exec_command/call", // function_call
+                "tool/result",            // function_call_output
+                "session/idle",           // token_count
+                "assistant/message",      // assistant final answer
+                "session/idle",           // task_complete
             ],
             "projected leaves: {leaves:?}"
         );
@@ -6549,9 +6676,15 @@ mod tests {
         let tc = r#"{"type":"turn_context","payload":{"turn_id":"t1"}}"#;
         let agentmsg = r#"{"type":"event_msg","payload":{"type":"agent_message","message":"dup"}}"#;
         assert!(map_line(dev).is_none(), "developer message must be dropped");
-        assert!(map_line(env).is_none(), "env/user response_item must be dropped");
+        assert!(
+            map_line(env).is_none(),
+            "env/user response_item must be dropped"
+        );
         assert!(map_line(tc).is_none(), "turn_context must be dropped");
-        assert!(map_line(agentmsg).is_none(), "agent_message mirror must be dropped");
+        assert!(
+            map_line(agentmsg).is_none(),
+            "agent_message mirror must be dropped"
+        );
 
         // Spot-check field projection: the user prompt, the tool call, its result.
         let user = projected.iter().find(|(l, _)| l == "user/message").unwrap();
@@ -6563,16 +6696,28 @@ mod tests {
             .iter()
             .find(|(l, _)| l == "tool/exec_command/call")
             .unwrap();
-        assert_eq!(call.1.get("call_id").and_then(Value::as_str), Some("call_ABC"));
-        assert_eq!(call.1.get("tool").and_then(Value::as_str), Some("exec_command"));
+        assert_eq!(
+            call.1.get("call_id").and_then(Value::as_str),
+            Some("call_ABC")
+        );
+        assert_eq!(
+            call.1.get("tool").and_then(Value::as_str),
+            Some("exec_command")
+        );
         let result = projected.iter().find(|(l, _)| l == "tool/result").unwrap();
-        assert_eq!(result.1.get("call_id").and_then(Value::as_str), Some("call_ABC"));
+        assert_eq!(
+            result.1.get("call_id").and_then(Value::as_str),
+            Some("call_ABC")
+        );
         // Reasoning is redacted (only encrypted_content in the rollout).
         let reasoning = projected
             .iter()
             .find(|(l, _)| l == "assistant/reasoning")
             .unwrap();
-        assert_eq!(reasoning.1.get("redacted").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            reasoning.1.get("redacted").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -6604,7 +6749,8 @@ mod tests {
         let file = day.join(format!("rollout-2026-06-17T02-20-30-{thread}.jsonl"));
         std::fs::write(&file, ROLLOUT_FIXTURE).unwrap();
         // Decoy with a different thread id should NOT match.
-        let decoy = day.join("rollout-2026-06-17T01-00-00-0000ffff-0000-0000-0000-000000000000.jsonl");
+        let decoy =
+            day.join("rollout-2026-06-17T01-00-00-0000ffff-0000-0000-0000-000000000000.jsonl");
         std::fs::write(&decoy, ROLLOUT_FIXTURE).unwrap();
 
         assert_eq!(rollout_thread_id(&file).as_deref(), Some(thread));
@@ -6663,12 +6809,10 @@ mod tests {
         let (leaf, body) = ClaudeCode.map_event("PostToolUseFailure", &payload);
         assert_eq!(leaf, "tool/Write/result");
         assert_eq!(body["failed"], true);
-        assert!(
-            body["response"]
-                .as_str()
-                .unwrap()
-                .contains("permission denied")
-        );
+        assert!(body["response"]
+            .as_str()
+            .unwrap()
+            .contains("permission denied"));
     }
 
     // ── READ CAMERA (M1, read-provenance handoff) ───────────────────────────
@@ -6693,7 +6837,10 @@ mod tests {
         // slash dropped) — a consumer's obs/fs/tmp/proj/# matches both flavors.
         assert_eq!(
             *topic_name,
-            format!("obs/fs/{}", topic::encode_path(Path::new("/tmp/proj/notes.md")))
+            format!(
+                "obs/fs/{}",
+                topic::encode_path(Path::new("/tmp/proj/notes.md"))
+            )
         );
         assert!(topic::valid_name(topic_name));
         assert!(topic::matches("obs/fs/tmp/proj/#", topic_name));
@@ -6786,7 +6933,10 @@ mod tests {
         std::fs::create_dir_all(root.profile_dir("default")).unwrap();
 
         // Default (no toggle written) ⇒ ON: the projection runs.
-        assert!(read_camera_enabled(&root), "absent toggle ⇒ camera ON (default)");
+        assert!(
+            read_camera_enabled(&root),
+            "absent toggle ⇒ camera ON (default)"
+        );
 
         // Explicitly OFF ⇒ the gate is closed.
         std::fs::write(
@@ -6794,7 +6944,10 @@ mod tests {
             "[sandbox]\nread_camera = false\n",
         )
         .unwrap();
-        assert!(!read_camera_enabled(&root), "read_camera=false ⇒ camera OFF");
+        assert!(
+            !read_camera_enabled(&root),
+            "read_camera=false ⇒ camera OFF"
+        );
 
         // The payload still PROJECTS a read locus in isolation — the suppression is
         // the call-site gate, not the projector — so the off-state is a single,
@@ -6921,13 +7074,11 @@ mod tests {
         assert_eq!(body["text"], "hello");
         assert_eq!(body["item_id"], "item_1");
         // The started form of an agent_message has no settled text → dropped.
-        assert!(
-            codex_map_event(&json!({
-                "type": "item.started",
-                "item": { "id": "item_1", "type": "agent_message", "text": "" }
-            }))
-            .is_none()
-        );
+        assert!(codex_map_event(&json!({
+            "type": "item.started",
+            "item": { "id": "item_1", "type": "agent_message", "text": "" }
+        }))
+        .is_none());
     }
 
     #[test]
@@ -6945,12 +7096,10 @@ mod tests {
         .unwrap();
         assert_eq!(call_leaf, "tool/command_execution/call");
         assert_eq!(call_body["tool"], "command_execution");
-        assert!(
-            call_body["command"]
-                .as_str()
-                .unwrap()
-                .contains("echo hello")
-        );
+        assert!(call_body["command"]
+            .as_str()
+            .unwrap()
+            .contains("echo hello"));
 
         let (res_leaf, res_body) = codex_map_event(&json!({
             "type": "item.completed",
@@ -6995,13 +7144,11 @@ mod tests {
         assert_eq!(leaf, "file/write");
         assert!(body["changes"].as_str().unwrap().contains("src/foo.rs"));
         // started has no settled change → dropped.
-        assert!(
-            codex_map_event(&json!({
-                "type": "item.started",
-                "item": { "id": "item_3", "type": "file_change", "status": "in_progress" }
-            }))
-            .is_none()
-        );
+        assert!(codex_map_event(&json!({
+            "type": "item.started",
+            "item": { "id": "item_3", "type": "file_change", "status": "in_progress" }
+        }))
+        .is_none());
     }
 
     #[test]
@@ -7092,9 +7239,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root { dir: dir.clone() };
         let principal = "code-deadbeef";
-        let token =
-            codesession::mint(&root, principal, "claude-code", std::process::id() as i32,
-                              None, None).unwrap();
+        let token = codesession::mint(
+            &root,
+            principal,
+            "claude-code",
+            std::process::id() as i32,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         // It does NOT resolve as a full-authority fenced secret — the broker's
         // owner-equivalent path (crate::secrets::read) must return None for it.
         assert_eq!(crate::secrets::read(&root, principal), None);
@@ -7321,7 +7476,10 @@ mod tests {
             }),
             &mut summary,
         );
-        assert_eq!(summary.file_changes, vec!["/tmp/x.rs", "/tmp/y.rs", "/tmp/z.rs"]);
+        assert_eq!(
+            summary.file_changes,
+            vec!["/tmp/x.rs", "/tmp/y.rs", "/tmp/z.rs"]
+        );
 
         // A non-writing tool does not add a change.
         opencode_collect_summary(
@@ -7331,7 +7489,10 @@ mod tests {
             }),
             &mut summary,
         );
-        assert_eq!(summary.file_changes, vec!["/tmp/x.rs", "/tmp/y.rs", "/tmp/z.rs"]);
+        assert_eq!(
+            summary.file_changes,
+            vec!["/tmp/x.rs", "/tmp/y.rs", "/tmp/z.rs"]
+        );
     }
 
     #[test]
@@ -7356,7 +7517,10 @@ mod tests {
         // Lifecycle floor it replaced.
         assert!(matches!(OpenCode.capture(Mode::Tui), Capture::ServerEvents));
         // Headless is unchanged (the OC1 StreamJson worker).
-        assert!(matches!(OpenCode.capture(Mode::Headless), Capture::StreamJson));
+        assert!(matches!(
+            OpenCode.capture(Mode::Headless),
+            Capture::StreamJson
+        ));
     }
 
     #[test]
@@ -7475,12 +7639,18 @@ mod tests {
                 "time": { "start": 1, "end": 2 }
             }}
         });
-        assert_eq!(opencode_sse_to_run_event(&reasoning).unwrap()["type"], "reasoning");
+        assert_eq!(
+            opencode_sse_to_run_event(&reasoning).unwrap()["type"],
+            "reasoning"
+        );
         let step = json!({
             "type": "message.part.updated",
             "properties": { "part": { "type": "step-finish", "tokens": {}, "cost": 0 } }
         });
-        assert_eq!(opencode_sse_to_run_event(&step).unwrap()["type"], "step_finish");
+        assert_eq!(
+            opencode_sse_to_run_event(&step).unwrap()["type"],
+            "step_finish"
+        );
 
         // A non-content SSE event has no headless analog → None (handled directly).
         let idle = json!({ "type": "session.idle", "properties": { "sessionID": "ses_a" } });
@@ -7536,10 +7706,9 @@ mod tests {
         assert!(args.contains(&"-p".to_string()));
         let resume_pos = args.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(args[resume_pos + 1], "cc-sess-9f");
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["--output-format", "stream-json"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--output-format", "stream-json"]));
         assert_eq!(args.last().unwrap(), "continue please");
     }
 
@@ -7897,15 +8066,13 @@ mod tests {
         .unwrap();
         assert_eq!(req.reply_to, "in/agent/kestrel/room-7");
         // A wildcard reply_to is rejected (not routable).
-        assert!(
-            delivery_requester(
-                &root,
-                &json!({ "prompt": "go", "reply_to": "in/agent/+/code-x" }),
-                None,
-                None,
-            )
-            .is_none()
-        );
+        assert!(delivery_requester(
+            &root,
+            &json!({ "prompt": "go", "reply_to": "in/agent/+/code-x" }),
+            None,
+            None,
+        )
+        .is_none());
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -7967,15 +8134,13 @@ mod tests {
         }
         // And a bare name that is path-unsafe / reserved cannot be coaxed into a
         // non-agent topic level either.
-        assert!(
-            delivery_requester(
-                &root,
-                &json!({ "prompt": "x", "reply_to": "../../owner" }),
-                Some("owner"),
-                None,
-            )
-            .is_none()
-        );
+        assert!(delivery_requester(
+            &root,
+            &json!({ "prompt": "x", "reply_to": "../../owner" }),
+            Some("owner"),
+            None,
+        )
+        .is_none());
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -8051,14 +8216,31 @@ mod tests {
 
     #[test]
     fn resume_errors_with_no_record() {
-        // Resuming a session that was never recorded is a clean error, not a panic
-        // and not a silent no-op (so a caller/test sees the missing record).
+        // The daemon resume primitive on a session that was never recorded is a
+        // clean error, not a panic and not a silent no-op (so the daemon sees the
+        // missing record). There is no human `resume` verb; `resume_capture` is the
+        // in-process primitive the daemon drives.
         let dir = std::env::temp_dir().join(format!("elanus-resume-norec-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root { dir: dir.clone() };
-        let err = resume(&root, "code-nope0000", "hi").unwrap_err();
+        let err = resume_capture(&root, "code-nope0000", "hi").unwrap_err();
         assert!(format!("{err:#}").contains("no resumable coding session"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interactive_resume_hint_is_per_tool_managed_passthrough() {
+        // Claude has a clean passthrough (`--resume <native>`); codex/opencode do
+        // not (their launch treats a positional as a seed prompt), so they get no
+        // suggestion. An unknown tool or empty native id also yields None.
+        assert_eq!(
+            interactive_resume_hint("claude", "38472ce9").as_deref(),
+            Some("elanus code claude --resume 38472ce9")
+        );
+        assert_eq!(interactive_resume_hint("codex", "abc"), None);
+        assert_eq!(interactive_resume_hint("opencode", "abc"), None);
+        assert_eq!(interactive_resume_hint("nonesuch", "abc"), None);
+        assert_eq!(interactive_resume_hint("claude", ""), None);
     }
 
     // ── The deliver tool (M4-B) ──────────────────────────────────────────────
@@ -8238,7 +8420,17 @@ mod tests {
     fn forced_session_token_file_blocks_forced_id_reuse() {
         let root = delivery_tmp_root();
         let principal = "code-live0001";
-        codesession::mint(&root, principal, "codex", std::process::id() as i32, None, None).unwrap();
+        codesession::mint(
+            &root,
+            principal,
+            "codex",
+            std::process::id() as i32,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(forced_session_token_exists(&root, principal));
         let _ = std::fs::remove_dir_all(&root.dir);
@@ -8434,18 +8626,14 @@ mod tests {
         let id1 = m3_deliver(&root, "codex", "code-uns00001", "owner", "one");
         m3_deliver(&root, "codex", "code-uns00001", "owner", "two");
         // Two unseen.
-        assert!(
-            turn_injection(&root, "codex", "code-uns00001")
-                .unwrap()
-                .contains("2 new message")
-        );
+        assert!(turn_injection(&root, "codex", "code-uns00001")
+            .unwrap()
+            .contains("2 new message"));
         // Pulling marks the first seen → the next turn reflects only the unseen.
         codesession::mark_inbox_seen(&root, "code-uns00001", &[id1]).unwrap();
-        assert!(
-            turn_injection(&root, "codex", "code-uns00001")
-                .unwrap()
-                .contains("1 new message")
-        );
+        assert!(turn_injection(&root, "codex", "code-uns00001")
+            .unwrap()
+            .contains("1 new message"));
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -8613,9 +8801,9 @@ mod tests {
         // surfaces no claims (and is None on an otherwise-quiet turn).
         let root = m3_tmp_root();
         m3_record(&root, "code-solo0001", "codex"); // room: None, workdir /tmp
-        // Even if some other session (in a room) holds a claim, a roomless session
-        // in a DIFFERENT workdir sees nothing (a distinct dir so SA2 does not make
-        // them workdir-siblings — this test is about claim-room isolation).
+                                                    // Even if some other session (in a room) holds a claim, a roomless session
+                                                    // in a DIFFERENT workdir sees nothing (a distinct dir so SA2 does not make
+                                                    // them workdir-siblings — this test is about claim-room isolation).
         m5_member_wd(&root, "other-room", "code-elsewhere", "/var/tmp");
         codesession::add_claim(&root, "other-room", "code-elsewhere", "x.rs").unwrap();
         assert!(turn_injection(&root, "codex", "code-solo0001").is_none());
@@ -8630,8 +8818,14 @@ mod tests {
         let dir = std::env::temp_dir();
         let r1 = resolve_room(None, &dir);
         let r2 = resolve_room(None, &dir);
-        assert!(r1.starts_with("wd-"), "default room is workdir-derived: {r1}");
-        assert_eq!(r1, r2, "the same workdir must derive the SAME room (stable)");
+        assert!(
+            r1.starts_with("wd-"),
+            "default room is workdir-derived: {r1}"
+        );
+        assert_eq!(
+            r1, r2,
+            "the same workdir must derive the SAME room (stable)"
+        );
         // A different dir derives a different room.
         let other = resolve_room(None, Path::new("/"));
         assert_ne!(r1, other, "distinct workdirs derive distinct rooms");
@@ -8641,10 +8835,16 @@ mod tests {
     fn sa1_explicit_room_overrides_workdir_default() {
         let dir = std::env::temp_dir();
         let explicit = resolve_room(Some("team-1"), &dir);
-        assert_eq!(explicit, "team-1", "an explicit --room wins over the workdir");
+        assert_eq!(
+            explicit, "team-1",
+            "an explicit --room wins over the workdir"
+        );
         // A blank/whitespace explicit value falls back to the workdir default.
         let blank = resolve_room(Some("   "), &dir);
-        assert!(blank.starts_with("wd-"), "a blank --room falls back to workdir: {blank}");
+        assert!(
+            blank.starts_with("wd-"),
+            "a blank --room falls back to workdir: {blank}"
+        );
     }
 
     #[test]
@@ -8731,7 +8931,10 @@ mod tests {
         m3_deliver(&root, "codex", "code-alone001", "owner", "hi");
         let inj = turn_injection(&root, "codex", "code-alone001").unwrap();
         // C2 (agent-comms): the inbox now renders as the `inbox` block.
-        assert!(inj.starts_with("[elanus block: inbox]"), "solo block is unchanged: {inj}");
+        assert!(
+            inj.starts_with("[elanus block: inbox]"),
+            "solo block is unchanged: {inj}"
+        );
         assert!(
             !inj.contains("[elanus siblings]"),
             "a solo session must have no siblings line: {inj}"
@@ -8902,7 +9105,9 @@ mod tests {
             .to_string();
         let peers = codesession::peer_claims(&root, &room, "code-bbbb2222").unwrap();
         assert!(
-            peers.iter().any(|c| c.session == "code-aaaa1111" && c.path == want),
+            peers
+                .iter()
+                .any(|c| c.session == "code-aaaa1111" && c.path == want),
             "roommate must see A's auto-claim on {want}; saw {peers:?}"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
@@ -8920,7 +9125,10 @@ mod tests {
         }
         let peers = codesession::peer_claims(&root, &room, "code-dddd4444").unwrap();
         assert_eq!(
-            peers.iter().filter(|c| c.session == "code-cccc3333").count(),
+            peers
+                .iter()
+                .filter(|c| c.session == "code-cccc3333")
+                .count(),
             1,
             "re-editing the same path must not spam claims (idempotent upsert)"
         );
@@ -8938,7 +9146,10 @@ mod tests {
         auto_claim_write(&root, "code-eeee5555", "", Some(workdir));
         auto_claim_write(&root, "code-eeee5555", "   ", Some(workdir));
         let peers = codesession::peer_claims(&root, &room, "code-ffff6666").unwrap();
-        assert!(peers.is_empty(), "a blank path must claim nothing; saw {peers:?}");
+        assert!(
+            peers.is_empty(),
+            "a blank path must claim nothing; saw {peers:?}"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -9058,7 +9269,10 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        assert_eq!(peers[0].path, want, "the one row must be the canonical path");
+        assert_eq!(
+            peers[0].path, want,
+            "the one row must be the canonical path"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -9075,7 +9289,10 @@ mod tests {
         // No record at all (native id not observed) is a no-op even with cwd=None.
         auto_claim_write(&root, "code-norecord0", "src/x.rs", None);
         let peers = codesession::peer_claims(&root, &room, "code-safeview0").unwrap();
-        assert!(peers.is_empty(), "blank/no-record must claim nothing; saw {peers:?}");
+        assert!(
+            peers.is_empty(),
+            "blank/no-record must claim nothing; saw {peers:?}"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -9086,7 +9303,10 @@ mod tests {
         let wr = json!({ "file_path": "/x/a.rs" });
         assert_eq!(claude_write_tool_path("Write", Some(&wr)), Some("/x/a.rs"));
         assert_eq!(claude_write_tool_path("Edit", Some(&wr)), Some("/x/a.rs"));
-        assert_eq!(claude_write_tool_path("MultiEdit", Some(&wr)), Some("/x/a.rs"));
+        assert_eq!(
+            claude_write_tool_path("MultiEdit", Some(&wr)),
+            Some("/x/a.rs")
+        );
         let nb = json!({ "notebook_path": "/x/n.ipynb" });
         assert_eq!(
             claude_write_tool_path("NotebookEdit", Some(&nb)),
@@ -9247,10 +9467,18 @@ mod tests {
     }
 
     /// Upsert a memory block for a coding session via the live store.
-    fn m4_block(root: &Root, session: &str, name: &str, content: &str, priority: i32, session_scope: bool) {
+    fn m4_block(
+        root: &Root,
+        session: &str,
+        name: &str,
+        content: &str,
+        priority: i32,
+        session_scope: bool,
+    ) {
         let conn = crate::db::open(root).unwrap();
         crate::db::init_schema(&conn).unwrap();
-        let mut b = crate::context_blocks::ContextBlock::new(name, content, ClaudeCode.agent_noun());
+        let mut b =
+            crate::context_blocks::ContextBlock::new(name, content, ClaudeCode.agent_noun());
         b.scope = if session_scope {
             crate::context_blocks::Scope::Session
         } else {
@@ -9264,8 +9492,22 @@ mod tests {
     fn turn_injection_renders_session_memory_blocks() {
         let root = delivery_tmp_root();
         m4_record(&root, "code-blk00001");
-        m4_block(&root, "code-blk00001", "identity", "I am Lily, the worker.", 0, false);
-        m4_block(&root, "code-blk00001", "focus", "Ship memory-blocks M4.", 0, true);
+        m4_block(
+            &root,
+            "code-blk00001",
+            "identity",
+            "I am Lily, the worker.",
+            0,
+            false,
+        );
+        m4_block(
+            &root,
+            "code-blk00001",
+            "focus",
+            "Ship memory-blocks M4.",
+            0,
+            true,
+        );
 
         let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-blk00001")
             .expect("blocks should produce an injection");
@@ -9285,12 +9527,17 @@ mod tests {
         codesession::set_note(&root, "code-note0009", "remember the rename").unwrap();
         // Round-trips through the block store.
         assert_eq!(
-            codesession::get_note(&root, "code-note0009").unwrap().as_deref(),
+            codesession::get_note(&root, "code-note0009")
+                .unwrap()
+                .as_deref(),
             Some("remember the rename")
         );
         let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-note0009")
             .expect("a note should produce an injection");
-        assert!(inj.contains("[elanus note] remember the rename"), "got:\n{inj}");
+        assert!(
+            inj.contains("[elanus note] remember the rename"),
+            "got:\n{inj}"
+        );
         assert!(
             !inj.contains("[elanus block: note]"),
             "the note must not also render as a generic block line; got:\n{inj}"
@@ -9303,7 +9550,14 @@ mod tests {
         let root = delivery_tmp_root();
         m4_record(&root, "code-mid00001");
         // A high-priority (mid-cycle) block.
-        m4_block(&root, "code-mid00001", "alert", "STOP: schema migrated", crate::context_store::MID_CYCLE_PRIORITY, true);
+        m4_block(
+            &root,
+            "code-mid00001",
+            "alert",
+            "STOP: schema migrated",
+            crate::context_store::MID_CYCLE_PRIORITY,
+            true,
+        );
 
         // First tool boundary: emitted.
         let first = mid_cycle_injection(&root, ClaudeCode.agent_noun(), "code-mid00001")
@@ -9349,7 +9603,11 @@ mod tests {
             InjectionVector::NextTurn
         );
         // next-turn is always achievable everywhere.
-        for noun in [ClaudeCode.agent_noun(), Codex.agent_noun(), OpenCode.agent_noun()] {
+        for noun in [
+            ClaudeCode.agent_noun(),
+            Codex.agent_noun(),
+            OpenCode.agent_noun(),
+        ] {
             assert_eq!(
                 achievable_vector(noun, InjectionVector::NextTurn),
                 InjectionVector::NextTurn
@@ -9377,14 +9635,21 @@ mod tests {
         // Store the block under the codex agent noun (its identity).
         let conn = crate::db::open(&root).unwrap();
         crate::db::init_schema(&conn).unwrap();
-        let mut b = crate::context_blocks::ContextBlock::new("alert", "urgent for codex", Codex.agent_noun());
+        let mut b = crate::context_blocks::ContextBlock::new(
+            "alert",
+            "urgent for codex",
+            Codex.agent_noun(),
+        );
         b.scope = crate::context_blocks::Scope::Session;
         b.priority = crate::context_store::MID_CYCLE_PRIORITY;
         crate::context_store::upsert_block(&conn, "default", &b, "code-cdx00001", None).unwrap();
 
         let inj = turn_injection(&root, Codex.agent_noun(), "code-cdx00001")
             .expect("the high-pri block must land next-turn for codex");
-        assert!(inj.contains("urgent for codex"), "degraded delivery must include the block; got:\n{inj}");
+        assert!(
+            inj.contains("urgent for codex"),
+            "degraded delivery must include the block; got:\n{inj}"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -9441,13 +9706,23 @@ mod tests {
             "an empty inbox must produce no inbox block (quiet turn)"
         );
         // Deliver one normal-priority message.
-        comms_mail(&root, ClaudeCode.agent_noun(), "code-inbx0001", "scout", "please review PR 7", 0);
+        comms_mail(
+            &root,
+            ClaudeCode.agent_noun(),
+            "code-inbx0001",
+            "scout",
+            "please review PR 7",
+            0,
+        );
         let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-inbx0001")
             .expect("unseen mail must produce an inbox block");
         // Rendered in the block shape (C2), with the count + a preview of the latest.
         assert!(inj.contains("[elanus block: inbox]"), "got:\n{inj}");
         assert!(inj.contains("1 new message(s)"), "got:\n{inj}");
-        assert!(inj.contains("Latest from scout: please review PR 7"), "got:\n{inj}");
+        assert!(
+            inj.contains("Latest from scout: please review PR 7"),
+            "got:\n{inj}"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -9456,16 +9731,33 @@ mod tests {
         let root = delivery_tmp_root();
         m4_record(&root, "code-hipr0001");
         // A high-priority (>= default threshold 5) unseen delivery.
-        comms_mail(&root, ClaudeCode.agent_noun(), "code-hipr0001", "lily", "STOP: API changed", 9);
+        comms_mail(
+            &root,
+            ClaudeCode.agent_noun(),
+            "code-hipr0001",
+            "lily",
+            "STOP: API changed",
+            9,
+        );
         // A normal one too — it must NOT ride the mid-cycle vector.
-        comms_mail(&root, ClaudeCode.agent_noun(), "code-hipr0001", "lily", "fyi later", 0);
+        comms_mail(
+            &root,
+            ClaudeCode.agent_noun(),
+            "code-hipr0001",
+            "lily",
+            "fyi later",
+            0,
+        );
 
         // First tool boundary: the high-pri mail is injected mid-cycle, once.
         let first = mid_cycle_mail_injection(&root, ClaudeCode.agent_noun(), "code-hipr0001")
             .expect("high-priority unseen mail must reach mid-cycle");
         assert!(first.contains("Urgent mail"), "got:\n{first}");
         assert!(first.contains("STOP: API changed"), "got:\n{first}");
-        assert!(!first.contains("fyi later"), "a normal message must not ride mid-cycle; got:\n{first}");
+        assert!(
+            !first.contains("fyi later"),
+            "a normal message must not ride mid-cycle; got:\n{first}"
+        );
 
         // Second tool boundary (unchanged): nothing — the same message is not
         // re-injected, and it was NOT marked seen, so it still shows next-turn.
@@ -9476,7 +9768,10 @@ mod tests {
         // Not marked seen: both deliveries still count in the next-turn inbox block.
         let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-hipr0001")
             .expect("unseen mail still shows next-turn");
-        assert!(inj.contains("2 new message(s)"), "mid-cycle delivery must not mark mail seen; got:\n{inj}");
+        assert!(
+            inj.contains("2 new message(s)"),
+            "mid-cycle delivery must not mark mail seen; got:\n{inj}"
+        );
 
         // Codex degrades: it has no mid-cycle hook, so its high-pri mail rides the
         // next-turn inbox block instead (achievable_vector). Verify the matrix gate.
@@ -9493,7 +9788,14 @@ mod tests {
         let root = delivery_tmp_root();
         m4_record(&root, "code-lopr0001");
         // priority 4 < default threshold 5 → next-turn only, never mid-cycle.
-        comms_mail(&root, ClaudeCode.agent_noun(), "code-lopr0001", "lily", "routine handoff", 4);
+        comms_mail(
+            &root,
+            ClaudeCode.agent_noun(),
+            "code-lopr0001",
+            "lily",
+            "routine handoff",
+            4,
+        );
         assert!(
             mid_cycle_mail_injection(&root, ClaudeCode.agent_noun(), "code-lopr0001").is_none(),
             "below-threshold mail must not ride the mid-cycle vector"
@@ -9532,10 +9834,22 @@ mod tests {
 
         let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-room0001")
             .expect("an in-room session with channel traffic gets a channel block");
-        assert!(inj.contains("[elanus block: channel:team-1]"), "got:\n{inj}");
-        assert!(inj.contains("msg three"), "newest must be present; got:\n{inj}");
-        assert!(inj.contains("msg two"), "second-newest within the bound; got:\n{inj}");
-        assert!(!inj.contains("msg one"), "the recent-N bound must drop the oldest; got:\n{inj}");
+        assert!(
+            inj.contains("[elanus block: channel:team-1]"),
+            "got:\n{inj}"
+        );
+        assert!(
+            inj.contains("msg three"),
+            "newest must be present; got:\n{inj}"
+        );
+        assert!(
+            inj.contains("msg two"),
+            "second-newest within the bound; got:\n{inj}"
+        );
+        assert!(
+            !inj.contains("msg one"),
+            "the recent-N bound must drop the oldest; got:\n{inj}"
+        );
 
         // A session in a DIFFERENT room sees nothing of team-1's channel.
         codesession::upsert_record(
@@ -9552,7 +9866,8 @@ mod tests {
         .unwrap();
         let inj2 = turn_injection(&root, ClaudeCode.agent_noun(), "code-room0002");
         assert!(
-            inj2.as_deref().map_or(true, |s| !s.contains("channel:team-1")),
+            inj2.as_deref()
+                .map_or(true, |s| !s.contains("channel:team-1")),
             "an out-of-room session must not see the channel; got:\n{inj2:?}"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
@@ -9578,7 +9893,8 @@ mod tests {
         comms_channel_msg(&root, "team-1", "scout", "hello room");
         let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-noopt0001");
         assert!(
-            inj.as_deref().map_or(true, |s| !s.contains("channel:team-1")),
+            inj.as_deref()
+                .map_or(true, |s| !s.contains("channel:team-1")),
             "a room not opted in must surface no channel block; got:\n{inj:?}"
         );
         let _ = std::fs::remove_dir_all(&root.dir);

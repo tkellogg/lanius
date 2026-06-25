@@ -226,11 +226,7 @@ pub fn set_session_note(
 
 /// M2 decision 5 — read the per-session memory note back out of the `note` block.
 /// `None` when no note is set (the per-turn injection then omits the note line).
-pub fn get_session_note(
-    conn: &Connection,
-    owner: &str,
-    session: &str,
-) -> Result<Option<String>> {
+pub fn get_session_note(conn: &Connection, owner: &str, session: &str) -> Result<Option<String>> {
     let block = note_block(owner, "");
     Ok(get_block(conn, &block, session, None)?.map(|b| b.content))
 }
@@ -279,14 +275,15 @@ pub fn take_pending_mid_cycle(
         }
         let sha = sha256_hex(b.content.as_bytes());
         // Already delivered at THIS exact content? (same name + sha) → skip.
-        let already: bool = conn.query_row(
-            "SELECT 1 FROM code_block_delivered
+        let already: bool = conn
+            .query_row(
+                "SELECT 1 FROM code_block_delivered
               WHERE session = ?1 AND block_name = ?2 AND content_sha256 = ?3",
-            params![session, b.name, sha],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
+                params![session, b.name, sha],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
         if already {
             continue;
         }
@@ -318,13 +315,7 @@ pub fn get_block(
                FROM context_blocks
               WHERE scope = ?1 AND owner = ?2
                 AND session_id IS ?3 AND run_id IS ?4 AND name = ?5",
-            params![
-                scope_str(&block.scope),
-                block.owner,
-                sid,
-                rid,
-                block.name
-            ],
+            params![scope_str(&block.scope), block.owner, sid, rid, block.name],
             |r| {
                 Ok(LoadedBlock {
                     name: r.get(0)?,
@@ -571,7 +562,11 @@ mod tests {
     use crate::paths::Root;
 
     fn conn() -> Connection {
-        let dir = std::env::temp_dir().join(format!("el-store-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let dir = std::env::temp_dir().join(format!(
+            "el-store-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root { dir };
@@ -624,9 +619,23 @@ mod tests {
     #[test]
     fn multi_writer_is_owner_scoped_not_locked() {
         let c = conn();
-        upsert_block(&c, "default", &block("shared", "lily's", "lily"), "s1", None).unwrap();
+        upsert_block(
+            &c,
+            "default",
+            &block("shared", "lily's", "lily"),
+            "s1",
+            None,
+        )
+        .unwrap();
         // A peer writing "the same" block writes a DIFFERENT owner row — no clash.
-        upsert_block(&c, "default", &block("shared", "scout's", "scout"), "s1", None).unwrap();
+        upsert_block(
+            &c,
+            "default",
+            &block("shared", "scout's", "scout"),
+            "s1",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             get_block(&c, &block("shared", "", "lily"), "s1", None)
                 .unwrap()
@@ -678,7 +687,14 @@ mod tests {
         let seeded = seed_defaults(&c, &p, &defaults, "default", "s1").unwrap();
         assert_eq!(seeded, vec!["identity".to_string()]);
         // Evolve it.
-        upsert_block(&c, "default", &block("identity", "evolved", "lily"), "s1", None).unwrap();
+        upsert_block(
+            &c,
+            "default",
+            &block("identity", "evolved", "lily"),
+            "s1",
+            None,
+        )
+        .unwrap();
         // A second seed never overwrites the evolved value.
         let seeded2 = seed_defaults(&c, &p, &defaults, "default", "s1").unwrap();
         assert!(seeded2.is_empty());
@@ -695,19 +711,34 @@ mod tests {
     fn note_alias_round_trips_as_a_block() {
         // M2 decision 5: the note IS a session-scope `note` block.
         let c = conn();
-        assert!(get_session_note(&c, "claude-code", "code-n1").unwrap().is_none());
-        set_session_note(&c, "default", "claude-code", "code-n1", "  do the migration  ").unwrap();
+        assert!(get_session_note(&c, "claude-code", "code-n1")
+            .unwrap()
+            .is_none());
+        set_session_note(
+            &c,
+            "default",
+            "claude-code",
+            "code-n1",
+            "  do the migration  ",
+        )
+        .unwrap();
         // Trimmed, like the old code_notes path.
         assert_eq!(
-            get_session_note(&c, "claude-code", "code-n1").unwrap().as_deref(),
+            get_session_note(&c, "claude-code", "code-n1")
+                .unwrap()
+                .as_deref(),
             Some("do the migration")
         );
         // It is a real `note` block under the session.
         let blocks = load_session_blocks(&c, "claude-code", "code-n1").unwrap();
-        assert!(blocks.iter().any(|b| b.name == NOTE_BLOCK && b.content == "do the migration"));
+        assert!(blocks
+            .iter()
+            .any(|b| b.name == NOTE_BLOCK && b.content == "do the migration"));
         // A blank note clears it (removes the block).
         set_session_note(&c, "default", "claude-code", "code-n1", "   ").unwrap();
-        assert!(get_session_note(&c, "claude-code", "code-n1").unwrap().is_none());
+        assert!(get_session_note(&c, "claude-code", "code-n1")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -726,7 +757,14 @@ mod tests {
         other.scope = Scope::Session;
         upsert_block(&c, "default", &other, "code-s2", None).unwrap();
         // A peer harness's block is not visible (owner filter).
-        upsert_block(&c, "default", &block("identity", "peer", "codex"), "code-s1", None).unwrap();
+        upsert_block(
+            &c,
+            "default",
+            &block("identity", "peer", "codex"),
+            "code-s1",
+            None,
+        )
+        .unwrap();
 
         let names: Vec<String> = load_session_blocks(&c, "claude-code", "code-s1")
             .unwrap()
@@ -735,8 +773,14 @@ mod tests {
             .collect();
         assert!(names.contains(&"I am Lily.".to_string()));
         assert!(names.contains(&"ship M4".to_string()));
-        assert!(!names.contains(&"other work".to_string()), "s2's block leaked into s1");
-        assert!(!names.contains(&"peer".to_string()), "codex's block leaked to claude-code");
+        assert!(
+            !names.contains(&"other work".to_string()),
+            "s2's block leaked into s1"
+        );
+        assert!(
+            !names.contains(&"peer".to_string()),
+            "codex's block leaked to claude-code"
+        );
     }
 
     #[test]
@@ -751,10 +795,16 @@ mod tests {
             owner: normal.owner.clone(),
             scope: Scope::Agent,
         };
-        assert!(!is_mid_cycle(&loaded_normal), "priority 0 is next-turn, not mid-cycle");
+        assert!(
+            !is_mid_cycle(&loaded_normal),
+            "priority 0 is next-turn, not mid-cycle"
+        );
         let mut hi = loaded_normal.clone();
         hi.priority = MID_CYCLE_PRIORITY;
-        assert!(is_mid_cycle(&hi), "priority <= MID_CYCLE_PRIORITY is mid-cycle");
+        assert!(
+            is_mid_cycle(&hi),
+            "priority <= MID_CYCLE_PRIORITY is mid-cycle"
+        );
     }
 
     #[test]
@@ -773,25 +823,42 @@ mod tests {
 
         // Second take (unchanged): NOT redelivered.
         let second = take_pending_mid_cycle(&c, "claude-code", "code-mc1").unwrap();
-        assert!(second.is_empty(), "an unchanged mid-cycle block must not re-inject");
+        assert!(
+            second.is_empty(),
+            "an unchanged mid-cycle block must not re-inject"
+        );
 
         // Edit the block → its sha changes → re-armed once.
         let mut b2 = b.clone();
         b2.content = "STOP: API changed AGAIN".into();
         upsert_block(&c, "default", &b2, "code-mc1", None).unwrap();
         let third = take_pending_mid_cycle(&c, "claude-code", "code-mc1").unwrap();
-        assert_eq!(third.len(), 1, "editing the block re-arms a single redelivery");
+        assert_eq!(
+            third.len(),
+            1,
+            "editing the block re-arms a single redelivery"
+        );
 
         // A NORMAL-priority block never rides the mid-cycle vector.
-        upsert_block(&c, "default", &{
-            let mut nb = ContextBlock::new("calm", "fyi", "claude-code");
-            nb.scope = Scope::Session;
-            nb // priority 0 default
-        }, "code-mc1", None).unwrap();
+        upsert_block(
+            &c,
+            "default",
+            &{
+                let mut nb = ContextBlock::new("calm", "fyi", "claude-code");
+                nb.scope = Scope::Session;
+                nb // priority 0 default
+            },
+            "code-mc1",
+            None,
+        )
+        .unwrap();
         // Drain the alert's re-arm first, then assert calm never appears.
         let _ = take_pending_mid_cycle(&c, "claude-code", "code-mc1").unwrap();
         let none = take_pending_mid_cycle(&c, "claude-code", "code-mc1").unwrap();
-        assert!(none.iter().all(|x| x.name != "calm"), "a normal block must not go mid-cycle");
+        assert!(
+            none.iter().all(|x| x.name != "calm"),
+            "a normal block must not go mid-cycle"
+        );
     }
 
     #[test]
@@ -803,7 +870,10 @@ mod tests {
         n.priority = MID_CYCLE_PRIORITY;
         upsert_block(&c, "default", &n, "code-mc2", None).unwrap();
         let pending = take_pending_mid_cycle(&c, "claude-code", "code-mc2").unwrap();
-        assert!(pending.iter().all(|b| b.name != NOTE_BLOCK), "note rides next-turn only");
+        assert!(
+            pending.iter().all(|b| b.name != NOTE_BLOCK),
+            "note rides next-turn only"
+        );
     }
 
     #[test]

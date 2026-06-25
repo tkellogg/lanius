@@ -193,7 +193,9 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
     log.line(format!("[serve] root={}", root.dir.display()));
     log.line(format!("[serve] log={}", log_path.display()));
     log.line(format!("[serve] daemon={}", self_exe.display()));
-    log.line(format!("[serve] web UI: http://127.0.0.1:{web_port} (embedded SPA, served in-process)"));
+    log.line(format!(
+        "[serve] web UI: http://127.0.0.1:{web_port} (embedded SPA, served in-process)"
+    ));
     log.line("[serve] ctrl-c stops the whole stack");
 
     for service in &mut services {

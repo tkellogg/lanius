@@ -213,10 +213,7 @@ impl Report {
             dollars,
             turns: Variance::of(est.turns.map(|v| v as f64), Some(act.turns as f64)),
             tool_calls: Variance::of(None, Some(act.tool_calls as f64)),
-            tokens: Variance::of(
-                est.tokens.map(|v| v as f64),
-                act.tokens.map(|v| v as f64),
-            ),
+            tokens: Variance::of(est.tokens.map(|v| v as f64), act.tokens.map(|v| v as f64)),
             wall_clock_ms: Variance::of(
                 est.wall_clock_ms.map(|v| v as f64),
                 act.wall_clock_ms.map(|v| v as f64),
@@ -265,7 +262,11 @@ fn miss_phrase(unit: &str, estimate: Option<f64>, actual: Option<f64>, prec: usi
         _ => String::new(),
     };
     let label = if unit == "$" { "" } else { " turns" };
-    format!("estimated {} actual {}{delta}{label}", fmt(estimate), fmt(actual))
+    format!(
+        "estimated {} actual {}{delta}{label}",
+        fmt(estimate),
+        fmt(actual)
+    )
 }
 
 /// Compute the actuals for `session` from the obs projection, counting only
@@ -300,7 +301,10 @@ pub fn compute_actuals(
           ORDER BY ts, id",
     ) {
         let rows = stmt.query_map(rusqlite::params![session, since], |r| {
-            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
         })?;
         for row in rows {
             let (kind, ts) = row?;

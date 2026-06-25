@@ -1063,15 +1063,20 @@ fn route_completion(
     let pointer = obs_pointer.as_str().unwrap_or("its obs subtree");
     let answer = match final_text {
         Some(t) if !t.trim().is_empty() => t.to_string(),
-        _ => format!(
-            "(worker {session} completed with no final message; {detail})"
-        ),
+        _ => format!("(worker {session} completed with no final message; {detail})"),
     };
     // The files the worker changed on disk, as the tool itself reported them.
     let files_line = if file_changes.is_empty() {
         "Files changed: none reported.".to_string()
     } else {
-        format!("Files changed:\n{}", file_changes.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n"))
+        format!(
+            "Files changed:\n{}",
+            file_changes
+                .iter()
+                .map(|p| format!("  - {p}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
     };
     // The prompt reads like the worker's actual answer, then the files it touched,
     // then the pointer to the full conversation — clean and honest, no summary.
@@ -1166,7 +1171,14 @@ fn reconcile_lost_routes(root: &Root, conn: &Connection) -> Result<()> {
             .query_row(
                 "SELECT type, sender, payload, correlation_id FROM events WHERE id = ?1",
                 [worker_event_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<String>>(3)?.unwrap_or_default())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    ))
+                },
             )
             .optional()?;
         let Some((_etype, sender, payload, correlation)) = row else {
@@ -1248,7 +1260,14 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
             .collect::<rusqlite::Result<Vec<_>>>()?;
         r
     };
-    for PendingDelivery { id, etype, corr, payload, sender } in pending {
+    for PendingDelivery {
+        id,
+        etype,
+        corr,
+        payload,
+        sender,
+    } in pending
+    {
         if code.claimed.contains(&id) {
             continue; // already handed to a worker this process; row not yet settled
         }
@@ -1277,7 +1296,11 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
             trace::write(
                 root,
                 "obs/agent/code/delivery/duplicate",
-                &trace::Ids { event_id: Some(id), correlation_id: corr.clone(), ..Default::default() },
+                &trace::Ids {
+                    event_id: Some(id),
+                    correlation_id: corr.clone(),
+                    ..Default::default()
+                },
                 json!({ "session": session, "idempotency_key": key, "reason": "already processed" }),
             );
             continue;
@@ -1294,7 +1317,11 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
             trace::write(
                 root,
                 "obs/agent/code/delivery/empty",
-                &trace::Ids { event_id: Some(id), correlation_id: corr.clone(), ..Default::default() },
+                &trace::Ids {
+                    event_id: Some(id),
+                    correlation_id: corr.clone(),
+                    ..Default::default()
+                },
                 json!({ "session": session, "reason": "no prompt/text in payload" }),
             );
             continue;
@@ -1315,7 +1342,11 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
                 trace::write(
                     root,
                     "obs/agent/code/delivery/duplicate",
-                    &trace::Ids { event_id: Some(id), correlation_id: corr.clone(), ..Default::default() },
+                    &trace::Ids {
+                        event_id: Some(id),
+                        correlation_id: corr.clone(),
+                        ..Default::default()
+                    },
                     json!({ "session": session, "idempotency_key": key, "reason": "key claimed concurrently" }),
                 );
                 continue;
@@ -1344,7 +1375,11 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
         trace::write(
             root,
             "obs/agent/code/delivery/accepted",
-            &trace::Ids { event_id: Some(id), correlation_id: corr.clone(), ..Default::default() },
+            &trace::Ids {
+                event_id: Some(id),
+                correlation_id: corr.clone(),
+                ..Default::default()
+            },
             json!({
                 "session": session,
                 "type": etype,
@@ -1356,7 +1391,12 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
             root,
             code,
             &session,
-            CodeJob { event_id: id, correlation: corr, message, requester },
+            CodeJob {
+                event_id: id,
+                correlation: corr,
+                message,
+                requester,
+            },
         );
     }
     Ok(())
@@ -1382,7 +1422,8 @@ fn enqueue_code_job(root: &Root, code: &mut CodeDrivers, session: &str, job: Cod
             .spawn(move || code_worker(root, sess, rx, done_tx));
         match spawned {
             Ok(_) => {
-                code.workers.insert(session.to_string(), CodeWorker { tx, inflight: 0 });
+                code.workers
+                    .insert(session.to_string(), CodeWorker { tx, inflight: 0 });
             }
             Err(e) => {
                 eprintln!("[daemon] code worker spawn for {session} failed: {e}");
@@ -1803,7 +1844,9 @@ mod tests {
 
         // The drivable event is now `running` and claimed; a job was enqueued.
         let st: String = conn
-            .query_row("SELECT state FROM events WHERE id=?1", [drivable], |r| r.get(0))
+            .query_row("SELECT state FROM events WHERE id=?1", [drivable], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(st, "running", "recognized delivery is claimed (running)");
         assert!(code.claimed.contains(&drivable));
@@ -1814,9 +1857,14 @@ mod tests {
         // The unknown-conv event is untouched — left pending for dispatch_pending
         // (which will mark it done as a no-consumer event), never resumed.
         let st: String = conn
-            .query_row("SELECT state FROM events WHERE id=?1", [unknown], |r| r.get(0))
+            .query_row("SELECT state FROM events WHERE id=?1", [unknown], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(st, "pending", "unrecognized in/agent event is left for dispatch");
+        assert_eq!(
+            st, "pending",
+            "unrecognized in/agent event is left for dispatch"
+        );
 
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -1864,7 +1912,10 @@ mod tests {
         drive_code_deliveries(&root, &conn, &mut code).unwrap();
 
         assert_eq!(rx.try_recv().map(|j| j.event_id).ok(), Some(ev));
-        assert!(rx.try_recv().is_err(), "the same delivery is never enqueued twice");
+        assert!(
+            rx.try_recv().is_err(),
+            "the same delivery is never enqueued twice"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -1896,7 +1947,11 @@ mod tests {
         drop(tx);
         h.join().unwrap();
         // Never overlapped, and ran in FIFO order.
-        assert_eq!(max_seen.load(Ordering::SeqCst), 1, "two same-session resumes never overlap");
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "two same-session resumes never overlap"
+        );
         assert_eq!(*order.lock().unwrap(), vec![1, 2], "FIFO order preserved");
     }
 
@@ -1919,7 +1974,8 @@ mod tests {
             },
         )
         .unwrap();
-        conn.execute("UPDATE events SET state='running' WHERE id=?1", [ev]).unwrap();
+        conn.execute("UPDATE events SET state='running' WHERE id=?1", [ev])
+            .unwrap();
         let mut code = CodeDrivers::default();
         code.claimed.insert(ev);
         let (tx, _rx) = std::sync::mpsc::channel::<CodeJob>();
@@ -1944,8 +2000,14 @@ mod tests {
             .query_row("SELECT state FROM events WHERE id=?1", [ev], |r| r.get(0))
             .unwrap();
         assert_eq!(st, "done", "a successful resume settles the delivery done");
-        assert!(!code.claimed.contains(&ev), "settled event leaves the claimed set");
-        assert!(!code.workers.contains_key("code-cccc0003"), "idle worker is retired");
+        assert!(
+            !code.claimed.contains(&ev),
+            "settled event leaves the claimed set"
+        );
+        assert!(
+            !code.workers.contains_key("code-cccc0003"),
+            "idle worker is retired"
+        );
 
         // A failed resume settles `failed`.
         let ev2 = events::emit(
@@ -1958,7 +2020,8 @@ mod tests {
             },
         )
         .unwrap();
-        conn.execute("UPDATE events SET state='running' WHERE id=?1", [ev2]).unwrap();
+        conn.execute("UPDATE events SET state='running' WHERE id=?1", [ev2])
+            .unwrap();
         code.claimed.insert(ev2);
         code.done_tx
             .send(CodeDone {
@@ -1976,7 +2039,10 @@ mod tests {
         let st: String = conn
             .query_row("SELECT state FROM events WHERE id=?1", [ev2], |r| r.get(0))
             .unwrap();
-        assert_eq!(st, "failed", "an errored resume settles the delivery failed");
+        assert_eq!(
+            st, "failed",
+            "an errored resume settles the delivery failed"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -2026,7 +2092,9 @@ mod tests {
         assert_eq!(job.event_id, ev);
         // The requester is the planner's OWN mailbox — routing the completion there
         // resumes the planner (the loop closing).
-        let req = job.requester.expect("the planner sender is captured as requester");
+        let req = job
+            .requester
+            .expect("the planner sender is captured as requester");
         assert_eq!(req.reply_to, "in/agent/claude-code/code-plannr01");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -2071,28 +2139,45 @@ mod tests {
         // First drive: claims + enqueues exactly once, and records the key.
         drive_code_deliveries(&root, &conn, &mut code).unwrap();
         assert_eq!(rx.try_recv().map(|j| j.event_id).ok(), Some(ev));
-        assert!(crate::codesession::delivery_key_seen(&root, &format!("event:{ev}"), "code-worker02"));
+        assert!(crate::codesession::delivery_key_seen(
+            &root,
+            &format!("event:{ev}"),
+            "code-worker02"
+        ));
 
         // Simulate the at-least-once replay across a restart: the row re-pends
         // (boot's running->pending sweep) AND a fresh process's in-flight guard is
         // empty (the `claimed` set does not survive a restart).
-        conn.execute("UPDATE events SET state='pending', finished_at=NULL WHERE id=?1", [ev])
-            .unwrap();
+        conn.execute(
+            "UPDATE events SET state='pending', finished_at=NULL WHERE id=?1",
+            [ev],
+        )
+        .unwrap();
         let mut code2 = CodeDrivers::default();
         let (tx2, rx2) = std::sync::mpsc::channel::<CodeJob>();
-        code2
-            .workers
-            .insert("code-worker02".into(), CodeWorker { tx: tx2, inflight: 0 });
+        code2.workers.insert(
+            "code-worker02".into(),
+            CodeWorker {
+                tx: tx2,
+                inflight: 0,
+            },
+        );
 
         drive_code_deliveries(&root, &conn, &mut code2).unwrap();
 
         // The replay is a recognized no-op: NO second job, and the row is settled
         // `done` (not re-driven, not left pending forever).
-        assert!(rx2.try_recv().is_err(), "the duplicate must not drive a second resume");
+        assert!(
+            rx2.try_recv().is_err(),
+            "the duplicate must not drive a second resume"
+        );
         let st: String = conn
             .query_row("SELECT state FROM events WHERE id=?1", [ev], |r| r.get(0))
             .unwrap();
-        assert_eq!(st, "done", "the replayed duplicate is settled as a clean no-op");
+        assert_eq!(
+            st, "done",
+            "the replayed duplicate is settled as a clean no-op"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -2149,12 +2234,19 @@ mod tests {
         let st: String = conn
             .query_row("SELECT state FROM events WHERE id=?1", [ev], |r| r.get(0))
             .unwrap();
-        assert_eq!(st, "running", "the victim delivery to B must be driven, not suppressed");
+        assert_eq!(
+            st, "running",
+            "the victim delivery to B must be driven, not suppressed"
+        );
         let job = rx.try_recv().expect("the victim delivery must drive a job");
         assert_eq!(job.event_id, ev);
         assert_eq!(job.message, "victim work");
         // And the key is now recorded under B's namespace (independent of A's).
-        assert!(crate::codesession::delivery_key_seen(&root, "K", "code-victimbb"));
+        assert!(crate::codesession::delivery_key_seen(
+            &root,
+            "K",
+            "code-victimbb"
+        ));
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -2203,8 +2295,15 @@ mod tests {
         .unwrap();
         // The crash state: the delivery was DRIVEN (key recorded) and settled `done`
         // by settle, but the route was NEVER emitted (crash in the gap).
-        assert!(crate::codesession::claim_delivery_key(&root, &format!("event:{ev}"), "code-wrkr0001", ev).unwrap());
-        conn.execute("UPDATE events SET state='done' WHERE id=?1", [ev]).unwrap();
+        assert!(crate::codesession::claim_delivery_key(
+            &root,
+            &format!("event:{ev}"),
+            "code-wrkr0001",
+            ev
+        )
+        .unwrap());
+        conn.execute("UPDATE events SET state='done' WHERE id=?1", [ev])
+            .unwrap();
         // Precondition: no completion routed to P yet.
         assert!(!route_already_emitted(&conn, ev, "in/agent/claude-code/code-plnr0001").unwrap());
 
@@ -2221,11 +2320,21 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .expect("the lost route is recovered to the planner's mailbox");
-        assert_eq!(st, "pending", "the recovered route is a pending delivery the planner drives");
-        assert_eq!(corr.as_deref(), Some("loop-x"), "same correlation threads the loop");
+        assert_eq!(
+            st, "pending",
+            "the recovered route is a pending delivery the planner drives"
+        );
+        assert_eq!(
+            corr.as_deref(),
+            Some("loop-x"),
+            "same correlation threads the loop"
+        );
         let pv: Value = serde_json::from_str(&payload.unwrap()).unwrap();
         assert!(pv["prompt"].as_str().unwrap().contains("code-wrkr0001"));
-        assert!(pv["idempotency_key"].as_str().unwrap().starts_with("code-complete:"));
+        assert!(pv["idempotency_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("code-complete:"));
 
         // Idempotent: a second boot does NOT route a duplicate (the guard sees the
         // existing route).
@@ -2273,8 +2382,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(crate::codesession::claim_delivery_key(&root, &format!("event:{ev}"), "code-wrkr0002", ev).unwrap());
-        conn.execute("UPDATE events SET state='done' WHERE id=?1", [ev]).unwrap();
+        assert!(crate::codesession::claim_delivery_key(
+            &root,
+            &format!("event:{ev}"),
+            "code-wrkr0002",
+            ev
+        )
+        .unwrap());
+        conn.execute("UPDATE events SET state='done' WHERE id=?1", [ev])
+            .unwrap();
 
         reconcile_lost_routes(&root, &conn).unwrap();
 
@@ -2325,7 +2441,8 @@ mod tests {
             },
         )
         .unwrap();
-        conn.execute("UPDATE events SET state='running' WHERE id=?1", [ev]).unwrap();
+        conn.execute("UPDATE events SET state='running' WHERE id=?1", [ev])
+            .unwrap();
         let mut code = CodeDrivers::default();
         code.claimed.insert(ev);
         let (tx, _rx) = std::sync::mpsc::channel::<CodeJob>();
@@ -2358,26 +2475,39 @@ mod tests {
         // A completion was routed to the planner's mailbox, pending, threaded by the
         // SAME correlation — exactly what drive_code_deliveries resumes the planner
         // on (the loop closing).
-        let (routed_state, routed_corr, routed_payload): (String, Option<String>, Option<String>) = conn
-            .query_row(
+        let (routed_state, routed_corr, routed_payload): (String, Option<String>, Option<String>) =
+            conn.query_row(
                 "SELECT state, correlation_id, payload FROM events
                  WHERE type='in/agent/claude-code/code-plannr03'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .expect("a completion was routed to the planner's mailbox");
-        assert_eq!(routed_state, "pending", "the routed completion is a pending delivery");
-        assert_eq!(routed_corr.as_deref(), Some("loop-corr-1"), "same correlation threads the loop");
+        assert_eq!(
+            routed_state, "pending",
+            "the routed completion is a pending delivery"
+        );
+        assert_eq!(
+            routed_corr.as_deref(),
+            Some("loop-corr-1"),
+            "same correlation threads the loop"
+        );
         let pv: Value = serde_json::from_str(&routed_payload.unwrap()).unwrap();
         // The payload carries a prompt (resumes a coding-session planner), the
         // success flag, and an idempotency key so a replayed completion dedupes.
         assert!(pv["prompt"].as_str().unwrap().contains("code-worker03"));
         assert_eq!(pv["failed"], false);
-        assert!(pv["idempotency_key"].as_str().unwrap().starts_with("code-complete:"));
+        assert!(pv["idempotency_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("code-complete:"));
         // M4-A follow-on: the completion carries the worker's VERBATIM final text,
         // the file paths it changed, and the obs pointer — NOT a generated summary.
         assert_eq!(pv["final_text"], "ALPHA is the answer");
-        assert!(pv["prompt"].as_str().unwrap().contains("ALPHA is the answer"));
+        assert!(pv["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("ALPHA is the answer"));
         assert_eq!(pv["file_changes"][0], "src/answer.rs");
         assert!(pv["prompt"].as_str().unwrap().contains("src/answer.rs"));
         assert!(
@@ -2426,8 +2556,8 @@ mod tests {
             "code-silent01",
             "in/agent/claude-code/code-plannr04",
             false,
-            None,          // the worker produced NO final text
-            &[],           // and changed no files
+            None, // the worker produced NO final text
+            &[],  // and changed no files
             "exit_code=Some(0)",
             Some("corr-silent"),
         );
@@ -2442,8 +2572,14 @@ mod tests {
         let ft = pv["final_text"].as_str().unwrap();
         // A minimal factual fallback — names the worker + the diagnostic; it does NOT
         // claim to describe what the worker accomplished.
-        assert!(ft.contains("no final message"), "factual fallback, not a summary: {ft}");
-        assert!(ft.contains("exit_code=Some(0)"), "the fallback carries the honest diagnostic");
+        assert!(
+            ft.contains("no final message"),
+            "factual fallback, not a summary: {ft}"
+        );
+        assert!(
+            ft.contains("exit_code=Some(0)"),
+            "the fallback carries the honest diagnostic"
+        );
         assert!(pv["file_changes"].as_array().unwrap().is_empty());
         assert!(pv["worker_obs"].as_str().unwrap().contains("code-silent01"));
         let _ = std::fs::remove_dir_all(&root.dir);

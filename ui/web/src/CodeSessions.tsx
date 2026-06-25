@@ -38,7 +38,7 @@ type Stat = {
 };
 
 type Ev = { id: number; ts: string | null; kind: string | null; summary: string | null };
-type Detail = { session: Stat; events: Ev[]; resume_command: string; children: Stat[] };
+type Detail = { session: Stat; events: Ev[]; resume_command: string | null; children: Stat[] };
 
 function humanDuration(ms: number | null): string {
   if (ms == null || ms < 0) return '—';
@@ -727,10 +727,15 @@ export default function CodeSessions({ focus }: { focus?: string } = {}) {
             {ds.workdir && (<><span>workdir</span><b className="cs-id">{ds.workdir}</b></>)}
           </div>
 
-          <div className="cs-resume">
-            <code>{detail.resume_command}</code>
-            <button className="cs-btn" onClick={() => copyResume(detail.resume_command)}>{copied ? 'copied' : 'copy'}</button>
-          </div>
+          {/* Interactive-resume hint: a managed relaunch with the tool's own
+              resume flag. Suggestive and per-tool — absent for tools with no clean
+              passthrough (codex/opencode), so render only when present. */}
+          {detail.resume_command && (
+            <div className="cs-resume">
+              <code title="Re-attach interactively (managed launch)">{detail.resume_command}</code>
+              <button className="cs-btn" onClick={() => copyResume(detail.resume_command!)}>{copied ? 'copied' : 'copy'}</button>
+            </div>
+          )}
 
           {/* M5: estimate vs actual — only when the session recorded an estimate. */}
           {estimate && estimate.session === detail.session.elanus_session && (
