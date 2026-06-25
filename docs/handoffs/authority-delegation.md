@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 author: Opus 4.8 in Claude Code
 ---
 # Handoff: delegated authority is a subset of the spawner
@@ -195,6 +195,19 @@ see it refused if it tries to exceed it.
   read `Grants`.
 
 ## Log
+
+- 2026-06-25 — **Landed on main (M1–M4 complete).** Merged `authority-delegation-rest`
+  into main (`3862ebd`). Context: main had only a divergent PARTIAL M2 (bundled
+  into the web-packaging consolidation commit while disentangling a commingled
+  working tree); the branch carried the complete, cleaner M2 + M3 + M4. Conflict
+  resolution (codex/high impl → Opus adversarial verify, the usual subagent
+  pattern) kept main's evolution of broker/codeagent/codesession — including the
+  session resume-hint (`interactive_resume_hint`/`session_resume_hint`) — and took
+  the branch's complete `Grants`/`RequestedGrants` model, dropping the obsolete
+  partial-M2 helper. Verified: `cargo test` **358 pass** on main (incl. the
+  seatbelt cage probe + the bus-subset, budget `Σ children ≤ parent`, and M3
+  capability-dimension tests); zero leftover conflict markers. The
+  `authority-delegation-rest` branch + its worktree are now redundant.
 
 - 2026-06-20 — Written after the web-packaging work surfaced the gap concretely: a
   CLI shelled from inside a supervised session presents that session's *scoped*
