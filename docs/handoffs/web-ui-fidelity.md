@@ -1,7 +1,7 @@
 ---
 name: UX Overhaul
 description: Output from a UX review
-status: planned
+status: done
 ---
 
 # Handoff: web UI fidelity pass — contrast, responsive, controls, language, warmth
@@ -350,8 +350,23 @@ Acceptance criteria:
 Status: M1–M6 implemented in one pass. Specs extended (`ui/web/test/ui.spec.mjs`
 flows 8 narrow-viewport, 9 a11y, 10 product-language + identity, plus
 contrast-baseline assertions in flow 1 and picker/validation assertions in
-flow 2). The web-qa skill should be run against an isolated stack before
-calling this done — that is the remaining task.
+flow 2).
+
+- **2026-06-25 — verified (handoff-workflow verify phase).** Authoritative
+  verification run uncaged by the orchestrator (the cross-model workers run caged
+  and cannot launch chromium/the web server):
+  - **Automated:** the full `ui.spec.mjs` suite passes against the Rust `elanus
+    web` server with real chromium (`ELANUS_UI_SPEC_RUST=1`) — ALL PASS, incl.
+    flow 1 contrast-baseline, flow 2 picker/validation, flow 8 narrow-viewport,
+    flow 9 a11y, flow 10 product-language + identity.
+  - **Visual QA:** a 14-shot pass (welcome/setup/converse/configure/signals/
+    workers/comms at desktop 1280 **and** narrow 390) confirmed: M1 text readable
+    across all views; M2 narrow views stack/wrap with no clipping (masthead
+    "CONNECTED" intact, tab strip wraps, cards `min-width:0`, compose reachable);
+    M3 closed-set model value renders; M5 product language + per-agent identity
+    chips (distinct colors) present; M6 amber reserved for voices, orange for
+    signals. A GLM-5.2 cross-model code-read review ran in parallel as a second
+    opinion. Status → **done**.
 
 - (M1) Measured ratios for the changed tokens, in rest and active states
   (computed against `--bg #0f100e`, `--panel #161814`, active-row `#1b1d18`):

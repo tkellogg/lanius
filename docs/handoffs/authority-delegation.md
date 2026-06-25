@@ -1,5 +1,5 @@
 ---
-status: completed
+status: in-progress
 author: Opus 4.8 in Claude Code
 ---
 # Handoff: delegated authority is a subset of the spawner
