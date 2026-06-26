@@ -430,7 +430,7 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     // The cage is built once per exec from the profile's [sandbox] grant;
     // every shell tool call spawns inside it and gets boundary-diffed.
     let cage = sandbox::Cage::from_profile(root, &prof.sandbox);
-    let client = build_client(&prof);
+    let (client, chat_opts) = build_client(root, &conn, &prof)?;
     let model = prof.model.model.clone();
     // MCP servers (border protocol, src/mcp.rs): approved third-party tool
     // servers spawn inside the agent's cage for the run; their tools join
@@ -507,7 +507,7 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
             json!({ "model": model, "turn": turns }),
         );
         let res = client
-            .exec_chat(model.as_str(), chat_req, None)
+            .exec_chat(model.as_str(), chat_req, chat_opts.as_ref())
             .await
             .with_context(|| format!("llm call failed (model {model})"))?;
         let tokens_in = res.usage.prompt_tokens.unwrap_or(0);
@@ -1071,43 +1071,194 @@ pub fn release_own_leases(conn: &Connection) {
     );
 }
 
-/// Default client unless an endpoint/auth override is in play — then a
-/// ServiceTargetResolver rewrites the target. ANTHROPIC_BASE_URL (env) only
-/// applies when the model resolved to the Anthropic adapter, mirroring the
-/// Anthropic SDK; a profile's explicit base_url applies unconditionally.
-fn build_client(prof: &profile::Profile) -> Client {
+/// How `build_client` will configure the genai client for this run. Extracted as
+/// a testable seam: genai's resolved `ServiceTarget` is produced inside a closure
+/// and isn't directly inspectable, so the resolution DECISION is computed here and
+/// asserted in tests, while `build_client` only translates a plan into a `Client`.
+#[derive(Debug)]
+enum DispatcherPlan {
+    /// No override in play — genai's defaults (adapter auth + endpoint).
+    Default,
+    /// DEPRECATED inline path (`[model].base_url`/`api_key_env`), unchanged: an
+    /// endpoint override (profile base_url, or ANTHROPIC_BASE_URL for the
+    /// Anthropic adapter) and/or an env-var-named API key.
+    Inline {
+        profile_url: Option<String>,
+        env_url: Option<String>,
+        api_key_env: Option<String>,
+    },
+    /// Canonical path: a named provider resolved through the vault. Carries the
+    /// LITERAL coordinates (endpoint + decrypted key + extra headers) — wins over
+    /// any inline fields. Never logged (the key is a `Secret`).
+    Provider(crate::provider::DispatcherInjection),
+}
+
+/// Map a provider wire to the genai adapter whose endpoint-normalization rules
+/// (and request shape) match it. The provider's wire is authoritative for the
+/// canonical path — it decides how the base_url is normalized.
+fn wire_adapter(wire: crate::provider::Wire) -> genai::adapter::AdapterKind {
     use genai::adapter::AdapterKind;
+    match wire {
+        crate::provider::Wire::Anthropic => AdapterKind::Anthropic,
+        crate::provider::Wire::OpenAI => AdapterKind::OpenAI,
+    }
+}
+
+/// Decide how to configure the dispatcher client for this profile. The testable
+/// seam: `env_url` is threaded in (the read-of-ANTHROPIC_BASE_URL) so the
+/// decision is pure given (root, conn, profile, env). A named `[model].provider`
+/// wins wholesale; a `NativeLogin` provider returns a legible Err (the agent
+/// can't start — there is no secret to feed a genai client); an unknown provider
+/// name errors. With no provider, the existing inline behavior is preserved
+/// byte-for-byte.
+fn dispatcher_plan(
+    root: &Root,
+    conn: &Connection,
+    prof: &profile::Profile,
+    env_url: Option<String>,
+) -> Result<DispatcherPlan> {
+    if let Some(name) = prof.model.provider.as_deref() {
+        let provider = crate::provider::get(root, conn, name)?.ok_or_else(|| {
+            anyhow!(
+                "profile's [model].provider names {name:?}, but no such provider exists — \
+                 define it with `elanus provider add {name} …` (or remove [model].provider \
+                 to use the inline base_url/api_key_env)"
+            )
+        })?;
+        // Dispatcher consumer: ApiKey -> DispatcherInjection; NativeLogin -> the
+        // legible refusal, propagated so the agent fails to start with a clear
+        // message (a native login can't drive the genai dispatcher).
+        let inj = crate::provider::materialize(
+            name,
+            &provider.credential,
+            crate::provider::Consumer::Dispatcher,
+            None,
+        )?;
+        let crate::provider::Injection::Dispatcher(d) = inj else {
+            unreachable!("the Dispatcher consumer yields a Dispatcher injection");
+        };
+        return Ok(DispatcherPlan::Provider(d));
+    }
+
+    let profile_url = prof.model.base_url.clone();
+    let api_key_env = prof.model.api_key_env.clone();
+    if profile_url.is_none() && env_url.is_none() && api_key_env.is_none() {
+        return Ok(DispatcherPlan::Default);
+    }
+    Ok(DispatcherPlan::Inline {
+        profile_url,
+        env_url,
+        api_key_env,
+    })
+}
+
+/// Default client unless an endpoint/auth override is in play — then a
+/// ServiceTargetResolver rewrites the target.
+///
+/// Two override sources, in precedence order:
+/// - **A named provider** (`[model].provider`, the canonical path): the vault
+///   supplies the literal endpoint + key (and any extra headers). It WINS over
+///   the inline fields. Extra headers (LiteLLM/OpenRouter) are returned as a
+///   PER-CALL `ChatOptions` (the second tuple element), NOT set client-wide:
+///   genai 0.6.5's Anthropic/OpenAI adapters merge `extra_headers` only from the
+///   per-call `options` argument of `exec_chat` (client_impl.rs:110), never from
+///   the client config — so client-level `with_extra_headers` would be silently
+///   dropped for exactly the adapters elanus uses. The caller threads the
+///   returned options into the `exec_chat(..., opts.as_ref())` call so the
+///   headers actually reach the wire (additive — preserves the adapter's auth
+///   header).
+/// - **Inline `base_url`/`api_key_env`** (DEPRECATED, unchanged): ANTHROPIC_BASE_URL
+///   (env) only applies when the model resolved to the Anthropic adapter,
+///   mirroring the Anthropic SDK; a profile's explicit base_url applies
+///   unconditionally; api_key_env reads the key from a named env var.
+///
+/// Returns the configured `Client` and an optional per-call `ChatOptions`
+/// carrying the provider's extra headers (`Some` only when non-empty).
+fn build_client(
+    root: &Root,
+    conn: &Connection,
+    prof: &profile::Profile,
+) -> Result<(Client, Option<genai::chat::ChatOptions>)> {
+    use genai::adapter::AdapterKind;
+    use genai::chat::ChatOptions;
     use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
     use genai::ServiceTarget;
 
-    let profile_url = prof.model.base_url.clone();
     let env_url = std::env::var("ANTHROPIC_BASE_URL")
         .ok()
         .filter(|s| !s.is_empty());
-    let api_key_env = prof.model.api_key_env.clone();
-    if profile_url.is_none() && env_url.is_none() && api_key_env.is_none() {
-        return Client::default();
-    }
-    let resolver = ServiceTargetResolver::from_resolver_fn(
-        move |mut target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-            let adapter = target.model.adapter_kind;
-            let url = profile_url.clone().or_else(|| {
-                (adapter == AdapterKind::Anthropic)
-                    .then(|| env_url.clone())
-                    .flatten()
+
+    match dispatcher_plan(root, conn, prof, env_url)? {
+        DispatcherPlan::Default => Ok((Client::default(), None)),
+
+        DispatcherPlan::Inline {
+            profile_url,
+            env_url,
+            api_key_env,
+        } => {
+            let resolver = ServiceTargetResolver::from_resolver_fn(
+                move |mut target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                    let adapter = target.model.adapter_kind;
+                    let url = profile_url.clone().or_else(|| {
+                        (adapter == AdapterKind::Anthropic)
+                            .then(|| env_url.clone())
+                            .flatten()
+                    });
+                    if let Some(url) = url {
+                        target.endpoint = Endpoint::from_owned(normalize_base_url(&url, adapter));
+                    }
+                    if let Some(envk) = &api_key_env {
+                        target.auth = AuthData::from_env(envk.clone());
+                    }
+                    Ok(target)
+                },
+            );
+            Ok((
+                Client::builder()
+                    .with_service_target_resolver(resolver)
+                    .build(),
+                None,
+            ))
+        }
+
+        DispatcherPlan::Provider(inj) => {
+            // The provider's wire is authoritative: it decides how the base_url is
+            // normalized and (for an Anthropic provider with an Anthropic model)
+            // matches genai's request shape.
+            let adapter = wire_adapter(inj.wire);
+            let endpoint = normalize_base_url(&inj.base_url, adapter);
+            // The LITERAL decrypted key (the vault stores the secret itself now,
+            // not an env-var name). Materialized transiently into the resolver;
+            // never logged.
+            let key = inj.key.expose().to_string();
+            let resolver = ServiceTargetResolver::from_resolver_fn(
+                move |mut target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                    target.endpoint = Endpoint::from_owned(endpoint.clone());
+                    target.auth = AuthData::from_single(key.clone());
+                    Ok(target)
+                },
+            );
+            let client = Client::builder()
+                .with_service_target_resolver(resolver)
+                .build();
+            // Extra headers (LiteLLM/OpenRouter): additive on top of the adapter's
+            // auth header. Carried as PER-CALL ChatOptions — genai 0.6.5's
+            // Anthropic/OpenAI adapters merge `extra_headers` only from the per-call
+            // `options` argument of exec_chat (client_impl.rs:110), never from the
+            // client config, so a client-level `with_extra_headers` would be silently
+            // dropped for those adapters. The caller threads this into the exec_chat
+            // call so the headers reach the wire.
+            let chat_opts = (!inj.headers.is_empty()).then(|| {
+                let pairs: Vec<(String, String)> = inj
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.expose().to_string()))
+                    .collect();
+                ChatOptions::default().with_extra_headers(pairs)
             });
-            if let Some(url) = url {
-                target.endpoint = Endpoint::from_owned(normalize_base_url(&url, adapter));
-            }
-            if let Some(envk) = &api_key_env {
-                target.auth = AuthData::from_env(envk.clone());
-            }
-            Ok(target)
-        },
-    );
-    Client::builder()
-        .with_service_target_resolver(resolver)
-        .build()
+            Ok((client, chat_opts))
+        }
+    }
 }
 
 /// genai appends e.g. "messages" directly to the endpoint, while SDK-style
@@ -1794,6 +1945,210 @@ mod tests {
             .unwrap();
         assert_eq!(got, p);
         std::fs::remove_dir_all(&p).ok();
+    }
+
+    // ───────────────────────── M3: dispatcher provider resolution ─────────────────────────
+
+    use crate::paths::Root;
+    use crate::provider::{self, Credential, Provider, Secret, Wire};
+    use rusqlite::Connection;
+
+    fn prov_root(tag: &str) -> Root {
+        let dir = std::env::temp_dir().join(format!(
+            "el-exec-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Root { dir }
+    }
+
+    fn profile_with(provider: Option<&str>) -> profile::Profile {
+        let mut p = profile::Profile::default();
+        p.model.provider = provider.map(String::from);
+        p
+    }
+
+    #[test]
+    fn provider_plan_resolves_endpoint_and_literal_key() {
+        let root = prov_root("apikey");
+        let conn = Connection::open(root.db()).unwrap();
+        provider::add(
+            &root,
+            &conn,
+            &Provider {
+                name: "deepseek".into(),
+                credential: Credential::ApiKey {
+                    wire: Wire::Anthropic,
+                    base_url: "https://api.deepseek.com/anthropic".into(),
+                    key: Secret::new("sk-live-123"),
+                    headers: vec![("X-LiteLLM".into(), Secret::new("hdr-secret"))],
+                },
+            },
+        )
+        .unwrap();
+
+        let prof = profile_with(Some("deepseek"));
+        let plan = dispatcher_plan(&root, &conn, &prof, None).unwrap();
+        match plan {
+            DispatcherPlan::Provider(d) => {
+                assert_eq!(d.wire, Wire::Anthropic);
+                assert_eq!(d.base_url, "https://api.deepseek.com/anthropic");
+                // The vault now stores the literal secret, not an env-var name.
+                assert_eq!(d.key.expose(), "sk-live-123");
+                assert_eq!(d.headers[0].0, "X-LiteLLM");
+                assert_eq!(d.headers[0].1.expose(), "hdr-secret");
+                // The endpoint normalization the client will apply (Anthropic wire
+                // → /v1/ suffix), proving the wire drives normalization.
+                assert_eq!(
+                    normalize_base_url(&d.base_url, wire_adapter(d.wire)),
+                    "https://api.deepseek.com/anthropic/v1/"
+                );
+            }
+            other => panic!("expected a Provider plan, got {other:?}"),
+        }
+        // build_client must succeed end-to-end for an ApiKey provider.
+        assert!(build_client(&root, &conn, &prof).is_ok());
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn provider_headers_ride_per_call_chat_options() {
+        // The provider's extra headers must land on the PER-CALL ChatOptions
+        // build_client returns (which the dispatcher threads into exec_chat) —
+        // NOT only into DispatcherInjection, and NOT client-level (genai 0.6.5's
+        // Anthropic/OpenAI adapters merge extra_headers only from the per-call
+        // options argument, so client-level headers never reach the wire).
+        let root = prov_root("hdrs");
+        let conn = Connection::open(root.db()).unwrap();
+        provider::add(
+            &root,
+            &conn,
+            &Provider {
+                name: "litellm".into(),
+                credential: Credential::ApiKey {
+                    wire: Wire::Anthropic,
+                    base_url: "https://proxy.example/anthropic".into(),
+                    key: Secret::new("sk-live-123"),
+                    headers: vec![("X-LiteLLM-Tag".into(), Secret::new("hdr-secret"))],
+                },
+            },
+        )
+        .unwrap();
+
+        let prof = profile_with(Some("litellm"));
+        let (_client, chat_opts) = build_client(&root, &conn, &prof).unwrap();
+        let opts = chat_opts.expect("provider with headers yields per-call ChatOptions");
+        let headers = opts
+            .extra_headers
+            .expect("the header rides on the per-call ChatOptions");
+        let got: std::collections::HashMap<String, String> =
+            headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(got.get("X-LiteLLM-Tag").map(String::as_str), Some("hdr-secret"));
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn native_login_provider_refuses_dispatcher() {
+        let root = prov_root("native");
+        let conn = Connection::open(root.db()).unwrap();
+        provider::add(
+            &root,
+            &conn,
+            &Provider {
+                name: "chatgpt".into(),
+                credential: Credential::NativeLogin { tool: None },
+            },
+        )
+        .unwrap();
+
+        let prof = profile_with(Some("chatgpt"));
+        // The agent must fail to start with the legible refusal — a native login
+        // has no secret to feed the genai dispatcher.
+        let err = dispatcher_plan(&root, &conn, &prof, None).unwrap_err().to_string();
+        assert!(err.contains("native-login"), "legible refusal: {err}");
+        assert!(build_client(&root, &conn, &prof).is_err());
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn unknown_provider_name_errors_legibly() {
+        let root = prov_root("missing");
+        let conn = Connection::open(root.db()).unwrap();
+        let prof = profile_with(Some("nope"));
+        let err = dispatcher_plan(&root, &conn, &prof, None).unwrap_err().to_string();
+        assert!(err.contains("no such provider"), "{err}");
+        assert!(err.contains("nope"), "{err}");
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn no_provider_keeps_inline_and_default_paths() {
+        let root = prov_root("inline");
+        let conn = Connection::open(root.db()).unwrap();
+
+        // No provider, no inline fields, no env → the genai default client.
+        let bare = profile_with(None);
+        assert!(matches!(
+            dispatcher_plan(&root, &conn, &bare, None).unwrap(),
+            DispatcherPlan::Default
+        ));
+
+        // No provider, but an inline base_url → the deprecated inline path, intact.
+        let mut inline = profile_with(None);
+        inline.model.base_url = Some("https://api.deepseek.com/anthropic".into());
+        inline.model.api_key_env = Some("DEEPSEEK_API_KEY".into());
+        match dispatcher_plan(&root, &conn, &inline, None).unwrap() {
+            DispatcherPlan::Inline {
+                profile_url,
+                api_key_env,
+                ..
+            } => {
+                assert_eq!(profile_url.as_deref(), Some("https://api.deepseek.com/anthropic"));
+                assert_eq!(api_key_env.as_deref(), Some("DEEPSEEK_API_KEY"));
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
+
+        // ANTHROPIC_BASE_URL alone (threaded as env_url) also takes the inline path.
+        let env_only = profile_with(None);
+        assert!(matches!(
+            dispatcher_plan(&root, &conn, &env_only, Some("https://x".into())).unwrap(),
+            DispatcherPlan::Inline { .. }
+        ));
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn provider_wins_over_inline_fields() {
+        let root = prov_root("wins");
+        let conn = Connection::open(root.db()).unwrap();
+        provider::add(
+            &root,
+            &conn,
+            &Provider {
+                name: "ds".into(),
+                credential: Credential::ApiKey {
+                    wire: Wire::OpenAI,
+                    base_url: "https://provider.example/v1".into(),
+                    key: Secret::new("sk-from-provider"),
+                    headers: vec![],
+                },
+            },
+        )
+        .unwrap();
+        // Both a provider AND inline fields set: the provider must win wholesale.
+        let mut prof = profile_with(Some("ds"));
+        prof.model.base_url = Some("https://inline.example".into());
+        prof.model.api_key_env = Some("IGNORED_ENV".into());
+        match dispatcher_plan(&root, &conn, &prof, Some("https://env".into())).unwrap() {
+            DispatcherPlan::Provider(d) => {
+                assert_eq!(d.base_url, "https://provider.example/v1");
+                assert_eq!(d.key.expose(), "sk-from-provider");
+            }
+            other => panic!("provider must win over inline, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root.dir).ok();
     }
 
     // M1 (docs/handoffs/chat-rendering.md): send_message (no suspend) and

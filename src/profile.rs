@@ -98,13 +98,25 @@ pub struct ModelCfg {
     pub model: String,
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
-    /// SDK-style base URL override for Anthropic-compatible providers
-    /// (e.g. "https://api.deepseek.com/anthropic"). Falls back to the
-    /// ANTHROPIC_BASE_URL env var when the model resolves to the Anthropic
-    /// adapter — same semantics as Anthropic's own SDK.
+    /// Name of a managed provider (docs/handoffs/model-providers.md) the
+    /// dispatcher resolves at launch via the encrypted vault. When set it WINS
+    /// wholesale: `build_client` loads the provider, materializes it for the
+    /// `Dispatcher` consumer (ApiKey only — a `NativeLogin` provider fails the
+    /// agent's start with a legible refusal), and the resolved base_url + key +
+    /// extra headers fully determine endpoint/auth/headers. The inline
+    /// `base_url`/`api_key_env` fields below are then IGNORED. This is the
+    /// canonical path; prefer it over the inline fields.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// DEPRECATED (superseded by `provider`): SDK-style base URL override for
+    /// Anthropic-compatible providers (e.g. "https://api.deepseek.com/anthropic").
+    /// Falls back to the ANTHROPIC_BASE_URL env var when the model resolves to
+    /// the Anthropic adapter — same semantics as Anthropic's own SDK. Honored
+    /// only when `provider` is unset; kept for back-compat migration.
     #[serde(default)]
     pub base_url: Option<String>,
-    /// Env var holding the API key, when it isn't the adapter's default.
+    /// DEPRECATED (superseded by `provider`): env var holding the API key, when
+    /// it isn't the adapter's default. Honored only when `provider` is unset.
     #[serde(default)]
     pub api_key_env: Option<String>,
 }
@@ -114,6 +126,7 @@ impl Default for ModelCfg {
         ModelCfg {
             model: default_model(),
             max_turns: default_max_turns(),
+            provider: None,
             base_url: None,
             api_key_env: None,
         }

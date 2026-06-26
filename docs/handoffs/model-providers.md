@@ -261,9 +261,13 @@ refused with the legible message) instead of re-deriving `base_url`/`api_key_env
 The inline `base_url` / `api_key_env` fields stay as a **deprecated** ad-hoc
 override (back-compat; inline wins, or is removed per Open Decisions). An ApiKey
 provider's `headers` are wired here via `ChatOptions::with_extra_headers` (additive —
-preserves genai's adapter auth) set client-wide on the `ClientConfig` (spike-confirmed
-in genai 0.6.5; reserve `AuthData::RequestOverride` for unorthodox auth that must
-replace the auth header too).
+preserves genai's adapter auth), carried on the **per-call** `ChatOptions` passed to
+`exec_chat` — NOT client-wide on the `ClientConfig`: genai 0.6.5's Anthropic/OpenAI
+adapters merge `extra_headers` only from the per-call `options` argument
+(`client_impl.rs:110`), never the client config (the `or_else(client)` getter is dead
+code for those adapters — this **corrects** the spike-2 client-level recommendation,
+found in M3 validation). Reserve `AuthData::RequestOverride` for unorthodox auth that
+must replace the auth header too.
 **Acceptance:** a dispatcher agent whose profile names an ApiKey provider routes
 through it (existing genai behavior, now by reference); a profile naming a
 `NativeLogin` provider fails to start with the legible refusal; profiles with the
@@ -446,3 +450,27 @@ dropdown; selecting (or being on) a NativeLogin shows neither list nor warning.
   `ELANUS_PV_<other>_KEY` from an outer launch is inherited (harmless — codex reads only
   its configured `env_key`, homogeneous authority). **Next: M3 (dispatcher
   `[model].provider` in `build_client`, src/exec.rs).**
+
+- 2026-06-26 — **M3 landed (impl Opus-med → validate Opus-high → fix →
+  re-validate, pass).** `provider: Option<String>` on `ModelCfg` (src/profile.rs);
+  `build_client` (src/exec.rs) resolves a named provider via a testable
+  `dispatcher_plan` seam (`Default | Inline | Provider`): a `Provider` sets the
+  endpoint from the provider's wire + literal-key auth (`AuthData::from_single`, not
+  `from_env` — the vault stores the secret itself) + extra headers; `NativeLogin`
+  propagates the legible refusal so the agent fails to start; `provider` wins
+  wholesale over the (deprecated, untouched) inline `base_url`/`api_key_env`;
+  `provider=None` is byte-identical to pre-M3. **Validation overturned a spike-2
+  claim** (a genuine catch): the impl wired headers **client-level** per spike-2's
+  recommendation, but a source read of genai 0.6.5 showed the Anthropic/OpenAI
+  adapters merge `extra_headers` ONLY from the **per-call** `options` arg
+  (`client_impl.rs:110`) — the client-level `or_else` getter is dead code for those
+  adapters — so the LiteLLM/OpenRouter headers would be **silently dropped**. Fixed:
+  `build_client` now returns `(Client, Option<ChatOptions>)`, the headers ride the
+  per-call `ChatOptions` threaded into the sole `exec_chat` call site (exec.rs ~510),
+  with a unit test asserting the header survives onto that path (the handoff M3 body +
+  Open Decision 4 corrected to match). `cargo test` **384 pass**. Carried non-blocking:
+  the header-survival test is unit-level (the genai per-call merge itself is
+  spike-established, not re-exercised against a live endpoint); endpoint normalization
+  uses the provider's wire while genai still picks the request adapter from the model
+  name (a model/wire mismatch is user misconfig, same exposure as the inline path).
+  **Next: M4 (the #4 UI — Providers page + route + ModelField link).**
