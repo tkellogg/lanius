@@ -198,6 +198,21 @@ statuses: planned | in-progress | verifying | done
   [coding-agent-observability.md](coding-agent-observability.md) and
   [chat-conversations.md](chat-conversations.md). Backed by
   [../journeys/11-profiles.md](../journeys/11-profiles.md).
+- [model-providers.md](model-providers.md) - **planned**: make a **provider** a
+  named, encrypted credential elanus can point any LLM consumer at — the genai
+  dispatcher *or* a coding harness. Collapses two `_questions.md` items (the
+  "provider-setup link" and "set a model provider on a subagent") into one missing
+  primitive. The credential is a **sum type with a per-consumer validity matrix**
+  (`ApiKey{wire,url,key,headers}` feeds both; `NativeLogin` — the Claude.AI/ChatGPT
+  login — feeds only a harness, never the dispatcher), so `materialize(cred,
+  consumer)` is **partial** and fails closed. Stored **encrypted in SQL** (keyring
+  too inconsistent for a headless daemon; master key in a `0600` file, threat model
+  = accidental disclosure), as a plain **resource** — not config-repo, not an
+  identity/authority (audited, not gated). Selected via an elanus option *before*
+  the tool token (`elanus code --provider deepseek claude --resume`) so tool args
+  forward verbatim; the existing harness **scrub** becomes the *enabler* of nesting
+  ("codex-on-ChatGPT-inside-codex-on-GLM"). M1 vault + sum type → M2 harness/launch
+  (delivers #5) → M3 dispatcher (`build_client`, src/exec.rs) → M4 the #4 UI.
 - [web-packaging.md](web-packaging.md) - **in-progress** (M1–M3 shipped, M4
   deferred): make `cargo install elanus` serve the web UI with **no Node.js, no
   npm, and no source tree at runtime** — fold `server.mjs` into a Rust `src/web.rs`
