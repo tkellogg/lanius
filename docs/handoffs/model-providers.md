@@ -408,3 +408,41 @@ dropdown; selecting (or being on) a NativeLogin shows neither list nor warning.
   real codex binary; confirm opencode routes through the injected custom-provider id
   when `--model <id>/<model>` is appended; the `add` upsert silently overwrites a
   same-named provider. **Next: M2 (harness consumption + `--provider` launch).**
+
+- 2026-06-26 — **M2 landed (impl Opus-med → empirical validate Opus-high → fix →
+  re-validate, pass).** `elanus code --provider <name> <tool> …` is parsed before the
+  tool token (`take_provider_flag`, src/codeagent.rs ~224; threaded via main.rs to
+  `launch`/`spawn`) and gated entirely on the flag — no `--provider` ⇒ byte-identical
+  launch. After `scrub_provider_creds`, `apply_provider_injection_env` (~206) clears
+  the scrub-gap vars (`HARNESS_CONFIG_VARS`: `CODEX_*`/`OPENCODE_CONFIG*`, even for a
+  `NativeLogin` clean child) then sets `materialize(name,cred,Harness(h),model)`'s env;
+  codex `-c` args append before the prompt; the secret rides env, never argv. Provider
+  NAME (not the secret) is recorded on session/start obs (audit, not gate). Wire/harness
+  mismatch + unknown provider are refused before any child spawns.
+  **Empirical validation earned its keep — two real bugs code-review would have missed,
+  both caught by running the real binaries against a 127.0.0.1 stub:** (1) **M1's codex
+  injection was silently NON-FUNCTIONAL** — codex 0.141 requires
+  `model_providers.<id>.name`; without it every `codex exec` failed config load
+  (`provider name must not be empty`). Added the `name` field (+ TOML-quoted
+  `model_provider` value so hyphenated ids parse); a full
+  `elanus code --provider deepseek-test codex --headless` then hit the stub with the
+  injected bearer on the `responses` wire. (2) **opencode config was incomplete** —
+  `options` alone yields `ProviderModelNotFoundError` and zero connection for any
+  non-models.dev-slug name; the config must also carry `npm`
+  (`@ai-sdk/openai-compatible` / `@ai-sdk/anthropic`) AND a `models.<model>` entry.
+  Fixed by threading the launch `--model` into `materialize` (new `model: Option<&str>`,
+  read only by the opencode arm; no model + opencode ⇒ legible refusal); re-verified
+  end-to-end (routes with the injected bearer). codex + opencode empirically confirmed;
+  claude sound-by-construction + Tim-confirmed OAuth precedence (no Anthropic creds in
+  the sandbox to live-launch). `cargo test` **378 pass** (single-threaded/isolated;
+  see flaky note). Notes: a **pre-existing flaky test** surfaced —
+  `secrets::tests::migration_folds_legacy_human_into_owner_without_orphan` fails ~1/4
+  parallel runs (green single-threaded + isolated) because `secrets::owner_name`/`ensure`
+  reads process-global state (`ELANUS_OWNER` env + a CWD/shared-relative `profile::load`)
+  a parallel test races — **unrelated to model-providers, not introduced here** (M2
+  tests mutate no process env/CWD); flagged for a separate hygiene fix. Minor M2 UX
+  carried: `--provider=<name>` (equals form) isn't parsed (space form only); the
+  `CODEX_HOME`/`CODEX_API_KEY` clear under `--provider` is opt-in (doc note); a stale
+  `ELANUS_PV_<other>_KEY` from an outer launch is inherited (harmless — codex reads only
+  its configured `env_key`, homogeneous authority). **Next: M3 (dispatcher
+  `[model].provider` in `build_client`, src/exec.rs).**

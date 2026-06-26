@@ -179,6 +179,79 @@ fn scrub_launch_control_env(cmd: &mut std::process::Command) -> &mut std::proces
     cmd
 }
 
+/// Harness-config env vars that `PROVIDER_CRED_VARS` does NOT cover but through
+/// which an inherited value could still bleed into a child (codex's `CODEX_*`,
+/// opencode's `OPENCODE_CONFIG*`). When `--provider` is present, these are removed
+/// BEFORE the injection is applied so a parent's harness config can't leak through
+/// a nested launch (the scrub gap flagged in docs/handoffs/model-providers.md, M2).
+/// This is gated on `--provider`: a no-`--provider` launch never touches them, so
+/// today's behavior is byte-identical.
+const HARNESS_CONFIG_VARS: &[&str] = &[
+    "CODEX_API_KEY",
+    "CODEX_HOME",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "OPENCODE_CONFIG_CONTENT",
+];
+
+/// Apply a materialized provider `HarnessInjection` to a child `Command`: first
+/// remove the harness-config vars an inherited value could bleed through (so a
+/// parent's provider can't leak into this child — even for `NativeLogin`, whose
+/// injection is empty: choosing native-login explicitly must give a clean child),
+/// then set every injected env pair. Called ONLY when `--provider` is present.
+/// The injection's `args` are appended by the caller at the harness-correct
+/// position in argv (codex `-c` flags before the prompt); claude/opencode carry no
+/// args today. Env VALUES carry the decrypted secret — they reach the child's env
+/// here and are never logged (the injection's `Debug` redacts them).
+fn apply_provider_injection_env(cmd: &mut std::process::Command, inj: &crate::provider::HarnessInjection) {
+    for var in HARNESS_CONFIG_VARS {
+        cmd.env_remove(var);
+    }
+    for (k, v) in &inj.env {
+        cmd.env(k, v);
+    }
+}
+
+/// Strip a single elanus-level `--provider <name>` that appears BEFORE the tool
+/// token, returning `(Option<name>, remaining argv)`. The grammar is
+/// `elanus code [--provider <name>] <tool> [tool args…]`: everything from the tool
+/// token onward forwards to the tool verbatim, so scanning stops at the first
+/// non-flag token (the tool). A `--provider` appearing AFTER the tool token is a
+/// tool arg and is left untouched. Absent flag ⇒ argv returned unchanged (the
+/// no-`--provider` invariant — byte-identical to today). Sibling of
+/// `take_grants_flags`, but it runs over the WHOLE `elanus code` argv (before the
+/// tool is split out) precisely because the option sits before the tool token.
+pub fn take_provider_flag(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
+    let mut provider: Option<String> = None;
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--provider" {
+            let value = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
+            if value.is_empty() || value.starts_with("--") {
+                bail!("flag `--provider` requires a value but none was provided");
+            }
+            if provider.is_some() {
+                bail!("`--provider` may be given at most once");
+            }
+            provider = Some(value.to_string());
+            i += 2;
+            continue;
+        }
+        // The first non-flag token is the tool; everything from here forwards
+        // verbatim (a later `--provider` is a tool arg, not ours).
+        if !a.starts_with('-') {
+            out.extend_from_slice(&args[i..]);
+            break;
+        }
+        // Some other pre-tool flag we don't own — keep it and keep scanning.
+        out.push(args[i].clone());
+        i += 1;
+    }
+    Ok((provider, out))
+}
+
 pub fn print_help() {
     println!(
         "\
@@ -330,6 +403,10 @@ struct StreamLaunch<'a> {
     /// Worker/headless launch (gates opencode's `--dangerously-skip-permissions`).
     worker: bool,
     worker_timeout: Option<u64>,
+    /// A materialized provider injection (`elanus code --provider <name> …`), or
+    /// None when no `--provider` was given (then the launch is byte-identical to
+    /// today's scrub-only path). Borrowed from the owner in `launch`.
+    injection: Option<&'a crate::provider::HarnessInjection>,
 }
 
 /// A coding-agent adapter. Implementing this trait + registering in `HARNESSES`
@@ -597,6 +674,7 @@ impl Harness for Codex {
             ctx.args,
             ctx.brief,
             ctx.worker_timeout,
+            ctx.injection,
         )
     }
     fn run_tui_rollout_import(
@@ -615,6 +693,7 @@ impl Harness for Codex {
             ctx.workdir,
             ctx.args,
             ctx.brief,
+            ctx.injection,
         )
     }
     fn resume_stream_capture(
@@ -715,6 +794,7 @@ impl Harness for OpenCode {
             ctx.brief,
             ctx.worker,
             ctx.worker_timeout,
+            ctx.injection,
         )
     }
     fn run_tui_server_events(
@@ -737,6 +817,7 @@ impl Harness for OpenCode {
             ctx.workdir,
             ctx.args,
             ctx.brief,
+            ctx.injection,
         )
     }
     fn resume_stream_capture(
@@ -1312,7 +1393,7 @@ fn scrub_spawn_wrapper_identity_env(cmd: &mut std::process::Command) -> &mut std
 /// completion when `launch()` finishes. The detached wrapper inherits
 /// `ELANUS_ROOT` so it resolves the same ledger/root, but it does NOT inherit the
 /// spawner's session/bus identity.
-pub fn spawn(root: &Root, tool: &str, prompt: &str) -> Result<()> {
+pub fn spawn(root: &Root, tool: &str, prompt: &str, provider: Option<&str>) -> Result<()> {
     let spawner = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
     let Some(spawner) = spawner else {
         bail!(
@@ -1341,7 +1422,15 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str) -> Result<()> {
         std::env::current_exe().context("locating the elanus binary for background spawn")?;
 
     let mut cmd = std::process::Command::new(self_exe);
-    cmd.arg("code").arg(parsed.id());
+    cmd.arg("code");
+    // M2: forward `--provider <name>` BEFORE the tool token so the detached worker
+    // wrapper re-enters `launch()` with the same provider selection (the worker
+    // funnels through the same parse). Validated for existence/wire-fit in the
+    // child's launch, exactly like a direct `elanus code --provider … <tool>`.
+    if let Some(name) = provider {
+        cmd.arg("--provider").arg(name);
+    }
+    cmd.arg(parsed.id());
     // HM3: a detached spawn ALWAYS runs headless — a background worker has no TTY
     // and routes its completion to the spawner mailbox. Every harness now defaults
     // bare → Tui (which needs inherited stdio), so the wrapper must force the
@@ -2887,7 +2976,7 @@ fn build_resume_message(root: &Root, agent_noun: &str, session: &str, message: &
 }
 
 /// `elanus code <tool> [args...]` — launch the real coding agent, observed.
-pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
+pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) -> Result<()> {
     // If this launcher is itself running inside a coding session, capture that
     // parent edge before this function sets ENV_SESSION for the child session.
     // A blocking nested launch inherits the parent in ENV_SESSION; a DETACHED
@@ -2932,6 +3021,45 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
         .map(|_| spawn_timeout_secs());
 
     let tool = parse_harness(tool)?;
+
+    // M2 (model-providers): `elanus code --provider <name> <tool> …` points this
+    // launch at a named provider. GATED ENTIRELY on `--provider` being present —
+    // when absent, nothing below runs and the launch is byte-identical to today's
+    // scrub-only path. When present: load the provider, materialize it for THIS
+    // harness (a wire/harness mismatch or NativeLogin pin mismatch returns a legible
+    // error and refuses the launch), and carry the resulting `HarnessInjection` to
+    // the per-harness command-build sites (applied AFTER the existing scrub). The
+    // provider NAME (never the secret) is audited on the session/start obs below.
+    let provider_injection: Option<crate::provider::HarnessInjection> = match provider {
+        None => None,
+        Some(name) => {
+            let conn = crate::db::open(root)
+                .with_context(|| "opening the ledger to resolve --provider".to_string())?;
+            let prov = crate::provider::get(root, &conn, name)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no provider named {name:?} — define one with `elanus provider add {name} …` \
+                     (list with `elanus provider list`)"
+                )
+            })?;
+            let hid = crate::provider::HarnessId::parse(tool.id())?;
+            match crate::provider::materialize(
+                name,
+                &prov.credential,
+                crate::provider::Consumer::Harness(hid),
+                // opencode needs the selected model to register a custom provider id;
+                // the other harnesses ignore it (they carry the model on their own
+                // flags). `model` is the parsed `--model`/`-m` launch value.
+                model.as_deref(),
+            )? {
+                crate::provider::Injection::Harness(h) => Some(h),
+                crate::provider::Injection::Dispatcher(_) => unreachable!(
+                    "materialize(Consumer::Harness) always returns Injection::Harness"
+                ),
+            }
+        }
+    };
+    let injection_ref = provider_injection.as_ref();
+
     // HM3: the launcher routes purely on Mode. `mode_for(headless)` maps the
     // uniform `--headless` flag (false → Tui, true → Headless) for every harness;
     // the capture/command path then branches on `tool.capture(mode)`, never on a
@@ -3024,6 +3152,9 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                 "parent": parent,
                 "model": model,
                 "effort": effort,
+                // M2: which named provider this session was pointed at (audit, not
+                // gate) — the NAME only, never the secret. None when no --provider.
+                "provider": provider,
             }),
         );
 
@@ -3076,6 +3207,12 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                     // them.
                     scrub_provider_creds(&mut cmd);
                     scrub_launch_control_env(&mut cmd);
+                    // M2: if `--provider` was given, apply the materialized injection
+                    // AFTER the scrub (claude: ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN,
+                    // overriding the Claude.AI login). No-op when absent.
+                    if let Some(inj) = injection_ref {
+                        apply_provider_injection_env(&mut cmd, inj);
+                    }
                     // The session's own identity, carried to the hook bridge
                     // children CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are
                     // what `elanus bus pub` authenticates with (src/buscli.rs);
@@ -3128,6 +3265,10 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                     // them.
                     scrub_provider_creds(&mut cmd);
                     scrub_launch_control_env(&mut cmd);
+                    // M2: apply the named-provider injection (if any) after the scrub.
+                    if let Some(inj) = injection_ref {
+                        apply_provider_injection_env(&mut cmd, inj);
+                    }
                     // The session's own identity, carried to the hook bridge
                     // children CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are
                     // what `elanus bus pub` authenticates with (src/buscli.rs);
@@ -3163,6 +3304,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                 brief: brief_text.as_deref(),
                 worker,
                 worker_timeout,
+                injection: injection_ref,
             }),
             // ── RolloutImport: interactive TUI + post-hoc rollout import ───────
             // The codex TUI cell (HM2). The launcher inherits stdio (a real,
@@ -3180,6 +3322,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                 brief: brief_text.as_deref(),
                 worker,
                 worker_timeout,
+                injection: injection_ref,
             }),
             // ── Lifecycle: interactive TUI, bracket-only capture ──────────────
             // The honest no-op floor for a TUI we can launch but not faithfully
@@ -3197,6 +3340,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                 brief: brief_text.as_deref(),
                 worker,
                 worker_timeout,
+                injection: injection_ref,
             }),
             // ── ServerEvents: interactive TUI captured LIVE off a server's SSE ─
             // opencode's Tui cell (OC3). The launcher starts its own `opencode
@@ -3215,6 +3359,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String]) -> Result<()> {
                 brief: brief_text.as_deref(),
                 worker,
                 worker_timeout,
+                injection: injection_ref,
             }),
         }
     })();
@@ -3320,6 +3465,7 @@ fn run_codex_capture(
     args: &[String],
     brief: Option<&str>,
     worker_timeout: Option<u64>,
+    injection: Option<&crate::provider::HarnessInjection>,
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
@@ -3331,6 +3477,12 @@ fn run_codex_capture(
         "--json".to_string(),
         "--skip-git-repo-check".to_string(),
     ];
+    // M2: a `--provider` codex injection is a set of `-c model_provider…` flags that
+    // must ride with the `codex exec` options, BEFORE the prompt positional. The
+    // secret rides the env (env_key), never the command line.
+    if let Some(inj) = injection {
+        codex_args.extend(inj.args.iter().cloned());
+    }
     codex_args.extend_from_slice(&args);
     let timeout_suffix;
     let (program, codex_args) = if let Some(secs) = worker_timeout {
@@ -3362,6 +3514,12 @@ fn run_codex_capture(
     // The ELANUS_* vars set below are NOT scrubbed.
     scrub_provider_creds(&mut cmd);
     scrub_launch_control_env(&mut cmd);
+    // M2: apply the named-provider injection (if any) after the scrub. For codex
+    // this carries the env_key secret + removes inherited CODEX_* so a parent's
+    // provider can't bleed into this child.
+    if let Some(inj) = injection {
+        apply_provider_injection_env(&mut cmd, inj);
+    }
     cmd.env_remove("ELANUS_PACKAGE")
         .env_remove("ELANUS_BUS_TOKEN");
     // The session's own identity, carried to anything the codex session spawns —
@@ -3445,6 +3603,7 @@ fn run_codex_tui_import(
     workdir: &Path,
     args: &[String],
     brief: Option<&str>,
+    injection: Option<&crate::provider::HarnessInjection>,
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::process::Command;
 
@@ -3455,6 +3614,11 @@ fn run_codex_tui_import(
     // and the user's seed prompt (if any) into one positional. With no user prompt
     // AND no brief, we pass nothing → a bare TUI.
     let mut codex_args: Vec<String> = Vec::new();
+    // M2: a `--provider` codex injection rides as `-c model_provider…` flags before
+    // the seed positional (same shape as the exec path, just the TUI cell).
+    if let Some(inj) = injection {
+        codex_args.extend(inj.args.iter().cloned());
+    }
     // Pass through any non-prompt flags the user supplied (e.g. -m/--model) before
     // the seed positional; the prompt itself, if present, is the LAST positional.
     let (flags, user_prompt) = split_codex_seed_prompt(args);
@@ -3480,6 +3644,10 @@ fn run_codex_tui_import(
         .stderr(std::process::Stdio::inherit());
     scrub_provider_creds(&mut cmd);
     scrub_launch_control_env(&mut cmd);
+    // M2: apply the named-provider injection (if any) after the scrub.
+    if let Some(inj) = injection {
+        apply_provider_injection_env(&mut cmd, inj);
+    }
     cmd.env_remove("ELANUS_PACKAGE")
         .env_remove("ELANUS_BUS_TOKEN");
     cmd.env(ENV_SESSION, session)
@@ -4118,6 +4286,7 @@ fn run_opencode_capture(
     brief: Option<&str>,
     worker: bool,
     worker_timeout: Option<u64>,
+    injection: Option<&crate::provider::HarnessInjection>,
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::process::{Command, Stdio};
 
@@ -4162,6 +4331,12 @@ fn run_opencode_capture(
     // scrubbed.
     scrub_provider_creds(&mut cmd);
     scrub_launch_control_env(&mut cmd);
+    // M2: apply the named-provider injection (if any) after the scrub. For opencode
+    // this sets OPENCODE_CONFIG_CONTENT (which outranks a stored login) and removes
+    // inherited OPENCODE_CONFIG* so a parent's provider can't bleed into this child.
+    if let Some(inj) = injection {
+        apply_provider_injection_env(&mut cmd, inj);
+    }
     cmd.env_remove("ELANUS_PACKAGE")
         .env_remove("ELANUS_BUS_TOKEN");
     // The session's own identity, carried to anything the opencode session spawns
@@ -4263,6 +4438,7 @@ fn run_opencode_tui_server_events(
     workdir: &Path,
     args: &[String],
     brief: Option<&str>,
+    injection: Option<&crate::provider::HarnessInjection>,
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -4283,6 +4459,12 @@ fn run_opencode_tui_server_events(
         .stderr(Stdio::inherit());
     scrub_provider_creds(&mut serve);
     scrub_launch_control_env(&mut serve);
+    // M2: the model runs in THIS served instance, so the named-provider injection
+    // (OPENCODE_CONFIG_CONTENT) goes on `serve` — not the `attach` client. No-op
+    // when no --provider.
+    if let Some(inj) = injection {
+        apply_provider_injection_env(&mut serve, inj);
+    }
     serve
         .env_remove("ELANUS_PACKAGE")
         .env_remove("ELANUS_BUS_TOKEN")
@@ -4324,7 +4506,7 @@ fn run_opencode_tui_server_events(
                 "[code] opencode serve did not announce a URL; launching TUI WITHOUT live capture"
             );
             return run_opencode_attach_tui(
-                root, agent, session, workdir, args, brief, None, &password,
+                root, agent, session, workdir, args, brief, None, &password, injection,
             );
         }
     };
@@ -4361,6 +4543,7 @@ fn run_opencode_tui_server_events(
         brief,
         Some(&url),
         &password,
+        injection,
     );
 
     // 4. Tear down: stop the subscriber loop, kill the served instance (EOFs the
@@ -4398,6 +4581,7 @@ fn run_opencode_attach_tui(
     brief: Option<&str>,
     url: Option<&str>,
     password: &str,
+    injection: Option<&crate::provider::HarnessInjection>,
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::process::Command;
 
@@ -4440,6 +4624,13 @@ fn run_opencode_attach_tui(
         .stderr(std::process::Stdio::inherit());
     scrub_provider_creds(&mut cmd);
     scrub_launch_control_env(&mut cmd);
+    // M2: in the degraded bare-TUI fallback (url=None) the model runs in THIS
+    // process, so it needs the named-provider injection; in attach mode the served
+    // instance already carries it and this is a harmless clean-child scrub. No-op
+    // when no --provider.
+    if let Some(inj) = injection {
+        apply_provider_injection_env(&mut cmd, inj);
+    }
     cmd.env_remove("ELANUS_PACKAGE")
         .env_remove("ELANUS_BUS_TOKEN");
     // attach reads the same basic-auth password to reach the server.
@@ -8881,6 +9072,158 @@ mod tests {
 
     fn s(v: &str) -> String { v.to_string() }
     fn sv(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+
+    // ── M2: take_provider_flag + injection-application unit tests ─────────────
+
+    #[test]
+    fn take_provider_flag_absent_leaves_argv_unchanged() {
+        // The no-`--provider` invariant: argv byte-identical, provider None.
+        let (p, rest) = take_provider_flag(&sv(&["claude", "--resume", "fix it"])).unwrap();
+        assert_eq!(p, None);
+        assert_eq!(rest, sv(&["claude", "--resume", "fix it"]));
+    }
+
+    #[test]
+    fn take_provider_flag_strips_before_tool_token() {
+        // `elanus code --provider deepseek claude --resume` → (deepseek, claude --resume).
+        let (p, rest) =
+            take_provider_flag(&sv(&["--provider", "deepseek", "claude", "--resume"])).unwrap();
+        assert_eq!(p.as_deref(), Some("deepseek"));
+        assert_eq!(rest, sv(&["claude", "--resume"]));
+    }
+
+    #[test]
+    fn take_provider_flag_leaves_tool_args_verbatim() {
+        // Everything after the tool token forwards verbatim — including a token that
+        // happens to look like our flag (it's the tool's arg now, not ours).
+        let (p, rest) = take_provider_flag(&sv(&[
+            "--provider", "ds", "codex", "--provider", "not-ours", "do it",
+        ]))
+        .unwrap();
+        assert_eq!(p.as_deref(), Some("ds"));
+        assert_eq!(rest, sv(&["codex", "--provider", "not-ours", "do it"]));
+    }
+
+    #[test]
+    fn take_provider_flag_after_tool_token_is_a_tool_arg() {
+        // A `--provider` that only appears AFTER the tool token is NOT consumed.
+        let (p, rest) = take_provider_flag(&sv(&["claude", "--provider", "x"])).unwrap();
+        assert_eq!(p, None);
+        assert_eq!(rest, sv(&["claude", "--provider", "x"]));
+    }
+
+    #[test]
+    fn take_provider_flag_missing_value_errors() {
+        let err = take_provider_flag(&sv(&["--provider"])).unwrap_err().to_string();
+        assert!(err.contains("requires a value"), "{err}");
+        // A flag as the value is also a usage error (would swallow the next flag).
+        let err = take_provider_flag(&sv(&["--provider", "--headless", "claude"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires a value"), "{err}");
+    }
+
+    #[test]
+    fn take_provider_flag_duplicate_errors() {
+        let err = take_provider_flag(&sv(&["--provider", "a", "--provider", "b", "claude"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most once"), "{err}");
+    }
+
+    #[test]
+    fn apply_provider_injection_seam_codex_env_args_no_secret() {
+        // The injection-application seam: materialize a codex ApiKey provider, then
+        // apply it to a Command. Assert (a) the -c args select the custom provider
+        // with a QUOTED hyphenated id, (b) the secret rides env (never the args),
+        // (c) the env_key pair lands on the child, and (d) inherited harness-config
+        // vars (a parent's provider) are scrubbed so they can't bleed through.
+        use crate::provider::{
+            materialize, Consumer, Credential, HarnessId, Injection, Secret, Wire,
+        };
+        let cred = Credential::ApiKey {
+            wire: Wire::OpenAI,
+            base_url: "https://api.example.com".to_string(),
+            key: Secret::new("sk-secret-xyz"),
+            headers: vec![],
+        };
+        let Injection::Harness(inj) = materialize(
+            "deepseek-anthropic",
+            &cred,
+            Consumer::Harness(HarnessId::Codex),
+            None,
+        )
+        .unwrap() else {
+            panic!("codex consumer yields a harness injection")
+        };
+        let joined = inj.args.join(" ");
+        assert!(
+            joined.contains("model_provider=\"deepseek-anthropic\""),
+            "hyphenated id must be a quoted TOML value: {joined}"
+        );
+        assert!(
+            !joined.contains("sk-secret-xyz"),
+            "the secret must NEVER appear in a -c arg"
+        );
+
+        let mut cmd = std::process::Command::new("true");
+        // A parent's leaked harness config that must NOT survive into the child.
+        cmd.env("CODEX_HOME", "/parent/.codex");
+        cmd.env("OPENCODE_CONFIG_CONTENT", "{parent}");
+        apply_provider_injection_env(&mut cmd, &inj);
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|x| x.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        // The env_key pair carries the secret to the child (this is where it lives).
+        assert!(
+            envs.iter().any(|(k, v)| k == "ELANUS_PV_DEEPSEEK_ANTHROPIC_KEY"
+                && v.as_deref() == Some("sk-secret-xyz")),
+            "env_key pair must be set: {envs:?}"
+        );
+        // Inherited harness-config vars are scheduled for removal (None).
+        assert!(
+            envs.iter().any(|(k, v)| k == "CODEX_HOME" && v.is_none()),
+            "inherited CODEX_HOME must be scrubbed: {envs:?}"
+        );
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "OPENCODE_CONFIG_CONTENT" && v.is_none()),
+            "inherited OPENCODE_CONFIG_CONTENT must be scrubbed: {envs:?}"
+        );
+    }
+
+    #[test]
+    fn apply_provider_injection_native_login_is_clean_child_scrub() {
+        // NativeLogin yields an empty injection, but applying it still scrubs the
+        // harness-config vars so an explicit native-login child is clean (the
+        // nesting guarantee for the "named default").
+        use crate::provider::{
+            materialize, Consumer, Credential, HarnessId, Injection,
+        };
+        let Injection::Harness(inj) = materialize(
+            "native",
+            &Credential::NativeLogin { tool: None },
+            Consumer::Harness(HarnessId::Codex),
+            None,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert!(inj.env.is_empty() && inj.args.is_empty());
+        let mut cmd = std::process::Command::new("true");
+        cmd.env("CODEX_HOME", "/parent/.codex");
+        apply_provider_injection_env(&mut cmd, &inj);
+        let scrubbed = cmd
+            .get_envs()
+            .any(|(k, v)| k.to_string_lossy() == "CODEX_HOME" && v.is_none());
+        assert!(scrubbed, "native-login apply must still scrub harness-config vars");
+    }
 
     #[test]
     fn take_grants_flags_absent_gives_default() {

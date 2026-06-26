@@ -1237,6 +1237,13 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Cmd::Code { args } => {
+            // M2 (model-providers): pull the elanus-level `--provider <name>` that
+            // sits BEFORE the tool token (`elanus code --provider deepseek claude …`)
+            // so it never collides with forwarded tool args. Absent ⇒ argv unchanged
+            // (byte-identical to today). Consumed by launch/spawn; ignored by the
+            // other code verbs.
+            let (provider, args) = codeagent::take_provider_flag(&args)?;
+            let provider = provider.as_deref();
             let tool = args.first().map(String::as_str).unwrap_or("");
             let rest = args.get(1..).unwrap_or(&[]);
             // Reserved first words: `hook` is the internal hook bridge
@@ -1292,7 +1299,7 @@ fn run(cli: Cli) -> Result<()> {
                         anyhow::bail!("usage: elanus code spawn <tool> \"<task>\"");
                     }
                     let prompt = rest.get(1..).unwrap_or(&[]).join(" ");
-                    codeagent::spawn(&root, worker_tool, &prompt)?;
+                    codeagent::spawn(&root, worker_tool, &prompt, provider)?;
                 }
                 "inbox" => {
                     // A session pulls its OWN inbox (M3). Identity comes from the
@@ -1467,7 +1474,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 _ => {
-                    codeagent::launch(&root, tool, rest)?;
+                    codeagent::launch(&root, tool, rest, provider)?;
                 }
             }
         }

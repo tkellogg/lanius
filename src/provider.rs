@@ -238,11 +238,22 @@ impl fmt::Debug for HarnessInjection {
 /// | `ApiKey{Anthropic}` | ✅ resolver | ✅ env | ❌    | ✅ config |
 /// | `ApiKey{OpenAI}`    | ✅ resolver | ❌     | ✅ cfg | ✅ config |
 /// | `NativeLogin`       | ❌          | ✅ scrub| ✅ scrub| ✅ scrub |
+///
+/// `model` is the launch's selected model (the harness `--model`/`-m` value), used
+/// ONLY by the opencode harness arm: opencode needs an explicit `models` entry to
+/// resolve a custom provider id (see that arm). It is ignored by every other
+/// `(variant, consumer)` pair (claude/codex carry the model on their own flags; the
+/// dispatcher names it on the profile).
 #[allow(dead_code)] // called by M2 (harness) / M3 (dispatcher); proven by tests now
-pub fn materialize(name: &str, cred: &Credential, consumer: Consumer) -> Result<Injection> {
+pub fn materialize(
+    name: &str,
+    cred: &Credential,
+    consumer: Consumer,
+    model: Option<&str>,
+) -> Result<Injection> {
     match consumer {
         Consumer::Dispatcher => materialize_dispatcher(name, cred).map(Injection::Dispatcher),
-        Consumer::Harness(h) => materialize_harness(name, cred, h).map(Injection::Harness),
+        Consumer::Harness(h) => materialize_harness(name, cred, h, model).map(Injection::Harness),
     }
 }
 
@@ -266,7 +277,12 @@ fn materialize_dispatcher(name: &str, cred: &Credential) -> Result<DispatcherInj
     }
 }
 
-fn materialize_harness(name: &str, cred: &Credential, h: HarnessId) -> Result<HarnessInjection> {
+fn materialize_harness(
+    name: &str,
+    cred: &Credential,
+    h: HarnessId,
+    model: Option<&str>,
+) -> Result<HarnessInjection> {
     let (wire, base_url, key, headers) = match cred {
         Credential::NativeLogin { tool } => {
             // Scrub-only: the named default. A pin, if present, must match the
@@ -320,7 +336,20 @@ fn materialize_harness(name: &str, cred: &Credential, h: HarnessId) -> Result<Ha
             let mut env = vec![(key_var.clone(), key.expose().to_string())];
             let mut args = vec![
                 "-c".into(),
-                format!("model_provider={id}"),
+                // The id is a TOML *value* here, so it must be quoted: a hyphenated
+                // name (`deepseek-anthropic`, allowed by `valid_name`) is NOT a valid
+                // bare TOML scalar and a bare emit fails codex's `-c` value parse.
+                // Quoting is also correct for the bare lowercase-alnum case (the
+                // spike-proven one) — `"deepseek"` parses to the same string. The
+                // dotted *key* segments below (`model_providers.<id>.…`) stay bare:
+                // hyphens ARE valid in TOML bare keys, so the table key still matches.
+                format!("model_provider={}", toml_str(id)),
+                "-c".into(),
+                // codex 0.141 REQUIRES a non-empty `name` on every custom provider
+                // table — without it `codex exec` fails at config load with
+                // "provider name must not be empty" (verified against codex-cli
+                // 0.141.0). Use the provider id as the display name.
+                format!("model_providers.{id}.name={}", toml_str(id)),
                 "-c".into(),
                 format!("model_providers.{id}.base_url={}", toml_str(base_url)),
                 "-c".into(),
@@ -348,10 +377,42 @@ fn materialize_harness(name: &str, cred: &Credential, h: HarnessId) -> Result<Ha
         // ── opencode: config outranks a stored login (config > auth.json > env),
         // so inject OPENCODE_CONFIG_CONTENT (inline JSON provider). Multi-wire: it
         // accepts both Anthropic and OpenAI ApiKey. The secret rides inside the env
-        // var's JSON value, not the command line. Model selection (`--model
-        // <id>/<model>`) is the user's tool arg, supplied at launch (M2).
-        (HarnessId::Opencode, _) => {
+        // var's JSON value, not the command line.
+        //
+        // A custom provider id must be FULLY defined — `options` alone is NOT
+        // enough. opencode only auto-derives the AI-SDK loader (`npm`) and a model
+        // catalog for a provider whose id is a known models.dev slug; for ANY other
+        // id (the general case — `deepseek-test`, `litellm`, `openrouter`…) the
+        // config must supply BOTH the `npm` SDK package AND an explicit `models`
+        // entry for the selected model, or opencode raises
+        // `ProviderModelNotFoundError: <id>/<model>` and never opens a connection.
+        // Empirically verified against opencode 1.17.9: `options` only → 0 hits;
+        // `npm` only → 0 hits; `npm` + `models.<model>` → routes (POST with the
+        // injected Bearer). So inject all three.
+        //
+        // The model is the user's `--model <id>/<model>` tool arg (M2 threads it
+        // here). opencode resolves the provider from the `<id>/` prefix and looks up
+        // `<model>` in this provider's `models` map, so the map KEY is the part
+        // AFTER the prefix.
+        (HarnessId::Opencode, w) => {
             let id = name;
+            let npm = match w {
+                Wire::OpenAI => "@ai-sdk/openai-compatible",
+                Wire::Anthropic => "@ai-sdk/anthropic",
+            };
+            let model = model.ok_or_else(|| {
+                anyhow!(
+                    "provider {name:?} drives opencode, which needs an explicit model to \
+                     register the custom provider — pass `--model {name}/<model>` \
+                     (opencode resolves the provider from the `<id>/` prefix and looks up \
+                     `<model>` in the injected config)"
+                )
+            })?;
+            // Strip the `<id>/` provider prefix if the user supplied the opencode
+            // `provider/model` form; a bare model id is used as-is.
+            let model_id = model
+                .strip_prefix(&format!("{id}/"))
+                .unwrap_or(model);
             let mut options = serde_json::Map::new();
             options.insert("baseURL".into(), serde_json::json!(base_url));
             options.insert("apiKey".into(), serde_json::json!(key.expose()));
@@ -362,8 +423,14 @@ fn materialize_harness(name: &str, cred: &Credential, h: HarnessId) -> Result<Ha
                 }
                 options.insert("headers".into(), serde_json::Value::Object(hmap));
             }
+            let mut models = serde_json::Map::new();
+            models.insert(model_id.to_string(), serde_json::json!({}));
             let config = serde_json::json!({
-                "provider": { id: { "options": serde_json::Value::Object(options) } }
+                "provider": { id: {
+                    "npm": npm,
+                    "options": serde_json::Value::Object(options),
+                    "models": serde_json::Value::Object(models),
+                } }
             });
             Ok(HarnessInjection {
                 env: vec![("OPENCODE_CONFIG_CONTENT".into(), config.to_string())],

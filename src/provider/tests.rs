@@ -28,7 +28,7 @@ fn api(wire: Wire) -> Credential {
 fn matrix_dispatcher() {
     // ApiKey (either wire) -> Dispatcher OK, carries the literal key.
     for wire in [Wire::Anthropic, Wire::OpenAI] {
-        let inj = materialize("p", &api(wire), Consumer::Dispatcher).unwrap();
+        let inj = materialize("p", &api(wire), Consumer::Dispatcher, None).unwrap();
         let Injection::Dispatcher(d) = inj else {
             panic!("expected dispatcher injection")
         };
@@ -39,7 +39,7 @@ fn matrix_dispatcher() {
         assert_eq!(d.headers[0].1.expose(), "hdr-secret");
     }
     // NativeLogin -> Dispatcher REFUSED.
-    let err = materialize("chatgpt", &Credential::NativeLogin { tool: None }, Consumer::Dispatcher)
+    let err = materialize("chatgpt", &Credential::NativeLogin { tool: None }, Consumer::Dispatcher, None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("native-login"), "refusal must be legible: {err}");
@@ -49,7 +49,7 @@ fn matrix_dispatcher() {
 #[test]
 fn matrix_claude() {
     // ApiKey{Anthropic} -> claude env injection.
-    let inj = materialize("ds", &api(Wire::Anthropic), Consumer::Harness(HarnessId::Claude)).unwrap();
+    let inj = materialize("ds", &api(Wire::Anthropic), Consumer::Harness(HarnessId::Claude), None).unwrap();
     let Injection::Harness(h) = inj else { panic!() };
     assert_eq!(
         h.env,
@@ -60,7 +60,7 @@ fn matrix_claude() {
     );
     assert!(h.args.is_empty());
     // ApiKey{OpenAI} -> claude REFUSED (wire mismatch).
-    let err = materialize("oai", &api(Wire::OpenAI), Consumer::Harness(HarnessId::Claude))
+    let err = materialize("oai", &api(Wire::OpenAI), Consumer::Harness(HarnessId::Claude), None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("OpenAI wire"), "{err}");
@@ -69,7 +69,7 @@ fn matrix_claude() {
 #[test]
 fn matrix_codex() {
     // ApiKey{OpenAI} -> codex -c custom-provider args + secret in env.
-    let inj = materialize("ds", &api(Wire::OpenAI), Consumer::Harness(HarnessId::Codex)).unwrap();
+    let inj = materialize("ds", &api(Wire::OpenAI), Consumer::Harness(HarnessId::Codex), None).unwrap();
     let Injection::Harness(h) = inj else { panic!() };
     // The key rides env (off the command line), named by env_key.
     assert!(h.env.contains(&("ELANUS_PV_DS_KEY".to_string(), "sk-secret-123".to_string())));
@@ -77,14 +77,18 @@ fn matrix_codex() {
     assert!(h.env.contains(&("ELANUS_PV_DS_H0".to_string(), "hdr-secret".to_string())));
     // The -c flags select a custom provider, never the literal key.
     let joined = h.args.join(" ");
-    assert!(joined.contains("model_provider=ds"));
+    // The model_provider VALUE is quoted (TOML scalar; required for hyphenated ids,
+    // safe for bare ones). The dotted KEY segments stay bare.
+    assert!(joined.contains("model_provider=\"ds\""));
+    // codex 0.141 requires a non-empty provider `name` (else config load fails).
+    assert!(joined.contains("model_providers.ds.name=\"ds\""));
     assert!(joined.contains("model_providers.ds.base_url=\"https://api.example.com\""));
     assert!(joined.contains("model_providers.ds.wire_api=\"responses\""));
     assert!(joined.contains("model_providers.ds.env_key=\"ELANUS_PV_DS_KEY\""));
     assert!(joined.contains("model_providers.ds.env_http_headers.\"X-LiteLLM\"=\"ELANUS_PV_DS_H0\""));
     assert!(!joined.contains("sk-secret-123"), "secret must never be a -c arg");
     // ApiKey{Anthropic} -> codex REFUSED (wire mismatch).
-    let err = materialize("ds", &api(Wire::Anthropic), Consumer::Harness(HarnessId::Codex))
+    let err = materialize("ds", &api(Wire::Anthropic), Consumer::Harness(HarnessId::Codex), None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("Anthropic wire"), "{err}");
@@ -93,23 +97,62 @@ fn matrix_codex() {
 #[test]
 fn matrix_opencode() {
     // opencode is multi-wire: accepts both Anthropic and OpenAI ApiKey via config.
-    for wire in [Wire::Anthropic, Wire::OpenAI] {
-        let inj = materialize("ds", &api(wire), Consumer::Harness(HarnessId::Opencode)).unwrap();
+    // The custom provider id must be FULLY defined — `npm` (the AI-SDK loader) AND
+    // an explicit `models.<model>` entry — or opencode raises
+    // ProviderModelNotFoundError and never connects (verified vs opencode 1.17.9).
+    for (wire, npm) in [
+        (Wire::Anthropic, "@ai-sdk/anthropic"),
+        (Wire::OpenAI, "@ai-sdk/openai-compatible"),
+    ] {
+        // The user passes `--model <id>/<model>`; the `models` key is the part after
+        // the `<id>/` prefix.
+        let inj = materialize(
+            "ds",
+            &api(wire),
+            Consumer::Harness(HarnessId::Opencode),
+            Some("ds/gpt-4o-mini"),
+        )
+        .unwrap();
         let Injection::Harness(h) = inj else { panic!() };
         assert_eq!(h.env.len(), 1);
         assert_eq!(h.env[0].0, "OPENCODE_CONFIG_CONTENT");
         let cfg: serde_json::Value = serde_json::from_str(&h.env[0].1).unwrap();
-        let opts = &cfg["provider"]["ds"]["options"];
+        let prov = &cfg["provider"]["ds"];
+        assert_eq!(prov["npm"], npm, "the AI-SDK loader must be declared");
+        let opts = &prov["options"];
         assert_eq!(opts["baseURL"], "https://api.example.com");
         assert_eq!(opts["apiKey"], "sk-secret-123");
         assert_eq!(opts["headers"]["X-LiteLLM"], "hdr-secret");
+        // The selected model must be registered (prefix stripped) so opencode can
+        // resolve `ds/gpt-4o-mini` against this custom id.
+        assert!(
+            prov["models"]["gpt-4o-mini"].is_object(),
+            "the selected model must be registered: {prov}"
+        );
     }
+    // A bare model id (no `<id>/` prefix) is registered as-is.
+    let inj = materialize(
+        "ds",
+        &api(Wire::OpenAI),
+        Consumer::Harness(HarnessId::Opencode),
+        Some("gpt-4o-mini"),
+    )
+    .unwrap();
+    let Injection::Harness(h) = inj else { panic!() };
+    let cfg: serde_json::Value = serde_json::from_str(&h.env[0].1).unwrap();
+    assert!(cfg["provider"]["ds"]["models"]["gpt-4o-mini"].is_object());
+
+    // No model → legible refusal (opencode can't resolve a custom id without one).
+    let err = materialize("ds", &api(Wire::OpenAI), Consumer::Harness(HarnessId::Opencode), None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("needs an explicit model"), "{err}");
 }
 
 #[test]
 fn matrix_native_login_is_scrub_only_for_every_harness() {
     for h in [HarnessId::Claude, HarnessId::Codex, HarnessId::Opencode] {
-        let inj = materialize("login", &Credential::NativeLogin { tool: None }, Consumer::Harness(h)).unwrap();
+        let inj = materialize("login", &Credential::NativeLogin { tool: None }, Consumer::Harness(h), None).unwrap();
         assert_eq!(inj, Injection::Harness(HarnessInjection::default()), "empty injection");
     }
 }
@@ -119,11 +162,11 @@ fn native_login_pin_must_match_harness() {
     let cred = Credential::NativeLogin { tool: Some(HarnessId::Claude) };
     // Matching harness -> empty injection.
     assert_eq!(
-        materialize("l", &cred, Consumer::Harness(HarnessId::Claude)).unwrap(),
+        materialize("l", &cred, Consumer::Harness(HarnessId::Claude), None).unwrap(),
         Injection::Harness(HarnessInjection::default())
     );
     // Mismatched harness -> legible refusal.
-    let err = materialize("l", &cred, Consumer::Harness(HarnessId::Codex))
+    let err = materialize("l", &cred, Consumer::Harness(HarnessId::Codex), None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("pinned to claude"), "{err}");
