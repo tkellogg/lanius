@@ -16,8 +16,30 @@ extern "C" fn request_shutdown(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
-pub fn run(root: &Root, interval_ms: u64, web_port: u16, vite_port: u16) -> Result<()> {
+pub fn run(
+    root: &Root,
+    interval_ms: u64,
+    web_port: u16,
+    vite_port: u16,
+    shift_ports: bool,
+) -> Result<()> {
     install_signal_handlers();
+
+    // `--shift-ports`: the dev stack needs TWO free ports (web relay + Vite), and
+    // the defaults 7180/5173 collide easily (a second dev stack, a stale server).
+    // Rather than fail to bind, walk each up to the next free port. The banner
+    // prints the resolved pair either way.
+    let (req_web, req_vite) = (web_port, vite_port);
+    let (web_port, vite_port) = if shift_ports {
+        let w = first_free_port(web_port);
+        let mut v = first_free_port(vite_port);
+        if v == w {
+            v = first_free_port(w.saturating_add(1));
+        }
+        (w, v)
+    } else {
+        (web_port, vite_port)
+    };
 
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let web_dir = repo.join("ui/web");
@@ -82,8 +104,18 @@ pub fn run(root: &Root, interval_ms: u64, web_port: u16, vite_port: u16) -> Resu
 
     log.line(format!("[dev] root={}", root.dir.display()));
     log.line(format!("[dev] log={}", log_path.display()));
-    log.line(format!("[dev] web relay: http://127.0.0.1:{web_port}"));
-    log.line(format!("[dev] vite UI:   http://127.0.0.1:{vite_port}"));
+    if shift_ports && (web_port != req_web || vite_port != req_vite) {
+        log.line(format!(
+            "[dev] ports shifted: requested web={req_web} vite={req_vite} were busy"
+        ));
+    }
+    log.line(format!("[dev] web relay: http://127.0.0.1:{web_port}   (api backend)"));
+    log.line(format!("[dev] vite UI:   http://127.0.0.1:{vite_port}   <- open this"));
+    log.line("[dev]");
+    log.line("[dev] drive a coding agent in another terminal (from this repo):");
+    log.line("[dev]   cargo run -- code claude                     # interactive TUI");
+    log.line("[dev]   cargo run -- code codex --headless \"<task>\"   # one-shot headless worker");
+    log.line("[dev]   cargo run -- code --provider <name> claude    # pin a named model provider");
     log.line("[dev] ctrl-c stops the whole stack");
 
     for service in &mut services {
@@ -492,6 +524,17 @@ fn prepend_path(dir: &Path) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("PATH contains non-UTF-8 data"))
 }
 
+/// Probe upward from `start` for a TCP port that binds on 127.0.0.1, returning the
+/// first free one (for `elanus dev --shift-ports`). The probe listener is dropped
+/// immediately, so there is a tiny TOCTOU window before the service rebinds — fine
+/// for a dev convenience. Falls back to `start` if the whole window is busy, so the
+/// service surfaces the real "address in use" error rather than this masking it.
+fn first_free_port(start: u16) -> u16 {
+    (start..=start.saturating_add(64))
+        .find(|&port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+        .unwrap_or(start)
+}
+
 fn render_command(spec: &CommandSpec) -> String {
     let mut parts = vec![spec.program.display().to_string()];
     parts.extend(spec.args.clone());
@@ -669,5 +712,33 @@ fn kill_child_group(child: &RunningChild) {
 fn kill_child_group(child: &RunningChild) {
     unsafe {
         libc::kill(child.id() as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_free_port;
+    use std::net::TcpListener;
+
+    #[test]
+    fn first_free_port_skips_a_bound_port() {
+        // Hold a port, then ask for one starting AT it: must walk past to a free one.
+        let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let free = first_free_port(port);
+        assert_ne!(free, port, "must not hand back the bound port");
+        assert!(free > port, "walks upward from the requested port");
+        assert!(
+            TcpListener::bind(("127.0.0.1", free)).is_ok(),
+            "the returned port is actually bindable"
+        );
+    }
+
+    #[test]
+    fn first_free_port_returns_start_when_already_free() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe); // free it
+        assert_eq!(first_free_port(port), port);
     }
 }

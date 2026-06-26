@@ -180,6 +180,10 @@ enum Cmd {
         /// Port for the Vite dev server.
         #[arg(long, default_value_t = 5173)]
         vite_port: u16,
+        /// If the requested web/vite ports are busy, walk up to the next free pair
+        /// instead of failing to bind. The banner prints the resolved ports.
+        #[arg(long)]
+        shift_ports: bool,
     },
     /// Run the packaged stack: the daemon (this binary) + the web server (also
     /// this binary, `elanus web`), supervised. The prod counterpart of `dev` —
@@ -740,7 +744,8 @@ fn run(cli: Cli) -> Result<()> {
             interval_ms,
             web_port,
             vite_port,
-        } => dev::run(&root, interval_ms, web_port, vite_port)?,
+            shift_ports,
+        } => dev::run(&root, interval_ms, web_port, vite_port, shift_ports)?,
         Cmd::Serve {
             interval_ms,
             web_port,
