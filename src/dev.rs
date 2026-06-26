@@ -106,7 +106,7 @@ pub fn run(
     log.line(format!("[dev] log={}", log_path.display()));
     if shift_ports && (web_port != req_web || vite_port != req_vite) {
         log.line(format!(
-            "[dev] ports shifted: requested web={req_web} vite={req_vite} were busy"
+            "[dev] ports shifted off a conflict (you asked for web={req_web} vite={req_vite})"
         ));
     }
     log.line(format!("[dev] web relay: http://127.0.0.1:{web_port}   (api backend)"));
@@ -118,7 +118,16 @@ pub fn run(
     log.line("[dev]   cargo run -- code --provider <name> claude    # pin a named model provider");
     log.line("[dev] ctrl-c stops the whole stack");
 
-    for service in &mut services {
+    // Start the daemon + web relay first, then WAIT for the web relay to actually
+    // bind before starting Vite. Vite is ready in ~150ms but `cargo run … web` has
+    // to build/bind, so without this gate Vite proxies /api to a dead backend and
+    // opens on a wall of ECONNREFUSED — the first page load (and a provider-add in
+    // that window) fails until web catches up.
+    for service in services.iter_mut().filter(|s| s.name != "vite") {
+        service.start(&log)?;
+    }
+    wait_for_port(web_port, Duration::from_secs(60), &log);
+    for service in services.iter_mut().filter(|s| s.name == "vite") {
         service.start(&log)?;
     }
 
@@ -535,6 +544,29 @@ fn first_free_port(start: u16) -> u16 {
         .unwrap_or(start)
 }
 
+/// Block until `127.0.0.1:port` accepts a TCP connection (the web relay has
+/// bound), or `timeout` elapses, or shutdown is requested. Holds Vite's start
+/// until the proxy backend is live so the dev loop doesn't open on a wall of
+/// ECONNREFUSED while `cargo run … web` is still building.
+fn wait_for_port(port: u16, timeout: Duration, log: &Log) {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return;
+        }
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            log.line(format!("[dev] web relay up on :{port} — starting vite"));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    log.line(format!(
+        "[dev] web relay not up after {}s — starting vite anyway (it may proxy-error until web binds)",
+        timeout.as_secs()
+    ));
+}
+
 fn render_command(spec: &CommandSpec) -> String {
     let mut parts = vec![spec.program.display().to_string()];
     parts.extend(spec.args.clone());
@@ -717,8 +749,9 @@ fn kill_child_group(child: &RunningChild) {
 
 #[cfg(test)]
 mod tests {
-    use super::first_free_port;
+    use super::{first_free_port, wait_for_port, Log};
     use std::net::TcpListener;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn first_free_port_skips_a_bound_port() {
@@ -740,5 +773,20 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe); // free it
         assert_eq!(first_free_port(port), port);
+    }
+
+    #[test]
+    fn wait_for_port_returns_promptly_once_bound() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tmp = std::env::temp_dir().join(format!("eldev-test-{}.log", std::process::id()));
+        let log = Log::create(&tmp).unwrap();
+        let started = Instant::now();
+        wait_for_port(port, Duration::from_secs(5), &log);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "wait_for_port returns ~immediately once the port is bound"
+        );
+        std::fs::remove_file(&tmp).ok();
     }
 }
