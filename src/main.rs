@@ -31,6 +31,8 @@ mod packages;
 mod paths;
 mod profile;
 mod profilecli;
+mod provider;
+mod providercli;
 mod recorder;
 mod render;
 mod resident;
@@ -138,6 +140,13 @@ enum Cmd {
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
+    },
+    /// Model providers (docs/handoffs/model-providers.md): a named, encrypted
+    /// credential any LLM consumer can be pointed at. add / list / get / test / rm.
+    /// The secret is encrypted at rest and never printed.
+    Provider {
+        #[command(subcommand)]
+        cmd: ProviderCmd,
     },
     /// Memory blocks (docs/handoffs/memory-blocks.md): named, durable, editable
     /// chunks of prompt. set / get / list / append / rm — owner-scoped, upserted
@@ -385,6 +394,52 @@ enum ConfigCmd {
     Accept { id: String },
     /// Decline a proposal: drop it without applying
     Decline { id: String },
+}
+
+#[derive(Subcommand)]
+enum ProviderCmd {
+    /// Define a provider. An api-key provider needs --base-url and a key
+    /// (--key, --key-env <VAR>, or piped on stdin); a native-login provider
+    /// (--native) carries no secret. Repeatable --header Name=Value.
+    Add {
+        name: String,
+        /// Make a native-login provider ("use the tool's own login; inject nothing").
+        #[arg(long)]
+        native: bool,
+        /// Optional harness pin for a native-login provider (claude|codex|opencode).
+        #[arg(long)]
+        tool: Option<String>,
+        /// Wire/adapter for an api-key provider: anthropic (default) | openai.
+        #[arg(long)]
+        wire: Option<String>,
+        /// Base URL for an api-key provider (e.g. https://api.deepseek.com/anthropic).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// The literal API key (convenience — visible in the process table; prefer --key-env/stdin).
+        #[arg(long)]
+        key: Option<String>,
+        /// Read the API key from this environment variable (keeps it off the command line).
+        #[arg(long)]
+        key_env: Option<String>,
+        /// Extra header Name=Value (repeatable; values are encrypted at rest).
+        #[arg(long = "header")]
+        headers: Vec<String>,
+    },
+    /// List providers (metadata only; secret never shown)
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one provider's metadata (secret redacted)
+    Get {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Probe a provider's /models endpoint for reachability (decrypts transiently)
+    Test { name: String },
+    /// Delete a provider
+    Rm { name: String },
 }
 
 /// Block-addressing flags shared by every `elanus block` verb (clap flattens
@@ -1024,6 +1079,50 @@ fn run(cli: Cli) -> Result<()> {
                 let conn = open(&root)?;
                 let by = secrets::owner_name(&root);
                 configcli::decline(&root, &conn, &id, &by)?;
+            }
+        },
+        Cmd::Provider { cmd } => match cmd {
+            ProviderCmd::Add {
+                name,
+                native,
+                tool,
+                wire,
+                base_url,
+                key,
+                key_env,
+                headers,
+            } => {
+                let conn = open(&root)?;
+                providercli::add(
+                    &root,
+                    &conn,
+                    providercli::AddArgs {
+                        name,
+                        native,
+                        tool,
+                        wire,
+                        base_url,
+                        key,
+                        key_env,
+                        headers,
+                    },
+                )?;
+            }
+            ProviderCmd::List { json } => {
+                let conn = open(&root)?;
+                providercli::list(&conn, json)?;
+            }
+            ProviderCmd::Get { name, json } => {
+                let conn = open(&root)?;
+                providercli::get(&conn, &name, json)?;
+            }
+            ProviderCmd::Test { name } => {
+                let conn = open(&root)?;
+                providercli::test(&root, &conn, &name)?;
+            }
+            ProviderCmd::Rm { name } => {
+                let conn = open(&root)?;
+                providercli::rm(&conn, &name)?;
             }
         },
         Cmd::Block { cmd } => match cmd {

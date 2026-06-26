@@ -761,3 +761,45 @@ onto a capability reference before budget/grants become load-bearing at runtime;
 (3) async `spawn` does not yet forward `--grant-*` flags to detached workers (mint
 still prevents widening — it just can't pass an explicit narrowing request through
 the async path); (4) the cross-process lock is unix-only by construction.
+
+## 23. [DESIGN 2026-06-25] The credential vault: encrypted-at-rest, accidental-disclosure scope
+
+Model providers (docs/handoffs/model-providers.md, M1) store a real secret — an
+API key, plus any secret extra-header values (LiteLLM/OpenRouter) — in the ledger.
+A provider is **a resource, not an identity or an authority** (entry 2 / Tim's
+"just a resource"): no `child ⊆ parent` narrowing, no phonebook entry; choosing one
+for a child is **audited on the session-start obs, not gated**. The vault is the
+`providers` table (src/provider.rs): **clear** columns for non-secret metadata
+(name, kind, wire, base_url, header *names*, tool) so `list`/`get`/`test`/the UI are
+plain queries, and **one sealed blob** (`secret` + its random 24-byte `nonce`)
+holding the serialized secret material. A `NativeLogin` row carries no blob.
+
+**Crypto.** XChaCha20-Poly1305 (`chacha20poly1305`), random per-row nonce stored
+beside the ciphertext, sealed under a 32-byte master key at `<root>/secret.key`
+(`0600`, generated on first use — sibling of the `.secrets` store, entry 6). Reads
+are **fail-closed**: a wrong-size/missing key, a tampered nonce, or a tampered
+ciphertext yields an error, never garbage plaintext (the AEAD tag is checked). The
+secret is decrypted **only transiently in daemon/CLI memory** at `materialize`/`test`
+time; it is never written to obs, the config git, logs, or printed — the CLI shows
+`••• (encrypted)`, and the `Secret` newtype redacts its own `Debug`, so an
+accidental `{:?}` cannot leak it. `materialize(credential, consumer)` is a partial
+function over the validity matrix; the literal key it returns lives in a `Secret`
+the caller must `.expose()` deliberately. For the harness shapes the key never
+touches the command line: claude takes it via `ANTHROPIC_AUTH_TOKEN` env, codex via
+`env_key`/`env_http_headers` (env, referenced from `-c` config — never a `-c` value),
+opencode inside the `OPENCODE_CONFIG_CONTENT` env JSON.
+
+**What this defends — and what it does NOT.** This is "safety = audit, not
+restriction" (entry 0 / the doctrine note): the real threat is **accidental
+disclosure** — a key landing in git, a `.db` backup, an obs stream, a `SELECT *` an
+agent runs, a screen-share. Encryption-at-rest closes all of those: a raw
+`SELECT * FROM providers` reveals no key (verified). It does **NOT** defend against
+an attacker who already has full filesystem read as the elanus user — they can read
+`secret.key` and the blob together — and chasing that would be theater. The
+**file-key tradeoff** is deliberate (handoff Open Decision 1): the master key on
+disk keeps the headless daemon auto-starting (no keyring on a systemd box, no
+passphrase prompt). The honest upgrade path, deferred: a keyring-backed master key
+*when a keyring is actually present and unlocked*, or `ELANUS_SECRET_KEY`/passphrase
+at daemon start for a key that never touches disk (at the cost of unattended
+auto-start). LATENT until then: anyone with FS read as the elanus user reads every
+stored credential.

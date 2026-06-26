@@ -1,5 +1,5 @@
 ---
-status: planned
+status: in-progress
 author: Opus 4.8 in Claude Code on Elanus
 last-updated: 2026-06-25
 ---
@@ -388,3 +388,23 @@ dropdown; selecting (or being on) a NativeLogin shows neither list nor warning.
   pollution). Decisions taken to unblock M1: **file-key master secret**
   (`<root>/secret.key`, `0600`, keyring-upgrade deferred) and **XChaCha20-Poly1305**
   (`chacha20poly1305` crate) per Open Decisions 1–2. **Next: M1 implementation.**
+
+- 2026-06-25 — **M1 landed (impl Opus-med → validate Opus-high, no blocking
+  findings).** The vault primitive, unwired (consumers are M2/M3): `src/provider.rs`
+  (Credential sum type, `materialize` + validity matrix, per-harness
+  `HarnessInjection`, master-key bootstrap + XChaCha20-Poly1305 seal/open, the
+  encrypted `providers` table), `src/providercli.rs` (`elanus provider
+  add|list|get|test|rm`), `src/models.rs` (extracted `probe` so `test` reuses the
+  `/models` candidates), `src/main.rs` wiring, `chacha20poly1305` dep, security.md
+  **entry 23** (vault threat model). Orchestrator review hardened three nonblocking
+  findings before commit: a **redacting `Debug` for `HarnessInjection`** (its env
+  values carry the decrypted key — a stray `{:?}` in M2 would leak), **dropped the
+  unused `Serialize`/`Deserialize` on `Secret`** (latent clear-emit footgun), and a
+  **`valid_name` gate at `add`** (`[a-z0-9][a-z0-9-]*`, ≤64 — keeps names safe as
+  env tokens / codex TOML keys, disallows the `-`/`_` collision and dot-breakage);
+  added two tests (name rejection, `get` fail-closed on a corrupt blob). `cargo
+  test` **370 pass**, clean build. Carried to M2 (flagged, non-blocking): verify the
+  codex `-c` flag grammar (incl. hyphenated ids and `env_http_headers`) against a
+  real codex binary; confirm opencode routes through the injected custom-provider id
+  when `--model <id>/<model>` is appended; the `add` upsert silently overwrites a
+  same-named provider. **Next: M2 (harness consumption + `--provider` launch).**
