@@ -63,13 +63,21 @@ const MODEL_LABEL = (m: any) => {
 // honest "provider unavailable" state at the field instead of silently
 // degrading to free text. ui-preferences.md: a text box is almost always the
 // worst choice for what is in fact a closed set.
-export function ModelField({ id, value, onChange, models, disabled, hint }: {
+export function ModelField({ id, value, onChange, models, disabled, hint, native, onSetupProvider }: {
   id?: string;
   value: string;
   onChange: (v: string) => void;
   models: any[];
   disabled?: boolean;
   hint?: string;
+  // A native-login provider (Claude.AI / ChatGPT login) has no API-key /models
+  // endpoint to probe — the coding tool picks the model. Suppress the "provider
+  // list unavailable" warning entirely; it was never a provider to probe (the
+  // real fix for the spurious warning on an OAuth login — model-providers M4).
+  native?: boolean;
+  // When set, the empty-list state offers a link to the Providers page so a
+  // person can define/select one (the literal #4 ask).
+  onSetupProvider?: () => void;
 }) {
   const list = models ?? [];
   const inList = list.some((m) => anyId(m) === value);
@@ -79,7 +87,14 @@ export function ModelField({ id, value, onChange, models, disabled, hint }: {
     return (
       <>
         <input id={id} disabled={disabled} spellCheck={false} value={value} onChange={(e) => onChange(e.target.value)} placeholder="model id" />
-        <span className="cfg-field-hint cfg-field-warn">provider list unavailable — type a model id or set an API key</span>
+        {!native && (
+          <span className="cfg-field-hint cfg-field-warn">
+            provider list unavailable — type a model id
+            {onSetupProvider
+              ? <> or <button type="button" className="cfg-link" data-providers-link onClick={onSetupProvider}>set up a provider →</button></>
+              : ' or set an API key'}
+          </span>
+        )}
         {hint && <span className="cfg-field-hint">{hint}</span>}
       </>
     );

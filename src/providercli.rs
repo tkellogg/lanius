@@ -9,7 +9,7 @@ use crate::paths::Root;
 use crate::provider::{self, Credential, HarnessId, Provider, Secret, Wire, REDACTED};
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::io::Read;
 
 /// Inputs for `provider add`, parsed from the CLI by main.
@@ -170,17 +170,74 @@ pub fn get(conn: &Connection, name: &str, want_json: bool) -> Result<()> {
 
 /// `elanus provider test <name>` — reachability via the `/models` probe. For an
 /// ApiKey the key is decrypted transiently and used to probe; for a NativeLogin
-/// there is nothing to probe.
-pub fn test(root: &Root, conn: &Connection, name: &str) -> Result<()> {
+/// there is nothing to probe. With `--json` the result is machine-readable (a
+/// single JSON object) and a probe FAILURE is reported in-band (`reachable:false`
+/// + `error`) with a success exit so the web layer can render it — without
+/// `--json` an unreachable provider is a hard error, as before.
+pub fn test(root: &Root, conn: &Connection, name: &str, want_json: bool) -> Result<()> {
     let Some(p) = provider::get(root, conn, name)? else {
+        if want_json {
+            println!("{}", json!({ "ok": false, "error": format!("no provider {name:?}") }));
+            return Ok(());
+        }
         bail!("no provider {name:?}");
     };
     match &p.credential {
-        Credential::NativeLogin { .. } => {
-            println!("{name}: native login — nothing to probe");
+        Credential::NativeLogin { tool } => {
+            if want_json {
+                // A native-login credential has no API-key /models endpoint to
+                // probe — the harness uses its own login. Report it as such: no
+                // model list, but explicitly NOT an error (this is the case that
+                // fixes the spurious "provider list unavailable" warning).
+                println!(
+                    "{}",
+                    json!({
+                        "ok": true,
+                        "name": name,
+                        "kind": "native_login",
+                        "native": true,
+                        "tool": tool.map(|t| t.as_str()),
+                        "reachable": Value::Null,
+                        "models": [],
+                        "count": 0,
+                    })
+                );
+            } else {
+                println!("{name}: native login — nothing to probe");
+            }
             Ok(())
         }
         Credential::ApiKey { base_url, key, .. } => {
+            if want_json {
+                match models::probe(base_url, key.expose()) {
+                    Ok(models) => println!(
+                        "{}",
+                        json!({
+                            "ok": true,
+                            "name": name,
+                            "kind": "api_key",
+                            "reachable": true,
+                            "base_url": base_url,
+                            "count": models.len(),
+                            "models": models,
+                        })
+                    ),
+                    Err(e) => println!(
+                        "{}",
+                        json!({
+                            "ok": true,
+                            "name": name,
+                            "kind": "api_key",
+                            "reachable": false,
+                            "base_url": base_url,
+                            "models": [],
+                            "count": 0,
+                            "error": format!("{e:#}"),
+                        })
+                    ),
+                }
+                return Ok(());
+            }
             let models = models::probe(base_url, key.expose())?;
             println!("{name}: ok — {} models at {base_url}", models.len());
             for m in models.iter().take(20) {

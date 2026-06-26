@@ -899,6 +899,50 @@ fn admin_dispatch(
                 },
             ));
         }
+        // ---- model providers (docs/handoffs/model-providers.md M4) ----------
+        // The named, encrypted credential surface. Every gesture shells `elanus
+        // provider …` (the same current_exe shell-out the rest of admin uses);
+        // the secret never rides argv — `add` pipes the key on the CLI's stdin
+        // safe path, and `list`/`test` only ever return the redaction the CLI
+        // prints.
+        ("providers", true, _) => {
+            let r = cli(root, &["provider", "list", "--json"])?;
+            return Ok(ok_or_err(
+                &r,
+                500,
+                |s| json!({ "ok": true, "providers": json_lines(s) }),
+            ));
+        }
+        ("providers", _, true) => {
+            return Ok(provider_add(root, body));
+        }
+        ("providers/rm", _, true) => {
+            let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+            if !valid_provider_name(name) {
+                return Ok((400, json!({ "ok": false, "error": "bad provider name" })));
+            }
+            cli(root, &["provider", "rm", name])?
+        }
+        ("providers/test", true, _) => {
+            let Some(name) = q("name") else {
+                return Ok((400, json!({ "ok": false, "error": "need ?name=" })));
+            };
+            if !valid_provider_name(&name) {
+                return Ok((400, json!({ "ok": false, "error": "bad provider name" })));
+            }
+            let r = cli(root, &["provider", "test", &name, "--json"])?;
+            if !r.ok {
+                return Ok((500, json!({ "ok": false, "error": cli_err(&r) })));
+            }
+            // `provider test --json` prints a single JSON object (reachability +
+            // the model list, or {reachable:false,error}). Pass it through; an
+            // empty/garbled line is a 500, never a silent empty list.
+            let line = r.stdout.trim();
+            return Ok(match serde_json::from_str::<Value>(line) {
+                Ok(v) => (200, v),
+                Err(_) => (500, json!({ "ok": false, "error": "bad provider test output" })),
+            });
+        }
         ("approve", _, true) | ("revoke", _, true) => {
             let pkg = body.get("package").and_then(Value::as_str).unwrap_or("");
             if !valid_pkg_name(pkg) {
@@ -1130,6 +1174,100 @@ fn admin_dispatch(
     // Shared shape for the simple mutating verbs above (approve/revoke, kits
     // add/unlink, config set, proposals accept/decline): {ok, output, error}.
     Ok(action_result(&r))
+}
+
+/// Build the `elanus provider add …` argv from a validated request body and run
+/// it. The API KEY is NEVER placed on argv — it is piped on the CLI's stdin safe
+/// path (`resolve_key`'s stdin fallback) so it stays off the process table and
+/// out of any obs line. `kind=native` builds a no-secret native-login provider;
+/// `kind=apikey` (default) needs base_url + a key. Extra headers ride as
+/// repeated `--header Name=Value` (values encrypted at rest by the vault).
+fn provider_add(root: &Root, body: &Value) -> (u16, Value) {
+    let s = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("").trim();
+    let name = s("name");
+    if !valid_provider_name(name) {
+        return (
+            400,
+            json!({ "ok": false, "error": "bad provider name — use lowercase letters, digits, and hyphens" }),
+        );
+    }
+    let kind = {
+        let k = s("kind");
+        if k.is_empty() { "apikey" } else { k }
+    };
+    let mut args: Vec<String> = vec!["provider".into(), "add".into(), name.into()];
+    let mut stdin_key: Option<String> = None;
+    match kind {
+        "native" | "native_login" | "nativelogin" => {
+            args.push("--native".into());
+            let tool = s("tool");
+            if !tool.is_empty() {
+                args.push("--tool".into());
+                args.push(tool.into());
+            }
+        }
+        "apikey" | "api_key" => {
+            let base_url = s("base_url");
+            if base_url.is_empty() {
+                return (400, json!({ "ok": false, "error": "an api-key provider needs a base URL" }));
+            }
+            let wire = s("wire");
+            if !wire.is_empty() {
+                args.push("--wire".into());
+                args.push(wire.into());
+            }
+            args.push("--base-url".into());
+            args.push(base_url.into());
+            // Headers: accept [{name,value}] objects or "Name=Value" strings.
+            if let Some(arr) = body.get("headers").and_then(Value::as_array) {
+                for h in arr {
+                    let pair = match h {
+                        Value::String(s) => s.trim().to_string(),
+                        Value::Object(_) => {
+                            let n = h.get("name").and_then(Value::as_str).unwrap_or("").trim();
+                            let v = h.get("value").and_then(Value::as_str).unwrap_or("");
+                            if n.is_empty() {
+                                continue;
+                            }
+                            format!("{n}={v}")
+                        }
+                        _ => continue,
+                    };
+                    if pair.is_empty() || !pair.contains('=') {
+                        continue;
+                    }
+                    args.push("--header".into());
+                    args.push(pair);
+                }
+            }
+            // The key rides stdin (the CLI's off-argv safe path), never argv.
+            let key = body.get("key").and_then(Value::as_str).unwrap_or("");
+            if key.is_empty() {
+                return (400, json!({ "ok": false, "error": "an api-key provider needs a key" }));
+            }
+            stdin_key = Some(key.to_string());
+        }
+        other => {
+            return (400, json!({ "ok": false, "error": format!("unknown provider kind {other:?}") }));
+        }
+    }
+    let r = match cli_stdin(root, &args, stdin_key.as_deref()) {
+        Ok(r) => r,
+        Err(_) => return (500, json!({ "ok": false, "error": "provider add failed to run" })),
+    };
+    action_result(&r)
+}
+
+/// Provider names are lowercase `[a-z0-9][a-z0-9-]*`, ≤64 — the same gate the
+/// vault enforces (src/provider.rs `valid_name`). Mirrored here so a bad name is
+/// a clean 400 before any shell-out.
+fn valid_provider_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    name.len() <= 64 && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// GET/PUT /api/admin/profile — read or validate-and-write a profile.toml. PUT
@@ -1510,6 +1648,42 @@ fn cli_owned(root: &Root, args: &[String]) -> Result<CliOut> {
         .env("ELANUS_ROOT", root.dir.display().to_string())
         .output()
         .context("spawning elanus")?;
+    Ok(CliOut {
+        ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        error: if out.status.success() {
+            None
+        } else {
+            Some(format!("exited {}", out.status))
+        },
+    })
+}
+
+/// Like `cli`, but feeds `stdin` (when Some) to the child on its stdin pipe — the
+/// safe path for a secret (`provider add`'s key) so it never lands on argv or in
+/// the `[web:cli]` obs line. The logged command line is the argv only (no key).
+fn cli_stdin(root: &Root, args: &[String], stdin: Option<&str>) -> Result<CliOut> {
+    use std::io::Write as _;
+    weblog("cli", &format!("elanus {}", args.join(" ")));
+    let exe = std::env::current_exe().context("locating the running elanus binary")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .env("ELANUS_ROOT", root.dir.display().to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if stdin.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    }
+    let mut child = cmd.spawn().context("spawning elanus")?;
+    if let Some(secret) = stdin {
+        if let Some(mut sink) = child.stdin.take() {
+            sink.write_all(secret.as_bytes())
+                .context("piping the provider key on stdin")?;
+            // Drop closes the pipe so the child's stdin read sees EOF.
+        }
+    }
+    let out = child.wait_with_output().context("awaiting elanus")?;
     Ok(CliOut {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -2484,6 +2658,39 @@ mod route_tests {
         // Empty content IS allowed (clearing a block is a legitimate edit).
         let ok = json!({ "session": "code-1", "name": "note", "owner": "a", "content": "" });
         assert!(block_set_args(&ok).is_ok());
+    }
+
+    // model-providers M4: the provider-name gate the admin routes apply before
+    // any `elanus provider …` shell-out — the same lowercase `[a-z0-9][a-z0-9-]*`
+    // (≤64) the vault enforces, so a bad name is a clean 400, never an injection.
+    #[test]
+    fn provider_name_guard() {
+        assert!(valid_provider_name("deepseek"));
+        assert!(valid_provider_name("gpt-5-litellm"));
+        assert!(valid_provider_name("a"));
+        assert!(!valid_provider_name(""));
+        assert!(!valid_provider_name("Deepseek")); // no uppercase
+        assert!(!valid_provider_name("-leading")); // must start alnum
+        assert!(!valid_provider_name("has_underscore"));
+        assert!(!valid_provider_name("has space"));
+        assert!(!valid_provider_name("dot.name"));
+        assert!(!valid_provider_name(&"x".repeat(65)));
+    }
+
+    // model-providers M4: `provider_add` builds the `elanus provider add …` argv
+    // and — crucially — keeps the api KEY off argv (it rides stdin). Exercise the
+    // body→argv shaping and the fail-closed validation without spawning the CLI.
+    #[test]
+    fn provider_add_validates_and_keeps_key_off_argv() {
+        // A bad name is a clean 400 before any shell-out.
+        let (code, _) = provider_add(&Root { dir: "/tmp/x".into() }, &json!({ "name": "BAD", "kind": "apikey" }));
+        assert_eq!(code, 400);
+        // An api-key provider with no base URL is refused.
+        let (code, _) = provider_add(&Root { dir: "/tmp/x".into() }, &json!({ "name": "p", "kind": "apikey", "key": "sk-x" }));
+        assert_eq!(code, 400);
+        // An api-key provider with no key is refused (the key never defaults).
+        let (code, _) = provider_add(&Root { dir: "/tmp/x".into() }, &json!({ "name": "p", "kind": "apikey", "base_url": "https://h/anthropic" }));
+        assert_eq!(code, 400);
     }
 
     // The CSRF/DNS-rebinding guard the POST route enforces, exercised through the

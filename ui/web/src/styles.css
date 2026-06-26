@@ -649,6 +649,8 @@ details.setup-fold > summary .dim-note { padding: 0; flex: 1; min-width: 0; over
 .cfg-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--dim); letter-spacing: 0.04em; }
 .cfg-field-hint { color: var(--dim); font-size: 10.5px; letter-spacing: 0; line-height: 1.25; }
 .cfg-field-warn { color: #e3a08c; }
+.cfg-link { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: var(--accent, #8ab4f8); text-decoration: underline; cursor: pointer; }
+.cfg-link:hover { color: var(--work); }
 .cfg-field-ok { color: var(--work); }
 .cfg-grid input,
 .cfg-grid select { background: rgba(0,0,0,0.25); color: inherit; font: inherit; font-size: 13px; border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-sharp); padding: 7px 9px; }

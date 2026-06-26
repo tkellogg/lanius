@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import CodeSessions from './CodeSessions';
 import CommsView from './CommsView';
+import ProvidersView from './ProvidersView';
 import { adminGet, adminPost, adminPut, history, publish, status as fetchStatus } from './api';
 import { openLiveStream } from './live';
 import { Button, IconButton, ModelField, WorkdirInput } from './components/primitives';
@@ -377,6 +378,7 @@ const emptyForm = {
   effectivePath: '',
   model: '',
   turns: '',
+  provider: '',
   baseUrl: '',
   apiKeyEnv: '',
   contextProgram: 'default',
@@ -542,6 +544,8 @@ export function App() {
   const selectCodeSessions = () => setSel({ kind: 'code-sessions' });
   // agent-comms-ui M2: the cross-agent comms plane (agent-to-agent mail + rooms).
   const selectComms = () => setSel({ kind: 'comms' });
+  // model-providers M4: the Providers page (the named, encrypted credential vault).
+  const selectProviders = () => setSel({ kind: 'providers' });
   // agent-comms-ui M2: cross-link a comms participant to its run in the runs view.
   const selectCodeSession = (session: string) => setSel({ kind: 'code-sessions', focus: session });
   const selectSetup = (status?: any) => {
@@ -639,11 +643,13 @@ export function App() {
       : sel.kind === 'setup' ? 'setup'
         : sel.kind === 'code-sessions' ? 'workers'
           : sel.kind === 'comms' ? 'comms'
+            : sel.kind === 'providers' ? 'providers'
             : sel.agent;
   const stageNote = sel.kind === 'welcome' ? 'orient, then dive in'
     : sel.kind === 'signals' ? 'a live view of everything happening — orange means something needs your attention'
       : sel.kind === 'code-sessions' ? 'coding runs and the workers they spawned — tool, model, effort, duration, and a resume command'
       : sel.kind === 'comms' ? 'the cross-agent comms plane — agent-to-agent mail (priority, state, failures) and the coordination rooms'
+      : sel.kind === 'providers' ? 'named, encrypted model-provider credentials — add, test reachability, and select one per agent'
       : sel.kind === 'setup' ? 'first-run health, agent setup, capabilities, and trust'
         : sel.tab === 'converse' ? `messages with ${sel.agent}`
           : sel.tab === 'sessions' ? 'your agent’s past conversations'
@@ -792,6 +798,7 @@ export function App() {
       effectivePath: csv(d.elanus_path ?? d.package_path ?? ['packages']),
       model: d.model ?? '',
       turns: d.max_turns ?? '',
+      provider: d.provider ?? '',
       baseUrl: d.base_url ?? '',
       apiKeyEnv: d.api_key_env ?? '',
       contextProgram: d.context?.program ?? 'default',
@@ -844,6 +851,10 @@ export function App() {
     set.elanus_path = localPath;
     if (cfgForm.model.trim()) set['model.model'] = cfgForm.model.trim();
     if (cfgForm.turns) set['model.max_turns'] = Number(cfgForm.turns);
+    // model-providers M3/M4: a named provider WINS wholesale over the deprecated
+    // inline base_url/api_key_env (which stay working for back-compat). Only set
+    // it when chosen; clearing a provider is a raw-TOML edit (M4 scope).
+    if (cfgForm.provider.trim()) set['model.provider'] = cfgForm.provider.trim();
     if (cfgForm.baseUrl.trim()) set['model.base_url'] = cfgForm.baseUrl.trim();
     if (cfgForm.apiKeyEnv.trim()) set['model.api_key_env'] = cfgForm.apiKeyEnv.trim();
     if (cfgForm.contextProgram.trim()) set['context.program'] = cfgForm.contextProgram.trim();
@@ -1176,7 +1187,7 @@ export function App() {
       </header>
 
       <main className="deck">
-        <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} selectComms={selectComms} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel={L.explore} />
+        <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} selectComms={selectComms} selectProviders={selectProviders} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel={L.explore} />
 
         <section className="stage panel" aria-label="view">
           <div className="panel-head">
@@ -1242,9 +1253,11 @@ export function App() {
             setSkillExcluded={setSkillExcluded}
             setKitPackagesExcluded={setKitPackagesExcluded}
             openKitModal={openKitModal}
+            selectProviders={selectProviders}
           />
           {sel.kind === 'code-sessions' && <CodeSessions focus={sel.focus} />}
           {sel.kind === 'comms' && <CommsView onSelectSession={selectCodeSession} />}
+          {sel.kind === 'providers' && <ProvidersView />}
           <SetupView
             hidden={sel.kind !== 'setup'}
             setup={setup}
@@ -1259,6 +1272,7 @@ export function App() {
             modelOptions={modelOptions}
             loadSetup={loadSetup}
             selectAgent={selectAgent}
+            selectProviders={selectProviders}
           />
           <RailView hidden={!(sel.kind === 'signals' || (sel.kind === 'agent' && sel.tab === 'telemetry'))} filter={filter} setFilter={setFilter} paused={paused} setPaused={setPaused} rows={filteredRail} />
 
@@ -1286,7 +1300,7 @@ export function App() {
   );
 }
 
-function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversation, selectSignals, selectSetup, selectCodeSessions, selectComms, navOpen, setNavOpen, exploreLabel }: any) {
+function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversation, selectSignals, selectSetup, selectCodeSessions, selectComms, selectProviders, navOpen, setNavOpen, exploreLabel }: any) {
   const items = [...agents.keys()].sort();
   const isWorkerItem = (name: string) => {
     const a = agents.get(name);
@@ -1308,6 +1322,7 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
       : sel.kind === 'signals' ? 'signals'
         : sel.kind === 'code-sessions' ? 'workers'
           : sel.kind === 'comms' ? 'comms'
+            : sel.kind === 'providers' ? 'providers'
             : 'setup';
   return (
     <nav className={`nav panel${navOpen ? ' nav-open' : ''}`} aria-label="explorer">
@@ -1320,6 +1335,7 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
         <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" title="health check, agent setup, capabilities, and trust footprint" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
         <button className={`nav-item nav-workers${sel.kind === 'code-sessions' ? ' on' : ''}`} data-sel="code-sessions" title="coding runs and the workers they spawned" onClick={() => selectCodeSessions && selectCodeSessions()}><span className="nav-sigil">⚙</span> runs</button>
         <button className={`nav-item nav-comms${sel.kind === 'comms' ? ' on' : ''}`} data-sel="comms" title="the cross-agent comms plane — what the agents are saying to each other" onClick={() => selectComms && selectComms()}><span className="nav-sigil">⇄</span> comms</button>
+        <button className={`nav-item nav-providers${sel.kind === 'providers' ? ' on' : ''}`} data-sel="providers" title="named, encrypted model-provider credentials — add, test, and select one per agent" onClick={() => selectProviders && selectProviders()}><span className="nav-sigil">⛁</span> providers</button>
         <div className="nav-label">agents</div>
         <div id="nav-agents">
           {chatItems.map((name) => {
@@ -1393,7 +1409,7 @@ function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, se
   );
 }
 
-function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent, setNewAgent, newAgentNote, createAgent, modelsHint, modelOptions, loadSetup, selectAgent }: any) {
+function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent, setNewAgent, newAgentNote, createAgent, modelsHint, modelOptions, loadSetup, selectAgent, selectProviders }: any) {
   const kits = setup.kits;
   const pkgs = setup.packages;
   const proposals = setup.proposals;
@@ -1450,7 +1466,7 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
               <label><span>1. name</span><input id="na-name" placeholder="kestrel" spellCheck={false} value={newAgent.name} onChange={(e) => setNewAgent({ ...newAgent, name: e.target.value })} /></label>
               <label><span>2. purpose</span><input id="na-purpose" placeholder="watch launches, draft briefs, triage issues..." spellCheck={false} value={newAgent.purpose} onChange={(e) => setNewAgent({ ...newAgent, purpose: e.target.value })} /></label>
               <label><span>3. home / workdir</span><WorkdirInput id="na-workdir" placeholder="optional path where tools should run" value={newAgent.workdir} onChange={(v) => setNewAgent({ ...newAgent, workdir: v })} /></label>
-              <label><span>4. model</span><ModelField id="na-model" value={newAgent.model} onChange={(v) => setNewAgent({ ...newAgent, model: v })} models={modelOptions} /></label>
+              <label><span>4. model</span><ModelField id="na-model" value={newAgent.model} onChange={(v) => setNewAgent({ ...newAgent, model: v })} models={modelOptions} onSetupProvider={selectProviders} /></label>
               <label><span>5. run-step cap</span><input id="na-turns" type="number" min="1" max="200" value={newAgent.turns} onChange={(e) => setNewAgent({ ...newAgent, turns: e.target.value })} /></label>
               <label><span>6. autonomy</span><select id="na-autonomy" value={newAgent.autonomy} onChange={(e) => setNewAgent({ ...newAgent, autonomy: e.target.value })}>{['off', 'manual', 'assisted', 'autonomous'].map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
               <label><span>starting capability</span><select id="na-capability" value={newAgent.capability} onChange={(e) => setNewAgent({ ...newAgent, capability: e.target.value })}><option value="">none yet</option>{capabilityOptions.map((k: any) => <option key={k.name} value={k.name}>{k.name}</option>)}</select></label>
@@ -1681,7 +1697,36 @@ function ProposalCard({ proposal, loadSetup }: any) {
 }
 
 function ConfigureView(props: any) {
-  const { hidden, modelOptions, form, setForm, cfgProfile, cfgParsed, cfgLoading, cfgNote, cfgToml, setCfgToml, cfgTomlNote, saveConfigure, saveRawToml, cfgPackages, cfgKits, cfgConfigPackages, cfgSharedConfigRows, setCfgSharedConfigRows, cfgContextChain, setCfgContextChain, cfgContextVarEdits, setCfgContextVarEdits, contextDefs, availableContextStages, moveContextStage, removeContextStage, addContextStage, skillIncluded, skillExcluded, setSkillExcluded, setKitPackagesExcluded, openKitModal } = props;
+  const { hidden, modelOptions, form, setForm, cfgProfile, cfgParsed, cfgLoading, cfgNote, cfgToml, setCfgToml, cfgTomlNote, saveConfigure, saveRawToml, cfgPackages, cfgKits, cfgConfigPackages, cfgSharedConfigRows, setCfgSharedConfigRows, cfgContextChain, setCfgContextChain, cfgContextVarEdits, setCfgContextVarEdits, contextDefs, availableContextStages, moveContextStage, removeContextStage, addContextStage, skillIncluded, skillExcluded, setSkillExcluded, setKitPackagesExcluded, openKitModal, selectProviders } = props;
+  // model-providers M4: the named-provider tie-in. Load the vault list so the
+  // agent can SELECT a provider (writing model.provider on save); when an api-key
+  // provider is selected the model dropdown sources its list from that provider's
+  // /models probe, and a native-login provider shows NEITHER a list NOR the
+  // "provider list unavailable" warning (the real fix for the spurious warning on
+  // a Claude.AI OAuth login).
+  const [providers, setProviders] = useState<any[]>([]);
+  const [providerModels, setProviderModels] = useState<any[]>([]);
+  useEffect(() => {
+    if (hidden) return;
+    let alive = true;
+    (async () => { const j = await adminGet('providers'); if (alive && j.ok) setProviders(j.providers ?? []); })();
+    return () => { alive = false; };
+  }, [hidden]);
+  const selectedProvider = providers.find((p: any) => p.name === form.provider) ?? null;
+  const providerIsNative = selectedProvider?.kind === 'native_login';
+  const providerIsApiKey = selectedProvider?.kind === 'api_key';
+  useEffect(() => {
+    let alive = true;
+    if (!form.provider || !providerIsApiKey) { setProviderModels([]); return; }
+    (async () => {
+      const j = await adminGet(`providers/test?name=${encodeURIComponent(form.provider)}`);
+      if (alive) setProviderModels(j.ok && Array.isArray(j.models) ? j.models : []);
+    })();
+    return () => { alive = false; };
+  }, [form.provider, providerIsApiKey]);
+  // With a named provider chosen, the model list comes from IT (api-key) or is
+  // suppressed (native). With no provider, fall back to the ambient model probe.
+  const modelFieldModels = form.provider ? providerModels : modelOptions;
   const [selectedContextStage, setSelectedContextStage] = useState('');
   const addStageValue = selectedContextStage || (availableContextStages[0] ? `${availableContextStages[0].package}/${availableContextStages[0].name}` : '');
   const disabled = cfgLoading;
@@ -1713,7 +1758,7 @@ function ConfigureView(props: any) {
             </div>
             <div className="cfg-grid">
               <label id="cfg-section-agent">name <input id="cfg-agent" disabled={disabled} spellCheck={false} value={form.agent} onChange={(e) => setForm({ agent: e.target.value })} /></label>
-              <label id="cfg-section-model">model <ModelField id="cfg-model" disabled={disabled} value={form.model} onChange={(v) => setForm({ model: v })} models={modelOptions} hint={modelCostHint(form.model)} /></label>
+              <label id="cfg-section-model">model <ModelField id="cfg-model" disabled={disabled} value={form.model} onChange={(v) => setForm({ model: v })} models={modelFieldModels} native={providerIsNative} onSetupProvider={selectProviders} hint={modelCostHint(form.model)} /></label>
               <label>max run steps <input id="cfg-turns" disabled={disabled} type="number" min="1" max="200" value={form.turns} onChange={(e) => setForm({ turns: e.target.value })} /><span className="cfg-field-hint">hard ceiling for one activation's model/tool loop</span></label>
               <label>autonomy <select id="cfg-autonomy" disabled={disabled} value={form.autonomy} onChange={(e) => setForm({ autonomy: e.target.value })}>{['off', 'manual', 'assisted', 'autonomous'].map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
               <label>working directory <WorkdirInput id="cfg-workdir" disabled={disabled} placeholder="(elanus root)" value={form.workdir} onChange={(v) => setForm({ workdir: v })} /></label>
@@ -1737,8 +1782,18 @@ function ConfigureView(props: any) {
             <section id="cfg-section-provider">
               <h4>provider</h4>
               <div className="cfg-grid">
-                <label>base URL <input id="cfg-base-url" disabled={disabled} spellCheck={false} placeholder="provider default" value={form.baseUrl} onChange={(e) => setForm({ baseUrl: e.target.value })} /></label>
-                <label>API key env <input id="cfg-api-key-env" disabled={disabled} spellCheck={false} placeholder="adapter default" value={form.apiKeyEnv} onChange={(e) => setForm({ apiKeyEnv: e.target.value })} /></label>
+                <label>named provider
+                  <select id="cfg-provider" disabled={disabled} value={form.provider} onChange={(e) => setForm({ provider: e.target.value })}>
+                    <option value="">(none — inline / default below)</option>
+                    {providers.map((p: any) => <option key={p.name} value={p.name}>{p.name} ({p.kind === 'native_login' ? 'native login' : p.wire || 'api key'})</option>)}
+                  </select>
+                  <span className="cfg-field-hint">a named provider (encrypted vault) wins over the inline fields. <button type="button" className="cfg-link" onClick={selectProviders}>manage providers →</button></span>
+                </label>
+              </div>
+              <p className="dim-note">The fields below are the deprecated inline override, kept for back-compat; a named provider above supersedes them.</p>
+              <div className="cfg-grid">
+                <label>base URL <input id="cfg-base-url" disabled={disabled || !!form.provider} spellCheck={false} placeholder="provider default" value={form.baseUrl} onChange={(e) => setForm({ baseUrl: e.target.value })} /></label>
+                <label>API key env <input id="cfg-api-key-env" disabled={disabled || !!form.provider} spellCheck={false} placeholder="adapter default" value={form.apiKeyEnv} onChange={(e) => setForm({ apiKeyEnv: e.target.value })} /></label>
               </div>
             </section>
 

@@ -1,7 +1,7 @@
 ---
-status: in-progress
+status: verifying
 author: Opus 4.8 in Claude Code on Elanus
-last-updated: 2026-06-25
+last-updated: 2026-06-26
 ---
 # Handoff: model providers as a first-class, protected resource
 
@@ -474,3 +474,37 @@ dropdown; selecting (or being on) a NativeLogin shows neither list nor warning.
   uses the provider's wire while genai still picks the request adapter from the model
   name (a model/wire mismatch is user misconfig, same exposure as the inline path).
   **Next: M4 (the #4 UI — Providers page + route + ModelField link).**
+
+- 2026-06-26 — **M4 landed (the #4 UI) — impl complete + orchestrator-verified; the
+  validation WORKFLOW died on a reporting error, not the work.** The Workflow's impl
+  agent produced a complete, coherent M4 in the tree but exceeded the StructuredOutput
+  retry cap on its FINAL report (no valid structured output after 5 tries), so the
+  validate phase never ran — the work was salvaged and verified directly by the
+  orchestrator instead (no rogue commits, no repo pollution; tree clean). Delivered:
+  backend admin endpoints (src/web.rs) — GET /api/admin/providers (shells `provider
+  list --json`), POST add, POST rm, GET providers/test (passes through `provider test
+  --json`); the api KEY rides the child's STDIN via a new `cli_stdin` helper, NEVER
+  argv/weblog/obs, and a `valid_provider_name` gate (`[a-z0-9][a-z0-9-]*`, ≤64) runs
+  before every shell-out. `provider test --json` added to the CLI (src/providercli.rs)
+  with in-band reachability (`{reachable:false,error}`) and the native-login case
+  (`{native:true, reachable:null}`). Frontend (ui/web): a new `ProvidersView.tsx`
+  (list/add/test/rm; key as a password field; redaction-only display), a nav entry,
+  the ModelField "… or set up a provider →" link (the literal #4 ask) + a `native`
+  prop that SUPPRESSES the "provider list unavailable" warning for a native-login
+  provider (the real fix for the spurious warning on a Claude.AI OAuth login), and a
+  Configure "named provider" dropdown sourced from the vault that writes
+  `[model].provider` + sources the model list from the chosen provider (inline
+  base_url/api_key_env disabled when a provider is set, kept for back-compat).
+  **Verification (orchestrator, empirical):** `cargo test` 386 pass (+2 web route
+  guards incl. one asserting `provider_add` keeps the key OFF argv); `tsc --noEmit`
+  clean; `vite build` clean; `cargo build` re-embeds the SPA (`include_dir!` over the
+  gitignored `ui/web/dist`); `ui.spec.mjs` **ALL PASS** with 15 new provider
+  assertions — add(api-key+native)/list/redaction/native-test-not-error/
+  page-opens-from-nav/link-navigates/dropdown-from-vault/native-no-warning/rm/
+  **cross-origin-add-refused-403**/no-console-errors. Scope note: M4 did NOT take on
+  full browser-history routing (a separate `_questions.md` item) — the Providers page
+  is a nav view, consistent with the current app. **All four milestones (M1 vault, M2
+  launch, M3 dispatcher, M4 UI) are implemented + verified on branch `model-providers`;
+  status `verifying` — awaiting Tim's review + merge to `main`. The whole arc delivers
+  both source `_questions.md` items: #4 (provider-setup link/UI) and #5 (per-subagent
+  provider, incl. the codex-on-ChatGPT-inside-codex-on-GLM nesting).**

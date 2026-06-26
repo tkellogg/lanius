@@ -437,7 +437,11 @@ enum ProviderCmd {
         json: bool,
     },
     /// Probe a provider's /models endpoint for reachability (decrypts transiently)
-    Test { name: String },
+    Test {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete a provider
     Rm { name: String },
 }
@@ -1116,9 +1120,9 @@ fn run(cli: Cli) -> Result<()> {
                 let conn = open(&root)?;
                 providercli::get(&conn, &name, json)?;
             }
-            ProviderCmd::Test { name } => {
+            ProviderCmd::Test { name, json } => {
                 let conn = open(&root)?;
-                providercli::test(&root, &conn, &name)?;
+                providercli::test(&root, &conn, &name, json)?;
             }
             ProviderCmd::Rm { name } => {
                 let conn = open(&root)?;

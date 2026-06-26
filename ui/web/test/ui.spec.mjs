@@ -1488,6 +1488,151 @@ const renamedAgent = 'falcon';
 }
 
 
+// ── flow 12: model providers (model-providers M4) ────────────────────────────
+// The named, encrypted credential vault surface: the /api/admin/providers
+// endpoints (list/add/test/rm), the Providers page, the ModelField "set up a
+// provider →" link, a provider-sourced model dropdown, and the no-warning-for-
+// native fix. These routes are web.rs-only.
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents', { timeout: 10000 });
+
+  // -- the backend endpoints (driven directly, like the comms/blocks flow) --
+  // add an api-key provider; the KEY rides the POST body and is piped on the
+  // CLI's stdin by the backend — it must NEVER come back in list output.
+  const addApi = await page.evaluate(async () => {
+    const r = await fetch('/api/admin/providers', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'ui-deepseek', kind: 'apikey', wire: 'anthropic', base_url: 'https://api.deepseek.com/anthropic', key: 'sk-ui-secret-xyz' }),
+    });
+    return { status: r.status, body: await r.json().catch(() => ({})) };
+  });
+  addApi.status === 200 && addApi.body.ok === true
+    ? ok('providers: POST add (api-key) succeeds')
+    : fail(`providers: api-key add failed (${JSON.stringify(addApi)})`);
+
+  // add a native-login provider (no secret).
+  const addNative = await page.evaluate(async () => {
+    const r = await fetch('/api/admin/providers', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'ui-claude-oauth', kind: 'native', tool: 'claude' }),
+    });
+    return { status: r.status, body: await r.json().catch(() => ({})) };
+  });
+  addNative.status === 200 && addNative.body.ok === true
+    ? ok('providers: POST add (native login) succeeds')
+    : fail(`providers: native add failed (${JSON.stringify(addNative)})`);
+
+  // list returns metadata only; the secret is shown as a redaction, never the bytes.
+  const listed = await page.evaluate(async () => {
+    const r = await fetch('/api/admin/providers');
+    return await r.json().catch(() => ({}));
+  });
+  const apiRow = (listed.providers ?? []).find((p) => p.name === 'ui-deepseek');
+  const nativeRow = (listed.providers ?? []).find((p) => p.name === 'ui-claude-oauth');
+  apiRow && nativeRow && apiRow.base_url === 'https://api.deepseek.com/anthropic'
+    ? ok('providers: GET list returns both providers with metadata')
+    : fail(`providers: list missing rows (${JSON.stringify(listed.providers)})`);
+  apiRow && apiRow.secret && !/sk-ui-secret/.test(JSON.stringify(listed))
+    ? ok('providers: the api key is redacted in list output (never the bytes)')
+    : fail(`providers: the secret may have leaked into list output (${JSON.stringify(listed)})`);
+
+  // test a native-login provider: it has no /models endpoint — the response is
+  // explicitly NOT an error (native:true), which is what suppresses the warning.
+  const testNative = await page.evaluate(async () => {
+    const r = await fetch('/api/admin/providers/test?name=ui-claude-oauth');
+    return await r.json().catch(() => ({}));
+  });
+  testNative.ok === true && testNative.native === true
+    ? ok('providers: test on a native-login provider reports native (nothing to probe, not an error)')
+    : fail(`providers: native test did not report native (${JSON.stringify(testNative)})`);
+
+  // -- the Providers page (nav + list render) --
+  await page.click('[data-sel="providers"]');
+  await page.waitForSelector('#view-providers', { timeout: 5000 });
+  ok('providers: the Providers page opens from the nav');
+  await waitFor('providers: the page lists the added providers', async () =>
+    page.evaluate(() => {
+      const rows = [...document.querySelectorAll('#view-providers [data-provider]')].map((el) => el.getAttribute('data-provider'));
+      return rows.includes('ui-deepseek') && rows.includes('ui-claude-oauth');
+    }), 8000);
+
+  // the page's test button surfaces the native result inline.
+  await page.click('[data-test-provider="ui-claude-oauth"]');
+  await waitFor('providers: the page test button surfaces a result', async () =>
+    page.evaluate(() => {
+      const el = document.querySelector('[data-test-result="ui-claude-oauth"]');
+      return el && /native login/i.test(el.textContent);
+    }), 8000);
+
+  // -- the ModelField "set up a provider →" link (the literal #4 ask) --
+  // The spec stack has no ambient model list, so the new-agent model field shows
+  // the empty-list state with the link; clicking it navigates to the Providers page.
+  await page.click('[data-sel="setup"]');
+  await page.waitForSelector('#view-setup:not([hidden])', { timeout: 5000 });
+  const naLink = await page.$('#view-setup [data-providers-link]');
+  if (naLink) {
+    ok('providers: the new-agent model field shows the "set up a provider →" link');
+    await naLink.click();
+    await page.waitForSelector('#view-providers', { timeout: 5000 });
+    ok('providers: the link navigates to the Providers page');
+  } else {
+    fail('providers: the "set up a provider →" link is missing from the empty model field');
+  }
+
+  // -- the no-warning-for-native fix in an agent's configure provider section --
+  await page.click('#nav-agents .nav-item');
+  await page.waitForSelector('#agent-tabs', { state: 'visible' });
+  await page.click('[data-tab="configure"]');
+  await page.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
+  await waitForConfigureLoaded(page);
+  // The configure provider dropdown is populated from the vault.
+  await page.click('#cfg-section-advanced summary').catch(() => {});
+  const hasProviderOpt = await page.evaluate(() => {
+    const sel = document.querySelector('#cfg-provider');
+    return sel ? [...sel.options].some((o) => o.value === 'ui-claude-oauth') : false;
+  });
+  hasProviderOpt
+    ? ok('providers: the configure provider dropdown is sourced from the vault')
+    : fail('providers: the configure provider dropdown did not list the native provider');
+  // Selecting the native-login provider suppresses BOTH the model list and the
+  // "provider list unavailable" warning (the real fix for the spurious warning).
+  await page.selectOption('#cfg-provider', 'ui-claude-oauth').catch(() => {});
+  const nativeNoWarn = await waitFor('providers: selecting a native-login provider shows no "unavailable" warning', async () =>
+    page.evaluate(() => {
+      const warn = document.querySelector('#cfg-section-model .cfg-field-warn');
+      return !warn || !/provider list unavailable/i.test(warn.textContent || '');
+    }), 5000);
+  if (!nativeNoWarn) fail('providers: native-login still showed the spurious warning');
+
+  // -- rm --
+  const removed = await page.evaluate(async () => {
+    const r = await fetch('/api/admin/providers/rm', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'ui-deepseek' }),
+    });
+    const body = await r.json().catch(() => ({}));
+    const list = await (await fetch('/api/admin/providers')).json().catch(() => ({}));
+    return { ok: body.ok, names: (list.providers ?? []).map((p) => p.name) };
+  });
+  removed.ok && !removed.names.includes('ui-deepseek')
+    ? ok('providers: POST rm deletes the provider')
+    : fail(`providers: rm did not delete the provider (${JSON.stringify(removed)})`);
+
+  // a cross-origin add POST is refused by the same origin_ok CSRF guard.
+  const crossOrigin = await fetch(`${BASE}/api/admin/providers`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'Origin': 'http://evil.example' },
+    body: JSON.stringify({ name: 'evil', kind: 'native' }),
+  });
+  crossOrigin.status === 403
+    ? ok('providers: a cross-origin add POST is refused by the origin_ok guard (403)')
+    : fail(`providers: cross-origin add was not refused (status ${crossOrigin.status})`);
+
+  await page.close();
+}
+
+
 if (pageErrors.length) {
   fail(`${pageErrors.length} JS page error(s) across all views:\n${pageErrors.join('\n')}`);
 } else {

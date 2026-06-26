@@ -43,6 +43,7 @@ pub fn list(root: &Root) -> Result<()> {
                 "parent": p.parent,
                 "model": p.model.model,
                 "max_turns": p.model.max_turns,
+                "provider": p.model.provider,
                 "base_url": p.model.base_url,
                 "api_key_env": p.model.api_key_env,
                 "workdir": p.sandbox.workdir,
