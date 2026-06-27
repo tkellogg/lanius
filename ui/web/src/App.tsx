@@ -1795,6 +1795,10 @@ function ConfigureView(props: any) {
                 <label>base URL <input id="cfg-base-url" disabled={disabled || !!form.provider} spellCheck={false} placeholder="provider default" value={form.baseUrl} onChange={(e) => setForm({ baseUrl: e.target.value })} /></label>
                 <label>API key env <input id="cfg-api-key-env" disabled={disabled || !!form.provider} spellCheck={false} placeholder="adapter default" value={form.apiKeyEnv} onChange={(e) => setForm({ apiKeyEnv: e.target.value })} /></label>
               </div>
+              <div className="setup-row">
+                <button id="cfg-provider-save" type="button" disabled={disabled} onClick={saveConfigure}>save provider</button>
+                <span id="cfg-provider-note" className="dim-note">{cfgNote}</span>
+              </div>
             </section>
 
             <section id="cfg-section-paths">

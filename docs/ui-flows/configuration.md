@@ -144,6 +144,12 @@ the configure tab.
   empty exclude is *always sent* so clearing it actually clears. Re-opening
   configure after reload shows the same `#cfg-model` / `#cfg-turns`, and the
   hidden `#cfg-include` / `#cfg-exclude` mirrors match the visible add-on state.
+- If a named provider is selected in advanced provider settings, the saved
+  profile JSON and raw TOML include `model.provider`; the provider section has
+  its own `#cfg-provider-save` button because the main `#cfg-save` is up in
+  Essentials. Re-opening configure shows the same `#cfg-provider`. This is the
+  durable proof that chat will use the encrypted provider vault instead of
+  falling back to the deprecated `model.api_key_env` path.
 - The header `#cfg-file` names the agent settings file the edit lands in
   (comments survive).
 - The essentials section shows this agent's model + autonomy. As of M6 the

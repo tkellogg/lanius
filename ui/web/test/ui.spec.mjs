@@ -1607,6 +1607,38 @@ const renamedAgent = 'falcon';
     }), 5000);
   if (!nativeNoWarn) fail('providers: native-login still showed the spurious warning');
 
+  // The dispatcher path depends on the *profile* naming the provider, not just
+  // on the model id. This catches a prior regression where `profile get` omitted
+  // `provider`, so configure reloads lost the selected provider and the next chat
+  // fell back to stale inline `api_key_env` resolution (e.g. DEEPSEEK_API_KEY).
+  await page.selectOption('#cfg-provider', 'ui-deepseek');
+  await page.fill('#cfg-model', 'deepseek-v4-flash');
+  const providerProfile = await page.$eval('#cfg-file', (el) => (el.textContent || '').replace(/\s+settings$/, '').trim());
+  await page.click('#cfg-provider-save');
+  await waitFor('providers: configure save persists the named provider in profile JSON', async () =>
+    page.evaluate(async (profile) => {
+      const r = await fetch(`/api/admin/profile?name=${encodeURIComponent(profile)}`);
+      const j = await r.json().catch(() => ({}));
+      return j.ok === true
+        && j.profile?.provider === 'ui-deepseek'
+        && j.profile?.model === 'deepseek-v4-flash'
+        && /\bprovider\s*=\s*"ui-deepseek"/.test(j.toml || '');
+    }, providerProfile), 8000);
+  await page.reload();
+  await page.waitForSelector('#nav-agents', { timeout: 10000 });
+  await page.click('#nav-agents .nav-item');
+  await page.waitForSelector('#agent-tabs', { state: 'visible' });
+  await page.click('[data-tab="configure"]');
+  await page.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
+  await waitForConfigureLoaded(page);
+  await page.click('#cfg-section-advanced summary').catch(() => {});
+  await waitFor('providers: configure reload shows the saved named provider', async () =>
+    page.evaluate(() => {
+      const provider = document.querySelector('#cfg-provider')?.value;
+      const model = document.querySelector('#cfg-model')?.value;
+      return provider === 'ui-deepseek' && model === 'deepseek-v4-flash';
+    }), 8000);
+
   // -- rm --
   const removed = await page.evaluate(async () => {
     const r = await fetch('/api/admin/providers/rm', {

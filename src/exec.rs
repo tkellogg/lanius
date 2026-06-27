@@ -1239,6 +1239,7 @@ fn build_client(
                 },
             );
             let client = Client::builder()
+                .with_adapter_kind(adapter)
                 .with_service_target_resolver(resolver)
                 .build();
             // Extra headers (LiteLLM/OpenRouter): additive on top of the adapter's
@@ -2008,7 +2009,12 @@ mod tests {
             other => panic!("expected a Provider plan, got {other:?}"),
         }
         // build_client must succeed end-to-end for an ApiKey provider.
-        assert!(build_client(&root, &conn, &prof).is_ok());
+        let (client, _) = build_client(&root, &conn, &prof).unwrap();
+        assert_eq!(
+            client.adapter_kind(),
+            Some(genai::adapter::AdapterKind::Anthropic),
+            "a named provider binds bare model names to the provider wire"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -2093,6 +2099,12 @@ mod tests {
             dispatcher_plan(&root, &conn, &bare, None).unwrap(),
             DispatcherPlan::Default
         ));
+        let (client, _) = build_client(&root, &conn, &bare).unwrap();
+        assert_eq!(
+            client.adapter_kind(),
+            None,
+            "default path keeps genai's model-name adapter inference"
+        );
 
         // No provider, but an inline base_url → the deprecated inline path, intact.
         let mut inline = profile_with(None);
@@ -2148,6 +2160,12 @@ mod tests {
             }
             other => panic!("provider must win over inline, got {other:?}"),
         }
+        let (client, _) = build_client(&root, &conn, &prof).unwrap();
+        assert_eq!(
+            client.adapter_kind(),
+            Some(genai::adapter::AdapterKind::OpenAI),
+            "OpenAI-wire providers bind bare model names to OpenAI"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
