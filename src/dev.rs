@@ -16,19 +16,45 @@ extern "C" fn request_shutdown(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
-pub fn run(
-    root: &Root,
-    interval_ms: u64,
-    web_port: u16,
-    vite_port: u16,
-    shift_ports: bool,
-) -> Result<()> {
+pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -> Result<()> {
     install_signal_handlers();
 
-    // `--shift-ports`: the dev stack needs TWO free ports (web relay + Vite), and
-    // the defaults 7180/5173 collide easily (a second dev stack, a stale server).
-    // Rather than fail to bind, walk each up to the next free port. The banner
-    // prints the resolved pair either way.
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // SHARED-NOTHING with `serve`/prod. dev runs against a dedicated, repo-local
+    // root under target/ (gitignored, disposable) — NEVER ~/.elanus/root. It gets
+    // its own DB, config, secrets, and bus port, so a dev stack can't (a) collide
+    // with `serve` on the bus, (b) contend on the prod DB, or (c) on teardown sweep
+    // up prod / `elanus code` processes by root path — `cleanup_root_processes`
+    // matches the command line, and a coding session runs as `claude --settings
+    // <root>/run/.../settings.json`, so a SHARED root made dev's teardown kill it.
+    // `serve` is the command for a real root; dev ignores the global -C on purpose.
+    let dev_dir = repo.join("target/elanus-dev");
+    if !dev_dir.join("bus.toml").exists() {
+        crate::initcmd::init(dev_dir.clone(), vec![], false)
+            .context("initializing the dev root")?;
+    }
+    let root = Root {
+        dir: dev_dir.canonicalize().unwrap_or(dev_dir),
+    };
+
+    // The dev bus lives on its OWN port (never the prod default 1883), written into
+    // the dev root's bus.toml each run so the dev daemon binds it and the dev web
+    // connects to it. --shift-ports walks it up if a second dev stack holds it.
+    let bus_port = if shift_ports {
+        first_free_port(11883)
+    } else {
+        11883
+    };
+    std::fs::write(
+        root.bus_file(),
+        format!("enabled = true\nbind = \"127.0.0.1:{bus_port}\"\n"),
+    )
+    .context("writing the dev bus config")?;
+
+    // --shift-ports also walks the web relay + Vite ports if the defaults (7180 /
+    // 5173) are busy, rather than failing to bind. The banner prints the resolved
+    // pair either way.
     let (req_web, req_vite) = (web_port, vite_port);
     let (web_port, vite_port) = if shift_ports {
         let w = first_free_port(web_port);
@@ -41,7 +67,6 @@ pub fn run(
         (web_port, vite_port)
     };
 
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let web_dir = repo.join("ui/web");
     let cargo = std::env::var_os("CARGO")
         .map(PathBuf::from)
@@ -62,6 +87,13 @@ pub fn run(
                 .arg("run")
                 .arg("--quiet")
                 .arg("--")
+                // Pass -C explicitly (not just ELANUS_ROOT env) so the daemon's
+                // command line carries the dev root — cleanup_root_processes matches
+                // on the command line, so this is what lets teardown sweep the dev
+                // broker (else it orphans on the dev bus port). The web relay below
+                // already carries -C for the same reason.
+                .arg("-C")
+                .arg(&root_s)
                 .arg("daemon")
                 .arg("--interval-ms")
                 .arg(interval_ms.to_string())
@@ -102,8 +134,12 @@ pub fn run(
         ),
     ];
 
-    log.line(format!("[dev] root={}", root.dir.display()));
+    log.line(format!(
+        "[dev] dev root: {}  (isolated — NOT ~/.elanus/root; `serve` uses your real root)",
+        root.dir.display()
+    ));
     log.line(format!("[dev] log={}", log_path.display()));
+    log.line(format!("[dev] bus: 127.0.0.1:{bus_port}   (dev broker — separate from prod's 1883)"));
     if shift_ports && (web_port != req_web || vite_port != req_vite) {
         log.line(format!(
             "[dev] ports shifted off a conflict (you asked for web={req_web} vite={req_vite})"
@@ -159,7 +195,7 @@ pub fn run(
     for service in services.iter_mut().rev() {
         service.stop(Duration::from_secs(3));
     }
-    cleanup_root_processes(root, &log);
+    cleanup_root_processes(&root, &log);
     Ok(())
 }
 

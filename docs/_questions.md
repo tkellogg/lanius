@@ -33,6 +33,10 @@ what it was doing with particular files, and explain; it wouldn't be able to cha
 explain the intent.
 
 
+new failure mode: If the coding agent can't contact teh MQTT broker it dies. This is not a good failure mode.
+Something softer??
+
+
 UI nitpicks:
 - Advanced bar should highlight on mouseover, some indication that the whole thing is one button, not separate
     buttons for each. (configure pane)

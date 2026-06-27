@@ -745,7 +745,12 @@ fn run(cli: Cli) -> Result<()> {
             web_port,
             vite_port,
             shift_ports,
-        } => dev::run(&root, interval_ms, web_port, vite_port, shift_ports)?,
+        } => {
+            // dev resolves its OWN isolated, repo-local root (target/elanus-dev) —
+            // it deliberately ignores the global root so it can never run against
+            // ~/.elanus/root and collide with `serve`/coding sessions. See dev::run.
+            dev::run(interval_ms, web_port, vite_port, shift_ports)?
+        }
         Cmd::Serve {
             interval_ms,
             web_port,
