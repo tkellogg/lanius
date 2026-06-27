@@ -105,3 +105,22 @@ Worth promoting into the permanent suite (`ui/web/test/ui.spec.mjs` or a new
    `#cfg-turns` before the form settles; the typed value must survive the load,
    or the field must have been disabled during it — *passes after this session's
    fix.*
+
+# Web UI — SSE reconnect finding (run 2026-06-27)
+
+User report: after laptop sleep/wake, the dashboard did not reconnect to MQTT;
+the browser console showed `/api/stream` being interrupted.
+
+Finding: the Rust SSE endpoint only wrote the initial status and live bus
+messages. A quiet installation could leave the browser with no bytes on
+`/api/stream` for a long stretch, and the shared browser helper relied solely on
+native `EventSource` retry. That was too weak for a sleep/wake half-open socket:
+the UI could remain visually disconnected even though the backend relay and MQTT
+broker were healthy.
+
+Status: fixed with SSE ping frames from `src/web.rs` and an application-level
+watchdog/reopen loop in `ui/web/src/live.ts`. Regression:
+`ui/web/test/sse-reconnect.mjs` stands up an isolated stack, asserts quiet-stream
+ping keepalive, forces the first browser `/api/stream` response to close, then
+proves the UI opens a replacement stream and receives a live MQTT event through
+it.

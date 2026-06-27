@@ -58,6 +58,7 @@ use std::time::Duration;
 static DIST: Dir = include_dir!("$CARGO_MANIFEST_DIR/ui/web/dist");
 
 const RING_CAP: usize = 1000;
+const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
 
 /// Shared state for the worker: the live bus client, the recent-history ring,
 /// connection status, and the registered SSE clients. Kept Send+Sync (tokio
@@ -71,7 +72,8 @@ struct Hub {
     seq: AtomicU64,
     client: AsyncClient,
     ring: Mutex<VecDeque<String>>,
-    clients: Mutex<Vec<tokio::sync::mpsc::UnboundedSender<Bytes>>>,
+    next_client_id: AtomicU64,
+    clients: Mutex<Vec<(u64, tokio::sync::mpsc::UnboundedSender<Bytes>)>>,
 }
 
 impl Hub {
@@ -92,7 +94,14 @@ impl Hub {
         self.clients
             .lock()
             .unwrap()
-            .retain(|tx| tx.send(bytes.clone()).is_ok());
+            .retain(|(_, tx)| tx.send(bytes.clone()).is_ok());
+    }
+
+    fn remove_client(&self, id: u64) {
+        self.clients
+            .lock()
+            .unwrap()
+            .retain(|(client_id, _)| *client_id != id);
     }
 
     /// A bus message: assign a seq, ring it for late joiners, broadcast it.
@@ -159,6 +168,7 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
             seq: AtomicU64::new(0),
             client,
             ring: Mutex::new(VecDeque::new()),
+            next_client_id: AtomicU64::new(0),
             clients: Mutex::new(Vec::new()),
         });
 
@@ -250,20 +260,33 @@ impl ntex::util::Stream for SseBody {
 
 async fn stream(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    let client_id = hub.next_client_id.fetch_add(1, Ordering::SeqCst) + 1;
     // Catch-up under the clients lock so no live message slips between the ring
     // snapshot and registration: status first, then the ring (matches mjs).
     {
         let mut clients = hub.clients.lock().unwrap();
+        let _ = tx.send(Bytes::from("retry: 2000\n\n"));
         let _ = tx.send(Bytes::from(format!("data: {}\n\n", hub.status_frame())));
         for frame in hub.ring.lock().unwrap().iter() {
             let _ = tx.send(Bytes::from(format!("data: {frame}\n\n")));
         }
-        clients.push(tx);
+        clients.push((client_id, tx.clone()));
     }
+    let heartbeat_hub = hub.get_ref().clone();
+    ntex::rt::spawn(async move {
+        loop {
+            ntex::time::sleep(SSE_HEARTBEAT).await;
+            if tx.send(Bytes::from("event: ping\ndata: {}\n\n")).is_err() {
+                heartbeat_hub.remove_client(client_id);
+                break;
+            }
+        }
+    });
     HttpResponse::Ok()
         .content_type("text/event-stream")
         .header("cache-control", "no-cache")
         .header("connection", "keep-alive")
+        .header("x-accel-buffering", "no")
         .streaming(SseBody { rx })
 }
 
