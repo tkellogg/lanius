@@ -1831,8 +1831,14 @@ fn percent_decode(s: &str) -> String {
 
 /// Browser-borne threats a terminal doesn't have: a hostile page POSTing to
 /// localhost (CSRF) and DNS rebinding. Mutations require a genuinely-local Host
-/// and — when a browser supplies Origin — an Origin whose host matches. curl and
-/// local agents send no Origin and pass (entry 3 already owns local processes).
+/// and — when a browser supplies Origin — an Origin whose host is ALSO local
+/// (any loopback port). The `elanus dev` loop serves the UI from Vite on one
+/// loopback port and proxies to the relay on another, a legitimate same-machine
+/// cross-origin; requiring a byte-equal Origin==Host (incl. port) wrongly refused
+/// every dev mutation. A FOREIGN Origin (evil.com) is still refused here, and a
+/// rebound Host (evil.com → 127.0.0.1) fails the Host check above — so neither CSRF
+/// nor DNS-rebinding is weakened. curl and local agents send no Origin and pass
+/// (entry 3 already owns local processes).
 fn origin_ok(req: &HttpRequest) -> bool {
     let headers = req.headers();
     let host = headers
@@ -1844,7 +1850,11 @@ fn origin_ok(req: &HttpRequest) -> bool {
     }
     match headers.get("origin").and_then(|h| h.to_str().ok()) {
         None => true,
-        Some(origin) => origin_host(origin).map(|h| h == host).unwrap_or(false),
+        // The Origin's host need only be LOCAL, not byte-equal to Host: the Vite
+        // dev proxy is a local cross-PORT origin. A foreign Origin is still refused.
+        Some(origin) => origin_host(origin)
+            .map(|h| host_is_local(&h))
+            .unwrap_or(false),
     }
 }
 
@@ -2693,24 +2703,24 @@ mod route_tests {
         assert_eq!(code, 400);
     }
 
-    // The CSRF/DNS-rebinding guard the POST route enforces, exercised through the
-    // same `host_is_local`/`origin_host` predicates `origin_ok` is built from: a
-    // same-origin local POST passes; a cross-origin Origin (an attacker page) is
-    // refused even when the Host is local.
+    // The CSRF/DNS-rebinding guard `origin_ok` enforces on mutations, via its
+    // `host_is_local`/`origin_host` predicates: a local Host is required; when a
+    // browser supplies Origin, that Origin's host must be LOCAL (any loopback port,
+    // so the Vite dev proxy passes) but a FOREIGN origin is refused.
     #[test]
-    fn origin_guard_rejects_cross_origin_post() {
-        // Local host, no Origin (curl / local agent) → allowed.
+    fn origin_guard_allows_local_cross_port_refuses_foreign() {
+        // Local host, no Origin (curl / local agent) → allowed (host check only).
         assert!(host_is_local("127.0.0.1:8080"));
-        // Same-origin browser POST → allowed.
-        assert_eq!(
-            origin_host("http://127.0.0.1:8080/").as_deref(),
-            Some("127.0.0.1:8080")
-        );
-        // Cross-origin: the attacker's Origin host does not match the local Host.
-        let host = "127.0.0.1:8080";
-        let evil = origin_host("http://evil.example/page").unwrap();
-        assert_ne!(evil, host);
-        // A non-local Host is refused outright.
+        // Same-origin browser POST → Origin host is local. allowed.
+        assert!(host_is_local(&origin_host("http://127.0.0.1:7182/").unwrap()));
+        // Vite dev proxy: UI on :5174, relay on :7182 — a local cross-PORT origin.
+        // Different port, but still local → origin_ok accepts it (the dev-loop fix).
+        let vite = origin_host("http://127.0.0.1:5174/").unwrap();
+        assert_ne!(vite, "127.0.0.1:7182");
+        assert!(host_is_local(&vite));
+        // A foreign Origin (an attacker page) is refused: its host is not local.
+        assert!(!host_is_local(&origin_host("http://evil.example/page").unwrap()));
+        // A rebound / non-local Host is refused outright by the Host check.
         assert!(!host_is_local("evil.example"));
     }
 }

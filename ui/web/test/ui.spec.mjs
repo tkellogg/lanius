@@ -1418,7 +1418,8 @@ const renamedAgent = 'falcon';
     // the same boundary every /api/admin mutation enforces. The browser forbids
     // overriding the `Origin` header on a same-page fetch, so this is driven from
     // the Node side (a hostile-page / rebinding request): a request whose Origin
-    // host does NOT match the local Host must be rejected (403), never written.
+    // host is not local must be rejected (403), never written. (A LOCAL cross-port
+    // Origin — the Vite dev proxy — is allowed; only a foreign host is refused.)
     const crossOriginRes = await fetch(`${BASE}/api/blocks`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'Origin': 'http://evil.example' },
@@ -1429,7 +1430,7 @@ const renamedAgent = 'falcon';
       : fail(`blocks: cross-origin write was not refused (status ${crossOriginRes.status})`);
     // (The non-local-Host / DNS-rebinding leg of origin_ok can't be exercised here —
     // undici forbids overriding the Host header — so it's covered by the Rust
-    // `origin_guard_rejects_cross_origin_post` unit test instead.)
+    // `origin_guard_allows_local_cross_port_refuses_foreign` unit test instead.)
     // And the rejected write left no trace — the content is still the edited value.
     const stillEdited = await page.evaluate(async () => {
       const r = await fetch('/api/blocks?session=code-uiblk01');
