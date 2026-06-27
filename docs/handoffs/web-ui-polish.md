@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 author: Opus 4.8 in Claude Code on Elanus
 last-updated: 2026-06-27
 ---
@@ -308,3 +308,28 @@ hovers).
   (opencode) high to verify; orchestrator (Claude) commits. Clean base first: committed
   the in-flight SSE-reconnect fix and the model-providers provider-save tail as two
   separate scoped commits so the impl doesn't entangle them.
+- 2026-06-27 — **DONE.** Core (M1/M3/M4/M5) landed as `0be3833`; M2 as `a7fa63b`. Full
+  `ui.spec.mjs` e2e green (192 assertions), cargo test 389 pass.
+  - **Core (GPT-5.5 med):** verified by GLM, two minor M5 nits fixed (pre-paint inline
+    script to kill the reload FOUC; renamed the mis-named `theme-toggle` id →
+    `vocabulary-toggle`).
+  - **M2 (GPT-5.5 high):** GLM's adversarial verify caught a real BLOCKER — the first
+    bridge polled the `events` table for `obs/` result topics the broker never
+    materializes there (obs/ → trace.jsonl only), so every client-tool call timed out.
+    Fix worker re-did it as an event-driven broker subscription (SUBACK before emitting
+    the call kills the race; channel-await, no DB conn across await; 120s timeout).
+  - **The big lesson — stale embedded SPA.** `elanus web` embeds `ui/web/dist` at
+    compile time (`include_dir!`), and `cargo build` does NOT re-embed on a dist-only
+    change, while `npm run test:ui` never runs `cargo build`. So GLM's core verify
+    passed 189/0 against a binary that didn't contain the core's UI — masking real
+    regressions (M4 iconified compose-send, breaking the `language: Send/transmit`
+    assertions; an M2 `<AgentAssistant>` mounted under `[hidden]` views fired its
+    opening publish on every page load, polluting the bus + shifting the converse
+    test's publish indices). All surfaced + fixed only after forcing a re-embed
+    (`touch src/web.rs && cargo build`). FOLLOW-UP: add `rerun-if-changed=ui/web/dist`
+    to build.rs (or make `test:ui` cargo-build) so verification can't test stale UI.
+  - Send button: per Tim, kept the `➤` icon and updated the e2e to assert its
+    `aria-label` (Send/transmit). Contrast e2e made theme-aware (asserts AA in both
+    dark+light). `+ New` ungated. Live LLM-driven tool round-trip not yet exercised
+    headlessly (needs a model + browser) — bridge verified by review + the UI wiring
+    e2e; recommend a 2-min manual smoke.
