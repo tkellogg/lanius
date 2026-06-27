@@ -74,6 +74,8 @@ const agentOf = (topic: string) => topic.match(/^(?:in|obs)\/agent\/([^/]+)/)?.[
 const uid = () => Math.random().toString(36).slice(2);
 const newWebConversationId = (agent: string) => `web-${agent}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 const conversationStorageKey = (agent: string) => `elanus.currentConversation.${agent}`;
+type ThemeChoice = 'system' | 'light' | 'dark';
+const THEME_CHOICES: ThemeChoice[] = ['system', 'light', 'dark'];
 // Coding-tool agent NOUNS are `claude-code` and `codex` (src/codeagent.rs); bare
 // `claude` is only a CLI alias, never a bus agent — keep it out so a real agent a
 // user names `claude` isn't evicted to Workers. The `code-*` session id (see
@@ -403,7 +405,26 @@ export function App() {
   const [cockpit, setCockpit] = useState<boolean>(() => {
     try { return localStorage.getItem('elanus.cockpit') === '1'; } catch { return false; }
   });
+  const [themeChoice, setThemeChoice] = useState<ThemeChoice>(() => {
+    try {
+      const stored = localStorage.getItem('elanus.theme');
+      return stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system';
+    } catch {
+      return 'system';
+    }
+  });
   useEffect(() => { try { localStorage.setItem('elanus.cockpit', cockpit ? '1' : '0'); } catch {} }, [cockpit]);
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-color-scheme: light)');
+    const apply = () => {
+      document.documentElement.dataset.theme = themeChoice === 'system' ? (media.matches ? 'light' : 'dark') : themeChoice;
+    };
+    try { localStorage.setItem('elanus.theme', themeChoice); } catch {}
+    apply();
+    if (themeChoice !== 'system') return;
+    media.addEventListener('change', apply);
+    return () => media.removeEventListener('change', apply);
+  }, [themeChoice]);
   const L = labelKey(cockpit);
   const [agents, setAgents] = useState(new Map());
   const [diskProfiles, setDiskProfiles] = useState<any[]>([]);
@@ -1119,7 +1140,7 @@ export function App() {
     void loadConversations(agent);
     btn.textContent = ok ? 'accepted ✓' : 'failed ✕';
     btn.classList.toggle('sent', ok);
-    setTimeout(() => { btn.textContent = L.send; btn.classList.remove('sent'); }, 1400);
+    setTimeout(() => { btn.textContent = '➤'; btn.classList.remove('sent'); }, 1400);
   };
 
   const loadSessions = async (agent: string) => {
@@ -1176,7 +1197,13 @@ export function App() {
           <span className="mast-sub">agent explorer // live</span>
         </button>
         <div className="mast-right">
-          <button id="theme-toggle" type="button" className="lamp" title={cockpit ? 'cockpit vocabulary on — click for plain language' : 'plain language on — click for cockpit vocabulary'} aria-pressed={cockpit} onClick={() => setCockpit(!cockpit)}>
+          <label className="theme-control" htmlFor="theme-mode" title="theme">
+            <span aria-hidden="true">{themeChoice === 'dark' ? '☾' : themeChoice === 'light' ? '☀' : '◐'}</span>
+            <select id="theme-mode" aria-label="theme" value={themeChoice} onChange={(e) => setThemeChoice(e.target.value as ThemeChoice)}>
+              {THEME_CHOICES.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
+            </select>
+          </label>
+          <button id="vocabulary-toggle" type="button" className="lamp" title={cockpit ? 'cockpit vocabulary on — click for plain language' : 'plain language on — click for cockpit vocabulary'} aria-pressed={cockpit} onClick={() => setCockpit(!cockpit)}>
             <span aria-hidden="true">{cockpit ? '⌬' : '∝'}</span><span className="lamp-label">{cockpit ? 'cockpit' : 'plain'}</span>
           </button>
           <button id="signal-lamp" className={`lamp${signal.lit ? ' lit' : ''}`} title="urgent alerts — click to acknowledge" onClick={() => setSignal({ lit: false, label: 'signal' })}>
@@ -1196,7 +1223,9 @@ export function App() {
               {(['converse', 'sessions', 'telemetry', 'configure'] as const).map((tab) => {
                 const on = sel.kind === 'agent' && sel.tab === tab;
                 const display = tab === 'sessions' ? L.history : tab === 'telemetry' ? L.telemetry : tab;
-                return <button key={tab} data-tab={tab} className={on ? 'on' : ''} aria-pressed={on} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>{display}</button>;
+                return tab === 'configure'
+                  ? <IconButton key={tab} data-tab={tab} label={`configure ${sel.agent}`} className={on ? 'on tab-icon-btn' : 'tab-icon-btn'} aria-pressed={on} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>⚙</IconButton>
+                  : <button key={tab} data-tab={tab} className={on ? 'on' : ''} aria-pressed={on} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>{display}</button>;
               })}
             </div>
             <span id="stage-note" className="panel-note">{stageNote}</span>
@@ -1328,7 +1357,7 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
     <nav className={`nav panel${navOpen ? ' nav-open' : ''}`} aria-label="explorer">
       <div className="panel-head">
         <h2>{exploreLabel}</h2>
-        <button id="nav-toggle" type="button" aria-label={navOpen ? 'collapse navigation' : 'expand navigation'} aria-expanded={navOpen} onClick={() => setNavOpen(!navOpen)}><span aria-hidden="true">{navOpen ? '✕' : '≡'}{!navOpen ? ` ${stageLabel}` : ''}</span></button>
+        <IconButton id="nav-toggle" label={navOpen ? 'collapse navigation' : `expand navigation: ${stageLabel}`} className="ghost cfg-icon-btn nav-toggle-btn" aria-expanded={navOpen} onClick={() => setNavOpen(!navOpen)}>{navOpen ? '✕' : '≡'}</IconButton>
       </div>
       <div id="nav-list" className="nav-list" onKeyDown={onKey}>
         <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" title="live activity across every agent and topic" onClick={selectSignals}><span className="nav-sigil">◮</span> signals</button>
@@ -1750,7 +1779,7 @@ function ConfigureView(props: any) {
         </aside>
         <div className="cfg-sections">
           <section className="setup-block cfg-essentials" id="cfg-section-essentials">
-            <h3>essentials</h3>
+            <h3><span className="section-glyph" aria-hidden="true">◎</span>essentials</h3>
             <p className="dim-note">These settings apply to {agentName} only. Edits land in <code id="cfg-file">{cfgProfile ? `${cfgProfile} settings` : "this agent's settings file"}</code> and apply on the agent's next run.</p>
             <div className="cfg-cost-summary">
               <div><span>model</span><strong>{cost.model}</strong><em>{modelCostHint(form.model)}</em></div>
@@ -1768,19 +1797,19 @@ function ConfigureView(props: any) {
           </section>
 
           <section className="setup-block" id="cfg-section-packages">
-            <h3>add-ons for this agent</h3>
+            <h3><span className="section-glyph" aria-hidden="true">＋</span>add-ons for this agent</h3>
             <input id="cfg-include" type="hidden" value={form.include} readOnly />
             <input id="cfg-exclude" type="hidden" value={form.exclude} readOnly />
-            <div className="setup-row cfg-package-toolbar"><button id="cfg-kit-add-toggle" type="button" disabled={disabled} onClick={openKitModal}>add</button><span className="dim-note">copy or link add-ons to change what {agentName} can use</span></div>
+            <div className="setup-row cfg-package-toolbar"><IconButton id="cfg-kit-add-toggle" label="add add-ons" className="cfg-icon-btn" disabled={disabled} onClick={openKitModal}>＋</IconButton><span className="dim-note">copy or link add-ons to change what {agentName} can use</span></div>
             <div id="cfg-package-configs" className="cfg-tree">
               <PackageTree packages={cfgPackages.filter((p: any) => skillIncluded(p))} skillExcluded={skillExcluded} setSkillExcluded={setSkillExcluded} setKitPackagesExcluded={setKitPackagesExcluded} cfgConfigPackages={cfgConfigPackages} cfgSharedConfigRows={cfgSharedConfigRows} setCfgSharedConfigRows={setCfgSharedConfigRows} cfgProfile={cfgProfile} cfgParsed={cfgParsed} setCfgContextVarEdits={setCfgContextVarEdits} />
             </div>
           </section>
 
           <details className="setup-block cfg-advanced" id="cfg-section-advanced">
-            <summary><h3>advanced</h3><span className="dim-note">context program, provider plumbing, sandbox prefixes, package paths, throttles, and raw settings</span></summary>
+            <summary><h3><span className="section-glyph" aria-hidden="true">⚙</span>advanced</h3><span className="dim-note">context program, provider plumbing, sandbox prefixes, package paths, throttles, and raw settings</span></summary>
             <section id="cfg-section-provider">
-              <h4>provider</h4>
+              <h4><span className="section-glyph" aria-hidden="true">⛁</span>provider</h4>
               <div className="cfg-grid">
                 <label>named provider
                   <select id="cfg-provider" disabled={disabled} value={form.provider} onChange={(e) => setForm({ provider: e.target.value })}>
@@ -1829,7 +1858,7 @@ function ConfigureView(props: any) {
           </section>
 
           <section className="setup-block" id="cfg-section-sandbox">
-            <h3>sandbox</h3>
+            <h3><span className="section-glyph" aria-hidden="true">□</span>sandbox</h3>
             <p className="dim-note">These settings apply to {agentName} only. Working directory is in essentials; prefixes are advanced.</p>
             <div className="cfg-grid">
               <label>writable prefixes <input id="cfg-fs-write" disabled={disabled} spellCheck={false} placeholder="comma separated" value={form.fsWrite} onChange={(e) => setForm({ fsWrite: e.target.value })} /></label>
@@ -1838,18 +1867,18 @@ function ConfigureView(props: any) {
           </section>
 
           <section className="setup-block" id="cfg-section-throttle">
-            <h3>throttle</h3>
+            <h3><span className="section-glyph" aria-hidden="true">⏱</span>throttle</h3>
             <p className="dim-note">These settings apply to {agentName} only.</p>
             <div id="cfg-throttle" className="cfg-table">
               {form.throttleRows.map((r: any) => <div key={r.id} className="cfg-throttle-row"><input className="cfg-throttle-name" disabled={disabled} placeholder="name" spellCheck={false} value={r.name} onChange={(e) => updateThrottle(r.id, { name: e.target.value })} /><input className="cfg-throttle-max" disabled={disabled} type="number" placeholder="max concurrent" value={r.max} onChange={(e) => updateThrottle(r.id, { max: e.target.value })} /><input className="cfg-throttle-rate" disabled={disabled} type="number" placeholder="rate/min" value={r.rate} onChange={(e) => updateThrottle(r.id, { rate: e.target.value })} /><input className="cfg-throttle-tokens" disabled={disabled} type="number" placeholder="tokens/hour" value={r.tokens} onChange={(e) => updateThrottle(r.id, { tokens: e.target.value })} /><label className="cfg-check"><input className="cfg-throttle-coalesce" disabled={disabled} type="checkbox" checked={r.coalesce} onChange={(e) => updateThrottle(r.id, { coalesce: e.target.checked })} /> coalesce</label></div>)}
             </div>
-            <button id="cfg-throttle-add" className="ghost" type="button" disabled={disabled} onClick={() => setForm({ throttleRows: [...form.throttleRows, { id: uid(), name: '', max: '', rate: '', tokens: '', coalesce: false }] })}>add throttle</button>
+            <IconButton id="cfg-throttle-add" label="add throttle" className="ghost cfg-icon-btn" disabled={disabled} onClick={() => setForm({ throttleRows: [...form.throttleRows, { id: uid(), name: '', max: '', rate: '', tokens: '', coalesce: false }] })}>＋</IconButton>
           </section>
 
           <section className="setup-block" id="cfg-section-raw">
-            <h3>raw settings</h3>
+            <h3><span className="section-glyph" aria-hidden="true">{'{}'}</span>raw settings</h3>
             <p className="dim-note">These advanced settings apply to {agentName} only.</p>
-            <details><summary className="dim-note">advanced context parameters</summary><p className="dim-note">Advanced values for context and templates; prefer add-on settings when available. Saved by the main save button above.</p><div id="cfg-vars" className="cfg-table">{form.varsRows.map((r: any) => <div key={r.id} className="cfg-var-row"><input className="cfg-var-key" disabled={disabled} placeholder="name" spellCheck={false} value={r.key} onChange={(e) => updateVar(r.id, { key: e.target.value })} /><input className="cfg-var-value" disabled={disabled} placeholder="value" spellCheck={false} value={r.value} onChange={(e) => updateVar(r.id, { value: e.target.value })} /></div>)}</div><button id="cfg-var-add" className="ghost" type="button" disabled={disabled} onClick={() => setForm({ varsRows: [...form.varsRows, { id: uid(), key: '', value: '' }] })}>add context parameter</button></details>
+            <details><summary className="dim-note">advanced context parameters</summary><p className="dim-note">Advanced values for context and templates; prefer add-on settings when available. Saved by the main save button above.</p><div id="cfg-vars" className="cfg-table">{form.varsRows.map((r: any) => <div key={r.id} className="cfg-var-row"><input className="cfg-var-key" disabled={disabled} placeholder="name" spellCheck={false} value={r.key} onChange={(e) => updateVar(r.id, { key: e.target.value })} /><input className="cfg-var-value" disabled={disabled} placeholder="value" spellCheck={false} value={r.value} onChange={(e) => updateVar(r.id, { value: e.target.value })} /></div>)}</div><IconButton id="cfg-var-add" label="add context parameter" className="ghost cfg-icon-btn" disabled={disabled} onClick={() => setForm({ varsRows: [...form.varsRows, { id: uid(), key: '', value: '' }] })}>＋</IconButton></details>
             <details><summary className="dim-note">the raw settings file</summary><textarea id="cfg-toml" disabled={disabled} spellCheck={false} rows={14} value={cfgToml} onChange={(e) => setCfgToml(e.target.value)} /><div className="setup-row"><button id="cfg-toml-save" disabled={disabled} onClick={saveRawToml}>save raw file</button><span id="cfg-toml-note" className="dim-note">{cfgTomlNote}</span></div></details>
           </section>
           </details>
@@ -2022,8 +2051,12 @@ function KitAddRow({ kit, cfgForm, cfgPackages, detail, loadKitDetail, installKi
 }
 
 function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation, selectCodeSessions, isTraceAgent, sendLabel }: any) {
-  const recent = conversations?.list ?? [];
-  const active = recent.find((c: any) => c.session === current);
+  const [conversationSearch, setConversationSearch] = useState('');
+  const allConversations = conversations?.list ?? [];
+  const query = conversationSearch.trim().toLowerCase();
+  const resultConversations = query
+    ? allConversations.filter((c: any) => [c.title, c.preview, c.session, c.source].some((v) => String(v ?? '').toLowerCase().includes(query)))
+    : allConversations.slice(0, 6);
   // M2 (chat-rendering): decide comms-plane-vs-trace purely from bus/ledger reads.
   // Comms-plane traffic between the owner and this agent = the conversation list the
   // ledger projection returns (/api/conversations reads in/agent + correlated
@@ -2039,7 +2072,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
   // `status === 'idle'/'loading'` before the first fetch is "still resolving": keep
   // the chat surface so we never flash the trace fallback while comms history loads.
   const resolved = conversations?.status === 'list' || conversations?.status === 'error';
-  const hasComms = recent.length > 0 || messages.length > 0;
+  const hasComms = allConversations.length > 0 || messages.length > 0;
   const traceOnly = resolved && !hasComms && !!isTraceAgent;
   if (traceOnly) {
     return (
@@ -2047,7 +2080,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
         <div id="conv-configure-hint" className="conv-configure-hint">
           <AgentChip name={agent} size="md" />
           <span>Tune {agent} anytime in configure.</span>
-          <button className="ghost" type="button" onClick={() => selectAgent(agent, 'configure')}>configure</button>
+          <IconButton label={`configure ${agent}`} className="ghost cfg-icon-btn" onClick={() => selectAgent(agent, 'configure')}>⚙</IconButton>
         </div>
         <div id="conv-trace-fallback" className="conv-trace-fallback">
           <p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p>
@@ -2063,19 +2096,20 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
       <div id="conv-configure-hint" className="conv-configure-hint">
         <AgentChip name={agent} size="md" />
         <span>Tune {agent} anytime in configure.</span>
-        <button id="conv-new" className="ghost" type="button" onClick={() => newConversation(agent)}>＋ new conversation</button>
-        <button className="ghost" type="button" onClick={() => selectAgent(agent, 'configure')}>configure</button>
+        <IconButton id="conv-new" label={`new conversation with ${agent}`} className="ghost cfg-icon-btn" onClick={() => newConversation(agent)}>＋</IconButton>
+        <IconButton label={`configure ${agent}`} className="ghost cfg-icon-btn" onClick={() => selectAgent(agent, 'configure')}>⚙</IconButton>
       </div>
       <div id="conv-recent" className="conv-recent">
-        <div className="conv-current">
-          <span>current conversation</span>
-          <strong title={current || ''}>{active?.title || (current ? 'untitled conversation' : 'say something to start')}</strong>
-        </div>
-        <div className="conv-recent-list" aria-label={`recent conversations with ${agent}`}>
-          {conversations?.status === 'loading' && !recent.length ? <span className="dim-inline">loading conversations…</span>
-            : conversations?.status === 'error' && !recent.length ? <span className="dim-inline">recent conversations unavailable</span>
-              : !recent.length ? <span className="dim-inline">recent conversations will appear here.</span>
-                : recent.slice(0, 6).map((c: any) => (
+        <label className="conv-search">
+          <span aria-hidden="true">⌕</span>
+          <input type="search" value={conversationSearch} onChange={(e) => setConversationSearch(e.target.value)} placeholder="search conversations" aria-label={`search conversations with ${agent}`} />
+        </label>
+        <div className="conv-recent-list" aria-label={query ? `conversation search results for ${agent}` : `recent conversations with ${agent}`}>
+          {conversations?.status === 'loading' && !allConversations.length ? <span className="dim-inline">loading conversations…</span>
+            : conversations?.status === 'error' && !allConversations.length ? <span className="dim-inline">recent conversations unavailable</span>
+              : !allConversations.length ? <span className="dim-inline">recent conversations will appear here.</span>
+                : !resultConversations.length ? <span className="dim-inline">no matching conversations.</span>
+                : resultConversations.map((c: any) => (
                   <button key={c.session} className={`conv-recent-row${c.session === current ? ' on' : ''}`} title={c.session} type="button" onClick={() => openConversation(agent, c.session)}>
                     <span>{c.title || c.preview || 'conversation'}</span>
                     <em><span className="source-badge">{c.source || 'you'}</span>{relativeTime(c.last_ts)}</em>
@@ -2089,7 +2123,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
           {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `correlation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : m.text}</div></div>)}
         </div>
       </div>
-      <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><button type="submit" id="compose-send">{sendLabel}</button></form>
+      <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><IconButton type="submit" id="compose-send" label={sendLabel} className="compose-send">➤</IconButton></form>
     </div>
   );
 }

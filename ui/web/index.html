@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>elanus - agent explorer</title>
+<script>
+  // Pre-paint theme so reloads don't flash dark before React's effect runs.
+  // Mirrors the resolution in App.tsx (localStorage 'elanus.theme' + matchMedia);
+  // the React effect re-applies the same value and owns live system switching.
+  (function () {
+    try {
+      var t = localStorage.getItem('elanus.theme');
+      if (t !== 'light' && t !== 'dark' && t !== 'system') t = 'system';
+      var light = t === 'system' ? window.matchMedia('(prefers-color-scheme: light)').matches : t === 'light';
+      document.documentElement.dataset.theme = light ? 'light' : 'dark';
+    } catch (e) { /* default to the bare :root (dark) palette */ }
+  })();
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" />

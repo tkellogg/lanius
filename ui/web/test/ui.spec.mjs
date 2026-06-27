@@ -1228,12 +1228,12 @@ const renamedAgent = 'falcon';
   });
   // Toggle into cockpit mode: the panel-head noun changes warm → cockpit.
   const warmHead = await page.$eval('.nav .panel-head h2', (el) => el.textContent.trim()).catch(() => '');
-  await page.click('#theme-toggle');
+  await page.click('#vocabulary-toggle');
   await waitFor('identity: cockpit toggle changes panel-head noun', async () => {
     const h = await page.$eval('.nav .panel-head h2', (el) => el.textContent.trim()).catch(() => '');
     return h && h !== warmHead;
   });
-  await page.click('#theme-toggle');
+  await page.click('#vocabulary-toggle');
   await waitFor('identity: warm mode restores the warm noun', async () => {
     const h = await page.$eval('.nav .panel-head h2', (el) => el.textContent.trim()).catch(() => '');
     return h === warmHead;
@@ -1250,12 +1250,12 @@ const renamedAgent = 'falcon';
   // The compose button says "Send", not "transmit".
   const sendLabel = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
   /^send$/i.test(sendLabel) ? ok('language: compose button is "Send"') : fail(`language: compose button is "${sendLabel}"`);
-  await page.click('#theme-toggle');
+  await page.click('#vocabulary-toggle');
   await waitFor('language: cockpit mode changes compose button to "transmit"', async () => {
     const label = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
     return /^transmit$/i.test(label);
   });
-  await page.click('#theme-toggle');
+  await page.click('#vocabulary-toggle');
   await waitFor('language: warm mode restores compose button to "Send"', async () => {
     const label = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
     return /^send$/i.test(label);
