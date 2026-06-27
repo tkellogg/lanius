@@ -112,22 +112,34 @@ async function waitForConfigureLoaded(page) {
   const page = await newPage();
   await page.goto('/');
   await page.waitForSelector('#nav-agents', { timeout: 10000 });
-  // Contrast baseline (M1): every text token must clear WCAG AA 4.5:1 against
-  // the page bg, the panel bg, and the active-row bg. Locking the values here
-  // catches a regression that pulls --dim or --meta back below the floor.
+  // Contrast baseline (M1 + M5): every text token must clear WCAG AA 4.5:1
+  // against the page bg, the panel bg, and the active-row bg (var(--hover)).
+  // Derives `active` from the live token and checks BOTH themes, so it stays
+  // correct under light mode rather than assuming the dark active color.
   const contrast = await page.evaluate(() => {
-    const css = getComputedStyle(document.documentElement);
-    const hex = (v) => css.getPropertyValue(v).trim();
-    const tok = { bg: hex('--bg'), panel: hex('--panel'), active: '#1b1d18', ink: hex('--ink'), dim: hex('--dim'), meta: hex('--meta') };
+    const root = document.documentElement;
+    const prior = root.getAttribute('data-theme');
     const lin = (ch) => { const c = ch / 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
     const lum = (h) => { const r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16); return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b); };
     const ratio = (a, b) => { const l1 = lum(a), l2 = lum(b); const hi = Math.max(l1, l2), lo = Math.min(l1, l2); return (hi + 0.05) / (lo + 0.05); };
-    const min = (fg) => Math.min(ratio(fg, tok.bg), ratio(fg, tok.panel), ratio(fg, tok.active));
-    return { inkAA: min(tok.ink) >= 4.5, dimAA: min(tok.dim) >= 4.5, metaAA: min(tok.meta) >= 4.5, ratios: { ink: min(tok.ink), dim: min(tok.dim), meta: min(tok.meta) } };
+    const measure = (theme) => {
+      root.dataset.theme = theme;
+      const css = getComputedStyle(root);
+      const hex = (v) => css.getPropertyValue(v).trim();
+      const tok = { bg: hex('--bg'), panel: hex('--panel'), active: hex('--hover'), ink: hex('--ink'), dim: hex('--dim'), meta: hex('--meta') };
+      const min = (fg) => Math.min(ratio(fg, tok.bg), ratio(fg, tok.panel), ratio(fg, tok.active));
+      return { ink: min(tok.ink), dim: min(tok.dim), meta: min(tok.meta) };
+    };
+    const out = { dark: measure('dark'), light: measure('light') };
+    if (prior === null) root.removeAttribute('data-theme'); else root.dataset.theme = prior;
+    return out;
   });
-  contrast.inkAA ? ok(`contrast: --ink clears AA (${contrast.ratios.ink.toFixed(2)})`) : fail(`contrast: --ink below AA (${contrast.ratios.ink.toFixed(2)})`);
-  contrast.dimAA ? ok(`contrast: --dim clears AA (${contrast.ratios.dim.toFixed(2)})`) : fail(`contrast: --dim below AA (${contrast.ratios.dim.toFixed(2)})`);
-  contrast.metaAA ? ok(`contrast: --meta clears AA (${contrast.ratios.meta.toFixed(2)})`) : fail(`contrast: --meta below AA (${contrast.ratios.meta.toFixed(2)})`);
+  for (const theme of ['dark', 'light']) {
+    const r = contrast[theme];
+    r.ink >= 4.5 ? ok(`contrast(${theme}): --ink clears AA (${r.ink.toFixed(2)})`) : fail(`contrast(${theme}): --ink below AA (${r.ink.toFixed(2)})`);
+    r.dim >= 4.5 ? ok(`contrast(${theme}): --dim clears AA (${r.dim.toFixed(2)})`) : fail(`contrast(${theme}): --dim below AA (${r.dim.toFixed(2)})`);
+    r.meta >= 4.5 ? ok(`contrast(${theme}): --meta clears AA (${r.meta.toFixed(2)})`) : fail(`contrast(${theme}): --meta below AA (${r.meta.toFixed(2)})`);
+  }
   // The harness init seeds a 'default' profile → agent 'main' in the nav.
   await waitFor('boot: default agent visible in nav', async () => {
     const items = await page.$$eval('#nav-agents .nav-item', (els) => els.map((e) => e.textContent));
@@ -289,19 +301,19 @@ const testAgentProfile = 'harrier';
   }, 5000);
   const windowContextStage = () => page.locator('#cfg-context-chain .cfg-context-stage[data-stage="window/window"]').first();
   await waitFor('configure: context stage chain renders as tiles', async () => {
-    const text = await page.$eval('#cfg-context-chain', (el) => el.textContent);
-    return /window\/window/.test(text) && /timeout ms/i.test(text);
+    return await windowContextStage().count() === 1
+      && /timeout ms/i.test(await windowContextStage().textContent());
   }, 8000);
-  await windowContextStage().locator('button[aria-label="remove window/window"]').click();
-  await waitFor('configure: context stage remove updates add menu', async () => {
-    const chainText = await page.$eval('#cfg-context-chain', (el) => el.textContent);
-    const option = await page.$eval('#cfg-context-add-stage', (el) => el.value).catch(() => '');
-    return !/window\/window/.test(chainText) && option === 'window/window';
-  }, 5000);
   await page.click('#cfg-context-add');
-  await waitFor('configure: context stage add restores tile', async () => {
-    return /window\/window/.test(await page.$eval('#cfg-context-chain', (el) => el.textContent));
+  await waitFor('configure: context stage new opens assistant modal', async () => {
+    return await page.$eval('#cfg-context-assistant-modal', (el) => el.open).catch(() => false)
+      && await page.locator('#cfg-context-assistant-modal .agent-assistant').count() === 1
+      && await page.locator('#cfg-context-assistant-modal .agent-assistant-head select').count() === 1;
   }, 5000);
+  await waitFor('configure: opening context assistant preserves existing chain', async () => {
+    return await windowContextStage().count() === 1;
+  }, 5000);
+  await page.click('button[aria-label="close context assistant"]');
   await windowContextStage().locator('label', { hasText: 'timeout ms' }).locator('input').fill('9000');
   await waitFor('configure: context stage declared setting renders in tile', async () => {
     const text = await windowContextStage().textContent();
@@ -1247,17 +1259,18 @@ const renamedAgent = 'falcon';
   // Converse header shows the identity chip alongside the agent name.
   const chipInHeader = await page.$eval('#conv-configure-hint', (el) => el.querySelector('.agent-chip') != null).catch(() => false);
   chipInHeader ? ok('identity: chip rendered in converse header') : fail('identity: converse header missing chip');
-  // The compose button says "Send", not "transmit".
-  const sendLabel = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
-  /^send$/i.test(sendLabel) ? ok('language: compose button is "Send"') : fail(`language: compose button is "${sendLabel}"`);
+  // The compose button is an icon (➤); its accessible name carries the
+  // vocabulary word ("Send" warm / "transmit" cockpit) via aria-label.
+  const sendLabel = await page.$eval('#compose-send', (el) => (el.getAttribute('aria-label') || '').trim()).catch(() => '');
+  /^send$/i.test(sendLabel) ? ok('language: compose button labelled "Send"') : fail(`language: compose button labelled "${sendLabel}"`);
   await page.click('#vocabulary-toggle');
   await waitFor('language: cockpit mode changes compose button to "transmit"', async () => {
-    const label = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
+    const label = await page.$eval('#compose-send', (el) => (el.getAttribute('aria-label') || '').trim()).catch(() => '');
     return /^transmit$/i.test(label);
   });
   await page.click('#vocabulary-toggle');
   await waitFor('language: warm mode restores compose button to "Send"', async () => {
-    const label = await page.$eval('#compose-send', (el) => el.textContent.trim()).catch(() => '');
+    const label = await page.$eval('#compose-send', (el) => (el.getAttribute('aria-label') || '').trim()).catch(() => '');
     return /^send$/i.test(label);
   });
   await page.click('[data-tab="sessions"]');

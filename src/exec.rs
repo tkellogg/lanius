@@ -14,10 +14,16 @@ use genai::chat::{
     ChatMessage, ChatRequest, ContentPart, MessageContent, Tool, ToolCall, ToolResponse,
 };
 use genai::Client;
+use rumqttc::v5::mqttbytes::v5::Packet;
+use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::v5::{AsyncClient, Event, MqttOptions};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Read as _;
+use std::time::Duration;
+
+const CLIENT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct ExecOpts {
     pub session: Option<String>,
@@ -33,6 +39,13 @@ pub struct ContextRenderOpts {
     pub profile: String,
     pub session: String,
     pub event: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClientToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
 }
 
 /// What a tool invocation produced. Model-caused errors (bad args, unknown
@@ -427,6 +440,7 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     let system_seed = render::render_parts(root, &conn, &opts.profile, &session)?;
     let stages = context::chain(root, &conn, &opts.profile, &prof)?;
     let event_doc = opts.event.clone().unwrap_or(Value::Null);
+    let client_tools = client_tools_from_event(&event_doc);
     // The cage is built once per exec from the profile's [sandbox] grant;
     // every shell tool call spawns inside it and gets boundary-diffed.
     let cage = sandbox::Cage::from_profile(root, &prof.sandbox);
@@ -446,6 +460,8 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     if !withheld.is_empty() {
         tools.retain(|t| !withheld.contains(t.name.as_str()));
     }
+    let client_tool_names: HashSet<String> = client_tools.iter().map(|t| t.name.clone()).collect();
+    tools.extend(client_tool_defs(&client_tools));
     tools.extend(mcp_pool.tool_defs());
     let root_type = match event_id {
         Some(id) => db::root_type(&conn, id).unwrap_or_else(|_| "cli".into()),
@@ -624,15 +640,15 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
                     .unwrap_or_else(|| call.fn_arguments.clone()),
                 thought_signatures: None,
             };
-            // The (effective) tool call goes to the trace BEFORE execution: a
-            // crash mid-tool must be visible as a call with no result.
-            trace::write(
-                root,
-                &obs_tool(&prof.agent, &session, &eff.fn_name, "call"),
-                &ids,
-                json!({ "call_id": eff.call_id, "name": eff.fn_name, "args": eff.fn_arguments }),
-            );
             if !pre.allow {
+                // The (effective) tool call goes to the trace BEFORE execution:
+                // a crash mid-tool must be visible as a call with no result.
+                trace::write(
+                    root,
+                    &obs_tool(&prof.agent, &session, &eff.fn_name, "call"),
+                    &ids,
+                    json!({ "call_id": eff.call_id, "name": eff.fn_name, "args": eff.fn_arguments }),
+                );
                 let result = json!({
                     "error": format!("blocked by hook {}", pre.denied_by.as_deref().unwrap_or("?")),
                     "reason": pre.reason,
@@ -657,19 +673,32 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
                 )?;
                 continue;
             }
-            match run_tool(
-                root,
-                &conn,
-                &cage,
-                &prof,
-                &session,
-                event_id,
-                ids.correlation_id.as_deref(),
-                in_handler,
-                &eff,
-                &mut self_emitted,
-                &mcp_pool,
-            ) {
+            let outcome = if client_tool_names.contains(&eff.fn_name) {
+                run_client_tool(root, &prof, &session, event_id, &ids, &eff).await
+            } else {
+                // The (effective) tool call goes to the trace BEFORE execution:
+                // a crash mid-tool must be visible as a call with no result.
+                trace::write(
+                    root,
+                    &obs_tool(&prof.agent, &session, &eff.fn_name, "call"),
+                    &ids,
+                    json!({ "call_id": eff.call_id, "name": eff.fn_name, "args": eff.fn_arguments }),
+                );
+                run_tool(
+                    root,
+                    &conn,
+                    &cage,
+                    &prof,
+                    &session,
+                    event_id,
+                    ids.correlation_id.as_deref(),
+                    in_handler,
+                    &eff,
+                    &mut self_emitted,
+                    &mcp_pool,
+                )
+            };
+            match outcome {
                 ToolOutcome::Output(result) => {
                     // Hook plane, post_tool_call: may scrub/rewrite the result
                     // or veto it (the model then sees the denial, not the data).
@@ -1500,6 +1529,269 @@ fn tool_defs() -> Vec<Tool> {
     ]
 }
 
+fn client_tool_defs(defs: &[ClientToolDef]) -> Vec<Tool> {
+    defs.iter()
+        .filter(|d| !d.name.trim().is_empty())
+        .map(|d| {
+            Tool::new(&d.name)
+                .with_description(d.description.as_str())
+                .with_schema(d.parameters.clone())
+        })
+        .collect()
+}
+
+fn client_tools_from_event(event: &Value) -> Vec<ClientToolDef> {
+    event["payload"]["client_tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| {
+                    let name = t["name"].as_str()?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some(ClientToolDef {
+                        name: name.to_string(),
+                        description: t["description"].as_str().unwrap_or("").to_string(),
+                        parameters: t
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn run_client_tool(
+    root: &Root,
+    prof: &profile::Profile,
+    session: &str,
+    event_id: Option<i64>,
+    ids: &trace::Ids,
+    call: &ToolCall,
+) -> ToolOutcome {
+    let result_topic = obs_tool(&prof.agent, session, &call.fn_name, "result");
+    let call_topic = obs_tool(&prof.agent, session, &call.fn_name, "call");
+    let (ready, mut results) =
+        subscribe_client_tool_result(root.clone(), result_topic.clone(), call.call_id.clone());
+
+    match tokio::time::timeout(CLIENT_TOOL_TIMEOUT, ready).await {
+        Err(_) => {
+            let result = json!({ "error": format!("client tool result subscription timed out after {}s", CLIENT_TOOL_TIMEOUT.as_secs()) }).to_string();
+            trace::write(
+                root,
+                &result_topic,
+                ids,
+                json!({ "call_id": call.call_id, "name": call.fn_name, "timeout": true, "result": trace::clip(&result, 2000) }),
+            );
+            let _ = event_id;
+            return ToolOutcome::Output(result);
+        }
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => {
+            let result = json!({ "error": e }).to_string();
+            trace::write(
+                root,
+                &result_topic,
+                ids,
+                json!({ "call_id": call.call_id, "name": call.fn_name, "error": trace::clip(&result, 2000) }),
+            );
+            let _ = event_id;
+            return ToolOutcome::Output(result);
+        }
+        Ok(Err(_)) => {
+            let result =
+                json!({ "error": "client tool result listener stopped before subscribing" })
+                    .to_string();
+            trace::write(
+                root,
+                &result_topic,
+                ids,
+                json!({ "call_id": call.call_id, "name": call.fn_name, "error": trace::clip(&result, 2000) }),
+            );
+            let _ = event_id;
+            return ToolOutcome::Output(result);
+        }
+    }
+
+    trace::write(
+        root,
+        &obs_tool(&prof.agent, session, &call.fn_name, "await"),
+        ids,
+        json!({ "call_id": call.call_id, "name": call.fn_name, "client_tool": true, "timeout_ms": CLIENT_TOOL_TIMEOUT.as_millis() }),
+    );
+    // Client tools publish their browser-visible call only after the result
+    // subscription is active, so a fast handler cannot beat the waiter.
+    trace::write(
+        root,
+        &call_topic,
+        ids,
+        json!({ "call_id": call.call_id, "name": call.fn_name, "args": call.fn_arguments }),
+    );
+
+    match await_client_tool_result(&mut results, &call.call_id).await {
+        Ok(Some(Ok(result))) => ToolOutcome::Output(result),
+        Ok(Some(Err(e))) => {
+            let result = json!({ "error": e }).to_string();
+            trace::write(
+                root,
+                &result_topic,
+                ids,
+                json!({ "call_id": call.call_id, "name": call.fn_name, "error": trace::clip(&result, 2000) }),
+            );
+            let _ = event_id;
+            ToolOutcome::Output(result)
+        }
+        Ok(None) => {
+            let result = json!({ "error": "client tool result listener stopped" }).to_string();
+            trace::write(
+                root,
+                &result_topic,
+                ids,
+                json!({ "call_id": call.call_id, "name": call.fn_name, "error": trace::clip(&result, 2000) }),
+            );
+            let _ = event_id;
+            ToolOutcome::Output(result)
+        }
+        Err(e) => {
+            let result = json!({ "error": e }).to_string();
+            trace::write(
+                root,
+                &result_topic,
+                ids,
+                json!({ "call_id": call.call_id, "name": call.fn_name, "timeout": true, "result": trace::clip(&result, 2000) }),
+            );
+            let _ = event_id;
+            ToolOutcome::Output(result)
+        }
+    }
+}
+
+async fn await_client_tool_result(
+    rx: &mut tokio::sync::mpsc::Receiver<std::result::Result<String, String>>,
+    call_id: &str,
+) -> std::result::Result<Option<std::result::Result<String, String>>, String> {
+    tokio::time::timeout(CLIENT_TOOL_TIMEOUT, rx.recv())
+        .await
+        .map_err(|_| {
+            format!(
+                "client tool {call_id} timed out after {}s",
+                CLIENT_TOOL_TIMEOUT.as_secs()
+            )
+        })
+}
+
+fn subscribe_client_tool_result(
+    root: Root,
+    topic: String,
+    call_id: String,
+) -> (
+    tokio::sync::oneshot::Receiver<std::result::Result<(), String>>,
+    tokio::sync::mpsc::Receiver<std::result::Result<String, String>>,
+) {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, result_rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        let mut ready_tx = Some(ready_tx);
+        let cfg = crate::bus::config(&root);
+        let Some(addr) = crate::bus::connect_addr(&cfg) else {
+            let _ = ready_tx
+                .take()
+                .unwrap()
+                .send(Err(format!("unparseable bus bind address {:?}", cfg.bind)));
+            return;
+        };
+        let mut opts = MqttOptions::new(
+            format!(
+                "el-exec-tool-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            addr.ip().to_string(),
+            addr.port(),
+        );
+        opts.set_keep_alive(Duration::from_secs(10));
+        opts.set_max_packet_size(Some(crate::resident::MAX_PACKET));
+        if let Some(secret) = crate::secrets::read(&root, crate::secrets::KERNEL) {
+            opts.set_credentials(crate::secrets::KERNEL, secret);
+        }
+
+        let (client, mut eventloop) = AsyncClient::new(opts, 16);
+        if let Err(e) = client.subscribe(&topic, QoS::AtLeastOnce).await {
+            let _ = ready_tx
+                .take()
+                .unwrap()
+                .send(Err(format!("client tool result subscribe failed: {e}")));
+            return;
+        }
+
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::SubAck(_))) => {
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Ok(()));
+                    }
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = format!("client tool result subscription failed: {e}");
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(msg));
+                    } else {
+                        let _ = result_tx.send(Err(msg)).await;
+                    }
+                    return;
+                }
+            }
+        }
+
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::Publish(p))) => {
+                    if let Some(result) = client_tool_result_from_payload(&p.payload, &call_id) {
+                        let _ = result_tx.send(Ok(result)).await;
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = result_tx
+                        .send(Err(format!("client tool result receive failed: {e}")))
+                        .await;
+                    return;
+                }
+            }
+        }
+    });
+    (ready_rx, result_rx)
+}
+
+fn client_tool_result_from_payload(raw: &[u8], call_id: &str) -> Option<String> {
+    let raw_payload: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
+    let payload = raw_payload
+        .get("payload")
+        .filter(|v| v.is_object())
+        .unwrap_or(&raw_payload);
+    if payload["call_id"].as_str() != Some(call_id) {
+        return None;
+    }
+    if payload["cancelled"].as_bool() == Some(true) {
+        return Some(json!({ "error": "client tool cancelled", "cancelled": true }).to_string());
+    }
+    if let Some(err) = payload["error"].as_str() {
+        return Some(json!({ "error": err }).to_string());
+    }
+    Some(match payload.get("result") {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) if !v.is_null() => v.to_string(),
+        _ => Value::Null.to_string(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tool(
     root: &Root,
@@ -2048,9 +2340,14 @@ mod tests {
         let headers = opts
             .extra_headers
             .expect("the header rides on the per-call ChatOptions");
-        let got: std::collections::HashMap<String, String> =
-            headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        assert_eq!(got.get("X-LiteLLM-Tag").map(String::as_str), Some("hdr-secret"));
+        let got: std::collections::HashMap<String, String> = headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(
+            got.get("X-LiteLLM-Tag").map(String::as_str),
+            Some("hdr-secret")
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -2071,7 +2368,9 @@ mod tests {
         let prof = profile_with(Some("chatgpt"));
         // The agent must fail to start with the legible refusal — a native login
         // has no secret to feed the genai dispatcher.
-        let err = dispatcher_plan(&root, &conn, &prof, None).unwrap_err().to_string();
+        let err = dispatcher_plan(&root, &conn, &prof, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("native-login"), "legible refusal: {err}");
         assert!(build_client(&root, &conn, &prof).is_err());
         std::fs::remove_dir_all(&root.dir).ok();
@@ -2082,7 +2381,9 @@ mod tests {
         let root = prov_root("missing");
         let conn = Connection::open(root.db()).unwrap();
         let prof = profile_with(Some("nope"));
-        let err = dispatcher_plan(&root, &conn, &prof, None).unwrap_err().to_string();
+        let err = dispatcher_plan(&root, &conn, &prof, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no such provider"), "{err}");
         assert!(err.contains("nope"), "{err}");
         std::fs::remove_dir_all(&root.dir).ok();
@@ -2116,7 +2417,10 @@ mod tests {
                 api_key_env,
                 ..
             } => {
-                assert_eq!(profile_url.as_deref(), Some("https://api.deepseek.com/anthropic"));
+                assert_eq!(
+                    profile_url.as_deref(),
+                    Some("https://api.deepseek.com/anthropic")
+                );
                 assert_eq!(api_key_env.as_deref(), Some("DEEPSEEK_API_KEY"));
             }
             other => panic!("expected Inline, got {other:?}"),
@@ -2267,7 +2571,8 @@ pub fn handle_exec(root: &Root) -> Result<()> {
         .map(String::from)
         .or_else(|| env["correlation_id"].as_str().map(|c| format!("evt-{c}")))
         .unwrap_or_else(|| format!("evt-{}", env["id"]));
-    let profile = payload["profile"].as_str().unwrap_or("default").to_string();
+    let requested_profile = payload["profile"].as_str().unwrap_or("default");
+    let profile = resolve_exec_profile(root, requested_profile);
     let resume = env.get("resume").filter(|r| !r.is_null());
     // The dispatching event rides into the context document verbatim
     // (docs/context.md): stages see topic, payload, correlation — and the
@@ -2324,4 +2629,12 @@ pub fn handle_exec(root: &Root) -> Result<()> {
         }
     };
     run(root, opts)
+}
+
+fn resolve_exec_profile(root: &Root, profile: &str) -> String {
+    if profile == "helper" && !root.profile_dir("helper").join("profile.toml").exists() {
+        "default".to_string()
+    } else {
+        profile.to_string()
+    }
 }

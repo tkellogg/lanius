@@ -980,11 +980,9 @@ fn admin_dispatch(
         }
         ("agents", true, _) => {
             let r = cli(root, &["profile", "list"])?;
-            return Ok(ok_or_err(
-                &r,
-                500,
-                |s| json!({ "ok": true, "profiles": json_lines(s) }),
-            ));
+            return Ok(ok_or_err(&r, 500, |s| {
+                json!({ "ok": true, "profiles": profiles_with_helper(root, s) })
+            }));
         }
         ("agents", _, true) => {
             let name = body.get("name").and_then(Value::as_str).unwrap_or("");
@@ -1923,6 +1921,41 @@ fn json_lines(text: &str) -> Vec<Value> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .collect()
+}
+
+fn profiles_with_helper(root: &Root, text: &str) -> Vec<Value> {
+    let mut profiles = json_lines(text);
+    let has_helper = profiles
+        .iter()
+        .any(|p| p["profile"].as_str() == Some("helper"));
+    if has_helper {
+        return profiles;
+    }
+    let Some(default) = profiles
+        .iter()
+        .find(|p| p["profile"].as_str() == Some("default"))
+        .cloned()
+        .or_else(|| profiles.first().cloned())
+    else {
+        return profiles;
+    };
+    let mut helper = default;
+    if let Some(obj) = helper.as_object_mut() {
+        obj.insert("profile".into(), json!("helper"));
+        obj.insert("mirrors".into(), json!("default"));
+        obj.insert(
+            "dir".into(),
+            json!(root.profile_dir("helper").display().to_string()),
+        );
+    }
+    profiles.push(helper);
+    profiles.sort_by(|a, b| {
+        a["profile"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["profile"].as_str().unwrap_or(""))
+    });
+    profiles
 }
 
 fn profile_toml_path(root: &Root, name: &str) -> PathBuf {

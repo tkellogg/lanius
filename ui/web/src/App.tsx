@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import CodeSessions from './CodeSessions';
 import CommsView from './CommsView';
 import ProvidersView from './ProvidersView';
+import AgentAssistant, { ClientTool } from './components/AgentAssistant';
 import { adminGet, adminPost, adminPut, history, publish, status as fetchStatus } from './api';
 import { openLiveStream } from './live';
 import { Button, IconButton, ModelField, WorkdirInput } from './components/primitives';
@@ -745,6 +746,7 @@ export function App() {
         defs.push({
           package: p.name,
           name: stage.name,
+          description: stage.description ?? stage.summary ?? stage.injects ?? '',
           mode: stage.mode ?? 'exec',
           order: Number(stage.order ?? 50),
           timeout_ms: stage.mode === 'resident' ? 15000 : 10000,
@@ -858,9 +860,10 @@ export function App() {
     setCfgNote(r.ok ? '' : `no settings file for ${profile} — this agent only exists as traffic; create an agent here to configure it`);
   };
 
-  const saveConfigure = async () => {
+  const saveConfigure = async (overrides?: any) => {
     if (!cfgProfile) return;
     setCfgNote('saving…');
+    const contextChainForSave = Array.isArray(overrides?.contextChain) ? overrides.contextChain : cfgContextChain;
     const set: Record<string, any> = {};
     const newAgentName = cfgForm.agent.trim();
     if (newAgentName) set.agent = newAgentName;
@@ -880,8 +883,8 @@ export function App() {
     if (cfgForm.apiKeyEnv.trim()) set['model.api_key_env'] = cfgForm.apiKeyEnv.trim();
     if (cfgForm.contextProgram.trim()) set['context.program'] = cfgForm.contextProgram.trim();
     if (cfgForm.contextMaxMs) set['context.max_total_ms'] = Number(cfgForm.contextMaxMs);
-    const chain = new Map(cfgContextChain.map((s) => [contextStageKey(s), s]));
-    const stageRows: any[] = cfgContextChain.map((s) => ({
+    const chain = new Map(contextChainForSave.map((s: any) => [contextStageKey(s), s]));
+    const stageRows: any[] = contextChainForSave.map((s: any) => ({
       package: s.package,
       name: s.name,
       enabled: true,
@@ -952,6 +955,22 @@ export function App() {
     if (!def) return;
     setCfgContextRemoved((old) => { const next = new Set(old); next.delete(key); return next; });
     setCfgContextChain((prev) => [...prev, { ...def, enabled: true, order: (prev.length + 1) * 10 }]);
+  };
+  const saveContextStageFromAssistant = async (stage: any) => {
+    const key = typeof stage === 'string'
+      ? stage
+      : stage?.key || (stage?.package && stage?.name ? `${stage.package}/${stage.name}` : '');
+    const def = contextDefs.find((s) => contextStageKey(s) === key);
+    if (!def) return { ok: false, error: `unknown context block ${key || '(missing)'}` };
+    if (cfgContextChain.some((s) => contextStageKey(s) === key)) {
+      return { ok: true, already_present: true, stage: key };
+    }
+    const nextChain = [...cfgContextChain, { ...def, enabled: true, order: (cfgContextChain.length + 1) * 10 }]
+      .map((s, i) => ({ ...s, order: (i + 1) * 10 }));
+    setCfgContextRemoved((old) => { const next = new Set(old); next.delete(key); return next; });
+    setCfgContextChain(nextChain);
+    await saveConfigure({ contextChain: nextChain });
+    return { ok: true, stage: key };
   };
 
   const setSkillExcluded = (pkgName: string, excluded: boolean) => {
@@ -1277,6 +1296,7 @@ export function App() {
             moveContextStage={moveContextStage}
             removeContextStage={removeContextStage}
             addContextStage={addContextStage}
+            saveContextStageFromAssistant={saveContextStageFromAssistant}
             skillIncluded={skillIncluded}
             skillExcluded={skillExcluded}
             setSkillExcluded={setSkillExcluded}
@@ -1726,7 +1746,7 @@ function ProposalCard({ proposal, loadSetup }: any) {
 }
 
 function ConfigureView(props: any) {
-  const { hidden, modelOptions, form, setForm, cfgProfile, cfgParsed, cfgLoading, cfgNote, cfgToml, setCfgToml, cfgTomlNote, saveConfigure, saveRawToml, cfgPackages, cfgKits, cfgConfigPackages, cfgSharedConfigRows, setCfgSharedConfigRows, cfgContextChain, setCfgContextChain, cfgContextVarEdits, setCfgContextVarEdits, contextDefs, availableContextStages, moveContextStage, removeContextStage, addContextStage, skillIncluded, skillExcluded, setSkillExcluded, setKitPackagesExcluded, openKitModal, selectProviders } = props;
+  const { hidden, modelOptions, form, setForm, cfgProfile, cfgParsed, cfgLoading, cfgNote, cfgToml, setCfgToml, cfgTomlNote, saveConfigure, saveRawToml, cfgPackages, cfgKits, cfgConfigPackages, cfgSharedConfigRows, setCfgSharedConfigRows, cfgContextChain, setCfgContextChain, cfgContextVarEdits, setCfgContextVarEdits, contextDefs, availableContextStages, moveContextStage, removeContextStage, saveContextStageFromAssistant, skillIncluded, skillExcluded, setSkillExcluded, setKitPackagesExcluded, openKitModal, selectProviders } = props;
   // model-providers M4: the named-provider tie-in. Load the vault list so the
   // agent can SELECT a provider (writing model.provider on save); when an api-key
   // provider is selected the model dropdown sources its list from that provider's
@@ -1756,13 +1776,65 @@ function ConfigureView(props: any) {
   // With a named provider chosen, the model list comes from IT (api-key) or is
   // suppressed (native). With no provider, fall back to the ambient model probe.
   const modelFieldModels = form.provider ? providerModels : modelOptions;
-  const [selectedContextStage, setSelectedContextStage] = useState('');
-  const addStageValue = selectedContextStage || (availableContextStages[0] ? `${availableContextStages[0].package}/${availableContextStages[0].name}` : '');
+  const [contextAssistantOpen, setContextAssistantOpen] = useState(false);
+  const contextAssistantRef = useRef<HTMLDialogElement | null>(null);
+  const draggingContextIndex = useRef<number | null>(null);
+  useEffect(() => {
+    const el = contextAssistantRef.current;
+    if (!el) return;
+    if (contextAssistantOpen && !el.open) el.showModal();
+    if (!contextAssistantOpen && el.open) el.close();
+  }, [contextAssistantOpen]);
   const disabled = cfgLoading;
   const agentName = form.agent || cfgParsed.agent || cfgProfile || 'this agent';
   const cost = costSummary({ model: form.model, max_turns: Number(form.turns || 0), autonomy: form.autonomy, throttle: cfgParsed.throttle ?? {} }, form.model);
   const updateVar = (id: string, patch: any) => setForm({ varsRows: form.varsRows.map((r: any) => r.id === id ? { ...r, ...patch } : r) });
   const updateThrottle = (id: string, patch: any) => setForm({ throttleRows: form.throttleRows.map((r: any) => r.id === id ? { ...r, ...patch } : r) });
+  const reorderContextStage = (from: number, to: number) => {
+    if (from === to || from < 0 || to < 0 || from >= cfgContextChain.length || to >= cfgContextChain.length) return;
+    setCfgContextChain((prev: any[]) => {
+      const next = [...prev];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next.map((s, i) => ({ ...s, order: (i + 1) * 10 }));
+    });
+  };
+  const contextAuthorTools: ClientTool[] = useMemo(() => [
+    {
+      name: 'list_context_blocks',
+      description: 'List context blocks available to add for this agent.',
+      parameters: { type: 'object', properties: {} },
+      handler: async () => ({
+        blocks: availableContextStages.map((s: any) => ({
+          key: `${s.package}/${s.name}`,
+          package: s.package,
+          name: s.name,
+          mode: s.mode,
+          timeout_ms: s.timeout_ms,
+          settings: (s.config ?? []).map((p: any) => p.key).filter(Boolean),
+        })),
+      }),
+    },
+    {
+      name: 'save_context_block',
+      description: 'Add one context block to this agent and save through the normal configure path.',
+      parameters: {
+        type: 'object',
+        properties: {
+          stage: {
+            type: 'object',
+            properties: {
+              key: { type: 'string' },
+              package: { type: 'string' },
+              name: { type: 'string' },
+            },
+          },
+        },
+        required: ['stage'],
+      },
+      handler: async (args: any) => saveContextStageFromAssistant(args.stage ?? args),
+    },
+  ], [availableContextStages, saveContextStageFromAssistant]);
   return (
     <div id="view-configure" className="view" hidden={hidden}>
       <div className="setup-pane cfg-pane">
@@ -1848,13 +1920,48 @@ function ConfigureView(props: any) {
               <label>program <input id="cfg-context-program" disabled={disabled} spellCheck={false} value={form.contextProgram} onChange={(e) => setForm({ contextProgram: e.target.value })} /></label>
               <label>max context ms <input id="cfg-context-max-ms" disabled={disabled} type="number" min="1" value={form.contextMaxMs} onChange={(e) => setForm({ contextMaxMs: e.target.value })} /></label>
             </div>
-            <div className="cfg-context-head"><h4>context steps</h4><div className="cfg-context-add"><select id="cfg-context-add-stage" disabled={disabled || !availableContextStages.length} value={addStageValue} onChange={(e) => setSelectedContextStage(e.target.value)}>{availableContextStages.map((s: any) => <option key={`${s.package}/${s.name}`} value={`${s.package}/${s.name}`}>{s.package}/{s.name}</option>)}</select><button id="cfg-context-add" className="ghost" disabled={disabled || !availableContextStages.length} type="button" onClick={() => addContextStage(addStageValue)}>add</button></div></div>
+            <div className="cfg-context-head"><h4>context steps</h4><div className="cfg-context-add"><button id="cfg-context-add" className="ghost" type="button" onClick={() => setContextAssistantOpen(true)}>+ New</button></div></div>
             <div id="cfg-context-chain" className="cfg-context-chain">
+              <div className="cfg-context-stage cfg-context-seed" aria-label="built-in seed context">
+                <div className="cfg-context-stage-head"><div className="cfg-context-stage-title"><strong>built-in seed</strong><span className="cfg-config-help">always first · identity, system blocks, and the current conversation</span></div><span className="badge">fixed</span></div>
+                <div className="cfg-context-narrative">This is the base context every turn starts with before add-on blocks run.</div>
+              </div>
               {!contextDefs.length ? <div className="dim-note">no visible add-on context steps</div> : !cfgContextChain.length ? <div className="dim-note">all visible context steps are removed for this agent</div> : cfgContextChain.map((stage: any, index: number) => (
-                <ContextStageTile key={`${stage.package}/${stage.name}`} stage={stage} index={index} chainLength={cfgContextChain.length} disabled={disabled} move={moveContextStage} remove={removeContextStage} setChain={setCfgContextChain} cfgParsed={cfgParsed} cfgProfile={cfgProfile} sharedRows={cfgSharedConfigRows.get(stage.package) ?? new Map()} cfgContextVarEdits={cfgContextVarEdits} setCfgContextVarEdits={setCfgContextVarEdits} />
+                <ContextStageTile
+                  key={`${stage.package}/${stage.name}`}
+                  stage={stage}
+                  index={index}
+                  chainLength={cfgContextChain.length}
+                  disabled={disabled}
+                  move={moveContextStage}
+                  remove={removeContextStage}
+                  setChain={setCfgContextChain}
+                  cfgParsed={cfgParsed}
+                  cfgProfile={cfgProfile}
+                  sharedRows={cfgSharedConfigRows.get(stage.package) ?? new Map()}
+                  cfgContextVarEdits={cfgContextVarEdits}
+                  setCfgContextVarEdits={setCfgContextVarEdits}
+                  draggable={!disabled}
+                  onDragStart={() => { draggingContextIndex.current = index; }}
+                  onDragOver={(e: any) => e.preventDefault()}
+                  onDrop={() => { if (draggingContextIndex.current != null) reorderContextStage(draggingContextIndex.current, index); draggingContextIndex.current = null; }}
+                  onDragEnd={() => { draggingContextIndex.current = null; }}
+                />
               ))}
             </div>
             <p className="dim-note">Stages run top to bottom after the built-in seed. Reorder or remove stages here; raw TOML stores this as the <code>context.stage</code> array.</p>
+            <dialog id="cfg-context-assistant-modal" className="cfg-modal cfg-assistant-modal" ref={contextAssistantRef} onClick={(e) => { if (e.target === e.currentTarget) setContextAssistantOpen(false); }}>
+              <div className="cfg-modal-head"><div><h3>new context step</h3><p className="dim-note">The assistant can inspect available blocks and save one for this agent.</p></div><button className="cfg-icon-btn" type="button" aria-label="close context assistant" onClick={() => setContextAssistantOpen(false)}>×</button></div>
+              {/* Only mount the assistant while the modal is open: the views are
+                  rendered-and-[hidden], so an always-mounted assistant would fire
+                  its opening publish on every page load. */}
+              {contextAssistantOpen && <AgentAssistant
+                title="Context author"
+                intro={`Help add one useful context step for ${agentName}. Start by calling list_context_blocks. When the choice is clear, call save_context_block with the selected block.`}
+                tools={contextAuthorTools}
+                onDone={() => setContextAssistantOpen(false)}
+              />}
+            </dialog>
           </section>
 
           <section className="setup-block" id="cfg-section-sandbox">
@@ -1888,14 +1995,19 @@ function ConfigureView(props: any) {
   );
 }
 
-function ContextStageTile({ stage, index, chainLength, disabled, move, remove, setChain, cfgParsed, cfgProfile, sharedRows, cfgContextVarEdits, setCfgContextVarEdits }: any) {
+function ContextStageTile({ stage, index, chainLength, disabled, move, remove, setChain, cfgParsed, cfgProfile, sharedRows, cfgContextVarEdits, setCfgContextVarEdits, draggable, onDragStart, onDragOver, onDrop, onDragEnd }: any) {
   const key = `${stage.package}/${stage.name}`;
   const params = (stage.config ?? []).filter((p: any) => p.key).map((p: any) => ({ key: p.key, type: p.type ?? 'string', label: p.label || p.key, help: p.help || '', default: p.default, options: p.options ?? [], agent_tunable: p.agent_tunable === true, agentScoped: true, source: `agent context ${stage.name}` }));
   const updateStage = (patch: any) => setChain((prev: any[]) => prev.map((s) => `${s.package}/${s.name}` === key ? { ...s, ...patch } : s));
+  const modeText = stage.mode === 'resident' ? 'resident block stays warm and injects live context' : 'exec block runs while assembling this turn';
+  const enabledText = stage.enabled === false ? 'disabled' : 'enabled';
+  const injects = stage.description || stage.injects || stage.summary || (params.length ? `injects context using ${params.length} configurable setting${params.length === 1 ? '' : 's'}` : 'injects package-provided context');
   return (
-    <div className="cfg-context-stage" data-stage={key}>
-      <div className="cfg-context-stage-head"><div className="cfg-context-stage-title"><strong>{key}</strong><span className="cfg-config-help">mode: {stage.mode} · {params.length} declared setting{params.length === 1 ? '' : 's'}</span></div><div className="cfg-context-stage-actions"><IconButton label={`move ${key} up`} disabled={disabled || index === 0} onClick={() => move(index, -1)}>↑</IconButton><IconButton label={`move ${key} down`} disabled={disabled || index === chainLength - 1} onClick={() => move(index, 1)}>↓</IconButton><IconButton label={`remove ${key}`} disabled={disabled} onClick={() => remove(index)}>×</IconButton></div></div>
-      <div className="cfg-context-stage-grid"><label>order<input type="number" min="1" data-context-field="order" disabled={disabled} value={stage.order} onChange={(e) => updateStage({ order: Number(e.target.value || stage.order) })} /></label><label>timeout ms<input type="number" min="1" data-context-field="timeout_ms" disabled={disabled} value={stage.timeout_ms} onChange={(e) => updateStage({ timeout_ms: Number(e.target.value || stage.timeout_ms) })} /></label></div>
+    <div className="cfg-context-stage" data-stage={key} draggable={draggable} onDragStart={onDragStart} onDragOver={onDragOver} onDrop={onDrop} onDragEnd={onDragEnd}>
+      <div className="cfg-context-stage-head"><div className="cfg-context-stage-title"><strong>{stage.name}</strong><span className="cfg-config-help">{stage.package} · {enabledText} · order {stage.order}</span></div><div className="cfg-context-stage-actions"><IconButton label={`move ${key} up`} disabled={disabled || index === 0} onClick={() => move(index, -1)}>↑</IconButton><IconButton label={`move ${key} down`} disabled={disabled || index === chainLength - 1} onClick={() => move(index, 1)}>↓</IconButton><IconButton label={`remove ${key}`} disabled={disabled} onClick={() => remove(index)}>×</IconButton></div></div>
+      <div className="cfg-context-narrative">{injects}</div>
+      <div className="cfg-context-stage-meta"><span className="badge">{stage.mode || 'exec'}</span><span>{modeText}</span><span>{params.length} setting{params.length === 1 ? '' : 's'}</span></div>
+      <div className="cfg-context-stage-grid"><label>timeout ms<input type="number" min="1" data-context-field="timeout_ms" disabled={disabled} value={stage.timeout_ms} onChange={(e) => updateStage({ timeout_ms: Number(e.target.value || stage.timeout_ms) })} /></label></div>
       {!!params.length && <div className="cfg-context-stage-config"><div className="cfg-context-stage-subhead">settings for {cfgParsed.agent || cfgProfile || 'this agent'} only</div>{params.map((param: any) => {
         const value = cfgContextVarEdits.get(param.key) ?? cfgParsed.vars?.[param.key] ?? tomlDisplayValue(param.default, param.type);
         const setValue = (v: string) => setCfgContextVarEdits((old: Map<string, string>) => new Map(old).set(param.key, v));
