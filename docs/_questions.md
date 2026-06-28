@@ -46,6 +46,9 @@ UI nitpicks:
     LLM and layers on it's own set of packages for modifying the context. Probably a profile that's system 
     configured and hidden by default. Dramatically scoped down permissions to just doing that one thing. Also, if
     existing packages have context programs, offer those as options to enable, as an alternative to the agent.
+- The "current conversation" panel on the chat pane is probably not super helpful to me. I probably would like a search bar though.
+- Too many words across the entire app. See if we can replace with icons where appropriate.
+- Make a light mode, and have it dynamically switch between them based on the system theme by default, also configurable. I use something on my mac that switches system mode based on ambient light in the room, so it does switch often
 
 
 
