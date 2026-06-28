@@ -100,10 +100,10 @@ const MAX_SPAWN_DEPTH: u32 = 8;
 /// plausibly asking for delegation, parallelism, or another coding agent.
 const DISPATCH_HINT: &str = "[elanus] Tip: you can dispatch coding workers yourself - run `elanus code help` for all verbs. Live/blocking headless workers: `elanus code codex --headless \"<task>\"` runs a Codex worker and returns its result inline; `elanus code opencode --headless \"<task>\"` runs an opencode worker; `elanus code claude --headless \"<task>\"` runs a headless Claude worker. (Bare `elanus code <tool>` opens that tool's interactive TUI. `--worker` is the deprecated alias for `--headless`.)";
 
-/// The session-local Claude Code skill body written under the run scratch. Claude
-/// discovers it through `--add-dir <scratch>/skillroot` loading
-/// `.claude/skills/elanus`, so `/elanus` is available only for this session and
-/// vanishes with the scratch without exposing generated settings.json.
+/// The session-local Claude Code skill body. Claude discovers it as a skill in the
+/// per-session plugin (`build_claude_skill_plugin`) loaded via `--plugin-dir`, the
+/// only channel that surfaces skills under `--setting-sources ''`. Available only
+/// for this session and vanishes with the run scratch.
 const ELANUS_SKILL: &str = r#"---
 name: elanus
 description: Shows how to dispatch coding workers from this elanus-launched Claude Code session.
@@ -407,6 +407,10 @@ struct StreamLaunch<'a> {
     /// None when no `--provider` was given (then the launch is byte-identical to
     /// today's scrub-only path). Borrowed from the owner in `launch`.
     injection: Option<&'a crate::provider::HarnessInjection>,
+    /// The profile's visible skill packages `(name, dir)` to materialize into this
+    /// harness's per-session skills dir (Codex `$CODEX_HOME/skills`, opencode
+    /// `$OPENCODE_CONFIG_DIR/skills`). Empty when the profile has no visible skills.
+    skills: &'a [(String, PathBuf)],
 }
 
 /// A coding-agent adapter. Implementing this trait + registering in `HARNESSES`
@@ -675,6 +679,7 @@ impl Harness for Codex {
             ctx.brief,
             ctx.worker_timeout,
             ctx.injection,
+            ctx.skills,
         )
     }
     fn run_tui_rollout_import(
@@ -694,6 +699,7 @@ impl Harness for Codex {
             ctx.args,
             ctx.brief,
             ctx.injection,
+            ctx.skills,
         )
     }
     fn resume_stream_capture(
@@ -795,6 +801,7 @@ impl Harness for OpenCode {
             ctx.worker,
             ctx.worker_timeout,
             ctx.injection,
+            ctx.skills,
         )
     }
     fn run_tui_server_events(
@@ -818,6 +825,7 @@ impl Harness for OpenCode {
             ctx.args,
             ctx.brief,
             ctx.injection,
+            ctx.skills,
         )
     }
     fn resume_stream_capture(
@@ -1605,20 +1613,188 @@ not be watching this session live."
     )
 }
 
-/// Write the `/elanus` Claude Code skill into a dedicated session scratch
-/// subroot, in the exact `.claude/skills/<name>/SKILL.md` shape that
-/// `--add-dir <skillroot>` discovers. Keeping the added dir under `skillroot`
-/// means Claude can see only the generated skill, not the sibling settings.json.
-/// The launch cleanup still removes the whole scratch directory.
-fn write_elanus_skill(scratch: &Path) -> Result<PathBuf> {
-    let skill_root = scratch.join("skillroot");
-    let skill_dir = skill_root.join(".claude").join("skills").join("elanus");
-    std::fs::create_dir_all(&skill_dir)
-        .with_context(|| format!("creating elanus skill dir {}", skill_dir.display()))?;
-    let skill_path = skill_dir.join("SKILL.md");
+/// Build the per-session Claude plugin carrying the bootstrap `/elanus` skill plus
+/// the profile's visible skills, returning its path for `--plugin-dir`.
+///
+/// Why a plugin and not `.claude/skills`: Claude only discovers `.claude/skills`
+/// through setting-sources that include project/user — which elanus disables with
+/// `--setting-sources ''` to isolate from the user's `~/.claude`
+/// (hooks/CLAUDE.md/settings). Under that isolation, `--add-dir` does NOT register
+/// skills (verified empirically against claude 2.1.195). A plugin loaded via
+/// `--plugin-dir` is the one channel that delivers skills BOTH under the isolation
+/// AND from an arbitrary, ephemeral, per-session path:
+/// `<scratch>/plugin/.claude-plugin/plugin.json` + a `skills/` dir. The bootstrap
+/// skill is written as a real file (it has no source package); the profile's skills
+/// are SYMLINKED in (live, no copy). The whole scratch is `remove_dir_all`'d at
+/// launch exit, so the plugin is ephemeral and private to the session.
+fn build_claude_skill_plugin(scratch: &Path, skills: &[(String, PathBuf)]) -> Result<PathBuf> {
+    let plugin = scratch.join("plugin");
+    let manifest_dir = plugin.join(".claude-plugin");
+    std::fs::create_dir_all(&manifest_dir)
+        .with_context(|| format!("creating plugin manifest dir {}", manifest_dir.display()))?;
+    std::fs::write(
+        manifest_dir.join("plugin.json"),
+        r#"{"name":"elanus","version":"1.0.0","description":"elanus session skills"}"#,
+    )
+    .with_context(|| "writing the elanus plugin manifest".to_string())?;
+    // The bootstrap dispatch skill — a real file, it has no source package.
+    let skills_dir = plugin.join("skills");
+    let elanus_skill = skills_dir.join("elanus");
+    std::fs::create_dir_all(&elanus_skill)
+        .with_context(|| format!("creating elanus skill dir {}", elanus_skill.display()))?;
+    let skill_path = elanus_skill.join("SKILL.md");
     std::fs::write(&skill_path, ELANUS_SKILL)
         .with_context(|| format!("writing {}", skill_path.display()))?;
-    Ok(skill_root)
+    // The profile's visible skills, symlinked alongside it (best-effort per skill).
+    link_skill_packages(&skills_dir, skills)?;
+    Ok(plugin)
+}
+
+/// Take the `--profile <name>` launch flag: the elanus profile whose VISIBLE
+/// skills this coding session adopts (the same `discover_for_profile ∩
+/// skill_visible` set the native renderer uses, `render.rs`). Default `"default"`
+/// — every `elanus code` session materializes the default profile's skills, the
+/// same whole-system config home native agents read. The flag and its value are
+/// stripped before the args reach the tool. A bare trailing `--profile` (no value)
+/// is ignored (keeps the default). Returns `(profile_name, filtered_args)`.
+///
+/// NB: elanus consumes the LONG `--profile`; Codex's own config-profile is still
+/// reachable via its short `-p` form, which passes through to codex untouched.
+fn take_profile_flag(args: &[String]) -> (String, Vec<String>) {
+    let mut profile: Option<String> = None;
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--profile" {
+            if let Some(v) = args.get(i + 1) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    profile = Some(v.to_string());
+                }
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    (profile.unwrap_or_else(|| "default".to_string()), out)
+}
+
+/// The visible skill packages for `profile_name`: exactly the
+/// `discover_for_profile ∩ skill_visible ∩ has-SKILL.md` set the native renderer
+/// surfaces (`render.rs` §3), as `(name, dir)` pairs. Best-effort — a profile-load
+/// or discovery error logs and yields an empty set, so a coding launch is never
+/// fatal-blocked on its skills (it just gets the bootstrap `/elanus` skill alone).
+fn visible_skill_packages(root: &Root, profile_name: &str) -> Vec<(String, PathBuf)> {
+    let prof = match crate::profile::load(root, profile_name) {
+        Ok((p, _)) => p,
+        Err(e) => {
+            eprintln!(
+                "[code] loading profile {profile_name:?} for skills ({e:#}); \
+                 no profile skills materialized"
+            );
+            return Vec::new();
+        }
+    };
+    match crate::packages::discover_for_profile(root, profile_name) {
+        Ok(pkgs) => pkgs
+            .into_iter()
+            .filter(|p| p.meta.is_some() && crate::profile::skill_visible(&prof, &p.name))
+            .map(|p| (p.name, p.dir))
+            .collect(),
+        Err(e) => {
+            eprintln!("[code] discovering skills for profile {profile_name:?}: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// Symlink each skill package dir into `skills_dir` as `<skills_dir>/<name>` — the
+/// `<name>/SKILL.md` shape every harness's skills loader scans (Claude Code's
+/// `.claude/skills`, Codex's `$CODEX_HOME/skills`, opencode's
+/// `$OPENCODE_CONFIG_DIR/skills`). One operation, three harnesses; only the parent
+/// dir differs. A symlink (not a copy) so edits to the source package reflect live
+/// and skill-relative script paths resolve back into the real package tree; the
+/// per-session run scratch this lands in is `remove_dir_all`'d at launch exit, so
+/// the links are ephemeral and private to the session. Best-effort per skill: a
+/// single bad link is logged, not fatal. No-op (no dir created) for an empty set.
+fn link_skill_packages(skills_dir: &Path, skills: &[(String, PathBuf)]) -> Result<()> {
+    if skills.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(skills_dir)
+        .with_context(|| format!("creating skills dir {}", skills_dir.display()))?;
+    for (name, dir) in skills {
+        let link = skills_dir.join(name);
+        if let Err(e) = std::os::unix::fs::symlink(dir, &link) {
+            eprintln!(
+                "[code] linking skill {name} -> {} into {}: {e:#}",
+                dir.display(),
+                skills_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build a per-session, ephemeral `CODEX_HOME` carrying the profile's skills, or
+/// None when there are no skills (then the caller leaves CODEX_HOME untouched and
+/// codex uses the user's real `~/.codex`). codex 0.141.0 scans `$CODEX_HOME/skills`
+/// but has no per-invocation skills lever, so an isolated home is the only way to
+/// inject skills without writing into `~/.codex` (global) or the user's repo. The
+/// user's real auth/config are SYMLINKED in (read in place — never copied — so the
+/// secret stays in `~/.codex`) and login survives the redirect; `skills/` holds the
+/// linked packages. The whole home lives under the run scratch and is removed at
+/// launch exit. Best-effort: a failure to build it logs and returns None (the
+/// session falls back to the user's real home, just without the profile skills)
+/// rather than blocking the launch.
+fn build_codex_skills_home(
+    root: &Root,
+    session: &str,
+    skills: &[(String, PathBuf)],
+) -> Option<PathBuf> {
+    if skills.is_empty() {
+        return None;
+    }
+    let home = root.run_dir().join(session).join("codex_home");
+    if let Err(e) = std::fs::create_dir_all(&home) {
+        eprintln!("[code] creating codex skills home {}: {e:#}", home.display());
+        return None;
+    }
+    // Mirror the user's real codex home entries (auth, config, version) by symlink
+    // so codex authenticates exactly as it would unredirected. `skills` is the one
+    // entry we own, so it is deliberately NOT mirrored — we provide our own below
+    // (the user's `~/.codex/skills`, e.g. system skills, are isolated out for this
+    // session, the same way Claude's `--setting-sources ''` isolates `~/.claude`).
+    if let Some(real) = dirs_next_home_codex() {
+        for entry in ["auth.json", "config.toml", "version.json"] {
+            let src = real.join(entry);
+            if src.exists() {
+                let _ = std::os::unix::fs::symlink(&src, home.join(entry));
+            }
+        }
+    }
+    if let Err(e) = link_skill_packages(&home.join("skills"), skills) {
+        eprintln!("[code] linking skills into codex home: {e:#}");
+        return None;
+    }
+    Some(home)
+}
+
+/// The user's real codex home (`$CODEX_HOME`, else `~/.codex`) — the source of the
+/// auth/config entries the per-session skills home mirrors. None if no home dir is
+/// resolvable (then the per-session home carries skills but no mirrored auth, and
+/// codex falls back to its own discovery).
+fn dirs_next_home_codex() -> Option<PathBuf> {
+    if let Ok(h) = std::env::var("CODEX_HOME") {
+        if !h.is_empty() {
+            return Some(PathBuf::from(h));
+        }
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex"))
 }
 
 /// Should the launch-envelope briefing be injected? Default yes; a `--no-brief`
@@ -3013,8 +3189,17 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
     let (want_brief, args) = take_brief_flag(&args);
     let (room, args) = take_room_flag(&args);
     let (headless, args) = take_headless_flag(&args);
+    let (profile_name, args) = take_profile_flag(&args);
     let args = &args[..];
     let (model, effort) = extract_model_effort(args);
+
+    // The profile's visible skills, materialized into the harness's per-session
+    // skills dir below (Claude `--plugin-dir` plugin / Codex `$CODEX_HOME` /
+    // opencode `$OPENCODE_CONFIG_DIR`). Computed once here; `--profile` selects the
+    // profile (default "default"). Empty (best-effort) when the profile has no
+    // visible skills or discovery fails — then a session sees only the bootstrap
+    // `/elanus` skill, exactly as before.
+    let skills = visible_skill_packages(root, &profile_name);
     let worker_timeout = std::env::var(ENV_REPLY_TO)
         .ok()
         .filter(|s| !s.is_empty())
@@ -3168,7 +3353,10 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
                     .expect("hook-bridge adapter generates settings");
                 std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
                     .with_context(|| format!("writing {}", settings_path.display()))?;
-                let skill_root = write_elanus_skill(&scratch)?;
+                // M1: the bootstrap `/elanus` skill + the profile's visible skills,
+                // delivered as a per-session plugin (the only channel that surfaces
+                // skills under `--setting-sources ''` from an ephemeral path).
+                let plugin_dir = build_claude_skill_plugin(&scratch, &skills)?;
 
                 // Launch the real binary with the generated, isolated config. The
                 // TUI gets inherited stdio so it is a normal, fully usable
@@ -3181,8 +3369,8 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
                         settings_path.display().to_string(),
                         "--setting-sources".to_string(),
                         "".to_string(),
-                        "--add-dir".to_string(),
-                        skill_root.display().to_string(),
+                        "--plugin-dir".to_string(),
+                        plugin_dir.display().to_string(),
                     ];
                     if let Some(brief) = &brief_text {
                         tool_args.push("--append-system-prompt".to_string());
@@ -3250,8 +3438,8 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
                         .arg(&settings_path)
                         .arg("--setting-sources")
                         .arg("")
-                        .arg("--add-dir")
-                        .arg(&skill_root);
+                        .arg("--plugin-dir")
+                        .arg(&plugin_dir);
                     // The launch-envelope briefing (M4-B): Claude Code injects it
                     // out-of-band via --append-system-prompt (the system layer,
                     // after the cached prefix — Appendix A), not the user message.
@@ -3305,6 +3493,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
                 worker,
                 worker_timeout,
                 injection: injection_ref,
+                skills: &skills,
             }),
             // ── RolloutImport: interactive TUI + post-hoc rollout import ───────
             // The codex TUI cell (HM2). The launcher inherits stdio (a real,
@@ -3323,6 +3512,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
                 worker,
                 worker_timeout,
                 injection: injection_ref,
+                skills: &skills,
             }),
             // ── Lifecycle: interactive TUI, bracket-only capture ──────────────
             // The honest no-op floor for a TUI we can launch but not faithfully
@@ -3341,6 +3531,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
                 worker,
                 worker_timeout,
                 injection: injection_ref,
+                skills: &skills,
             }),
             // ── ServerEvents: interactive TUI captured LIVE off a server's SSE ─
             // opencode's Tui cell (OC3). The launcher starts its own `opencode
@@ -3360,6 +3551,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
                 worker,
                 worker_timeout,
                 injection: injection_ref,
+                skills: &skills,
             }),
         }
     })();
@@ -3466,11 +3658,25 @@ fn run_codex_capture(
     brief: Option<&str>,
     worker_timeout: Option<u64>,
     injection: Option<&crate::provider::HarnessInjection>,
+    skills: &[(String, PathBuf)],
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
     let args = codex_args_with_prompt_from_stdin(args)?;
+
+    // M2: codex 0.141.0 has no per-invocation skills flag, no `skills.config`, and
+    // no `AGENTS_HOME` (all postdate it) — it scans `$CODEX_HOME/skills` and the
+    // project `.codex/skills`. To deliver the profile's skills PER-SESSION and
+    // ephemerally (not polluting `~/.codex` or the user's repo), repoint CODEX_HOME
+    // to an isolated scratch home: symlink the user's real auth/config in so login
+    // survives, then add our own `skills/` of symlinked packages. The scratch is
+    // removed at launch exit, so the home (and the credential symlinks, never the
+    // secrets) vanishes with the session. Built only when the profile has skills;
+    // otherwise CODEX_HOME is left untouched and the launch is byte-identical to
+    // before. The symlinked auth is the user's OWN codex credential, read in place
+    // for the user's OWN codex — homogeneous authority, no boundary crossing.
+    let codex_home = build_codex_skills_home(root, session, skills);
 
     let mut codex_args = vec![
         "exec".to_string(),
@@ -3530,6 +3736,11 @@ fn run_codex_capture(
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir);
+    // M2: point codex at the per-session skills home (set LAST so it wins over any
+    // inherited/injection CODEX_HOME). Only Some when the profile had skills.
+    if let Some(home) = &codex_home {
+        cmd.env("CODEX_HOME", home);
+    }
     eprintln!("[code] launching codex exec --json as session {session}{timeout_suffix}");
 
     let mut child = cmd
@@ -3604,6 +3815,7 @@ fn run_codex_tui_import(
     args: &[String],
     brief: Option<&str>,
     injection: Option<&crate::provider::HarnessInjection>,
+    skills: &[(String, PathBuf)],
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::process::Command;
 
@@ -3653,6 +3865,11 @@ fn run_codex_tui_import(
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir);
+    // M2: the profile's skills in a per-session CODEX_HOME (same as the exec cell),
+    // so an interactive codex TUI sees them too. Set LAST so it wins. None → no skills.
+    if let Some(home) = build_codex_skills_home(root, session, skills) {
+        cmd.env("CODEX_HOME", &home);
+    }
     eprintln!("[code] launching codex TUI as session {session} (rollout import on exit)");
 
     // Remember the newest rollout that already exists, so after the TUI exits we
@@ -4287,10 +4504,25 @@ fn run_opencode_capture(
     worker: bool,
     worker_timeout: Option<u64>,
     injection: Option<&crate::provider::HarnessInjection>,
+    skills: &[(String, PathBuf)],
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::process::{Command, Stdio};
 
     let task = opencode_task_from_args(args)?;
+
+    // M3: opencode scans `$OPENCODE_CONFIG_DIR/skills/<name>/SKILL.md` (verified
+    // against 1.17.9 — it loaded a skill placed there and invoked it). So deliver
+    // the profile's skills per-session by pointing OPENCODE_CONFIG_DIR at a scratch
+    // dir of symlinked packages — ephemeral (removed at launch exit) and private to
+    // the session, without touching the user's `~/.config/opencode` or repo. Built
+    // only when the profile has skills; otherwise the env is left untouched.
+    let oc_config_dir = (!skills.is_empty()).then(|| {
+        let dir = root.run_dir().join(session).join("oc_config");
+        if let Err(e) = link_skill_packages(&dir.join("skills"), skills) {
+            eprintln!("[code] linking skills into opencode config dir: {e:#}");
+        }
+        dir
+    });
     let message = opencode_message_with_brief(brief, &task);
 
     let mut oc_args = vec![
@@ -4344,6 +4576,12 @@ fn run_opencode_capture(
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir);
+    // M3: point opencode at the per-session skills config dir (Some only when the
+    // profile had skills). Coexists with a `--provider` OPENCODE_CONFIG_CONTENT
+    // injection (different config layer — dir = skills/agents, content = inline).
+    if let Some(dir) = &oc_config_dir {
+        cmd.env("OPENCODE_CONFIG_DIR", dir);
+    }
     eprintln!("[code] launching opencode run --format json as session {session}{timeout_suffix}");
 
     let mut child = cmd
@@ -4439,10 +4677,22 @@ fn run_opencode_tui_server_events(
     args: &[String],
     brief: Option<&str>,
     injection: Option<&crate::provider::HarnessInjection>,
+    skills: &[(String, PathBuf)],
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    // M3: the profile's skills in a per-session OPENCODE_CONFIG_DIR (same as the
+    // headless cell). The SERVER is the process that loads skills, so the env goes
+    // on the `serve` command below. None when the profile has no skills.
+    let oc_config_dir = (!skills.is_empty()).then(|| {
+        let dir = root.run_dir().join(session).join("oc_config");
+        if let Err(e) = link_skill_packages(&dir.join("skills"), skills) {
+            eprintln!("[code] linking skills into opencode config dir: {e:#}");
+        }
+        dir
+    });
 
     // 1. Start our own served instance. A fresh per-launch password fences the
     //    loopback server (basic auth: user `opencode`, default username). `--port 0`
@@ -4472,6 +4722,11 @@ fn run_opencode_tui_server_events(
         .env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir);
+    // M3: point the served instance at the per-session skills config dir. None when
+    // the profile has no skills.
+    if let Some(dir) = &oc_config_dir {
+        serve.env("OPENCODE_CONFIG_DIR", dir);
+    }
 
     let mut serve_child = serve
         .spawn()
@@ -8877,7 +9132,7 @@ mod tests {
     }
 
     #[test]
-    fn elanus_skill_is_session_scratch_scoped() {
+    fn elanus_skill_plugin_is_session_scratch_scoped() {
         let dir = std::env::temp_dir().join(format!(
             "elanus-skill-{}-{}",
             std::process::id(),
@@ -8885,18 +9140,35 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let skill_root = write_elanus_skill(&dir).unwrap();
-        let skill_path = skill_root
-            .join(".claude")
-            .join("skills")
-            .join("elanus")
-            .join("SKILL.md");
-        let skill = std::fs::read_to_string(&skill_path).unwrap();
-        assert!(skill.contains("name: elanus"));
-        assert!(skill.contains("elanus code help"));
-        assert!(skill.contains("elanus code claude --headless"));
-        assert_eq!(skill_root, dir.join("skillroot"));
-        assert!(!skill_root.join("settings.json").exists());
+        // A source skill package to materialize alongside the bootstrap skill.
+        let pkg = dir.join("pkgs/wiring-probe");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("SKILL.md"), "probe body").unwrap();
+        let skills = vec![("wiring-probe".to_string(), pkg.clone())];
+
+        let plugin = build_claude_skill_plugin(&dir, &skills).unwrap();
+        assert_eq!(plugin, dir.join("plugin"));
+
+        // The plugin manifest makes `--plugin-dir` recognize it.
+        let manifest =
+            std::fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap();
+        assert!(manifest.contains("\"name\":\"elanus\""));
+
+        // The bootstrap `/elanus` skill is a real file under skills/elanus.
+        let boot = std::fs::read_to_string(plugin.join("skills/elanus/SKILL.md")).unwrap();
+        assert!(boot.contains("name: elanus"));
+        assert!(boot.contains("elanus code help"));
+        assert!(boot.contains("elanus code claude --headless"));
+
+        // The profile skill is SYMLINKED alongside it (live, not copied) and its
+        // SKILL.md is reachable through the link.
+        let link = plugin.join("skills/wiring-probe");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&link).unwrap(), pkg);
+        assert!(link.join("SKILL.md").exists());
+
+        // The generated settings.json never leaks into the plugin dir.
+        assert!(!plugin.join("settings.json").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10729,5 +11001,124 @@ mod tests {
             "a room not opted in must surface no channel block; got:\n{inj:?}"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── Skill materialization into coding harnesses ───────────────────────────
+
+    #[test]
+    fn profile_flag_default_and_override() {
+        // No flag → the "default" profile; args pass through untouched.
+        let (p, rest) = take_profile_flag(&["-p".into(), "say hi".into()]);
+        assert_eq!(p, "default");
+        assert_eq!(rest, vec!["-p".to_string(), "say hi".to_string()]);
+
+        // `--profile <name>` selects the profile and is stripped (value too).
+        let (p, rest) = take_profile_flag(&[
+            "--profile".into(),
+            "dev".into(),
+            "task".into(),
+        ]);
+        assert_eq!(p, "dev");
+        assert_eq!(rest, vec!["task".to_string()]);
+
+        // A bare trailing `--profile` (no value) keeps the default and is dropped.
+        let (p, rest) = take_profile_flag(&["--profile".into()]);
+        assert_eq!(p, "default");
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn link_skill_packages_symlinks_each_and_is_noop_when_empty() {
+        let base = std::env::temp_dir().join(format!(
+            "elanus-skilllink-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        // Two source package dirs, each with a SKILL.md.
+        let pkg_a = base.join("src/alpha");
+        let pkg_b = base.join("src/beta");
+        std::fs::create_dir_all(&pkg_a).unwrap();
+        std::fs::create_dir_all(&pkg_b).unwrap();
+        std::fs::write(pkg_a.join("SKILL.md"), "alpha body").unwrap();
+        std::fs::write(pkg_b.join("SKILL.md"), "beta body").unwrap();
+
+        let skills = vec![
+            ("alpha".to_string(), pkg_a.clone()),
+            ("beta".to_string(), pkg_b.clone()),
+        ];
+        let target = base.join("skillroot/.claude/skills");
+        link_skill_packages(&target, &skills).unwrap();
+
+        // Each package is a symlink at <target>/<name>, resolving to the source dir,
+        // and the SKILL.md is reachable THROUGH the link (so a harness scanning the
+        // dir sees it). Symlink, not copy: the link target is the real package dir.
+        for (name, src) in &skills {
+            let link = target.join(name);
+            assert!(
+                std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+                "{name} should be a symlink"
+            );
+            assert_eq!(&std::fs::read_link(&link).unwrap(), src);
+            assert!(link.join("SKILL.md").exists(), "{name}/SKILL.md via the link");
+        }
+
+        // Empty set: no dir is created, no error.
+        let empty_target = base.join("never_made/skills");
+        link_skill_packages(&empty_target, &[]).unwrap();
+        assert!(!empty_target.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn codex_skills_home_mirrors_auth_and_links_skills() {
+        let base = std::env::temp_dir().join(format!(
+            "elanus-codexhome-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        // A fake real ~/.codex with auth + config (the entries we mirror by symlink).
+        let real_codex = base.join("real_codex");
+        std::fs::create_dir_all(&real_codex).unwrap();
+        std::fs::write(real_codex.join("auth.json"), "{\"token\":\"x\"}").unwrap();
+        std::fs::write(real_codex.join("config.toml"), "model=\"gpt\"").unwrap();
+        // A source skill package.
+        let pkg = base.join("pkgs/git-release");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("SKILL.md"), "release body").unwrap();
+
+        let root = Root {
+            dir: base.join("root"),
+        };
+        let skills = vec![("git-release".to_string(), pkg.clone())];
+
+        // Point dirs_next_home_codex() at the fake real home via CODEX_HOME.
+        // (Test-local env mutation; restored after.)
+        let prev = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_HOME", &real_codex);
+        let home = build_codex_skills_home(&root, "code-test0001", &skills)
+            .expect("a profile with skills yields a home");
+        match prev {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+
+        // Auth/config mirrored by symlink (read in place — the secret stays in the
+        // real home), and login content is reachable through the link.
+        for entry in ["auth.json", "config.toml"] {
+            let link = home.join(entry);
+            assert!(
+                std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+                "{entry} should be a symlink into the real codex home"
+            );
+            assert_eq!(&std::fs::read_link(&link).unwrap(), &real_codex.join(entry));
+        }
+        // The skill is linked under <home>/skills/<name>, scannable by codex.
+        assert!(home.join("skills/git-release/SKILL.md").exists());
+
+        // No skills → no home (the launch leaves CODEX_HOME untouched).
+        assert!(build_codex_skills_home(&root, "code-test0002", &[]).is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
