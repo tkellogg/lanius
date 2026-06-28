@@ -139,14 +139,20 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
         root.dir.display()
     ));
     log.line(format!("[dev] log={}", log_path.display()));
-    log.line(format!("[dev] bus: 127.0.0.1:{bus_port}   (dev broker — separate from prod's 1883)"));
+    log.line(format!(
+        "[dev] bus: 127.0.0.1:{bus_port}   (dev broker — separate from prod's 1883)"
+    ));
     if shift_ports && (web_port != req_web || vite_port != req_vite) {
         log.line(format!(
             "[dev] ports shifted off a conflict (you asked for web={req_web} vite={req_vite})"
         ));
     }
-    log.line(format!("[dev] web relay: http://127.0.0.1:{web_port}   (api backend)"));
-    log.line(format!("[dev] vite UI:   http://127.0.0.1:{vite_port}   <- open this"));
+    log.line(format!(
+        "[dev] web relay: http://127.0.0.1:{web_port}   (api backend)"
+    ));
+    log.line(format!(
+        "[dev] vite UI:   http://127.0.0.1:{vite_port}   <- open this"
+    ));
     log.line("[dev]");
     log.line("[dev] drive a coding agent in another terminal (from this repo):");
     log.line("[dev]   cargo run -- code claude                     # interactive TUI");

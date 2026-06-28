@@ -120,7 +120,13 @@ pub fn list(conn: &Connection, want_json: bool) -> Result<()> {
                     p.base_url.as_deref().unwrap_or(""),
                     REDACTED
                 ),
-                _ => format!("native-login{}", p.tool.as_deref().map(|t| format!(" ({t})")).unwrap_or_default()),
+                _ => format!(
+                    "native-login{}",
+                    p.tool
+                        .as_deref()
+                        .map(|t| format!(" ({t})"))
+                        .unwrap_or_default()
+                ),
             };
             println!("{:<20} {:<14} {}", p.name, p.kind, detail);
         }
@@ -177,7 +183,10 @@ pub fn get(conn: &Connection, name: &str, want_json: bool) -> Result<()> {
 pub fn test(root: &Root, conn: &Connection, name: &str, want_json: bool) -> Result<()> {
     let Some(p) = provider::get(root, conn, name)? else {
         if want_json {
-            println!("{}", json!({ "ok": false, "error": format!("no provider {name:?}") }));
+            println!(
+                "{}",
+                json!({ "ok": false, "error": format!("no provider {name:?}") })
+            );
             return Ok(());
         }
         bail!("no provider {name:?}");

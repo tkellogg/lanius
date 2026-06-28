@@ -39,42 +39,77 @@ fn matrix_dispatcher() {
         assert_eq!(d.headers[0].1.expose(), "hdr-secret");
     }
     // NativeLogin -> Dispatcher REFUSED.
-    let err = materialize("chatgpt", &Credential::NativeLogin { tool: None }, Consumer::Dispatcher, None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("native-login"), "refusal must be legible: {err}");
+    let err = materialize(
+        "chatgpt",
+        &Credential::NativeLogin { tool: None },
+        Consumer::Dispatcher,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("native-login"),
+        "refusal must be legible: {err}"
+    );
     assert!(err.contains("chatgpt"));
 }
 
 #[test]
 fn matrix_claude() {
     // ApiKey{Anthropic} -> claude env injection.
-    let inj = materialize("ds", &api(Wire::Anthropic), Consumer::Harness(HarnessId::Claude), None).unwrap();
+    let inj = materialize(
+        "ds",
+        &api(Wire::Anthropic),
+        Consumer::Harness(HarnessId::Claude),
+        None,
+    )
+    .unwrap();
     let Injection::Harness(h) = inj else { panic!() };
     assert_eq!(
         h.env,
         vec![
-            ("ANTHROPIC_BASE_URL".to_string(), "https://api.example.com".to_string()),
-            ("ANTHROPIC_AUTH_TOKEN".to_string(), "sk-secret-123".to_string()),
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://api.example.com".to_string()
+            ),
+            (
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                "sk-secret-123".to_string()
+            ),
         ]
     );
     assert!(h.args.is_empty());
     // ApiKey{OpenAI} -> claude REFUSED (wire mismatch).
-    let err = materialize("oai", &api(Wire::OpenAI), Consumer::Harness(HarnessId::Claude), None)
-        .unwrap_err()
-        .to_string();
+    let err = materialize(
+        "oai",
+        &api(Wire::OpenAI),
+        Consumer::Harness(HarnessId::Claude),
+        None,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("OpenAI wire"), "{err}");
 }
 
 #[test]
 fn matrix_codex() {
     // ApiKey{OpenAI} -> codex -c custom-provider args + secret in env.
-    let inj = materialize("ds", &api(Wire::OpenAI), Consumer::Harness(HarnessId::Codex), None).unwrap();
+    let inj = materialize(
+        "ds",
+        &api(Wire::OpenAI),
+        Consumer::Harness(HarnessId::Codex),
+        None,
+    )
+    .unwrap();
     let Injection::Harness(h) = inj else { panic!() };
     // The key rides env (off the command line), named by env_key.
-    assert!(h.env.contains(&("ELANUS_PV_DS_KEY".to_string(), "sk-secret-123".to_string())));
+    assert!(h
+        .env
+        .contains(&("ELANUS_PV_DS_KEY".to_string(), "sk-secret-123".to_string())));
     // The secret header value also rides env.
-    assert!(h.env.contains(&("ELANUS_PV_DS_H0".to_string(), "hdr-secret".to_string())));
+    assert!(h
+        .env
+        .contains(&("ELANUS_PV_DS_H0".to_string(), "hdr-secret".to_string())));
     // The -c flags select a custom provider, never the literal key.
     let joined = h.args.join(" ");
     // The model_provider VALUE is quoted (TOML scalar; required for hyphenated ids,
@@ -85,12 +120,22 @@ fn matrix_codex() {
     assert!(joined.contains("model_providers.ds.base_url=\"https://api.example.com\""));
     assert!(joined.contains("model_providers.ds.wire_api=\"responses\""));
     assert!(joined.contains("model_providers.ds.env_key=\"ELANUS_PV_DS_KEY\""));
-    assert!(joined.contains("model_providers.ds.env_http_headers.\"X-LiteLLM\"=\"ELANUS_PV_DS_H0\""));
-    assert!(!joined.contains("sk-secret-123"), "secret must never be a -c arg");
+    assert!(
+        joined.contains("model_providers.ds.env_http_headers.\"X-LiteLLM\"=\"ELANUS_PV_DS_H0\"")
+    );
+    assert!(
+        !joined.contains("sk-secret-123"),
+        "secret must never be a -c arg"
+    );
     // ApiKey{Anthropic} -> codex REFUSED (wire mismatch).
-    let err = materialize("ds", &api(Wire::Anthropic), Consumer::Harness(HarnessId::Codex), None)
-        .unwrap_err()
-        .to_string();
+    let err = materialize(
+        "ds",
+        &api(Wire::Anthropic),
+        Consumer::Harness(HarnessId::Codex),
+        None,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("Anthropic wire"), "{err}");
 }
 
@@ -143,23 +188,40 @@ fn matrix_opencode() {
     assert!(cfg["provider"]["ds"]["models"]["gpt-4o-mini"].is_object());
 
     // No model → legible refusal (opencode can't resolve a custom id without one).
-    let err = materialize("ds", &api(Wire::OpenAI), Consumer::Harness(HarnessId::Opencode), None)
-        .unwrap_err()
-        .to_string();
+    let err = materialize(
+        "ds",
+        &api(Wire::OpenAI),
+        Consumer::Harness(HarnessId::Opencode),
+        None,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("needs an explicit model"), "{err}");
 }
 
 #[test]
 fn matrix_native_login_is_scrub_only_for_every_harness() {
     for h in [HarnessId::Claude, HarnessId::Codex, HarnessId::Opencode] {
-        let inj = materialize("login", &Credential::NativeLogin { tool: None }, Consumer::Harness(h), None).unwrap();
-        assert_eq!(inj, Injection::Harness(HarnessInjection::default()), "empty injection");
+        let inj = materialize(
+            "login",
+            &Credential::NativeLogin { tool: None },
+            Consumer::Harness(h),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            inj,
+            Injection::Harness(HarnessInjection::default()),
+            "empty injection"
+        );
     }
 }
 
 #[test]
 fn native_login_pin_must_match_harness() {
-    let cred = Credential::NativeLogin { tool: Some(HarnessId::Claude) };
+    let cred = Credential::NativeLogin {
+        tool: Some(HarnessId::Claude),
+    };
     // Matching harness -> empty injection.
     assert_eq!(
         materialize("l", &cred, Consumer::Harness(HarnessId::Claude), None).unwrap(),
@@ -212,7 +274,10 @@ fn decrypt_fails_closed_on_corruption() {
     let (nonce, mut ct) = seal(&key, b"secret").unwrap();
     // Flip a ciphertext byte: the AEAD tag must reject it (no garbage plaintext).
     ct[0] ^= 0xff;
-    assert!(open(&key, &nonce, &ct).is_err(), "tampered ciphertext must fail");
+    assert!(
+        open(&key, &nonce, &ct).is_err(),
+        "tampered ciphertext must fail"
+    );
     // A wrong key must also fail.
     let mut wrong = key;
     wrong[0] ^= 0xff;
@@ -238,8 +303,13 @@ fn vault_round_trip_and_no_plaintext_at_rest() {
     assert_eq!(got, p);
 
     // A raw SELECT * reveals no key and no header value in the clear.
-    let (wire, base_url, names, secret): (Option<String>, Option<String>, Option<String>, Option<Vec<u8>>) =
-        conn.query_row(
+    let (wire, base_url, names, secret): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+    ) = conn
+        .query_row(
             "SELECT wire, base_url, header_names, secret FROM providers WHERE name='deepseek'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -250,8 +320,14 @@ fn vault_round_trip_and_no_plaintext_at_rest() {
     assert_eq!(names.as_deref(), Some(r#"["X-LiteLLM"]"#)); // header NAME is clear
     let blob = secret.unwrap();
     let hay = String::from_utf8_lossy(&blob);
-    assert!(!hay.contains("sk-secret-123"), "key must not be in the blob in clear");
-    assert!(!hay.contains("hdr-secret"), "header value must not be in the blob in clear");
+    assert!(
+        !hay.contains("sk-secret-123"),
+        "key must not be in the blob in clear"
+    );
+    assert!(
+        !hay.contains("hdr-secret"),
+        "header value must not be in the blob in clear"
+    );
 
     // list() / get_meta() never carry the secret.
     let meta = get_meta(&conn, "deepseek").unwrap().unwrap();
@@ -274,16 +350,27 @@ fn vault_native_login_carries_no_blob() {
         &conn,
         &Provider {
             name: "chatgpt".into(),
-            credential: Credential::NativeLogin { tool: Some(HarnessId::Codex) },
+            credential: Credential::NativeLogin {
+                tool: Some(HarnessId::Codex),
+            },
         },
     )
     .unwrap();
     let secret: Option<Vec<u8>> = conn
-        .query_row("SELECT secret FROM providers WHERE name='chatgpt'", [], |r| r.get(0))
+        .query_row(
+            "SELECT secret FROM providers WHERE name='chatgpt'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert!(secret.is_none(), "native-login row must carry no blob");
     let got = get(&root, &conn, "chatgpt").unwrap().unwrap();
-    assert_eq!(got.credential, Credential::NativeLogin { tool: Some(HarnessId::Codex) });
+    assert_eq!(
+        got.credential,
+        Credential::NativeLogin {
+            tool: Some(HarnessId::Codex)
+        }
+    );
     std::fs::remove_dir_all(&root.dir).ok();
 }
 
@@ -291,7 +378,10 @@ fn vault_native_login_carries_no_blob() {
 fn corrupt_master_key_size_fails_closed() {
     let root = tmp_root("badkey");
     std::fs::write(root.dir.join("secret.key"), b"too short").unwrap();
-    assert!(master_key(&root).is_err(), "a wrong-size key must be refused");
+    assert!(
+        master_key(&root).is_err(),
+        "a wrong-size key must be refused"
+    );
     std::fs::remove_dir_all(&root.dir).ok();
 }
 
@@ -301,12 +391,23 @@ fn add_rejects_unsafe_names() {
     let conn = Connection::open(root.db()).unwrap();
     // Dots break codex dotted keys; underscores/uppercase/spaces collide or break
     // env tokens; a leading hyphen and the empty name are malformed.
-    for bad in ["deep.seek", "Deep", "deep seek", "deep_seek", "-x", "", "a/b"] {
+    for bad in [
+        "deep.seek",
+        "Deep",
+        "deep seek",
+        "deep_seek",
+        "-x",
+        "",
+        "a/b",
+    ] {
         let p = Provider {
             name: bad.into(),
             credential: api(Wire::Anthropic),
         };
-        assert!(add(&root, &conn, &p).is_err(), "name {bad:?} must be rejected");
+        assert!(
+            add(&root, &conn, &p).is_err(),
+            "name {bad:?} must be rejected"
+        );
     }
     // A clean hyphenated name is accepted.
     let p = Provider {
@@ -336,6 +437,9 @@ fn get_fails_closed_on_corrupt_blob() {
         rusqlite::params![vec![0u8, 1, 2, 3, 4]],
     )
     .unwrap();
-    assert!(get(&root, &conn, "ds").is_err(), "a corrupt blob must fail closed");
+    assert!(
+        get(&root, &conn, "ds").is_err(),
+        "a corrupt blob must fail closed"
+    );
     std::fs::remove_dir_all(&root.dir).ok();
 }

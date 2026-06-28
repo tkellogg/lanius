@@ -3,7 +3,10 @@ name: Questions
 description: This is stuff from Tim. All sessions are busy, things I want to chase down but can't do it now
 ---
 
-How does it work when we have a list of 5 kits and 10 skills and we wire it into claude code? codex? ...
+Let's say your an agent, either coding agent or native elanus agent. Can you launch elanus agents? Can you launch
+native elanus agents? Can you launch one with a certain package? Can you introspect available packages & profiles
+to launch various kinds of agents that maybe havent' been launched before? (side question: Can you dynamically
+configure?) I want all these things to be possible, maybe even easy.
 
 
 In UI have the screen automatically follow the latest message by default, i.e. scroll to the bottom unless the
@@ -37,18 +40,8 @@ new failure mode: If the coding agent can't contact teh MQTT broker it dies. Thi
 Something softer??
 
 
-UI nitpicks:
-- Advanced bar should highlight on mouseover, some indication that the whole thing is one button, not separate
-    buttons for each. (configure pane)
-- context steps: I think this needs to be a more visual view, like blocks. Being a visual view, prefer drag-n-drop
-    over up/down arrows. Have it be a very visual walk through of what things are. Then with the "new" part, have
-    it be a single button, just "New" or "+" that opens up a modal wizard. The wizard takes an existing configured 
-    LLM and layers on it's own set of packages for modifying the context. Probably a profile that's system 
-    configured and hidden by default. Dramatically scoped down permissions to just doing that one thing. Also, if
-    existing packages have context programs, offer those as options to enable, as an alternative to the agent.
-- The "current conversation" panel on the chat pane is probably not super helpful to me. I probably would like a search bar though.
-- Too many words across the entire app. See if we can replace with icons where appropriate.
-- Make a light mode, and have it dynamically switch between them based on the system theme by default, also configurable. I use something on my mac that switches system mode based on ambient light in the room, so it does switch often
+Each coding agent's native MCP servers seem to not be able to load on launch. At least claude code & codex.
 
 
-
+When I start a new codex or claude code session through elanus, it starts running one of my prompts from some
+previous session, i think. Maybe it's related to QoS 1?? it's a strange behavior when in TUI mode.

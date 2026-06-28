@@ -410,9 +410,7 @@ fn materialize_harness(
             })?;
             // Strip the `<id>/` provider prefix if the user supplied the opencode
             // `provider/model` form; a bare model id is used as-is.
-            let model_id = model
-                .strip_prefix(&format!("{id}/"))
-                .unwrap_or(model);
+            let model_id = model.strip_prefix(&format!("{id}/")).unwrap_or(model);
             let mut options = serde_json::Map::new();
             options.insert("baseURL".into(), serde_json::json!(base_url));
             options.insert("apiKey".into(), serde_json::json!(key.expose()));
@@ -492,8 +490,7 @@ fn master_key(root: &Root) -> Result<[u8; 32]> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    write_0600(&path, &k)
-        .with_context(|| format!("writing master key {}", path.display()))?;
+    write_0600(&path, &k).with_context(|| format!("writing master key {}", path.display()))?;
     Ok(k)
 }
 
@@ -530,7 +527,10 @@ fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
 /// tampered ciphertext yields an error, never garbage plaintext.
 fn open(key: &[u8; 32], nonce: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
     if nonce.len() != 24 {
-        bail!("stored nonce is {} bytes, expected 24 — refusing", nonce.len());
+        bail!(
+            "stored nonce is {} bytes, expected 24 — refusing",
+            nonce.len()
+        );
     }
     let cipher = XChaCha20Poly1305::new(key.into());
     let nonce = XNonce::from_slice(nonce);

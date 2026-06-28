@@ -1005,7 +1005,12 @@ pub struct RequestedGrants {
 /// Resolved M3 capability dimensions for a child session: (fs_write, fs_read,
 /// tool_allowlist, blocking). Each is `None` (unbounded) or `Some(narrowed_set)`.
 /// Produced by `Grants::narrow_m3_dims` and consumed by `mint`.
-type M3Dims = (Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>);
+type M3Dims = (
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+);
 
 impl Grants {
     /// Compute the child's grants from the spawner's grants and the child's
@@ -1048,12 +1053,8 @@ impl Grants {
             "fs_write",
             spawner_name,
         )?;
-        let fs_read = Self::narrow_path_dim(
-            &spawner.fs_read,
-            &request.fs_read,
-            "fs_read",
-            spawner_name,
-        )?;
+        let fs_read =
+            Self::narrow_path_dim(&spawner.fs_read, &request.fs_read, "fs_read", spawner_name)?;
         let tool_allowlist = Self::narrow_set_dim(
             &spawner.tool_allowlist,
             &request.tool_allowlist,
@@ -1392,10 +1393,15 @@ pub fn mint(
     //   - spawner=None (owner/top-of-chain): no spawner file to check.
     //   - spawner file genuinely ABSENT (pre-M1 token, or owner context):
     //     unbounded on all dimensions; no lock needed.
-    let (child_budget, child_publish, child_subscribe,
-         child_fs_write, child_fs_read, child_tool_allowlist, child_blocking)
-        = if let Some(spawner_name) = spawner
-    {
+    let (
+        child_budget,
+        child_publish,
+        child_subscribe,
+        child_fs_write,
+        child_fs_read,
+        child_tool_allowlist,
+        child_blocking,
+    ) = if let Some(spawner_name) = spawner {
         let spawner_token_path = token_path(root, spawner_name);
         // Use the file's EXISTENCE as the branch signal (M1's fail-closed
         // discipline: see the M1 comment above for the full rationale).
@@ -1405,9 +1411,15 @@ pub fn mint(
             // session): treat as unbounded on all dimensions.
             let pub_vec = requested.publish.unwrap_or_else(|| vec![own_obs.clone()]);
             let sub_vec = requested.subscribe.unwrap_or_default();
-            (requested.budget, pub_vec, sub_vec,
-             requested.fs_write, requested.fs_read,
-             requested.tool_allowlist, requested.blocking)
+            (
+                requested.budget,
+                pub_vec,
+                sub_vec,
+                requested.fs_write,
+                requested.fs_read,
+                requested.tool_allowlist,
+                requested.blocking,
+            )
         } else {
             // Spawner token file EXISTS → acquire the lock before reading,
             // checking, and writing back. Covers all dimensions.
@@ -1528,8 +1540,15 @@ pub fn mint(
                 }
             };
 
-            (child_budget, child_pub_req, child_sub_req,
-             child_fw, child_fr, child_ta, child_bl)
+            (
+                child_budget,
+                child_pub_req,
+                child_sub_req,
+                child_fw,
+                child_fr,
+                child_ta,
+                child_bl,
+            )
         }
     } else {
         // Owner (no spawner session): no dimension checks needed. The child
@@ -1537,9 +1556,15 @@ pub fn mint(
         // change for the owner-spawned common case.
         let pub_vec = requested.publish.unwrap_or_else(|| vec![own_obs.clone()]);
         let sub_vec = requested.subscribe.unwrap_or_default();
-        (requested.budget, pub_vec, sub_vec,
-         requested.fs_write, requested.fs_read,
-         requested.tool_allowlist, requested.blocking)
+        (
+            requested.budget,
+            pub_vec,
+            sub_vec,
+            requested.fs_write,
+            requested.fs_read,
+            requested.tool_allowlist,
+            requested.blocking,
+        )
     };
 
     let secret = format!(
@@ -1959,7 +1984,10 @@ mod tests {
         .unwrap();
         assert!(token.may_publish("obs/agent/codex/code-resume01/session/resume"));
         assert!(!token.may_publish("in/human/owner"));
-        assert!(token.grants.subscribe.is_empty(), "resume token must be emit-only");
+        assert!(
+            token.grants.subscribe.is_empty(),
+            "resume token must be emit-only"
+        );
         assert!(read(&root, "code-resume01").is_some());
 
         // … and retires it: no idle credential survives the resume.
@@ -2347,7 +2375,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tok.grants.turn_budget, None, "owner path must be unbounded");
-        assert_eq!(tok.grants.remaining_budget, None, "owner path must be unbounded");
+        assert_eq!(
+            tok.grants.remaining_budget, None,
+            "owner path must be unbounded"
+        );
         // Roundtrip: the token file deserializes back with None budgets.
         let read_back = read(&root, "code-budget001").unwrap();
         assert_eq!(read_back.grants.turn_budget, None);
@@ -2714,9 +2745,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(result.is_err(), "second sibling must be refused when Σ > parent");
-        assert!(read(&root, "code-sib002").is_none(),
-                "refused sibling must not leave a token");
+        assert!(
+            result.is_err(),
+            "second sibling must be refused when Σ > parent"
+        );
+        assert!(
+            read(&root, "code-sib002").is_none(),
+            "refused sibling must not leave a token"
+        );
 
         // Parent's remaining is still 20 (the failed mint did not charge it).
         let after_fail = read(&root, "code-parent04").unwrap();
@@ -2767,13 +2803,11 @@ mod tests {
         std::fs::write(&path, legacy_json).unwrap();
         let tok = read(&root, "code-legacy01").expect("legacy token must be readable");
         assert_eq!(
-            tok.grants.turn_budget,
-            None,
+            tok.grants.turn_budget, None,
             "missing turn_budget in old token → None (unbounded)"
         );
         assert_eq!(
-            tok.grants.remaining_budget,
-            None,
+            tok.grants.remaining_budget, None,
             "missing remaining_budget in old token → None (unbounded)"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
@@ -2783,10 +2817,22 @@ mod tests {
 
     /// Helper: mint a spawner, then overwrite its grants to a specific bus scope.
     fn spawner_with_scope(root: &Root, name: &str, publish: &[&str], subscribe: &[&str]) {
-        let mut sp = mint(root, name, "claude-code", 999_999, None, RequestedGrants::default()).unwrap();
+        let mut sp = mint(
+            root,
+            name,
+            "claude-code",
+            999_999,
+            None,
+            RequestedGrants::default(),
+        )
+        .unwrap();
         sp.grants.publish = publish.iter().map(|s| s.to_string()).collect();
         sp.grants.subscribe = subscribe.iter().map(|s| s.to_string()).collect();
-        write_0600(&token_path(root, name), &serde_json::to_string(&sp).unwrap()).unwrap();
+        write_0600(
+            &token_path(root, name),
+            &serde_json::to_string(&sp).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2794,8 +2840,19 @@ mod tests {
         // The common case (no spawner) is byte-identical to entry-20/M1: publish
         // exactly the own obs subtree, subscribe nothing.
         let root = tmp_root();
-        let tok = mint(&root, "code-ownerdef", "claude-code", 1, None, RequestedGrants::default()).unwrap();
-        assert_eq!(tok.grants.publish, vec!["obs/agent/claude-code/code-ownerdef/#".to_string()]);
+        let tok = mint(
+            &root,
+            "code-ownerdef",
+            "claude-code",
+            1,
+            None,
+            RequestedGrants::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            tok.grants.publish,
+            vec!["obs/agent/claude-code/code-ownerdef/#".to_string()]
+        );
         assert!(tok.grants.subscribe.is_empty());
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -2805,19 +2862,49 @@ mod tests {
         let root = tmp_root();
         spawner_with_scope(&root, "code-scopep1", &["obs/agent/claude-code/#"], &[]);
         // A child requesting a WIDER publish (obs/#) than the spawner is refused.
-        let widen = mint(&root, "code-cwide1", "claude-code", 1, Some("code-scopep1"),
-                         RequestedGrants { publish: Some(vec!["obs/#".to_string()]), ..Default::default() });
+        let widen = mint(
+            &root,
+            "code-cwide1",
+            "claude-code",
+            1,
+            Some("code-scopep1"),
+            RequestedGrants {
+                publish: Some(vec!["obs/#".to_string()]),
+                ..Default::default()
+            },
+        );
         assert!(widen.is_err(), "widening publish must be refused");
         let err = widen.unwrap_err().to_string();
-        assert!(err.contains("bus publish refused"), "must name the refusal: {err}");
+        assert!(
+            err.contains("bus publish refused"),
+            "must name the refusal: {err}"
+        );
         // A child requesting another agent's subtree (not its own, not under
         // spawner's claude-code-only grant) is refused.
-        let cross = mint(&root, "code-ccross1", "claude-code", 1, Some("code-scopep1"),
-                         RequestedGrants { publish: Some(vec!["obs/agent/codex/code-ccross1/#".to_string()]), ..Default::default() });
+        let cross = mint(
+            &root,
+            "code-ccross1",
+            "claude-code",
+            1,
+            Some("code-scopep1"),
+            RequestedGrants {
+                publish: Some(vec!["obs/agent/codex/code-ccross1/#".to_string()]),
+                ..Default::default()
+            },
+        );
         assert!(cross.is_err(), "cross-agent publish must be refused");
         // A child requesting a filter under the spawner's grant succeeds.
-        let ok = mint(&root, "code-cok1", "claude-code", 1, Some("code-scopep1"),
-                      RequestedGrants { publish: Some(vec!["obs/agent/claude-code/code-cok1/#".to_string()]), ..Default::default() });
+        let ok = mint(
+            &root,
+            "code-cok1",
+            "claude-code",
+            1,
+            Some("code-scopep1"),
+            RequestedGrants {
+                publish: Some(vec!["obs/agent/claude-code/code-cok1/#".to_string()]),
+                ..Default::default()
+            },
+        );
         assert!(ok.is_ok(), "publish ⊆ spawner must pass: {ok:?}");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -2830,16 +2917,38 @@ mod tests {
         // Spawner can only publish a DISJOINT subtree (a different agent).
         spawner_with_scope(&root, "code-scopep2", &["obs/agent/codex/#"], &[]);
         let own = "obs/agent/claude-code/code-cown2/#".to_string();
-        let tok = mint(&root, "code-cown2", "claude-code", 1, Some("code-scopep2"),
-                       RequestedGrants { publish: Some(vec![own.clone()]), ..Default::default() }).unwrap();
+        let tok = mint(
+            &root,
+            "code-cown2",
+            "claude-code",
+            1,
+            Some("code-scopep2"),
+            RequestedGrants {
+                publish: Some(vec![own.clone()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(tok.grants.publish, vec![own]);
         // But the child CANNOT borrow the spawner's disjoint subtree for itself
         // unless it explicitly requests it AND it is covered — requesting codex's
         // subtree IS covered by the spawner here, so that is legitimately allowed
         // (it is ⊆ spawner). Requesting something neither own nor ⊆ spawner fails.
-        let bad = mint(&root, "code-cown2b", "claude-code", 1, Some("code-scopep2"),
-                       RequestedGrants { publish: Some(vec!["in/human/owner".to_string()]), ..Default::default() });
-        assert!(bad.is_err(), "a filter neither own nor ⊆ spawner must be refused");
+        let bad = mint(
+            &root,
+            "code-cown2b",
+            "claude-code",
+            1,
+            Some("code-scopep2"),
+            RequestedGrants {
+                publish: Some(vec!["in/human/owner".to_string()]),
+                ..Default::default()
+            },
+        );
+        assert!(
+            bad.is_err(),
+            "a filter neither own nor ⊆ spawner must be refused"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -2849,9 +2958,19 @@ mod tests {
         // which is always allowed — so a narrow spawner never blocks the default.
         let root = tmp_root();
         spawner_with_scope(&root, "code-scopep3", &["obs/agent/codex/#"], &[]);
-        let tok = mint(&root, "code-cdef3", "claude-code", 1, Some("code-scopep3"),
-                       RequestedGrants::default()).unwrap();
-        assert_eq!(tok.grants.publish, vec!["obs/agent/claude-code/code-cdef3/#".to_string()]);
+        let tok = mint(
+            &root,
+            "code-cdef3",
+            "claude-code",
+            1,
+            Some("code-scopep3"),
+            RequestedGrants::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            tok.grants.publish,
+            vec!["obs/agent/claude-code/code-cdef3/#".to_string()]
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -2859,17 +2978,42 @@ mod tests {
     fn m2_child_subscribe_must_be_subset_of_spawner() {
         let root = tmp_root();
         // Spawner has a non-empty subscribe scope.
-        spawner_with_scope(&root, "code-scopes1", &["obs/agent/claude-code/#"],
-                           &["obs/agent/claude-code/#"]);
+        spawner_with_scope(
+            &root,
+            "code-scopes1",
+            &["obs/agent/claude-code/#"],
+            &["obs/agent/claude-code/#"],
+        );
         // A child subscribe not covered by the spawner's is refused.
-        let widen = mint(&root, "code-csub1", "claude-code", 1, Some("code-scopes1"),
-                         RequestedGrants { subscribe: Some(vec!["obs/#".to_string()]), ..Default::default() });
+        let widen = mint(
+            &root,
+            "code-csub1",
+            "claude-code",
+            1,
+            Some("code-scopes1"),
+            RequestedGrants {
+                subscribe: Some(vec!["obs/#".to_string()]),
+                ..Default::default()
+            },
+        );
         assert!(widen.is_err(), "widening subscribe must be refused");
         let err = widen.unwrap_err().to_string();
-        assert!(err.contains("bus subscribe refused"), "must name the refusal: {err}");
+        assert!(
+            err.contains("bus subscribe refused"),
+            "must name the refusal: {err}"
+        );
         // A covered subscribe passes.
-        let ok = mint(&root, "code-csub2", "claude-code", 1, Some("code-scopes1"),
-                      RequestedGrants { subscribe: Some(vec!["obs/agent/claude-code/code-x/#".to_string()]), ..Default::default() });
+        let ok = mint(
+            &root,
+            "code-csub2",
+            "claude-code",
+            1,
+            Some("code-scopes1"),
+            RequestedGrants {
+                subscribe: Some(vec!["obs/agent/claude-code/code-x/#".to_string()]),
+                ..Default::default()
+            },
+        );
         assert!(ok.is_ok(), "subscribe ⊆ spawner must pass: {ok:?}");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -2880,8 +3024,15 @@ mod tests {
         // when the spawner's subscribe is also empty (today's structural default).
         let root = tmp_root();
         spawner_with_scope(&root, "code-scopes2", &["obs/agent/claude-code/#"], &[]);
-        let tok = mint(&root, "code-csub3", "claude-code", 1, Some("code-scopes2"),
-                       RequestedGrants::default()).unwrap();
+        let tok = mint(
+            &root,
+            "code-csub3",
+            "claude-code",
+            1,
+            Some("code-scopes2"),
+            RequestedGrants::default(),
+        )
+        .unwrap();
         assert!(tok.grants.subscribe.is_empty());
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -2894,12 +3045,18 @@ mod tests {
                      "publish":["obs/agent/codex/code-m1tok/#"],"subscribe":[],
                      "turn_budget":5,"remaining_budget":2}"#;
         let tok: SessionToken = serde_json::from_str(m1).unwrap();
-        assert_eq!(tok.grants.publish, vec!["obs/agent/codex/code-m1tok/#".to_string()]);
+        assert_eq!(
+            tok.grants.publish,
+            vec!["obs/agent/codex/code-m1tok/#".to_string()]
+        );
         assert_eq!(tok.grants.turn_budget, Some(5));
         assert_eq!(tok.grants.remaining_budget, Some(2));
         // And it re-serializes to the same flat shape (no nested "grants" key).
         let back = serde_json::to_string(&tok).unwrap();
-        assert!(back.contains("\"publish\""), "publish stays top-level: {back}");
+        assert!(
+            back.contains("\"publish\""),
+            "publish stays top-level: {back}"
+        );
         assert!(!back.contains("\"grants\""), "no nested grants key: {back}");
     }
 
@@ -3012,7 +3169,9 @@ mod tests {
             // (c) The parent's final persisted remaining equals parent_start − Σgranted.
             let parent_final = read(&root, &parent_name)
                 .expect("parent token must still be readable after concurrent mints");
-            let final_remaining = parent_final.grants.remaining_budget
+            let final_remaining = parent_final
+                .grants
+                .remaining_budget
                 .expect("parent remaining must be Some after finite-budget mints");
             assert_eq!(
                 final_remaining,
@@ -3040,12 +3199,25 @@ mod tests {
         tool_allowlist: Option<Vec<&str>>,
         blocking: Option<Vec<&str>>,
     ) {
-        let mut sp = mint(root, name, "claude-code", 999_999, None, RequestedGrants::default()).unwrap();
+        let mut sp = mint(
+            root,
+            name,
+            "claude-code",
+            999_999,
+            None,
+            RequestedGrants::default(),
+        )
+        .unwrap();
         sp.grants.fs_write = fs_write.map(|v| v.iter().map(|s| s.to_string()).collect());
         sp.grants.fs_read = fs_read.map(|v| v.iter().map(|s| s.to_string()).collect());
-        sp.grants.tool_allowlist = tool_allowlist.map(|v| v.iter().map(|s| s.to_string()).collect());
+        sp.grants.tool_allowlist =
+            tool_allowlist.map(|v| v.iter().map(|s| s.to_string()).collect());
         sp.grants.blocking = blocking.map(|v| v.iter().map(|s| s.to_string()).collect());
-        write_0600(&token_path(root, name), &serde_json::to_string(&sp).unwrap()).unwrap();
+        write_0600(
+            &token_path(root, name),
+            &serde_json::to_string(&sp).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3053,11 +3225,31 @@ mod tests {
         // Owner path (spawner=None): child gets all M3 dims as None (unbounded).
         // Zero behavior change for today's common case.
         let root = tmp_root();
-        let tok = mint(&root, "code-m3owner", "claude-code", 1, None, RequestedGrants::default()).unwrap();
-        assert!(tok.grants.fs_write.is_none(), "owner-spawned fs_write must be None (unbounded)");
-        assert!(tok.grants.fs_read.is_none(), "owner-spawned fs_read must be None (unbounded)");
-        assert!(tok.grants.tool_allowlist.is_none(), "owner-spawned tool_allowlist must be None");
-        assert!(tok.grants.blocking.is_none(), "owner-spawned blocking must be None");
+        let tok = mint(
+            &root,
+            "code-m3owner",
+            "claude-code",
+            1,
+            None,
+            RequestedGrants::default(),
+        )
+        .unwrap();
+        assert!(
+            tok.grants.fs_write.is_none(),
+            "owner-spawned fs_write must be None (unbounded)"
+        );
+        assert!(
+            tok.grants.fs_read.is_none(),
+            "owner-spawned fs_read must be None (unbounded)"
+        );
+        assert!(
+            tok.grants.tool_allowlist.is_none(),
+            "owner-spawned tool_allowlist must be None"
+        );
+        assert!(
+            tok.grants.blocking.is_none(),
+            "owner-spawned blocking must be None"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -3065,26 +3257,55 @@ mod tests {
     fn m3_child_fs_write_must_be_within_spawner_prefixes() {
         // THE CRUX: a child cannot request an fs_write path outside the spawner's.
         let root = tmp_root();
-        spawner_with_m3(&root, "code-fw-spawner", Some(vec!["/work/project"]), None, None, None);
+        spawner_with_m3(
+            &root,
+            "code-fw-spawner",
+            Some(vec!["/work/project"]),
+            None,
+            None,
+            None,
+        );
 
         // A child requesting a path inside the spawner's prefix: allowed.
-        let ok = mint(&root, "code-fw-child1", "claude-code", 1, Some("code-fw-spawner"),
-                      RequestedGrants {
-                          fs_write: Some(vec!["/work/project/src".to_string()]),
-                          ..Default::default()
-                      }).unwrap();
-        assert_eq!(ok.grants.fs_write, Some(vec!["/work/project/src".to_string()]));
+        let ok = mint(
+            &root,
+            "code-fw-child1",
+            "claude-code",
+            1,
+            Some("code-fw-spawner"),
+            RequestedGrants {
+                fs_write: Some(vec!["/work/project/src".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ok.grants.fs_write,
+            Some(vec!["/work/project/src".to_string()])
+        );
 
         // A child requesting a path OUTSIDE the spawner's prefix: refused.
-        let bad = mint(&root, "code-fw-child2", "claude-code", 1, Some("code-fw-spawner"),
-                       RequestedGrants {
-                           fs_write: Some(vec!["/etc/passwd".to_string()]),
-                           ..Default::default()
-                       });
+        let bad = mint(
+            &root,
+            "code-fw-child2",
+            "claude-code",
+            1,
+            Some("code-fw-spawner"),
+            RequestedGrants {
+                fs_write: Some(vec!["/etc/passwd".to_string()]),
+                ..Default::default()
+            },
+        );
         assert!(bad.is_err(), "fs_write outside spawner must be refused");
         let err = bad.unwrap_err().to_string();
-        assert!(err.contains("fs_write refused"), "error must name the dimension: {err}");
-        assert!(err.contains("entry 22"), "error must cite the ledger entry: {err}");
+        assert!(
+            err.contains("fs_write refused"),
+            "error must name the dimension: {err}"
+        );
+        assert!(
+            err.contains("entry 22"),
+            "error must cite the ledger entry: {err}"
+        );
         // No token written for the refused mint.
         assert!(read(&root, "code-fw-child2").is_none());
         let _ = std::fs::remove_dir_all(&root.dir);
@@ -3095,13 +3316,29 @@ mod tests {
         // The component-boundary trap: /work/proj is NOT within /work/project
         // (string prefix would say yes; Path::starts_with says no).
         let root = tmp_root();
-        spawner_with_m3(&root, "code-fw-boundary", Some(vec!["/work/project"]), None, None, None);
-        let bad = mint(&root, "code-fw-bchild", "claude-code", 1, Some("code-fw-boundary"),
-                       RequestedGrants {
-                           fs_write: Some(vec!["/work/projectX".to_string()]),
-                           ..Default::default()
-                       });
-        assert!(bad.is_err(), "/work/projectX is NOT within /work/project — component boundary");
+        spawner_with_m3(
+            &root,
+            "code-fw-boundary",
+            Some(vec!["/work/project"]),
+            None,
+            None,
+            None,
+        );
+        let bad = mint(
+            &root,
+            "code-fw-bchild",
+            "claude-code",
+            1,
+            Some("code-fw-boundary"),
+            RequestedGrants {
+                fs_write: Some(vec!["/work/projectX".to_string()]),
+                ..Default::default()
+            },
+        );
+        assert!(
+            bad.is_err(),
+            "/work/projectX is NOT within /work/project — component boundary"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -3109,23 +3346,46 @@ mod tests {
     fn m3_child_fs_read_must_be_within_spawner_prefixes() {
         // fs_read: same path_covered rule as fs_write.
         let root = tmp_root();
-        spawner_with_m3(&root, "code-fr-spawner", None, Some(vec!["/data"]), None, None);
+        spawner_with_m3(
+            &root,
+            "code-fr-spawner",
+            None,
+            Some(vec!["/data"]),
+            None,
+            None,
+        );
 
-        let ok = mint(&root, "code-fr-child1", "claude-code", 1, Some("code-fr-spawner"),
-                      RequestedGrants {
-                          fs_read: Some(vec!["/data/reports".to_string()]),
-                          ..Default::default()
-                      }).unwrap();
+        let ok = mint(
+            &root,
+            "code-fr-child1",
+            "claude-code",
+            1,
+            Some("code-fr-spawner"),
+            RequestedGrants {
+                fs_read: Some(vec!["/data/reports".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(ok.grants.fs_read, Some(vec!["/data/reports".to_string()]));
 
-        let bad = mint(&root, "code-fr-child2", "claude-code", 1, Some("code-fr-spawner"),
-                       RequestedGrants {
-                           fs_read: Some(vec!["/secrets".to_string()]),
-                           ..Default::default()
-                       });
+        let bad = mint(
+            &root,
+            "code-fr-child2",
+            "claude-code",
+            1,
+            Some("code-fr-spawner"),
+            RequestedGrants {
+                fs_read: Some(vec!["/secrets".to_string()]),
+                ..Default::default()
+            },
+        );
         assert!(bad.is_err(), "fs_read outside spawner must be refused");
         let err = bad.unwrap_err().to_string();
-        assert!(err.contains("fs_read refused"), "error must name the dimension: {err}");
+        assert!(
+            err.contains("fs_read refused"),
+            "error must name the dimension: {err}"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -3133,25 +3393,51 @@ mod tests {
     fn m3_child_tool_allowlist_must_be_subset_of_spawner() {
         // tool_allowlist: exact-string membership.
         let root = tmp_root();
-        spawner_with_m3(&root, "code-ta-spawner", None, None, Some(vec!["Bash", "Read"]), None);
+        spawner_with_m3(
+            &root,
+            "code-ta-spawner",
+            None,
+            None,
+            Some(vec!["Bash", "Read"]),
+            None,
+        );
 
         // A child requesting a strict subset: allowed.
-        let ok = mint(&root, "code-ta-child1", "claude-code", 1, Some("code-ta-spawner"),
-                      RequestedGrants {
-                          tool_allowlist: Some(vec!["Bash".to_string()]),
-                          ..Default::default()
-                      }).unwrap();
+        let ok = mint(
+            &root,
+            "code-ta-child1",
+            "claude-code",
+            1,
+            Some("code-ta-spawner"),
+            RequestedGrants {
+                tool_allowlist: Some(vec!["Bash".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(ok.grants.tool_allowlist, Some(vec!["Bash".to_string()]));
 
         // A child requesting a tool NOT in the spawner's allowlist: refused.
-        let bad = mint(&root, "code-ta-child2", "claude-code", 1, Some("code-ta-spawner"),
-                       RequestedGrants {
-                           tool_allowlist: Some(vec!["Bash".to_string(), "Write".to_string()]),
-                           ..Default::default()
-                       });
-        assert!(bad.is_err(), "tool not in spawner allowlist must be refused");
+        let bad = mint(
+            &root,
+            "code-ta-child2",
+            "claude-code",
+            1,
+            Some("code-ta-spawner"),
+            RequestedGrants {
+                tool_allowlist: Some(vec!["Bash".to_string(), "Write".to_string()]),
+                ..Default::default()
+            },
+        );
+        assert!(
+            bad.is_err(),
+            "tool not in spawner allowlist must be refused"
+        );
         let err = bad.unwrap_err().to_string();
-        assert!(err.contains("tool_allowlist refused"), "error must name the dimension: {err}");
+        assert!(
+            err.contains("tool_allowlist refused"),
+            "error must name the dimension: {err}"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -3159,23 +3445,49 @@ mod tests {
     fn m3_child_blocking_must_be_subset_of_spawner() {
         // blocking: exact-string membership.
         let root = tmp_root();
-        spawner_with_m3(&root, "code-bl-spawner", None, None, None, Some(vec!["hook-a"]));
+        spawner_with_m3(
+            &root,
+            "code-bl-spawner",
+            None,
+            None,
+            None,
+            Some(vec!["hook-a"]),
+        );
 
-        let ok = mint(&root, "code-bl-child1", "claude-code", 1, Some("code-bl-spawner"),
-                      RequestedGrants {
-                          blocking: Some(vec!["hook-a".to_string()]),
-                          ..Default::default()
-                      }).unwrap();
+        let ok = mint(
+            &root,
+            "code-bl-child1",
+            "claude-code",
+            1,
+            Some("code-bl-spawner"),
+            RequestedGrants {
+                blocking: Some(vec!["hook-a".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(ok.grants.blocking, Some(vec!["hook-a".to_string()]));
 
-        let bad = mint(&root, "code-bl-child2", "claude-code", 1, Some("code-bl-spawner"),
-                       RequestedGrants {
-                           blocking: Some(vec!["hook-b".to_string()]),
-                           ..Default::default()
-                       });
-        assert!(bad.is_err(), "blocking entry not in spawner set must be refused");
+        let bad = mint(
+            &root,
+            "code-bl-child2",
+            "claude-code",
+            1,
+            Some("code-bl-spawner"),
+            RequestedGrants {
+                blocking: Some(vec!["hook-b".to_string()]),
+                ..Default::default()
+            },
+        );
+        assert!(
+            bad.is_err(),
+            "blocking entry not in spawner set must be refused"
+        );
         let err = bad.unwrap_err().to_string();
-        assert!(err.contains("blocking refused"), "error must name the dimension: {err}");
+        assert!(
+            err.contains("blocking refused"),
+            "error must name the dimension: {err}"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -3184,23 +3496,45 @@ mod tests {
         // When the child makes no request (all M3 dims None in RequestedGrants),
         // it inherits the spawner's set exactly — inherit-equal default.
         let root = tmp_root();
-        spawner_with_m3(&root, "code-m3-inh-sp",
-                        Some(vec!["/work"]),
-                        Some(vec!["/data"]),
-                        Some(vec!["Bash"]),
-                        Some(vec!["hook-x"]));
+        spawner_with_m3(
+            &root,
+            "code-m3-inh-sp",
+            Some(vec!["/work"]),
+            Some(vec!["/data"]),
+            Some(vec!["Bash"]),
+            Some(vec!["hook-x"]),
+        );
 
-        let tok = mint(&root, "code-m3-inh-ch", "claude-code", 1, Some("code-m3-inh-sp"),
-                       RequestedGrants::default()).unwrap();
+        let tok = mint(
+            &root,
+            "code-m3-inh-ch",
+            "claude-code",
+            1,
+            Some("code-m3-inh-sp"),
+            RequestedGrants::default(),
+        )
+        .unwrap();
 
-        assert_eq!(tok.grants.fs_write, Some(vec!["/work".to_string()]),
-                   "fs_write: inherit-equal from spawner");
-        assert_eq!(tok.grants.fs_read, Some(vec!["/data".to_string()]),
-                   "fs_read: inherit-equal from spawner");
-        assert_eq!(tok.grants.tool_allowlist, Some(vec!["Bash".to_string()]),
-                   "tool_allowlist: inherit-equal from spawner");
-        assert_eq!(tok.grants.blocking, Some(vec!["hook-x".to_string()]),
-                   "blocking: inherit-equal from spawner");
+        assert_eq!(
+            tok.grants.fs_write,
+            Some(vec!["/work".to_string()]),
+            "fs_write: inherit-equal from spawner"
+        );
+        assert_eq!(
+            tok.grants.fs_read,
+            Some(vec!["/data".to_string()]),
+            "fs_read: inherit-equal from spawner"
+        );
+        assert_eq!(
+            tok.grants.tool_allowlist,
+            Some(vec!["Bash".to_string()]),
+            "tool_allowlist: inherit-equal from spawner"
+        );
+        assert_eq!(
+            tok.grants.blocking,
+            Some(vec!["hook-x".to_string()]),
+            "blocking: inherit-equal from spawner"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -3212,14 +3546,24 @@ mod tests {
         // Spawner with all M3 dims unbounded (None).
         spawner_with_m3(&root, "code-m3-unb-sp", None, None, None, None);
 
-        let tok = mint(&root, "code-m3-unb-ch", "claude-code", 1, Some("code-m3-unb-sp"),
-                       RequestedGrants {
-                           fs_write: Some(vec!["/arbitrary/path".to_string()]),
-                           tool_allowlist: Some(vec!["AnyTool".to_string()]),
-                           ..Default::default()
-                       }).unwrap();
+        let tok = mint(
+            &root,
+            "code-m3-unb-ch",
+            "claude-code",
+            1,
+            Some("code-m3-unb-sp"),
+            RequestedGrants {
+                fs_write: Some(vec!["/arbitrary/path".to_string()]),
+                tool_allowlist: Some(vec!["AnyTool".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-        assert_eq!(tok.grants.fs_write, Some(vec!["/arbitrary/path".to_string()]));
+        assert_eq!(
+            tok.grants.fs_write,
+            Some(vec!["/arbitrary/path".to_string()])
+        );
         assert_eq!(tok.grants.tool_allowlist, Some(vec!["AnyTool".to_string()]));
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -3233,13 +3577,28 @@ mod tests {
                          "publish":["obs/agent/codex/code-prem3/#"],"subscribe":[],
                          "turn_budget":5,"remaining_budget":2}"#;
         let tok: SessionToken = serde_json::from_str(pre_m3).unwrap();
-        assert!(tok.grants.fs_write.is_none(), "pre-M3 token: fs_write must be None");
-        assert!(tok.grants.fs_read.is_none(), "pre-M3 token: fs_read must be None");
-        assert!(tok.grants.tool_allowlist.is_none(), "pre-M3 token: tool_allowlist must be None");
-        assert!(tok.grants.blocking.is_none(), "pre-M3 token: blocking must be None");
+        assert!(
+            tok.grants.fs_write.is_none(),
+            "pre-M3 token: fs_write must be None"
+        );
+        assert!(
+            tok.grants.fs_read.is_none(),
+            "pre-M3 token: fs_read must be None"
+        );
+        assert!(
+            tok.grants.tool_allowlist.is_none(),
+            "pre-M3 token: tool_allowlist must be None"
+        );
+        assert!(
+            tok.grants.blocking.is_none(),
+            "pre-M3 token: blocking must be None"
+        );
         // And it serializes back WITHOUT a nested "grants" key — back-compat shape.
         let back = serde_json::to_string(&tok).unwrap();
-        assert!(!back.contains("\"grants\""), "no nested grants key in output: {back}");
+        assert!(
+            !back.contains("\"grants\""),
+            "no nested grants key in output: {back}"
+        );
     }
 
     #[test]

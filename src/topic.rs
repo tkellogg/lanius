@@ -403,7 +403,10 @@ mod tests {
     fn covers_exact_equal() {
         // A filter covers itself (trivially ⊆).
         assert!(covers("a/b/c", "a/b/c"));
-        assert!(covers("obs/agent/claude-code/code-abc/#", "obs/agent/claude-code/code-abc/#"));
+        assert!(covers(
+            "obs/agent/claude-code/code-abc/#",
+            "obs/agent/claude-code/code-abc/#"
+        ));
         assert!(covers("#", "#"));
         assert!(covers("+", "+"));
     }
@@ -443,14 +446,20 @@ mod tests {
         // obs/# covers obs/agent/…/# because every topic under obs/agent/… starts with obs/.
         assert!(covers("obs/#", "obs/agent/claude-code/code-abc/#"));
         assert!(covers("obs/#", "obs/agent/+/#"));
-        assert!(covers("obs/#", "obs/agent/claude-code/code-abc/tool/Bash/call"));
+        assert!(covers(
+            "obs/#",
+            "obs/agent/claude-code/code-abc/tool/Bash/call"
+        ));
         // obs/agent/+/# covers obs/agent/claude-code/# because + matches any single level.
         assert!(covers("obs/agent/+/#", "obs/agent/claude-code/#"));
         assert!(covers("obs/agent/+/#", "obs/agent/codex/#"));
         // obs/agent/+/# covers obs/agent/+/# (equal).
         assert!(covers("obs/agent/+/#", "obs/agent/+/#"));
         // obs/agent/claude-code/# covers obs/agent/claude-code/code-abc/#.
-        assert!(covers("obs/agent/claude-code/#", "obs/agent/claude-code/code-abc/#"));
+        assert!(covers(
+            "obs/agent/claude-code/#",
+            "obs/agent/claude-code/code-abc/#"
+        ));
         // prefix/# covers the prefix itself (sport/# matches sport).
         assert!(covers("obs/#", "obs"));
     }
@@ -510,7 +519,7 @@ mod tests {
         assert!(!covers("", "obs/#"));
         assert!(!covers("obs/#", ""));
         assert!(!covers("a/#/b", "a/x/b")); // # not last
-        assert!(!covers("a+b", "a+b"));     // + not a whole level
+        assert!(!covers("a+b", "a+b")); // + not a whole level
         assert!(!covers("obs/#", "a/#/b"));
     }
 
@@ -541,7 +550,10 @@ mod tests {
         // THE CRITICAL TRAP: /a/b is NOT a prefix of /a/bc (component boundary).
         // String-prefix would say yes; Path::starts_with correctly says no.
         assert!(!path_covered(&["/a/b".into()], "/a/bc"));
-        assert!(!path_covered(&["/Users/tim".into()], "/Users/timothy/doc.txt"));
+        assert!(!path_covered(
+            &["/Users/tim".into()],
+            "/Users/timothy/doc.txt"
+        ));
         assert!(!path_covered(&["/foo".into()], "/foobar/baz"));
     }
 
@@ -591,7 +603,10 @@ mod tests {
         assert!(!path_covered(&["".to_string()], "/etc/passwd"));
         assert!(!path_covered(&["".to_string()], "/"));
         // A relative wide prefix is equally degenerate and grants nothing.
-        assert!(!path_covered(&["relative/dir".to_string()], "/relative/dir/x"));
+        assert!(!path_covered(
+            &["relative/dir".to_string()],
+            "/relative/dir/x"
+        ));
         // A mix: the empty/relative entries are ignored, the real one still works.
         assert!(path_covered(
             &["".to_string(), "/work/proj".to_string()],
@@ -731,7 +746,12 @@ mod tests {
             violations.is_empty(),
             "UNSOUND covers() — {} violations:\n{}",
             violations.len(),
-            violations.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
+            violations
+                .iter()
+                .take(40)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }

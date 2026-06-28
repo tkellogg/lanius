@@ -963,7 +963,10 @@ fn admin_dispatch(
             let line = r.stdout.trim();
             return Ok(match serde_json::from_str::<Value>(line) {
                 Ok(v) => (200, v),
-                Err(_) => (500, json!({ "ok": false, "error": "bad provider test output" })),
+                Err(_) => (
+                    500,
+                    json!({ "ok": false, "error": "bad provider test output" }),
+                ),
             });
         }
         ("approve", _, true) | ("revoke", _, true) => {
@@ -980,9 +983,11 @@ fn admin_dispatch(
         }
         ("agents", true, _) => {
             let r = cli(root, &["profile", "list"])?;
-            return Ok(ok_or_err(&r, 500, |s| {
-                json!({ "ok": true, "profiles": profiles_with_helper(root, s) })
-            }));
+            return Ok(ok_or_err(
+                &r,
+                500,
+                |s| json!({ "ok": true, "profiles": profiles_with_helper(root, s) }),
+            ));
         }
         ("agents", _, true) => {
             let name = body.get("name").and_then(Value::as_str).unwrap_or("");
@@ -1214,7 +1219,11 @@ fn provider_add(root: &Root, body: &Value) -> (u16, Value) {
     }
     let kind = {
         let k = s("kind");
-        if k.is_empty() { "apikey" } else { k }
+        if k.is_empty() {
+            "apikey"
+        } else {
+            k
+        }
     };
     let mut args: Vec<String> = vec!["provider".into(), "add".into(), name.into()];
     let mut stdin_key: Option<String> = None;
@@ -1230,7 +1239,10 @@ fn provider_add(root: &Root, body: &Value) -> (u16, Value) {
         "apikey" | "api_key" => {
             let base_url = s("base_url");
             if base_url.is_empty() {
-                return (400, json!({ "ok": false, "error": "an api-key provider needs a base URL" }));
+                return (
+                    400,
+                    json!({ "ok": false, "error": "an api-key provider needs a base URL" }),
+                );
             }
             let wire = s("wire");
             if !wire.is_empty() {
@@ -1264,17 +1276,28 @@ fn provider_add(root: &Root, body: &Value) -> (u16, Value) {
             // The key rides stdin (the CLI's off-argv safe path), never argv.
             let key = body.get("key").and_then(Value::as_str).unwrap_or("");
             if key.is_empty() {
-                return (400, json!({ "ok": false, "error": "an api-key provider needs a key" }));
+                return (
+                    400,
+                    json!({ "ok": false, "error": "an api-key provider needs a key" }),
+                );
             }
             stdin_key = Some(key.to_string());
         }
         other => {
-            return (400, json!({ "ok": false, "error": format!("unknown provider kind {other:?}") }));
+            return (
+                400,
+                json!({ "ok": false, "error": format!("unknown provider kind {other:?}") }),
+            );
         }
     }
     let r = match cli_stdin(root, &args, stdin_key.as_deref()) {
         Ok(r) => r,
-        Err(_) => return (500, json!({ "ok": false, "error": "provider add failed to run" })),
+        Err(_) => {
+            return (
+                500,
+                json!({ "ok": false, "error": "provider add failed to run" }),
+            )
+        }
     };
     action_result(&r)
 }
@@ -2749,13 +2772,28 @@ mod route_tests {
     #[test]
     fn provider_add_validates_and_keeps_key_off_argv() {
         // A bad name is a clean 400 before any shell-out.
-        let (code, _) = provider_add(&Root { dir: "/tmp/x".into() }, &json!({ "name": "BAD", "kind": "apikey" }));
+        let (code, _) = provider_add(
+            &Root {
+                dir: "/tmp/x".into(),
+            },
+            &json!({ "name": "BAD", "kind": "apikey" }),
+        );
         assert_eq!(code, 400);
         // An api-key provider with no base URL is refused.
-        let (code, _) = provider_add(&Root { dir: "/tmp/x".into() }, &json!({ "name": "p", "kind": "apikey", "key": "sk-x" }));
+        let (code, _) = provider_add(
+            &Root {
+                dir: "/tmp/x".into(),
+            },
+            &json!({ "name": "p", "kind": "apikey", "key": "sk-x" }),
+        );
         assert_eq!(code, 400);
         // An api-key provider with no key is refused (the key never defaults).
-        let (code, _) = provider_add(&Root { dir: "/tmp/x".into() }, &json!({ "name": "p", "kind": "apikey", "base_url": "https://h/anthropic" }));
+        let (code, _) = provider_add(
+            &Root {
+                dir: "/tmp/x".into(),
+            },
+            &json!({ "name": "p", "kind": "apikey", "base_url": "https://h/anthropic" }),
+        );
         assert_eq!(code, 400);
     }
 
@@ -2768,14 +2806,18 @@ mod route_tests {
         // Local host, no Origin (curl / local agent) → allowed (host check only).
         assert!(host_is_local("127.0.0.1:8080"));
         // Same-origin browser POST → Origin host is local. allowed.
-        assert!(host_is_local(&origin_host("http://127.0.0.1:7182/").unwrap()));
+        assert!(host_is_local(
+            &origin_host("http://127.0.0.1:7182/").unwrap()
+        ));
         // Vite dev proxy: UI on :5174, relay on :7182 — a local cross-PORT origin.
         // Different port, but still local → origin_ok accepts it (the dev-loop fix).
         let vite = origin_host("http://127.0.0.1:5174/").unwrap();
         assert_ne!(vite, "127.0.0.1:7182");
         assert!(host_is_local(&vite));
         // A foreign Origin (an attacker page) is refused: its host is not local.
-        assert!(!host_is_local(&origin_host("http://evil.example/page").unwrap()));
+        assert!(!host_is_local(
+            &origin_host("http://evil.example/page").unwrap()
+        ));
         // A rebound / non-local Host is refused outright by the Host check.
         assert!(!host_is_local("evil.example"));
     }
