@@ -498,6 +498,24 @@ CREATE TABLE IF NOT EXISTS code_mail_delivered (
   delivered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (session, event_id)
 );
+
+-- Per-session task list (sibling-intent SI2). Each coding session's TODO/task
+-- tool output is folded here by the projection (src/code_projection.rs) from the
+-- session's todo obs events (Claude `tool/TodoWrite/{call,result}`, codex
+-- `assistant/todo`), latest-wins per (session, item_id). This is the ambient
+-- "what is this sibling working on" surface the per-turn sibling note +
+-- `elanus code whose`/`sessions` read. Advisory only, gates nothing; one row per
+-- task item, status ∈ todo|in_progress|done. Written from the projection rather
+-- than db.rs, but the table lives here beside the other coding-session tables.
+CREATE TABLE IF NOT EXISTS code_session_tasks (
+  elanus_session TEXT NOT NULL,        -- the session the task list belongs to
+  item_id        TEXT NOT NULL,        -- stable per-item key (list index, zero-padded)
+  text           TEXT NOT NULL,        -- the task text (content / step)
+  status         TEXT NOT NULL,        -- todo | in_progress | done
+  updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (elanus_session, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_code_session_tasks_session ON code_session_tasks(elanus_session);
 "#,
     )?;
     // M5: the room a coding session belongs to, stored on the durable record so a

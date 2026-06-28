@@ -147,6 +147,11 @@ pub struct LiveSibling {
     pub session: String,
     /// The obs noun it runs under (`claude-code` | `codex`) — shown in the line.
     pub agent_noun: String,
+    /// SI1 (sibling-intent): when this sibling was last active, RFC3339 — the
+    /// FRESHER of its `code_sessions.last_active` and the projection's
+    /// `code_session_stats.updated_at` (its most-recent obs event). Lets a viewer
+    /// judge alive-vs-stranded before touching the sibling's WIP.
+    pub last_active: String,
 }
 
 /// List the LIVE sibling sessions sharing `viewer`'s canonical workdir (SA2). A
@@ -194,6 +199,13 @@ pub fn live_siblings(root: &Root, viewer: &str, viewer_workdir: &str) -> Vec<Liv
         if canon_str(&workdir) != want {
             continue; // a different checkout — not a sibling here
         }
+        // SI1: a session's recency is the FRESHER of its `code_sessions.last_active`
+        // (bumped on resume/obs-publish) and the projection's per-session
+        // `code_session_stats.updated_at` (its most-recent obs event) — so a
+        // long-running session whose record was not re-bumped still reads as live
+        // off its event stream. Computed in Rust (the stats table may not exist).
+        let stats_upd = session_stats_updated_at(&conn, &session);
+        let last_active = fresher_iso(&last_active, stats_upd.as_deref());
         let last_secs = iso_to_secs(&last_active);
         let fresh = match last_secs {
             Some(t) => now.saturating_sub(t) <= LIVE_WINDOW_SECS,
@@ -214,6 +226,7 @@ pub fn live_siblings(root: &Root, viewer: &str, viewer_workdir: &str) -> Vec<Liv
             LiveSibling {
                 session,
                 agent_noun,
+                last_active,
             },
         ));
     }
@@ -247,6 +260,41 @@ fn iso_to_secs(ts: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(ts)
         .ok()
         .map(|dt| dt.timestamp())
+}
+
+/// SI1: read the projection's `code_session_stats.updated_at` (a session's
+/// most-recent obs event time) on an EXISTING connection. None on any error,
+/// including the projection table not existing yet — the caller then falls back to
+/// `code_sessions.last_active` alone ("compute the max of the two in Rust").
+fn session_stats_updated_at(conn: &rusqlite::Connection, session: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT updated_at FROM code_session_stats WHERE elanus_session = ?1",
+        [session],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
+/// SI1: the fresher (later) of two RFC3339 timestamps. `b` is optional; when it is
+/// absent or unparseable, `a` wins; when `a` is unparseable but `b` parses, `b`
+/// wins. Folds `code_sessions.last_active` with the projection's `updated_at`
+/// without a SQL join (the stats table may not exist on this connection).
+fn fresher_iso(a: &str, b: Option<&str>) -> String {
+    match b {
+        None => a.to_string(),
+        Some(b) => match (iso_to_secs(a), iso_to_secs(b)) {
+            (Some(ta), Some(tb)) => {
+                if tb > ta {
+                    b.to_string()
+                } else {
+                    a.to_string()
+                }
+            }
+            (None, Some(_)) => b.to_string(),
+            _ => a.to_string(),
+        },
+    }
 }
 
 /// Read a durable record by elanus session id. None if there is no such session
@@ -740,6 +788,64 @@ pub fn peer_claims(root: &Root, room: &str, viewer: &str) -> Result<Vec<Claim>> 
     Ok(rows)
 }
 
+/// SI3 variant of `peer_claims` that drops claims older than `max_age_secs` — a
+/// TTL so a touch from long ago does not read as current. The SI3 fs-touch
+/// auto-claims refresh `created_at` on each write, so a live edit stays fresh
+/// while a stranded one ages out. `max_age_secs <= 0` means no age filter (behaves
+/// exactly like `peer_claims`). Newest last, same shape/scoping as `peer_claims`.
+pub fn peer_claims_fresh(
+    root: &Root,
+    room: &str,
+    viewer: &str,
+    max_age_secs: i64,
+) -> Result<Vec<Claim>> {
+    let claims = peer_claims(root, room, viewer)?;
+    if max_age_secs <= 0 {
+        return Ok(claims);
+    }
+    let now = chrono_now_secs();
+    Ok(claims
+        .into_iter()
+        .filter(|c| match iso_to_secs(&c.created_at) {
+            Some(t) => now.saturating_sub(t) <= max_age_secs,
+            None => true, // an unparseable stamp is kept (advisory; never hide data)
+        })
+        .collect())
+}
+
+/// Derive the stable default room id for a canonical workdir (SA1/SI3). MUST match
+/// codeagent.rs's `workdir_room_id` so a manual `claim`, a tool-event auto-claim,
+/// and an fs-touch auto-claim (code_projection SI3) all land in the SAME room for
+/// one checkout. Deterministic FNV-1a over the canonical path bytes (NOT
+/// DefaultHasher — its hashing is not stable across builds), `wd-` prefix.
+pub fn workdir_room_id(canonical: &Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in canonical.as_os_str().to_string_lossy().as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("wd-{hash:016x}")
+}
+
+/// The room an auto-claim for `session` lands in, plus its recorded workdir — the
+/// explicit `--room` on the record if any, else the SA1 workdir-derived room.
+/// Mirrors codeagent.rs's `session_auto_claim_room_and_workdir` (which this module
+/// cannot call) so SI3's projection-side fs-touch claims share the room siblings
+/// read. None when the session has no durable record yet.
+pub fn auto_claim_room_and_workdir(root: &Root, session: &str) -> Option<(String, String)> {
+    let rec = read_record(root, session).ok().flatten()?;
+    let workdir = rec.workdir.clone();
+    let room = match rec.room.filter(|r| !r.is_empty()) {
+        Some(r) => r,
+        None => {
+            let canon = std::fs::canonicalize(&workdir)
+                .unwrap_or_else(|_| PathBuf::from(&workdir));
+            workdir_room_id(&canon)
+        }
+    };
+    Some((room, workdir))
+}
+
 /// One recent message seen on a shared channel (C4 — agent-comms): a room's
 /// (`in/group/<id>`) traffic, surfaced advisory in the `channel:<id>` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -882,6 +988,16 @@ pub fn touch_record(root: &Root, elanus_session: &str) -> Result<()> {
         [elanus_session],
     )?;
     Ok(())
+}
+
+/// SI1 (sibling-intent): bump a session's `code_sessions.last_active` to now from
+/// the obs-publish path (codeagent.rs calls this each time the session emits
+/// telemetry), so a long-running session stays "live" between resumes rather than
+/// reading as stale off a `last_active` that only `upsert_record`/`touch_record`
+/// bump on resume. Same effect as `touch_record`; named for the obs-path caller.
+/// Best-effort: a ledger error never breaks the session.
+pub fn bump_last_active(root: &Root, session: &str) -> Result<()> {
+    touch_record(root, session)
 }
 
 /// The session-id prefix that marks a coding-session actor everywhere (CONNECT
