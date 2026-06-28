@@ -295,9 +295,13 @@ Commands:
 }
 
 pub fn print_tools() {
-    println!("claude");
-    println!("codex");
-    println!("opencode");
+    for tool in tools() {
+        println!("{tool}");
+    }
+}
+
+pub fn tools() -> Vec<&'static str> {
+    HARNESSES.iter().map(|h| h.id()).collect()
 }
 
 // ── The harness adapter seam (HM1) ────────────────────────────────────────────

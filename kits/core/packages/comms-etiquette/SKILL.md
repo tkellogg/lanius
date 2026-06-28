@@ -1,6 +1,6 @@
 ---
 name: comms-etiquette
-description: How agents talk on Elanus — to the human (send_message vs ask_human) and to each other (deliver/spawn/inbox), when to speak unprompted vs stay quiet, when to set priority, shared-channel etiquette, and the failure-mail contract. Read before messaging the human, dispatching work to another agent, or coordinating in a shared room.
+description: How agents talk on Elanus - to the human (send_message vs ask_human), to coding workers (deliver/spawn/inbox), and to native/profile agents (agent catalog/run/spawn), when to speak unprompted vs stay quiet, when to set priority, shared-channel etiquette, and the failure-mail contract. Read before messaging the human, dispatching work to another agent, launching a native/profile agent, or coordinating in a shared room.
 ---
 
 # comms-etiquette
@@ -14,6 +14,20 @@ boundary between the owner's own agents: this is conflict-avoidance and
 courtesy, not authorization.
 
 ## The verbs
+
+Start with discovery when you are unsure what can run:
+
+- **`elanus agent catalog`** - list coding tools, native/profile agents,
+  providers, and the packages visible to each profile. Add `--json` when you
+  need machine-readable launch data. For native/profile agents, check
+  `daemon_drivable`: if false, use blocking `agent run` or fix the package
+  wiring before expecting `agent spawn` to run.
+
+Use the `elanus code ...` verbs for coding sessions and coding workers. Use
+the `elanus agent ...` verbs for native/profile agents backed by elanus
+profiles and the ordinary `exec` loop.
+
+## Coding-session dispatch
 
 All of these run **inside a coding session** (the launcher sets your
 identity in the environment; you never name yourself or another session's
@@ -44,6 +58,33 @@ inbox as an argument — it is derived, so you can only ever act as yourself).
 You see waiting mail *without* asking: each turn an `inbox` block reports the
 unseen count and a preview of the latest. Treat it as a notification — run
 `elanus code inbox` to actually read and act.
+
+## Native/profile-agent launch
+
+Native/profile agents are ordinary elanus profiles: model, context program,
+visible packages, memory blocks, package stages, and tools come from the
+profile. Launch them through the `agent` namespace:
+
+- **`elanus agent run --profile <profile> "<task>"`** - run one blocking
+  native/profile-agent turn. This is the direct foreground path. Use it when
+  you need the answer in this turn.
+
+- **`elanus agent spawn --profile <profile> "<task>"`** - queue one durable
+  native/profile-agent turn for the daemon. It prints JSON with the event id,
+  correlation, session, profile, agent, and mailbox. It only works when
+  `agent catalog --json` reports the profile as `daemon_drivable`; otherwise
+  the command refuses rather than emitting work no handler will consume.
+
+- **`--with-package <pkg>`** on `agent run` or `agent spawn` is a preflight
+  requirement, not a temporary grant. It verifies that `<pkg>` is already
+  visible to the profile. If the package is not visible, choose a different
+  profile or propose/edit the profile's `elanus_path`; do not assume launch
+  can silently widen a profile for one run.
+
+Native `spawn` is currently a background launch handle, not the same routed
+completion loop as `elanus code spawn`: correlated native-agent final replies
+follow the existing native exec behavior. If you need a worker's answer in the
+same turn, use `agent run`.
 
 ## Talking to the human — `send_message` vs `ask_human`
 
