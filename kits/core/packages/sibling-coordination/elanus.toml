@@ -1,0 +1,22 @@
+# sibling-coordination — the shared-working-tree coordination package
+# (docs/handoffs/sibling-resolution-skills.md). It carries the resolution
+# playbook for when your coding session shares a working tree (and git index)
+# with sibling sessions: how to read what each sibling is doing, attribute a
+# dirty file to its owner, ask a live sibling, and run the conflict decision
+# tree without clobbering another agent's work.
+#
+# Pure skill content. This package requests NO bus authority and provides NO
+# builtin tools — every "move" it teaches is an existing `elanus code` CLI verb
+# (sessions/rooms/whose/ask/claim/inbox), so there is nothing to grant or
+# approve. Hence no [request]/[process]/[[hook]] blocks; visibility is gated by
+# the profile's elanus_path alone.
+#
+# inherit_to_subagents = false: like comms-etiquette, this package does NOT flow
+# down to a subagent that resolves the literal "$parent" in its elanus_path. A
+# worker subagent is valued for its focused trace, not for independently
+# arbitrating a shared working tree — it should not inherit the sibling
+# coordination playbook just because it pulled the parent scope with "$parent".
+# A child that genuinely shares the tree and needs these moves lists this package
+# (or its kit) explicitly in its own elanus_path. This is VISIBILITY only — it
+# touches no authority/grant.
+inherit_to_subagents = false
