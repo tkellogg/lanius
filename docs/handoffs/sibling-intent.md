@@ -49,12 +49,18 @@ no claims, so the note showed name + tool and nothing else. Three concrete gaps:
    items), and codex already maps `todo_list` → `obs/agent/codex/<s>/assistant/todo`
    (`codeagent.rs` ~6060) — but nothing projects it into a queryable per-session task
    surface, so it never reaches the note.
-3. **Hookless harnesses are mute.** codex/opencode produce no auto-claims, so "what
-   each is touching" is empty for exactly the harnesses I collided with. The signal
-   exists elsewhere — the fs **write camera** publishes `obs/fs/<path>` carrying the
-   acting `session_id` in the trace envelope (`exec.rs:2020`), and the stream
-   mapping already emits `tool/<name>/call` for codex/opencode edits — but no
-   consumer turns either into a claim.
+3. **Hookless harnesses appeared mute** — but the mechanism already exists.
+   _(Correction, post-implementation:)_ codex/opencode DO auto-claim, from each
+   harness's OWN write-tool events: `auto_claim_write` is wired at the codex
+   `file_change` capture (`codeagent.rs:6069`) and the opencode `edit`/`write`
+   capture (`codeagent.rs:5709`), with tests. This is a **settled** design decision
+   (`codeagent.rs:2731`): the fs `obs/fs` write camera only brackets *caged* actors
+   (the kernel shell/package actors), and coding harnesses run their OWN sandboxes
+   *outside* elanus's cage — so an `obs/fs` subscriber would NEVER witness a coding
+   agent's edit. So my codex siblings showing no "last editing" was **not** a missing
+   mechanism; it's operational (their `file_change` summaries arrive at turn end, and
+   the human's siblings may not have been captured by elanus at all). SI3 below is
+   therefore "verify the existing path," not "build a new one."
 
 ## Milestones
 
@@ -101,35 +107,35 @@ The heart of journey 12 — turn the name tag into "what it's working on."
   `in_progress` item in the viewer's note and in `elanus code sessions`; as the
   sibling advances items, the surface refreshes on the next projection tick.
 
-### SI3 — Touch-derived claims for hookless harnesses (close the codex/opencode gap)
-Make "what each is touching" work for codex/opencode, which produce no auto-claims —
-the exact gap that left my codex siblings mute. This is the deferred **SA3
-auto-claim consumer**, now scoped concretely.
-- Build a consumer that tails the bus and converts touches into advisory claims via
-  the existing `add_claim` (`codesession.rs:679`):
-  - Primary source: the fs **write camera** `obs/fs/<path>` events, which carry the
-    acting `session_id` in the trace envelope (`exec.rs:2020`) — harness-agnostic, so
-    it covers codex/opencode/claude uniformly.
-  - The consumer maps `session_id` → its room (`session_auto_claim_room_and_workdir`,
-    already used by the Write/Edit auto-claim) and `add_claim(room, session, path)`.
-  - Claims should expire/refresh so a touch from 20m ago doesn't read as current
-    (tie to `last_active` / a TTL on auto-claims).
-- This unifies the SA3 write-half across all three harnesses (today only Claude's
-  hook path produces auto-claims) and removes the reason my codex siblings showed no
-  "last editing".
-- **Acceptance:** a codex sibling that writes `src/foo.rs` shows `last editing
-  src/foo.rs` in the viewer's note **with no hook and no manual `claim`** — purely
-  from the fs camera. Parity with the Claude auto-claim path.
-- **Note:** the read-half (attributing *reads*) stays deferred behind the read
-  camera (`sandbox.md` "[OPEN]"); this milestone is writes only.
+### SI3 — Touch-derived claims for hookless harnesses — ALREADY SHIPPED (verify only)
+**Do NOT build an `obs/fs` consumer.** This was the original plan and it is wrong:
+`obs/fs` only brackets *caged* actors; coding harnesses run outside the cage, so the
+camera never witnesses their edits (settled, `codeagent.rs:2731`). The correct,
+already-wired mechanism is `auto_claim_write` driven by each harness's OWN write-tool
+events:
+- claude: the `Write`/`Edit` PreToolUse hook → `auto_claim_write` (`codeagent.rs` ~6957).
+- codex: `file_change` summary items → `auto_claim_write` (`codeagent.rs:6069`).
+- opencode: `edit`/`write` tool events → `auto_claim_write` (`codeagent.rs:5709`).
+All three already collapse a touch into a `code_claims` row in the session's room,
+tested (`codeagent.rs` ~10803 codex, ~10857 opencode). So codex/opencode siblings DO
+get "last editing <path>" — there is no mechanism to add.
+- **What's left is to verify, not build:** if a codex/opencode sibling still shows no
+  "last editing" in practice, investigate the EXISTING path — does the *interactive
+  TUI* capture (codex RolloutImport / opencode ServerEvents) call `auto_claim_write`,
+  or only the headless stream? Are the human's own codex sessions even captured by
+  elanus? Those are the real questions, not a new consumer.
+- _(History: an earlier attempt added an `obs/fs`→claim fold in `code_projection.rs`;
+  it was redundant + built on the false premise and has been removed. The dead
+  `codesession.rs` helpers it needed — `auto_claim_room_and_workdir`,
+  `workdir_room_id`, `peer_claims_fresh` — were removed too.)_
 
 ### SI4 — Change attribution backend (`whose-change`)
 Answer "which of these dirty files are mine, and who owns the rest?" — the question
 my human and I both got wrong about the codex WIP.
 - A query/CLI that maps a path (or the working tree's `git status` set) → owning
-  session, from two sources, freshest-wins:
-  - `code_claims` (auto + manual claims, now covering all harnesses after SI3), and
-  - `obs/fs/<path>` events' `session_id` (direct write attribution).
+  session via `code_claims` (the auto-claims `auto_claim_write` already records for
+  all three harnesses from their write-tool events, plus manual `elanus code claim`),
+  freshest-claim-wins.
 - Expose as `elanus code whose <path>` (and a bulk `elanus code whose --dirty` that
   takes `git status --porcelain` and annotates each file with its owner + that
   session's last-active + current task). Back it the same way `elanus code rooms`

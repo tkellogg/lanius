@@ -536,74 +536,6 @@ fn item_id_of(item: &Value, idx: usize) -> String {
     format!("{idx:04}")
 }
 
-// ── SI3: touch-derived auto-claims from the fs WRITE camera ───────────────────
-//
-// docs/handoffs/sibling-intent.md SI3. The fs write camera (src/exec.rs
-// `emit_fs_delta`) publishes one `obs/fs/<encoded-canonical-path>` line per changed
-// file, carrying the acting session on the trace ENVELOPE (`session_id`, set via
-// `trace::Ids`) and the op in the payload. Turning a WRITE into an advisory
-// `code_claims` auto-claim is harness-agnostic, so it closes the gap that left
-// HOOKLESS codex/opencode siblings with no "last editing <path>" — parity with
-// claude's Write/Edit hook auto-claim. NOTE: claims are recorded via
-// `codesession::add_claim` (its own connection) AFTER the projection transaction
-// commits — doing it inside the open write-tx would self-deadlock on the ledger.
-
-/// If `kind` is an `obs/fs/<path>` WRITE-camera line (op create/modify/unlink) that
-/// carries a coding `session_id` on its envelope, return the `(session, path)` to
-/// auto-claim. None for a read-camera line (op `read`), a summary, a session-less
-/// line, or an undecodable path — those never claim.
-fn fs_touch_claim(line: &Value, kind: &str) -> Option<(String, String)> {
-    // Only the WRITE flavor of the shared obs/fs noun claims; reads/others skip.
-    let op = line
-        .get("payload")
-        .and_then(|p| p.get("op"))
-        .and_then(Value::as_str)?;
-    if !matches!(op, "create" | "modify" | "unlink") {
-        return None;
-    }
-    // The acting session rides the trace envelope (not the payload).
-    let session = line.get("session_id").and_then(Value::as_str)?;
-    if !session.starts_with("code-") {
-        return None;
-    }
-    let path = decode_fs_topic(kind)?;
-    Some((session.to_string(), path))
-}
-
-/// Decode an `obs/fs/<encoded-path>` topic back to the absolute path the camera
-/// bracketed: strip the `obs/fs/` prefix, split on the `/` level separators,
-/// percent-decode each segment, and re-root at `/` (encode_path drops the leading
-/// slash). None for an empty suffix (the filesystem root is never a file write).
-fn decode_fs_topic(kind: &str) -> Option<String> {
-    let suffix = kind.strip_prefix("obs/fs/")?;
-    if suffix.is_empty() {
-        return None;
-    }
-    let decoded: Vec<String> = suffix.split('/').map(decode_segment).collect();
-    Some(format!("/{}", decoded.join("/")))
-}
-
-/// Inverse of `topic::encode_segment` for one path segment: percent-decode `%XX`
-/// bytes (covers the encoder's `% + # /`), passing anything else through. Lenient on
-/// a trailing/partial `%` (kept literal). UTF-8 lossy on the decoded bytes.
-fn decode_segment(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 fn cursor(conn: &Connection) -> rusqlite::Result<i64> {
     Ok(conn
         .query_row(
@@ -672,9 +604,6 @@ pub fn project_trace(root: &Root) -> Result<usize> {
     let complete = &bytes[..consumed];
     let tx = conn.transaction()?;
     let mut applied = 0usize;
-    // SI3: fs-touch auto-claims collected during the fold, recorded AFTER commit
-    // (add_claim opens its own connection — see fs_touch_claim's note).
-    let mut fs_claims: Vec<(String, String)> = Vec::new();
 
     for line in complete.split(|b| *b == b'\n') {
         if line.is_empty() {
@@ -686,16 +615,13 @@ pub fn project_trace(root: &Root) -> Result<usize> {
         let Some(kind) = v.get("kind").and_then(Value::as_str) else {
             continue;
         };
-        // SI3: the fs WRITE camera (obs/fs/<path>) is harness-agnostic — turn a
-        // WRITE into an advisory auto-claim so hookless codex/opencode siblings also
-        // surface "last editing <path>". Other obs/fs lines (reads, summaries,
-        // session-less) are still ignored. Recorded post-commit, below.
-        if kind.starts_with("obs/fs/") {
-            if let Some(claim) = fs_touch_claim(&v, kind) {
-                fs_claims.push(claim);
-            }
-            continue;
-        }
+        // The projection only folds obs/agent/<noun>/<session>/… lines (durable
+        // coding-session state). Edit-claims for hookless codex/opencode siblings are
+        // NOT derived here: the obs/fs write camera only brackets CAGED actors, never
+        // the un-caged coding harnesses (codeagent.rs SOURCE DECISION), so it never
+        // witnesses their edits. They are auto-claimed from each harness's OWN
+        // write-tool events instead (`auto_claim_write`: codex `file_change`, opencode
+        // `edit`/`write`, claude hook) — a separate, already-wired locus.
         if !kind.starts_with("obs/agent/") {
             continue;
         }
@@ -709,17 +635,6 @@ pub fn project_trace(root: &Root) -> Result<usize> {
     }
     save_cursor(&tx, i64::try_from(new_offset).unwrap_or(i64::MAX))?;
     tx.commit()?;
-    // SI3: now that the projection write-tx is committed and its ledger lock
-    // released, record the fs-touch auto-claims via the shared `add_claim` path
-    // (mapping the acting session → its room/workdir exactly as the Write/Edit
-    // auto-claim does, so a manual claim and a touch collapse to one row). Advisory
-    // + best-effort: a failure here never fails the projection.
-    for (session, claim_path) in fs_claims {
-        if let Some((room, _workdir)) = crate::codesession::auto_claim_room_and_workdir(root, &session)
-        {
-            let _ = crate::codesession::add_claim(root, &room, &session, &claim_path);
-        }
-    }
     Ok(applied)
 }
 
@@ -1555,7 +1470,7 @@ mod tests {
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
-    // ── sibling-intent (SI2 / SI3) ────────────────────────────────────────────
+    // ── sibling-intent (SI2: per-session task list projection) ────────────────
 
     #[test]
     fn si2_codex_todo_folds_and_selects_in_progress() {
@@ -1627,84 +1542,6 @@ mod tests {
         project_trace(&root).unwrap();
         let cur = crate::codesession::current_task(&root, "code-si2cc").unwrap();
         assert_eq!(cur, ("write the fold".to_string(), "in_progress".to_string()));
-        std::fs::remove_dir_all(&root.dir).ok();
-    }
-
-    #[test]
-    fn si3_fs_write_obs_line_produces_auto_claim() {
-        use std::io::Write as _;
-        let root = temp_root("si3-claim");
-        // A durable record so `auto_claim_room_and_workdir` resolves a room+workdir.
-        let workdir = root.dir.to_string_lossy().into_owned();
-        crate::codesession::upsert_record(
-            &root,
-            &crate::codesession::SessionRecord {
-                elanus_session: "code-si3write".into(),
-                native_session: "n1".into(),
-                tool: "codex".into(),
-                agent_noun: "codex".into(),
-                workdir: workdir.clone(),
-                room: None,
-            },
-        )
-        .unwrap();
-
-        // An fs WRITE camera line: obs/fs/<encoded path>, op=modify, with the acting
-        // session on the ENVELOPE (session_id) exactly as emit_fs_delta writes it.
-        let abs = root.dir.join("src").join("foo.rs");
-        let topic = format!("obs/fs/{}", crate::topic::encode_path(&abs));
-        let line = json!({
-            "ts": "2026-06-28T00:00:00.000Z",
-            "kind": topic,
-            "payload": { "op": "modify", "size": 3, "tool_call_id": "c1" },
-            "session_id": "code-si3write",
-        });
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(root.trace_file())
-            .unwrap();
-        writeln!(f, "{line}").unwrap();
-        drop(f);
-
-        project_trace(&root).unwrap();
-
-        // The auto-claim lands in the workdir-derived room (record has no --room).
-        let canon = std::fs::canonicalize(&workdir)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&workdir));
-        let room = crate::codesession::workdir_room_id(&canon);
-        let conn = crate::db::open(&root).unwrap();
-        let claimed: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM code_claims WHERE room=?1 AND session=?2",
-                rusqlite::params![room, "code-si3write"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(claimed, 1, "an fs WRITE produces one advisory auto-claim");
-
-        // A READ-camera line on the same noun (op=read) must NOT claim.
-        let rline = json!({
-            "ts": "2026-06-28T00:01:00.000Z",
-            "kind": format!("obs/fs/{}", crate::topic::encode_path(&root.dir.join("src").join("read.rs"))),
-            "payload": { "op": "read", "via": "tool" },
-            "session_id": "code-si3write",
-        });
-        let mut f2 = std::fs::OpenOptions::new()
-            .append(true)
-            .open(root.trace_file())
-            .unwrap();
-        writeln!(f2, "{rline}").unwrap();
-        drop(f2);
-        project_trace(&root).unwrap();
-        let claimed2: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM code_claims WHERE session=?1",
-                rusqlite::params!["code-si3write"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(claimed2, 1, "a READ event does not add a claim");
         std::fs::remove_dir_all(&root.dir).ok();
     }
 }

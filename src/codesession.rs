@@ -331,9 +331,11 @@ fn current_task_on(conn: &rusqlite::Connection, session: &str) -> Option<(String
 
 /// SI2 (sibling-intent): a session's CURRENT task — the `in_progress` item if any,
 /// else the most-recently-updated item — as `(text, status)`. Standalone (opens its
-/// own connection) for the render + the `whose`/`sessions` CLI verbs; `live_siblings`
-/// uses `current_task_on` on its already-open connection. None when there is no
-/// projected task list for the session. `status` ∈ `todo|in_progress|done`.
+/// own connection); `live_siblings`/`whose_path` use `current_task_on` on their
+/// already-open connection. The public accessor the SI2 projection tests assert
+/// through and the intended `whose`/`sessions` CLI surface; `allow(dead_code)` until
+/// that CLI wiring lands. None when there is no projected task list for the session.
+#[allow(dead_code)]
 pub fn current_task(root: &Root, session: &str) -> Option<(String, String)> {
     let conn = crate::db::open(root).ok()?;
     let _ = crate::db::init_schema(&conn);
@@ -831,73 +833,15 @@ pub fn peer_claims(root: &Root, room: &str, viewer: &str) -> Result<Vec<Claim>> 
     Ok(rows)
 }
 
-/// SI3 variant of `peer_claims` that drops claims older than `max_age_secs` — a
-/// TTL so a touch from long ago does not read as current. The SI3 fs-touch
-/// auto-claims refresh `created_at` on each write, so a live edit stays fresh
-/// while a stranded one ages out. `max_age_secs <= 0` means no age filter (behaves
-/// exactly like `peer_claims`). Newest last, same shape/scoping as `peer_claims`.
-pub fn peer_claims_fresh(
-    root: &Root,
-    room: &str,
-    viewer: &str,
-    max_age_secs: i64,
-) -> Result<Vec<Claim>> {
-    let claims = peer_claims(root, room, viewer)?;
-    if max_age_secs <= 0 {
-        return Ok(claims);
-    }
-    let now = chrono_now_secs();
-    Ok(claims
-        .into_iter()
-        .filter(|c| match iso_to_secs(&c.created_at) {
-            Some(t) => now.saturating_sub(t) <= max_age_secs,
-            None => true, // an unparseable stamp is kept (advisory; never hide data)
-        })
-        .collect())
-}
-
-/// Derive the stable default room id for a canonical workdir (SA1/SI3). MUST match
-/// codeagent.rs's `workdir_room_id` so a manual `claim`, a tool-event auto-claim,
-/// and an fs-touch auto-claim (code_projection SI3) all land in the SAME room for
-/// one checkout. Deterministic FNV-1a over the canonical path bytes (NOT
-/// DefaultHasher — its hashing is not stable across builds), `wd-` prefix.
-pub fn workdir_room_id(canonical: &Path) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in canonical.as_os_str().to_string_lossy().as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("wd-{hash:016x}")
-}
-
-/// The room an auto-claim for `session` lands in, plus its recorded workdir — the
-/// explicit `--room` on the record if any, else the SA1 workdir-derived room.
-/// Mirrors codeagent.rs's `session_auto_claim_room_and_workdir` (which this module
-/// cannot call) so SI3's projection-side fs-touch claims share the room siblings
-/// read. None when the session has no durable record yet.
-pub fn auto_claim_room_and_workdir(root: &Root, session: &str) -> Option<(String, String)> {
-    let rec = read_record(root, session).ok().flatten()?;
-    let workdir = rec.workdir.clone();
-    let room = match rec.room.filter(|r| !r.is_empty()) {
-        Some(r) => r,
-        None => {
-            let canon = std::fs::canonicalize(&workdir)
-                .unwrap_or_else(|_| PathBuf::from(&workdir));
-            workdir_room_id(&canon)
-        }
-    };
-    Some((room, workdir))
-}
-
 // ── SI4: change attribution — who owns this path? ─────────────────────────────
 //
 // docs/handoffs/sibling-intent.md SI4 (`whose-change`). Resolve a path to the
 // coding session that last claimed it, freshest-claim-wins, off `code_claims` —
-// which now carries claims from ALL THREE harnesses: claude's Write/Edit hook
-// auto-claim, a manual `elanus code claim`, and (SI3) the projection's fs-touch
-// auto-claim for hookless codex/opencode. Advisory, gates nothing: it answers
-// "which of these dirty files are mine, and who owns the rest?" — the exact
-// question the motivating incident got wrong by hand.
+// which carries claims from ALL THREE harnesses via each one's OWN write-tool
+// events (`auto_claim_write`: claude's Write/Edit hook, codex `file_change`,
+// opencode `edit`/`write`), plus a manual `elanus code claim`. Advisory, gates
+// nothing: it answers "which of these dirty files are mine, and who owns the
+// rest?" — the exact question the motivating incident got wrong by hand.
 
 /// Who owns a path: the session that holds the freshest `code_claims` claim on it,
 /// plus that session's agent noun, last-active recency, and current task — the
