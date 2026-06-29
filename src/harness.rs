@@ -69,8 +69,16 @@ impl Ctx {
         &self.session
     }
 
+    pub fn root(&self) -> &Root {
+        &self.root
+    }
+
     pub fn agent_noun(&self) -> &str {
         &self.agent_noun
+    }
+
+    pub fn bus_token(&self) -> Option<&str> {
+        self.bus_token.as_deref()
     }
 
     pub fn tool(&self) -> &str {

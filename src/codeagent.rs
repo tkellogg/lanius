@@ -170,6 +170,26 @@ pub fn scrub_provider_creds(cmd: &mut std::process::Command) -> &mut std::proces
     cmd
 }
 
+/// Resolve the `elanus` binary used by generated hook commands.
+///
+/// When running from the main binary, this is just the current executable. When
+/// one of the thin adapter binaries runs beside it, prefer the sibling `elanus`
+/// binary in the same directory so generated hook configs still call the real
+/// `elanus code hook ...` entrypoint.
+fn elanus_command_path() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("locating the running elanus binary")?;
+    if exe.file_stem().and_then(|s| s.to_str()) == Some("elanus") {
+        return Ok(exe);
+    }
+    if let Some(dir) = exe.parent() {
+        let sibling = dir.join("elanus");
+        if sibling.exists() {
+            return Ok(sibling);
+        }
+    }
+    Ok(exe)
+}
+
 /// Remove internal launch-control variables from a real coding-tool child. They
 /// are instructions to this elanus wrapper, not part of the session identity the
 /// model should inherit. The wrapper sets fresh `ELANUS_CODE_SESSION` /
@@ -1856,8 +1876,7 @@ fn build_codex_skills_home(
 }
 
 fn append_codex_hook_config(root: &Root, home: &Path) -> Result<()> {
-    let self_exe =
-        std::env::current_exe().context("resolving current executable for codex hook")?;
+    let self_exe = elanus_command_path()?;
     let config = home.join("config.toml");
     let needs_separator = config.metadata().map(|m| m.len() > 0).unwrap_or(false);
     let mut f = std::fs::OpenOptions::new()
@@ -3861,16 +3880,6 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
         }
     }
 
-    // The session's run scratch — for CC, the generated hook config lives here;
-    // for Codex (no hooks) it's still created for symmetry and is empty. Never
-    // ~/.claude / ~/.codex.
-    let scratch = root.run_dir().join(&session);
-    std::fs::create_dir_all(&scratch)
-        .with_context(|| format!("creating run scratch {}", scratch.display()))?;
-    let settings_path = scratch.join("settings.json");
-
-    let self_exe =
-        std::env::current_exe().context("locating the elanus binary for hook commands")?;
     let result = (|| -> Result<(std::process::ExitStatus, CaptureSummary)> {
         // Session start (the first ordered record): timestamp + the resolved
         // workdir, so the bus shows when and where the session began. Emitted by
@@ -3899,134 +3908,20 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
             // ── Claude Code: hook bridge ──────────────────────────────────────
             // The child's own generated hooks call `elanus code hook`; the
             // launcher inherits stdio and parses nothing.
-            Capture::HookBridge => {
-                let settings = tool
-                    .settings(&self_exe, root)
-                    .expect("hook-bridge adapter generates settings");
-                std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
-                    .with_context(|| format!("writing {}", settings_path.display()))?;
-                // M1: the bootstrap `/elanus` skill + the profile's visible skills,
-                // delivered as a per-session plugin (the only channel that surfaces
-                // skills under `--setting-sources ''` from an ephemeral path).
-                let plugin_dir = build_claude_skill_plugin(&scratch, &skills)?;
-
-                // Launch the real binary with the generated, isolated config. The
-                // TUI gets inherited stdio so it is a normal, fully usable
-                // session. `--setting-sources ''` loads NO user/project/local
-                // settings (the user's ~/.claude hooks/CLAUDE.md are untouched);
-                // `--settings <file>` loads only our generated hooks (Appendix A).
-                if worker {
-                    let mut tool_args = vec![
-                        "--settings".to_string(),
-                        settings_path.display().to_string(),
-                        "--setting-sources".to_string(),
-                        "".to_string(),
-                        "--plugin-dir".to_string(),
-                        plugin_dir.display().to_string(),
-                    ];
-                    if let Some(brief) = &brief_text {
-                        tool_args.push("--append-system-prompt".to_string());
-                        tool_args.push(brief.clone());
-                    }
-                    tool_args.push("-p".to_string());
-                    tool_args.extend_from_slice(args);
-                    let timeout_suffix;
-                    let (program, tool_args) = if let Some(secs) = worker_timeout {
-                        timeout_suffix = format!(" [timeout {secs}s]");
-                        timeout_wrap(tool.binary(), &tool_args, secs)
-                    } else {
-                        timeout_suffix = String::new();
-                        (tool.binary().to_string(), tool_args)
-                    };
-                    let mut cmd = std::process::Command::new(&program);
-                    cmd.args(&tool_args);
-                    // Scrub elanus's provider credentials FIRST so Claude Code uses
-                    // its own login (`~/.claude`) rather than inheriting elanus's
-                    // DeepSeek ANTHROPIC_BASE_URL/API_KEY (Task 2). The ELANUS_*
-                    // vars set below are NOT scrubbed — the hook bridge depends on
-                    // them.
-                    scrub_provider_creds(&mut cmd);
-                    scrub_launch_control_env(&mut cmd);
-                    // M2: if `--provider` was given, apply the materialized injection
-                    // AFTER the scrub (claude: ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN,
-                    // overriding the Claude.AI login). No-op when absent.
-                    if let Some(inj) = injection_ref {
-                        apply_provider_injection_env(&mut cmd, inj);
-                    }
-                    // The session's own identity, carried to the hook bridge
-                    // children CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are
-                    // what `elanus bus pub` authenticates with (src/buscli.rs);
-                    // ELANUS_CODE_* tell the bridge which session/agent to file
-                    // under.
-                    cmd.env("ELANUS_PACKAGE", &principal)
-                        .env("ELANUS_BUS_TOKEN", &bus_token)
-                        .env(ENV_SESSION, &session)
-                        .env(ENV_AGENT, &agent)
-                        .env("ELANUS_ROOT", &root.dir);
-                    eprintln!(
-                        "[code] launching {} as session {session}{timeout_suffix}",
-                        tool.binary()
-                    );
-                    cmd.stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::inherit());
-                    let output = cmd.output().with_context(|| {
-                        format!("launching {program} (is it installed and on PATH?)")
-                    })?;
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    print_claude_worker_result(&session, &text);
-                    let final_text = (!text.trim().is_empty()).then(|| clip(&text, FINAL_TEXT_CAP));
-                    Ok((
-                        output.status,
-                        CaptureSummary {
-                            final_text,
-                            file_changes: Vec::new(),
-                        },
-                    ))
-                } else {
-                    // Foreground/interactive launches are deliberately NOT wrapped
-                    // in timeout; real live delegations can run as long as needed.
-                    let mut cmd = std::process::Command::new(tool.binary());
-                    cmd.arg("--settings")
-                        .arg(&settings_path)
-                        .arg("--setting-sources")
-                        .arg("")
-                        .arg("--plugin-dir")
-                        .arg(&plugin_dir);
-                    // The launch-envelope briefing (M4-B): Claude Code injects it
-                    // out-of-band via --append-system-prompt (the system layer,
-                    // after the cached prefix — Appendix A), not the user message.
-                    if let Some(brief) = &brief_text {
-                        cmd.arg("--append-system-prompt").arg(brief);
-                    }
-                    // Scrub elanus's provider credentials FIRST so Claude Code uses
-                    // its own login (`~/.claude`) rather than inheriting elanus's
-                    // DeepSeek ANTHROPIC_BASE_URL/API_KEY (Task 2). The ELANUS_*
-                    // vars set below are NOT scrubbed — the hook bridge depends on
-                    // them.
-                    scrub_provider_creds(&mut cmd);
-                    scrub_launch_control_env(&mut cmd);
-                    // M2: apply the named-provider injection (if any) after the scrub.
-                    if let Some(inj) = injection_ref {
-                        apply_provider_injection_env(&mut cmd, inj);
-                    }
-                    // The session's own identity, carried to the hook bridge
-                    // children CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are
-                    // what `elanus bus pub` authenticates with (src/buscli.rs);
-                    // ELANUS_CODE_* tell the bridge which session/agent to file
-                    // under.
-                    cmd.env("ELANUS_PACKAGE", &principal)
-                        .env("ELANUS_BUS_TOKEN", &bus_token)
-                        .env(ENV_SESSION, &session)
-                        .env(ENV_AGENT, &agent)
-                        .env("ELANUS_ROOT", &root.dir);
-                    eprintln!("[code] launching {} as session {session}", tool.binary());
-                    cmd.args(args);
-                    let status = cmd.status().with_context(|| {
-                        format!("launching {} (is it installed and on PATH?)", tool.binary())
-                    })?;
-                    Ok((status, CaptureSummary::default()))
-                }
-            }
+            Capture::HookBridge => run_claude_capture(ClaudeLaunch {
+                root,
+                principal: &principal,
+                bus_token: &bus_token,
+                agent: &agent,
+                session: &session,
+                workdir: &workdir,
+                args,
+                brief: brief_text.as_deref(),
+                worker,
+                worker_timeout,
+                injection: injection_ref,
+                skills: &skills,
+            }),
             // ── StreamJson: stdout JSONL stream ───────────────────────────────
             // No hooks. Run the harness's headless JSON mode, pipe stdout, and
             // parse+publish each event in-process as the session principal. The
@@ -4152,12 +4047,10 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
         }
     }
 
-    // No home-state pollution and no lingering credential: drop the generated
-    // config and retire the session's scoped token (best-effort; a SIGKILL leaves
-    // it, but it is reaped at the next launcher/daemon boot, and even unreaped it
-    // can only ever publish this dead session's own obs subtree — never the
-    // owner, work, or another agent).
-    let _ = std::fs::remove_dir_all(&scratch);
+    // No lingering credential: retire the session's scoped token (best-effort;
+    // a SIGKILL leaves it, but it is reaped at the next launcher/daemon boot,
+    // and even unreaped it can only ever publish this dead session's own obs
+    // subtree — never the owner, work, or another agent).
     codesession::retire(root, &principal);
     // M5: room membership + advisory claims are NOT released here. A coding
     // session is DURABLE and RESUMABLE (M2-A: a turn-process exiting is not the
@@ -4180,6 +4073,307 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+struct ClaudeLaunch<'a> {
+    root: &'a Root,
+    principal: &'a str,
+    bus_token: &'a str,
+    agent: &'a str,
+    session: &'a str,
+    workdir: &'a Path,
+    args: &'a [String],
+    brief: Option<&'a str>,
+    worker: bool,
+    worker_timeout: Option<u64>,
+    injection: Option<&'a crate::provider::HarnessInjection>,
+    skills: &'a [(String, PathBuf)],
+}
+
+/// Reconstruct the launch argv that the thin adapter binaries pass to a capture
+/// function from `ELANUS_CODE_PROMPT`. The prompt is the user's TASK and must travel
+/// as ONE positional arg — splitting on whitespace shreds a multi-word prompt (codex
+/// then keeps only the first token). So the whole prompt is a single argv element.
+fn adapter_prompt_args(prompt: Option<&str>) -> Vec<String> {
+    match prompt {
+        Some(p) if !p.is_empty() => vec![p.to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// Reconstruct the visible skill package list from `ELANUS_CODE_SKILLS_DIR`.
+fn skill_packages_from_dir(skills_dir: Option<&Path>) -> Vec<(String, PathBuf)> {
+    let Some(skills_dir) = skills_dir else {
+        return Vec::new();
+    };
+    let read_dir = match std::fs::read_dir(skills_dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            eprintln!(
+                "[code] reading skills dir {} for adapter launch failed: {e:#}",
+                skills_dir.display()
+            );
+            return Vec::new();
+        }
+    };
+    let mut skills: Vec<(String, PathBuf)> = read_dir
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let target = std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path());
+            Some((name, target))
+        })
+        .collect();
+    skills.sort_by(|a, b| a.0.cmp(&b.0));
+    skills
+}
+
+/// Extracted Claude hook-bridge capture path, shared by `launch()` and the thin
+/// adapter binary entrypoint.
+#[allow(clippy::too_many_arguments)]
+fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+    use std::process::Command;
+
+    let ClaudeLaunch {
+        root,
+        principal,
+        bus_token,
+        agent,
+        session,
+        workdir: _workdir,
+        args,
+        brief,
+        worker,
+        worker_timeout,
+        injection,
+        skills,
+    } = ctx;
+    let scratch = root.run_dir().join(session);
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("creating run scratch {}", scratch.display()))?;
+    let settings_path = scratch.join("settings.json");
+    let self_exe = elanus_command_path()?;
+    let binary = ClaudeCode.binary();
+    let result = (|| -> Result<(std::process::ExitStatus, CaptureSummary)> {
+        let settings = ClaudeCode
+            .settings(&self_exe, root)
+            .expect("hook-bridge adapter generates settings");
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
+            .with_context(|| format!("writing {}", settings_path.display()))?;
+        // M1: the bootstrap `/elanus` skill + the profile's visible skills,
+        // delivered as a per-session plugin (the only channel that surfaces
+        // skills under `--setting-sources ''` from an ephemeral path).
+        let plugin_dir = build_claude_skill_plugin(&scratch, skills)?;
+
+        // Launch the real binary with the generated, isolated config. The
+        // TUI gets inherited stdio so it is a normal, fully usable session.
+        // `--setting-sources ''` loads NO user/project/local settings (the
+        // user's ~/.claude hooks/CLAUDE.md are untouched); `--settings <file>`
+        // loads only our generated hooks (Appendix A).
+        if worker {
+            let mut tool_args = vec![
+                "--settings".to_string(),
+                settings_path.display().to_string(),
+                "--setting-sources".to_string(),
+                "".to_string(),
+                "--plugin-dir".to_string(),
+                plugin_dir.display().to_string(),
+            ];
+            if let Some(brief) = &brief {
+                tool_args.push("--append-system-prompt".to_string());
+                tool_args.push(brief.to_string());
+            }
+            tool_args.push("-p".to_string());
+            tool_args.extend_from_slice(args);
+            let timeout_suffix;
+            let (program, tool_args) = if let Some(secs) = worker_timeout {
+                timeout_suffix = format!(" [timeout {secs}s]");
+                timeout_wrap(binary, &tool_args, secs)
+            } else {
+                timeout_suffix = String::new();
+                (binary.to_string(), tool_args)
+            };
+            let mut cmd = Command::new(&program);
+            cmd.args(&tool_args);
+            // Scrub elanus's provider credentials FIRST so Claude Code uses
+            // its own login (`~/.claude`) rather than inheriting elanus's
+            // DeepSeek ANTHROPIC_BASE_URL/API_KEY (Task 2). The ELANUS_*
+            // vars set below are NOT scrubbed — the hook bridge depends on
+            // them.
+            scrub_provider_creds(&mut cmd);
+            scrub_launch_control_env(&mut cmd);
+            // M2: if `--provider` was given, apply the materialized injection
+            // AFTER the scrub (claude: ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN,
+            // overriding the Claude.AI login). No-op when absent.
+            if let Some(inj) = injection {
+                apply_provider_injection_env(&mut cmd, inj);
+            }
+            // The session's own identity, carried to the hook bridge children
+            // CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are what
+            // `elanus bus pub` authenticates with (src/buscli.rs); ELANUS_CODE_*
+            // tell the bridge which session/agent to file under.
+            cmd.env("ELANUS_PACKAGE", principal)
+                .env("ELANUS_BUS_TOKEN", bus_token)
+                .env(ENV_SESSION, session)
+                .env(ENV_AGENT, agent)
+                .env("ELANUS_ROOT", &root.dir);
+            eprintln!(
+                "[code] launching {} as session {session}{timeout_suffix}",
+                binary
+            );
+            cmd.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit());
+            let output = cmd.output().with_context(|| {
+                format!("launching {program} (is it installed and on PATH?)")
+            })?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            print_claude_worker_result(session, &text);
+            let final_text = (!text.trim().is_empty()).then(|| clip(&text, FINAL_TEXT_CAP));
+            Ok((
+                output.status,
+                CaptureSummary {
+                    final_text,
+                    file_changes: Vec::new(),
+                },
+            ))
+        } else {
+            // Foreground/interactive launches are deliberately NOT wrapped in
+            // timeout; real live delegations can run as long as needed.
+            let mut cmd = Command::new(binary);
+            cmd.arg("--settings")
+                .arg(&settings_path)
+                .arg("--setting-sources")
+                .arg("")
+                .arg("--plugin-dir")
+                .arg(&plugin_dir);
+            // The launch-envelope briefing (M4-B): Claude Code injects it
+            // out-of-band via --append-system-prompt (the system layer, after
+            // the cached prefix — Appendix A), not the user message.
+            if let Some(brief) = &brief {
+                cmd.arg("--append-system-prompt").arg(brief);
+            }
+            // Scrub elanus's provider credentials FIRST so Claude Code uses
+            // its own login (`~/.claude`) rather than inheriting elanus's
+            // DeepSeek ANTHROPIC_BASE_URL/API_KEY (Task 2). The ELANUS_*
+            // vars set below are NOT scrubbed — the hook bridge depends on
+            // them.
+            scrub_provider_creds(&mut cmd);
+            scrub_launch_control_env(&mut cmd);
+            // M2: apply the named-provider injection (if any) after the scrub.
+            if let Some(inj) = injection {
+                apply_provider_injection_env(&mut cmd, inj);
+            }
+            // The session's own identity, carried to the hook bridge children
+            // CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are what
+            // `elanus bus pub` authenticates with (src/buscli.rs); ELANUS_CODE_*
+            // tell the bridge which session/agent to file under.
+            cmd.env("ELANUS_PACKAGE", principal)
+                .env("ELANUS_BUS_TOKEN", bus_token)
+                .env(ENV_SESSION, session)
+                .env(ENV_AGENT, agent)
+                .env("ELANUS_ROOT", &root.dir);
+            eprintln!("[code] launching {} as session {session}", binary);
+            cmd.args(args);
+            let status = cmd.status().with_context(|| {
+                format!("launching {} (is it installed and on PATH?)", binary)
+            })?;
+            Ok((status, CaptureSummary::default()))
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// Shared adapter prompt reconstruction and capture delegation. The adapter
+/// binaries are thin wrappers around these entrypoints.
+pub fn run_claude_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::ExitStatus> {
+    let bus_token = ctx.bus_token().context("missing ELANUS_BUS_TOKEN")?;
+    let skills = skill_packages_from_dir(ctx.skills_dir());
+    let args = adapter_prompt_args(ctx.prompt());
+    let (status, _) = run_claude_capture(ClaudeLaunch {
+        root: ctx.root(),
+        principal: ctx.session(),
+        bus_token,
+        agent: ctx.agent_noun(),
+        session: ctx.session(),
+        workdir: ctx.workdir(),
+        args: &args,
+        brief: ctx.briefing(),
+        worker: ctx.mode() == Mode::Headless,
+        worker_timeout: None,
+        injection: None,
+        skills: &skills,
+    })?;
+    Ok(status)
+}
+
+pub fn run_codex_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::ExitStatus> {
+    let bus_token = ctx.bus_token().context("missing ELANUS_BUS_TOKEN")?;
+    let skills = skill_packages_from_dir(ctx.skills_dir());
+    let args = adapter_prompt_args(ctx.prompt());
+    let (status, _) = match ctx.mode() {
+        Mode::Headless => run_codex_capture(
+            ctx.root(),
+            ctx.session(),
+            bus_token,
+            ctx.agent_noun(),
+            ctx.session(),
+            ctx.workdir(),
+            &args,
+            ctx.briefing(),
+            None,
+            None,
+            &skills,
+        )?,
+        Mode::Tui => run_codex_tui_import(
+            ctx.root(),
+            ctx.session(),
+            bus_token,
+            ctx.agent_noun(),
+            ctx.session(),
+            ctx.workdir(),
+            &args,
+            ctx.briefing(),
+            None,
+            &skills,
+        )?,
+    };
+    Ok(status)
+}
+
+pub fn run_opencode_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::ExitStatus> {
+    let bus_token = ctx.bus_token().context("missing ELANUS_BUS_TOKEN")?;
+    let skills = skill_packages_from_dir(ctx.skills_dir());
+    let args = adapter_prompt_args(ctx.prompt());
+    let (status, _) = match ctx.mode() {
+        Mode::Headless => run_opencode_capture(
+            ctx.root(),
+            ctx.session(),
+            bus_token,
+            ctx.agent_noun(),
+            ctx.session(),
+            ctx.workdir(),
+            &args,
+            ctx.briefing(),
+            true,
+            None,
+            None,
+            &skills,
+        )?,
+        Mode::Tui => run_opencode_tui_server_events(
+            ctx.root(),
+            ctx.session(),
+            bus_token,
+            ctx.agent_noun(),
+            ctx.session(),
+            ctx.workdir(),
+            &args,
+            ctx.briefing(),
+            None,
+            &skills,
+        )?,
+    };
+    Ok(status)
 }
 
 /// Run Codex non-interactively and capture its JSONL event stream, publishing
