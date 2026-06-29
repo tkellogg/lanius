@@ -6,16 +6,32 @@ last-updated: 2026-06-29
 
 # Onboarding a new coding harness
 
-What it takes to bring a new coding agent (aider, cursor-cli, gemini-cli, cline,
-amp, …) under elanus the way `claude`, `codex`, and `opencode` already are:
-`elanus code <tool> "<task>"`, captured to the bus, resumable, briefed, dispatchable,
-skill-equipped, and sibling-aware. This is the requirements + decision guide; the
-per-tool work plans (e.g. [handoffs/onboard-opencode.md](handoffs/onboard-opencode.md))
-are worked examples.
+You want to drive a new coding tool (gemini-cli, aider, cursor-cli, …) through elanus
+the way `claude`/`codex`/`opencode` are: `elanus code <tool> "<task>"`, captured to the
+bus, resumable, briefed, dispatchable, skill-equipped, sibling-aware.
 
-## The seam: one trait, one registry line
+## Start here: build an adapter, don't fork elanus
 
-Adding a harness is **one `impl Harness` + one entry in `HARNESSES`**
+The intended way to add a harness is to **write a small adapter and ship it as a
+package** — no elanus PR. Your adapter is the tool-specific 20% (launch the tool, read
+its event stream); an `elanus-harness` SDK is the shared 80% (session identity, the
+bus, edit-claims, comms). elanus hands your adapter a session (id, bus token, workdir,
+mode, prompt, briefing, skills dir); you launch your tool, and for each event call
+`ctx.emit(...)` / `ctx.claim(path)` / `ctx.record(native_id)`. Declare `[[harness]]` in
+your package's `elanus.toml` and `elanus code <yourtool>` discovers it.
+
+> **Status:** the adapter SDK + package dispatch is the TARGET shape, speced in
+> [handoffs/pluggable-coding-harness.md](handoffs/pluggable-coding-harness.md) (why:
+> [journeys/13-adding-a-harness-without-forking.md](journeys/13-adding-a-harness-without-forking.md)).
+> Until it lands, harnesses are added in-tree against the `Harness` trait (below).
+> Either way the REQUIREMENTS are the same — what your adapter must expose and emit —
+> so the capability ladder and checklist below are what you implement regardless of
+> whether you ship a package or (for now) a trait impl. Read the requirements as "what
+> my adapter does," not "what I edit in elanus."
+
+## The in-tree seam (how the built-ins work today): one trait, one registry line
+
+Adding a built-in harness is **one `impl Harness` + one entry in `HARNESSES`**
 (`src/codeagent.rs`). The launch envelope never matches on a concrete tool; it drives
 everything off the trait. The structs are zero-sized (`&'static dyn`).
 
