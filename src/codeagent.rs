@@ -71,8 +71,8 @@ use std::path::{Path, PathBuf};
 
 /// Env vars the launcher sets for the child coding-agent process tree, read back
 /// by `elanus code hook` so each hook event publishes as the session principal.
-const ENV_SESSION: &str = "ELANUS_CODE_SESSION";
-const ENV_AGENT: &str = "ELANUS_CODE_AGENT";
+pub const ENV_SESSION: &str = "ELANUS_CODE_SESSION";
+pub const ENV_AGENT: &str = "ELANUS_CODE_AGENT";
 
 /// Internal launch-control env vars used by `elanus code spawn`.
 ///
@@ -161,7 +161,7 @@ const PROVIDER_CRED_VARS: &[&str] = &[
 /// provider env (see `PROVIDER_CRED_VARS`). Returns the same `&mut Command` for
 /// chaining. The `ELANUS_*` session/bus/root vars the bridge needs are set by the
 /// caller AFTER this and are deliberately NOT scrubbed.
-fn scrub_provider_creds(cmd: &mut std::process::Command) -> &mut std::process::Command {
+pub fn scrub_provider_creds(cmd: &mut std::process::Command) -> &mut std::process::Command {
     for var in PROVIDER_CRED_VARS {
         cmd.env_remove(var);
     }
@@ -327,7 +327,7 @@ pub fn tools() -> Vec<&'static str> {
 /// Headless-only. HM2/HM3 wire the missing TUI cells and the uniform `--headless`
 /// flag — HM1 just names the axis and routes today's behavior through it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Mode {
+pub enum Mode {
     /// The harness's native interactive terminal UI (inherited stdio, human-pumped).
     Tui,
     /// Non-interactive, fully captured (one task in → result out).
@@ -2854,7 +2854,7 @@ fn canonicalize_claim_path(raw_path: &str, base: Option<&str>) -> Option<String>
 /// use — NOT the raw lexical string. A blank/empty path is a no-op (never panics,
 /// never claims an empty path). ADVISORY: every failure is swallowed (logged at
 /// most) — recording a claim must never break or block the coding session.
-fn auto_claim_write(root: &Root, session: &str, raw_path: &str, cwd: Option<&str>) {
+pub fn auto_claim_write(root: &Root, session: &str, raw_path: &str, cwd: Option<&str>) {
     if raw_path.trim().is_empty() {
         // No/blank path (e.g. a malformed tool event): nothing honest to claim.
         return;
@@ -7431,7 +7431,7 @@ fn claude_settings(self_exe: &Path, root: &Root) -> Value {
 /// process's environment so the broker stamps `sender = <principal>`. Best
 /// effort: a publish failure (broker down) never breaks the coding session —
 /// the observation plane is QoS-0-droppable telemetry (docs/bus.md).
-fn publish_obs(root: &Root, principal: &str, token: &str, topic_name: &str, body: Value) {
+pub fn publish_obs(root: &Root, principal: &str, token: &str, topic_name: &str, body: Value) {
     // buscli::publish reads ELANUS_PACKAGE/ELANUS_BUS_TOKEN from the environment.
     // In the launcher process those aren't set (only the child's were), so set
     // them for this publish; the hook process already has them. Setting them
@@ -7460,7 +7460,7 @@ fn publish_obs(root: &Root, principal: &str, token: &str, topic_name: &str, body
 
 /// Session-scoped observation topic: obs/agent/<agent>/<session>/<leaf>. Mirrors
 /// src/exec.rs `obs()` exactly so coding-session telemetry shares the grammar.
-fn obs_topic(agent: &str, session: &str, leaf: &str) -> String {
+pub fn obs_topic(agent: &str, session: &str, leaf: &str) -> String {
     format!(
         "obs/agent/{}/{}/{leaf}",
         topic::encode_segment(agent),

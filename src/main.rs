@@ -1,50 +1,11 @@
-mod agentcli;
-mod blockcli;
-mod broker;
-mod bus;
-mod buscli;
-mod code_projection;
-mod codeagent;
-mod codesession;
-mod config_repo;
-mod configcli;
-mod context;
-mod context_blocks;
-mod context_store;
-mod db;
-mod dev;
-mod dispatcher;
-mod dotenv;
-mod envcompat;
-mod estimate;
-mod estimatecli;
-mod events;
-mod exec;
-mod hooks;
-mod human;
-mod initcmd;
-mod kit;
-mod mailcli;
-mod manifest;
-mod mcp;
-mod models;
-mod packages;
-mod paths;
-mod profile;
-mod profilecli;
-mod provider;
-mod providercli;
-mod recorder;
-mod render;
-mod resident;
-mod sandbox;
-mod secrets;
-mod topic;
-mod trace;
-mod web;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use elanus::{
+    agentcli, blockcli, buscli, code_projection, codeagent, configcli, context, db, dev,
+    dispatcher, dotenv, envcompat, estimatecli, events, exec, human, initcmd, kit, mailcli,
+    manifest, models, packages, paths, profile, profilecli, providercli, render, secrets, trace,
+    web,
+};
 use serde_json::Value;
 use std::path::PathBuf;
 
