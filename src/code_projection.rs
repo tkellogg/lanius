@@ -246,6 +246,12 @@ fn apply_event(conn: &Connection, topic: &str, payload: &Value) -> rusqlite::Res
     };
     let ts = text_field(payload, "ts");
     let updated_at = ts.clone().unwrap_or_else(now_iso);
+    // SI2 (sibling-intent): fold a todo/task-list event into `code_session_tasks`
+    // so a sibling's CURRENT task is queryable. This is IN ADDITION to the normal
+    // stats/timeline handling below (a TodoWrite is still a timeline tool event, so
+    // we deliberately do NOT consume the leaf here). Best-effort: an unrecognized
+    // shape or ledger error is a clean no-op that never blocks the projection.
+    let _ = fold_tasks(conn, session, leaf, payload, &updated_at);
     match leaf {
         "session/start" => {
             conn.execute(
@@ -362,6 +368,242 @@ fn apply_event(conn: &Connection, topic: &str, payload: &Value) -> rusqlite::Res
     Ok(())
 }
 
+// ── SI2: project a session's todo/task list into `code_session_tasks` ─────────
+//
+// docs/handoffs/sibling-intent.md SI2. Two harnesses already put the task list on
+// the bus; this fold turns it into a queryable per-session surface (latest-wins):
+//   • Claude: `tool/TodoWrite/{call,result}` — the items ride `input`/`tool_input`.
+//   • codex:  `assistant/todo` — an `items` array.
+// CAUTION (the load-bearing gotcha): the harness clips tool payloads with
+// `clip_value`, which SERIALIZES a non-string value to a JSON *string*. So in
+// practice the `input`/`items` field is usually a JSON STRING, not a structured
+// array — `extract_items` parses-if-string before reading it, and a value clipped
+// past the limit (unparseable) is skipped rather than panicking.
+
+/// Fold one todo/task-list obs event into `code_session_tasks`, replacing the
+/// session's task set with exactly the items in this event (upsert each, then drop
+/// any prior rows no longer present — a shrunk or cleared list must not leave stale
+/// items behind). Unrecognized leaves / shapes are a clean no-op. `status` is
+/// normalized to `todo|in_progress|done`. `updated_at` is the event ts.
+fn fold_tasks(
+    conn: &Connection,
+    session: &str,
+    leaf: &str,
+    payload: &Value,
+    updated_at: &str,
+) -> rusqlite::Result<()> {
+    // Locate the raw items field by harness leaf; anything else is not a task event.
+    let raw = match leaf {
+        "assistant/todo" => payload.get("items"),
+        "tool/TodoWrite/result" | "tool/TodoWrite/call" => {
+            payload.get("input").or_else(|| payload.get("tool_input"))
+        }
+        _ => return Ok(()),
+    };
+    let Some(items) = raw.and_then(extract_items) else {
+        return Ok(()); // absent / unrecognized shape — skip, mutate nothing
+    };
+    // Upsert each readable item; collect the ids we kept so stale rows can be reaped.
+    let mut seen: Vec<String> = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let Some((text, status)) = item_text_status(item) else {
+            continue; // an item with no readable text — skip it
+        };
+        let item_id = item_id_of(item, idx);
+        conn.execute(
+            "INSERT INTO code_session_tasks (elanus_session, item_id, text, status, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(elanus_session, item_id) DO UPDATE SET
+               text=excluded.text, status=excluded.status, updated_at=excluded.updated_at",
+            params![session, item_id, text, status, updated_at],
+        )?;
+        seen.push(item_id);
+    }
+    if seen.is_empty() {
+        // A genuinely EMPTY list = the agent cleared its tasks: drop the session's
+        // rows. A non-empty-but-all-unreadable list is treated as unrecognized and
+        // left untouched (do not wipe a real list on a shape we failed to read).
+        if items.is_empty() {
+            conn.execute(
+                "DELETE FROM code_session_tasks WHERE elanus_session = ?1",
+                params![session],
+            )?;
+        }
+        return Ok(());
+    }
+    // Drop prior rows for this session absent from the latest list.
+    let placeholders = (0..seen.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "DELETE FROM code_session_tasks WHERE elanus_session = ?1 AND item_id NOT IN ({placeholders})"
+    );
+    let mut binds: Vec<String> = Vec::with_capacity(seen.len() + 1);
+    binds.push(session.to_string());
+    binds.extend(seen.iter().cloned());
+    conn.execute(&sql, rusqlite::params_from_iter(binds.iter()))?;
+    Ok(())
+}
+
+/// Resolve a todo-list field (often a serialized JSON string, see `clip_value`) to
+/// the array of item values: a direct array, or the array under a recognized key on
+/// an object (`todos`/`items`/`tasks`/…). None when no array can be found.
+fn extract_items(raw: &Value) -> Option<Vec<Value>> {
+    let parsed: Value = match raw {
+        Value::String(s) => serde_json::from_str(s).ok()?,
+        other => other.clone(),
+    };
+    if let Some(arr) = parsed.as_array() {
+        return Some(arr.clone());
+    }
+    if let Some(obj) = parsed.as_object() {
+        for key in ["todos", "items", "tasks", "list", "todo", "plan"] {
+            if let Some(arr) = obj.get(key).and_then(Value::as_array) {
+                return Some(arr.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Extract `(text, status)` from one task item. Handles a bare string item (the
+/// string IS the text, status `todo`) and an object with a text-ish field plus a
+/// status/state string or a `completed`/`done` bool. None when no readable text.
+fn item_text_status(item: &Value) -> Option<(String, String)> {
+    if let Some(s) = item.as_str() {
+        let t = s.trim();
+        if t.is_empty() {
+            return None;
+        }
+        return Some((t.to_string(), "todo".to_string()));
+    }
+    let obj = item.as_object()?;
+    let text = ["content", "text", "step", "title", "name", "description", "task", "label"]
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some((text, normalize_status(obj)))
+}
+
+/// Normalize a task item's status to `todo|in_progress|done`. Reads a `status`/`state`
+/// string (mapping the common synonyms each harness uses) or a `completed`/`done`
+/// bool; an unknown status string is kept (lowercased) rather than guessed; absent
+/// status defaults to `todo`.
+fn normalize_status(obj: &serde_json::Map<String, Value>) -> String {
+    if let Some(s) = obj
+        .get("status")
+        .or_else(|| obj.get("state"))
+        .and_then(Value::as_str)
+    {
+        let s = s.trim().to_ascii_lowercase();
+        return match s.as_str() {
+            "in_progress" | "in-progress" | "inprogress" | "running" | "active" | "doing"
+            | "started" => "in_progress".to_string(),
+            "completed" | "complete" | "done" | "finished" | "closed" => "done".to_string(),
+            "pending" | "todo" | "to_do" | "not_started" | "queued" | "open" | "" => {
+                "todo".to_string()
+            }
+            _ => s, // unknown status: keep the raw lowercased value (advisory)
+        };
+    }
+    if let Some(b) = obj
+        .get("completed")
+        .or_else(|| obj.get("done"))
+        .and_then(Value::as_bool)
+    {
+        return if b { "done" } else { "todo" }.to_string();
+    }
+    "todo".to_string()
+}
+
+/// The stable per-item key: the item's own `id` (string or number) when present and
+/// non-empty, else the zero-padded list index. Stable across events so latest-wins
+/// upserts land on the same row.
+fn item_id_of(item: &Value, idx: usize) -> String {
+    if let Some(obj) = item.as_object() {
+        let id = match obj.get("id") {
+            Some(Value::String(s)) => s.trim().to_string(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        };
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    format!("{idx:04}")
+}
+
+// ── SI3: touch-derived auto-claims from the fs WRITE camera ───────────────────
+//
+// docs/handoffs/sibling-intent.md SI3. The fs write camera (src/exec.rs
+// `emit_fs_delta`) publishes one `obs/fs/<encoded-canonical-path>` line per changed
+// file, carrying the acting session on the trace ENVELOPE (`session_id`, set via
+// `trace::Ids`) and the op in the payload. Turning a WRITE into an advisory
+// `code_claims` auto-claim is harness-agnostic, so it closes the gap that left
+// HOOKLESS codex/opencode siblings with no "last editing <path>" — parity with
+// claude's Write/Edit hook auto-claim. NOTE: claims are recorded via
+// `codesession::add_claim` (its own connection) AFTER the projection transaction
+// commits — doing it inside the open write-tx would self-deadlock on the ledger.
+
+/// If `kind` is an `obs/fs/<path>` WRITE-camera line (op create/modify/unlink) that
+/// carries a coding `session_id` on its envelope, return the `(session, path)` to
+/// auto-claim. None for a read-camera line (op `read`), a summary, a session-less
+/// line, or an undecodable path — those never claim.
+fn fs_touch_claim(line: &Value, kind: &str) -> Option<(String, String)> {
+    // Only the WRITE flavor of the shared obs/fs noun claims; reads/others skip.
+    let op = line
+        .get("payload")
+        .and_then(|p| p.get("op"))
+        .and_then(Value::as_str)?;
+    if !matches!(op, "create" | "modify" | "unlink") {
+        return None;
+    }
+    // The acting session rides the trace envelope (not the payload).
+    let session = line.get("session_id").and_then(Value::as_str)?;
+    if !session.starts_with("code-") {
+        return None;
+    }
+    let path = decode_fs_topic(kind)?;
+    Some((session.to_string(), path))
+}
+
+/// Decode an `obs/fs/<encoded-path>` topic back to the absolute path the camera
+/// bracketed: strip the `obs/fs/` prefix, split on the `/` level separators,
+/// percent-decode each segment, and re-root at `/` (encode_path drops the leading
+/// slash). None for an empty suffix (the filesystem root is never a file write).
+fn decode_fs_topic(kind: &str) -> Option<String> {
+    let suffix = kind.strip_prefix("obs/fs/")?;
+    if suffix.is_empty() {
+        return None;
+    }
+    let decoded: Vec<String> = suffix.split('/').map(decode_segment).collect();
+    Some(format!("/{}", decoded.join("/")))
+}
+
+/// Inverse of `topic::encode_segment` for one path segment: percent-decode `%XX`
+/// bytes (covers the encoder's `% + # /`), passing anything else through. Lenient on
+/// a trailing/partial `%` (kept literal). UTF-8 lossy on the decoded bytes.
+fn decode_segment(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn cursor(conn: &Connection) -> rusqlite::Result<i64> {
     Ok(conn
         .query_row(
@@ -394,6 +636,11 @@ fn save_cursor(conn: &Connection, offset: i64) -> rusqlite::Result<()> {
 pub fn project_trace(root: &Root) -> Result<usize> {
     let mut conn = crate::db::open(root)?;
     init_schema(&conn)?;
+    // SI2/SI3 read+write the shared coding-session tables owned by db.rs
+    // (`code_session_tasks`, `code_claims`, `code_sessions`); ensure they exist so
+    // the fold is self-sufficient even if the projection runs before any other
+    // codesession path has initialized the full schema. Idempotent.
+    crate::db::init_schema(&conn)?;
     let path = root.trace_file();
     let mut offset = cursor(&conn)?.max(0) as u64;
     let len = match std::fs::metadata(&path) {
@@ -425,6 +672,9 @@ pub fn project_trace(root: &Root) -> Result<usize> {
     let complete = &bytes[..consumed];
     let tx = conn.transaction()?;
     let mut applied = 0usize;
+    // SI3: fs-touch auto-claims collected during the fold, recorded AFTER commit
+    // (add_claim opens its own connection — see fs_touch_claim's note).
+    let mut fs_claims: Vec<(String, String)> = Vec::new();
 
     for line in complete.split(|b| *b == b'\n') {
         if line.is_empty() {
@@ -436,6 +686,16 @@ pub fn project_trace(root: &Root) -> Result<usize> {
         let Some(kind) = v.get("kind").and_then(Value::as_str) else {
             continue;
         };
+        // SI3: the fs WRITE camera (obs/fs/<path>) is harness-agnostic — turn a
+        // WRITE into an advisory auto-claim so hookless codex/opencode siblings also
+        // surface "last editing <path>". Other obs/fs lines (reads, summaries,
+        // session-less) are still ignored. Recorded post-commit, below.
+        if kind.starts_with("obs/fs/") {
+            if let Some(claim) = fs_touch_claim(&v, kind) {
+                fs_claims.push(claim);
+            }
+            continue;
+        }
         if !kind.starts_with("obs/agent/") {
             continue;
         }
@@ -449,6 +709,17 @@ pub fn project_trace(root: &Root) -> Result<usize> {
     }
     save_cursor(&tx, i64::try_from(new_offset).unwrap_or(i64::MAX))?;
     tx.commit()?;
+    // SI3: now that the projection write-tx is committed and its ledger lock
+    // released, record the fs-touch auto-claims via the shared `add_claim` path
+    // (mapping the acting session → its room/workdir exactly as the Write/Edit
+    // auto-claim does, so a manual claim and a touch collapse to one row). Advisory
+    // + best-effort: a failure here never fails the projection.
+    for (session, claim_path) in fs_claims {
+        if let Some((room, _workdir)) = crate::codesession::auto_claim_room_and_workdir(root, &session)
+        {
+            let _ = crate::codesession::add_claim(root, &room, &session, &claim_path);
+        }
+    }
     Ok(applied)
 }
 
@@ -1281,6 +1552,159 @@ mod tests {
                 "additive field {field} present in wire"
             );
         }
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    // ── sibling-intent (SI2 / SI3) ────────────────────────────────────────────
+
+    #[test]
+    fn si2_codex_todo_folds_and_selects_in_progress() {
+        let root = temp_root("si2-codex");
+        // codex `assistant/todo`: the harness clips `items` with `clip_value`, which
+        // SERIALIZES the array to a JSON STRING — fold it through that real shape.
+        let items = json!([
+            { "content": "step 1", "status": "completed" },
+            { "content": "step 2", "status": "in_progress" },
+            { "content": "step 3", "status": "pending" }
+        ])
+        .to_string();
+        append_trace(
+            &root,
+            "obs/agent/codex/code-si2codex/assistant/todo",
+            json!({ "ts": "2026-06-28T00:00:00.000Z", "items": items }),
+        );
+        project_trace(&root).unwrap();
+
+        // Three rows, normalized statuses, in_progress selected as the current task.
+        let conn = crate::db::open(&root).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM code_session_tasks WHERE elanus_session='code-si2codex'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+        let cur = crate::codesession::current_task(&root, "code-si2codex").unwrap();
+        assert_eq!(cur, ("step 2".to_string(), "in_progress".to_string()));
+
+        // Latest-wins + stale-reap: a shorter follow-up list drops the removed item.
+        let items2 = json!([{ "content": "only step", "status": "in_progress" }]).to_string();
+        append_trace(
+            &root,
+            "obs/agent/codex/code-si2codex/assistant/todo",
+            json!({ "ts": "2026-06-28T00:01:00.000Z", "items": items2 }),
+        );
+        project_trace(&root).unwrap();
+        let n2: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM code_session_tasks WHERE elanus_session='code-si2codex'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n2, 1, "the shrunk list reaps the removed items");
+        let cur2 = crate::codesession::current_task(&root, "code-si2codex").unwrap();
+        assert_eq!(cur2, ("only step".to_string(), "in_progress".to_string()));
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn si2_claude_todowrite_folds_from_stringified_input() {
+        let root = temp_root("si2-claude");
+        // Claude TodoWrite's obs `input` is the clip_value-stringified tool_input,
+        // i.e. a JSON STRING of `{ "todos": [ { content, status } ] }`.
+        let input = json!({ "todos": [
+            { "content": "write the fold", "status": "in_progress" },
+            { "content": "ship it", "status": "pending" }
+        ] })
+        .to_string();
+        append_trace(
+            &root,
+            "obs/agent/claude-code/code-si2cc/tool/TodoWrite/result",
+            json!({ "ts": "2026-06-28T00:00:00.000Z", "tool": "TodoWrite", "input": input }),
+        );
+        project_trace(&root).unwrap();
+        let cur = crate::codesession::current_task(&root, "code-si2cc").unwrap();
+        assert_eq!(cur, ("write the fold".to_string(), "in_progress".to_string()));
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn si3_fs_write_obs_line_produces_auto_claim() {
+        use std::io::Write as _;
+        let root = temp_root("si3-claim");
+        // A durable record so `auto_claim_room_and_workdir` resolves a room+workdir.
+        let workdir = root.dir.to_string_lossy().into_owned();
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-si3write".into(),
+                native_session: "n1".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: workdir.clone(),
+                room: None,
+            },
+        )
+        .unwrap();
+
+        // An fs WRITE camera line: obs/fs/<encoded path>, op=modify, with the acting
+        // session on the ENVELOPE (session_id) exactly as emit_fs_delta writes it.
+        let abs = root.dir.join("src").join("foo.rs");
+        let topic = format!("obs/fs/{}", crate::topic::encode_path(&abs));
+        let line = json!({
+            "ts": "2026-06-28T00:00:00.000Z",
+            "kind": topic,
+            "payload": { "op": "modify", "size": 3, "tool_call_id": "c1" },
+            "session_id": "code-si3write",
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.trace_file())
+            .unwrap();
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+
+        project_trace(&root).unwrap();
+
+        // The auto-claim lands in the workdir-derived room (record has no --room).
+        let canon = std::fs::canonicalize(&workdir)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&workdir));
+        let room = crate::codesession::workdir_room_id(&canon);
+        let conn = crate::db::open(&root).unwrap();
+        let claimed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM code_claims WHERE room=?1 AND session=?2",
+                rusqlite::params![room, "code-si3write"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed, 1, "an fs WRITE produces one advisory auto-claim");
+
+        // A READ-camera line on the same noun (op=read) must NOT claim.
+        let rline = json!({
+            "ts": "2026-06-28T00:01:00.000Z",
+            "kind": format!("obs/fs/{}", crate::topic::encode_path(&root.dir.join("src").join("read.rs"))),
+            "payload": { "op": "read", "via": "tool" },
+            "session_id": "code-si3write",
+        });
+        let mut f2 = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.trace_file())
+            .unwrap();
+        writeln!(f2, "{rline}").unwrap();
+        drop(f2);
+        project_trace(&root).unwrap();
+        let claimed2: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM code_claims WHERE session=?1",
+                rusqlite::params!["code-si3write"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed2, 1, "a READ event does not add a claim");
         std::fs::remove_dir_all(&root.dir).ok();
     }
 }

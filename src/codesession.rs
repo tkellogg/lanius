@@ -152,6 +152,13 @@ pub struct LiveSibling {
     /// `code_session_stats.updated_at` (its most-recent obs event). Lets a viewer
     /// judge alive-vs-stranded before touching the sibling's WIP.
     pub last_active: String,
+    /// SI2 (sibling-intent): what this sibling is currently working on, as
+    /// `(text, status)` selected from its `code_session_tasks` projection — the
+    /// `in_progress` item if any, else the most-recently-updated item. `None` when
+    /// the session has no projected task list yet (e.g. an opencode sibling, which
+    /// emits no todo event — honestly absent, not a fake empty list). `status` is
+    /// one of `todo|in_progress|done`.
+    pub current_task: Option<(String, String)>,
 }
 
 /// List the LIVE sibling sessions sharing `viewer`'s canonical workdir (SA2). A
@@ -221,12 +228,17 @@ pub fn live_siblings(root: &Root, viewer: &str, viewer_workdir: &str) -> Vec<Liv
                 continue; // a SIGKILL'd ghost — drop it
             }
         }
+        // SI2: enrich with the sibling's current task (one cheap extra SELECT on
+        // the open connection). Reuses the standalone selection logic so the note
+        // and a `whose`/`sessions` CLI verb all agree on which item is "current".
+        let current_task = current_task_on(&conn, &session);
         out.push((
             last_secs.unwrap_or(0),
             LiveSibling {
                 session,
                 agent_noun,
                 last_active,
+                current_task,
             },
         ));
     }
@@ -295,6 +307,37 @@ fn fresher_iso(a: &str, b: Option<&str>) -> String {
             _ => a.to_string(),
         },
     }
+}
+
+/// SI2 (sibling-intent): pick the task to DISPLAY for a session from its
+/// `code_session_tasks` rows on an EXISTING connection — the `in_progress` item if
+/// any (the most-recently-updated when several), else the most-recently-`updated_at`
+/// item. Returns `(text, status)`. None when the session has no projected task list
+/// (the projection has folded no todo event for it yet), the table doesn't exist, or
+/// on any query error — best-effort, never an error to the caller.
+fn current_task_on(conn: &rusqlite::Connection, session: &str) -> Option<(String, String)> {
+    conn.query_row(
+        "SELECT text, status FROM code_session_tasks
+          WHERE elanus_session = ?1
+          ORDER BY (status = 'in_progress') DESC, updated_at DESC, item_id ASC
+          LIMIT 1",
+        [session],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// SI2 (sibling-intent): a session's CURRENT task — the `in_progress` item if any,
+/// else the most-recently-updated item — as `(text, status)`. Standalone (opens its
+/// own connection) for the render + the `whose`/`sessions` CLI verbs; `live_siblings`
+/// uses `current_task_on` on its already-open connection. None when there is no
+/// projected task list for the session. `status` ∈ `todo|in_progress|done`.
+pub fn current_task(root: &Root, session: &str) -> Option<(String, String)> {
+    let conn = crate::db::open(root).ok()?;
+    let _ = crate::db::init_schema(&conn);
+    current_task_on(&conn, session)
 }
 
 /// Read a durable record by elanus session id. None if there is no such session
@@ -844,6 +887,127 @@ pub fn auto_claim_room_and_workdir(root: &Root, session: &str) -> Option<(String
         }
     };
     Some((room, workdir))
+}
+
+// ── SI4: change attribution — who owns this path? ─────────────────────────────
+//
+// docs/handoffs/sibling-intent.md SI4 (`whose-change`). Resolve a path to the
+// coding session that last claimed it, freshest-claim-wins, off `code_claims` —
+// which now carries claims from ALL THREE harnesses: claude's Write/Edit hook
+// auto-claim, a manual `elanus code claim`, and (SI3) the projection's fs-touch
+// auto-claim for hookless codex/opencode. Advisory, gates nothing: it answers
+// "which of these dirty files are mine, and who owns the rest?" — the exact
+// question the motivating incident got wrong by hand.
+
+/// Who owns a path: the session that holds the freshest `code_claims` claim on it,
+/// plus that session's agent noun, last-active recency, and current task — the
+/// answer `elanus code whose <path>` renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attribution {
+    /// The owning session id (`code-<id>`) — who is/was editing the path.
+    pub session: String,
+    /// The obs noun that session runs under (`claude-code` | `codex` | `opencode`).
+    pub agent_noun: String,
+    /// When that session was last active, RFC3339 — the FRESHER of its
+    /// `code_sessions.last_active` and the projection's `code_session_stats.updated_at`
+    /// (same recency rule as `live_siblings`). Empty when no record/stats exist.
+    pub last_active: String,
+    /// That session's current task TEXT (SI2), if it has a projected task list. None
+    /// for a harness that emits no todo event (opencode) — honestly absent.
+    pub current_task: Option<String>,
+}
+
+/// Resolve a lookup path to the canonical, absolute form claims are STORED in
+/// (`canonicalize_claim_path` in codeagent.rs and the SI3 fs-touch claim both store
+/// the canonicalized absolute path): a relative path is joined against the process
+/// CWD, then symlink-resolved best-effort (falling back to the lexical absolute when
+/// it no longer exists). This makes a `whose_path` lookup match an auto-claim
+/// recorded by the camera, which keys on the canonical path.
+fn canon_claim_lookup(path: &str) -> String {
+    let p = path.trim();
+    let pb = PathBuf::from(p);
+    let abs = if pb.is_absolute() {
+        pb
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(&pb)
+    } else {
+        pb
+    };
+    std::fs::canonicalize(&abs)
+        .unwrap_or(abs)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The session holding the freshest claim on `path` (exact path match), or None.
+/// Freshest-wins by `created_at` (the SI3 fs-touch and Write/Edit auto-claims
+/// refresh `created_at` on each write, so the live editor wins over a stale one).
+fn freshest_claim_holder(conn: &rusqlite::Connection, path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    conn.query_row(
+        "SELECT session FROM code_claims WHERE path = ?1
+          ORDER BY created_at DESC, session ASC LIMIT 1",
+        [path],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// A session's `(agent_noun, last_active)` for attribution: the noun off its durable
+/// record and the FRESHER of `code_sessions.last_active` and the projection's
+/// `code_session_stats.updated_at` (the same recency rule `live_siblings` uses).
+/// Empty strings when the session has no record (a claim whose session was never
+/// recorded — still attributed by id, just without enrichment).
+fn session_identity(conn: &rusqlite::Connection, session: &str) -> (String, String) {
+    let rec: Option<(String, String)> = conn
+        .query_row(
+            "SELECT agent_noun, last_active FROM code_sessions WHERE elanus_session = ?1",
+            [session],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let (agent_noun, last_active) = rec.unwrap_or_default();
+    let last_active = fresher_iso(&last_active, session_stats_updated_at(conn, session).as_deref());
+    (agent_noun, last_active)
+}
+
+/// SI4 (sibling-intent): which session owns `path`? Resolves the path to its owning
+/// coding session via the freshest `code_claims` claim — covering claude's hook
+/// auto-claims, manual `claim`s, AND the SI3 projection fs-touch auto-claims for
+/// hookless codex/opencode — then fills the owner's agent noun, last-active recency,
+/// and current task. The lookup path is canonicalized the same way claims are stored
+/// (absolute, symlink-resolved, relative resolved against the CWD) so it matches a
+/// camera-recorded claim; a verbatim string is also tried as a fallback for a manual
+/// claim recorded with no workdir base. None when no claim matches.
+pub fn whose_path(root: &Root, path: &str) -> Option<Attribution> {
+    let Ok(conn) = crate::db::open(root) else {
+        return None;
+    };
+    if crate::db::init_schema(&conn).is_err() {
+        return None;
+    }
+    let canon = canon_claim_lookup(path);
+    let session = freshest_claim_holder(&conn, &canon)
+        .or_else(|| freshest_claim_holder(&conn, path.trim()))?;
+    let (agent_noun, last_active) = session_identity(&conn, &session);
+    let current_task = current_task_on(&conn, &session).map(|(text, _status)| text);
+    Some(Attribution {
+        session,
+        agent_noun,
+        last_active,
+        current_task,
+    })
 }
 
 /// One recent message seen on a shared channel (C4 — agent-comms): a room's
