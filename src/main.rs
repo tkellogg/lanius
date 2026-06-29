@@ -1465,6 +1465,22 @@ fn run(cli: Cli) -> Result<()> {
                     // claims), M5. `elanus code claims [--json]`.
                     codeagent::claims_cmd(&root, rest)?;
                 }
+                "whose" => {
+                    // SI4 (sibling-intent): change attribution. `elanus code whose
+                    // <path>` or `elanus code whose --dirty [--json]` — map a path
+                    // (or the whole `git status` set) to its owning session, that
+                    // session's tool, last-active, and current task. Backed by the
+                    // `code_claims` projection (codesession::whose_path).
+                    codeagent::whose_cmd(&root, rest)?;
+                }
+                "ask" => {
+                    // sibling-resolution: a blocking deliver-and-wait. `elanus code
+                    // ask <session> "<question>" [--timeout SECS] [--priority N]` —
+                    // send a scoped question to a live sibling and block briefly for
+                    // the correlated reply (or "no answer — treat as theirs"). Thin
+                    // over the shipped deliver/inbox/correlation rails.
+                    codeagent::ask_cmd(&root, rest)?;
+                }
                 "project" => {
                     // Observability: run the trace->sqlite projection once now
                     // (the daemon also does this each tick). Useful to refresh the

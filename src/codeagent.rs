@@ -285,6 +285,8 @@ Commands:
   elanus code claim <path>                            announce an advisory edit claim
   elanus code unclaim <path>                          release an advisory edit claim
   elanus code claims [--json]                         show edit claims in this room
+  elanus code whose <path> | --dirty [--json]         attribute a path (or the git-dirty set) to its owning session
+  elanus code ask <session> \"<q>\" [--timeout N] [--priority N]  ask a live sibling and block for the reply
   elanus code project                                  refresh the trace->sqlite session projection
   elanus code sessions [--json]                        list coding sessions + stats
   elanus code session <id> [--json]                   one session: stats, timeline, resume command
@@ -1236,6 +1238,27 @@ pub fn record_delivery(
     worker_session: &str,
     message: &str,
 ) -> Result<i64> {
+    record_delivery_priority(root, requester, worker_session, message, 0).map(|(id, _corr)| id)
+}
+
+/// Like `record_delivery` but takes an `events.priority` AND returns the
+/// `correlation` that threads the whole round trip — the env-free core both
+/// `record_delivery` (priority 0, id-only façade) and `elanus code ask` call.
+///
+/// A non-zero priority rides the inbound delivery (`EmitOpts.priority`), so a
+/// HIGH-priority question (`elanus code ask … --priority 5`) reaches a live sibling
+/// **mid-turn** (the agent-comms HIGH-priority unseen-mail vector — Claude Code's
+/// `mid_cycle_mail_injection`) rather than only on its next turn. The returned
+/// correlation lets `ask` match the worker's completion reply on its OWN inbox: the
+/// daemon's `route_completion` publishes the reply back to the requester's mailbox
+/// carrying this SAME `correlation_id`.
+pub fn record_delivery_priority(
+    root: &Root,
+    requester: &str,
+    worker_session: &str,
+    message: &str,
+    priority: i64,
+) -> Result<(i64, String)> {
     let worker_session = worker_session.trim();
     if worker_session.is_empty() {
         bail!("usage: elanus code deliver <worker-session> \"<message>\"");
@@ -1307,13 +1330,14 @@ pub fn record_delivery(
         &conn,
         crate::events::EmitOpts {
             payload: Some(payload),
+            priority,
             correlation: Some(correlation.clone()),
             sender: Some(requester.clone()),
             ..crate::events::EmitOpts::new(&mailbox)
         },
     )
     .context("recording the delivery on the ledger")?;
-    Ok(id)
+    Ok((id, correlation))
 }
 
 // ── The spawn tool: create a worker and route completion back (D3) ───────────
@@ -2296,6 +2320,286 @@ pub fn inbox_cmd(root: &Root, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ── SI4 / sibling-resolution: `whose` (attribution) + `ask` (deliver-and-wait) ─
+//
+// The CLI surface of docs/handoffs/sibling-intent.md (SI4) and
+// docs/handoffs/sibling-resolution-skills.md. `whose` answers "which of these
+// dirty files are mine, and who owns the rest?" by mapping a path (or the whole
+// `git status` set) to its owning session via `codesession::whose_path`. `ask` is a
+// blocking deliver-and-wait: send a scoped question to a live sibling and block
+// briefly for the correlated reply, so an agent need not hand-roll the poll loop.
+
+/// SI1 (sibling-intent): render an RFC3339 timestamp as a humanized "time since"
+/// delta for the sibling note + `whose`/`ask`. "just now" / "30s ago" / "4m ago" /
+/// "1h ago" / "2d ago". An unparseable/empty timestamp degrades to "recently" — the
+/// note is advisory, so we never fabricate a precision we don't have.
+fn humanize_since(rfc3339: &str) -> String {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(rfc3339.trim()) else {
+        return "recently".to_string();
+    };
+    let secs = (chrono::Utc::now() - then.with_timezone(&chrono::Utc)).num_seconds();
+    if secs < 5 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// SI2 (sibling-intent): clip a task text for the compact sibling note / `whose`
+/// line (~80 chars, plain ellipsis — `clip`'s "[clipped N chars]" tail is too noisy
+/// for an inline task). Whitespace-trimmed so a wrapped todo renders on one line.
+fn clip_task(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 80;
+    if text.chars().count() <= MAX {
+        text
+    } else {
+        let head: String = text.chars().take(MAX).collect();
+        format!("{head}…")
+    }
+}
+
+/// `elanus code ask <session> "<question>" [--timeout SECS] [--priority N] [--json]`
+/// — a blocking deliver-and-wait (sibling-resolution skills "ask-sibling"). Sends
+/// the question to `<session>` threaded on a fresh correlation, then BLOCKS up to
+/// `--timeout` (default 20s) polling THIS session's OWN inbox (~1/s) for the
+/// correlated reply. Prints the reply on arrival; on timeout prints "no answer …
+/// treat the contended file as theirs" and returns Ok (silence is a legitimate
+/// answer — route around it, don't error). `--priority N` rides the delivery so a
+/// HIGH-priority question can reach the sibling mid-turn. Identity comes ONLY from
+/// the env the launcher set (never an argument), the same own-inbox-only guarantee
+/// `inbox` has.
+pub fn ask_cmd(root: &Root, args: &[String]) -> Result<()> {
+    let own_session = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
+    let own_noun = std::env::var(ENV_AGENT).ok().filter(|s| !s.is_empty());
+    let (Some(own_session), Some(own_noun)) = (own_session, own_noun) else {
+        bail!(
+            "elanus code ask must run inside a coding session \
+             (no {ENV_SESSION}/{ENV_AGENT} in the environment — run it from a \
+             session launched by `elanus code`)"
+        );
+    };
+
+    // Parse: first positional = target session; remaining positionals = the
+    // question; flags --timeout/--priority/--json may appear anywhere.
+    let mut target = String::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut timeout_secs: u64 = 20;
+    let mut priority: i64 = 0;
+    let mut want_json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--timeout" => {
+                i += 1;
+                timeout_secs = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| anyhow::anyhow!("--timeout needs a number of seconds"))?;
+            }
+            "--priority" => {
+                i += 1;
+                priority = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| anyhow::anyhow!("--priority needs an integer"))?;
+            }
+            "--json" => want_json = true,
+            other if target.is_empty() => target = other.to_string(),
+            other => words.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let question = words.join(" ");
+    if target.is_empty() || question.trim().is_empty() {
+        bail!(
+            "usage: elanus code ask <session> \"<question>\" [--timeout SECS] [--priority N] [--json]"
+        );
+    }
+
+    // Send the question threaded on a FRESH correlation, captured so we can match
+    // the worker's completion reply on our own inbox (route_completion echoes it).
+    let (_id, correlation) =
+        record_delivery_priority(root, &own_session, &target, &question, priority)?;
+    eprintln!(
+        "[code] asked {target} (corr {correlation}); waiting up to {timeout_secs}s for a reply"
+    );
+
+    // BLOCK: poll our own inbox ~1/s for a delivery carrying our correlation.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        // Best-effort: a transient inbox read error just retries next tick.
+        if let Ok(items) = codesession::inbox_for_session(root, &own_noun, &own_session, false) {
+            if let Some(reply) = items
+                .into_iter()
+                .find(|it| it.correlation.as_deref() == Some(correlation.as_str()))
+            {
+                if want_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "answered": true,
+                            "from": reply.from,
+                            "correlation": reply.correlation,
+                            "message": reply.message,
+                        }))?
+                    );
+                } else {
+                    let from = reply.from.as_deref().unwrap_or(target.as_str());
+                    println!("{from} answered: {}", clip(&reply.message, 4000));
+                }
+                // Mark it seen so it doesn't re-surface in the per-turn inbox count.
+                let _ = codesession::mark_inbox_seen(root, &own_session, &[reply.event_id]);
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    if want_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "answered": false,
+                "session": target,
+                "timeout_secs": timeout_secs,
+            }))?
+        );
+    } else {
+        println!(
+            "no answer from {target} within {timeout_secs}s — treat the contended file as theirs"
+        );
+    }
+    Ok(())
+}
+
+/// `elanus code whose <path>` / `elanus code whose --dirty [--json]` — change
+/// attribution (SI4). Maps a path (or the whole `git status --porcelain` set) to its
+/// owning coding session via `codesession::whose_path`, printing the owner, its
+/// tool, humanized last-active, and current task. A path no session claims reads as
+/// "unattributed" (likely the viewer's own work, or untracked-by-elanus).
+pub fn whose_cmd(root: &Root, args: &[String]) -> Result<()> {
+    let want_json = args.iter().any(|a| a == "--json");
+    let want_dirty = args.iter().any(|a| a == "--dirty");
+    let viewer = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
+    let viewer = viewer.as_deref();
+
+    if want_dirty {
+        // Annotate the whole working-tree change set. `git status --porcelain` in
+        // the CWD (std::process::Command — no shell), one attribution per path.
+        let out = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .context("running `git status --porcelain` (is this a git repo?)")?;
+        if !out.status.success() {
+            bail!(
+                "`git status --porcelain` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let paths = parse_porcelain_paths(&text);
+        if want_json {
+            let arr: Vec<Value> = paths.iter().map(|p| whose_json(root, p, viewer)).collect();
+            println!("{}", serde_json::to_string_pretty(&json!(arr))?);
+        } else if paths.is_empty() {
+            println!("(working tree clean — nothing to attribute)");
+        } else {
+            for p in &paths {
+                println!("{}", whose_line(root, p, viewer));
+            }
+        }
+        return Ok(());
+    }
+
+    // Single-path form: the first non-flag argument.
+    let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
+        bail!("usage: elanus code whose <path>   |   elanus code whose --dirty [--json]");
+    };
+    if want_json {
+        println!("{}", serde_json::to_string_pretty(&whose_json(root, path, viewer))?);
+    } else {
+        println!("{}", whose_line(root, path, viewer));
+    }
+    Ok(())
+}
+
+/// Extract the changed-file paths from `git status --porcelain` output. Each line is
+/// `XY <path>` (cols 0..2 are the status code, col 2 a space, the path from col 3);
+/// a rename is `XY <old> -> <new>` — we take the post-rename path. Git quotes a path
+/// with special chars, so a surrounding pair of quotes is stripped. Bytes 0..3 are
+/// always ASCII, so the slice never splits a multibyte char.
+fn parse_porcelain_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let rest = line[3..].trim();
+        let path = match rest.rsplit_once(" -> ") {
+            Some((_old, new)) => new,
+            None => rest,
+        };
+        let path = path.trim().trim_matches('"');
+        if !path.is_empty() {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
+/// One human-readable attribution line for `whose`.
+fn whose_line(root: &Root, path: &str, viewer: Option<&str>) -> String {
+    match codesession::whose_path(root, path) {
+        Some(att) => {
+            let since = humanize_since(&att.last_active);
+            let task = att
+                .current_task
+                .as_deref()
+                .map(|t| format!(" — {}", clip_task(t)))
+                .unwrap_or_default();
+            let mine = viewer == Some(att.session.as_str());
+            let yours = if mine { ", yours" } else { "" };
+            format!(
+                "{path}  ← {} ({}, last active {since}{yours}){task}",
+                att.session, att.agent_noun
+            )
+        }
+        None => format!("{path}  ← unattributed (no session claims it — likely yours)"),
+    }
+}
+
+/// One JSON attribution object for `whose --json`.
+fn whose_json(root: &Root, path: &str, viewer: Option<&str>) -> Value {
+    match codesession::whose_path(root, path) {
+        Some(att) => json!({
+            "path": path,
+            "attributed": true,
+            "session": att.session,
+            "tool": att.agent_noun,
+            "last_active": att.last_active,
+            "last_active_human": humanize_since(&att.last_active),
+            "current_task": att.current_task,
+            "mine": viewer == Some(att.session.as_str()),
+        }),
+        None => json!({
+            "path": path,
+            "attributed": false,
+            "session": Value::Null,
+            "mine": Value::Null,
+        }),
+    }
+}
+
 // ── M5: advisory edit claims (run inside a session) ───────────────────────────
 //
 // `elanus code claim <path>` / `elanus code unclaim <path>` record/clear an
@@ -3018,11 +3322,26 @@ divide the work, nothing is locked): "
             .iter()
             .take(MAX_NAMED)
             .map(|s| {
+                // SI1: humanized recency so a viewer can judge alive-vs-stranded
+                // before touching a sibling's WIP.
+                let since = humanize_since(&s.last_active);
+                // SI2: the sibling's CURRENT task, when it has a projected task list.
+                // None → render nothing (opencode emits no todo event → honestly
+                // absent, never a faked empty list). Quoted + clipped (~80 chars).
+                let task = s
+                    .current_task
+                    .as_ref()
+                    .map(|(text, status)| format!(": {status} {:?}", clip_task(text)))
+                    .unwrap_or_default();
+                // SA2/SA3: the file it last claimed (auto/manual), when known.
                 let touching = last_path
                     .get(s.session.as_str())
                     .map(|p| format!(", last editing {}", clip(p, 200)))
                     .unwrap_or_default();
-                format!("{} ({}){}", s.session, s.agent_noun, touching)
+                format!(
+                    "{} ({}, last active {since}){task}{touching}",
+                    s.session, s.agent_noun
+                )
             })
             .collect();
         out.push_str(&named.join("; "));
@@ -5429,6 +5748,10 @@ fn capture_opencode_stream(
                 body,
             );
         }
+        // SI1 (sibling-intent): opencode is hookless too — refresh `last_active`
+        // once per stream event so a long-running opencode session stays "live"
+        // to its siblings between resumes. Best-effort.
+        let _ = codesession::bump_last_active(root, session);
     }
     summary
 }
@@ -5782,6 +6105,10 @@ fn capture_codex_stream(
                 &obs_topic(agent, session, &leaf),
                 body,
             );
+            // SI1 (sibling-intent): codex is hookless, so its `last_active` would
+            // only bump on resume; refresh it once per mapped stream event so a
+            // long-running codex session stays "live" to its siblings. Best-effort.
+            let _ = codesession::bump_last_active(root, session);
         }
     }
     summary
@@ -6587,6 +6914,12 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
         &obs_topic(&agent, &session, &leaf),
         body,
     );
+
+    // SI1 (sibling-intent): keep `code_sessions.last_active` genuinely fresh from
+    // the per-event capture path. Claude fires this hook per tool event, so a
+    // long-running session never reads as stranded to a sibling between resumes.
+    // Best-effort: a bump failure must never break the hook or the session.
+    let _ = codesession::bump_last_active(root, &session);
 
     // READ CAMERA — M1 (read-provenance handoff). For Claude Code only, ALSO
     // project read-shaped tool calls (Read/Grep/Glob) into the WRITE camera's
