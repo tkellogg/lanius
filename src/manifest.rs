@@ -31,6 +31,8 @@ pub struct Manifest {
     #[serde(default)]
     pub mcp: Vec<McpDecl>,
     #[serde(default)]
+    pub harness: Vec<HarnessDecl>,
+    #[serde(default)]
     pub throttle: BTreeMap<String, ThrottleDecl>,
     #[serde(default)]
     pub config: ConfigDecl,
@@ -68,6 +70,7 @@ impl Default for Manifest {
             provider: Vec::new(),
             stage: Vec::new(),
             mcp: Vec::new(),
+            harness: Vec::new(),
             throttle: BTreeMap::new(),
             config: ConfigDecl::default(),
             inherit_to_subagents: default_inherit_to_subagents(),
@@ -258,6 +261,21 @@ fn default_mcp_transport() -> String {
     "stdio".into()
 }
 
+/// A package-declared coding harness adapter. `name` is the CLI verb
+/// (`elanus code <name>`), aliases are alternate verbs, `agent_noun` is the obs
+/// noun (defaulting to `name` after parse), and `run` is the package-relative
+/// adapter binary.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessDecl {
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub agent_noun: String,
+    pub run: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ThrottleDecl {
     pub max_concurrent: Option<i64>,
@@ -296,7 +314,7 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
     }
     let raw = std::fs::read(&f)?;
     let s = String::from_utf8_lossy(&raw);
-    let m: Manifest = toml::from_str(&s).with_context(|| format!("parsing {}", f.display()))?;
+    let mut m: Manifest = toml::from_str(&s).with_context(|| format!("parsing {}", f.display()))?;
     if let Some(p) = &m.process {
         if p.mode != "exec" && p.mode != "daemon" {
             anyhow::bail!(
@@ -348,6 +366,42 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
             );
         }
     }
+    for h in &mut m.harness {
+        if h.agent_noun.is_empty() {
+            h.agent_noun = h.name.clone();
+        }
+        if !crate::topic::valid_name(&h.name) || h.name.contains('/') {
+            anyhow::bail!(
+                "{}: harness name {:?} must be one topic level (no + # /)",
+                f.display(),
+                h.name
+            );
+        }
+        if !crate::topic::valid_name(&h.agent_noun) || h.agent_noun.contains('/') {
+            anyhow::bail!(
+                "{}: harness agent_noun {:?} must be one topic level (no + # /)",
+                f.display(),
+                h.agent_noun
+            );
+        }
+        for alias in &h.aliases {
+            if !crate::topic::valid_name(alias) || alias.contains('/') {
+                anyhow::bail!(
+                    "{}: harness alias {:?} must be one topic level (no + # /)",
+                    f.display(),
+                    alias
+                );
+            }
+        }
+        if Path::new(&h.run).is_absolute() {
+            anyhow::bail!(
+                "{}: harness {:?} run path must be relative to the package dir, got {}",
+                f.display(),
+                h.name,
+                h.run
+            );
+        }
+    }
     // code_hash = each referenced executable's bytes in a fixed order
     // (relative path + contents, so a rename is also a change). A missing
     // script hashes as its path + a sentinel — its later appearance is itself
@@ -360,6 +414,7 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
     runs.extend(m.provider.iter().map(|p| p.run.clone()));
     runs.extend(m.stage.iter().map(|s| s.run.clone()));
     runs.extend(m.mcp.iter().map(|s| s.run.clone()));
+    runs.extend(m.harness.iter().map(|h| h.run.clone()));
     runs.sort();
     runs.dedup();
     let mut code = Sha256::new();
@@ -591,6 +646,30 @@ default = "many"
         .unwrap();
         std::fs::write(dir.join("scripts/stage"), "#!/bin/sh\ncat\n").unwrap();
         assert!(load(&dir).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn harness_declarations_parse_with_defaults() {
+        let dir = std::env::temp_dir().join(format!("el-man-harness-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join("elanus.toml"),
+            r#"
+[[harness]]
+name = "echo"
+aliases = ["ec"]
+run = "bin/adapter"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("bin/adapter"), "#!/bin/sh\necho hi\n").unwrap();
+        let lm = load(&dir).unwrap().unwrap();
+        let h = &lm.manifest.harness[0];
+        assert_eq!(h.name, "echo");
+        assert_eq!(h.aliases, vec!["ec"]);
+        assert_eq!(h.agent_noun, "echo");
+        assert_eq!(h.run, "bin/adapter");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -62,6 +62,8 @@
 
 use crate::buscli;
 use crate::codesession;
+use crate::manifest::HarnessDecl;
+use crate::packages;
 use crate::paths::Root;
 use crate::topic;
 use anyhow::{bail, Context, Result};
@@ -915,6 +917,38 @@ fn parse_harness(s: &str) -> Result<&'static dyn Harness> {
     harness(s).ok_or_else(|| {
         anyhow::anyhow!("unknown coding tool {s:?} (supported: claude, codex, opencode)")
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalHarness {
+    pub package: String,
+    pub package_dir: PathBuf,
+    pub decl: HarnessDecl,
+}
+
+/// Resolve a package-declared coding harness from the active profile's package
+/// path. Built-in harnesses are resolved before this fallback; this function
+/// only answers for `[[harness]] name = ...` or its aliases.
+pub fn find_external_harness(
+    root: &Root,
+    profile_name: &str,
+    tool: &str,
+) -> Result<Option<ExternalHarness>> {
+    for pkg in packages::discover_for_profile(root, profile_name)? {
+        let Some(lm) = &pkg.manifest else {
+            continue;
+        };
+        for decl in &lm.manifest.harness {
+            if decl.name == tool || decl.aliases.iter().any(|alias| alias == tool) {
+                return Ok(Some(ExternalHarness {
+                    package: pkg.name,
+                    package_dir: pkg.dir,
+                    decl: decl.clone(),
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 // ── Inbound delivery: mailbox → resume (M2-B) ────────────────────────────────
@@ -3526,6 +3560,132 @@ fn build_resume_message(root: &Root, agent_noun: &str, session: &str, message: &
     }
 }
 
+fn launch_external_harness(
+    root: &Root,
+    external: ExternalHarness,
+    args: &[String],
+    headless: bool,
+    want_brief: bool,
+    requested_grants: codesession::RequestedGrants,
+    parent: Option<String>,
+    skills: &[(String, PathBuf)],
+) -> Result<()> {
+    let session = launch_session_id(root);
+    let principal = session.clone();
+    let agent = external.decl.agent_noun.clone();
+    let mode = if headless { Mode::Headless } else { Mode::Tui };
+    let mode_str = match mode {
+        Mode::Tui => "tui",
+        Mode::Headless => "headless",
+    };
+    let workdir = std::env::current_dir().unwrap_or_else(|_| root.dir.clone());
+    let adapter = external.package_dir.join(&external.decl.run);
+    if !adapter.exists() {
+        bail!(
+            "external harness {:?} from package {:?} points at missing adapter {}",
+            external.decl.name,
+            external.package,
+            adapter.display()
+        );
+    }
+
+    let token = codesession::mint(
+        root,
+        &principal,
+        &agent,
+        std::process::id() as i32,
+        parent.as_deref(),
+        requested_grants,
+    )
+    .with_context(|| format!("minting the session credential for {principal}"))?;
+    let bus_token = token.secret.clone();
+
+    let scratch = root.run_dir().join(&session);
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("creating run scratch {}", scratch.display()))?;
+    let skills_dir = scratch.join("skills");
+
+    let prompt = (!args.is_empty()).then(|| args.join(" "));
+    let brief_text = want_brief.then(|| briefing(&session));
+    // The workdir-derived coordination room (SA1) — same as a built-in session, so the
+    // external adapter's auto-claims land where siblings see them.
+    let room = resolve_room(None, &workdir);
+
+    // Setup + exec inside the closure so the scratch/token cleanup below ALWAYS runs,
+    // even if a setup step (skill link, record, room join) fails.
+    let status_result = (|| -> Result<std::process::ExitStatus> {
+        if !skills.is_empty() {
+            link_skill_packages(&skills_dir, skills)
+                .with_context(|| format!("linking skills into {}", skills_dir.display()))?;
+        }
+        codesession::upsert_record(
+            root,
+            &codesession::SessionRecord {
+                elanus_session: session.clone(),
+                native_session: session.clone(),
+                tool: external.decl.name.clone(),
+                agent_noun: agent.clone(),
+                workdir: workdir.to_string_lossy().into_owned(),
+                room: None,
+            },
+        )
+        .with_context(|| format!("recording external harness session {session}"))?;
+        // Join the coordination room so this session's advisory claims are REAPED when
+        // it dies (reap_dead_members keys on code_room_members) — parity with built-ins.
+        let _ = codesession::set_room(root, &session, &room);
+        let _ = codesession::join_room(
+            root,
+            &room,
+            &session,
+            &agent,
+            std::process::id() as i32,
+        );
+
+        let mut cmd = std::process::Command::new(&adapter);
+        scrub_launch_control_env(&mut cmd);
+        cmd.current_dir(&workdir)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .env("ELANUS_ROOT", &root.dir)
+            .env(ENV_SESSION, &session)
+            .env(ENV_AGENT, &agent)
+            .env("ELANUS_PACKAGE", &principal)
+            .env(crate::harness::ENV_BUS_TOKEN, &bus_token)
+            .env(crate::harness::ENV_WORKDIR, &workdir)
+            .env(crate::harness::ENV_MODE, mode_str)
+            .env(crate::harness::ENV_TOOL, &external.decl.name);
+        if let Some(prompt) = &prompt {
+            cmd.env(crate::harness::ENV_PROMPT, prompt);
+        }
+        if let Some(brief) = &brief_text {
+            cmd.env(crate::harness::ENV_BRIEFING, brief);
+        }
+        if !skills.is_empty() {
+            cmd.env(crate::harness::ENV_SKILLS_DIR, &skills_dir);
+        }
+        eprintln!(
+            "[code] launching external harness {} from package {} as session {session}",
+            external.decl.name, external.package
+        );
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("launching external adapter {}", adapter.display()))?;
+        child
+            .wait()
+            .with_context(|| format!("waiting for external adapter {}", adapter.display()))
+    })();
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    codesession::retire(root, &principal);
+
+    let status = status_result?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
 /// `elanus code <tool> [args...]` — launch the real coding agent, observed.
 pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) -> Result<()> {
     // If this launcher is itself running inside a coding session, capture that
@@ -3580,7 +3740,24 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
         .filter(|s| !s.is_empty())
         .map(|_| spawn_timeout_secs());
 
-    let tool = parse_harness(tool)?;
+    let tool = match harness(tool) {
+        Some(tool) => tool,
+        None => {
+            if let Some(external) = find_external_harness(root, &profile_name, tool)? {
+                return launch_external_harness(
+                    root,
+                    external,
+                    args,
+                    headless,
+                    want_brief,
+                    requested_grants,
+                    parent,
+                    &skills,
+                );
+            }
+            parse_harness(tool)?
+        }
+    };
 
     // M2 (model-providers): `elanus code --provider <name> <tool> …` points this
     // launch at a named provider. GATED ENTIRELY on `--provider` being present —
