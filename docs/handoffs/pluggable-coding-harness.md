@@ -65,17 +65,14 @@ trusted process with `$ELANUS_ROOT`). A fully bus-only variant — claims/record
 messages a core subscriber persists — is the harder, more decoupled future (works
 remotely, no shared db file); name it, don't block on it.
 
-### 2. Dispatch — discover an external adapter when the tool isn't built-in
-`elanus code <x>`: if `<x>` is not a built-in `Harness`, resolve an external adapter:
-- **Primary: a package that declares `[[harness]]` in its `elanus.toml`** — so the
-  adapter inherits package discovery, the fenced/scoped bus token, grants, and the
-  sandbox (capabilities-as-grants, the elanus doctrine). The manifest names the verb
-  (`name = "gemini"`), the agent noun, the adapter binary (`run = "..."`), and which
-  capture cells it supports.
-- **Fallback: `elanus-code-harness-<x>` on PATH** — the git-style zero-config path for
-  a quick local adapter, with no identity scoping (use the package path for anything
-  shared/granted).
-Built-in-first, external-fallback — exactly git's built-in vs `git-foo` model.
+### 2. Dispatch — ONE way: a package that declares `[[harness]]`
+`elanus code <x>` resolves the package whose `elanus.toml` declares `[[harness]]` with
+`name = "<x>"`. That's the only mechanism — same discovery + grant + scoped-token +
+sandbox path as every other package (capabilities-as-grants, the elanus doctrine; one
+way to do things). The manifest names the verb (`name`), aliases, the agent noun, the
+adapter binary (`run`, relative to the package dir), and the bus grants the adapter
+needs (`[request]`). No PATH fallback, no second mechanism — a harness is a package,
+full stop.
 
 ### 3. The launch + obs contract — what core hands over, what the adapter must emit
 - **Core → adapter (env/args):** `ELANUS_ROOT`, `ELANUS_CODE_SESSION`, `ELANUS_AGENT`
@@ -97,21 +94,23 @@ Built-in-first, external-fallback — exactly git's built-in vs `git-foo` model.
   `codex` (or `opencode`) as an adapter that uses only `Ctx`, in-process at first.
   Acceptance: that harness behaves identically through the SDK — the proof an outsider
   could have written it. (This mirrors how opencode validated the `Harness` trait.)
-- **PH3 — external dispatch + a reference external adapter.** Add the `[[harness]]`
-  manifest + the PATH fallback; ship a tiny reference adapter package (even an "echo"
-  harness, or codex-as-an-external-package). Acceptance: `elanus code <ref>` runs a
-  harness that lives entirely outside the elanus binary, captured to the bus.
-- **PH4 — docs rewrite.** Reframe [../coding-harness-onboarding.md](../coding-harness-onboarding.md)
-  so the FIRST thing a reader reaches for is "build an adapter package on the SDK,"
-  with the in-tree `Harness` trait demoted to "how the built-ins work / advanced." The
-  onboarding checklist becomes "what your adapter must emit," not "what to edit in
-  elanus."
+- **PH3 — `[[harness]]` package dispatch + a reference external adapter.** Add the
+  `[[harness]]` manifest + the `elanus code <x>` → package resolution (the one
+  mechanism); ship a tiny reference adapter package (even an "echo" harness, or
+  codex-as-an-external-package). Acceptance: `elanus code <ref>` runs a harness that
+  lives entirely outside the elanus binary, captured to the bus.
+- **PH4 — migrate the built-ins + docs.** Reimplement claude/codex/opencode as stock
+  harness packages seeded by `init` (like the stock skills) and DELETE the `Harness`
+  trait + `HARNESSES` registry — one way, no dual path. The onboarding guide already
+  leads with the package recipe; finalize it once the SDK is real.
 
 ## Identity & trust
 A package-declared adapter gets a **scoped session bus token** and ledger grants like
 any package — homogeneous authority (the user's own tools cooperating, no trust
-boundary between them; [security.md] doctrine). The PATH fallback has no scoping, so
-it's for local/dev adapters only; anything shared rides the package path. The adapter
+boundary between them; [security.md] doctrine). Because a harness is just a package,
+it inherits the same approve/grant/sandbox story as every other capability — that's a
+reason to have only the one mechanism (a raw PATH binary would have no scoping). The
+adapter
 launches the underlying tool with the tool's OWN auth (scrub elanus's provider creds),
 exactly as the built-ins do.
 
@@ -119,8 +118,11 @@ exactly as the built-ins do.
 - **A stable API surface** (the `Ctx` + the obs contract) elanus must version — but
   it's ~90% the already-stable obs grammar; the genuinely new part is `Ctx`'s method
   signatures.
-- **Two paths coexist** (in-process trait built-ins + external SDK adapters) until/if
-  the built-ins migrate; the envelope grows one branch (built-in vs exec-adapter).
+- **The built-ins migrate to packages** — the end state is ONE way: every harness is a
+  package, the `Harness` trait + `HARNESSES` registry are deleted (claude/codex/opencode
+  become stock harness packages seeded by `init`, like the stock skills). A transitional
+  window where the trait built-ins and the first package adapters coexist is fine, but
+  it's a migration, not a permanent dual path — don't enshrine two ways.
 - **Capture for external adapters is self-contained** — an external adapter does its
   own hooks/stream/SSE/rollout capture and emits obs, rather than plugging into the
   trait's `run_*_capture`. The SDK should offer capture helpers (a JSONL-stream reader,

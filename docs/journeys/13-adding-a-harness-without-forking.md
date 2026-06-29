@@ -74,9 +74,11 @@ elanus PR, no fork, no merge wait.
 # The catch worth naming
 A library + a dispatch contract is a *stable API surface* elanus must then keep — but
 it's mostly the obs grammar elanus already documents
-([../topics.md](../topics.md)), so the new surface is small. And the built-ins can
-stay compiled-in at first; the external path is the *extension* path, exactly like
-git ships built-in commands plus a `git-foo` PATH fallback.
+([../topics.md](../topics.md)), so the new surface is small. And there should be just
+ONE way: a harness is a package, the same as everything else. The built-ins
+(claude/codex/opencode) migrate to stock harness packages too — a transitional window
+where the old trait and the first package adapters coexist is fine, but the end state
+is one mechanism, not two.
 
 I don't want to fork elanus to add my tool. I want to write a hundred-line adapter on
 top of an SDK and drop it in as a package. Make the harness a package, not a PR.
@@ -85,6 +87,6 @@ top of an SDK and drop it in as a package. Make the harness a package, not a PR.
 
 [../handoffs/pluggable-coding-harness.md](../handoffs/pluggable-coding-harness.md) —
 the `elanus-harness` adapter SDK (the orchestration verbs as a library), the
-package-declared (`[[harness]]`) + PATH dispatch fallback, and the launch/obs
+package-declared (`[[harness]]`) dispatch — the one mechanism — and the launch/obs
 contract; with the onboarding guide rewritten to lead with "build an adapter package,"
 not "edit the source."

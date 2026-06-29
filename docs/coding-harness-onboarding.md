@@ -10,167 +10,184 @@ You want to drive a new coding tool (gemini-cli, aider, cursor-cli, …) through
 the way `claude`/`codex`/`opencode` are: `elanus code <tool> "<task>"`, captured to the
 bus, resumable, briefed, dispatchable, skill-equipped, sibling-aware.
 
-## Start here: build an adapter, don't fork elanus
+**There is one way to do this: ship a harness as a package** — the same distribution
+mechanism as every other elanus capability (a skill, a provider, a stage, a daemon
+actor). You write a small adapter binary, drop it in your elanus root's `packages/`
+with an `elanus.toml`, grant it, and `elanus code <tool>` runs it. No fork of elanus,
+no PR.
 
-The intended way to add a harness is to **write a small adapter and ship it as a
-package** — no elanus PR. Your adapter is the tool-specific 20% (launch the tool, read
-its event stream); an `elanus-harness` SDK is the shared 80% (session identity, the
-bus, edit-claims, comms). elanus hands your adapter a session (id, bus token, workdir,
-mode, prompt, briefing, skills dir); you launch your tool, and for each event call
-`ctx.emit(...)` / `ctx.claim(path)` / `ctx.record(native_id)`. Declare `[[harness]]` in
-your package's `elanus.toml` and `elanus code <yourtool>` discovers it.
+> **Status:** the `[[harness]]` manifest + dispatch + the `elanus-harness` adapter SDK
+> are speced in [handoffs/pluggable-coding-harness.md](handoffs/pluggable-coding-harness.md)
+> (why: [journeys/13-adding-a-harness-without-forking.md](journeys/13-adding-a-harness-without-forking.md))
+> and not yet implemented. This is the canonical recipe for that one way. (The three
+> built-ins are currently in-tree trait impls; they are migrating to packages — you do
+> not write a trait.)
 
-> **Status:** the adapter SDK + package dispatch is the TARGET shape, speced in
-> [handoffs/pluggable-coding-harness.md](handoffs/pluggable-coding-harness.md) (why:
-> [journeys/13-adding-a-harness-without-forking.md](journeys/13-adding-a-harness-without-forking.md)).
-> Until it lands, harnesses are added in-tree against the `Harness` trait (below).
-> Either way the REQUIREMENTS are the same — what your adapter must expose and emit —
-> so the capability ladder and checklist below are what you implement regardless of
-> whether you ship a package or (for now) a trait impl. Read the requirements as "what
-> my adapter does," not "what I edit in elanus."
+## What you build
 
-## The in-tree seam (how the built-ins work today): one trait, one registry line
-
-Adding a built-in harness is **one `impl Harness` + one entry in `HARNESSES`**
-(`src/codeagent.rs`). The launch envelope never matches on a concrete tool; it drives
-everything off the trait. The structs are zero-sized (`&'static dyn`).
+A **harness package** is a directory:
 
 ```
-static HARNESSES: &[&dyn Harness] = &[&ClaudeCode, &Codex, &OpenCode /*, &YourTool */];
+harness-gemini/                 # the package (dir name is convention: harness-<tool>)
+├── elanus.toml                 # the manifest: declares [[harness]] + bus grants
+└── bin/
+    └── adapter                 # your adapter binary (any name; the manifest points at it)
 ```
 
-Trait surface (`src/codeagent.rs` ~415): `id`, `aliases`, `agent_noun` (the
-`obs/agent/<noun>/…` bus identity), `binary`, `capture(mode) -> Capture`,
-`mode_for(headless) -> Mode`, `settings` (hook config or None), `map_event`,
-`resume_command`, `interactive_resume_args`, and the capture runners
-(`run_stream_capture`, `run_tui_rollout_import`, `run_tui_server_events`,
-`resume_stream_capture`).
+Your **adapter** is a small program (write it in Rust against the `elanus-harness`
+crate — the supported path; any executable that speaks the obs contract works). elanus
+mints the session and hands the adapter its identity (env); the adapter launches the
+tool, watches it, and reports. The whole thing is roughly:
 
-## The two axes
+```rust
+fn main() -> elanus_harness::Result<()> {
+    let ctx = elanus_harness::Ctx::from_env()?;   // session id, bus token, root, workdir,
+                                                  // mode, prompt, briefing, skills dir
+    let mut child = launch_gemini(&ctx)?;         // YOUR 20%: spawn the tool
+    for ev in gemini_events(&mut child) {         // YOUR 20%: parse its stream/hooks/SSE
+        ctx.emit(ev.leaf, ev.body);               // → obs/agent/<noun>/<session>/<leaf>
+        if let Some(p) = ev.edited_path { ctx.claim(&p); }       // advisory edit-claim
+        if let Some(id) = ev.native_session { ctx.record(id); }  // durable resume record
+    }
+    ctx.finish(child.wait()?)
+}
+```
 
-**Mode** (what the human asked for): `Tui` (bare `elanus code <tool>`, interactive,
-inherited stdio) vs `Headless` (`--headless`, captured one-shot worker).
+The SDK is the shared 80% (identity, the bus, claims, comms, last-active); your adapter
+is the tool-specific 20% (launch + translate). See the SDK surface in the handoff.
 
-**Capture** (how elanus observes that mode) — pick per `(tool, mode)` cell:
+## The manifest: `elanus.toml`
 
-| Capture | Live? | What it needs from the tool | Used by |
-|---|---|---|---|
-| `HookBridge` | ✅ live | a **hook system** that fires on tool calls + a way to point it at a generated config | claude (both cells); **codex TUI** (hook bridge) |
-| `StreamJson` | ✅ live | a **non-interactive JSON event stream** (`--json`/`--format json` on a one-shot run) | codex/opencode headless |
-| `ServerEvents` | ✅ live | a **client/server model**: a `serve` that emits an event stream (SSE/WS) you can subscribe to + an `attach` so the human still drives a TUI | opencode TUI |
-| `RolloutImport` | ❌ post-hoc | only an on-disk **session transcript** written as it runs; imported AFTER exit | codex TUI fallback |
-| `Lifecycle` | ❌ brackets only | nothing — just start/stop brackets when there's no observable channel at all | (floor; avoid) |
+```toml
+# Declares this package as a coding harness. `elanus code gemini …` resolves here.
+[[harness]]
+name       = "gemini"            # the verb: `elanus code gemini`
+aliases    = ["gem"]             # optional extra verbs
+agent_noun = "gemini"            # the bus identity: obs/agent/gemini/<session>/…
+run        = "bin/adapter"       # the adapter binary, RELATIVE to the package dir
 
-**The ranking is the requirement ladder.** Prefer a live cell. A tool with hooks or a
-JSON stream or a served event stream gets real-time capture (and real-time
-sibling-awareness / auto-claims). A tool that exposes only a transcript file gets
-post-hoc `RolloutImport` — usable, but its events are not live (siblings can't see it
-until it exits). A tool that exposes nothing falls to `Lifecycle` brackets.
+# The bus authority the adapter needs (deny-by-default, like every package).
+[request]
+publish = ["obs/agent/gemini/#"] # to emit its session's observations
+# add subscribe/comms grants here if the adapter uses the inbox/deliver rails
+```
 
-## Capability checklist — what a harness must expose, by concern
+`run` is resolved relative to the package directory (same as a daemon package's
+`[process].run`).
 
-For each concern: what's required, and how the three existing harnesses solve it (so
-you can pattern-match a new tool).
+## Install it — from a fresh repo into your elanus root
 
-### 1. Live observation (capture) — REQUIRED for real-time features
-The single most important question: **how can a supervising process watch this tool's
-tool-calls/edits as they happen?** Options, best first:
-- **Hooks** — claude (`settings.json` PreToolUse/PostToolUse → `elanus code hook`);
-  **codex** (`config.toml [[hooks.PostToolUse]]` on `apply_patch`, run with
-  `--dangerously-bypass-hook-trust`; the path is inside `tool_input.command`).
-- **A JSON event stream** on a non-interactive run — `codex exec --json`,
-  `opencode run --format json`. Parse the JSONL, map to obs leaves in `map_event`.
+Your elanus root defaults to **`~/.elanus/root`** (or `$ELANUS_ROOT`). Packages live in
+**`<root>/packages/<name>/`**. Develop the adapter in its own git repo, then copy the
+built binary + manifest into the root:
+
+```sh
+# In your adapter's own git repo:
+cargo build --release                       # build the adapter binary
+
+# Place it as a package in the elanus root (default ~/.elanus/root):
+ROOT="${ELANUS_ROOT:-$HOME/.elanus/root}"
+mkdir -p "$ROOT/packages/harness-gemini/bin"
+cp target/release/adapter "$ROOT/packages/harness-gemini/bin/adapter"
+cp elanus.toml            "$ROOT/packages/harness-gemini/elanus.toml"
+
+# Grant it (packages are deny-by-default; this approves its requested bus authority):
+elanus approve harness-gemini
+
+# Use it:
+elanus code gemini "refactor foo.rs"
+elanus code gemini --headless "run the test suite and report"
+```
+
+That's it — same `packages/` + `elanus approve` flow as any other capability. To
+distribute it to others, ship it as a **kit** (the existing distro: a `packages/` dir
+the recipient `elanus kit install`s), exactly like a bundle of skills.
+
+## What your adapter must do (the requirements)
+
+These are the same regardless of which tool you wrap — they're "what the adapter
+emits," not "what to edit in elanus."
+
+### 1. Live observation (capture) — the load-bearing question
+How can your adapter watch the tool's tool-calls/edits **as they happen**? Options,
+best first — this decides how real-time the integration (and sibling-awareness) is:
+- **Hooks** — claude (`settings.json` PreToolUse/PostToolUse → a command); **codex**
+  (`config.toml [[hooks.PostToolUse]]` on `apply_patch`, run with
+  `--dangerously-bypass-hook-trust`; the path is inside `tool_input.command`). Your
+  adapter generates the hook config and turns each hook callback into `ctx.emit` /
+  `ctx.claim`.
+- **A non-interactive JSON event stream** — `codex exec --json`,
+  `opencode run --format json`. Parse the JSONL; `ctx.emit` each event.
 - **A served event stream** for the interactive case — `opencode serve` + SSE `/event`
-  + `opencode attach`. elanus runs its own server, subscribes, and attaches the human.
-- **Fallback:** an on-disk transcript imported post-hoc (codex rollout).
-If a tool has none of these, you only get lifecycle brackets — fine for "it ran", not
-for "what is it doing".
+  + `opencode attach`: run your own server, subscribe, attach the human.
+- **Fallback:** an on-disk transcript imported after exit (codex rollout) — not live.
+None of these → lifecycle brackets only ("it ran", not "what it's doing").
 
 ### 2. Identity & auth isolation — REQUIRED
-The tool brings its OWN provider auth; elanus must NOT leak its own provider creds into
-it, and SHOULD isolate it from the user's global tool config.
-- **Scrub** `PROVIDER_CRED_VARS` (ANTHROPIC_*/OPENAI_* …) from the child before exec, so
-  the tool uses its own login, not elanus's DeepSeek/etc. env (`scrub_provider_creds`).
-- **Isolate from the user's global config:** claude `--setting-sources ''`; codex a
-  per-session `CODEX_HOME` (auth symlinked in so login survives); opencode `--pure` +
-  `OPENCODE_CONFIG_DIR`. Find the tool's "don't load my global config / use this home
-  instead" lever.
-- Set elanus's own session identity in the child env (`ELANUS_CODE_SESSION`,
-  `ELANUS_AGENT`, `ELANUS_ROOT`) so `elanus code` sub-invocations (deliver/claim/hook)
-  resolve. For a hook bridge the hook reads the elanus session from ENV, never from the
-  tool's native session id.
+- The tool brings its OWN provider auth; do NOT leak elanus's provider creds — the SDK
+  gives you a `scrub_provider_creds` helper for the child.
+- Isolate the tool from the user's global config: claude `--setting-sources ''`; codex a
+  per-session `CODEX_HOME` (auth symlinked in); opencode `--pure` + `OPENCODE_CONFIG_DIR`.
+  Find the tool's "use this home, not my global config" lever.
+- elanus sets the session identity in your adapter's env (`ELANUS_CODE_SESSION`,
+  `ELANUS_AGENT`, `ELANUS_ROOT`, `ELANUS_BUS_TOKEN`); `Ctx::from_env` reads it. A hook
+  the tool spawns inherits this env and resolves the elanus session from it (never from
+  the tool's native session id).
 
 ### 3. Skills / context materialization — for skill-equipped sessions
-Deliver a profile's visible skills into the tool's native skills surface (see
-[handoffs/coding-skill-materialization.md](handoffs/coding-skill-materialization.md)).
-Each tool has a different scan location, all fed the same `SKILL.md` packages by symlink
-into a per-session scratch:
-- claude: `--plugin-dir <scratch>/plugin` (a generated `.claude-plugin/plugin.json` +
-  `skills/`) — note `--add-dir` does NOT register skills and `--setting-sources ''`
-  disables `.claude/skills` discovery.
-- codex: `$CODEX_HOME/skills/<name>/` (the per-session home).
-- opencode: `$OPENCODE_CONFIG_DIR/skills/<name>/`.
-For a new tool: find where it scans for agent skills and whether you can point it at an
-arbitrary per-session dir. (Most have converged on the agentskills.io `SKILL.md` format.)
+elanus hands the adapter a skills dir; materialize it into the tool's native skills
+scan location (see [handoffs/coding-skill-materialization.md](handoffs/coding-skill-materialization.md)):
+claude `--plugin-dir` (a generated plugin); codex `$CODEX_HOME/skills/`; opencode
+`$OPENCODE_CONFIG_DIR/skills/`. (Most tools take the agentskills.io `SKILL.md` format.)
 
-### 4. Briefing injection (the launch envelope) — OPTIONAL but expected
-Inject elanus's per-session briefing out-of-band: claude `--append-system-prompt`;
-codex prepends it to the prompt / pipes on stdin (no system-prompt flag); opencode
-folds it into the message. Find the tool's "extra system/context" channel; degrade to
-prepending the user prompt if none.
+### 4. Briefing injection — OPTIONAL but expected
+Inject elanus's per-session briefing out-of-band: claude `--append-system-prompt`; codex
+prepends/pipes on stdin; opencode folds it into the message. Degrade to prepending the
+user prompt if the tool has no extra-context channel.
 
 ### 5. Model / provider selection — OPTIONAL
-How to point the tool at a chosen model/effort (claude `--model`; codex `-c model=…`,
-`-c model_reasoning_effort=…`; opencode `--model provider/model`). Wire through the
-`--provider` materialization if the tool can take a provider override
-([handoffs/model-providers.md](handoffs/model-providers.md)).
+Point the tool at a chosen model/effort: claude `--model`; codex `-c model=…`,
+`-c model_reasoning_effort=…`; opencode `--model provider/model`.
 
 ### 6. Resume — OPTIONAL but valued
-A way to re-enter a prior native session headlessly (`resume_command`) and, ideally, an
-interactive passthrough (`interactive_resume_args`). Requires the tool to expose a
-stable native session/thread id (codex thread id in the rollout; opencode `sessionID`;
-claude session id) that elanus records and can resume against.
+`ctx.record(native_session_id)` the tool's stable native session/thread id so elanus can
+resume it (codex thread id; opencode `sessionID`; claude session id).
 
-## Decision tree for the capture strategy
-
+## Capture decision tree
 ```
 Does the tool have a hook system that fires on tool/file events?
-  └─ yes → HookBridge for BOTH cells (best; live even in the TUI). [claude, codex-TUI]
+  └─ yes → hooks for BOTH cells (best; live even in the TUI). [claude, codex]
 Else, does it have a non-interactive JSON event stream (--json run)?
-  └─ yes → StreamJson for the Headless cell. [codex, opencode headless]
+  └─ yes → stream it for the headless cell. [codex, opencode headless]
 For the interactive TUI cell, in order:
-  ├─ client/server with a subscribable event stream + attach? → ServerEvents (live). [opencode]
-  ├─ writes a session transcript file? → RolloutImport (post-hoc, not live). [codex rollout]
-  └─ none of the above? → Lifecycle brackets only (last resort).
+  ├─ client/server with a subscribable event stream + attach? → served events (live). [opencode]
+  ├─ writes a session transcript file? → import it post-hoc (not live). [codex rollout]
+  └─ none of the above? → lifecycle brackets only (last resort).
 ```
 
-## Onboarding checklist
-- [ ] `impl Harness` + add to `HARNESSES`; pick `agent_noun`, `aliases`, `binary`.
-- [ ] `mode_for` + `capture(mode)` per the decision tree above.
-- [ ] Headless capture: implement the JSONL/event parse in `map_event` + the runner.
-- [ ] TUI capture: hook bridge / served-events / rollout import, per the tree.
-- [ ] Auth: scrub provider creds; isolate from global config; set ELANUS_* session env.
-- [ ] (If skills) materialize the profile's `SKILL.md` packages into the tool's skills dir.
-- [ ] (If briefing) wire the launch-envelope briefing into the tool's context channel.
-- [ ] (If sibling-aware) call `auto_claim_write` from the tool's write-tool detection so
-      its edits become advisory claims (hook handler / stream / SSE — wherever you see
-      edits live).
-- [ ] Resume: record the native session id; implement `resume_command`.
-- [ ] Verify: a real `--headless` run captures to `obs/agent/<noun>/<session>/…`; a TUI
-      run is observable per its cell; a sibling sees its edits (if live).
+## Checklist
+- [ ] Pick the verb + `agent_noun`; write `elanus.toml` with `[[harness]]` + `[request]`.
+- [ ] Adapter: `Ctx::from_env`, launch the tool, translate events → `ctx.emit`.
+- [ ] Capture: per the decision tree (hooks / stream / served events / rollout).
+- [ ] Auth: `scrub_provider_creds`; isolate from the tool's global config.
+- [ ] Edit-claims: `ctx.claim(path)` on every write the tool makes (this is what makes
+      it sibling-aware).
+- [ ] (If skills) materialize the handed-over skills dir into the tool's skills location.
+- [ ] (If briefing) inject the briefing into the tool's context channel.
+- [ ] Resume: `ctx.record(native_id)`.
+- [ ] Install: copy binary + `elanus.toml` into `<root>/packages/harness-<tool>/`;
+      `elanus approve`; verify `elanus code <tool> --headless …` captures to
+      `obs/agent/<noun>/<session>/…` and a sibling sees its edits (if live).
 
 ## The "remaining dozen"
-Likely candidates and the lever each is bet to expose (verify before building — this
-session's lesson is that capability assumptions rot fast):
-- **aider** — non-interactive run + a transcript; probably `StreamJson`-ish or
-  Lifecycle; check for a JSON/event mode.
-- **gemini-cli**, **cursor-cli**, **cline/continue (mostly IDE)**, **amp**, **goose**,
-  **crush**, **qwen-coder**, … — for each, ask the six questions above, but START with
-  #1 (live observation): does it have hooks, a `--json` stream, or a serve/attach? That
-  one answer places it on the capture ladder and decides how much of the journey-12
-  sibling-awareness it can support.
+For each, ask the requirements above, but START with #1 (live observation): does it have
+hooks, a `--json` stream, or a serve/attach? That one answer places it on the capture
+ladder and decides how much sibling-awareness it can support.
+- **aider** — non-interactive run + a transcript; check for a JSON/event mode.
+- **gemini-cli**, **cursor-cli**, **cline/continue** (mostly IDE), **amp**, **goose**,
+  **crush**, **qwen-coder**, …
 
 **Hard-won caveat:** do not assume a tool's capabilities from memory or an old version.
 This session shipped a wrong "codex has no hooks / its TUI is unobservable" claim that a
 30-second smoke test refuted (codex has a full hook system). Smoke-test the lever before
-you design the cell.
+you design the adapter.
