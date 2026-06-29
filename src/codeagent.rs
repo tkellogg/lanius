@@ -4700,14 +4700,13 @@ fn rollout_reasoning_text(payload: &Value) -> String {
 /// the way the live stream does, so we conservatively collect no paths here —
 /// changed files still appear in the projected tool calls).
 ///
-/// KNOWN LIMITATION (journey 12 / its adjudication): an INTERACTIVE codex TUI is
-/// captured POST-HOC — this rollout is imported only AFTER the session exits, and it
-/// carries no discrete file-change item. So a codex TUI does NOT auto-claim its
-/// edits, and crucially could not coordinate in real time even if it did (by import
-/// time the session is over). Unlike opencode (live SSE) and the headless cells
-/// (live stream), real-time "last editing <path>" for an interactive codex sibling
-/// needs LIVE codex TUI capture, which does not exist — not an auto_claim_write
-/// oversight. The headless codex worker (`codex exec --json`) DOES auto-claim live.
+/// This rollout import is POST-HOC (read after the TUI exits) and carries no discrete
+/// file-change item, so it is NOT the place to auto-claim a codex TUI's live edits.
+/// The LIVE channel for that is codex's HOOK system: `PostToolUse` fires on
+/// `apply_patch` even in the interactive TUI, delivering the patch on stdin (verified
+/// against 0.141.0). The codex hook bridge (mirroring the Claude HookBridge) wires
+/// that — see `codex` launch + `hook()`. This summary remains a legible-result
+/// fallback; real-time "last editing <path>" rides the hook, not this import.
 fn rollout_collect_summary(rec: &Value, summary: &mut CaptureSummary) {
     let payload = rec.get("payload").unwrap_or(&Value::Null);
     let rtype = rec.get("type").and_then(Value::as_str).unwrap_or("");

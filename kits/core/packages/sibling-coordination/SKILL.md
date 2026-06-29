@@ -20,10 +20,11 @@ reverse-engineer it from `git diff` or commit a dirty tree blind. Use these move
   note does.
 - "last active 30s ago" → actively working, treat its files as hot. "last active
   40m ago / off the roster" → likely stranded; its work may be safe to take over.
-- **Caveat:** an *interactive* codex TUI sibling is captured only post-hoc (after it
-  exits), so it may show no live task and no claims even while actively editing —
-  absence of a claim is NOT proof a codex sibling isn't touching a file. When a codex
-  sibling is live, prefer `ask-sibling` / `git` over trusting an empty claim set.
+- **Caveat:** auto-claims depend on elanus observing a harness's edits live (Claude &
+  codex via hooks, opencode via its event stream). If a sibling is clearly active but
+  shows no task/claims, don't assume it's idle — absence of a claim is not proof it
+  isn't touching a file. When unsure about a live sibling, prefer `ask-sibling` / `git`
+  over trusting an empty claim set.
 
 ## whose-change — which changes are mine?
 - `elanus code whose --dirty` — annotates `git status` with the owning session,

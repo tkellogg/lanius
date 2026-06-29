@@ -124,14 +124,18 @@ get "last editing <path>" — there is no mechanism to add.
     `auto_claim_write` on each settled `edit`/`write` part (`codeagent.rs`,
     `run_opencode_tui_server_events` SSE loop), parity with the headless `run` cell.
     An interactive opencode sibling now auto-claims in real time.
-  - *codex TUI* — a real ARCHITECTURAL limitation, NOT an auto-claim oversight, and
-    deliberately not "fixed": codex's TUI is captured POST-HOC (the rollout is
-    imported only after the session exits) and the rollout carries no discrete
-    file-change item. So an interactive codex sibling cannot surface live edits at all
-    — by import time it's over. Real-time codex-TUI awareness needs LIVE codex capture,
-    which doesn't exist. Documented at `rollout_collect_summary` and surfaced as a
-    caveat in the `sibling-coordination` skill. The headless codex worker DOES
-    auto-claim live.
+  - *codex TUI* — fixable via codex's HOOK system (corrected: codex DOES have hooks;
+    an earlier claim that it didn't was wrong). `PostToolUse` fires on `apply_patch`
+    in the interactive TUI, delivering the patch on stdin (verified 0.141.0:
+    `tool_name=apply_patch`, `tool_input.command` = the `*** Add/Update/Delete File:`
+    patch text; config is nested `[[hooks.PostToolUse]]`+`[[hooks.PostToolUse.hooks]]`,
+    run with `--dangerously-bypass-hook-trust`). The fix is a **codex hook bridge**
+    mirroring the Claude HookBridge: generate a codex hooks config in the per-session
+    `CODEX_HOME`, point `PostToolUse` at `elanus code hook`, parse the apply_patch
+    paths, `auto_claim_write`. The session id rides ENV (`ELANUS_CODE_SESSION`), not
+    the payload's native `session_id`. The post-hoc rollout import stays as a
+    legible-result fallback. (The headless codex worker already auto-claims via its
+    `file_change` stream.)
 - _(History: an earlier attempt added an `obs/fs`→claim fold in `code_projection.rs`;
   it was redundant + built on the false premise and has been removed. The dead
   `codesession.rs` helpers it needed — `auto_claim_room_and_workdir`,
