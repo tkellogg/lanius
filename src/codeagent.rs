@@ -4039,6 +4039,7 @@ fn run_codex_capture(
     use std::process::{Command, Stdio};
 
     let args = codex_args_with_prompt_from_stdin(args)?;
+    let prompt_env = split_codex_seed_prompt(&args).1;
 
     // Point codex at an isolated per-session home carrying the generated hook config
     // (always) and profile skills (when present), while symlinking auth so the user's
@@ -4099,11 +4100,25 @@ fn run_codex_capture(
     // The session's own identity, carried to anything the codex session spawns —
     // crucially `elanus code deliver`, which reads ELANUS_CODE_SESSION/AGENT to
     // record the running session as the requester, and ELANUS_ROOT to resolve the
-    // same root. (Bus auth uses the in-process env per publish; these are for child
-    // processes the agent runs.)
+    // same root. ELANUS_BUS_TOKEN stays SCRUBBED (above): the codex child is the
+    // tool, not an elanus adapter — its hook claims via the ledger (no bus), so it
+    // needs no bus credential. The bus token enters the launch contract only for an
+    // actual adapter process (PH3), never the raw tool child.
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
-        .env("ELANUS_ROOT", &root.dir);
+        .env("ELANUS_ROOT", &root.dir)
+        .env(crate::harness::ENV_WORKDIR, workdir)
+        .env(crate::harness::ENV_MODE, "headless")
+        .env(crate::harness::ENV_TOOL, "codex");
+    if let Some(brief) = brief {
+        cmd.env(crate::harness::ENV_BRIEFING, brief);
+    }
+    if let Some(prompt) = prompt_env.as_deref() {
+        cmd.env(crate::harness::ENV_PROMPT, prompt);
+    }
+    if !skills.is_empty() {
+        cmd.env(crate::harness::ENV_SKILLS_DIR, codex_home.join("skills"));
+    }
     // Point codex at the per-session home (set LAST so it wins over any
     // inherited/injection CODEX_HOME).
     cmd.env("CODEX_HOME", &codex_home);
@@ -4227,12 +4242,26 @@ fn run_codex_tui_import(
     }
     cmd.env_remove("ELANUS_PACKAGE")
         .env_remove("ELANUS_BUS_TOKEN");
+    // ELANUS_BUS_TOKEN stays scrubbed: the codex child is the tool, not an adapter;
+    // its hook claims via the ledger (no bus). (See the exec path for the rationale.)
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
-        .env("ELANUS_ROOT", &root.dir);
+        .env("ELANUS_ROOT", &root.dir)
+        .env(crate::harness::ENV_WORKDIR, workdir)
+        .env(crate::harness::ENV_MODE, "tui")
+        .env(crate::harness::ENV_TOOL, "codex");
+    if let Some(brief) = brief {
+        cmd.env(crate::harness::ENV_BRIEFING, brief);
+    }
+    if let Some(prompt) = user_prompt.as_deref() {
+        cmd.env(crate::harness::ENV_PROMPT, prompt);
+    }
     // The per-session CODEX_HOME carries generated hooks (always) and profile skills
     // (when present). Set LAST so it wins over inherited/injected CODEX_HOME.
     let codex_home = build_codex_skills_home(root, session, skills)?;
+    if !skills.is_empty() {
+        cmd.env(crate::harness::ENV_SKILLS_DIR, codex_home.join("skills"));
+    }
     cmd.env("CODEX_HOME", &codex_home);
     eprintln!("[code] launching codex TUI as session {session} (rollout import on exit)");
 
@@ -6979,9 +7008,9 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     }
 
     // Route event-mapping through the adapter the launcher recorded as the
-    // session's agent noun. Codex hooks are claim-only today: the codex child does
-    // not inherit bus credentials, and even if a future launch did, this hook path
-    // deliberately avoids publishing codex observations.
+    // session's agent noun. Codex hooks are claim-only today: even though the child
+    // has the SDK launch contract, this hook path deliberately avoids publishing
+    // codex observations.
     if agent != Codex.agent_noun() {
         if let (Some(principal), Some(token)) = (principal.as_deref(), token.as_deref()) {
             let (leaf, body) = match harness_by_noun(&agent) {
@@ -7057,8 +7086,13 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
             .and_then(|i| i.get("command"))
             .and_then(Value::as_str)
         {
+            let ctx = crate::harness::Ctx::from_env().ok();
             for path in codex_apply_patch_paths(command) {
-                auto_claim_write(root, &session, &path, cwd);
+                if let Some(ctx) = &ctx {
+                    ctx.claim(&path);
+                } else {
+                    auto_claim_write(root, &session, &path, cwd);
+                }
             }
         }
     }
