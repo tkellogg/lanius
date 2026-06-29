@@ -34,8 +34,8 @@
 //!
 //! **Two adapters, two capture mechanisms (one envelope).** The shared envelope —
 //! launch, per-session grant-scoped identity, the obs grammar, the reaper — is
-//! tool-agnostic; only the *capture mechanism* differs, and that is the `Harness`
-//! adapter seam (`Harness::capture`, HM1 of docs/handoffs/harness-modes.md):
+//! tool-agnostic; only the *capture mechanism* differs, and that is the free
+//! adapter seam in this module (HM1 of docs/handoffs/harness-modes.md):
 //!
 //! - **Claude Code — a hook bridge.** The launcher inherits the child's stdio and
 //!   the child's own *hooks* (a generated `--settings` config) call
@@ -325,24 +325,11 @@ pub fn print_tools() {
 }
 
 pub fn tools() -> Vec<&'static str> {
-    HARNESSES.iter().map(|h| h.id()).collect()
+    vec!["claude", "codex", "opencode"]
 }
 
-// ── The harness adapter seam (HM1) ────────────────────────────────────────────
-//
-// HM1 of docs/handoffs/harness-modes.md: replace the hard-coded `Tool` enum +
-// scattered `match self`/`match tool`/`match rec.tool` with a `Harness` adapter
-// registry. The envelope (launch / resume / spawn / briefing / front door) is
-// harness-agnostic and parameterized by `(Harness, Mode)`; a new harness is one
-// `impl Harness` + a line in `HARNESSES`, and touches nothing else.
-//
-// This is a refactor with NO behavior change: every per-(harness, mode) detail —
-// argv, flags, stdio, the provider-cred scrub, the `--worker` gating, the resume
-// shapes, the obs mapping — is reproduced exactly as before, just behind the
-// trait. The three structs below ARE the three adapters that used to be `Tool`
-// variants (opencode is the real third adapter that already proves "a third
-// adapter compiles against the seam", so HM5's checklist target is satisfied in
-// code; per the handoff we do NOT write the checklist doc here).
+// Built-in coding tools resolve through seeded `[[harness]]` packages; the
+// launch/resume/hook helpers below are the remaining package-agnostic utilities.
 
 /// The launch mode of a harness *process* (harness-modes.md axis 1). Today only
 /// Claude has both cells (Tui interactive vs Headless `-p`); codex/opencode are
@@ -356,539 +343,25 @@ pub enum Mode {
     Headless,
 }
 
-/// How the launcher captures a session's activity — the per-(harness, mode) seam.
-/// HM2 adds `RolloutImport` (the codex TUI floor). `Lifecycle` (a bracketed
-/// start/stop-only no-op floor) is deliberately NOT added: nothing uses it, and
-/// the handoff says add it ONLY if genuinely used. `RolloutImport` already gives
-/// the codex TUI real (post-hoc) granularity, so the unused-variant floor is dead
-/// code we don't introduce.
-enum Capture {
-    /// The child's own hooks call `elanus code hook` (Claude Code): the launcher
-    /// inherits stdio and parses nothing.
-    HookBridge,
-    /// The launcher pipes the child's stdout and parses its JSONL event stream
-    /// in-process (Codex `exec --json`, opencode `run --format json`).
-    StreamJson,
-    /// POST-HOC import (HM2): the harness ran as an interactive TUI with inherited
-    /// stdio (the launcher parsed NOTHING live), and at session STOP the launcher
-    /// resolves the rollout JSONL the TUI wrote and projects its turns into the obs
-    /// grammar. This is the codex-TUI cell: the faithful TUI obs capture is reading
-    /// its on-disk rollout afterwards; live hooks are used only for edit-claims.
-    ///
-    /// FIDELITY: a `RolloutImport` cell is **not** live. Its projected events carry
-    /// an explicit `"fidelity":"rollout-import"` / `"source":"rollout"` marker (see
-    /// `rollout_map_*`) so a consumer never mistakes post-hoc, coarse rollout import
-    /// for the live, per-event granularity of a hook-bridged TUI.
-    RolloutImport,
-    /// The bracketed no-op floor: the harness runs as an interactive TUI with
-    /// inherited stdio and the launcher captures ONLY the session/start + stop
-    /// brackets it already emits — no per-turn detail at all. The honest floor for a
-    /// TUI we can launch but cannot faithfully capture. No harness currently selects
-    /// it (opencode's Tui cell was promoted from this floor to `ServerEvents` in OC3,
-    /// codex's is `RolloutImport`), but the variant + its `run_tui_lifecycle` arm are
-    /// kept as the declared fallback a future harness with no live/rollout capture can
-    /// drop to rather than silently pretending to live-capture.
-    #[allow(dead_code)]
-    Lifecycle,
-    /// LIVE capture off a harness server's SSE event stream (OC3). opencode is
-    /// client/server: `opencode serve` exposes an HTTP + SSE `/event` stream and
-    /// `opencode attach <url>` runs the TUI against it. The launcher starts its own
-    /// `opencode serve` on a free port (basic-auth'd via `OPENCODE_SERVER_PASSWORD`),
-    /// subscribes the SSE stream in a background thread, launches the human's TUI via
-    /// `opencode attach <url>` with inherited stdio, and projects each SSE event into
-    /// the obs grammar LIVE as it arrives — capturing opencode's native session id off
-    /// the same stream (so resume still works). On TUI exit the launcher kills the
-    /// served instance and closes the stream cleanly.
-    ///
-    /// FIDELITY: a `ServerEvents` cell is **LIVE** (per-event, as it happens), unlike
-    /// `RolloutImport`'s post-hoc on-disk import. Its projected events carry an explicit
-    /// `"fidelity":"server-events-live"` / `"source":"sse"` marker (see
-    /// `opencode_sse_publish`) so a consumer knows it is live SSE capture, distinct from
-    /// codex's post-hoc rollout import and from a Claude live hook bridge. Best-effort
-    /// where noted: the SSE subscriber is advisory telemetry — if the stream drops, the
-    /// TUI keeps running uncaptured and the launcher records the gap honestly rather than
-    /// killing the human's session.
-    ServerEvents,
-}
-
-/// The shared, harness-agnostic bits the launch envelope assembles, passed to a
-/// StreamJson harness so it can build + run its capture without the envelope
-/// branching on the concrete harness. (The HookBridge harness — Claude — builds
-/// its own `Command` inline in the launcher because it needs the generated
-/// settings path + skill root + the `--worker` split; threading those through
-/// here would obscure rather than simplify, so the seam routes by `Capture` and
-/// the StreamJson harnesses share this context.)
-struct StreamLaunch<'a> {
-    root: &'a Root,
-    principal: &'a str,
-    bus_token: &'a str,
-    agent: &'a str,
-    session: &'a str,
-    workdir: &'a Path,
-    args: &'a [String],
-    brief: Option<&'a str>,
-    /// Worker/headless launch (gates opencode's `--dangerously-skip-permissions`).
-    worker: bool,
-    worker_timeout: Option<u64>,
-    /// A materialized provider injection (`elanus code --provider <name> …`), or
-    /// None when no `--provider` was given (then the launch is byte-identical to
-    /// today's scrub-only path). Borrowed from the owner in `launch`.
-    injection: Option<&'a crate::provider::HarnessInjection>,
-    /// The profile's visible skill packages `(name, dir)` to materialize into this
-    /// harness's per-session skills dir (Codex `$CODEX_HOME/skills`, opencode
-    /// `$OPENCODE_CONFIG_DIR/skills`). Empty when the profile has no visible skills.
-    skills: &'a [(String, PathBuf)],
-}
-
-/// A coding-agent adapter. Implementing this trait + registering in `HARNESSES`
-/// is the entire surface for adding a harness; the envelope never matches on a
-/// concrete harness. `&'static dyn` trait objects (the structs are zero-sized).
-trait Harness: Sync {
-    /// The canonical CLI id (`"claude"` | `"codex"` | `"opencode"`).
-    fn id(&self) -> &'static str;
-    /// All accepted CLI verbs/aliases that resolve to this harness (includes `id`).
-    fn aliases(&self) -> &'static [&'static str];
-    /// The agent noun this harness's sessions publish under: `obs/agent/<noun>/…`.
-    fn agent_noun(&self) -> &'static str;
-    /// The real binary to launch.
-    fn binary(&self) -> &'static str;
-    /// How the launcher captures this harness's activity in `mode` (the matrix cell).
-    fn capture(&self, mode: Mode) -> Capture;
-    /// Pick the launch mode from the uniform `--headless` flag (HM3). `headless`
-    /// is true when the user passed `--headless` (or its deprecated alias
-    /// `--worker`), false for a bare/prompt invocation. Every harness now honors
-    /// both cells: bare → `Tui`, `--headless` → `Headless`.
-    fn mode_for(&self, headless: bool) -> Mode;
-    /// The generated tool config that routes hook events through `elanus code hook`
-    /// (only the HookBridge harness generates one; StreamJson harnesses return None
-    /// and write nothing to the tool home).
-    fn settings(&self, self_exe: &Path, root: &Root) -> Option<Value>;
-    /// Map one hook event + payload to an `obs/` leaf + trimmed body (HookBridge
-    /// only; StreamJson harnesses map their stream directly and never reach here, so
-    /// they file generically as a safety net if a hook somehow arrives).
-    fn map_event(&self, event: &str, payload: &Value) -> (String, Value);
-    /// The native daemon-resume command (program + args) for a recorded session +
-    /// message — exactly today's `resume_command`. Pure; the caller sets the cwd.
-    fn resume_command(
-        &self,
-        rec: &codesession::SessionRecord,
-        message: &str,
-    ) -> (String, Vec<String>);
-    /// The human-facing INTERACTIVE resume passthrough for a recorded native
-    /// session: the args to append after `elanus code <tool>` so a managed TUI
-    /// re-attaches to that native session, or None when this tool has no stable
-    /// passthrough-resume incantation (e.g. codex/opencode launches treat a
-    /// positional as a seed prompt, mangling a `resume` subcommand). Purely a
-    /// webui/CLI SUGGESTION — nothing in elanus core depends on it, and a tool
-    /// without one simply shows no suggestion. Distinct from `resume_command`, the
-    /// daemon's HEADLESS one-shot primitive. Default None (no clean passthrough).
-    fn interactive_resume_args(&self, _native_session: &str) -> Option<Vec<String>> {
-        None
-    }
-    /// Run a StreamJson capture in the launch envelope (the `Capture::StreamJson`
-    /// arm). Default: unreachable — only StreamJson harnesses override it, and the
-    /// envelope only calls it for `Capture::StreamJson`, so it is never invoked on a
-    /// HookBridge harness.
-    fn run_stream_capture(
-        &self,
-        _ctx: StreamLaunch<'_>,
-    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        unreachable!("run_stream_capture called on a non-StreamJson harness")
-    }
-    /// Run an interactive TUI launch (inherited stdio) and capture it POST-HOC by
-    /// importing the rollout it wrote (the `Capture::RolloutImport` arm). Default:
-    /// unreachable — only the codex harness overrides it, and the envelope only
-    /// calls it for `Capture::RolloutImport`.
-    fn run_tui_rollout_import(
-        &self,
-        _ctx: StreamLaunch<'_>,
-    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        unreachable!("run_tui_rollout_import called on a non-RolloutImport harness")
-    }
-    /// Run an interactive TUI launch (inherited stdio) with ONLY the launcher's
-    /// session/start+stop brackets for capture (the `Capture::Lifecycle` floor).
-    /// Default: unreachable — only a Lifecycle harness (opencode's Tui cell)
-    /// overrides it, and the envelope only calls it for `Capture::Lifecycle`.
-    fn run_tui_lifecycle(
-        &self,
-        _ctx: StreamLaunch<'_>,
-    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        unreachable!("run_tui_lifecycle called on a non-Lifecycle harness")
-    }
-    /// Run an interactive TUI launch wired to a harness server the launcher observes,
-    /// subscribing the server's SSE event stream and projecting each event into the obs
-    /// grammar LIVE (the `Capture::ServerEvents` arm, OC3). Default: unreachable — only
-    /// the opencode harness overrides it, and the envelope only calls it for
-    /// `Capture::ServerEvents`.
-    fn run_tui_server_events(
-        &self,
-        _ctx: StreamLaunch<'_>,
-    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        unreachable!("run_tui_server_events called on a non-ServerEvents harness")
-    }
-    /// Read this harness's daemon-resume stdout stream (the spawned child) into the
-    /// obs grammar + capture summary, under the resumed elanus session. Each harness
-    /// owns its stream grammar: codex/opencode reuse their launch-stream readers;
-    /// Claude's `-p --output-format stream-json` is a different JSONL grammar
-    /// (`capture_claude_stream`). Routes by the recorded `tool` (the daemon already
-    /// resolved the harness via `harness_for_record`).
-    #[allow(clippy::too_many_arguments)]
-    fn resume_stream_capture(
-        &self,
-        root: &Root,
-        principal: &str,
-        bus_token: &str,
-        agent: &str,
-        session: &str,
-        child: &mut std::process::Child,
-    ) -> CaptureSummary;
-}
-
-struct ClaudeCode;
-struct Codex;
-struct OpenCode;
-
-impl Harness for ClaudeCode {
-    fn id(&self) -> &'static str {
-        "claude"
-    }
-    fn aliases(&self) -> &'static [&'static str] {
-        &["claude", "claude-code", "cc"]
-    }
-    fn agent_noun(&self) -> &'static str {
-        "claude-code"
-    }
-    fn binary(&self) -> &'static str {
-        "claude"
-    }
-    fn capture(&self, _mode: Mode) -> Capture {
-        Capture::HookBridge
-    }
-    fn mode_for(&self, headless: bool) -> Mode {
-        // Claude has both cells: bare/interactive → Tui; `--headless` → Headless `-p`.
-        if headless {
-            Mode::Headless
-        } else {
-            Mode::Tui
-        }
-    }
-    fn settings(&self, self_exe: &Path, root: &Root) -> Option<Value> {
-        Some(claude_settings(self_exe, root))
-    }
-    fn map_event(&self, event: &str, payload: &Value) -> (String, Value) {
-        claude_map_event(event, payload)
-    }
-    fn resume_command(
-        &self,
-        rec: &codesession::SessionRecord,
-        message: &str,
-    ) -> (String, Vec<String>) {
-        // `claude -p --resume <session_id> --output-format stream-json --verbose
-        // "<msg>"` — headless print, resuming the recorded native session id,
-        // capturing the JSONL result stream (the generated hooks are NOT reloaded on
-        // a bare `-p --resume`, so resume parses the stream like codex rather than
-        // relying on hooks). Confirmed flags against Claude Code 2.1.183.
-        (
-            "claude".to_string(),
-            vec![
-                "-p".to_string(),
-                "--resume".to_string(),
-                rec.native_session.clone(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                message.to_string(),
-            ],
-        )
-    }
-    fn interactive_resume_args(&self, native_session: &str) -> Option<Vec<String>> {
-        // `claude --resume <id>` re-opens the interactive TUI on a prior session.
-        // Claude's TUI launch appends passthrough args verbatim (codeagent.rs
-        // `cmd.args(args)`), so `elanus code claude --resume <id>` flows through
-        // cleanly and stays fully managed (generated hooks, room, obs, cred-scrub).
-        Some(vec!["--resume".to_string(), native_session.to_string()])
-    }
-    fn resume_stream_capture(
-        &self,
-        root: &Root,
-        principal: &str,
-        bus_token: &str,
-        agent: &str,
-        session: &str,
-        child: &mut std::process::Child,
-    ) -> CaptureSummary {
-        // Claude's `-p --output-format stream-json` is a DIFFERENT JSONL grammar;
-        // map it via the CC stream mapper.
-        capture_claude_stream(root, principal, bus_token, agent, session, child)
+fn harness_id_for_tool(tool: &str) -> Option<&'static str> {
+    match tool {
+        "claude" | "claude-code" | "cc" => Some("claude"),
+        "codex" => Some("codex"),
+        "opencode" | "oc" => Some("opencode"),
+        _ => None,
     }
 }
 
-impl Harness for Codex {
-    fn id(&self) -> &'static str {
-        "codex"
-    }
-    fn aliases(&self) -> &'static [&'static str] {
-        &["codex"]
-    }
-    fn agent_noun(&self) -> &'static str {
-        "codex"
-    }
-    fn binary(&self) -> &'static str {
-        "codex"
-    }
-    fn capture(&self, mode: Mode) -> Capture {
-        // Codex uses its JSON stream for headless telemetry and a scoped hook only
-        // for live TUI apply_patch auto-claims. The two cells:
-        //  - Headless: `codex exec --json` prints a JSONL stream we parse live.
-        //  - Tui (HM2): the interactive `codex` TUI writes a rollout JSONL; we
-        //    import it POST-HOC at stop. We choose rollout-import over the
-        //    alternative (forcing codex's headless hooks/JSON onto an interactive
-        //    session via a bypass) because the rollout is codex's own first-class,
-        //    documented on-disk record of the exact turns — no fragile flag
-        //    coupling, no home pollution, and it survives a launcher crash. The
-        //    cost is honestly declared: it is post-hoc and coarser than live
-        //    (marked `fidelity=rollout-import`).
-        match mode {
-            Mode::Headless => Capture::StreamJson,
-            Mode::Tui => Capture::RolloutImport,
-        }
-    }
-    fn mode_for(&self, headless: bool) -> Mode {
-        // HM3: codex now honors both cells. Bare `elanus code codex` → the
-        // interactive TUI (HM2's RolloutImport); `--headless`/`--worker` →
-        // `codex exec --json` (the live StreamJson worker, unchanged).
-        if headless {
-            Mode::Headless
-        } else {
-            Mode::Tui
-        }
-    }
-    fn settings(&self, _self_exe: &Path, _root: &Root) -> Option<Value> {
-        None
-    }
-    fn map_event(&self, event: &str, payload: &Value) -> (String, Value) {
-        // Codex hooks are claim-only today; file generically if a bus-backed hook
-        // ever reaches the observation bridge.
-        generic_event(event, payload)
-    }
-    fn resume_command(
-        &self,
-        rec: &codesession::SessionRecord,
-        message: &str,
-    ) -> (String, Vec<String>) {
-        // `codex exec resume <thread_id> --json --skip-git-repo-check "<msg>"` —
-        // confirmed against codex-cli 0.141.0. `codex exec resume` has NO `--cd`, so
-        // the workdir is set as the child cwd by the caller.
-        (
-            "codex".to_string(),
-            vec![
-                "exec".to_string(),
-                "resume".to_string(),
-                rec.native_session.clone(),
-                "--json".to_string(),
-                "--skip-git-repo-check".to_string(),
-                message.to_string(),
-            ],
-        )
-    }
-    fn run_stream_capture(
-        &self,
-        ctx: StreamLaunch<'_>,
-    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        run_codex_capture(
-            ctx.root,
-            ctx.principal,
-            ctx.bus_token,
-            ctx.agent,
-            ctx.session,
-            ctx.workdir,
-            ctx.args,
-            ctx.brief,
-            ctx.worker_timeout,
-            ctx.injection,
-            ctx.skills,
-        )
-    }
-    fn run_tui_rollout_import(
-        &self,
-        ctx: StreamLaunch<'_>,
-    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        // HM2: the codex TUI cell — launch the interactive TUI (inherited stdio),
-        // then import the rollout it wrote post-hoc. No worker timeout: a TUI is a
-        // human-pumped live session and may run as long as needed (like Claude's).
-        run_codex_tui_import(
-            ctx.root,
-            ctx.principal,
-            ctx.bus_token,
-            ctx.agent,
-            ctx.session,
-            ctx.workdir,
-            ctx.args,
-            ctx.brief,
-            ctx.injection,
-            ctx.skills,
-        )
-    }
-    fn resume_stream_capture(
-        &self,
-        root: &Root,
-        principal: &str,
-        bus_token: &str,
-        agent: &str,
-        session: &str,
-        child: &mut std::process::Child,
-    ) -> CaptureSummary {
-        // Codex's `exec resume --json` emits the same JSONL stream as its launch
-        // (record_workdir = None — the record already exists).
-        capture_codex_stream(root, principal, bus_token, agent, session, child, None)
-    }
+fn claude_agent_noun() -> &'static str {
+    "claude-code"
 }
 
-impl Harness for OpenCode {
-    fn id(&self) -> &'static str {
-        "opencode"
-    }
-    fn aliases(&self) -> &'static [&'static str] {
-        &["opencode", "oc"]
-    }
-    fn agent_noun(&self) -> &'static str {
-        "opencode"
-    }
-    fn binary(&self) -> &'static str {
-        "opencode"
-    }
-    fn capture(&self, mode: Mode) -> Capture {
-        // opencode `run --format json` prints a JSONL event stream on stdout (no
-        // hooks, no home pollution) — same StreamJson strategy as Codex for the
-        // Headless cell. The Tui cell (OC3) exploits opencode being client/server:
-        // the launcher starts its OWN `opencode serve`, subscribes the server's SSE
-        // `/event` stream, and runs the human's TUI via `opencode attach <url>` —
-        // so the TUI is captured LIVE off the event stream (a strictly nicer cell
-        // than codex's post-hoc RolloutImport). This replaced the earlier
-        // bracket-only Lifecycle floor now that the SSE capture exists.
-        match mode {
-            Mode::Headless => Capture::StreamJson,
-            Mode::Tui => Capture::ServerEvents,
-        }
-    }
-    fn mode_for(&self, headless: bool) -> Mode {
-        // HM3: opencode now honors both cells. Bare `elanus code opencode` → its
-        // interactive TUI (OC3 live SSE capture via a served instance);
-        // `--headless`/`--worker` → `opencode run --format json` (the live
-        // StreamJson worker, unchanged).
-        if headless {
-            Mode::Headless
-        } else {
-            Mode::Tui
-        }
-    }
-    fn settings(&self, _self_exe: &Path, _root: &Root) -> Option<Value> {
-        None
-    }
-    fn map_event(&self, event: &str, payload: &Value) -> (String, Value) {
-        // opencode is also a StreamJson adapter (no hooks); the hook bridge is never
-        // reached for it. File generically if it somehow is.
-        generic_event(event, payload)
-    }
-    fn resume_command(
-        &self,
-        rec: &codesession::SessionRecord,
-        message: &str,
-    ) -> (String, Vec<String>) {
-        // `opencode run --session <id> --format json --pure
-        // --dangerously-skip-permissions "<msg>"` — confirmed flags against opencode
-        // 1.17.9. The workdir is applied by the caller as the child cwd.
-        (
-            "opencode".to_string(),
-            vec![
-                "run".to_string(),
-                "--session".to_string(),
-                rec.native_session.clone(),
-                "--format".to_string(),
-                "json".to_string(),
-                "--pure".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                message.to_string(),
-            ],
-        )
-    }
-    fn run_stream_capture(
-        &self,
-        ctx: StreamLaunch<'_>,
-    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        run_opencode_capture(
-            ctx.root,
-            ctx.principal,
-            ctx.bus_token,
-            ctx.agent,
-            ctx.session,
-            ctx.workdir,
-            ctx.args,
-            ctx.brief,
-            ctx.worker,
-            ctx.worker_timeout,
-            ctx.injection,
-            ctx.skills,
-        )
-    }
-    fn run_tui_server_events(
-        &self,
-        ctx: StreamLaunch<'_>,
-    ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        // OC3: opencode's Tui cell — LIVE capture off a served instance's SSE
-        // `/event` stream. The launcher starts its own `opencode serve`, subscribes
-        // the stream in a background thread (projecting each event into the obs
-        // grammar live via `opencode_map_event`), runs the human's TUI via `opencode
-        // attach <url>` with inherited stdio, and on TUI exit kills the server and
-        // closes the stream. The native session id is harvested off the same stream
-        // (so OC2 resume keeps working from a TUI session).
-        run_opencode_tui_server_events(
-            ctx.root,
-            ctx.principal,
-            ctx.bus_token,
-            ctx.agent,
-            ctx.session,
-            ctx.workdir,
-            ctx.args,
-            ctx.brief,
-            ctx.injection,
-            ctx.skills,
-        )
-    }
-    fn resume_stream_capture(
-        &self,
-        root: &Root,
-        principal: &str,
-        bus_token: &str,
-        agent: &str,
-        session: &str,
-        child: &mut std::process::Child,
-    ) -> CaptureSummary {
-        // opencode `run --session <id> --format json` emits the SAME JSONL stream the
-        // launch path parses (record_workdir = None — the record already exists).
-        capture_opencode_stream(root, principal, bus_token, agent, session, child, None)
-    }
+fn codex_agent_noun() -> &'static str {
+    "codex"
 }
 
-/// The harness registry: the only place that enumerates the adapters. Adding a
-/// harness is one `impl Harness` above + one line here.
-static HARNESSES: &[&dyn Harness] = &[&ClaudeCode, &Codex, &OpenCode];
-
-/// Resolve a harness by any of its CLI aliases (`claude`/`cc`, `codex`,
-/// `opencode`/`oc`). The registry replaces the old `Tool::parse` match.
-fn harness(name: &str) -> Option<&'static dyn Harness> {
-    HARNESSES
-        .iter()
-        .copied()
-        .find(|h| h.aliases().contains(&name))
-}
-
-/// Resolve a harness by the agent NOUN the launcher recorded in the session env
-/// (`claude-code` / `codex` / `opencode`) — so the hook bridge routes event-mapping
-/// through the right adapter without re-parsing the tool name. None for an unknown
-/// noun (a future adapter this binary predates). Replaces `Tool::from_agent_noun`.
-fn harness_by_noun(noun: &str) -> Option<&'static dyn Harness> {
-    HARNESSES.iter().copied().find(|h| h.agent_noun() == noun)
+fn opencode_agent_noun() -> &'static str {
+    "opencode"
 }
 
 /// The human-facing interactive-resume SUGGESTION for a recorded session:
@@ -903,10 +376,10 @@ pub fn interactive_resume_hint(tool: &str, native_session: &str) -> Option<Strin
     if native_session.is_empty() {
         return None;
     }
-    // Exact resolve (no Claude fallback): an unknown tool gets no suggestion.
-    let h = harness(tool)?;
-    let args = h.interactive_resume_args(native_session)?;
-    Some(format!("elanus code {} {}", h.id(), args.join(" ")))
+    match harness_id_for_tool(tool)? {
+        "claude" => Some(format!("elanus code claude --resume {native_session}")),
+        _ => None,
+    }
 }
 
 /// A ready-to-print " → <hint>" suffix for the resume redirect: given an elanus
@@ -925,17 +398,11 @@ pub fn session_resume_hint(root: &Root, elanus_session: &str) -> String {
     }
 }
 
-/// Resolve a harness by a recorded session's `tool` field (used by daemon resume).
-/// Falls back to Claude for any CC-noun/unknown record, matching the old
-/// `resume_command`'s default arm (which keyed on `rec.tool.as_str()`).
-fn harness_for_record(tool: &str) -> &'static dyn Harness {
-    harness(tool).unwrap_or(&ClaudeCode)
-}
-
-/// Parse a CLI tool token to a harness, erroring like the old `Tool::parse`.
-fn parse_harness(s: &str) -> Result<&'static dyn Harness> {
-    harness(s).ok_or_else(|| {
-        anyhow::anyhow!("unknown coding tool {s:?} (supported: claude, codex, opencode)")
+fn resolve_external_harness(root: &Root, profile_name: &str, tool: &str) -> Result<ExternalHarness> {
+    find_external_harness(root, profile_name, tool)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no harness named {tool} — is it installed? (run `elanus init` to seed the stock claude/codex/opencode harness packages)"
+        )
     })
 }
 
@@ -947,8 +414,8 @@ pub struct ExternalHarness {
 }
 
 /// Resolve a package-declared coding harness from the active profile's package
-/// path. Built-in harnesses are resolved before this fallback; this function
-/// only answers for `[[harness]] name = ...` or its aliases.
+/// path. Stock harnesses are seeded as packages too, so this is now the sole
+/// lookup for built-ins and external adapters alike.
 pub fn find_external_harness(
     root: &Root,
     profile_name: &str,
@@ -1497,7 +964,7 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str, provider: Option<&str>) -> R
         bail!("usage: elanus code spawn <tool> \"<task>\"");
     }
 
-    let parsed = parse_harness(tool)?;
+    let parsed = resolve_external_harness(root, "default", tool)?;
     let spawn_depth = std::env::var(ENV_SPAWN_DEPTH)
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
@@ -1519,7 +986,7 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str, provider: Option<&str>) -> R
     if let Some(name) = provider {
         cmd.arg("--provider").arg(name);
     }
-    cmd.arg(parsed.id());
+    cmd.arg(parsed.decl.name);
     // HM3: a detached spawn ALWAYS runs headless — a background worker has no TTY
     // and routes its completion to the spawner mailbox. Every harness now defaults
     // bare → Tui (which needs inherited stdio), so the wrapper must force the
@@ -3076,7 +2543,7 @@ pub fn achievable_vector(agent_noun: &str, desired: InjectionVector) -> Injectio
     match desired {
         InjectionVector::NextTurn => InjectionVector::NextTurn,
         InjectionVector::MidCycle => {
-            if agent_noun == ClaudeCode.agent_noun() {
+            if agent_noun == "claude-code" {
                 InjectionVector::MidCycle
             } else {
                 // Codex (no live hook bridge) and opencode-headless (no served
@@ -3587,6 +3054,10 @@ fn launch_external_harness(
     want_brief: bool,
     requested_grants: codesession::RequestedGrants,
     parent: Option<String>,
+    room: Option<String>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    provider: Option<&str>,
     skills: &[(String, PathBuf)],
 ) -> Result<()> {
     let session = launch_session_id(root);
@@ -3623,12 +3094,13 @@ fn launch_external_harness(
     std::fs::create_dir_all(&scratch)
         .with_context(|| format!("creating run scratch {}", scratch.display()))?;
     let skills_dir = scratch.join("skills");
+    let summary_path = scratch.join("adapter-summary.json");
 
     let prompt = (!args.is_empty()).then(|| args.join(" "));
     let brief_text = want_brief.then(|| briefing(&session));
     // The workdir-derived coordination room (SA1) — same as a built-in session, so the
     // external adapter's auto-claims land where siblings see them.
-    let room = resolve_room(None, &workdir);
+    let room = resolve_room(room.as_deref(), &workdir);
 
     // Setup + exec inside the closure so the scratch/token cleanup below ALWAYS runs,
     // even if a setup step (skill link, record, room join) fails.
@@ -3660,6 +3132,24 @@ fn launch_external_harness(
             std::process::id() as i32,
         );
 
+        // Emit the same launch envelope the direct path used to own.
+        publish_obs(
+            root,
+            &principal,
+            &bus_token,
+            &obs_topic(&agent, &session, "session/start"),
+            json!({
+                "ts": now_iso(),
+                "tool": &external.decl.name,
+                "workdir": workdir.display().to_string(),
+                "args": args,
+                "parent": parent,
+                "model": model,
+                "effort": effort,
+                "provider": provider,
+            }),
+        );
+
         let mut cmd = std::process::Command::new(&adapter);
         scrub_launch_control_env(&mut cmd);
         cmd.current_dir(&workdir)
@@ -3674,6 +3164,19 @@ fn launch_external_harness(
             .env(crate::harness::ENV_WORKDIR, &workdir)
             .env(crate::harness::ENV_MODE, mode_str)
             .env(crate::harness::ENV_TOOL, &external.decl.name);
+        if let Some(model) = model {
+            cmd.env(crate::harness::ENV_MODEL, model);
+        }
+        if let Some(provider) = provider {
+            cmd.env(crate::harness::ENV_PROVIDER, provider);
+        }
+        cmd.env(crate::harness::ENV_SUMMARY_FILE, &summary_path);
+        // The FULL raw argv (harness flags + prompt) — real adapters split it via
+        // their capture fn. The joined ENV_PROMPT is kept for simple adapters.
+        cmd.env(
+            crate::harness::ENV_ARGS,
+            serde_json::to_string(args).unwrap_or_else(|_| "[]".into()),
+        );
         if let Some(prompt) = &prompt {
             cmd.env(crate::harness::ENV_PROMPT, prompt);
         }
@@ -3695,7 +3198,46 @@ fn launch_external_harness(
             .with_context(|| format!("waiting for external adapter {}", adapter.display()))
     })();
 
+    let summary = read_capture_summary_file(Some(&summary_path)).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&scratch);
+    let exit_code = status_result.as_ref().ok().and_then(|status| status.code());
+    publish_obs(
+        root,
+        &principal,
+        &bus_token,
+        &obs_topic(&agent, &session, "session/stop"),
+        json!({ "ts": now_iso(), "exit_code": exit_code }),
+    );
+
+    if let Some(reply_to) = std::env::var(ENV_REPLY_TO).ok().filter(|s| !s.is_empty()) {
+        let correlation = std::env::var(ENV_REPLY_CORRELATION)
+            .ok()
+            .filter(|s| !s.is_empty());
+        let launch_error = status_result.as_ref().err().map(|e| format!("{e:#}"));
+        let fallback_summary;
+        let (status, summary) = match status_result.as_ref() {
+            Ok(status) => (Some(status), &summary),
+            Err(_) => {
+                fallback_summary = CaptureSummary {
+                    final_text: launch_error.as_deref().map(|e| clip(e, FINAL_TEXT_CAP)),
+                    file_changes: Vec::new(),
+                };
+                (None, &fallback_summary)
+            }
+        };
+        if let Err(e) = emit_completion_delivery(
+            root,
+            &session,
+            &reply_to,
+            correlation.as_deref(),
+            status,
+            summary,
+            launch_error.as_deref(),
+        ) {
+            eprintln!("[code] delivering spawned-worker completion failed (continuing): {e:#}");
+        }
+    }
+
     codesession::retire(root, &principal);
 
     let status = status_result?;
@@ -3754,325 +3296,21 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
     // visible skills or discovery fails — then a session sees only the bootstrap
     // `/elanus` skill, exactly as before.
     let skills = visible_skill_packages(root, &profile_name);
-    let worker_timeout = std::env::var(ENV_REPLY_TO)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|_| spawn_timeout_secs());
-
-    let tool = match harness(tool) {
-        Some(tool) => tool,
-        None => {
-            if let Some(external) = find_external_harness(root, &profile_name, tool)? {
-                return launch_external_harness(
-                    root,
-                    external,
-                    args,
-                    headless,
-                    want_brief,
-                    requested_grants,
-                    parent,
-                    &skills,
-                );
-            }
-            parse_harness(tool)?
-        }
-    };
-
-    // M2 (model-providers): `elanus code --provider <name> <tool> …` points this
-    // launch at a named provider. GATED ENTIRELY on `--provider` being present —
-    // when absent, nothing below runs and the launch is byte-identical to today's
-    // scrub-only path. When present: load the provider, materialize it for THIS
-    // harness (a wire/harness mismatch or NativeLogin pin mismatch returns a legible
-    // error and refuses the launch), and carry the resulting `HarnessInjection` to
-    // the per-harness command-build sites (applied AFTER the existing scrub). The
-    // provider NAME (never the secret) is audited on the session/start obs below.
-    let provider_injection: Option<crate::provider::HarnessInjection> = match provider {
-        None => None,
-        Some(name) => {
-            let conn = crate::db::open(root)
-                .with_context(|| "opening the ledger to resolve --provider".to_string())?;
-            let prov = crate::provider::get(root, &conn, name)?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no provider named {name:?} — define one with `elanus provider add {name} …` \
-                     (list with `elanus provider list`)"
-                )
-            })?;
-            let hid = crate::provider::HarnessId::parse(tool.id())?;
-            match crate::provider::materialize(
-                name,
-                &prov.credential,
-                crate::provider::Consumer::Harness(hid),
-                // opencode needs the selected model to register a custom provider id;
-                // the other harnesses ignore it (they carry the model on their own
-                // flags). `model` is the parsed `--model`/`-m` launch value.
-                model.as_deref(),
-            )? {
-                crate::provider::Injection::Harness(h) => Some(h),
-                crate::provider::Injection::Dispatcher(_) => unreachable!(
-                    "materialize(Consumer::Harness) always returns Injection::Harness"
-                ),
-            }
-        }
-    };
-    let injection_ref = provider_injection.as_ref();
-
-    // HM3: the launcher routes purely on Mode. `mode_for(headless)` maps the
-    // uniform `--headless` flag (false → Tui, true → Headless) for every harness;
-    // the capture/command path then branches on `tool.capture(mode)`, never on a
-    // raw `worker` bool. `worker` below is just the Headless predicate the legacy
-    // StreamJson/HookBridge code paths still read (worker == headless == Mode::Headless).
-    let mode = tool.mode_for(headless);
-    let worker = mode == Mode::Headless;
-    let session = launch_session_id(root);
-    let agent = tool.agent_noun().to_string();
-    let brief_text = want_brief.then(|| briefing(&session));
-
-    // Per-session identity: a GRANT-SCOPED session token (NOT a full-authority
-    // fenced secret — docs/security.md entry 16). The launcher is uncaged (the
-    // human ran it), so it can place the token in the fenced store; that is what
-    // lets the session's hook bridge authenticate as ITSELF and the broker stamp
-    // the session — not the owner — as the sender, while holding it to its own
-    // obs subtree. We record this launcher's pid as the token owner so the reaper
-    // can distinguish a live session from a SIGKILL orphan.
-    let principal = session.clone();
-    // M1/M4 (authority-delegation): pass the spawner session so mint can enforce
-    // Σ children ≤ parent.remaining at the fenced-store level (never from env).
-    // `parent` is None when the owner runs `elanus code` directly → unbounded.
-    // M4: pass `requested_grants` from the CLI flags so the owner can deliberately
-    // narrow the child's slice (e.g. `--budget 4` gives the session 4 turns).
-    // When no M4 flags are present, `requested_grants` is `RequestedGrants::default()`
-    // (all None → inherit-equal), preserving the existing behavior exactly.
-    let token = codesession::mint(
+    let external = resolve_external_harness(root, &profile_name, tool)?;
+    return launch_external_harness(
         root,
-        &principal,
-        &agent,
-        std::process::id() as i32,
-        parent.as_deref(),
+        external,
+        args,
+        headless,
+        want_brief,
         requested_grants,
-    )
-    .with_context(|| format!("minting the session credential for {principal}"))?;
-    let bus_token = token.secret.clone();
-
-    // SA1: every session is in a room now. An explicit `--room <id>` wins;
-    // otherwise the room defaults to a stable id derived from the CANONICAL
-    // workdir, so two `elanus code` launched in the SAME checkout with NO flags
-    // see each other (docs/handoffs/sibling-awareness.md). This is advisory
-    // coordination, not authorization — a solo session in a unique dir gets a room
-    // with no peers, identical to today.
-    //
-    // We compute the workdir HERE (the launcher's cwd, the dir the child runs in)
-    // so the derived room matches what `session_room_identity` later derives from
-    // the recorded workdir. The native session id isn't known yet, so set_room
-    // writes/stubs the record's room and the later native-id upsert preserves it
-    // (COALESCE). Best-effort: a room-setup failure must not break the launch.
-    let launch_workdir = std::env::current_dir().unwrap_or_else(|_| root.dir.clone());
-    let room = resolve_room(room.as_deref(), &launch_workdir);
-    {
-        if let Err(e) = codesession::set_room(root, &session, &room) {
-            eprintln!("[code] setting room {room} (continuing without coordination): {e:#}");
-        }
-        if let Err(e) =
-            codesession::join_room(root, &room, &session, &agent, std::process::id() as i32)
-        {
-            eprintln!("[code] joining room {room} (continuing without coordination): {e:#}");
-        } else {
-            eprintln!("[code] session {session} joined coordination room {room}");
-        }
-    }
-
-    let result = (|| -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        // Session start (the first ordered record): timestamp + the resolved
-        // workdir, so the bus shows when and where the session began. Emitted by
-        // the launcher itself for both adapters, before the child runs.
-        let workdir = std::env::current_dir().unwrap_or_else(|_| root.dir.clone());
-        publish_obs(
-            root,
-            &principal,
-            &bus_token,
-            &obs_topic(&agent, &session, "session/start"),
-            json!({
-                "ts": now_iso(),
-                "tool": tool.binary(),
-                "workdir": workdir.display().to_string(),
-                "args": args,
-                "parent": parent,
-                "model": model,
-                "effort": effort,
-                // M2: which named provider this session was pointed at (audit, not
-                // gate) — the NAME only, never the secret. None when no --provider.
-                "provider": provider,
-            }),
-        );
-
-        match tool.capture(mode) {
-            // ── Claude Code: hook bridge ──────────────────────────────────────
-            // The child's own generated hooks call `elanus code hook`; the
-            // launcher inherits stdio and parses nothing.
-            Capture::HookBridge => run_claude_capture(ClaudeLaunch {
-                root,
-                principal: &principal,
-                bus_token: &bus_token,
-                agent: &agent,
-                session: &session,
-                workdir: &workdir,
-                args,
-                brief: brief_text.as_deref(),
-                worker,
-                worker_timeout,
-                injection: injection_ref,
-                skills: &skills,
-            }),
-            // ── StreamJson: stdout JSONL stream ───────────────────────────────
-            // No hooks. Run the harness's headless JSON mode, pipe stdout, and
-            // parse+publish each event in-process as the session principal. The
-            // harness owns the concrete capture (Codex `exec --json` vs opencode
-            // `run --format json`) via `run_stream_capture`; the envelope no longer
-            // branches on the concrete harness. Both fill the same envelope.
-            Capture::StreamJson => tool.run_stream_capture(StreamLaunch {
-                root,
-                principal: &principal,
-                bus_token: &bus_token,
-                agent: &agent,
-                session: &session,
-                workdir: &workdir,
-                args,
-                brief: brief_text.as_deref(),
-                worker,
-                worker_timeout,
-                injection: injection_ref,
-                skills: &skills,
-            }),
-            // ── RolloutImport: interactive TUI + post-hoc rollout import ───────
-            // The codex TUI cell (HM2). The launcher inherits stdio (a real,
-            // human-pumped session, like Claude's TUI) and parses NOTHING live;
-            // after the TUI exits, the harness resolves the rollout JSONL it wrote
-            // and projects its turns into the obs grammar, marked as post-hoc.
-            Capture::RolloutImport => tool.run_tui_rollout_import(StreamLaunch {
-                root,
-                principal: &principal,
-                bus_token: &bus_token,
-                agent: &agent,
-                session: &session,
-                workdir: &workdir,
-                args,
-                brief: brief_text.as_deref(),
-                worker,
-                worker_timeout,
-                injection: injection_ref,
-                skills: &skills,
-            }),
-            // ── Lifecycle: interactive TUI, bracket-only capture ──────────────
-            // The honest no-op floor for a TUI we can launch but not faithfully
-            // capture. No harness currently selects it (opencode's Tui cell was
-            // promoted to ServerEvents in OC3); kept as the declared floor a future
-            // harness can fall back to.
-            Capture::Lifecycle => tool.run_tui_lifecycle(StreamLaunch {
-                root,
-                principal: &principal,
-                bus_token: &bus_token,
-                agent: &agent,
-                session: &session,
-                workdir: &workdir,
-                args,
-                brief: brief_text.as_deref(),
-                worker,
-                worker_timeout,
-                injection: injection_ref,
-                skills: &skills,
-            }),
-            // ── ServerEvents: interactive TUI captured LIVE off a server's SSE ─
-            // opencode's Tui cell (OC3). The launcher starts its own `opencode
-            // serve`, subscribes the server's SSE `/event` stream in a background
-            // thread (projecting each event into the obs grammar live), and runs the
-            // human's TUI via `opencode attach <url>` with inherited stdio. On TUI
-            // exit it kills the server and closes the stream.
-            Capture::ServerEvents => tool.run_tui_server_events(StreamLaunch {
-                root,
-                principal: &principal,
-                bus_token: &bus_token,
-                agent: &agent,
-                session: &session,
-                workdir: &workdir,
-                args,
-                brief: brief_text.as_deref(),
-                worker,
-                worker_timeout,
-                injection: injection_ref,
-                skills: &skills,
-            }),
-        }
-    })();
-
-    // Stop (the last ordered record): always emitted, even on a launch error,
-    // so the bus shows the session ended and with what code.
-    let exit_code = result.as_ref().ok().and_then(|(s, _)| s.code());
-    publish_obs(
-        root,
-        &principal,
-        &bus_token,
-        &obs_topic(&agent, &session, "session/stop"),
-        json!({ "ts": now_iso(), "exit_code": exit_code }),
+        parent,
+        room,
+        model.as_deref(),
+        effort.as_deref(),
+        provider,
+        &skills,
     );
-
-    // A detached spawn asks this wrapper to route the worker's result back to the
-    // spawning session's mailbox. This is best-effort and uses the same safe
-    // actor→mailbox resolver as delivery routing; a reply failure is logged but
-    // never changes the worker's normal stop/cleanup/exit behavior.
-    if let Some(reply_to) = std::env::var(ENV_REPLY_TO).ok().filter(|s| !s.is_empty()) {
-        let correlation = std::env::var(ENV_REPLY_CORRELATION)
-            .ok()
-            .filter(|s| !s.is_empty());
-        let launch_error = result.as_ref().err().map(|e| format!("{e:#}"));
-        let fallback_summary;
-        let (status, summary) = match result.as_ref() {
-            Ok((status, summary)) => (Some(status), summary),
-            Err(_) => {
-                fallback_summary = CaptureSummary {
-                    final_text: launch_error.as_deref().map(|e| clip(e, FINAL_TEXT_CAP)),
-                    file_changes: Vec::new(),
-                };
-                (None, &fallback_summary)
-            }
-        };
-        if let Err(e) = emit_completion_delivery(
-            root,
-            &session,
-            &reply_to,
-            correlation.as_deref(),
-            status,
-            summary,
-            launch_error.as_deref(),
-        ) {
-            eprintln!("[code] delivering spawned-worker completion failed (continuing): {e:#}");
-        }
-    }
-
-    // No lingering credential: retire the session's scoped token (best-effort;
-    // a SIGKILL leaves it, but it is reaped at the next launcher/daemon boot,
-    // and even unreaped it can only ever publish this dead session's own obs
-    // subtree — never the owner, work, or another agent).
-    codesession::retire(root, &principal);
-    // M5: room membership + advisory claims are NOT released here. A coding
-    // session is DURABLE and RESUMABLE (M2-A: a turn-process exiting is not the
-    // session ending) — a one-shot `codex exec` / `claude -p` turn ends its
-    // process every turn, but the session lives on and may resume editing, so its
-    // claims must persist between turns (otherwise a worker would lose its claims
-    // the instant it finished a turn). Release is therefore by:
-    //   - explicit `elanus code unclaim <path>` (the agent finished a file), and
-    //   - crash-reap: `reap_dead_members` drops the membership+claims of a session
-    //     whose owner pid is gone, at the next launcher/daemon boot — so a
-    //     SIGKILL'd (or simply finished) session's claims don't linger forever
-    //     (the lease-released membership of docs/topics.md decided-5).
-    // The owner pid recorded at join is this launcher's pid; once this process
-    // exits it is dead, so the boot reaper will release the membership — but not
-    // mid-turn, and not while a live interactive launcher holds the session open.
-
-    let (status, _summary) = result?;
-    if !status.success() {
-        // Propagate the tool's exit so a script driving the launcher sees it.
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
 }
 
 struct ClaudeLaunch<'a> {
@@ -4098,6 +3336,17 @@ fn adapter_prompt_args(prompt: Option<&str>) -> Vec<String> {
     match prompt {
         Some(p) if !p.is_empty() => vec![p.to_string()],
         _ => Vec::new(),
+    }
+}
+
+/// The argv an adapter passes to its capture fn: the FULL raw argv (harness flags +
+/// prompt) from `ELANUS_CODE_ARGS` so codex `-c …`/etc. reach the tool and the prompt
+/// is parsed correctly — falling back to the single joined prompt when no argv was set.
+fn adapter_args(ctx: &crate::harness::Ctx) -> Vec<String> {
+    if ctx.args().is_empty() {
+        adapter_prompt_args(ctx.prompt())
+    } else {
+        ctx.args().to_vec()
     }
 }
 
@@ -4153,11 +3402,9 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
         .with_context(|| format!("creating run scratch {}", scratch.display()))?;
     let settings_path = scratch.join("settings.json");
     let self_exe = elanus_command_path()?;
-    let binary = ClaudeCode.binary();
+    let binary = "claude";
     let result = (|| -> Result<(std::process::ExitStatus, CaptureSummary)> {
-        let settings = ClaudeCode
-            .settings(&self_exe, root)
-            .expect("hook-bridge adapter generates settings");
+        let settings = claude_settings(&self_exe, root);
         std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
             .with_context(|| format!("writing {}", settings_path.display()))?;
         // M1: the bootstrap `/elanus` skill + the profile's visible skills,
@@ -4286,11 +3533,40 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
 
 /// Shared adapter prompt reconstruction and capture delegation. The adapter
 /// binaries are thin wrappers around these entrypoints.
+fn adapter_provider_injection(
+    ctx: &crate::harness::Ctx,
+) -> Result<Option<crate::provider::HarnessInjection>> {
+    let Some(name) = ctx.provider() else {
+        return Ok(None);
+    };
+    let conn = crate::db::open(ctx.root())
+        .with_context(|| "opening the ledger to resolve --provider".to_string())?;
+    let prov = crate::provider::get(ctx.root(), &conn, name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no provider named {name:?} — define one with `elanus provider add {name} …` \
+             (list with `elanus provider list`)"
+        )
+    })?;
+    let hid = crate::provider::HarnessId::parse(ctx.tool())?;
+    match crate::provider::materialize(
+        name,
+        &prov.credential,
+        crate::provider::Consumer::Harness(hid),
+        ctx.model(),
+    )? {
+        crate::provider::Injection::Harness(h) => Ok(Some(h)),
+        crate::provider::Injection::Dispatcher(_) => unreachable!(
+            "materialize(Consumer::Harness) always returns Injection::Harness"
+        ),
+    }
+}
+
 pub fn run_claude_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::ExitStatus> {
     let bus_token = ctx.bus_token().context("missing ELANUS_BUS_TOKEN")?;
     let skills = skill_packages_from_dir(ctx.skills_dir());
-    let args = adapter_prompt_args(ctx.prompt());
-    let (status, _) = run_claude_capture(ClaudeLaunch {
+    let args = adapter_args(ctx);
+    let injection = adapter_provider_injection(ctx)?;
+    let (status, summary) = run_claude_capture(ClaudeLaunch {
         root: ctx.root(),
         principal: ctx.session(),
         bus_token,
@@ -4301,17 +3577,19 @@ pub fn run_claude_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::Exi
         brief: ctx.briefing(),
         worker: ctx.mode() == Mode::Headless,
         worker_timeout: None,
-        injection: None,
+        injection: injection.as_ref(),
         skills: &skills,
     })?;
+    write_capture_summary_file(ctx.summary_file(), &summary);
     Ok(status)
 }
 
 pub fn run_codex_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::ExitStatus> {
     let bus_token = ctx.bus_token().context("missing ELANUS_BUS_TOKEN")?;
     let skills = skill_packages_from_dir(ctx.skills_dir());
-    let args = adapter_prompt_args(ctx.prompt());
-    let (status, _) = match ctx.mode() {
+    let args = adapter_args(ctx);
+    let injection = adapter_provider_injection(ctx)?;
+    let (status, summary) = match ctx.mode() {
         Mode::Headless => run_codex_capture(
             ctx.root(),
             ctx.session(),
@@ -4322,7 +3600,7 @@ pub fn run_codex_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::Exit
             &args,
             ctx.briefing(),
             None,
-            None,
+            injection.as_ref(),
             &skills,
         )?,
         Mode::Tui => run_codex_tui_import(
@@ -4334,18 +3612,20 @@ pub fn run_codex_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::Exit
             ctx.workdir(),
             &args,
             ctx.briefing(),
-            None,
+            injection.as_ref(),
             &skills,
         )?,
     };
+    write_capture_summary_file(ctx.summary_file(), &summary);
     Ok(status)
 }
 
 pub fn run_opencode_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::ExitStatus> {
     let bus_token = ctx.bus_token().context("missing ELANUS_BUS_TOKEN")?;
     let skills = skill_packages_from_dir(ctx.skills_dir());
-    let args = adapter_prompt_args(ctx.prompt());
-    let (status, _) = match ctx.mode() {
+    let args = adapter_args(ctx);
+    let injection = adapter_provider_injection(ctx)?;
+    let (status, summary) = match ctx.mode() {
         Mode::Headless => run_opencode_capture(
             ctx.root(),
             ctx.session(),
@@ -4357,7 +3637,7 @@ pub fn run_opencode_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::E
             ctx.briefing(),
             true,
             None,
-            None,
+            injection.as_ref(),
             &skills,
         )?,
         Mode::Tui => run_opencode_tui_server_events(
@@ -4369,10 +3649,11 @@ pub fn run_opencode_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::E
             ctx.workdir(),
             &args,
             ctx.briefing(),
-            None,
+            injection.as_ref(),
             &skills,
         )?,
     };
+    write_capture_summary_file(ctx.summary_file(), &summary);
     Ok(status)
 }
 
@@ -4528,7 +3809,7 @@ fn run_codex_capture(
     Ok((status, summary))
 }
 
-// ── HM2: codex TUI (Capture::RolloutImport) ───────────────────────────────────
+// ── HM2: codex TUI (RolloutImport) ────────────────────────────────────────────
 //
 // The codex TUI cell. Its interactive TUI prints nothing parseable to stdout, so
 // the faithful way to capture obs for an interactive codex session is to read the
@@ -5208,7 +4489,7 @@ fn rollout_collect_summary(rec: &Value, summary: &mut CaptureSummary) {
 //
 // DEFERRED (see the onboard-opencode handoff): OC3 — the live SSE/ServerEvents
 // capture variant (opencode is client/server; `serve` exposes an SSE stream) — and
-// OC5 — folding all three adapters into the HM1 `Harness` trait. This adapter is
+// OC5 — folding all three adapters into the HM1 capture seam. This adapter is
 // the headless `run --format json` path only (OC1/OC2/OC4).
 
 /// Compose the opencode run message: opencode's `run` has no out-of-band
@@ -5378,7 +4659,7 @@ fn run_opencode_capture(
     Ok((status, summary))
 }
 
-// ── OC3: opencode TUI via a LIVE server SSE capture (Capture::ServerEvents) ────
+// ── OC3: opencode TUI via a LIVE server SSE capture ───────────────────────────
 //
 // OBSERVED SSE CONTRACT — `opencode serve` + GET `/event` (v1.17.9).
 // Discovered 2026-06-22 from the installed binary (no model call needed to read the
@@ -5413,7 +4694,7 @@ fn run_opencode_capture(
 // obs leaf vocabulary, differing only in the honest fidelity stamp.
 
 /// OC3: launch opencode's interactive TUI captured LIVE off a served instance's SSE
-/// stream (the `Capture::ServerEvents` cell). Steps:
+/// stream (the live SSE cell). Steps:
 ///   1. Start our OWN `opencode serve` on a free port, basic-auth'd with a fresh
 ///      random `OPENCODE_SERVER_PASSWORD`, read its listen URL off stdout.
 ///   2. Spawn a background thread subscribing GET `/event` (SSE), projecting each
@@ -6409,7 +5690,7 @@ fn opencode_map_event(event: &Value) -> Vec<(String, Value)> {
 /// generated summary. `final_text` is the worker's actual last message (None when
 /// it produced no text); `file_changes` are the on-disk paths the tool itself
 /// reported writing (deduped, in first-seen order).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CaptureSummary {
     pub final_text: Option<String>,
     pub file_changes: Vec<String>,
@@ -6425,6 +5706,24 @@ impl CaptureSummary {
         }
         self.file_changes.push(path);
     }
+}
+
+fn write_capture_summary_file(path: Option<&Path>, summary: &CaptureSummary) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Err(e) = std::fs::write(path, serde_json::to_string(summary).unwrap_or_default()) {
+        eprintln!(
+            "[code] writing adapter summary {} failed: {e:#}",
+            path.display()
+        );
+    }
+}
+
+fn read_capture_summary_file(path: Option<&Path>) -> Option<CaptureSummary> {
+    let path = path?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 /// Print the legible result of a blocking Codex launch to the caller's stdout.
@@ -6918,11 +6217,63 @@ fn command_succeeded(item: &Value) -> bool {
 ///   capturing the JSONL result stream (the generated hooks are NOT reloaded on a
 ///   bare `-p --resume`, so resume parses the stream like codex rather than relying
 ///   on hooks). Confirmed flags against Claude Code 2.1.183.
-fn resume_command(rec: &codesession::SessionRecord, message: &str) -> (String, Vec<String>) {
-    // Route to the recorded harness's adapter (codex / opencode / claude-default).
-    // `harness_for_record` reproduces the old match's default-to-claude arm for any
-    // CC-noun or unknown `rec.tool`.
-    harness_for_record(&rec.tool).resume_command(rec, message)
+fn resume_command_for(rec: &codesession::SessionRecord, message: &str) -> (String, Vec<String>) {
+    match harness_id_for_tool(&rec.tool).unwrap_or("claude") {
+        "claude" => (
+            "claude".to_string(),
+            vec![
+                "-p".to_string(),
+                "--resume".to_string(),
+                rec.native_session.clone(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                message.to_string(),
+            ],
+        ),
+        "codex" => (
+            "codex".to_string(),
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                rec.native_session.clone(),
+                "--json".to_string(),
+                "--skip-git-repo-check".to_string(),
+                message.to_string(),
+            ],
+        ),
+        "opencode" => (
+            "opencode".to_string(),
+            vec![
+                "run".to_string(),
+                "--session".to_string(),
+                rec.native_session.clone(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--pure".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                message.to_string(),
+            ],
+        ),
+        _ => unreachable!("harness_id_for_tool only yields known tool ids"),
+    }
+}
+
+fn resume_stream_capture_for(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    rec: &codesession::SessionRecord,
+    child: &mut std::process::Child,
+) -> CaptureSummary {
+    match harness_id_for_tool(&rec.tool).unwrap_or("claude") {
+        "claude" => capture_claude_stream(root, principal, bus_token, agent, session, child),
+        "codex" => capture_codex_stream(root, principal, bus_token, agent, session, child, None),
+        "opencode" => capture_opencode_stream(root, principal, bus_token, agent, session, child, None),
+        _ => unreachable!("harness_id_for_tool only yields known tool ids"),
+    }
 }
 
 /// Wall-clock ceiling on a single resume's native model turn. A resume is one
@@ -7064,7 +6415,7 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     // any prompt cache. None when there's nothing to inject (a quiet turn).
     let injected = build_resume_message(root, &agent, &session, message);
 
-    let (program, cmd_args) = resume_command(&rec, &injected);
+    let (program, cmd_args) = resume_command_for(&rec, &injected);
     // Bound the native turn (handoff guardrail): timeout(1) kills a hung model.
     let secs = resume_timeout_secs();
     let (program, cmd_args) = timeout_wrap(&program, &cmd_args, secs);
@@ -7115,10 +6466,17 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
 
         // Each adapter's resume emits a JSONL stream on stdout; the harness owns
         // reading it (codex/opencode reuse their launch-stream readers, claude uses
-        // the CC `-p --output-format stream-json` mapper). The daemon resolved the
-        // harness via `harness_for_record`, the same key the resume command used.
-        summary = harness_for_record(&rec.tool)
-            .resume_stream_capture(root, &principal, &bus_token, &agent, &session, &mut child);
+        // the CC `-p --output-format stream-json` mapper). The daemon resolves the
+        // capture path from the recorded tool.
+        summary = resume_stream_capture_for(
+            root,
+            &principal,
+            &bus_token,
+            &agent,
+            &session,
+            &rec,
+            &mut child,
+        );
         child.wait().context("waiting for the resume to finish")
     })();
 
@@ -7327,6 +6685,16 @@ fn claude_stream_message(event: &Value, ts: &str) -> Option<(String, Value)> {
     None
 }
 
+fn map_hook_event(noun: &str, event: &str, payload: &Value) -> (String, Value) {
+    match noun {
+        n if n == claude_agent_noun() => claude_map_event(event, payload),
+        n if n == codex_agent_noun() || n == opencode_agent_noun() => {
+            generic_event(event, payload)
+        }
+        _ => generic_event(event, payload),
+    }
+}
+
 /// `elanus code hook <event>` — the bridge. Reads the Claude Code hook JSON
 /// payload on stdin and publishes one ordered observation to the bus as the
 /// session principal. Always exits 0: a hook that fails must never break or alter
@@ -7357,7 +6725,7 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // ↔ workdir), so the session is resumable (`claude -p --resume <session_id>`)
     // even after the launcher exits. The record carries no secret. Best-effort: a
     // failure here must never break the hook or the coding session.
-    if matches!(event, "SessionStart" | "Setup") && agent == ClaudeCode.agent_noun() {
+    if matches!(event, "SessionStart" | "Setup") && agent == claude_agent_noun() {
         if let Some(native) = payload.get("session_id").and_then(Value::as_str) {
             let workdir = payload
                 .get("cwd")
@@ -7382,12 +6750,9 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // session's agent noun. Codex hooks are claim-only today: even though the child
     // has the SDK launch contract, this hook path deliberately avoids publishing
     // codex observations.
-    if agent != Codex.agent_noun() {
+    if agent != codex_agent_noun() {
         if let (Some(principal), Some(token)) = (principal.as_deref(), token.as_deref()) {
-            let (leaf, body) = match harness_by_noun(&agent) {
-                Some(h) => h.map_event(event, &payload),
-                None => generic_event(event, &payload),
-            };
+            let (leaf, body) = map_hook_event(&agent, event, &payload);
             publish_obs(
                 root,
                 principal,
@@ -7419,7 +6784,7 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // (read-provenance M3), not cosmetic — and the broker fast-fails any subscribe
     // to the read flavor so a consumer never reads silence as "no reads happened".
     // The AUTHORITATIVE tier (M2, the cage/syscall read camera) stays deferred.
-    if event == "PreToolUse" && agent == ClaudeCode.agent_noun() && read_camera_enabled(root) {
+    if event == "PreToolUse" && agent == claude_agent_noun() && read_camera_enabled(root) {
         for (topic_name, fs_body) in claude_read_fs_events(&payload, &session) {
             if let (Some(principal), Some(token)) = (principal.as_deref(), token.as_deref()) {
                 publish_obs(root, principal, token, &topic_name, fs_body);
@@ -7435,7 +6800,7 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // half (auto-claim on Read/Grep/Glob) is DEFERRED: it rides the authoritative
     // read camera (read-provenance M2), not built — claiming every file an agent
     // merely READS would be a firehose and the M1 read tier is honest-agent-only.
-    if event == "PreToolUse" && agent == ClaudeCode.agent_noun() {
+    if event == "PreToolUse" && agent == claude_agent_noun() {
         let tool = tool_name(&payload);
         if let Some(path) = claude_write_tool_path(&tool, payload.get("tool_input")) {
             let cwd = payload.get("cwd").and_then(Value::as_str);
@@ -7448,7 +6813,7 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or(event);
     if hook_event == "PostToolUse"
-        && agent == Codex.agent_noun()
+        && agent == codex_agent_noun()
         && tool_name(&payload) == "apply_patch"
     {
         let cwd = payload.get("cwd").and_then(Value::as_str);
@@ -7490,7 +6855,7 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // turn_injection — this arm is reached only for Claude Code (the only harness
     // whose hook fires). The dedup write makes this safe to call every tool event.
     if matches!(event, "PreToolUse" | "PostToolUse" | "PostToolUseFailure")
-        && agent == ClaudeCode.agent_noun()
+        && agent == claude_agent_noun()
     {
         // Sanity: this IS the achievable mid-cycle vector for Claude Code.
         if achievable_vector(&agent, InjectionVector::MidCycle) == InjectionVector::MidCycle {
@@ -7594,7 +6959,7 @@ fn estimate_retro_once(root: &Root, agent: &str, session: &str) {
 /// `tool/<name>/{call,result}` for the tool loop, plus session/turn leaves.
 /// The hook stdin payload includes `session_id`, `cwd`, `permission_mode`,
 /// `hook_event_name`, plus event-specific fields (Appendix A). The Codex adapter
-/// adds a sibling `codex_map_event` and its own `Harness::map_event` impl.
+/// adds a sibling `codex_map_event` and its own hook-mapping helper.
 fn claude_map_event(event: &str, payload: &Value) -> (String, Value) {
     let ts = json!(now_iso());
     let cc_session = payload.get("session_id").cloned().unwrap_or(Value::Null);
@@ -7919,139 +7284,49 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn tool_parse() {
-        // The registry resolves every CLI alias to a harness, and rejects unknowns
-        // (the old `Tool::parse` match, now `harness(name)`).
-        assert_eq!(harness("claude").unwrap().id(), "claude");
-        assert_eq!(harness("claude-code").unwrap().id(), "claude");
-        assert_eq!(harness("cc").unwrap().id(), "claude");
-        assert_eq!(harness("codex").unwrap().id(), "codex");
-        assert_eq!(harness("opencode").unwrap().id(), "opencode");
-        assert_eq!(harness("oc").unwrap().id(), "opencode");
-        assert!(harness("nonsense").is_none());
-        assert!(parse_harness("nonsense").is_err());
-        assert_eq!(parse_harness("cc").unwrap().id(), "claude");
+    fn tool_aliases_normalize_for_dispatch() {
+        assert_eq!(harness_id_for_tool("claude"), Some("claude"));
+        assert_eq!(harness_id_for_tool("claude-code"), Some("claude"));
+        assert_eq!(harness_id_for_tool("cc"), Some("claude"));
+        assert_eq!(harness_id_for_tool("codex"), Some("codex"));
+        assert_eq!(harness_id_for_tool("opencode"), Some("opencode"));
+        assert_eq!(harness_id_for_tool("oc"), Some("opencode"));
+        assert!(harness_id_for_tool("nonsense").is_none());
     }
 
     #[test]
-    fn harness_registry_holds_the_three_adapters() {
-        // The registry enumerates exactly the three adapters; "adding a harness" is
-        // a single `impl Harness` + one line in `HARNESSES` (the HM5 payoff, proven
-        // by opencode being a real third adapter behind the seam).
-        let ids: Vec<&str> = HARNESSES.iter().map(|h| h.id()).collect();
-        assert_eq!(ids, vec!["claude", "codex", "opencode"]);
-        // Every harness round-trips through both lookups (alias + agent noun).
-        for h in HARNESSES {
-            assert_eq!(harness(h.id()).unwrap().id(), h.id());
-            assert_eq!(harness_by_noun(h.agent_noun()).unwrap().id(), h.id());
-        }
-        // An unknown agent noun resolves to no harness (a future adapter this binary
-        // predates) — the hook bridge then files generically.
-        assert!(harness_by_noun("future-harness").is_none());
-        // A recorded `tool` with no matching harness defaults to Claude (the old
-        // `resume_command` default arm).
-        assert_eq!(harness_for_record("claude").id(), "claude");
-        assert_eq!(harness_for_record("anything-else").id(), "claude");
-    }
+    fn map_hook_event_and_resume_command_are_free_functions() {
+        let payload = json!({
+            "session_id": "cc-123",
+            "cwd": "/tmp/proj",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "ls -la" },
+        });
+        let (leaf, body) = map_hook_event(claude_agent_noun(), "PreToolUse", &payload);
+        assert_eq!(leaf, "tool/Bash/call");
+        assert_eq!(body["tool"], "Bash");
+        assert_eq!(body["cc_session"], "cc-123");
 
-    #[test]
-    fn capture_strategy_and_agent_noun_per_tool() {
-        // CC uses the hook bridge and generates settings; Codex/opencode use the
-        // JSONL stream and generate NO settings (no hooks, no home pollution).
-        let claude = harness("claude").unwrap();
-        let codex = harness("codex").unwrap();
-        let opencode = harness("opencode").unwrap();
-
-        // Claude has both cells: bare → Tui (hook bridge), --headless → Headless.
-        assert_eq!(claude.mode_for(false), Mode::Tui);
-        assert_eq!(claude.mode_for(true), Mode::Headless);
-        assert!(matches!(claude.capture(Mode::Tui), Capture::HookBridge));
-        assert!(matches!(
-            claude.capture(Mode::Headless),
-            Capture::HookBridge
-        ));
-
-        // HM2/HM3: codex now honors both cells. bare → Tui (RolloutImport, the
-        // post-hoc rollout reader); --headless → Headless (StreamJson, unchanged).
-        assert_eq!(codex.mode_for(false), Mode::Tui);
-        assert_eq!(codex.mode_for(true), Mode::Headless);
-        assert!(matches!(codex.capture(Mode::Tui), Capture::RolloutImport));
-        assert!(matches!(codex.capture(Mode::Headless), Capture::StreamJson));
-        assert_eq!(codex.agent_noun(), "codex");
-        assert_eq!(codex.binary(), "codex");
-
-        // OC3: opencode now honors both cells. bare → Tui (ServerEvents — live SSE
-        // capture off a served instance, inherited-stdio TUI via `opencode attach`);
-        // --headless → Headless (StreamJson, unchanged).
-        assert_eq!(opencode.mode_for(false), Mode::Tui);
-        assert_eq!(opencode.mode_for(true), Mode::Headless);
-        assert!(matches!(opencode.capture(Mode::Tui), Capture::ServerEvents));
-        assert!(matches!(
-            opencode.capture(Mode::Headless),
-            Capture::StreamJson
-        ));
-        assert_eq!(opencode.agent_noun(), "opencode");
-        assert_eq!(opencode.binary(), "opencode");
-
-        let dummy_root = Root {
-            dir: PathBuf::from("/tmp/fake-root"),
+        let rec = codesession::SessionRecord {
+            elanus_session: "code-aaaa1111".to_string(),
+            native_session: "019ee252-3d31-7681-b1d7-7a4b3c494fb5".to_string(),
+            tool: "codex".to_string(),
+            agent_noun: codex_agent_noun().to_string(),
+            workdir: "/tmp/proj".to_string(),
+            room: None,
         };
-        let exe = Path::new("/usr/local/bin/elanus");
-        assert!(opencode.settings(exe, &dummy_root).is_none());
-        assert!(codex.settings(exe, &dummy_root).is_none());
-        assert!(claude.settings(exe, &dummy_root).is_some());
-    }
+        let (prog, args) = resume_command_for(&rec, "say hi again");
+        assert_eq!(prog, "codex");
+        assert_eq!(args[0], "exec");
+        assert_eq!(args[1], "resume");
+        assert_eq!(args[2], rec.native_session);
 
-    // ── HM3: uniform --headless flag → Mode per (harness, flag) ──────────────
-
-    #[test]
-    fn headless_flag_selects_mode_for_every_harness() {
-        // Bare (no flag) → Tui for ALL harnesses; --headless → Headless for ALL.
-        for id in ["claude", "codex", "opencode"] {
-            let h = harness(id).unwrap();
-            // bare invocation: no --headless, no --worker.
-            let (headless, rest) = take_headless_flag(&["a-prompt".to_string()]);
-            assert!(!headless, "{id}: bare must not be headless");
-            assert_eq!(rest, vec!["a-prompt".to_string()]);
-            assert_eq!(h.mode_for(headless), Mode::Tui, "{id}: bare → Tui");
-
-            // --headless anywhere → Headless, flag stripped from argv.
-            let (headless, rest) =
-                take_headless_flag(&["--headless".to_string(), "a-prompt".to_string()]);
-            assert!(headless, "{id}: --headless must be headless");
-            assert_eq!(rest, vec!["a-prompt".to_string()], "{id}: flag stripped");
-            assert_eq!(
-                h.mode_for(headless),
-                Mode::Headless,
-                "{id}: --headless → Headless"
-            );
-        }
-    }
-
-    #[test]
-    fn worker_flag_is_a_deprecated_alias_for_headless() {
-        // --worker still selects Headless (back-compat) and is stripped from argv.
-        let (headless, rest) = take_headless_flag(&["--worker".to_string(), "task".to_string()]);
-        assert!(headless);
-        assert_eq!(rest, vec!["task".to_string()]);
-        // Every harness maps the alias to Headless exactly like --headless.
-        for id in ["claude", "codex", "opencode"] {
-            assert_eq!(harness(id).unwrap().mode_for(headless), Mode::Headless);
-        }
-    }
-
-    #[test]
-    fn bare_codex_selects_the_tui_cell_not_an_error() {
-        // HM3 regression guard: bare `elanus code codex` must resolve to the TUI
-        // (RolloutImport) cell — NOT the old headless-only path that errored on a
-        // missing prompt. We assert the mode/capture arg path (not a live launch).
-        let codex = harness("codex").unwrap();
-        let (headless, rest) = take_headless_flag(&[]); // bare: no args at all
-        assert!(!headless);
-        assert!(rest.is_empty());
-        let mode = codex.mode_for(headless);
-        assert_eq!(mode, Mode::Tui);
-        assert!(matches!(codex.capture(mode), Capture::RolloutImport));
+        let mut rec = rec.clone();
+        rec.tool = "nonesuch".to_string();
+        let (prog, args) = resume_command_for(&rec, "fallback");
+        assert_eq!(prog, "claude");
+        assert!(args.contains(&"--resume".to_string()));
     }
 
     #[test]
@@ -8267,7 +7542,7 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": { "command": "ls -la" },
         });
-        let (leaf, body) = ClaudeCode.map_event("PreToolUse", &payload);
+        let (leaf, body) = map_hook_event(claude_agent_noun(), "PreToolUse", &payload);
         assert_eq!(leaf, "tool/Bash/call");
         assert_eq!(body["tool"], "Bash");
         assert_eq!(body["cc_session"], "cc-123");
@@ -8285,7 +7560,7 @@ mod tests {
             "tool_input": { "file_path": "/x" },
             "tool_response": "permission denied",
         });
-        let (leaf, body) = ClaudeCode.map_event("PostToolUseFailure", &payload);
+        let (leaf, body) = map_hook_event(claude_agent_noun(), "PostToolUseFailure", &payload);
         assert_eq!(leaf, "tool/Write/result");
         assert_eq!(body["failed"], true);
         assert!(body["response"]
@@ -8454,20 +7729,21 @@ mod tests {
 
     #[test]
     fn map_user_prompt_and_stop() {
-        let (leaf, body) = ClaudeCode.map_event(
+        let (leaf, body) = map_hook_event(
+            claude_agent_noun(),
             "UserPromptSubmit",
             &json!({ "prompt": "fix the bug", "session_id": "cc" }),
         );
         assert_eq!(leaf, "user/message");
         assert_eq!(body["prompt"], "fix the bug");
 
-        let (leaf, _) = ClaudeCode.map_event("Stop", &json!({ "session_id": "cc" }));
+        let (leaf, _) = map_hook_event(claude_agent_noun(), "Stop", &json!({ "session_id": "cc" }));
         assert_eq!(leaf, "session/idle");
     }
 
     #[test]
     fn unknown_event_still_lands() {
-        let (leaf, body) = ClaudeCode.map_event("PreCompact", &json!({ "session_id": "cc" }));
+        let (leaf, body) = map_hook_event(claude_agent_noun(), "PreCompact", &json!({ "session_id": "cc" }));
         assert_eq!(leaf, "event/PreCompact");
         assert_eq!(body["event"], "PreCompact");
     }
@@ -8757,7 +8033,7 @@ mod tests {
             workdir: "/tmp/proj".to_string(),
             room: None,
         };
-        let (prog, args) = resume_command(&rec, "say hi again");
+        let (prog, args) = resume_command_for(&rec, "say hi again");
         assert_eq!(prog, "codex");
         assert_eq!(
             args,
@@ -8789,7 +8065,7 @@ mod tests {
             workdir: "/tmp/proj".to_string(),
             room: None,
         };
-        let (prog, args) = resume_command(&rec, "carry on");
+        let (prog, args) = resume_command_for(&rec, "carry on");
         assert_eq!(prog, "opencode");
         assert_eq!(
             args,
@@ -8986,20 +8262,6 @@ mod tests {
         );
     }
 
-    // ── OC3: opencode TUI live SSE capture (Capture::ServerEvents) ─────────────
-
-    #[test]
-    fn opencode_tui_capture_is_server_events_live() {
-        // OC3: opencode's Tui cell is the LIVE SSE capture, not the bracket-only
-        // Lifecycle floor it replaced.
-        assert!(matches!(OpenCode.capture(Mode::Tui), Capture::ServerEvents));
-        // Headless is unchanged (the OC1 StreamJson worker).
-        assert!(matches!(
-            OpenCode.capture(Mode::Headless),
-            Capture::StreamJson
-        ));
-    }
-
     #[test]
     fn opencode_serve_url_is_extracted_from_the_announce_line() {
         // The exact line `opencode serve` prints on stdout (v1.17.9, captured live).
@@ -9178,7 +8440,7 @@ mod tests {
             workdir: "/work".to_string(),
             room: None,
         };
-        let (prog, args) = resume_command(&rec, "continue please");
+        let (prog, args) = resume_command_for(&rec, "continue please");
         assert_eq!(prog, "claude");
         assert!(args.contains(&"-p".to_string()));
         let resume_pos = args.iter().position(|a| a == "--resume").unwrap();
@@ -11027,7 +10289,7 @@ mod tests {
                 elanus_session: session.into(),
                 native_session: format!("native-{session}"),
                 tool: "claude".into(),
-                agent_noun: ClaudeCode.agent_noun().into(),
+                agent_noun: claude_agent_noun().into(),
                 workdir: workdir.into(),
                 room: None,
             },
@@ -11127,7 +10389,7 @@ mod tests {
                 elanus_session: "code-room1111".into(),
                 native_session: "native-room".into(),
                 tool: "claude".into(),
-                agent_noun: ClaudeCode.agent_noun().into(),
+                agent_noun: claude_agent_noun().into(),
                 workdir: "/tmp/sa3-explicit".into(),
                 room: Some("planner-room".into()),
             },
@@ -11410,7 +10672,7 @@ mod tests {
         auto_claim_write(&root, "code-inja0001", "App.tsx", Some(workdir));
 
         // B's turn injection mentions A's auto-claimed path.
-        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-injb0002")
+        let inj = turn_injection(&root, claude_agent_noun(), "code-injb0002")
             .expect("B should see a sibling/peer-claim line");
         let want = std::fs::canonicalize(Path::new(workdir).join("App.tsx"))
             .unwrap_or_else(|_| Path::new(workdir).join("App.tsx"))
@@ -11433,7 +10695,7 @@ mod tests {
                 elanus_session: session.into(),
                 native_session: format!("native-{session}"),
                 tool: "claude".into(),
-                agent_noun: ClaudeCode.agent_noun().into(),
+                agent_noun: claude_agent_noun().into(),
                 workdir: String::new(),
                 room: None,
             },
@@ -11453,7 +10715,7 @@ mod tests {
         let conn = crate::db::open(root).unwrap();
         crate::db::init_schema(&conn).unwrap();
         let mut b =
-            crate::context_blocks::ContextBlock::new(name, content, ClaudeCode.agent_noun());
+            crate::context_blocks::ContextBlock::new(name, content, claude_agent_noun());
         b.scope = if session_scope {
             crate::context_blocks::Scope::Session
         } else {
@@ -11484,7 +10746,7 @@ mod tests {
             true,
         );
 
-        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-blk00001")
+        let inj = turn_injection(&root, claude_agent_noun(), "code-blk00001")
             .expect("blocks should produce an injection");
         assert!(inj.contains("[elanus block: identity]"), "got:\n{inj}");
         assert!(inj.contains("I am Lily, the worker."), "got:\n{inj}");
@@ -11507,7 +10769,7 @@ mod tests {
                 .as_deref(),
             Some("remember the rename")
         );
-        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-note0009")
+        let inj = turn_injection(&root, claude_agent_noun(), "code-note0009")
             .expect("a note should produce an injection");
         assert!(
             inj.contains("[elanus note] remember the rename"),
@@ -11535,21 +10797,21 @@ mod tests {
         );
 
         // First tool boundary: emitted.
-        let first = mid_cycle_injection(&root, ClaudeCode.agent_noun(), "code-mid00001")
+        let first = mid_cycle_injection(&root, claude_agent_noun(), "code-mid00001")
             .expect("a fresh high-priority block emits mid-cycle");
         assert!(first.contains("[elanus block: alert]"), "got:\n{first}");
         assert!(first.contains("STOP: schema migrated"), "got:\n{first}");
 
         // Second tool boundary (unchanged): nothing (dedup).
         assert!(
-            mid_cycle_injection(&root, ClaudeCode.agent_noun(), "code-mid00001").is_none(),
+            mid_cycle_injection(&root, claude_agent_noun(), "code-mid00001").is_none(),
             "an unchanged mid-cycle block must not re-emit on the next tool call"
         );
 
         // A NORMAL block does NOT ride mid-cycle.
         m4_block(&root, "code-mid00001", "calm", "fyi only", 0, true);
         assert!(
-            mid_cycle_injection(&root, ClaudeCode.agent_noun(), "code-mid00001").is_none(),
+            mid_cycle_injection(&root, claude_agent_noun(), "code-mid00001").is_none(),
             "a normal-priority block must not emit mid-cycle"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
@@ -11559,29 +10821,29 @@ mod tests {
     fn capability_matrix_degrades_codex_and_opencode_to_next_turn() {
         // Claude Code can do both vectors.
         assert_eq!(
-            achievable_vector(ClaudeCode.agent_noun(), InjectionVector::MidCycle),
+            achievable_vector(claude_agent_noun(), InjectionVector::MidCycle),
             InjectionVector::MidCycle
         );
         assert_eq!(
-            achievable_vector(ClaudeCode.agent_noun(), InjectionVector::NextTurn),
+            achievable_vector(claude_agent_noun(), InjectionVector::NextTurn),
             InjectionVector::NextTurn
         );
         // Codex has no live hook bridge → a mid-cycle request DEGRADES to next-turn.
         assert_eq!(
-            achievable_vector(Codex.agent_noun(), InjectionVector::MidCycle),
+            achievable_vector(codex_agent_noun(), InjectionVector::MidCycle),
             InjectionVector::NextTurn,
             "Codex must degrade mid-cycle to next-turn, not error or drop"
         );
         // opencode-headless degrades too (served path deferred).
         assert_eq!(
-            achievable_vector(OpenCode.agent_noun(), InjectionVector::MidCycle),
+            achievable_vector(opencode_agent_noun(), InjectionVector::MidCycle),
             InjectionVector::NextTurn
         );
         // next-turn is always achievable everywhere.
         for noun in [
-            ClaudeCode.agent_noun(),
-            Codex.agent_noun(),
-            OpenCode.agent_noun(),
+            claude_agent_noun(),
+            codex_agent_noun(),
+            opencode_agent_noun(),
         ] {
             assert_eq!(
                 achievable_vector(noun, InjectionVector::NextTurn),
@@ -11601,7 +10863,7 @@ mod tests {
                 elanus_session: "code-cdx00001".into(),
                 native_session: "native-cdx".into(),
                 tool: "codex".into(),
-                agent_noun: Codex.agent_noun().into(),
+                agent_noun: codex_agent_noun().into(),
                 workdir: String::new(),
                 room: None,
             },
@@ -11613,13 +10875,13 @@ mod tests {
         let mut b = crate::context_blocks::ContextBlock::new(
             "alert",
             "urgent for codex",
-            Codex.agent_noun(),
+            codex_agent_noun(),
         );
         b.scope = crate::context_blocks::Scope::Session;
         b.priority = crate::context_store::MID_CYCLE_PRIORITY;
         crate::context_store::upsert_block(&conn, "default", &b, "code-cdx00001", None).unwrap();
 
-        let inj = turn_injection(&root, Codex.agent_noun(), "code-cdx00001")
+        let inj = turn_injection(&root, codex_agent_noun(), "code-cdx00001")
             .expect("the high-pri block must land next-turn for codex");
         assert!(
             inj.contains("urgent for codex"),
@@ -11677,19 +10939,19 @@ mod tests {
         m4_record(&root, "code-inbx0001");
         // Empty inbox → no injection at all (the quiet turn is preserved).
         assert!(
-            turn_injection(&root, ClaudeCode.agent_noun(), "code-inbx0001").is_none(),
+            turn_injection(&root, claude_agent_noun(), "code-inbx0001").is_none(),
             "an empty inbox must produce no inbox block (quiet turn)"
         );
         // Deliver one normal-priority message.
         comms_mail(
             &root,
-            ClaudeCode.agent_noun(),
+            claude_agent_noun(),
             "code-inbx0001",
             "scout",
             "please review PR 7",
             0,
         );
-        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-inbx0001")
+        let inj = turn_injection(&root, claude_agent_noun(), "code-inbx0001")
             .expect("unseen mail must produce an inbox block");
         // Rendered in the block shape (C2), with the count + a preview of the latest.
         assert!(inj.contains("[elanus block: inbox]"), "got:\n{inj}");
@@ -11708,7 +10970,7 @@ mod tests {
         // A high-priority (>= default threshold 5) unseen delivery.
         comms_mail(
             &root,
-            ClaudeCode.agent_noun(),
+            claude_agent_noun(),
             "code-hipr0001",
             "lily",
             "STOP: API changed",
@@ -11717,7 +10979,7 @@ mod tests {
         // A normal one too — it must NOT ride the mid-cycle vector.
         comms_mail(
             &root,
-            ClaudeCode.agent_noun(),
+            claude_agent_noun(),
             "code-hipr0001",
             "lily",
             "fyi later",
@@ -11725,7 +10987,7 @@ mod tests {
         );
 
         // First tool boundary: the high-pri mail is injected mid-cycle, once.
-        let first = mid_cycle_mail_injection(&root, ClaudeCode.agent_noun(), "code-hipr0001")
+        let first = mid_cycle_mail_injection(&root, claude_agent_noun(), "code-hipr0001")
             .expect("high-priority unseen mail must reach mid-cycle");
         assert!(first.contains("Urgent mail"), "got:\n{first}");
         assert!(first.contains("STOP: API changed"), "got:\n{first}");
@@ -11737,11 +10999,11 @@ mod tests {
         // Second tool boundary (unchanged): nothing — the same message is not
         // re-injected, and it was NOT marked seen, so it still shows next-turn.
         assert!(
-            mid_cycle_mail_injection(&root, ClaudeCode.agent_noun(), "code-hipr0001").is_none(),
+            mid_cycle_mail_injection(&root, claude_agent_noun(), "code-hipr0001").is_none(),
             "the same high-pri message must not re-inject on the next tool call"
         );
         // Not marked seen: both deliveries still count in the next-turn inbox block.
-        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-hipr0001")
+        let inj = turn_injection(&root, claude_agent_noun(), "code-hipr0001")
             .expect("unseen mail still shows next-turn");
         assert!(
             inj.contains("2 new message(s)"),
@@ -11751,7 +11013,7 @@ mod tests {
         // Codex degrades: it has no mid-cycle hook, so its high-pri mail rides the
         // next-turn inbox block instead (achievable_vector). Verify the matrix gate.
         assert_eq!(
-            achievable_vector(Codex.agent_noun(), InjectionVector::MidCycle),
+            achievable_vector(codex_agent_noun(), InjectionVector::MidCycle),
             InjectionVector::NextTurn,
             "Codex degrades mid-cycle mail to next-turn"
         );
@@ -11765,18 +11027,18 @@ mod tests {
         // priority 4 < default threshold 5 → next-turn only, never mid-cycle.
         comms_mail(
             &root,
-            ClaudeCode.agent_noun(),
+            claude_agent_noun(),
             "code-lopr0001",
             "lily",
             "routine handoff",
             4,
         );
         assert!(
-            mid_cycle_mail_injection(&root, ClaudeCode.agent_noun(), "code-lopr0001").is_none(),
+            mid_cycle_mail_injection(&root, claude_agent_noun(), "code-lopr0001").is_none(),
             "below-threshold mail must not ride the mid-cycle vector"
         );
         // But it still shows next-turn (the inbox block).
-        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-lopr0001").unwrap();
+        let inj = turn_injection(&root, claude_agent_noun(), "code-lopr0001").unwrap();
         assert!(inj.contains("[elanus block: inbox]"), "got:\n{inj}");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -11796,7 +11058,7 @@ mod tests {
                 elanus_session: "code-room0001".into(),
                 native_session: "native-room1".into(),
                 tool: "claude".into(),
-                agent_noun: ClaudeCode.agent_noun().into(),
+                agent_noun: claude_agent_noun().into(),
                 workdir: String::new(),
                 room: Some("team-1".into()),
             },
@@ -11807,7 +11069,7 @@ mod tests {
         comms_channel_msg(&root, "team-1", "scout", "msg two");
         comms_channel_msg(&root, "team-1", "lily", "msg three");
 
-        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-room0001")
+        let inj = turn_injection(&root, claude_agent_noun(), "code-room0001")
             .expect("an in-room session with channel traffic gets a channel block");
         assert!(
             inj.contains("[elanus block: channel:team-1]"),
@@ -11833,13 +11095,13 @@ mod tests {
                 elanus_session: "code-room0002".into(),
                 native_session: "native-room2".into(),
                 tool: "claude".into(),
-                agent_noun: ClaudeCode.agent_noun().into(),
+                agent_noun: claude_agent_noun().into(),
                 workdir: String::new(),
                 room: Some("other-room".into()),
             },
         )
         .unwrap();
-        let inj2 = turn_injection(&root, ClaudeCode.agent_noun(), "code-room0002");
+        let inj2 = turn_injection(&root, claude_agent_noun(), "code-room0002");
         assert!(
             inj2.as_deref()
                 .map_or(true, |s| !s.contains("channel:team-1")),
@@ -11859,14 +11121,14 @@ mod tests {
                 elanus_session: "code-noopt0001".into(),
                 native_session: "native-noopt".into(),
                 tool: "claude".into(),
-                agent_noun: ClaudeCode.agent_noun().into(),
+                agent_noun: claude_agent_noun().into(),
                 workdir: String::new(),
                 room: Some("team-1".into()),
             },
         )
         .unwrap();
         comms_channel_msg(&root, "team-1", "scout", "hello room");
-        let inj = turn_injection(&root, ClaudeCode.agent_noun(), "code-noopt0001");
+        let inj = turn_injection(&root, claude_agent_noun(), "code-noopt0001");
         assert!(
             inj.as_deref()
                 .map_or(true, |s| !s.contains("channel:team-1")),

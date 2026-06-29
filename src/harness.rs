@@ -10,7 +10,15 @@ pub const ENV_BUS_TOKEN: &str = "ELANUS_BUS_TOKEN";
 pub const ENV_WORKDIR: &str = "ELANUS_CODE_WORKDIR";
 pub const ENV_MODE: &str = "ELANUS_CODE_MODE";
 pub const ENV_TOOL: &str = "ELANUS_CODE_TOOL";
+pub const ENV_MODEL: &str = "ELANUS_CODE_MODEL";
+pub const ENV_PROVIDER: &str = "ELANUS_CODE_PROVIDER";
+pub const ENV_SUMMARY_FILE: &str = "ELANUS_CODE_SUMMARY_FILE";
 pub const ENV_PROMPT: &str = "ELANUS_CODE_PROMPT";
+/// The FULL post-elanus-flags argv the user passed (JSON array). Real harness
+/// adapters pass this verbatim to their capture fn, which knows how to split the
+/// harness's own flags (e.g. codex `-c …`) from the prompt — joining it into a
+/// single `ENV_PROMPT` string loses that distinction.
+pub const ENV_ARGS: &str = "ELANUS_CODE_ARGS";
 pub const ENV_BRIEFING: &str = "ELANUS_CODE_BRIEFING";
 pub const ENV_SKILLS_DIR: &str = "ELANUS_CODE_SKILLS_DIR";
 
@@ -23,7 +31,11 @@ pub struct Ctx {
     bus_token: Option<String>,
     workdir: PathBuf,
     mode: Mode,
+    args: Vec<String>,
     tool: String,
+    model: Option<String>,
+    provider: Option<String>,
+    summary_file: Option<PathBuf>,
     prompt: Option<String>,
     briefing: Option<String>,
     skills_dir: Option<PathBuf>,
@@ -46,7 +58,13 @@ impl Ctx {
             Some(mode) => parse_mode(&mode)?,
             None => Mode::Headless,
         };
+        let args = env_optional(ENV_ARGS)
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default();
         let tool = env_optional(ENV_TOOL).unwrap_or_else(|| agent_noun.clone());
+        let model = env_optional(ENV_MODEL);
+        let provider = env_optional(ENV_PROVIDER);
+        let summary_file = env_optional(ENV_SUMMARY_FILE).map(PathBuf::from);
         let prompt = env_optional(ENV_PROMPT);
         let briefing = env_optional(ENV_BRIEFING);
         let skills_dir = env_optional(ENV_SKILLS_DIR).map(PathBuf::from);
@@ -58,7 +76,11 @@ impl Ctx {
             bus_token,
             workdir,
             mode,
+            args,
             tool,
+            model,
+            provider,
+            summary_file,
             prompt,
             briefing,
             skills_dir,
@@ -83,6 +105,24 @@ impl Ctx {
 
     pub fn tool(&self) -> &str {
         &self.tool
+    }
+
+    /// The full post-elanus-flags argv (harness flags + prompt). Real adapters pass
+    /// this to their capture fn, which splits the harness's flags from the prompt.
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    pub fn summary_file(&self) -> Option<&Path> {
+        self.summary_file.as_deref()
     }
 
     pub fn workdir(&self) -> &Path {
@@ -221,6 +261,9 @@ mod tests {
             ENV_WORKDIR,
             ENV_MODE,
             ENV_TOOL,
+            ENV_MODEL,
+            ENV_PROVIDER,
+            ENV_SUMMARY_FILE,
             ENV_PROMPT,
             ENV_BRIEFING,
             ENV_SKILLS_DIR,
@@ -276,6 +319,9 @@ mod tests {
             ENV_WORKDIR,
             ENV_MODE,
             ENV_TOOL,
+            ENV_MODEL,
+            ENV_PROVIDER,
+            ENV_SUMMARY_FILE,
             ENV_PROMPT,
             ENV_BRIEFING,
             ENV_SKILLS_DIR,
