@@ -111,6 +111,16 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: false,
     },
     PkgFile {
+        rel: "core/packages/sibling-coordination/SKILL.md",
+        content: include_str!("../kits/core/packages/sibling-coordination/SKILL.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/packages/sibling-coordination/elanus.toml",
+        content: include_str!("../kits/core/packages/sibling-coordination/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
         rel: "core/profiles/architect/profile.toml",
         content: include_str!("../kits/core/profiles/architect/profile.toml"),
         exec: false,

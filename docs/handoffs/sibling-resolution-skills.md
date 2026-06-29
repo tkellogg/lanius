@@ -34,10 +34,13 @@ disclosure. Rejected for the first cut — the moves are one short decision flow
 splitting them buries the umbrella (`resolve-sibling-conflict`) that ties them
 together. Split later if the SKILL.md grows past a screen.
 
-Materialization: once installed on the default profile, the
-[coding-skill-materialization](coding-skill-materialization.md) work already
-delivers it into claude (`--plugin-dir`), codex (`CODEX_HOME`), and opencode
-(`OPENCODE_CONFIG_DIR`) sessions automatically. No per-harness work here.
+Seeding: the package (`SKILL.md` + `elanus.toml`) is in the stock-init set
+(`src/initcmd.rs` `STOCK_KIT_FILES`), so every fresh `elanus init` root has it —
+without that it would exist in-tree but never ship (a gap the journey-12 adjudication
+caught). Materialization: once visible on a profile, the
+[coding-skill-materialization](coding-skill-materialization.md) work delivers it into
+claude (`--plugin-dir`), codex (`CODEX_HOME`), and opencode (`OPENCODE_CONFIG_DIR`)
+sessions automatically. No per-harness work here.
 
 ## Two new CLI verbs this skill needs
 

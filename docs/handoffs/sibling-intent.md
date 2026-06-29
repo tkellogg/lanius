@@ -119,11 +119,19 @@ events:
 All three already collapse a touch into a `code_claims` row in the session's room,
 tested (`codeagent.rs` ~10803 codex, ~10857 opencode). So codex/opencode siblings DO
 get "last editing <path>" — there is no mechanism to add.
-- **What's left is to verify, not build:** if a codex/opencode sibling still shows no
-  "last editing" in practice, investigate the EXISTING path — does the *interactive
-  TUI* capture (codex RolloutImport / opencode ServerEvents) call `auto_claim_write`,
-  or only the headless stream? Are the human's own codex sessions even captured by
-  elanus? Those are the real questions, not a new consumer.
+- **Interactive-TUI status (resolved after the journey-12 adjudication):**
+  - *opencode TUI* — was the headless-only gap; now FIXED: the live SSE handler calls
+    `auto_claim_write` on each settled `edit`/`write` part (`codeagent.rs`,
+    `run_opencode_tui_server_events` SSE loop), parity with the headless `run` cell.
+    An interactive opencode sibling now auto-claims in real time.
+  - *codex TUI* — a real ARCHITECTURAL limitation, NOT an auto-claim oversight, and
+    deliberately not "fixed": codex's TUI is captured POST-HOC (the rollout is
+    imported only after the session exits) and the rollout carries no discrete
+    file-change item. So an interactive codex sibling cannot surface live edits at all
+    — by import time it's over. Real-time codex-TUI awareness needs LIVE codex capture,
+    which doesn't exist. Documented at `rollout_collect_summary` and surfaced as a
+    caveat in the `sibling-coordination` skill. The headless codex worker DOES
+    auto-claim live.
 - _(History: an earlier attempt added an `obs/fs`→claim fold in `code_projection.rs`;
   it was redundant + built on the false premise and has been removed. The dead
   `codesession.rs` helpers it needed — `auto_claim_room_and_workdir`,

@@ -4699,6 +4699,15 @@ fn rollout_reasoning_text(payload: &Value) -> String {
 /// ran is left to the obs (the rollout does not carry a discrete file-change item
 /// the way the live stream does, so we conservatively collect no paths here —
 /// changed files still appear in the projected tool calls).
+///
+/// KNOWN LIMITATION (journey 12 / its adjudication): an INTERACTIVE codex TUI is
+/// captured POST-HOC — this rollout is imported only AFTER the session exits, and it
+/// carries no discrete file-change item. So a codex TUI does NOT auto-claim its
+/// edits, and crucially could not coordinate in real time even if it did (by import
+/// time the session is over). Unlike opencode (live SSE) and the headless cells
+/// (live stream), real-time "last editing <path>" for an interactive codex sibling
+/// needs LIVE codex TUI capture, which does not exist — not an auto_claim_write
+/// oversight. The headless codex worker (`codex exec --json`) DOES auto-claim live.
 fn rollout_collect_summary(rec: &Value, summary: &mut CaptureSummary) {
     let payload = rec.get("payload").unwrap_or(&Value::Null);
     let rtype = rec.get("type").and_then(Value::as_str).unwrap_or("");
@@ -5525,6 +5534,15 @@ fn opencode_sse_publish(
     // projection. `None` = an SSE-only control frame we surface directly below.
     if let Some(run_event) = opencode_sse_to_run_event(event) {
         opencode_collect_summary(&run_event, summary);
+        // SA3 write half for the LIVE TUI cell (the gap journey 12's adjudication
+        // flagged): a settled `edit`/`write` part is a file write — auto-claim it,
+        // parity with the headless `run` path, so a roommate sees what an
+        // INTERACTIVE opencode session is editing in REAL TIME, not just a headless
+        // worker. cwd=None → resolved from the session's recorded workdir (upserted
+        // above). Advisory + idempotent.
+        if let Some(path) = opencode_file_write_path(&run_event) {
+            auto_claim_write(root, session, path, None);
+        }
         for (leaf, body) in opencode_map_event(&run_event) {
             publish_obs(
                 root,

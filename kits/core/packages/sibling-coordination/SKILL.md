@@ -11,11 +11,19 @@ active, and what each is working on. When their work and yours tangle, do NOT
 reverse-engineer it from `git diff` or commit a dirty tree blind. Use these moves.
 
 ## sibling-status — what is each sibling doing?
-- `elanus code sessions` — every live coding session: tool, last-active, current task.
+- The per-turn **`[elanus siblings]` note is the source of truth** for *what each
+  sibling is doing + when it was last active* — it renders, per live sibling, its
+  last-active delta, current `in_progress` task, and last-edited file. Read it first.
 - `elanus code rooms` — your room's roster + who is claiming/editing which files.
-- Read the per-turn `[elanus siblings]` note first; these commands are the detail.
+- `elanus code sessions` — the coding-session roster (tool, status, duration,
+  tokens) for cross-checking who exists; it does NOT show task/last-active — the
+  note does.
 - "last active 30s ago" → actively working, treat its files as hot. "last active
   40m ago / off the roster" → likely stranded; its work may be safe to take over.
+- **Caveat:** an *interactive* codex TUI sibling is captured only post-hoc (after it
+  exits), so it may show no live task and no claims even while actively editing —
+  absence of a claim is NOT proof a codex sibling isn't touching a file. When a codex
+  sibling is live, prefer `ask-sibling` / `git` over trusting an empty claim set.
 
 ## whose-change — which changes are mine?
 - `elanus code whose --dirty` — annotates `git status` with the owning session,
