@@ -40,13 +40,13 @@
 //! - **Claude Code — a hook bridge.** The launcher inherits the child's stdio and
 //!   the child's own *hooks* (a generated `--settings` config) call
 //!   `elanus code hook <Event>`, which publishes. The launcher parses nothing.
-//! - **Codex — a stdout stream.** Codex 0.141's hooks are plugin/managed-config
-//!   based and a dead end for this (Appendix B), so the Codex adapter does NOT use
-//!   hooks at all: it runs `codex exec --json`, which prints a JSONL event stream
-//!   to stdout. The launcher **pipes the child's stdout, reads it line-by-line as
-//!   JSONL, maps each event, and publishes the obs record itself** (in-process,
-//!   authenticating as the session principal — the same scoped-token identity).
-//!   No `elanus code hook` bridge, no hooks.json, no `~/.codex` pollution at all.
+//! - **Codex — a stdout stream plus a claim hook.** Headless codex runs
+//!   `codex exec --json`, which prints a JSONL event stream to stdout. The launcher
+//!   **pipes the child's stdout, reads it line-by-line as JSONL, maps each event,
+//!   and publishes the obs record itself** (in-process, authenticating as the
+//!   session principal — the same scoped-token identity). Interactive codex still
+//!   imports rollout JSONL post-hoc for obs, but a generated per-session
+//!   `PostToolUse` hook records live advisory apply_patch edit-claims.
 //!
 //! **Sandbox stance for this increment (recorded in the handoff Log).** We do NOT
 //! bypass Claude Code's own sandbox onto today's elanus cage. Today the cage is a
@@ -66,7 +66,7 @@ use crate::paths::Root;
 use crate::topic;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::io::{BufRead as _, Read as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 /// Env vars the launcher sets for the child coding-agent process tree, read back
@@ -345,14 +345,13 @@ enum Capture {
     /// inherits stdio and parses nothing.
     HookBridge,
     /// The launcher pipes the child's stdout and parses its JSONL event stream
-    /// in-process (Codex `exec --json`, opencode `run --format json`): no hooks,
-    /// no home pollution.
+    /// in-process (Codex `exec --json`, opencode `run --format json`).
     StreamJson,
     /// POST-HOC import (HM2): the harness ran as an interactive TUI with inherited
     /// stdio (the launcher parsed NOTHING live), and at session STOP the launcher
     /// resolves the rollout JSONL the TUI wrote and projects its turns into the obs
-    /// grammar. This is the codex-TUI cell: codex has no live hook bridge, so the
-    /// only faithful TUI capture is reading its on-disk rollout afterwards.
+    /// grammar. This is the codex-TUI cell: the faithful TUI obs capture is reading
+    /// its on-disk rollout afterwards; live hooks are used only for edit-claims.
     ///
     /// FIDELITY: a `RolloutImport` cell is **not** live. Its projected events carry
     /// an explicit `"fidelity":"rollout-import"` / `"source":"rollout"` marker (see
@@ -616,8 +615,8 @@ impl Harness for Codex {
         "codex"
     }
     fn capture(&self, mode: Mode) -> Capture {
-        // Codex 0.141 hooks are a plugin/managed-config dead end, so codex never
-        // uses a live hook bridge (Appendix B). The two cells:
+        // Codex uses its JSON stream for headless telemetry and a scoped hook only
+        // for live TUI apply_patch auto-claims. The two cells:
         //  - Headless: `codex exec --json` prints a JSONL stream we parse live.
         //  - Tui (HM2): the interactive `codex` TUI writes a rollout JSONL; we
         //    import it POST-HOC at stop. We choose rollout-import over the
@@ -646,8 +645,8 @@ impl Harness for Codex {
         None
     }
     fn map_event(&self, event: &str, payload: &Value) -> (String, Value) {
-        // Codex never reaches the hook bridge (no hooks); file generically if it
-        // somehow does, so nothing is dropped.
+        // Codex hooks are claim-only today; file generically if a bus-backed hook
+        // ever reaches the observation bridge.
         generic_event(event, payload)
     }
     fn resume_command(
@@ -1768,48 +1767,101 @@ fn link_skill_packages(skills_dir: &Path, skills: &[(String, PathBuf)]) -> Resul
     Ok(())
 }
 
-/// Build a per-session, ephemeral `CODEX_HOME` carrying the profile's skills, or
-/// None when there are no skills (then the caller leaves CODEX_HOME untouched and
-/// codex uses the user's real `~/.codex`). codex 0.141.0 scans `$CODEX_HOME/skills`
-/// but has no per-invocation skills lever, so an isolated home is the only way to
-/// inject skills without writing into `~/.codex` (global) or the user's repo. The
-/// user's real auth/config are SYMLINKED in (read in place — never copied — so the
-/// secret stays in `~/.codex`) and login survives the redirect; `skills/` holds the
-/// linked packages. The whole home lives under the run scratch and is removed at
-/// launch exit. Best-effort: a failure to build it logs and returns None (the
-/// session falls back to the user's real home, just without the profile skills)
-/// rather than blocking the launch.
+/// Build a per-session, ephemeral `CODEX_HOME` carrying elanus's managed codex
+/// hooks and, when present, the profile's skills. codex 0.141.0 scans
+/// `$CODEX_HOME/skills` but has no per-invocation skills lever, and its hook config
+/// lives in `config.toml`; an isolated home is therefore the scoped way to add both
+/// without writing into the user's real `~/.codex` or the repo. The user's real
+/// auth/version stay symlinked (secret read in place, never copied), while
+/// `config.toml` is copied then appended with the elanus PostToolUse hook.
 fn build_codex_skills_home(
     root: &Root,
     session: &str,
     skills: &[(String, PathBuf)],
-) -> Option<PathBuf> {
-    if skills.is_empty() {
-        return None;
-    }
+) -> Result<PathBuf> {
     let home = root.run_dir().join(session).join("codex_home");
-    if let Err(e) = std::fs::create_dir_all(&home) {
-        eprintln!("[code] creating codex skills home {}: {e:#}", home.display());
-        return None;
-    }
-    // Mirror the user's real codex home entries (auth, config, version) by symlink
-    // so codex authenticates exactly as it would unredirected. `skills` is the one
-    // entry we own, so it is deliberately NOT mirrored — we provide our own below
-    // (the user's `~/.codex/skills`, e.g. system skills, are isolated out for this
-    // session, the same way Claude's `--setting-sources ''` isolates `~/.claude`).
+    std::fs::create_dir_all(&home)
+        .with_context(|| format!("creating codex home {}", home.display()))?;
+
+    // Mirror the user's real codex auth/version by symlink so codex authenticates
+    // exactly as it would unredirected. `config.toml` is copied below because we
+    // append managed hooks to the session-local copy.
+    let dst_config = home.join("config.toml");
+    let _ = std::fs::remove_file(&dst_config);
     if let Some(real) = dirs_next_home_codex() {
-        for entry in ["auth.json", "config.toml", "version.json"] {
+        for entry in ["auth.json", "version.json"] {
             let src = real.join(entry);
             if src.exists() {
-                let _ = std::os::unix::fs::symlink(&src, home.join(entry));
+                let dst = home.join(entry);
+                let _ = std::fs::remove_file(&dst);
+                if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                    eprintln!(
+                        "[code] linking codex {entry} {} -> {}: {e:#}",
+                        dst.display(),
+                        src.display()
+                    );
+                }
             }
         }
+
+        let real_config = real.join("config.toml");
+        if real_config.exists() {
+            std::fs::copy(&real_config, &dst_config).with_context(|| {
+                format!(
+                    "copying codex config {} -> {}",
+                    real_config.display(),
+                    dst_config.display()
+                )
+            })?;
+        }
     }
-    if let Err(e) = link_skill_packages(&home.join("skills"), skills) {
-        eprintln!("[code] linking skills into codex home: {e:#}");
-        return None;
+    append_codex_hook_config(root, &home)?;
+    link_skill_packages(&home.join("skills"), skills)
+        .with_context(|| format!("linking skills into codex home {}", home.display()))?;
+    Ok(home)
+}
+
+fn append_codex_hook_config(root: &Root, home: &Path) -> Result<()> {
+    let self_exe =
+        std::env::current_exe().context("resolving current executable for codex hook")?;
+    let config = home.join("config.toml");
+    let needs_separator = config.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config)
+        .with_context(|| format!("opening codex config {}", config.display()))?;
+    if needs_separator {
+        f.write_all(b"\n\n")?;
     }
-    Some(home)
+    f.write_all(codex_hook_config(&self_exe, root).as_bytes())?;
+    Ok(())
+}
+
+fn codex_hook_config(self_exe: &Path, root: &Root) -> String {
+    let exe = self_exe.display().to_string();
+    let root_dir = std::fs::canonicalize(&root.dir).unwrap_or_else(|_| root.dir.clone());
+    let root_arg = root_dir.display().to_string();
+    let command = format!("{exe} -C {root_arg} code hook PostToolUse");
+    format!(
+        "[[hooks.PostToolUse]]\nmatcher = \"*\"\n[[hooks.PostToolUse.hooks]]\ntype = \"command\"\ncommand = \"{}\"\n",
+        toml_basic_string_content(&command)
+    )
+}
+
+fn toml_basic_string_content(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The user's real codex home (`$CODEX_HOME`, else `~/.codex`) — the source of the
@@ -3988,23 +4040,16 @@ fn run_codex_capture(
 
     let args = codex_args_with_prompt_from_stdin(args)?;
 
-    // M2: codex 0.141.0 has no per-invocation skills flag, no `skills.config`, and
-    // no `AGENTS_HOME` (all postdate it) — it scans `$CODEX_HOME/skills` and the
-    // project `.codex/skills`. To deliver the profile's skills PER-SESSION and
-    // ephemerally (not polluting `~/.codex` or the user's repo), repoint CODEX_HOME
-    // to an isolated scratch home: symlink the user's real auth/config in so login
-    // survives, then add our own `skills/` of symlinked packages. The scratch is
-    // removed at launch exit, so the home (and the credential symlinks, never the
-    // secrets) vanishes with the session. Built only when the profile has skills;
-    // otherwise CODEX_HOME is left untouched and the launch is byte-identical to
-    // before. The symlinked auth is the user's OWN codex credential, read in place
-    // for the user's OWN codex — homogeneous authority, no boundary crossing.
-    let codex_home = build_codex_skills_home(root, session, skills);
+    // Point codex at an isolated per-session home carrying the generated hook config
+    // (always) and profile skills (when present), while symlinking auth so the user's
+    // native codex login survives the redirect.
+    let codex_home = build_codex_skills_home(root, session, skills)?;
 
     let mut codex_args = vec![
         "exec".to_string(),
         "--json".to_string(),
         "--skip-git-repo-check".to_string(),
+        "--dangerously-bypass-hook-trust".to_string(),
     ];
     // M2: a `--provider` codex injection is a set of `-c model_provider…` flags that
     // must ride with the `codex exec` options, BEFORE the prompt positional. The
@@ -4029,8 +4074,8 @@ fn run_codex_capture(
     // alongside the prompt positional — robust, no arg parsing. stdin is piped only
     // when there is a briefing to write; otherwise null (the prompt is the arg, so
     // the child never blocks on stdin). Piped stdout (we parse it), inherited stderr
-    // (the human sees Codex's own output). We keep the real CODEX_HOME — setting it
-    // to a scratch would drop the user's auth.
+    // (the human sees Codex's own output). CODEX_HOME is set below to the session
+    // home, which symlinks the user's real auth.
     cmd.stdin(if brief.is_some() {
         Stdio::piped()
     } else {
@@ -4059,11 +4104,9 @@ fn run_codex_capture(
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir);
-    // M2: point codex at the per-session skills home (set LAST so it wins over any
-    // inherited/injection CODEX_HOME). Only Some when the profile had skills.
-    if let Some(home) = &codex_home {
-        cmd.env("CODEX_HOME", home);
-    }
+    // Point codex at the per-session home (set LAST so it wins over any
+    // inherited/injection CODEX_HOME).
+    cmd.env("CODEX_HOME", &codex_home);
     eprintln!("[code] launching codex exec --json as session {session}{timeout_suffix}");
 
     let mut child = cmd
@@ -4101,20 +4144,19 @@ fn run_codex_capture(
 
 // ── HM2: codex TUI (Capture::RolloutImport) ───────────────────────────────────
 //
-// The codex TUI cell. Codex 0.141 has NO live hook bridge (Appendix B) and its
-// interactive TUI prints nothing parseable to stdout, so the only faithful way to
-// capture an interactive codex session is to read the rollout JSONL the TUI writes
-// to `~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<thread_id>.jsonl` AFTER it exits,
-// and project its turns into the obs grammar.
+// The codex TUI cell. Its interactive TUI prints nothing parseable to stdout, so
+// the faithful way to capture obs for an interactive codex session is to read the
+// rollout JSONL the TUI writes to
+// `~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<thread_id>.jsonl` AFTER it exits.
+// Live apply_patch edit-claims ride the generated PostToolUse hook.
 //
-// WHY rollout-import rather than hooks-via-bypass: the alternative — forcing
-// codex's headless `--json` event stream (or a managed-config hook) onto an
-// interactive TUI via a bypass — is fragile (couples to undocumented flag
-// interplay), pollutes `~/.codex`, and dies if the launcher crashes. The rollout
-// is codex's OWN first-class, documented on-disk record of the exact turns; it
-// survives a launcher crash and needs no flag coupling. The cost — it is post-hoc
-// and coarser than a live hook bridge — is declared honestly: every projected
-// event is marked `fidelity=rollout-import` (see `rollout_map_record`).
+// WHY rollout-import for obs rather than hooks/JSON: forcing codex's headless
+// `--json` event stream onto an interactive TUI is fragile (couples to
+// undocumented flag interplay). The rollout is codex's OWN first-class,
+// documented on-disk record of the exact turns; it survives a launcher crash.
+// The cost — it is post-hoc and coarser than a live hook bridge — is declared
+// honestly: every projected event is marked `fidelity=rollout-import` (see
+// `rollout_map_record`). The generated hook below is narrower: live edit-claims.
 //
 // !!! FLAGGED GAP (accepted, NOT hidden) !!!
 // This path is built + unit-tested against the REAL on-disk rollout schema (a
@@ -4148,7 +4190,7 @@ fn run_codex_tui_import(
     // seed prompt positional (codex's documented seed channel): we fold the brief
     // and the user's seed prompt (if any) into one positional. With no user prompt
     // AND no brief, we pass nothing → a bare TUI.
-    let mut codex_args: Vec<String> = Vec::new();
+    let mut codex_args: Vec<String> = vec!["--dangerously-bypass-hook-trust".to_string()];
     // M2: a `--provider` codex injection rides as `-c model_provider…` flags before
     // the seed positional (same shape as the exec path, just the TUI cell).
     if let Some(inj) = injection {
@@ -4188,11 +4230,10 @@ fn run_codex_tui_import(
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir);
-    // M2: the profile's skills in a per-session CODEX_HOME (same as the exec cell),
-    // so an interactive codex TUI sees them too. Set LAST so it wins. None → no skills.
-    if let Some(home) = build_codex_skills_home(root, session, skills) {
-        cmd.env("CODEX_HOME", &home);
-    }
+    // The per-session CODEX_HOME carries generated hooks (always) and profile skills
+    // (when present). Set LAST so it wins over inherited/injected CODEX_HOME.
+    let codex_home = build_codex_skills_home(root, session, skills)?;
+    cmd.env("CODEX_HOME", &codex_home);
     eprintln!("[code] launching codex TUI as session {session} (rollout import on exit)");
 
     // Remember the newest rollout that already exists, so after the TUI exits we
@@ -6122,9 +6163,9 @@ fn capture_codex_stream(
                 &obs_topic(agent, session, &leaf),
                 body,
             );
-            // SI1 (sibling-intent): codex is hookless, so its `last_active` would
-            // only bump on resume; refresh it once per mapped stream event so a
-            // long-running codex session stays "live" to its siblings. Best-effort.
+            // SI1 (sibling-intent): refresh once per mapped stream event so a
+            // long-running codex exec session stays "live" to its siblings.
+            // Best-effort.
             let _ = codesession::bump_last_active(root, session);
         }
     }
@@ -6190,6 +6231,25 @@ fn codex_file_change_paths(event: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn codex_apply_patch_paths(command: &str) -> Vec<String> {
+    const PREFIXES: &[&str] = &[
+        "*** Add File:",
+        "*** Update File:",
+        "*** Delete File:",
+        "*** Move to:",
+    ];
+    command
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            PREFIXES.iter().find_map(|prefix| {
+                let path = line.strip_prefix(prefix)?.trim();
+                (!path.is_empty()).then(|| path.to_string())
+            })
+        })
+        .collect()
 }
 
 /// Map one Codex `exec --json` stream event to an obs/ topic leaf and a trimmed
@@ -6879,16 +6939,17 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     let _ = std::io::stdin().read_to_string(&mut raw);
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
 
-    let (Ok(principal), Ok(token), Ok(session), Ok(agent)) = (
-        std::env::var("ELANUS_PACKAGE"),
-        std::env::var("ELANUS_BUS_TOKEN"),
-        std::env::var(ENV_SESSION),
-        std::env::var(ENV_AGENT),
-    ) else {
+    let (Ok(session), Ok(agent)) = (std::env::var(ENV_SESSION), std::env::var(ENV_AGENT)) else {
         // Outside a launched session (no identity in the env): nothing to file,
         // and we must not fail the coding session. Stay quiet.
         return Ok(());
     };
+    let principal = std::env::var("ELANUS_PACKAGE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let token = std::env::var("ELANUS_BUS_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     // The DURABLE session record (M2-A): Claude Code carries its own native
     // resumable session id in every hook payload (`session_id`). On SessionStart —
@@ -6896,7 +6957,7 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // ↔ workdir), so the session is resumable (`claude -p --resume <session_id>`)
     // even after the launcher exits. The record carries no secret. Best-effort: a
     // failure here must never break the hook or the coding session.
-    if matches!(event, "SessionStart" | "Setup") {
+    if matches!(event, "SessionStart" | "Setup") && agent == ClaudeCode.agent_noun() {
         if let Some(native) = payload.get("session_id").and_then(Value::as_str) {
             let workdir = payload
                 .get("cwd")
@@ -6918,19 +6979,24 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     }
 
     // Route event-mapping through the adapter the launcher recorded as the
-    // session's agent noun. An unknown noun (a future adapter this binary
-    // predates) still files the event generically rather than dropping it.
-    let (leaf, body) = match harness_by_noun(&agent) {
-        Some(h) => h.map_event(event, &payload),
-        None => generic_event(event, &payload),
-    };
-    publish_obs(
-        root,
-        &principal,
-        &token,
-        &obs_topic(&agent, &session, &leaf),
-        body,
-    );
+    // session's agent noun. Codex hooks are claim-only today: the codex child does
+    // not inherit bus credentials, and even if a future launch did, this hook path
+    // deliberately avoids publishing codex observations.
+    if agent != Codex.agent_noun() {
+        if let (Some(principal), Some(token)) = (principal.as_deref(), token.as_deref()) {
+            let (leaf, body) = match harness_by_noun(&agent) {
+                Some(h) => h.map_event(event, &payload),
+                None => generic_event(event, &payload),
+            };
+            publish_obs(
+                root,
+                principal,
+                token,
+                &obs_topic(&agent, &session, &leaf),
+                body,
+            );
+        }
+    }
 
     // SI1 (sibling-intent): keep `code_sessions.last_active` genuinely fresh from
     // the per-event capture path. Claude fires this hook per tool event, so a
@@ -6955,7 +7021,9 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // The AUTHORITATIVE tier (M2, the cage/syscall read camera) stays deferred.
     if event == "PreToolUse" && agent == ClaudeCode.agent_noun() && read_camera_enabled(root) {
         for (topic_name, fs_body) in claude_read_fs_events(&payload, &session) {
-            publish_obs(root, &principal, &token, &topic_name, fs_body);
+            if let (Some(principal), Some(token)) = (principal.as_deref(), token.as_deref()) {
+                publish_obs(root, principal, token, &topic_name, fs_body);
+            }
         }
     }
 
@@ -6972,6 +7040,26 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
         if let Some(path) = claude_write_tool_path(&tool, payload.get("tool_input")) {
             let cwd = payload.get("cwd").and_then(Value::as_str);
             auto_claim_write(root, &session, path, cwd);
+        }
+    }
+
+    let hook_event = payload
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or(event);
+    if hook_event == "PostToolUse"
+        && agent == Codex.agent_noun()
+        && tool_name(&payload) == "apply_patch"
+    {
+        let cwd = payload.get("cwd").and_then(Value::as_str);
+        if let Some(command) = payload
+            .get("tool_input")
+            .and_then(|i| i.get("command"))
+            .and_then(Value::as_str)
+        {
+            for path in codex_apply_patch_paths(command) {
+                auto_claim_write(root, &session, &path, cwd);
+            }
         }
     }
 
@@ -10825,6 +10913,31 @@ mod tests {
     }
 
     #[test]
+    fn codex_apply_patch_paths_extracts_verified_hook_patch_headers() {
+        let command = "*** Begin Patch\n\
+*** Add File: note2.txt\n\
++kiwi\n\
+*** Update File: src/lib.rs\n\
+@@\n\
+-old\n\
++new\n\
+*** Delete File: old.txt\n\
+*** Update File: before.txt\n\
+*** Move to: after.txt\n\
+*** End Patch\n";
+        assert_eq!(
+            codex_apply_patch_paths(command),
+            vec![
+                "note2.txt".to_string(),
+                "src/lib.rs".to_string(),
+                "old.txt".to_string(),
+                "before.txt".to_string(),
+                "after.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn sa3_opencode_file_write_path_extracts_edit_and_write() {
         // A settled opencode edit/write tool_use carries state.input.filePath
         // (REAL opencode 1.17.9 envelope, trimmed from a live `run --format json`
@@ -11431,11 +11544,12 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        // A fake real ~/.codex with auth + config (the entries we mirror by symlink).
+        // A fake real ~/.codex with auth/config/version.
         let real_codex = base.join("real_codex");
         std::fs::create_dir_all(&real_codex).unwrap();
         std::fs::write(real_codex.join("auth.json"), "{\"token\":\"x\"}").unwrap();
         std::fs::write(real_codex.join("config.toml"), "model=\"gpt\"").unwrap();
+        std::fs::write(real_codex.join("version.json"), "{\"v\":\"1\"}").unwrap();
         // A source skill package.
         let pkg = base.join("pkgs/git-release");
         std::fs::create_dir_all(&pkg).unwrap();
@@ -11451,15 +11565,15 @@ mod tests {
         let prev = std::env::var_os("CODEX_HOME");
         std::env::set_var("CODEX_HOME", &real_codex);
         let home = build_codex_skills_home(&root, "code-test0001", &skills)
-            .expect("a profile with skills yields a home");
+            .expect("codex home is built for every launch");
         match prev {
             Some(v) => std::env::set_var("CODEX_HOME", v),
             None => std::env::remove_var("CODEX_HOME"),
         }
 
-        // Auth/config mirrored by symlink (read in place — the secret stays in the
-        // real home), and login content is reachable through the link.
-        for entry in ["auth.json", "config.toml"] {
+        // Auth/version are mirrored by symlink (read in place — the secret stays in
+        // the real home), and login content is reachable through the link.
+        for entry in ["auth.json", "version.json"] {
             let link = home.join(entry);
             assert!(
                 std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
@@ -11467,11 +11581,30 @@ mod tests {
             );
             assert_eq!(&std::fs::read_link(&link).unwrap(), &real_codex.join(entry));
         }
+        // Config is copied, not symlinked, because elanus appends its managed hook.
+        let config = home.join("config.toml");
+        assert!(
+            !std::fs::symlink_metadata(&config)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config.toml must be a session-local copy"
+        );
+        let config = std::fs::read_to_string(config).unwrap();
+        assert!(config.starts_with("model=\"gpt\""));
+        assert!(config.contains("[[hooks.PostToolUse]]"));
+        assert!(config.contains("matcher = \"*\""));
+        assert!(config.contains("[[hooks.PostToolUse.hooks]]"));
+        assert!(config.contains("type = \"command\""));
+        assert!(config.contains(" code hook PostToolUse"));
         // The skill is linked under <home>/skills/<name>, scannable by codex.
         assert!(home.join("skills/git-release/SKILL.md").exists());
 
-        // No skills → no home (the launch leaves CODEX_HOME untouched).
-        assert!(build_codex_skills_home(&root, "code-test0002", &[]).is_none());
+        // No skills still yields a home because hooks are always wanted.
+        let hook_only_home = build_codex_skills_home(&root, "code-test0002", &[])
+            .expect("codex hook-only home is built without skills");
+        assert!(hook_only_home.join("config.toml").exists());
+        assert!(!hook_only_home.join("skills").exists());
 
         let _ = std::fs::remove_dir_all(&base);
     }
