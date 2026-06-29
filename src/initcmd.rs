@@ -85,6 +85,46 @@ const PKG_FILES: &[PkgFile] = &[
     },
 ];
 
+struct StockHarnessPackage {
+    dir: &'static str,
+    binary: &'static str,
+    manifest: &'static str,
+}
+
+const STOCK_HARNESS_PACKAGES: &[StockHarnessPackage] = &[
+    StockHarnessPackage {
+        dir: "harness-claude",
+        binary: "harness-claude",
+        manifest: concat!(
+            "[[harness]]\n",
+            "name = \"claude\"\n",
+            "aliases = [\"cc\"]\n",
+            "agent_noun = \"claude-code\"\n",
+            "run = \"bin/adapter\"\n",
+        ),
+    },
+    StockHarnessPackage {
+        dir: "harness-codex",
+        binary: "harness-codex",
+        manifest: concat!(
+            "[[harness]]\n",
+            "name = \"codex\"\n",
+            "agent_noun = \"codex\"\n",
+            "run = \"bin/adapter\"\n",
+        ),
+    },
+    StockHarnessPackage {
+        dir: "harness-opencode",
+        binary: "harness-opencode",
+        manifest: concat!(
+            "[[harness]]\n",
+            "name = \"opencode\"\n",
+            "agent_noun = \"opencode\"\n",
+            "run = \"bin/adapter\"\n",
+        ),
+    },
+];
+
 /// ALL stock kits, seeded into <root>/kits so every root has the
 /// out-of-the-box set resolvable — no env var, no repo checkout. The kit
 /// dir is the config; these are just its defaults (write_if_missing, so
@@ -308,6 +348,10 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
         write_if_missing(&path, f.content, f.exec)?;
     }
 
+    // Stock harness packages seed the built-in coding agents as discoverable
+    // packages without changing dispatch yet.
+    seed_stock_harness_packages(&root)?;
+
     let conn = db::open(&root)?;
     db::init_schema(&conn)?;
     // The algedonic class: never coalesced, never queued behind other work.
@@ -398,6 +442,46 @@ fn write_if_missing(path: &Path, content: &str, exec: bool) -> Result<()> {
         std::fs::write(path, content)?;
     }
     if exec {
+        set_executable(path)?;
+    }
+    Ok(())
+}
+
+fn seed_stock_harness_packages(root: &Root) -> Result<()> {
+    let exe = std::env::current_exe().context("locating the running elanus binary")?;
+    let exe_dir = exe
+        .parent()
+        .context("running elanus binary has no parent directory")?;
+
+    for pkg in STOCK_HARNESS_PACKAGES {
+        let pkg_dir = root.packages().join(pkg.dir);
+        let bin_dir = pkg_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir)?;
+        write_if_missing(&pkg_dir.join("elanus.toml"), pkg.manifest, false)?;
+
+        let adapter = bin_dir.join("adapter");
+        let source = exe_dir.join(format!("{}{}", pkg.binary, std::env::consts::EXE_SUFFIX));
+        if source.is_file() {
+            if !adapter.exists() {
+                std::fs::copy(&source, &adapter).with_context(|| {
+                    format!("copying {} -> {}", source.display(), adapter.display())
+                })?;
+            }
+            set_executable(&adapter)?;
+        } else if !adapter.exists() {
+            eprintln!(
+                "[init] warning: missing stock harness binary {}; seeded {} without bin/adapter",
+                source.display(),
+                pkg_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn set_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(path)?.permissions();
         perms.set_mode(perms.mode() | 0o755);
