@@ -341,6 +341,18 @@ scoped" does not fully bound it; the real fix is a reserved-prefix guard in
 actor-authorization work. recall's self-sender gate still holds (a self-forged
 dispatch never recalls); the residual is the multi-agent case.
 
+**[UPDATE 2026-07-01] Tool path closed.** The `emit_event` tool arm
+(`src/exec.rs:1866`) now refuses any `type` beginning `in/` before calling
+`events::emit`, pointing the agent at `send_message`/`ask_human` instead — the
+guard lives at the tool arm, not inside `events::emit` itself, because `emit`
+also serves the kernel/bridge path (verified-sender `send_message` via
+`emit_message`) and cannot reliably tell an agent apart from the kernel
+(`ELANUS_ACTOR` is self-reported). This closes the ledger-write path an agent
+could reach directly. The **bus-grant half is the remaining residual**: an
+agent with a broad publish grant can still forge `in/dm/...` on the bus itself
+(not through the tool), reaching another agent's dispatch — that is the
+reserved-ingress-prefix work described above, still open.
+
 ## 16. [LEGS / LATENT] Exec handlers publish as the owner, not as themselves
 
 Reacting (`mode = "exec"`) package handlers are spawned by the dispatcher

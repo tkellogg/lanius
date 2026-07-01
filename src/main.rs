@@ -649,7 +649,12 @@ enum KitCmd {
     Show { kit: String },
     /// Remove a linked kit's packages dir from the package path (grants
     /// stay in the ledger, inert; revoke per package to retire them)
-    Unlink { kit: String },
+    Unlink {
+        kit: String,
+        /// Required to unlink a protected stdlib kit
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1047,8 +1052,9 @@ fn run(cli: Cli) -> Result<()> {
             KitCmd::Show { kit: kref } => {
                 print!("{}", kit::show(&root, &kref)?);
             }
-            KitCmd::Unlink { kit: kref } => {
+            KitCmd::Unlink { kit: kref, force } => {
                 let dir = kit::resolve(&root, &kref)?;
+                kit::guard_unlink_protected(&dir, &kref, force)?;
                 kit::unlink(&root, &dir)?;
             }
         },

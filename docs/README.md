@@ -103,3 +103,8 @@ that layer.
 - Web product and QA flows: [ui/web/src/App.tsx](../ui/web/src/App.tsx),
   [ui/web/server.mjs](../ui/web/server.mjs), and
   [ui/web/test/ui.spec.mjs](../ui/web/test/ui.spec.mjs).
+- Agent and profile CLIs: [src/agentcli.rs](../src/agentcli.rs) (`elanus agent`) and
+  [src/profilecli.rs](../src/profilecli.rs) (`elanus profile`).
+- Example kits and packages: [kits/funnel/](../kits/funnel/),
+  [kits/memory-blocks-demo/](../kits/memory-blocks-demo/), and
+  [packages/triage-demo/](../packages/triage-demo/).

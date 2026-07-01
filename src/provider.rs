@@ -159,14 +159,11 @@ pub struct ProviderMeta {
 
 // ───────────────────────────── consumers & injection ─────────────────────────────
 //
-// M1 ships this surface and proves the matrix in isolation (tests below); the
-// consumers that CALL `materialize` land in M2 (harness launch, src/codeagent.rs)
-// and M3 (dispatcher build_client, src/exec.rs). Until then these are
-// deliberately unwired — the `#[allow(dead_code)]` on `materialize` and its
-// injection types records that, not neglect.
+// M1 shipped this surface and proved the matrix in isolation (tests below);
+// M2 (harness launch, src/codeagent.rs:3551) and M3 (dispatcher build_client,
+// src/exec.rs:1160) now call `materialize` — these types are wired, not dead.
 
 /// Who is asking to consume a credential. The validity matrix is keyed on this.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Consumer {
     /// The genai dispatcher (`build_client`, src/exec.rs). ApiKey only.
@@ -178,7 +175,6 @@ pub enum Consumer {
 /// What `materialize` produces. The two consumer families need different shapes,
 /// so this is a sum — a single return type that keeps the partial function total
 /// over its valid domain.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Injection {
     /// For M3's `build_client`: the literal coordinates to set endpoint/auth/headers.
@@ -190,7 +186,6 @@ pub enum Injection {
 /// The dispatcher coordinates — enough for genai's `ServiceTargetResolver` +
 /// `with_extra_headers`. Carries the LITERAL key (decrypted transiently); never
 /// logged.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DispatcherInjection {
     pub wire: Wire,
@@ -201,7 +196,6 @@ pub struct DispatcherInjection {
 
 /// The per-tool harness injection: environment to set + CLI args to append after
 /// the existing scrub. `NativeLogin` yields an empty injection (scrub-only).
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct HarnessInjection {
     pub env: Vec<(String, String)>,
@@ -244,7 +238,6 @@ impl fmt::Debug for HarnessInjection {
 /// resolve a custom provider id (see that arm). It is ignored by every other
 /// `(variant, consumer)` pair (claude/codex carry the model on their own flags; the
 /// dispatcher names it on the profile).
-#[allow(dead_code)] // called by M2 (harness) / M3 (dispatcher); proven by tests now
 pub fn materialize(
     name: &str,
     cred: &Credential,

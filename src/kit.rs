@@ -342,6 +342,20 @@ pub fn protected_packages(root: &Root) -> std::collections::HashSet<String> {
     out
 }
 
+/// Refuse to unlink a protected kit without `--force`: unlinking silently
+/// drops its packages off the path, the same off-switch `elanus revoke`
+/// already guards at the package level (docs/config.md, "Stdlib").
+pub fn guard_unlink_protected(kit_dir: &Path, name: &str, force: bool) -> Result<()> {
+    if !force && kit_is_protected(kit_dir) {
+        bail!(
+            "⚠ {name} is a protected stdlib kit — the product depends on it \
+             (docs/config.md). Unlinking it breaks things (e.g. the web UI's \
+             transcripts). Re-run with --force if you really mean it."
+        );
+    }
+    Ok(())
+}
+
 /// Remove a kit dir from the default profile's elanus_path.
 /// Grants are NOT revoked here — they're inert without discovery, and
 /// revocation is its own gesture (`elanus revoke <pkg>`); we say so.
@@ -551,6 +565,56 @@ mod tests {
             !prot.contains("freepkg"),
             "a package in an unmarked kit must not be"
         );
+        std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn unlink_honors_protected_gate() {
+        let (root, kit) = scratch("unlink-protected");
+        std::fs::write(kit.join("kit.toml"), "protected = true\n").unwrap();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        install(&root, &conn, &kit, Mode::Link, true).unwrap();
+
+        // Without --force: refused, loud, and still linked.
+        let err = guard_unlink_protected(&kit, "mykit", false).unwrap_err();
+        assert!(
+            err.to_string().contains("protected"),
+            "refusal must name the reason: {err}"
+        );
+        let (prof, _) = crate::profile::load(&root, "default").unwrap();
+        assert!(prof
+            .elanus_path
+            .iter()
+            .any(|p| p == &kit.canonicalize().unwrap().display().to_string()));
+
+        // With --force: guard steps aside, unlink proceeds.
+        guard_unlink_protected(&kit, "mykit", true).unwrap();
+        unlink(&root, &kit).unwrap();
+        let (prof, _) = crate::profile::load(&root, "default").unwrap();
+        assert!(!prof
+            .elanus_path
+            .iter()
+            .any(|p| p == &kit.canonicalize().unwrap().display().to_string()));
+        std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn unlink_ordinary_kit_unchanged() {
+        let (root, kit) = scratch("unlink-ordinary");
+        // No kit.toml at all — not protected.
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        install(&root, &conn, &kit, Mode::Link, true).unwrap();
+
+        // No --force needed for an ordinary kit.
+        guard_unlink_protected(&kit, "mykit", false).unwrap();
+        unlink(&root, &kit).unwrap();
+        let (prof, _) = crate::profile::load(&root, "default").unwrap();
+        assert!(!prof
+            .elanus_path
+            .iter()
+            .any(|p| p == &kit.canonicalize().unwrap().display().to_string()));
         std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
     }
 }

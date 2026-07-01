@@ -33,7 +33,7 @@ Executable web-flow catalogs and QA findings. Read this folder when changing
 
 - Main React dashboard: [ui/web/src/App.tsx](../../ui/web/src/App.tsx).
 - Browser API relay and admin/history endpoints:
-  [ui/web/server.mjs](../../ui/web/server.mjs).
+  [src/web.rs](../../src/web.rs).
 - Permanent browser suite: [ui/web/test/ui.spec.mjs](../../ui/web/test/ui.spec.mjs).
 - Smoke and walkthrough helpers:
   [ui/web/test/smoke.mjs](../../ui/web/test/smoke.mjs) and

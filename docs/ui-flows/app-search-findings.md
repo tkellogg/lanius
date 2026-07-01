@@ -59,8 +59,8 @@ and repair it.
 verbatim to disk and returned success with the note reading "saved"; the agent
 list then failed entirely and the agent was gone from the nav with no error
 shown. The structured form, by contrast, correctly refused the same kind of bad
-value. The save handler writes the file with no parse check
-(server.mjs line 320).
+value. The save handler writes the file with no parse check (line 320 of the
+Node relay at the time of this finding; the relay is now src/web.rs).
 
 #### 2. The first sentence and a main button on the welcome screen use the internal word "stage"
 
@@ -192,7 +192,8 @@ raw "error:" prefix and trailing newline.
 
 **Confidence.** Certain. Confirmed in source and live run: the duplicate path
 surfaces the command's raw error verbatim, and the spaces case returns the bare
-"bad profile name" string (server.mjs line 309).
+"bad profile name" string (line 309 of the Node relay at the time of this
+finding; the relay is now src/web.rs).
 
 ## Internal-vocabulary leaks
 

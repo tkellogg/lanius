@@ -1867,6 +1867,20 @@ fn run_tool(
             let Some(etype) = args["type"].as_str() else {
                 return err("emit_event: missing 'type'".into());
             };
+            // The in/ plane is reserved ingress: kernel and bridge code path
+            // through events::emit() with a verified sender, but this tool
+            // arm is agent-reachable, and emit() can't tell an agent apart
+            // from the kernel (ELANUS_ACTOR is self-reported, events.rs
+            // sender fallback). Without this refusal an agent could mint
+            // in/dm/... or in/human/<owner> events and poison another
+            // agent's recall or forge owner mail (security.md entry 15).
+            if etype.starts_with("in/") {
+                return err(
+                    "emit_event: the in/ plane is reserved for ingress; use send_message or \
+                     ask_human to reach your owner"
+                        .into(),
+                );
+            }
             match events::emit(
                 root,
                 conn,
@@ -2556,6 +2570,127 @@ mod tests {
         assert_eq!(expand_tilde("~"), home);
         // not a tilde prefix: untouched
         assert_eq!(expand_tilde("/a/~b"), "/a/~b");
+    }
+
+    // M2 (docs/handoffs/small-fixes.md, security.md entry 15): the emit_event
+    // tool arm is the agent-reachable surface that can mint a forged in/...
+    // event, so the guard lives here — obs/... and other custom types stay
+    // untouched, and send_message (which emits in/human/<owner> through its
+    // OWN arm, not the tool's raw type) keeps working.
+    #[test]
+    fn emit_event_refuses_reserved_ingress_plane() {
+        let dir = std::env::temp_dir().join(format!("el-emitguard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let prof = profile::Profile::default();
+        let cage = sandbox::Cage::from_profile(&root, &prof.sandbox);
+        let mcp_pool = crate::mcp::Pool::default();
+
+        let forge_call = ToolCall {
+            call_id: "c1".into(),
+            fn_name: "emit_event".into(),
+            fn_arguments: json!({ "type": "in/dm/bluesky/somebody" }),
+            thought_signatures: None,
+        };
+        let mut self_emitted = HashSet::new();
+        let out = run_tool(
+            &root,
+            &conn,
+            &cage,
+            &prof,
+            "s1",
+            None,
+            None,
+            false,
+            &forge_call,
+            &mut self_emitted,
+            &mcp_pool,
+        );
+        let ToolOutcome::Output(raw) = out else {
+            panic!("expected an Output outcome");
+        };
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert!(v["error"].as_str().is_some(), "forged in/... must refuse: {raw}");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'in/dm/bluesky/somebody'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "a refused emit must not land a ledger row");
+
+        let ok_call = ToolCall {
+            call_id: "c2".into(),
+            fn_name: "emit_event".into(),
+            fn_arguments: json!({ "type": "obs/custom/thing" }),
+            thought_signatures: None,
+        };
+        let out = run_tool(
+            &root,
+            &conn,
+            &cage,
+            &prof,
+            "s1",
+            None,
+            None,
+            false,
+            &ok_call,
+            &mut self_emitted,
+            &mcp_pool,
+        );
+        let ToolOutcome::Output(raw) = out else {
+            panic!("expected an Output outcome");
+        };
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            v["emitted_event_id"].as_i64().is_some(),
+            "a non-in/... type must still succeed: {raw}"
+        );
+
+        let send_call = ToolCall {
+            call_id: "c3".into(),
+            fn_name: "send_message".into(),
+            fn_arguments: json!({ "text": "hi owner" }),
+            thought_signatures: None,
+        };
+        let out = run_tool(
+            &root,
+            &conn,
+            &cage,
+            &prof,
+            "s1",
+            None,
+            None,
+            false,
+            &send_call,
+            &mut self_emitted,
+            &mcp_pool,
+        );
+        let ToolOutcome::Output(raw) = out else {
+            panic!("expected an Output outcome");
+        };
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            v["message_id"].as_i64().is_some(),
+            "send_message must still work: {raw}"
+        );
+        let msg_type: String = conn
+            .query_row(
+                "SELECT type FROM events WHERE id = ?1",
+                [v["message_id"].as_i64().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            msg_type,
+            crate::topic::human_mailbox(&prof.owner),
+            "send_message keeps landing on the owner's mailbox through its own arm"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

@@ -484,15 +484,15 @@ what an installed-but-buggy or injection-compromised package can reach, but a
 *deliberately* malicious package is not contained. Do not present the bus ACL
 as a sandbox to a user installing third-party packages until legs 1–3 land.
 
-**[OPEN]** Identity model (supersedes the old "loopback = the human"
+**[DECIDED / BUILT]** Identity model (supersedes the old "loopback = the human"
 assumption, which the review showed is unsound against local packages):
-should privileged local clients (the human CLI, the kernel mirror, exec
-processes) authenticate positively — e.g. a daemon-minted 0600 cookie — so
-that *unauthenticated* becomes deny rather than allow? It raises the bar
-(deliberate cookie read, auditable) but does not fully contain a package
-until fs_read scoping lands, and it trades away the "the CLI just works"
-simplicity Tim chose. Decision deferred to Tim; recorded rather than
-silently re-architected.
+*unauthenticated is deny, not allow.* The broker handshake (`src/broker.rs:424`,
+`handshake`) refuses both wrong credentials and no credentials — a connection
+with no verified identity gets none — so privileged local clients (the human
+CLI, the kernel mirror, exec processes) must present a verified identity
+(username + a fenced secret, or a package's supervisor-minted spawn token) to
+get anything past the handshake. Still does not fully contain a package until
+fs_read scoping lands (leg 1 above).
 
 Both process modes coexist: daemons for adapters/indexers (warm state,
 websockets, ingress — the hole v1 hand-waved), exec for stateless scripts.

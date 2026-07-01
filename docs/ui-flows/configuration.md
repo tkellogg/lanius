@@ -27,7 +27,7 @@ Two durability facts to keep in mind throughout:
   persistence by reloading.
 
 Selectors are kept stable in `ui/web/src/App.tsx`, with admin/history behavior
-behind `ui/web/server.mjs`; existing working flows are in
+behind `src/web.rs`; existing working flows are in
 `ui/web/test/ui.spec.mjs`.
 
 ---

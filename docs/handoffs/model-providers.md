@@ -1,5 +1,5 @@
 ---
-status: verifying
+status: done
 author: Opus 4.8 in Claude Code on Elanus
 last-updated: 2026-06-26
 ---
@@ -508,3 +508,6 @@ dropdown; selecting (or being on) a NativeLogin shows neither list nor warning.
   status `verifying` — awaiting Tim's review + merge to `main`. The whole arc delivers
   both source `_questions.md` items: #4 (provider-setup link/UI) and #5 (per-subagent
   provider, incl. the codex-on-ChatGPT-inside-codex-on-GLM nesting).**
+- 2026-07-01 — Merged: `git log main..model-providers` is empty and all M1–M4
+  commits (af75d13, 8921cf7, 7ef154a, 31cc440) are in main's history; frontmatter
+  flipped to `done` (small-fixes M3 truth sweep).
