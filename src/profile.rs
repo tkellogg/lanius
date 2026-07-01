@@ -184,6 +184,28 @@ pub struct SandboxCfg {
     /// availability is reported by `crate::sandbox::read_camera_status`.
     #[serde(default = "default_read_camera")]
     pub read_camera: bool,
+    /// Network egress posture for the agent's shell tool (docs/sandbox.md, the
+    /// single-cage increment). One of `"open"` (the default — full network,
+    /// today's behavior), `"loopback"` (this machine only: the bus and local
+    /// read planes stay reachable, external egress is cut), or `"none"` (no
+    /// network at all). ABSENT = open, byte-identical to before this key. Only
+    /// the agent shell path reads it this increment; package/MCP cages are
+    /// unchanged.
+    #[serde(default)]
+    pub network: Option<String>,
+    /// Read DENY-list (the supported read-scoping mode): baseline reads stay
+    /// open; these trees become unreadable on top of the secrets fence — e.g.
+    /// another agent's state dir. Absolute, or relative to the harness root.
+    /// Absent/empty = reads unrestricted, as today.
+    #[serde(default)]
+    pub fs_read_deny: Vec<String>,
+    /// Read ALLOW-list (EXPERIMENTAL): when nonempty, flips reads to
+    /// deny-by-default with only these trees (plus the write roots and the
+    /// fixed interpreter holes) readable. Whoever sets it owns the baseline
+    /// problem — a too-tight list breaks interpreters and dynamic libraries.
+    /// No default baseline ships this increment. Absolute or root-relative.
+    #[serde(default)]
+    pub fs_read_allow: Vec<String>,
 }
 
 fn default_read_camera() -> bool {
@@ -197,6 +219,9 @@ impl Default for SandboxCfg {
             capture_exclude: default_capture_exclude(),
             workdir: None,
             read_camera: default_read_camera(),
+            network: None,
+            fs_read_deny: Vec::new(),
+            fs_read_allow: Vec::new(),
         }
     }
 }

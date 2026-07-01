@@ -109,6 +109,38 @@ interpreters, system libraries, and its repo, so the read grant needs a broad
 sensible baseline with deny-listed sensitive regions (secrets, credential stores,
 other agents' state), not the tight allowlist the write side uses.
 
+**[DELIVERED 2026-07-01 — first enforcement increment, macOS, default-off]** The
+Seatbelt cage now emits read and network arms too, gated per-profile and absent
+by default (docs/handoffs/single-cage-macos.md). A default install is
+byte-identical to the write-only cage — a regression test asserts the exact SBPL
+string is unchanged when no new key is set. Only the agent shell path
+(`Cage::from_profile`) reads the new keys this increment; package/MCP cages keep
+today's posture. Three new optional `[sandbox]` keys:
+
+- `network` — what egress the agent's shell may use: `"open"` (default; full
+  network, today's behavior), `"loopback"` (this machine only — the bus and the
+  local HTTP read planes stay reachable, external egress is cut), or `"none"`
+  (no network at all, for pure-compute spawns). `loopback` is the bus-preserving
+  middle: a plain deny would cut every actor off the broker.
+- `fs_read_deny` — the **supported** read-scoping mode: baseline reads stay open,
+  the listed trees become unreadable on top of the secrets fence (e.g. another
+  agent's state dir). Low breakage risk. Absolute or root-relative paths.
+- `fs_read_allow` — **experimental** allow-list mode: when nonempty it flips
+  reads to deny-by-default with only these trees (plus the write roots and the
+  fixed interpreter holes) readable. Whoever sets it owns the baseline problem —
+  a too-tight list breaks interpreters and dynamic libraries. No default
+  baseline ships this increment; getting that baseline right is the real
+  end-state work.
+
+Leases still narrow the **write** set only; the read + network posture is
+whole-agent authority and rides through a lease-narrowed cage unchanged. Off
+macOS every dimension reports "unavailable here" — the policy is inert without an
+enforcement mechanism and the trust surface says so, never a silent "on"
+(Landlock + bubblewrap land with the VPS move). A live seatbelt test is the
+arbiter for every arm: `none` blocks a loopback connect, `loopback` allows it,
+`fs_read_deny` hides a tree while other reads stay open, and allow-list mode
+still runs a shell.
+
 **[Note — security review 2026-06-11].** These two deferred passes turned out
 to be load-bearing for *bus* security too, not just fs exfil. The
 per-connection bus ACL (bus.md, Packages) cannot contain a malicious local

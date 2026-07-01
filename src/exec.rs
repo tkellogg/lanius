@@ -1043,11 +1043,15 @@ fn narrowed_cage(
     }
     let mut roots = vec![root.dir.clone()];
     roots.extend(held.into_iter().map(std::path::PathBuf::from));
-    Ok(Some(sandbox::Cage::from_roots(
+    // Leases narrow the WRITE set only; the read + network posture is
+    // whole-agent authority and must ride through unchanged (docs/sandbox.md,
+    // wonky bit 5). Carry the base cage's policy into the rebuilt cage.
+    Ok(Some(sandbox::Cage::from_roots_with_policy(
         roots,
         base.exclude.clone(),
         true,
         &sandbox::Protect::for_root(root),
+        base.policy.clone(),
     )))
 }
 
@@ -2556,6 +2560,86 @@ mod tests {
         assert_eq!(expand_tilde("~"), home);
         // not a tilde prefix: untouched
         assert_eq!(expand_tilde("/a/~b"), "/a/~b");
+    }
+
+    // ── M3: narrowed_cage carries the read/network posture through a lease ────
+    //
+    // Leases narrow the WRITE set only; the whole-agent read + network posture
+    // must ride through unchanged (docs/sandbox.md, wonky bit 5). The string
+    // side is covered in sandbox.rs; this is the live arbiter the handoff's M3
+    // acceptance names: a profile with network=none yields a shell tool call
+    // that cannot reach a loopback listener EVEN WHILE HOLDING A LEASE. macOS +
+    // sandbox-exec gated; skipped (not failed) where the mechanism is absent.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn narrowed_cage_carries_network_policy_under_lease() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "el-narrow-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root {
+            dir: dir.canonicalize().unwrap(),
+        };
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        // A subtree to lease, inside the whole-agent grant (root itself).
+        let sub = root.dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // A loopback listener the caged shell will try to reach.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if let Ok(mut s) = conn {
+                    use std::io::Write;
+                    let _ = s.write_all(b"HELLO\n");
+                }
+            }
+        });
+
+        let cfg = profile::SandboxCfg {
+            fs_write: vec![root.dir.display().to_string()],
+            capture_exclude: vec![],
+            workdir: None,
+            network: Some("none".into()),
+            ..Default::default()
+        };
+        let base = sandbox::Cage::from_profile(&root, &cfg);
+        assert!(base.enforcing());
+        // Base cage (no lease) already blocks the listener.
+        let base_conn = base
+            .shell_command(&format!("nc -w 2 127.0.0.1 {port}"))
+            .output()
+            .unwrap();
+        assert!(!base_conn.status.success(), "base network=none must block");
+
+        // Hold a lease on the subtree, then rebuild the narrowed cage.
+        acquire_lease(&root, &conn, &base, "agent", "sess", "sub").unwrap();
+        let narrowed = narrowed_cage(&root, &conn, &base)
+            .unwrap()
+            .expect("a held lease yields a narrowed cage");
+        assert!(narrowed.enforcing());
+        // The narrowed write set really did narrow to root + the leased subtree.
+        assert!(narrowed.write_roots.iter().any(|r| r == &sub) || narrowed
+            .write_roots
+            .iter()
+            .any(|r| sub.starts_with(r)));
+        // ...and the network posture rode through: still cannot reach loopback.
+        let narrowed_conn = narrowed
+            .shell_command(&format!("nc -w 2 127.0.0.1 {port}"))
+            .output()
+            .unwrap();
+        assert!(
+            !narrowed_conn.status.success(),
+            "network=none must survive lease narrowing: {narrowed_conn:?}"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
     }
 }
 
