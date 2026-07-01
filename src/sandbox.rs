@@ -25,8 +25,67 @@ pub struct Cage {
     pub write_roots: Vec<PathBuf>,
     /// Camera exclusions, prefix-matched against root-relative paths.
     pub exclude: Vec<String>,
+    /// The read/network posture this cage runs under (docs/sandbox.md, the
+    /// single-cage increment). Default = today's write-only cage. Stored so a
+    /// narrowing rebuild (leases, `narrowed_cage`) carries it through unchanged.
+    pub policy: CagePolicy,
     /// Seatbelt profile, when enforcement is on (fs_write nonempty + macOS).
     sbpl: Option<String>,
+}
+
+/// Network egress posture (docs/sandbox.md, wonky bit 3). Default `Open` is
+/// today's behavior — no network rule at all, so the SBPL stays byte-identical.
+/// `Loopback` keeps caged actors on the bus and the local HTTP read planes but
+/// cuts external egress; `None` is for pure-compute spawns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkPolicy {
+    #[default]
+    Open,
+    Loopback,
+    None,
+}
+
+impl NetworkPolicy {
+    /// Parse the profile's `network` value. Unknown values warn and fall back to
+    /// `Open` (the default posture) rather than silently over-restricting.
+    pub fn parse(s: &str) -> NetworkPolicy {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "open" => NetworkPolicy::Open,
+            "loopback" => NetworkPolicy::Loopback,
+            "none" => NetworkPolicy::None,
+            other => {
+                eprintln!("[sandbox] unknown network policy {other:?}; using open");
+                NetworkPolicy::Open
+            }
+        }
+    }
+}
+
+/// The read + network policy layered on top of the write cage (docs/sandbox.md,
+/// the single-cage increment). Absent everywhere = `Default`, which emits no new
+/// SBPL arms and keeps the profile byte-identical to the write-only cage.
+///
+/// Reads ship deny-list-first (`fs_read_deny`): baseline reads stay open, the
+/// listed trees become unreadable on top of the secrets fence. `fs_read_allow`
+/// is the experimental allow-list mode: when nonempty it flips to
+/// `(deny file-read*)` with these roots plus the always-needed holes — whoever
+/// sets it owns the baseline (interpreters, /usr, /System, the repo).
+#[derive(Debug, Clone, Default)]
+pub struct CagePolicy {
+    pub network: NetworkPolicy,
+    /// Deny-list mode: these canonical trees become unreadable.
+    pub fs_read_deny: Vec<PathBuf>,
+    /// Experimental allow-list mode: nonempty flips reads to deny-by-default
+    /// with these canonical trees (plus write roots + the fixed holes) allowed.
+    pub fs_read_allow: Vec<PathBuf>,
+}
+
+impl CagePolicy {
+    fn is_default(&self) -> bool {
+        self.network == NetworkPolicy::Open
+            && self.fs_read_deny.is_empty()
+            && self.fs_read_allow.is_empty()
+    }
 }
 
 /// Paths the cage fences from actors even though they sit inside an allowed
@@ -90,11 +149,12 @@ impl Cage {
         }
         // The whole-agent grant cage only enforces when fs_write is declared:
         // an empty declaration means "no cage", v1 behavior preserved.
-        Cage::from_roots(
+        Cage::from_roots_with_policy(
             roots,
             cfg.exclude_or_default(),
             !cfg.fs_write.is_empty(),
             &Protect::for_root(root),
+            policy_from_cfg(root, cfg),
         )
     }
 
@@ -109,6 +169,22 @@ impl Cage {
         enforce: bool,
         protect: &Protect,
     ) -> Cage {
+        // The do-nothing default policy: write-only cage, byte-identical SBPL.
+        // Package actors and MCP servers spawn on this in this increment; only
+        // the agent shell path (from_profile) reads the read/network keys.
+        Cage::from_roots_with_policy(roots, exclude, enforce, protect, CagePolicy::default())
+    }
+
+    /// `from_roots` plus an explicit read/network policy — the agent shell path
+    /// and lease narrowing use this so the posture rides through. A default
+    /// policy produces an SBPL byte-identical to the write-only cage.
+    pub fn from_roots_with_policy(
+        roots: Vec<PathBuf>,
+        exclude: Vec<String>,
+        enforce: bool,
+        protect: &Protect,
+        policy: CagePolicy,
+    ) -> Cage {
         let mut roots = roots;
         roots.sort();
         roots.dedup();
@@ -119,17 +195,17 @@ impl Cage {
                 top.push(r);
             }
         }
-        let can_enforce =
-            enforce && cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists();
+        let can_enforce = enforce && enforcement_available();
         if enforce && !can_enforce {
             eprintln!(
                 "[sandbox] enforcement requested but no mechanism on this platform; camera only"
             );
         }
-        let sbpl = can_enforce.then(|| sbpl(&top, protect));
+        let sbpl = can_enforce.then(|| sbpl(&top, protect, &policy));
         Cage {
             write_roots: top,
             exclude,
+            policy,
             sbpl,
         }
     }
@@ -173,11 +249,45 @@ impl SandboxCfg {
     }
 }
 
+/// Canonicalize a profile path list the way `from_profile` does the write set:
+/// absolute as given, else relative to the harness root; drop entries that do
+/// not resolve (warned, never silent — a typo must not silently widen reads).
+fn canon_read_list(root: &Root, kind: &str, list: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for w in list {
+        let p = if Path::new(w).is_absolute() {
+            PathBuf::from(w)
+        } else {
+            root.dir.join(w)
+        };
+        match p.canonicalize() {
+            Ok(c) => out.push(c),
+            Err(e) => eprintln!("[sandbox] {kind} {w:?} ignored: {e}"),
+        }
+    }
+    out
+}
+
+/// Build the read/network policy from a profile's `[sandbox]` block. Absent
+/// keys (network unset, empty read lists) yield the default policy, so a profile
+/// that opts into nothing produces a byte-identical SBPL to the write-only cage.
+fn policy_from_cfg(root: &Root, cfg: &SandboxCfg) -> CagePolicy {
+    CagePolicy {
+        network: cfg
+            .network
+            .as_deref()
+            .map(NetworkPolicy::parse)
+            .unwrap_or_default(),
+        fs_read_deny: canon_read_list(root, "fs_read_deny", &cfg.fs_read_deny),
+        fs_read_allow: canon_read_list(root, "fs_read_allow", &cfg.fs_read_allow),
+    }
+}
+
 /// Seatbelt: allow everything except file writes; allow writes only inside
 /// the write roots, system temp, and /dev. Temp dirs are an accepted hole
 /// (staging is visible-by-absence; exfil needs network, the cage's other
 /// half — docs/sandbox.md).
-fn sbpl(write_roots: &[PathBuf], protect: &Protect) -> String {
+fn sbpl(write_roots: &[PathBuf], protect: &Protect, policy: &CagePolicy) -> String {
     let mut allow = String::new();
     for r in write_roots {
         allow.push_str(&format!(
@@ -209,10 +319,79 @@ fn sbpl(write_roots: &[PathBuf], protect: &Protect) -> String {
             p = sbpl_escape(&p.display().to_string())
         ));
     }
-    format!(
+    let base = format!(
         "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n{allow}\
          \x20 (subpath \"/private/tmp\")\n  (subpath \"/private/var/folders\")\n  (subpath \"/dev\")\n)\n{fence}"
-    )
+    );
+    // The read/network arms are APPENDED after the write cage + fence. The
+    // default policy appends nothing, so the string stays byte-identical to the
+    // write-only cage (M3's non-negotiable regression). Every arm is
+    // last-match-wins, so the secrets fence is re-asserted after an allow-list.
+    if policy.is_default() {
+        return base;
+    }
+    format!("{base}{}", read_network_arms(write_roots, protect, policy))
+}
+
+/// The opt-in read + network SBPL, appended after the write cage. Empty when
+/// the policy is default (never reached — `sbpl` short-circuits). Verified
+/// against a real `sandbox-exec` in the M1 spike: `(deny network*)` cuts egress,
+/// the loopback allow keeps 127.0.0.1 reachable, and an allow-list read mode
+/// needs `(literal "/")` for root-path traversal or the process aborts.
+fn read_network_arms(write_roots: &[PathBuf], protect: &Protect, policy: &CagePolicy) -> String {
+    let mut arms = String::new();
+    // Network. Open emits nothing; loopback denies all then re-allows the local
+    // planes (bus + local HTTP read planes) so caged actors stay on the bus.
+    match policy.network {
+        NetworkPolicy::Open => {}
+        NetworkPolicy::None => arms.push_str("(deny network*)\n"),
+        NetworkPolicy::Loopback => arms.push_str(
+            "(deny network*)\n\
+             (allow network* (local ip \"localhost:*\") (remote ip \"localhost:*\"))\n",
+        ),
+    }
+    // Read allow-list (experimental): flip to deny-by-default reads. The allow
+    // set is the write roots (an agent must read what it writes) + the fixed
+    // holes + the caller's fs_read_allow trees. `(literal "/")` is mechanism,
+    // not policy: without read on the root inode, path resolution aborts.
+    if !policy.fs_read_allow.is_empty() {
+        arms.push_str("(deny file-read*)\n(allow file-read*\n  (literal \"/\")\n");
+        for r in write_roots {
+            arms.push_str(&format!(
+                "  (subpath \"{}\")\n",
+                sbpl_escape(&r.display().to_string())
+            ));
+        }
+        arms.push_str(
+            "  (subpath \"/private/tmp\")\n  (subpath \"/private/var/folders\")\n  (subpath \"/dev\")\n",
+        );
+        for r in &policy.fs_read_allow {
+            arms.push_str(&format!(
+                "  (subpath \"{}\")\n",
+                sbpl_escape(&r.display().to_string())
+            ));
+        }
+        arms.push_str(")\n");
+    }
+    // Read deny-list: the listed trees become unreadable, on top of the secrets
+    // fence. Emitted AFTER any allow-list so a deny always wins (last-match).
+    for p in &policy.fs_read_deny {
+        arms.push_str(&format!(
+            "(deny file-read* (subpath \"{}\"))\n",
+            sbpl_escape(&p.display().to_string())
+        ));
+    }
+    // Re-assert the secrets fence after an allow-list re-opened reads: an allow
+    // root that is a parent of the secret store would otherwise re-grant it.
+    if !policy.fs_read_allow.is_empty() {
+        for p in &protect.deny_all_trees {
+            arms.push_str(&format!(
+                "(deny file-read* (subpath \"{}\"))\n",
+                sbpl_escape(&p.display().to_string())
+            ));
+        }
+    }
+    arms
 }
 
 fn sbpl_escape(s: &str) -> String {
@@ -403,6 +582,77 @@ pub fn read_camera_status(cfg: &SandboxCfg) -> ReadCameraStatus {
     }
 }
 
+// ── Cage posture status (M4, docs/handoffs/single-cage-macos.md) ─────────────
+//
+// The honest surface for "what posture is this cage actually in?", mirroring the
+// read-camera two-tier status above. Enforcement availability is the SAME probe
+// the cage uses to decide whether to build an SBPL at all — macOS + sandbox-exec
+// present. Off macOS every dimension reports UNAVAILABLE: the policy may be
+// configured, but nothing enforces it, and that must never read as a silent
+// "on". Product words live in `web.rs`; here we carry the machine states.
+
+/// Whether the OS write/read/network enforcement mechanism exists on this
+/// platform/build: macOS with `sandbox-exec` present. The single availability
+/// probe the cage and the status surface share.
+pub fn enforcement_available() -> bool {
+    cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists()
+}
+
+/// The read dimension's active posture (M4 status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadScope {
+    /// Baseline reads open (today's default) — only the secrets fence hides.
+    Open,
+    /// Deny-list mode: some trees hidden on top of the secrets fence.
+    SomeHidden,
+    /// Experimental allow-list mode: reads are deny-by-default.
+    AllowList,
+}
+
+/// What posture this agent's cage is actually in, per dimension (M4). Each
+/// dimension is meaningful only when `available` — off macOS the policy is
+/// inert and the surface says so rather than implying enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CageStatus {
+    /// Is the enforcement mechanism present here (macOS + sandbox-exec)?
+    pub available: bool,
+    /// Is a cage actually built for this profile (fs_write declared)? When
+    /// false, writes are unfenced even where enforcement is available — an
+    /// empty grant means "no cage", v1 behavior.
+    pub enforcing: bool,
+    /// Writes fenced to the declared roots? (= `enforcing`, surfaced per
+    /// dimension so the three dimensions read uniformly.)
+    pub write_fenced: bool,
+    pub read: ReadScope,
+    pub network: NetworkPolicy,
+}
+
+/// Compute the cage posture from a profile's `[sandbox]` block (M4). Availability
+/// is the platform probe; the policy dimensions are read straight off the config
+/// the agent shell path would enforce.
+pub fn cage_status(cfg: &SandboxCfg) -> CageStatus {
+    let enforcing = !cfg.fs_write.is_empty();
+    let read = if !cfg.fs_read_allow.is_empty() {
+        ReadScope::AllowList
+    } else if !cfg.fs_read_deny.is_empty() {
+        ReadScope::SomeHidden
+    } else {
+        ReadScope::Open
+    };
+    let network = cfg
+        .network
+        .as_deref()
+        .map(NetworkPolicy::parse)
+        .unwrap_or_default();
+    CageStatus {
+        available: enforcement_available(),
+        enforcing,
+        write_fenced: enforcing,
+        read,
+        network,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +669,7 @@ mod tests {
         Cage {
             write_roots: vec![root.dir.clone()],
             exclude: vec!["run/".into(), "elanus.db".into()],
+            policy: CagePolicy::default(),
             sbpl: None,
         }
     }
@@ -555,17 +806,21 @@ mod tests {
         assert_eq!(changes[0].path.file_name().unwrap(), "real.txt");
     }
 
-    #[test]
-    fn sbpl_contains_roots_and_denies_writes() {
-        let protect = Protect {
+    fn test_protect() -> Protect {
+        Protect {
             deny_write_files: vec![
                 PathBuf::from("/r/elanus.db"),
                 PathBuf::from("/r/elanus.db-wal"),
             ],
             deny_write_trees: vec![PathBuf::from("/r/profiles"), PathBuf::from("/r/config")],
             deny_all_trees: vec![PathBuf::from("/r/.secrets")],
-        };
-        let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect);
+        }
+    }
+
+    #[test]
+    fn sbpl_contains_roots_and_denies_writes() {
+        let protect = test_protect();
+        let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &CagePolicy::default());
         assert!(p.contains("(deny file-write*)"));
         assert!(p.contains("(subpath \"/tmp/ws\")"));
         assert!(p.contains("(subpath \"/dev\")"));
@@ -584,6 +839,178 @@ mod tests {
         let allow_at = p.find("(allow file-write*").unwrap();
         let deny_at = p.find("(deny file-write* (literal").unwrap();
         assert!(deny_at > allow_at, "fence must override the allow");
+    }
+
+    // ── M1: the read + network arms (docs/handoffs/single-cage-macos.md) ──────
+
+    #[test]
+    fn sbpl_default_policy_byte_identical() {
+        // THE one rule above everything: a default install must behave
+        // bit-for-bit as before. The default policy appends no arm, so the SBPL
+        // string is identical to the write-only cage. This is the M3 regression
+        // in string form; the profile-level version rides SandboxCfg::default.
+        let protect = test_protect();
+        let roots = [PathBuf::from("/tmp/ws")];
+        let today = sbpl(&roots, &protect, &CagePolicy::default());
+        // No network rule, no read scoping anywhere in a default profile.
+        assert!(!today.contains("network"), "default has no network arm");
+        assert!(
+            !today.contains("(deny file-read*)"),
+            "default never flips reads to deny-by-default"
+        );
+        // Only the secrets fence carries a file-read deny — nothing else.
+        assert_eq!(
+            today.matches("(deny file-read*").count(),
+            1,
+            "default reads = secrets fence only"
+        );
+    }
+
+    #[test]
+    fn sbpl_network_none_denies_all() {
+        let protect = test_protect();
+        let policy = CagePolicy {
+            network: NetworkPolicy::None,
+            ..Default::default()
+        };
+        let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
+        assert!(p.contains("(deny network*)"), "{p}");
+        assert!(!p.contains("(allow network*"), "none never re-allows: {p}");
+        // The network arm is appended AFTER the write cage (last-match-wins).
+        let write_at = p.find("(allow file-write*").unwrap();
+        let net_at = p.find("(deny network*)").unwrap();
+        assert!(net_at > write_at, "network arm after the write cage");
+    }
+
+    #[test]
+    fn sbpl_network_loopback_denies_then_allows_local() {
+        let protect = test_protect();
+        let policy = CagePolicy {
+            network: NetworkPolicy::Loopback,
+            ..Default::default()
+        };
+        let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
+        // Deny all, then re-allow the local planes — order matters (allow wins).
+        let deny_at = p.find("(deny network*)").unwrap();
+        let allow_at = p.find("(allow network*").unwrap();
+        assert!(deny_at < allow_at, "deny then allow loopback: {p}");
+        assert!(p.contains("(local ip \"localhost:*\")"), "{p}");
+        assert!(p.contains("(remote ip \"localhost:*\")"), "{p}");
+    }
+
+    #[test]
+    fn sbpl_read_deny_list_adds_denies_keeps_reads_open() {
+        let protect = test_protect();
+        let policy = CagePolicy {
+            fs_read_deny: vec![PathBuf::from("/home/.ssh"), PathBuf::from("/home/.aws")],
+            ..Default::default()
+        };
+        let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
+        // Deny-list mode NEVER flips to deny-by-default: baseline reads stay open.
+        assert!(!p.contains("(deny file-read*)\n"), "no blanket read deny: {p}");
+        assert!(p.contains("(deny file-read* (subpath \"/home/.ssh\"))"), "{p}");
+        assert!(p.contains("(deny file-read* (subpath \"/home/.aws\"))"), "{p}");
+        // The secrets fence survives alongside the new denies.
+        assert!(p.contains("(deny file-read* (subpath \"/r/.secrets\"))"), "{p}");
+    }
+
+    #[test]
+    fn sbpl_read_allow_list_flips_and_keeps_holes_and_secrets() {
+        let protect = test_protect();
+        let policy = CagePolicy {
+            fs_read_allow: vec![PathBuf::from("/usr"), PathBuf::from("/System")],
+            ..Default::default()
+        };
+        let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
+        // Allow-list mode flips reads to deny-by-default.
+        assert!(p.contains("(deny file-read*)\n"), "flips to deny-by-default: {p}");
+        // `(literal "/")` is required for root-path traversal (M1 spike).
+        assert!(p.contains("(allow file-read*\n  (literal \"/\")"), "{p}");
+        // The write roots are readable (an agent must read what it writes).
+        let allow_read_at = p.find("(allow file-read*").unwrap();
+        let ws_read = p[allow_read_at..].find("(subpath \"/tmp/ws\")");
+        assert!(ws_read.is_some(), "write root is read-allowed: {p}");
+        // The always-needed holes mirror the write side.
+        assert!(p[allow_read_at..].contains("(subpath \"/private/tmp\")"), "{p}");
+        assert!(p[allow_read_at..].contains("(subpath \"/dev\")"), "{p}");
+        // The caller's allow trees are present.
+        assert!(p[allow_read_at..].contains("(subpath \"/usr\")"), "{p}");
+        // The secrets fence is RE-ASSERTED after the allow-list so it still wins
+        // even if an allow root is a parent of the secret store (last-match).
+        let deny_flip = p.find("(deny file-read*)\n").unwrap();
+        let last_secret_deny = p.rfind("(deny file-read* (subpath \"/r/.secrets\"))").unwrap();
+        assert!(
+            last_secret_deny > deny_flip && last_secret_deny > allow_read_at,
+            "secrets fence re-asserted after the allow-list: {p}"
+        );
+    }
+
+    #[test]
+    fn sbpl_combined_policy_orders_denies_last() {
+        // Network none + allow-list reads + a deny-list entry together: the
+        // deny-list entry and the secrets fence must both win over the
+        // allow-list (last-match), and the network arm is present.
+        let protect = test_protect();
+        let policy = CagePolicy {
+            network: NetworkPolicy::None,
+            fs_read_deny: vec![PathBuf::from("/tmp/ws/private")],
+            fs_read_allow: vec![PathBuf::from("/usr")],
+        };
+        let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
+        assert!(p.contains("(deny network*)"), "{p}");
+        let allow_read_at = p.find("(allow file-read*").unwrap();
+        let deny_entry_at = p.find("(deny file-read* (subpath \"/tmp/ws/private\"))").unwrap();
+        assert!(deny_entry_at > allow_read_at, "deny-list wins over allow-list: {p}");
+    }
+
+    #[test]
+    fn network_policy_parse() {
+        assert_eq!(NetworkPolicy::parse("open"), NetworkPolicy::Open);
+        assert_eq!(NetworkPolicy::parse("loopback"), NetworkPolicy::Loopback);
+        assert_eq!(NetworkPolicy::parse("none"), NetworkPolicy::None);
+        assert_eq!(NetworkPolicy::parse("NONE"), NetworkPolicy::None);
+        // Unknown falls back to open (never silently over-restrict).
+        assert_eq!(NetworkPolicy::parse("garbage"), NetworkPolicy::Open);
+    }
+
+    #[test]
+    fn cage_status_reports_each_dimension() {
+        // A default profile: no cage (no fs_write), reads open, network open.
+        let base = cage_status(&SandboxCfg::default());
+        assert!(!base.enforcing, "no fs_write ⇒ no cage");
+        assert!(!base.write_fenced);
+        assert_eq!(base.read, ReadScope::Open);
+        assert_eq!(base.network, NetworkPolicy::Open);
+
+        // A profile that opts into every dimension.
+        let s = cage_status(&SandboxCfg {
+            fs_write: vec!["/tmp/ws".into()],
+            network: Some("loopback".into()),
+            fs_read_deny: vec!["/home/.ssh".into()],
+            fs_read_allow: vec![],
+            ..Default::default()
+        });
+        assert!(s.enforcing && s.write_fenced, "fs_write ⇒ writes fenced");
+        assert_eq!(s.read, ReadScope::SomeHidden, "deny-list ⇒ some hidden");
+        assert_eq!(s.network, NetworkPolicy::Loopback);
+
+        // Allow-list wins over deny-list for the read dimension label.
+        let allow = cage_status(&SandboxCfg {
+            fs_read_allow: vec!["/usr".into()],
+            fs_read_deny: vec!["/home/.ssh".into()],
+            ..Default::default()
+        });
+        assert_eq!(allow.read, ReadScope::AllowList);
+
+        // Availability is the platform probe: on macOS with sandbox-exec it is
+        // true; OFF macOS every enforcement dimension is UNAVAILABLE — the policy
+        // is inert and the surface must say so, never a silent "on".
+        assert_eq!(base.available, enforcement_available());
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            !base.available,
+            "off macOS the cage enforcement mechanism is unavailable here"
+        );
     }
 
     #[test]
@@ -712,6 +1139,189 @@ mod tests {
         assert!(
             !git_write.status.success(),
             "writing config/.git from the cage must fail"
+        );
+    }
+
+    // ── M2: live proof the read + network arms cage (and do not over-cage) ────
+    //
+    // The live test is the arbiter (handoff wonky bit 4), not the string tests.
+    // Each function is macOS + `sandbox-exec`-gated exactly like
+    // seatbelt_actually_cages: skipped (not failed) where the mechanism is
+    // absent. The SBPL grammar these exercise was first verified against a real
+    // sandbox-exec in the M1 spike.
+
+    #[cfg(target_os = "macos")]
+    fn have_sandbox_exec() -> bool {
+        Path::new("/usr/bin/sandbox-exec").exists()
+    }
+
+    /// Bind a loopback listener that accepts connections and writes one line,
+    /// so a caged `nc` either connects (loopback/open) or is blocked (none).
+    /// Returns the bound port; the accept loop runs on a detached thread until
+    /// the process exits. Only 127.0.0.1 is touched — no external network.
+    #[cfg(target_os = "macos")]
+    fn spawn_loopback_listener() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if let Ok(mut s) = conn {
+                    use std::io::Write;
+                    let _ = s.write_all(b"HELLO\n");
+                }
+            }
+        });
+        port
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_network_none_blocks_loopback() {
+        if !have_sandbox_exec() {
+            return;
+        }
+        let root = tmp_root();
+        let port = spawn_loopback_listener();
+        let cfg = SandboxCfg {
+            fs_write: vec![root.dir.display().to_string()],
+            capture_exclude: vec![],
+            workdir: None,
+            network: Some("none".into()),
+            ..Default::default()
+        };
+        let cage = Cage::from_profile(&root, &cfg);
+        assert!(cage.enforcing());
+        // A caged connect to the loopback listener must FAIL under network=none.
+        let out = cage
+            .shell_command(&format!("nc -w 2 127.0.0.1 {port}"))
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "network=none must block a loopback connect: {out:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_network_loopback_allows_local() {
+        if !have_sandbox_exec() {
+            return;
+        }
+        let root = tmp_root();
+        let port = spawn_loopback_listener();
+        let cfg = SandboxCfg {
+            fs_write: vec![root.dir.display().to_string()],
+            capture_exclude: vec![],
+            workdir: None,
+            network: Some("loopback".into()),
+            ..Default::default()
+        };
+        let cage = Cage::from_profile(&root, &cfg);
+        assert!(cage.enforcing());
+        // The SAME local request SUCCEEDS under network=loopback — the bus and
+        // local read planes stay reachable. Asserts loopback only; no external
+        // network is touched, so the test does not depend on internet access.
+        let out = cage
+            .shell_command(&format!("nc -w 2 127.0.0.1 {port}"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "network=loopback must allow a 127.0.0.1 connect: {out:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("HELLO"),
+            "loopback connect must read the listener's line: {out:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_read_deny_hides_tree() {
+        if !have_sandbox_exec() {
+            return;
+        }
+        let root = tmp_root();
+        // A scratch tree to hide, and a sibling file left readable. Both live
+        // inside the write root (reads stay open by default; only the deny tree
+        // is hidden, on top of the secrets fence).
+        let hidden = root.dir.join("hidden");
+        std::fs::create_dir_all(&hidden).unwrap();
+        let secret_file = hidden.join("f.txt");
+        std::fs::write(&secret_file, "classified").unwrap();
+        let open_file = root.dir.join("open.txt");
+        std::fs::write(&open_file, "public").unwrap();
+        let cfg = SandboxCfg {
+            fs_write: vec![root.dir.display().to_string()],
+            capture_exclude: vec![],
+            workdir: None,
+            fs_read_deny: vec![hidden.display().to_string()],
+            ..Default::default()
+        };
+        let cage = Cage::from_profile(&root, &cfg);
+        assert!(cage.enforcing());
+        // A caged read INSIDE the deny tree fails...
+        let denied = cage
+            .shell_command(&format!("cat {}", secret_file.display()))
+            .output()
+            .unwrap();
+        assert!(
+            !denied.status.success(),
+            "reading a fs_read_deny tree from the cage must fail: {denied:?}"
+        );
+        // ...a caged read OUTSIDE it (still open) succeeds.
+        let ok = cage
+            .shell_command(&format!("cat {} > /dev/null", open_file.display()))
+            .output()
+            .unwrap();
+        assert!(
+            ok.status.success(),
+            "reading outside the deny tree must still succeed: {ok:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_read_allow_list_still_runs_shell() {
+        if !have_sandbox_exec() {
+            return;
+        }
+        let root = tmp_root();
+        let inside = root.dir.join("f.txt");
+        std::fs::write(&inside, "inside").unwrap();
+        // The anti-catastrophe case: allow-list mode flips reads to
+        // deny-by-default. Whoever sets it owns the baseline, so the test
+        // supplies a sane interpreter baseline (verified sufficient for a shell
+        // in the M1 spike). A caged `sh -c 'echo hi'` must STILL run and read
+        // its allow roots — a too-tight list would break every spawn.
+        let cfg = SandboxCfg {
+            fs_write: vec![root.dir.display().to_string()],
+            capture_exclude: vec![],
+            workdir: None,
+            fs_read_allow: vec![
+                "/usr".into(),
+                "/bin".into(),
+                "/System".into(),
+                "/Library".into(),
+            ],
+            ..Default::default()
+        };
+        let cage = Cage::from_profile(&root, &cfg);
+        assert!(cage.enforcing());
+        let hi = cage.shell_command("echo hi").output().unwrap();
+        assert!(
+            hi.status.success() && String::from_utf8_lossy(&hi.stdout).contains("hi"),
+            "allow-list mode must still run a shell: {hi:?}"
+        );
+        // The write root is an allow root — an agent must read what it writes.
+        let read_own = cage
+            .shell_command(&format!("cat {} > /dev/null", inside.display()))
+            .output()
+            .unwrap();
+        assert!(
+            read_own.status.success(),
+            "allow-list mode must let the agent read its own write root: {read_own:?}"
         );
     }
 }

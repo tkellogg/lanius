@@ -403,6 +403,7 @@ async fn status(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
             "binary": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
             "history": { "available": history.is_some(), "endpoint": history },
             "read_camera": read_camera_status(root),
+            "cage": cage_status(root),
             "paths": {
                 "bus": { "path": bus.display().to_string(), "exists": bus.exists() },
                 "database": { "path": db.display().to_string(), "exists": db.exists() },
@@ -432,6 +433,54 @@ fn read_camera_status(root: &Root) -> Value {
     json!({
         "advisory": { "available": s.advisory.available, "enabled": s.advisory.enabled },
         "authoritative": { "available": s.authoritative.available, "enabled": s.authoritative.enabled },
+    })
+}
+
+/// CAGE posture status (M4, docs/handoffs/single-cage-macos.md) — the honest
+/// "what posture is this cage in?" surface, mirroring `read_camera_status`. Reuses
+/// the backend's own loader + computation (`default` profile's `[sandbox]` →
+/// `crate::sandbox::cage_status`) so it can never drift from what the agent shell
+/// actually enforces. Product words only — never "SBPL", "Seatbelt", or "cage":
+/// writes fenced/open, reads open/some folders hidden/allow-list, network
+/// open/this machine only/off. Off macOS `available` is false and each dimension
+/// reads "unavailable here" rather than implying a silent "on".
+fn cage_status(root: &Root) -> Value {
+    use crate::sandbox::{NetworkPolicy, ReadScope};
+    let cfg = crate::profile::load(root, "default")
+        .map(|(p, _)| p.sandbox)
+        .unwrap_or_default();
+    let s = crate::sandbox::cage_status(&cfg);
+    let write = if !s.available {
+        "unavailable here"
+    } else if s.write_fenced {
+        "writes fenced"
+    } else {
+        "writes open"
+    };
+    let read = if !s.available {
+        "unavailable here"
+    } else {
+        match s.read {
+            ReadScope::Open => "reads open",
+            ReadScope::SomeHidden => "some folders hidden",
+            ReadScope::AllowList => "allow-list",
+        }
+    };
+    let network = if !s.available {
+        "unavailable here"
+    } else {
+        match s.network {
+            NetworkPolicy::Open => "network open",
+            NetworkPolicy::Loopback => "this machine only",
+            NetworkPolicy::None => "network off",
+        }
+    };
+    json!({
+        "available": s.available,
+        "enforcing": s.enforcing,
+        "write": write,
+        "read": read,
+        "network": network,
     })
 }
 

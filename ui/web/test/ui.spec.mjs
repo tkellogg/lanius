@@ -179,6 +179,16 @@ const testAgentProfile = 'harrier';
     const text = await page.$eval('.setup-wizard', (el) => el.textContent);
     return /purpose/i.test(text) && /home \/ workdir/i.test(text) && /run-step cap/i.test(text) && /autonomy/i.test(text);
   }, 8000);
+  await waitFor('setup: cage posture is legible (writes/reads/network in product words)', async () => {
+    const text = await page.$eval('.setup-home', (el) => el.textContent);
+    // M4 (single-cage): the three cage dimensions surface, in product words —
+    // never "SBPL"/"Seatbelt"/"cage-jargon". A default install reads "open" on
+    // every dimension where enforcement is available, or "unavailable here" off
+    // macOS. Either way the labels and one legible value must render.
+    const hasLabels = /cage \(writes\)/i.test(text) && /cage \(reads\)/i.test(text) && /cage \(network\)/i.test(text);
+    const hasValue = /writes (fenced|open)|unavailable here/i.test(text) && /(reads open|some folders hidden|allow-list|unavailable here)/i.test(text) && /(network open|this machine only|network off|unavailable here)/i.test(text);
+    return hasLabels && hasValue;
+  }, 8000);
   await waitFor('setup: cost visibility separates hard caps from estimates', async () => {
     const text = await page.$eval('.setup-cost', (el) => el.textContent);
     return /cost visibility/i.test(text) && /hard activation limits/i.test(text) && /fake precision/i.test(text);

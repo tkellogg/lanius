@@ -1485,6 +1485,25 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
       value: systemStatus?.read_camera?.authoritative?.available ? 'available' : 'unavailable here',
       state: systemStatus?.read_camera?.authoritative?.available ? 'ok' : 'warn',
     },
+    // Cage posture (single-cage macOS increment) — writes/reads/network, in
+    // product words. Off macOS every dimension reads "unavailable here" (warn,
+    // an honest platform gap), never a silent "on". "writes open" / "reads
+    // open" / "network open" are the default, unrestricted posture (neutral).
+    {
+      label: 'cage (writes)',
+      value: systemStatus?.cage?.write ?? 'checking...',
+      state: systemStatus?.cage?.available === false ? 'warn' : 'ok',
+    },
+    {
+      label: 'cage (reads)',
+      value: systemStatus?.cage?.read ?? 'checking...',
+      state: systemStatus?.cage?.available === false ? 'warn' : 'ok',
+    },
+    {
+      label: 'cage (network)',
+      value: systemStatus?.cage?.network ?? 'checking...',
+      state: systemStatus?.cage?.available === false ? 'warn' : 'ok',
+    },
   ];
   return (
     <div id="view-setup" className="view" hidden={hidden}>
