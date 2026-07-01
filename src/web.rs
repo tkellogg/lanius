@@ -2229,7 +2229,13 @@ impl Convs {
             return;
         }
         let item = self.ensure(session, None, ts);
-        if item.title.is_empty() && role == "you" {
+        // The human's own prompt titles a thread when there is one; an
+        // agent-first (ambient) conversation has no "you" prompt, so its title
+        // is the agent's opening message/ask instead (honest about who spoke
+        // first — docs/handoffs/ambient-conversations.md M3). A prompted thread
+        // always folds its "you" prompt before any agent turn, so "you" still
+        // wins there.
+        if item.title.is_empty() && (role == "you" || role == "agent" || role == "ask") {
             item.title = truncate_text(text, 72);
         }
         item.preview = truncate_text(text, 110);
@@ -2283,6 +2289,49 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
         }
     }
 
+    // M2 (docs/handoffs/ambient-conversations.md): an agent can speak first — a
+    // send_message/ask fired by a timer or an event handler with no preceding
+    // human prompt. It lands on in/human/<owner> carrying the run's session
+    // (stamped by the send_message/ask_human handlers), but no in/agent seed
+    // exists, so the thread was previously dropped. Seed a conversation from any
+    // owner-mailbox row that carries a real (non-worker) session and was NOT
+    // already established by an in/agent prompt (its correlation is not in the
+    // map). The correlation join below still folds replies into prompted
+    // threads; this only adds the agent-first seed source (no new authority —
+    // a pure read over the ledger).
+    let ambient = query_owner_mailbox(&conn, owner, 5000)?;
+    for row in &ambient {
+        // The owner's mailbox is shared across every agent, so an ambient row
+        // belongs to THIS agent's conversation only when THIS agent sent it. The
+        // send_message/ask_human handlers emit with the agent as the kernel
+        // sender (ELANUS_ACTOR = the agent noun), so the sender is the honest,
+        // ledger-recorded link back to the agent — without it, one agent's
+        // unprompted message would surface under every agent.
+        if row.sender.as_deref() != Some(agent) {
+            continue;
+        }
+        // A reply into a prompted thread rides a known correlation and is folded
+        // by the correlation join below — don't re-seed it here.
+        if let Some(c) = &row.correlation_id {
+            if corr_to_session.contains_key(c) {
+                continue;
+            }
+        }
+        let payload = parse_payload(&row.payload);
+        // Anchor only on a real session carried in the payload; the evt-*
+        // fallback is not a thread a human can group by or reply into.
+        let Some(session) = payload.get("session").and_then(Value::as_str) else {
+            continue;
+        };
+        if is_worker_session(session) {
+            continue;
+        }
+        let source = source_for(session, &row.sender, &payload, owner);
+        let created = row.created_at.clone().unwrap_or_default();
+        convs.ensure(session, Some(&source), &created);
+        fold_human_payload(&mut convs, session, &payload, &created);
+    }
+
     if !corr_to_session.is_empty() {
         let corrs: Vec<String> = corr_to_session.keys().cloned().collect();
         let human_rows = query_human_by_corr(&conn, &corrs, 5000)?;
@@ -2295,29 +2344,14 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
             };
             let payload = parse_payload(&row.payload);
             let created = row.created_at.clone().unwrap_or_default();
-            if payload.get("failed").is_some_and(truthy) {
-                let err = payload
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("the agent failed");
-                convs.touch(&session, "failed", err, true, &created);
-            } else if payload.get("question").is_some_and(|v| !v.is_null()) {
-                let q = payload
-                    .get("question")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                convs.touch(&session, "ask", q, true, &created);
-            } else if let Some(t) = payload.get("text").and_then(Value::as_str) {
-                convs.touch(&session, "agent", t, true, &created);
-            } else if let Some(a) = payload.get("answer").filter(|v| !v.is_null()) {
-                let a = a
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| a.to_string());
-                convs.touch(&session, "you", &a, true, &created);
-            }
+            fold_human_payload(&mut convs, &session, &payload, &created);
         }
+    }
 
+    // Durable transcript for every seeded session — prompted or ambient. (Was
+    // gated behind a non-empty correlation map, which starved ambient-only
+    // conversations of their message backfill.)
+    {
         let sessions: Vec<String> = convs.order.clone();
         if !sessions.is_empty() {
             let placeholders = placeholders(sessions.len());
@@ -2489,56 +2523,21 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
     if !corrs.is_empty() {
         let human_rows = query_human_by_corr(&conn, &corrs, 4000)?;
         for row in &human_rows {
-            let payload = parse_payload(&row.payload);
-            if payload.get("failed").is_some_and(truthy) {
-                add_message(
-                    &mut messages,
-                    &mut seen,
-                    json!({
-                        "id": format!("e-{}", row.id),
-                        "key": format!("event:{}:failed", row.id),
-                        "type": "msg",
-                        "who": "agent failed",
-                        "cls": "failed",
-                        "text": payload.get("error").and_then(Value::as_str).unwrap_or("the agent failed with no detail."),
-                        "corr": row.correlation_id,
-                        "failed": true,
-                        "ts": row.created_at,
-                        "event_id": row.id,
-                    }),
-                );
-            } else if payload.get("question").is_some_and(|v| !v.is_null()) {
-                add_message(
-                    &mut messages,
-                    &mut seen,
-                    json!({
-                        "id": format!("e-{}", row.id),
-                        "key": format!("event:{}:ask", row.id),
-                        "type": "ask",
-                        "corr": row.correlation_id,
-                        "payload": payload,
-                        "answered": Value::Null,
-                        "ts": row.created_at,
-                        "event_id": row.id,
-                    }),
-                );
-            } else if let Some(t) = payload.get("text").and_then(Value::as_str) {
-                add_message(
-                    &mut messages,
-                    &mut seen,
-                    json!({
-                        "id": format!("e-{}", row.id),
-                        "key": format!("event:{}:agent", row.id),
-                        "type": "msg",
-                        "who": "agent",
-                        "cls": "agent",
-                        "text": t,
-                        "corr": row.correlation_id,
-                        "ts": row.created_at,
-                        "event_id": row.id,
-                    }),
-                );
-            }
+            push_human_feed_message(&mut messages, &mut seen, row);
+        }
+    }
+
+    // M2 (docs/handoffs/ambient-conversations.md): an agent-first send_message —
+    // one that carries THIS session but was never correlated to an in/agent
+    // prompt (the agent spoke first) — is invisible to the correlation join
+    // above, so the ambient thread would render empty. Project owner-mailbox
+    // sends by session too. Content-key dedup in add_message collapses any
+    // overlap with the correlation-joined rows, so a prompted thread is
+    // unaffected. Skip the evt-* fallback: it is not a real session to match on.
+    if !is_evt {
+        let ambient = query_human_by_session(&conn, session, 4000)?;
+        for row in &ambient {
+            push_human_feed_message(&mut messages, &mut seen, row);
         }
     }
 
@@ -2548,6 +2547,119 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
         av.cmp(bv)
     });
     Ok(Value::Array(messages))
+}
+
+// The owner's mailbox rows, oldest first — the source for agent-first (ambient)
+// conversation seeds (docs/handoffs/ambient-conversations.md M2). Matches the
+// exact `in/human/<owner>` topic so another human's mailbox never bleeds in.
+fn query_owner_mailbox(
+    conn: &rusqlite::Connection,
+    owner: &str,
+    limit: i64,
+) -> Result<Vec<EventRow>> {
+    let topic = crate::topic::human_mailbox(owner);
+    let mut stmt = conn.prepare(
+        "SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type = ? ORDER BY id ASC LIMIT ?",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![topic, limit], map_event)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+// Fold one owner-mailbox event into its conversation the same way whether it was
+// reached by correlation (a reply to a prompted thread) or by session (an
+// agent-first ambient send) — one place so the two seed paths stay identical.
+fn fold_human_payload(convs: &mut Convs, session: &str, payload: &Value, created: &str) {
+    if payload.get("failed").is_some_and(truthy) {
+        let err = payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the agent failed");
+        convs.touch(session, "failed", err, true, created);
+    } else if payload.get("question").is_some_and(|v| !v.is_null()) {
+        let q = payload.get("question").and_then(Value::as_str).unwrap_or("");
+        convs.touch(session, "ask", q, true, created);
+    } else if let Some(t) = payload.get("text").and_then(Value::as_str) {
+        convs.touch(session, "agent", t, true, created);
+    } else if let Some(a) = payload.get("answer").filter(|v| !v.is_null()) {
+        let a = a
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| a.to_string());
+        convs.touch(session, "you", &a, true, created);
+    }
+}
+
+// Owner-mailbox rows whose payload carries this exact session — the session-keyed
+// sibling of query_human_by_corr, used to fold agent-first (ambient) sends into a
+// conversation's feed. Mirrors the in/agent payload-LIKE match already used above.
+fn query_human_by_session(
+    conn: &rusqlite::Connection,
+    session: &str,
+    limit: i64,
+) -> Result<Vec<EventRow>> {
+    let like = format!("%\"session\":\"{session}\"%");
+    let mut stmt = conn.prepare(
+        "SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type LIKE 'in/human/%' AND payload LIKE ? ORDER BY id ASC LIMIT ?",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![like, limit], map_event)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+// Project one owner-mailbox event into a conversation feed message
+// (failed / ask / agent-text). Shared by the correlation join (replies to a
+// prompted thread) and the session join (agent-first sends) so both render the
+// same shapes; add_message dedups by content key across the two.
+fn push_human_feed_message(messages: &mut Vec<Value>, seen: &mut HashSet<String>, row: &EventRow) {
+    let payload = parse_payload(&row.payload);
+    if payload.get("failed").is_some_and(truthy) {
+        add_message(
+            messages,
+            seen,
+            json!({
+                "id": format!("e-{}", row.id),
+                "key": format!("event:{}:failed", row.id),
+                "type": "msg",
+                "who": "agent failed",
+                "cls": "failed",
+                "text": payload.get("error").and_then(Value::as_str).unwrap_or("the agent failed with no detail."),
+                "corr": row.correlation_id,
+                "failed": true,
+                "ts": row.created_at,
+                "event_id": row.id,
+            }),
+        );
+    } else if payload.get("question").is_some_and(|v| !v.is_null()) {
+        add_message(
+            messages,
+            seen,
+            json!({
+                "id": format!("e-{}", row.id),
+                "key": format!("event:{}:ask", row.id),
+                "type": "ask",
+                "corr": row.correlation_id,
+                "payload": payload,
+                "answered": Value::Null,
+                "ts": row.created_at,
+                "event_id": row.id,
+            }),
+        );
+    } else if let Some(t) = payload.get("text").and_then(Value::as_str) {
+        add_message(
+            messages,
+            seen,
+            json!({
+                "id": format!("e-{}", row.id),
+                "key": format!("event:{}:agent", row.id),
+                "type": "msg",
+                "who": "agent",
+                "cls": "agent",
+                "text": t,
+                "corr": row.correlation_id,
+                "ts": row.created_at,
+                "event_id": row.id,
+            }),
+        );
+    }
 }
 
 fn query_human_by_corr(
@@ -2627,6 +2739,157 @@ fn normalize_role(role: &str) -> String {
 
 fn placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
+}
+
+#[cfg(test)]
+mod ambient_tests {
+    use super::*;
+    use crate::paths::Root;
+
+    fn insert_event(
+        conn: &rusqlite::Connection,
+        etype: &str,
+        correlation: Option<&str>,
+        payload: Value,
+        sender: Option<&str>,
+        created_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO events(type, correlation_id, payload, sender, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![etype, correlation, payload.to_string(), sender, created_at],
+        )
+        .unwrap();
+    }
+
+    // M2 (docs/handoffs/ambient-conversations.md): an agent-first send_message —
+    // one with no preceding in/agent prompt — must materialize a conversation the
+    // human can reply to, seeded from the in/human/<owner> row that carries the
+    // run's session. A prompted thread must stay a single conversation (no
+    // duplication when both the in/agent seed and its correlated in/human reply
+    // exist), and a worker-session send must NOT surface as a chat conversation.
+    #[test]
+    fn ambient_send_materializes_a_conversation() {
+        let dir = std::env::temp_dir().join(format!("el-ambconv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let agent = "companion";
+        let owner = "owner";
+        let mailbox = crate::topic::human_mailbox(owner);
+
+        // (1) A fully unprompted send: no in/agent prompt, carries the run's
+        // session, sent by the agent (sender = the agent noun). It declares its
+        // origin (a timer) so the badge is honestly not "you".
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
+            json!({ "text": "your build finished — all green", "session": "run-amb-1", "source": "cron" }),
+            Some(agent),
+            "2026-07-01T10:00:00.000Z",
+        );
+
+        // (2) A normal prompted thread: an in/agent prompt + a correlated reply,
+        // both on the same web- session.
+        insert_event(
+            &conn,
+            &format!("in/agent/{agent}"),
+            Some("c-prompted"),
+            json!({ "prompt": "how are the tests?", "session": "web-1" }),
+            Some(owner),
+            "2026-07-01T09:00:00.000Z",
+        );
+        insert_event(
+            &conn,
+            &mailbox,
+            Some("c-prompted"),
+            json!({ "text": "13 passing", "session": "web-1" }),
+            Some(agent),
+            "2026-07-01T09:00:01.000Z",
+        );
+
+        // (3) A worker-session send: must be evicted (stays in the trace view).
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
+            json!({ "text": "worker chatter", "session": "code-deadbeef" }),
+            Some(agent),
+            "2026-07-01T11:00:00.000Z",
+        );
+
+        // (4) Another agent's ambient send on the shared mailbox: must NOT leak
+        // into this agent's conversations.
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
+            json!({ "text": "not for companion", "session": "run-other-1" }),
+            Some("researcher"),
+            "2026-07-01T12:00:00.000Z",
+        );
+
+        let out = conversation_rows(agent, &root.db(), owner).unwrap();
+        let convs = out.as_array().unwrap();
+        let sessions: Vec<&str> = convs
+            .iter()
+            .map(|c| c["session"].as_str().unwrap())
+            .collect();
+
+        assert!(
+            sessions.contains(&"run-amb-1"),
+            "the ambient send is a conversation ({sessions:?})"
+        );
+        assert!(
+            sessions.contains(&"web-1"),
+            "the prompted thread is a conversation ({sessions:?})"
+        );
+        assert_eq!(
+            sessions.iter().filter(|s| **s == "web-1").count(),
+            1,
+            "the prompted thread is a SINGLE conversation, not duplicated"
+        );
+        assert!(
+            !sessions.contains(&"code-deadbeef"),
+            "a worker-session send stays in the trace view, not chat ({sessions:?})"
+        );
+        assert!(
+            !sessions.contains(&"run-other-1"),
+            "another agent's ambient send does not leak in ({sessions:?})"
+        );
+
+        // The ambient conversation is honest about who started it: title is the
+        // agent's message preview and the badge is not "you".
+        let ambient = convs
+            .iter()
+            .find(|c| c["session"] == "run-amb-1")
+            .unwrap();
+        assert_eq!(
+            ambient["title"].as_str().unwrap(),
+            "your build finished — all green",
+            "ambient title is the agent's opening message"
+        );
+        assert_ne!(
+            ambient["source"].as_str().unwrap(),
+            "you",
+            "an agent-initiated conversation is not badged 'you'"
+        );
+        assert_eq!(ambient["source"].as_str().unwrap(), "cron");
+
+        // And the ambient thread is not empty: conversation_messages projects the
+        // agent-first send into a replyable feed (>=1 message). Without the
+        // session join it would be blank (no in/agent prompt to correlate on).
+        let feed = conversation_messages("run-amb-1", &root.db()).unwrap();
+        let feed = feed.as_array().unwrap();
+        assert!(
+            feed.iter().any(|m| m["text"].as_str() == Some("your build finished — all green")
+                && m["cls"].as_str() == Some("agent")),
+            "the ambient send renders as an agent turn in the feed ({feed:?})"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 fn truthy(v: &Value) -> bool {

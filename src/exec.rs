@@ -2563,6 +2563,56 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // M1 (docs/handoffs/ambient-conversations.md): a send_message fired from a
+    // run with NO preceding in/agent prompt still records its run's session on
+    // the in/human/<owner> event, so the projection has something to anchor an
+    // agent-first thread on. The session travels in the payload (where
+    // session_for_event reads it); this proves it lands non-null with no prior
+    // prompt to establish a correlation→session mapping.
+    #[test]
+    fn ambient_send_records_run_session() {
+        let dir = std::env::temp_dir().join(format!("el-ambient-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let owner = "owner";
+        let topic = crate::topic::human_mailbox(owner);
+
+        // The shape the send_message handler emits: text + the run's session,
+        // no correlation (a timer-fired run has no owner turn to thread onto).
+        let run_session = "run-ambient-01";
+        let id = emit_message(
+            &root,
+            &conn,
+            None,
+            &OutboundMessage {
+                topic: topic.clone(),
+                payload: json!({ "text": "the build you asked about finished", "session": run_session }),
+                correlation: None,
+                deadline: None,
+                default_action: None,
+            },
+        )
+        .unwrap();
+
+        let (etype, payload): (String, Option<String>) = conn
+            .query_row(
+                "SELECT type, payload FROM events WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(etype, topic, "an ambient send lands on the owner mailbox");
+        let payload: Value = serde_json::from_str(&payload.expect("payload present")).unwrap();
+        assert_eq!(
+            payload.get("session").and_then(Value::as_str),
+            Some(run_session),
+            "the ambient send carries its run's session (not null)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn tilde_expands_against_home() {
         let home = std::env::var("HOME").unwrap();

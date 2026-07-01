@@ -1057,6 +1057,116 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
+// ── flow 6c: ambient-conversations — an agent that speaks first is replyable ───
+// docs/handoffs/ambient-conversations.md: an unprompted send_message (a timer or
+// event handler firing, no preceding in/agent prompt) must surface as its own
+// labeled, replyable conversation — not a notification you can only watch. The
+// send lands on in/human/<owner> carrying the run's session and is sent by the
+// agent (sender = the agent noun), which is the only link back to the agent.
+//  - /api/conversations?agent=<name> returns a conversation for it;
+//  - it opens a #view-converse thread with >=1 message;
+//  - its source badge is NOT "you" (honest: the agent reached out);
+//  - replying into it appends and threads by the conversation's session, with no
+//    duplicate of the just-sent message.
+{
+  const ambientAgent = 'beacon';
+  const ambientSession = `run-${ambientAgent}-${Date.now().toString(36)}`;
+  const ambientText = `your nightly build finished — all green (${Date.now().toString(36)})`;
+  // `elanus emit` records the sender from ELANUS_ACTOR; the real send_message
+  // path runs with ELANUS_ACTOR = the agent noun, so seed the same way.
+  const emitAs = (actor, ...a) =>
+    execFileSync(path.join(BIN, 'elanus'), a, { env: { ...ENV, ELANUS_ACTOR: actor }, encoding: 'utf8' });
+
+  const seedPage = await newPage();
+  await seedPage.goto('/');
+  const created = await seedPage.evaluate(async (name) => {
+    const r = await fetch('/api/admin/agents', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return r.json().catch(() => ({}));
+  }, ambientAgent);
+  created.ok ? ok(`ambient: created agent ${ambientAgent}`) : fail(`ambient: could not create ${ambientAgent} (${JSON.stringify(created)})`);
+  await seedPage.close();
+  try {
+    // No in/agent prompt, no correlation: a fully unprompted agent-first send.
+    // `source: cron` declares the timer origin so the badge is honestly not "you".
+    emitAs(ambientAgent, 'emit', 'in/human/owner', '--payload',
+      JSON.stringify({ text: ambientText, session: ambientSession, source: 'cron' }));
+  } catch (e) { fail(`ambient: seeding the unprompted send failed: ${e.message ?? e}`); }
+
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+
+  // The projection returns the ambient conversation, badged not-"you".
+  const ambientConv = await page.evaluate(async (name) => {
+    const r = await fetch(`/api/conversations?agent=${encodeURIComponent(name)}`);
+    const j = await r.json().catch(() => ({}));
+    const convs = j.conversations ?? [];
+    return { ok: !!j.ok, count: convs.length, sources: convs.map((c) => c.source), sessions: convs.map((c) => c.session) };
+  }, ambientAgent);
+  ambientConv.ok && ambientConv.count >= 1 && ambientConv.sessions.includes(ambientSession)
+    ? ok(`ambient: projection returns the unprompted conversation for ${ambientAgent}`)
+    : fail(`ambient: projection missing the unprompted conversation (${JSON.stringify(ambientConv)})`);
+  ambientConv.sources.every((s) => s !== 'you')
+    ? ok(`ambient: source badge marks it agent-initiated, not "you" (${JSON.stringify(ambientConv.sources)})`)
+    : fail(`ambient: an agent-initiated conversation was badged "you" (${JSON.stringify(ambientConv.sources)})`);
+
+  // Select the agent, then open the ambient conversation from the nav.
+  await waitFor(`ambient: ${ambientAgent} in nav`, async () => {
+    const items = await page.$$('#nav-agents .nav-agent');
+    for (const item of items) {
+      if ((await item.getAttribute('data-sel')) === `agent:${ambientAgent}`) { await item.click(); return true; }
+    }
+    return false;
+  }, 10000);
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  // The ambient conversation is listed with a non-"you" source badge. Scope to
+  // THIS conversation by its unique title text — the nav lists every agent's
+  // conversations, so a bare `.nav-conversation` would match a neighbour.
+  await waitFor('ambient: nav lists the conversation with a non-"you" badge', async () => {
+    const rows = await page.$$eval('#nav-agents .nav-conversation', (els, t) => els
+      .filter((el) => (el.textContent || '').includes(t))
+      .map((el) => (el.querySelector('.source-badge')?.textContent || '').trim()), ambientText).catch(() => []);
+    return rows.length >= 1 && rows.every((b) => b && b !== 'you');
+  }, 10000);
+  await waitFor('ambient: open the unprompted conversation', async () => {
+    const rows = await page.$$('#nav-agents .nav-conversation');
+    for (const row of rows) {
+      const txt = (await row.textContent()) || '';
+      if (txt.includes(ambientText)) { await row.click(); return true; }
+    }
+    return false;
+  }, 10000);
+  // The thread is not empty — the agent-first send renders as a turn.
+  await waitFor('ambient: opens a replyable thread with the agent-first message', async () => {
+    const msgs = await page.$$eval('.conv-feed .msg', (els) => els.length).catch(() => 0);
+    const text = await page.$eval('#conv-holder', (el) => el.textContent).catch(() => '');
+    return msgs >= 1 && text.includes(ambientText);
+  }, 10000);
+
+  // Replying into it appends and threads onto the conversation's session — no dup.
+  const publishes = [];
+  page.on('request', (req) => {
+    if (!req.url().endsWith('/api/publish') || req.method() !== 'POST') return;
+    try { publishes.push(JSON.parse(req.postData() || '{}')); } catch {}
+  });
+  const reply = `on it — thanks beacon (${Date.now().toString(36)})`;
+  await page.fill('#compose-input', reply);
+  await page.click('#compose-send');
+  await waitFor('ambient: reply appends to the thread', async () =>
+    (await page.$eval('#conv-holder', (el) => el.textContent)).includes(reply), 8000);
+  await waitFor('ambient: reply threads onto the ambient conversation session', async () =>
+    publishes.length >= 1 && publishes.some((p) => p.payload?.session === ambientSession && p.correlation), 8000);
+  // No duplicate of the just-sent reply (idempotent optimistic insert ⊕ echo).
+  const replyCount = await page.$$eval('#conv-holder .msg', (els, r) => els.filter((el) => (el.textContent || '').includes(r)).length, reply).catch(() => 0);
+  replyCount === 1
+    ? ok('ambient: the reply renders exactly once (no duplicate)')
+    : fail(`ambient: the reply rendered ${replyCount} times (expected 1)`);
+  await page.close();
+}
+
 // ── flow 7: history works out of the box ──────────────────────────────────────
 // history is stdlib, on at init, so the sessions tab is backed
 // by the real transcript view — NOT the unavailable-transcripts note —
