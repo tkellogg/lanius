@@ -3487,22 +3487,35 @@ fn launch_external_harness(
         // into this session, so a session's capabilities are reconstructable from
         // its trace. Empty when the user configured none.
         let mcp_merged = merged_mcp_server_names(&external.decl.name);
+        // Ungated-posture stamp (Tim's ruling, docs/security.md): when this launch
+        // is a headless codex worker, MCP tool calls run with NO human approval —
+        // record that fact on session/start (alongside mcp_merged) so a session's
+        // capabilities/authority are reconstructable from its trace, not just
+        // inferred from code. Absent for every other tool/mode (nothing ungated to
+        // record — the human approves in the TUI, and claude/opencode's own
+        // posture is unchanged by this ruling).
+        let mut start_record = json!({
+            "ts": now_iso(),
+            "tool": &external.decl.name,
+            "workdir": workdir.display().to_string(),
+            "args": args,
+            "parent": parent,
+            "model": model,
+            "effort": effort,
+            "provider": provider,
+            "mcp_merged": mcp_merged,
+        });
+        if let Some((approvals, sandbox)) = codex_headless_approval_posture(&external.decl.name, mode)
+        {
+            start_record["approvals"] = json!(approvals);
+            start_record["sandbox"] = json!(sandbox);
+        }
         let captured = publish_obs_captured(
             root,
             &principal,
             &bus_token,
             &obs_topic(&agent, &session, "session/start"),
-            json!({
-                "ts": now_iso(),
-                "tool": &external.decl.name,
-                "workdir": workdir.display().to_string(),
-                "args": args,
-                "parent": parent,
-                "model": model,
-                "effort": effort,
-                "provider": provider,
-                "mcp_merged": mcp_merged,
-            }),
+            start_record,
         );
         if !captured {
             let note = "[elanus] NOTE: elanus can't reach its message bus, so this \
@@ -4066,16 +4079,91 @@ pub fn run_opencode_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::E
 ///
 /// `codex exec --json --skip-git-repo-check [args…]`, cwd = the workdir, keeping
 /// the user's real `CODEX_HOME` so auth stays intact and nothing is written to
-/// `~/.codex`. We do NOT pass `--dangerously-bypass-approvals-and-sandbox`: Codex
-/// keeps its OWN sandbox active (the complete elanus cage is the deferred
-/// prerequisite, recorded in the handoff Log), exactly as the CC adapter keeps
-/// CC's sandbox. The user prompt must be a positional arg by the time Codex is
+/// `~/.codex`. The user prompt must be a positional arg by the time Codex is
 /// spawned; if the caller omitted one, we promote the launcher's stdin to that
 /// positional or fail loudly before spawning. Codex's stdin remains reserved for
 /// the elanus briefing block, and stderr is inherited so the human still sees
 /// Codex's own progress/errors. Returns the native exit status plus the captured
 /// legible result so foreground launches can print it and spawned launches can
 /// route it back to the spawner.
+///
+/// **Ruling on headless approvals (Tim, 2026-07-02).** `codex exec` has NO
+/// approval channel at all — no TTY, stdin is the prompt/briefing — so an MCP
+/// tool call under codex's default approval/sandbox posture auto-CANCELS
+/// ("user cancelled MCP tool call") rather than pausing for a decision. Live
+/// research (`docs/notes-headless-elicitation.md` §2) confirms elicitation is
+/// architecturally impossible for this transport (only a transport swap to
+/// `codex app-server` — future work, not this fix — could hold the decision
+/// open). Where elicitation is impossible, the doctrine is: auto-approve at the
+/// TIGHTEST scope that works, and RECORD the ungated posture (safety = audit,
+/// not restriction). Live-tested against a scratch stdio MCP server
+/// (`scratch_ping`, one `ping` tool) on a scratch `CODEX_HOME`, four postures:
+///   - default (no override): MCP call auto-cancels.
+///   - `-c approval_policy=never` alone: STILL auto-cancels — approval policy
+///     does not gate MCP tool calls at all under `exec`.
+///   - `-c approval_policy=never -c sandbox_mode=workspace-write`: STILL
+///     auto-cancels — workspace-write is not sufficient.
+///   - `-c sandbox_mode=danger-full-access` (with or without
+///     `approval_policy=never`): the call COMPLETES (`"status":"completed"`,
+///     `pong: <arg>` returned). This is the minimal working posture; no
+///     narrower sandbox mode lets a headless MCP tool call finish today.
+/// So `danger-full-access` is not a discretionary escalation here — it is the
+/// floor `codex exec` requires before an MCP tool call can complete headless at
+/// all. We pass BOTH `-c` overrides explicitly (not
+/// `--dangerously-bypass-approvals-and-sandbox`, which also disables other
+/// checks like `--skip-git-repo-check`'s cousins) so the posture stays a
+/// legible, scoped config override rather than the special-cased CLI bypass —
+/// and it is stamped on the `session/start` obs record below (`approvals`,
+/// `sandbox`) so the ungated fact is visible in the audit trail, per
+/// `docs/security.md`. Interactive `run_codex_tui_import` does NOT get this —
+/// the human is present there to approve.
+/// The two `-c` overrides that make a headless `codex exec` MCP tool call
+/// complete instead of auto-cancelling (see the doc comment above for the live
+/// evidence). Named constants so the session/start posture stamp below and the
+/// argv builder can't drift apart.
+const CODEX_HEADLESS_SANDBOX_MODE_VALUE: &str = "danger-full-access";
+const CODEX_HEADLESS_APPROVAL_POLICY: &str = "approval_policy=never";
+const CODEX_HEADLESS_SANDBOX_MODE: &str =
+    concat!("sandbox_mode=", "danger-full-access");
+
+/// Pure, unit-testable: the base `codex exec` argv (before provider injection /
+/// the user's own args are appended) for the HEADLESS capture path only. Carries
+/// the auto-approve posture (Tim's ruling); `run_codex_tui_import`'s base argv
+/// deliberately does NOT include it — the human approves in the TUI.
+fn codex_headless_base_args() -> Vec<String> {
+    vec![
+        "exec".to_string(),
+        "--json".to_string(),
+        "--skip-git-repo-check".to_string(),
+        "--dangerously-bypass-hook-trust".to_string(),
+        "-c".to_string(),
+        CODEX_HEADLESS_APPROVAL_POLICY.to_string(),
+        "-c".to_string(),
+        CODEX_HEADLESS_SANDBOX_MODE.to_string(),
+    ]
+}
+
+/// Pure, unit-testable: the base interactive `codex` TUI argv. No approval/
+/// sandbox override — the human is present to approve.
+fn codex_tui_base_args() -> Vec<String> {
+    vec!["--dangerously-bypass-hook-trust".to_string()]
+}
+
+/// The `(approvals, sandbox)` pair to stamp on `session/start` when this launch
+/// runs ungated (Tim's ruling) — `Some(("auto", "danger-full-access"))` for a
+/// headless codex worker only, `None` for every other tool/mode (nothing to
+/// record: claude/opencode's posture is untouched by this ruling, and the codex
+/// TUI is human-approved). Kept in lockstep with `codex_headless_base_args` via
+/// the same constants so the audit record can't drift from what was actually
+/// passed to the child process.
+fn codex_headless_approval_posture(tool: &str, mode: Mode) -> Option<(&'static str, &'static str)> {
+    if tool == "codex" && mode == Mode::Headless {
+        Some(("auto", CODEX_HEADLESS_SANDBOX_MODE_VALUE))
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_codex_capture(
     root: &Root,
@@ -4101,12 +4189,7 @@ fn run_codex_capture(
     // native codex login survives the redirect.
     let codex_home = build_codex_skills_home(root, session, skills)?;
 
-    let mut codex_args = vec![
-        "exec".to_string(),
-        "--json".to_string(),
-        "--skip-git-repo-check".to_string(),
-        "--dangerously-bypass-hook-trust".to_string(),
-    ];
+    let mut codex_args = codex_headless_base_args();
     // M2: a `--provider` codex injection is a set of `-c model_provider…` flags that
     // must ride with the `codex exec` options, BEFORE the prompt positional. The
     // secret rides the env (env_key), never the command line.
@@ -4260,7 +4343,12 @@ fn run_codex_tui_import(
     // seed prompt positional (codex's documented seed channel): we fold the brief
     // and the user's seed prompt (if any) into one positional. With no user prompt
     // AND no brief, we pass nothing → a bare TUI.
-    let mut codex_args: Vec<String> = vec!["--dangerously-bypass-hook-trust".to_string()];
+    // Deliberately NOT `codex_headless_base_args()` — no `approval_policy`/
+    // `sandbox_mode` override here. The TUI is interactive: the human is present
+    // to approve MCP tool calls and shell commands, so codex's own default
+    // approval/sandbox posture stays in force (Tim's ruling scopes auto-approve
+    // to the headless path only; see `run_codex_capture`'s doc comment).
+    let mut codex_args: Vec<String> = codex_tui_base_args();
     // M2: a `--provider` codex injection rides as `-c model_provider…` flags before
     // the seed positional (same shape as the exec path, just the TUI cell).
     if let Some(inj) = injection {
@@ -9941,6 +10029,43 @@ mod tests {
                 "do it".to_string(),
             ]
         );
+    }
+
+    // ── Headless codex auto-approve (Tim's ruling, 2026-07-02) ────────────────
+    //
+    // `codex exec` has no approval channel, so a headless MCP tool call
+    // auto-cancels under codex's default posture; live-tested minimal fix is
+    // `-c approval_policy=never -c sandbox_mode=danger-full-access` (see the doc
+    // comment on `run_codex_capture`). This must ride ONLY the headless argv,
+    // never the interactive TUI argv (the human approves there).
+
+    #[test]
+    fn codex_headless_args_carry_auto_approve_posture() {
+        let args = codex_headless_base_args();
+        assert!(args.windows(2).any(|w| w[0] == "-c" && w[1] == "approval_policy=never"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "sandbox_mode=danger-full-access"));
+    }
+
+    #[test]
+    fn codex_tui_args_do_not_carry_auto_approve_posture() {
+        let args = codex_tui_base_args();
+        assert!(!args.iter().any(|a| a.starts_with("approval_policy=")));
+        assert!(!args.iter().any(|a| a.starts_with("sandbox_mode=")));
+        // No stray `-c` flag at all — the TUI base argv is untouched by the ruling.
+        assert!(!args.iter().any(|a| a == "-c"));
+    }
+
+    #[test]
+    fn codex_headless_approval_posture_only_for_headless_codex() {
+        assert_eq!(
+            codex_headless_approval_posture("codex", Mode::Headless),
+            Some(("auto", "danger-full-access"))
+        );
+        assert_eq!(codex_headless_approval_posture("codex", Mode::Tui), None);
+        assert_eq!(codex_headless_approval_posture("claude-code", Mode::Headless), None);
+        assert_eq!(codex_headless_approval_posture("opencode", Mode::Headless), None);
     }
 
     // ── The launch-envelope briefing (M4-B) ──────────────────────────────────

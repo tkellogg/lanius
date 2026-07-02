@@ -235,6 +235,51 @@ silently lost.
   `merged_mcp_names_unknown_tool_is_empty`, plus the settings invariant. `cargo
   test --lib` = 437 passed.
 
+### 2026-07-02 — codex residual RESOLVED (Tim's ruling: headless auto-approve)
+The "codex residual" above (M3 Log entry) escalated one question to Fable/Tim:
+`codex exec` auto-cancels MCP tool CALLS under its default approval/sandbox, and
+elanus deliberately did not silently bypass approvals to fix it. `docs/
+notes-headless-elicitation.md` researched whether elicitation (pause, ask a
+human, resume) is possible for this transport instead of blanket auto-approve —
+finding it is **architecturally impossible** for `codex exec`: no TTY, no
+approval callback, stdin is reserved for the prompt/briefing; only a full
+transport swap to `codex app-server`'s bidirectional JSON-RPC (future work, not
+this fix) could hold a decision open (§2–3 of that doc). Per its doctrine
+(§2, "General principle for 'elicitation impossible' cases"): auto-approve at
+the tightest scope the harness offers, and record the ungated fact in the
+audit trail.
+
+Tim's ruling: headless codex workers auto-approve so MCP tool calls complete,
+scoped as tightly as possible, and the ungated posture is RECORDED.
+
+Implemented in `src/codeagent.rs`, headless path (`run_codex_capture` /
+`codex_headless_base_args()`) ONLY — the interactive TUI (`run_codex_tui_import`
+/ `codex_tui_base_args()`) is untouched; the human approves there. Live-tested
+against a scratch stdio MCP server (`scratch_ping`, one `ping` tool) on a
+scratch `CODEX_HOME`, four postures:
+- default (no override): MCP call auto-cancels ("user cancelled MCP tool call").
+- `-c approval_policy=never` alone: **still** auto-cancels.
+- `-c approval_policy=never -c sandbox_mode=workspace-write`: **still**
+  auto-cancels — `workspace-write` is not sufficient.
+- `-c sandbox_mode=danger-full-access` (with or without `approval_policy=never`):
+  the call **completes** (`"status":"completed"`, `pong: <arg>` returned).
+
+So `danger-full-access` is not a discretionary escalation — it is the floor
+`codex exec` requires before a headless MCP tool call can complete at all;
+`workspace-write` (the narrower sandbox originally hoped for in `docs/
+notes-headless-elicitation.md` §2) does not unblock MCP calls. elanus passes
+both `-c` overrides explicitly (`approval_policy=never`,
+`sandbox_mode=danger-full-access`) rather than
+`--dangerously-bypass-approvals-and-sandbox`, so the posture stays a legible,
+scoped config override instead of the special-cased CLI bypass (which also
+disables unrelated checks). The posture is stamped on the `session/start` obs
+record (`"approvals": "auto", "sandbox": "danger-full-access"`, alongside
+`mcp_merged`) for every headless codex launch, so a session's ungated
+authority is reconstructable from its trace — never silent. See
+`docs/security.md` (new entry) for the ledger record. Revisit when the
+`codex app-server` driver lands (§3 of `notes-headless-elicitation.md`) — that
+is the actual fix for elicitation, not this stopgap.
+
 ### 2026-07-02 — Created from Tim's `_questions.md` sprint-3 pull. Grounded
   against the worktree: claude's shadowing is total and deliberate
   (`--setting-sources ''`, hooks-only settings, no `--mcp-config`); opencode's

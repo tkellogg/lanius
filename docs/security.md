@@ -856,3 +856,43 @@ passphrase prompt). The honest upgrade path, deferred: a keyring-backed master k
 at daemon start for a key that never touches disk (at the cost of unattended
 auto-start). LATENT until then: anyone with FS read as the elanus user reads every
 stored credential.
+
+## 24. [DECIDED 2026-07-02] Headless codex workers run MCP tool calls approval-free, by ruling
+
+`codex exec` (the transport `elanus code codex --headless` shells out to,
+`src/codeagent.rs`) has **no approval channel at all**: no TTY, no callback, and
+stdin is reserved for the prompt/briefing — so under codex's default
+approval/sandbox posture, any MCP tool call the worker attempts auto-CANCELS
+("user cancelled MCP tool call") rather than pausing for a decision
+(`docs/handoffs/mcp-on-launch.md`, the "codex residual"). `docs/
+notes-headless-elicitation.md` researched whether a pause-ask-resume channel
+(elicitation) exists for this transport instead of blanket auto-approve, and
+found it **architecturally impossible** for `codex exec` — only a full driver
+swap to `codex app-server`'s bidirectional JSON-RPC (deferred future work)
+could hold a decision open long enough for a real human answer.
+
+Where elicitation is impossible, the doctrine (safety = audit, not
+restriction; entry 0) is: auto-approve at the tightest scope the harness
+offers, and RECORD the ungated fact. Tim's ruling applies that here: headless
+codex workers auto-approve so MCP tool calls complete. Live-tested against a
+scratch stdio MCP server, the tightest **working** scope is `-c
+approval_policy=never -c sandbox_mode=danger-full-access` — `sandbox_mode=
+workspace-write` was tried first and still auto-cancels the call, so
+`danger-full-access` is not a discretionary escalation; it is the floor
+`codex exec` requires. elanus passes these as explicit `-c` overrides
+(`codex_headless_base_args()`), not `--dangerously-bypass-approvals-and-
+sandbox` (which also disables unrelated checks), and ONLY on the headless
+path — the interactive TUI (`run_codex_tui_import`) is untouched; a human is
+present there to approve. The ungated posture is stamped on every headless
+codex `session/start` obs record (`"approvals": "auto", "sandbox":
+"danger-full-access"`, alongside the existing `mcp_merged` field), so a
+session's authority is reconstructable from its trace, never inferred or
+silent.
+
+**LATENT residual:** this is a stopgap, not the real fix. It means a headless
+codex worker's shell commands ALSO run with no sandbox and no approval (the
+sandbox override is process-wide, not scoped to MCP calls specifically) —
+codex offers no narrower lever today. Revisit when the `codex app-server`
+driver lands (`docs/notes-headless-elicitation.md` §3): a real bidirectional
+RPC session can hold approval requests open and relay them to elanus's
+mailbox/`ask_human` rail, which removes the need for this bypass entirely.
