@@ -20,3 +20,8 @@ Sprint-3 pull (2026-07-02): every other item moved into agreed handoffs / delive
 - knowledge-base.md (design-review, for Tim) — KB first-class + consolidation actor + LLM-strengths KB (Q14, Q15)
 - storage-hardening.md — the two real bugs the scaling probe found (bonus)
 -->
+
+Dolt — hands-on spike, not just the paper verdict. notes-scaling-and-storage.md §3 said "no win today"
+(ledger doesn't need versioning, config already has real git, blocks/KB closest fit but Rust embedding weak).
+Tim wants to actually run it and see. Natural moment: when the KB (knowledge-base.md) gets built — stand the
+KB corpus up on Dolt vs files-in-package side by side and judge with hands, not citations.
