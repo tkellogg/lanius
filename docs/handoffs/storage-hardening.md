@@ -154,6 +154,30 @@ deadline-expiry tests green. `cargo test` green.
   session-scope — one of the affected scopes).
 
 ## Log
+- 2026-07-02 — Implemented (Opus, implementer). M1: sentinel migration
+  (`db.rs::migrate_context_block_sentinels`, dedupe-keep-latest then backfill
+  NULL→`''`, gated on NULL presence so steady-state open is a no-op) +
+  `scope_binding` returns `''` not `None`; `upsert_block` is now one native
+  `INSERT … ON CONFLICT … DO UPDATE` inside `BEGIN IMMEDIATE` with its
+  build-log row; get/exists/remove predicates switched `IS ?` → `= ?`. M2:
+  both load paths dedup by `ROW_NUMBER() … PARTITION BY logical-key ORDER BY id
+  DESC` (max-id wins), predicate matches `''`, this session, and legacy NULL.
+  M3: added `idx_events_type_deadline (type, deadline)`; extracted the
+  `expire_deadlines` SELECT to a const guarded by an EXPLAIN-plan test.
+  **M3 measurement (sqlite3 CLI, 200k events, ~1143 expired-unanswered asks):
+  before (no index) ~11ms full `SCAN e`; after (with index) ~2–3ms —
+  `SEARCH e USING INDEX idx_events_type_deadline (type=? AND deadline range)`,
+  and the `NOT EXISTS` subquery rides `idx_events_correlation` on real data
+  exactly as predicted.** New tests (all green):
+  `context_store::concurrent_upsert_same_key_yields_exactly_one_row` (N=10
+  real concurrent connections → exactly 1 row, 0 errors),
+  `context_store::migration_dedupes_null_keyed_and_backfills_sentinel`,
+  `context_store::load_paths_dedup_duplicate_logical_key`,
+  `dispatcher::expire_deadlines_uses_type_deadline_index`. Existing
+  `upsert_get_roundtrip_and_last_writer_wins` and the deadline-expiry tests
+  still pass. `cargo test --lib` green except one pre-existing flaky
+  port-allocation test (`dev::first_free_port_returns_start_when_already_free`,
+  passes in isolation, unrelated).
 - 2026-07-02 — Created from the storage research probe's findings
   (`docs/notes-scaling-and-storage.md`, landed 7ee9aa5) at Fable's direction,
   alongside the `_questions.md` sprint-3 pull. Grounded against the worktree:

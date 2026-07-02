@@ -172,6 +172,11 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_pending ON events(state, type, priority);
 CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id);
+-- expire_deadlines() runs every tick with a WHERE leading `type = ?1 AND
+-- deadline IS NOT NULL AND deadline < now`; without this it full-scans `events`
+-- (linear in ledger age — 9.3ms @ 200k rows). `(type, deadline)` lets that
+-- SELECT SEARCH by index instead of SCAN (docs/handoffs/storage-hardening.md M3).
+CREATE INDEX IF NOT EXISTS idx_events_type_deadline ON events(type, deadline);
 
 -- One row per handler invocation; the event-level state machine derives from these.
 CREATE TABLE IF NOT EXISTS dispatches (
@@ -559,6 +564,65 @@ CREATE INDEX IF NOT EXISTS idx_code_session_tasks_session ON code_session_tasks(
     // the batch (a pre-`announced` DB would fail the whole batch otherwise).
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_unannounced ON events(announced) WHERE announced = 0",
+        [],
+    )?;
+    migrate_context_block_sentinels(conn)?;
+    Ok(())
+}
+
+/// Sentinel migration (docs/handoffs/storage-hardening.md M1). The
+/// `context_blocks` UNIQUE(scope, owner, session_id, run_id, name) constraint is
+/// inert for every scope except `run`, because SQLite treats NULL as DISTINCT in
+/// a UNIQUE index — so unbound `session_id`/`run_id` (NULL for global/agent/
+/// session scope) let concurrent writers to the same logical key silently insert
+/// DUPLICATE rows. The fix backfills NULL → `''` so the constraint fires and the
+/// upsert can use native `ON CONFLICT`.
+///
+/// Order is load-bearing: existing DBs already contain duplicate rows, and
+/// backfilling NULL → `''` on a table with duplicates would violate the
+/// now-live UNIQUE constraint mid-UPDATE. So (a) DEDUPE first — for each logical
+/// key `(scope, owner, ifnull(session_id,''), ifnull(run_id,''), name)` keep the
+/// row with the greatest `updated_at`, tie-broken by greatest `id` (the
+/// last-writer-wins row an uncontended write would have produced), delete the
+/// rest; then (b) backfill the sentinels. Idempotent: once no NULL columns
+/// remain (steady state, new rows always bind `''`) it is a no-op, so it is
+/// cheap to run at every open.
+fn migrate_context_block_sentinels(conn: &Connection) -> Result<()> {
+    // Fast path: nothing to migrate once every row carries the sentinel. This
+    // makes the steady-state open O(a single index/scan probe), not a rebuild.
+    let needs: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM context_blocks WHERE session_id IS NULL OR run_id IS NULL)",
+        [],
+        |r| r.get(0),
+    )?;
+    if !needs {
+        return Ok(());
+    }
+    // (a) Dedupe: keep the max-(updated_at, id) row per logical key.
+    let deleted = conn.execute(
+        "DELETE FROM context_blocks WHERE id NOT IN (
+           SELECT id FROM (
+             SELECT id, ROW_NUMBER() OVER (
+                      PARTITION BY scope, owner, ifnull(session_id,''), ifnull(run_id,''), name
+                      ORDER BY updated_at DESC, id DESC
+                    ) AS rn
+               FROM context_blocks
+           ) WHERE rn = 1
+         )",
+        [],
+    )?;
+    if deleted > 0 {
+        eprintln!(
+            "[db] context_blocks sentinel migration: healed {deleted} duplicate block row(s)"
+        );
+    }
+    // (b) Backfill the sentinels so the UNIQUE constraint fires from here on.
+    conn.execute(
+        "UPDATE context_blocks SET session_id = '' WHERE session_id IS NULL",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE context_blocks SET run_id = '' WHERE run_id IS NULL",
         [],
     )?;
     Ok(())

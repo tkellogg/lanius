@@ -82,18 +82,18 @@ pub struct LoadedBlock {
 
 /// The `session_id` / `run_id` columns a row carries for a given scope. A
 /// `global`/`agent` block is not bound to a session; a `session` block is bound
-/// to `session`; a `run` block to a session+run. The UNIQUE key includes both,
-/// so the binding must be deterministic per scope to upsert and to read the
-/// same row back.
-fn scope_binding<'a>(
-    scope: &Scope,
-    session: &'a str,
-    run: Option<&'a str>,
-) -> (Option<&'a str>, Option<&'a str>) {
+/// to `session`; a `run` block to a session+run. Unbound columns bind the empty
+/// SENTINEL `''`, never NULL (storage-hardening M1): SQLite treats NULL as
+/// DISTINCT in a UNIQUE index, so NULL-bound columns silently neutered the
+/// `UNIQUE(scope, owner, session_id, run_id, name)` constraint and let
+/// concurrent writers duplicate the same logical key. With `''` the constraint
+/// fires and the upsert is one native `ON CONFLICT`. The binding is
+/// deterministic per scope so a block round-trips to the same row.
+fn scope_binding<'a>(scope: &Scope, session: &'a str, run: Option<&'a str>) -> (&'a str, &'a str) {
     match scope {
-        Scope::Global | Scope::Agent => (None, None),
-        Scope::Session => (Some(session), None),
-        Scope::Run => (Some(session), run),
+        Scope::Global | Scope::Agent => ("", ""),
+        Scope::Session => (session, ""),
+        Scope::Run => (session, run.unwrap_or("")),
     }
 }
 
@@ -108,13 +108,26 @@ pub fn load_system_blocks(
     prof: &Profile,
     session: &str,
 ) -> Result<Vec<LoadedBlock>> {
+    // Dedup-on-read guard (storage-hardening M2): collapse to one row per logical
+    // key (max `id` wins) BEFORE ordering, so a DB restored from a pre-migration
+    // backup — or an attach of an old `elanus.db` with NULL-keyed duplicates —
+    // never renders the same block 2–30 times into the prompt. The sentinel
+    // migration already prevents new duplicates; this is the belt-and-suspenders.
+    // The visibility predicate matches the `''` sentinel, this session, AND legacy
+    // NULL (an un-migrated row) so nothing silently disappears pre-migration.
     let mut stmt = conn.prepare(
-        "SELECT name, content, priority, placement, owner, scope
-           FROM context_blocks
-          WHERE placement = 'system'
-            AND owner IN (?1, ?2)
-            AND (session_id IS NULL OR session_id = ?3)
-          ORDER BY priority ASC, name ASC, id ASC",
+        "SELECT name, content, priority, placement, owner, scope FROM (
+           SELECT id, name, content, priority, placement, owner, scope,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY scope, owner, session_id, run_id, name
+                    ORDER BY id DESC
+                  ) AS rn
+             FROM context_blocks
+            WHERE placement = 'system'
+              AND owner IN (?1, ?2)
+              AND (session_id = '' OR session_id IS NULL OR session_id = ?3)
+         ) WHERE rn = 1
+         ORDER BY priority ASC, name ASC, id ASC",
     )?;
     let rows = stmt.query_map(params![prof.agent, prof.owner, session], |r| {
         Ok((
@@ -160,13 +173,20 @@ pub fn load_session_blocks(
     owner: &str,
     session: &str,
 ) -> Result<Vec<LoadedBlock>> {
+    // Dedup-on-read guard (storage-hardening M2) — see `load_system_blocks`.
     let mut stmt = conn.prepare(
-        "SELECT name, content, priority, placement, owner, scope
-           FROM context_blocks
-          WHERE placement = 'system'
-            AND owner = ?1
-            AND (session_id IS NULL OR session_id = ?2)
-          ORDER BY priority ASC, name ASC, id ASC",
+        "SELECT name, content, priority, placement, owner, scope FROM (
+           SELECT id, name, content, priority, placement, owner, scope,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY scope, owner, session_id, run_id, name
+                    ORDER BY id DESC
+                  ) AS rn
+             FROM context_blocks
+            WHERE placement = 'system'
+              AND owner = ?1
+              AND (session_id = '' OR session_id IS NULL OR session_id = ?2)
+         ) WHERE rn = 1
+         ORDER BY priority ASC, name ASC, id ASC",
     )?;
     let rows = stmt.query_map(params![owner, session], |r| {
         Ok((
@@ -314,7 +334,7 @@ pub fn get_block(
             "SELECT name, content, priority, placement, owner, scope
                FROM context_blocks
               WHERE scope = ?1 AND owner = ?2
-                AND session_id IS ?3 AND run_id IS ?4 AND name = ?5",
+                AND session_id = ?3 AND run_id = ?4 AND name = ?5",
             params![scope_str(&block.scope), block.owner, sid, rid, block.name],
             |r| {
                 Ok(LoadedBlock {
@@ -347,7 +367,7 @@ fn exists(
     let (sid, rid) = scope_binding(&block.scope, session, run);
     let n: i64 = conn.query_row(
         "SELECT count(*) FROM context_blocks
-          WHERE scope = ?1 AND owner = ?2 AND session_id IS ?3 AND run_id IS ?4 AND name = ?5",
+          WHERE scope = ?1 AND owner = ?2 AND session_id = ?3 AND run_id = ?4 AND name = ?5",
         params![scope_str(&block.scope), block.owner, sid, rid, block.name],
         |r| r.get(0),
     )?;
@@ -376,41 +396,32 @@ pub fn upsert_block(
 ) -> Result<BuildAction> {
     block.validate()?;
     let (sid, rid) = scope_binding(&block.scope, session, run);
-    let before = get_block(conn, block, session, run)?;
     let sha = block.content_sha256();
     let meta_json = serde_json::to_string(&block.meta).unwrap_or_else(|_| "{}".into());
-    // NOTE: a plain `ON CONFLICT(scope, owner, session_id, run_id, name)` does
-    // NOT fire for agent/global-scope rows, because SQLite treats NULL as
-    // DISTINCT in a UNIQUE index — the unbound session_id/run_id are NULL, so two
-    // "same key" writes would each insert a fresh row. We therefore resolve the
-    // upsert by hand against the same `IS`-comparison key get_block/exists use:
-    // UPDATE the existing row, else INSERT. (Last-writer-wins per key.)
-    if before.is_some() {
-        conn.execute(
-            "UPDATE context_blocks SET
-               placement = ?6, priority = ?7, package = ?8, content = ?9,
-               content_sha256 = ?10, meta = ?11,
-               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE scope = ?1 AND owner = ?2 AND session_id IS ?3 AND run_id IS ?4 AND name = ?5",
-            params![
-                scope_str(&block.scope),
-                block.owner,
-                sid,
-                rid,
-                block.name,
-                placement_str(&block.placement),
-                block.priority,
-                block.package,
-                block.content,
-                sha,
-                meta_json,
-            ],
-        )?;
-    } else {
+    // One `BEGIN IMMEDIATE` transaction (storage-hardening M1): the sentinel
+    // binding (`''` not NULL for unbound session_id/run_id, see `scope_binding`)
+    // makes the `UNIQUE(scope, owner, session_id, run_id, name)` constraint fire,
+    // so the upsert is one native `INSERT … ON CONFLICT … DO UPDATE` — atomic in
+    // the engine, no read-then-branch TOCTOU window. IMMEDIATE takes the write
+    // lock up front so concurrent writers to the same key serialize (busy_timeout
+    // absorbs the wait) rather than racing. The `before` read and the
+    // `context_build_log` row commit in the SAME transaction, so a crash between
+    // the write and its log leaves neither.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<BuildAction> {
+        let before = get_block(conn, block, session, run)?;
         conn.execute(
             "INSERT INTO context_blocks
                (scope, owner, session_id, run_id, name, placement, priority, package, content, content_sha256, meta)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(scope, owner, session_id, run_id, name) DO UPDATE SET
+               placement = excluded.placement,
+               priority = excluded.priority,
+               package = excluded.package,
+               content = excluded.content,
+               content_sha256 = excluded.content_sha256,
+               meta = excluded.meta,
+               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             params![
                 scope_str(&block.scope),
                 block.owner,
@@ -425,26 +436,36 @@ pub fn upsert_block(
                 meta_json,
             ],
         )?;
+        let action = if before.is_some() {
+            BuildAction::Rewrite
+        } else {
+            BuildAction::Add
+        };
+        write_build_log(
+            conn,
+            profile,
+            &block.owner,
+            session,
+            run,
+            &component_for(block),
+            &action,
+            Some(&block.name),
+            before.as_ref().map(|b| sha256_hex(b.content.as_bytes())),
+            Some(sha),
+            None,
+        )?;
+        Ok(action)
+    })();
+    match result {
+        Ok(action) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(action)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
     }
-    let action = if before.is_some() {
-        BuildAction::Rewrite
-    } else {
-        BuildAction::Add
-    };
-    write_build_log(
-        conn,
-        profile,
-        &block.owner,
-        session,
-        run,
-        &component_for(block),
-        &action,
-        Some(&block.name),
-        before.as_ref().map(|b| sha256_hex(b.content.as_bytes())),
-        Some(sha),
-        None,
-    )?;
-    Ok(action)
 }
 
 /// Remove a block (M2) and log the removal.
@@ -459,7 +480,7 @@ pub fn remove_block(
     let before = get_block(conn, block, session, run)?;
     let n = conn.execute(
         "DELETE FROM context_blocks
-          WHERE scope = ?1 AND owner = ?2 AND session_id IS ?3 AND run_id IS ?4 AND name = ?5",
+          WHERE scope = ?1 AND owner = ?2 AND session_id = ?3 AND run_id = ?4 AND name = ?5",
         params![scope_str(&block.scope), block.owner, sid, rid, block.name],
     )?;
     if let Some(b) = &before {
@@ -885,5 +906,186 @@ mod tests {
         // The same key under a different session is a different row.
         assert!(get_block(&c, &b, "s1", None).unwrap().is_some());
         assert!(get_block(&c, &b, "s2", None).unwrap().is_none());
+    }
+
+    /// A fresh root+db with the schema initialized, shareable across threads by
+    /// its path (each thread opens its OWN connection).
+    fn shared_root(tag: &str) -> Root {
+        let dir = std::env::temp_dir().join(format!(
+            "el-store-shared-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir };
+        let c = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&c).unwrap();
+        root
+    }
+
+    // storage-hardening M1 acceptance: N concurrent writers, each on its OWN
+    // connection, upsert the SAME agent-scope key. Against the old NULL-neutered
+    // UNIQUE + non-transactional read-then-branch this produced 5–10 duplicate
+    // rows; with the sentinel + native ON CONFLICT under BEGIN IMMEDIATE it must
+    // leave EXACTLY one row, its content one of the writers', and surface no
+    // error.
+    #[test]
+    fn concurrent_upsert_same_key_yields_exactly_one_row() {
+        let root = shared_root("concurrent");
+        let n = 10;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let root = root.clone();
+            handles.push(std::thread::spawn(move || -> Result<()> {
+                let c = crate::db::open(&root)?;
+                upsert_block(
+                    &c,
+                    "default",
+                    &block("identity", &format!("writer-{i}"), "lily"),
+                    "s1",
+                    None,
+                )?;
+                Ok(())
+            }));
+        }
+        for h in handles {
+            // No writer surfaced an error (busy_timeout absorbs the queueing).
+            h.join().unwrap().expect("a concurrent upsert errored");
+        }
+        let c = crate::db::open(&root).unwrap();
+        let rows: i64 = c
+            .query_row(
+                "SELECT count(*) FROM context_blocks
+                  WHERE scope='agent' AND owner='lily' AND name='identity'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "concurrent same-key writers must not duplicate");
+        let content: String = c
+            .query_row(
+                "SELECT content FROM context_blocks
+                  WHERE scope='agent' AND owner='lily' AND name='identity'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            content.starts_with("writer-"),
+            "surviving content is one writer's payload, got {content:?}"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    // storage-hardening M1 acceptance: a DB carrying hand-inserted NULL-keyed
+    // duplicates (what a pre-migration instance accumulated) heals on open —
+    // exactly one row per logical key, keeping the latest content, all
+    // session_id/run_id backfilled to the non-NULL sentinel.
+    #[test]
+    fn migration_dedupes_null_keyed_and_backfills_sentinel() {
+        let c = conn();
+        // Two agent-scope duplicates of the same logical key (NULL session/run
+        // dodges the UNIQUE index), distinct updated_at — 'new' is later.
+        c.execute(
+            "INSERT INTO context_blocks
+               (scope, owner, session_id, run_id, name, placement, priority, content, content_sha256, meta, updated_at)
+             VALUES ('agent','lily',NULL,NULL,'identity','system',0,'old',?1,'{}','2020-01-01T00:00:00.000Z')",
+            params![sha256_hex(b"old")],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO context_blocks
+               (scope, owner, session_id, run_id, name, placement, priority, content, content_sha256, meta, updated_at)
+             VALUES ('agent','lily',NULL,NULL,'identity','system',0,'new',?1,'{}','2020-01-02T00:00:00.000Z')",
+            params![sha256_hex(b"new")],
+        )
+        .unwrap();
+        // A session-scope row with a bound session but NULL run_id (the pre-fix
+        // shape for session scope) must survive and get its run_id backfilled.
+        c.execute(
+            "INSERT INTO context_blocks
+               (scope, owner, session_id, run_id, name, placement, priority, content, content_sha256, meta, updated_at)
+             VALUES ('session','lily','s1',NULL,'note','system',0,'hi',?1,'{}','2020-01-01T00:00:00.000Z')",
+            params![sha256_hex(b"hi")],
+        )
+        .unwrap();
+        let before: i64 = c
+            .query_row("SELECT count(*) FROM context_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 3, "constraint was inert for NULL-keyed rows");
+
+        // Re-running init_schema fires the sentinel migration.
+        crate::db::init_schema(&c).unwrap();
+
+        let (content, sid, rid): (String, String, String) = c
+            .query_row(
+                "SELECT content, session_id, run_id FROM context_blocks
+                  WHERE scope='agent' AND name='identity'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(content, "new", "keep-latest (greatest updated_at) wins");
+        assert_eq!(sid, "", "unbound session_id backfilled to sentinel");
+        assert_eq!(rid, "", "unbound run_id backfilled to sentinel");
+        // The session row survived and its NULL run_id became the sentinel.
+        let (srid,): (String,) = c
+            .query_row(
+                "SELECT run_id FROM context_blocks WHERE scope='session' AND name='note'",
+                [],
+                |r| Ok((r.get(0)?,)),
+            )
+            .unwrap();
+        assert_eq!(srid, "");
+        // No NULLs remain anywhere; the identity dupe collapsed to one.
+        let nulls: i64 = c
+            .query_row(
+                "SELECT count(*) FROM context_blocks WHERE session_id IS NULL OR run_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 0);
+        let total: i64 = c
+            .query_row("SELECT count(*) FROM context_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 2, "identity dupe collapsed; note survived");
+        // Idempotent: running again heals nothing.
+        crate::db::init_schema(&c).unwrap();
+        let total2: i64 = c
+            .query_row("SELECT count(*) FROM context_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total2, 2);
+    }
+
+    // storage-hardening M2 acceptance: even with two rows for the same logical
+    // key present (a pre-migration NULL-keyed duplicate a restored backup could
+    // carry), both load paths return the block exactly once, with the max-`id`
+    // (newest) content.
+    #[test]
+    fn load_paths_dedup_duplicate_logical_key() {
+        let c = conn();
+        // Two agent-scope 'identity' rows for owner 'lily', NULL-keyed so they
+        // bypass the UNIQUE constraint; the higher id carries the newer content.
+        for (content, sha) in [("first", sha256_hex(b"first")), ("second", sha256_hex(b"second"))] {
+            c.execute(
+                "INSERT INTO context_blocks
+                   (scope, owner, session_id, run_id, name, placement, priority, content, content_sha256, meta)
+                 VALUES ('agent','lily',NULL,NULL,'identity','system',0,?1,?2,'{}')",
+                params![content, sha],
+            )
+            .unwrap();
+        }
+        // load_system_blocks (profile owner = lily's agent) returns 'identity' once.
+        let sys = load_system_blocks(&c, &prof("lily", "owner"), "s1").unwrap();
+        let idents: Vec<&LoadedBlock> = sys.iter().filter(|b| b.name == "identity").collect();
+        assert_eq!(idents.len(), 1, "system load must collapse the duplicate");
+        assert_eq!(idents[0].content, "second", "max-id (newest) content wins");
+        // load_session_blocks (owner = lily) same guarantee.
+        let sess = load_session_blocks(&c, "lily", "s1").unwrap();
+        let idents2: Vec<&LoadedBlock> = sess.iter().filter(|b| b.name == "identity").collect();
+        assert_eq!(idents2.len(), 1, "session load must collapse the duplicate");
+        assert_eq!(idents2[0].content, "second");
     }
 }
