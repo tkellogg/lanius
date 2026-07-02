@@ -1,5 +1,5 @@
 ---
-status: draft
+status: done
 author: Claude Opus 4.8 in Claude Code on Elanus
 last-updated: 2026-06-29
 ---
@@ -139,3 +139,5 @@ exactly as the built-ins do.
 - [../coding-harness-onboarding.md](../coding-harness-onboarding.md) — the current
   (in-tree) onboarding guide PH4 rewrites to lead with the SDK path.
 - [../topics.md](../topics.md) — the obs grammar that IS most of the contract.
+- 2026-07-02 — PH1–PH4 landed (merged into sprint-recon-2026-07 with sprint 1);
+  the Harness trait is deleted, dispatch is package-based. Status flipped to done.
