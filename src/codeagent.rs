@@ -1405,6 +1405,248 @@ fn dirs_next_home_codex() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex"))
 }
 
+// ── MCP-on-launch: the user's native MCP servers survive isolation ────────────
+//
+// The launch deliberately isolates the user's hooks/plugins/settings
+// (`--setting-sources ''` for claude, `--pure` for opencode, an ephemeral
+// CODEX_HOME for codex) so a session does not drag in the user's global hooks or
+// plugins. That isolation used to throw the user's MCP SERVER registrations out
+// with the bathwater. An MCP server is user-authority, not elanus-authority
+// (docs: safety = audit, not restriction; no trust boundary between the user's
+// own agents) — the user configured it for this tool, so an elanus launch
+// selectively MERGES the MCP registrations back in while still excluding
+// everything else (hooks, plugins, misc settings). record-not-gate: the merged
+// server names are recorded on session/start, never approved or filtered. See
+// docs/handoffs/mcp-on-launch.md.
+
+/// Read the user's Claude Code MCP server registrations from `~/.claude.json`
+/// (its top-level `mcpServers` — the user-scope registry that `claude mcp add
+/// --scope user` writes and that `--setting-sources ''` disables; pinned live
+/// against Claude Code 2.1.198). Returns the server map exactly as Claude stores
+/// it — the same `{command,args,env,type|url}` shape `--mcp-config` consumes, so
+/// it round-trips verbatim (MCP servers are user-authority; we carry, never
+/// filter). A missing file is simply empty (the user registered nothing); an
+/// unreadable/malformed file is empty WITH a human note the caller prints to
+/// stderr — a launch NEVER fails because the user's MCP config could not be read.
+fn claude_user_mcp_servers() -> (serde_json::Map<String, Value>, Option<String>) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return (Default::default(), None);
+    };
+    let path = home.join(".claude.json");
+    if !path.exists() {
+        return (Default::default(), None);
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                Default::default(),
+                Some(format!(
+                    "[code] couldn't read your Claude MCP config ({}): {e} — \
+                     launching with no user MCP servers",
+                    path.display()
+                )),
+            )
+        }
+    };
+    let json: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                Default::default(),
+                Some(format!(
+                    "[code] couldn't parse your Claude MCP config ({}): {e} — \
+                     launching with no user MCP servers",
+                    path.display()
+                )),
+            )
+        }
+    };
+    (mcp_servers_from_json(&json, "mcpServers"), None)
+}
+
+/// Extract an MCP-registrations object at `key` from a parsed config document,
+/// tolerating absence or a non-object value (both ⇒ empty). Shared by the claude
+/// (`mcpServers`) and opencode (`mcp`) readers.
+fn mcp_servers_from_json(json: &Value, key: &str) -> serde_json::Map<String, Value> {
+    json.get(key)
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Materialize the user's Claude MCP registrations into a per-session
+/// `--mcp-config` file — the channel that composes with `--setting-sources ''`
+/// (verified live against Claude Code 2.1.198: `--setting-sources '' --mcp-config
+/// <file>` loads the server while every other user setting stays disabled).
+/// Returns the file path and the sorted server names (for the session/start
+/// record), or None when the user has no MCP servers — in which case NO
+/// `--mcp-config` is added and the launch is byte-identical to before. Any
+/// read/parse note is printed to stderr here (never a launch failure).
+fn write_claude_mcp_config(scratch: &Path) -> Result<Option<(PathBuf, Vec<String>)>> {
+    let (servers, note) = claude_user_mcp_servers();
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    if servers.is_empty() {
+        return Ok(None);
+    }
+    let mut names: Vec<String> = servers.keys().cloned().collect();
+    names.sort();
+    let path = scratch.join("mcp-config.json");
+    let doc = json!({ "mcpServers": servers });
+    std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some((path, names)))
+}
+
+/// The path to the user's opencode config, in opencode's discovery order:
+/// `$OPENCODE_CONFIG` (an explicit file), else
+/// `$XDG_CONFIG_HOME/opencode/opencode.json[c]` (default `~/.config/opencode`).
+/// None if nothing is found.
+fn opencode_user_config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("OPENCODE_CONFIG") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    for name in ["opencode.json", "opencode.jsonc"] {
+        let p = base.join("opencode").join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Strip `//` line comments and `/* … */` block comments that sit OUTSIDE JSON
+/// string literals, so opencode's JSONC config can be parsed by serde_json.
+/// String contents (including escaped quotes) are preserved verbatim.
+fn strip_jsonc_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_str {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            out.push(c);
+            i += 1;
+        } else if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Read the user's opencode MCP registrations (the config's `mcp` section — the
+/// `{name: {type,command,enabled,…}}` block that `opencode mcp add` writes).
+/// JSONC comments are stripped before parsing. Same fail-open contract as the
+/// claude reader: missing ⇒ empty; unreadable/unparseable ⇒ empty + a note.
+fn opencode_user_mcp_servers() -> (serde_json::Map<String, Value>, Option<String>) {
+    let Some(path) = opencode_user_config_path() else {
+        return (Default::default(), None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                Default::default(),
+                Some(format!(
+                    "[code] couldn't read your opencode MCP config ({}): {e} — \
+                     launching with no user MCP servers",
+                    path.display()
+                )),
+            )
+        }
+    };
+    let json: Value = match serde_json::from_str::<Value>(&strip_jsonc_comments(&text)) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                Default::default(),
+                Some(format!(
+                    "[code] couldn't parse your opencode MCP config ({}): {e} — \
+                     launching with no user MCP servers",
+                    path.display()
+                )),
+            )
+        }
+    };
+    (mcp_servers_from_json(&json, "mcp"), None)
+}
+
+/// The user's codex MCP server names, read from `$CODEX_HOME/config.toml`'s
+/// `[mcp_servers]` table (the user's real codex home, before elanus copies it into
+/// the per-session home). Codex already carries these by COPYING config.toml
+/// verbatim into the session home (`build_codex_skills_home`), so this reader is
+/// only for the session/start record — the merge itself is the copy. Fail-open:
+/// any read/parse problem yields an empty list.
+fn codex_user_mcp_server_names() -> Vec<String> {
+    let Some(home) = dirs_next_home_codex() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(home.join("config.toml")) else {
+        return Vec::new();
+    };
+    let Ok(val) = text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    val.get("mcp_servers")
+        .and_then(|v| v.as_table())
+        .map(|t| {
+            let mut n: Vec<String> = t.keys().cloned().collect();
+            n.sort();
+            n
+        })
+        .unwrap_or_default()
+}
+
+/// The names of the user's native MCP servers a launch of `tool` merges back in,
+/// for the session/start record (record-not-gate — a session's MCP capability is
+/// reconstructable from its trace; the launch never approves or filters them).
+/// Best-effort and side-effect-free: a read failure yields an empty list (the
+/// stderr note is emitted on the generating path, not here).
+fn merged_mcp_server_names(tool: &str) -> Vec<String> {
+    let mut names: Vec<String> = match tool {
+        "claude" => claude_user_mcp_servers().0.keys().cloned().collect(),
+        "opencode" => opencode_user_mcp_servers().0.keys().cloned().collect(),
+        "codex" => codex_user_mcp_server_names(),
+        _ => Vec::new(),
+    };
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Should the launch-envelope briefing be injected? Default yes; a `--no-brief`
 /// flag anywhere in the user args suppresses it (and is stripped before the args
 /// reach the tool, so it never confuses the binary). Returns the filtered args.
@@ -3145,6 +3387,10 @@ fn launch_external_harness(
         // session is uncaptured from turn one — tell the AGENT so via a briefing
         // note, so it does not confidently claim "I filed my mail" against a dark
         // trace (docs/handoffs/bus-resilience.md wonky bit 5; journey-14).
+        // MCP-on-launch (record-not-gate): the user's native MCP servers merged
+        // into this session, so a session's capabilities are reconstructable from
+        // its trace. Empty when the user configured none.
+        let mcp_merged = merged_mcp_server_names(&external.decl.name);
         let captured = publish_obs_captured(
             root,
             &principal,
@@ -3159,6 +3405,7 @@ fn launch_external_harness(
                 "model": model,
                 "effort": effort,
                 "provider": provider,
+                "mcp_merged": mcp_merged,
             }),
         );
         if !captured {
@@ -3440,6 +3687,11 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
         // delivered as a per-session plugin (the only channel that surfaces
         // skills under `--setting-sources ''` from an ephemeral path).
         let plugin_dir = build_claude_skill_plugin(&scratch, skills)?;
+        // MCP-on-launch: carry the user's native MCP registrations back in via
+        // `--mcp-config` (the one channel that composes with `--setting-sources
+        // ''`), while hooks/plugins/settings stay isolated. None when the user
+        // has no MCP servers ⇒ no flag added ⇒ byte-identical to before.
+        let mcp_config = write_claude_mcp_config(&scratch)?;
 
         // Launch the real binary with the generated, isolated config. The
         // TUI gets inherited stdio so it is a normal, fully usable session.
@@ -3455,6 +3707,10 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
                 "--plugin-dir".to_string(),
                 plugin_dir.display().to_string(),
             ];
+            if let Some((path, _)) = &mcp_config {
+                tool_args.push("--mcp-config".to_string());
+                tool_args.push(path.display().to_string());
+            }
             if let Some(brief) = &brief {
                 tool_args.push("--append-system-prompt".to_string());
                 tool_args.push(brief.to_string());
@@ -3522,6 +3778,9 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
                 .arg("")
                 .arg("--plugin-dir")
                 .arg(&plugin_dir);
+            if let Some((path, _)) = &mcp_config {
+                cmd.arg("--mcp-config").arg(path);
+            }
             // The launch-envelope briefing (M4-B): Claude Code injects it
             // out-of-band via --append-system-prompt (the system layer, after
             // the cached prefix — Appendix A), not the user message.
@@ -7947,6 +8206,80 @@ mod tests {
         // Tool hooks carry a matcher; session hooks do not.
         assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "*");
         assert!(s["hooks"]["SessionStart"][0].get("matcher").is_none());
+    }
+
+    // ── MCP-on-launch (docs/handoffs/mcp-on-launch.md) ───────────────────────
+
+    #[test]
+    fn settings_stay_hooks_only_even_with_mcp_merge() {
+        // The MCP merge rides `--mcp-config` (a separate file), NEVER the
+        // `--settings` object — so the hooks-only invariant is untouched by M2.
+        let root = Root {
+            dir: PathBuf::from("/tmp/fake-root"),
+        };
+        let s = claude_settings(Path::new("/usr/local/bin/elanus"), &root);
+        let obj = s.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
+        assert!(obj.contains_key("hooks"));
+        assert!(!obj.contains_key("mcpServers"));
+    }
+
+    #[test]
+    fn mcp_servers_from_json_tolerates_shape() {
+        // Present ⇒ carried verbatim.
+        let j = json!({ "mcpServers": { "a": { "command": "x" }, "b": { "url": "u" } } });
+        let m = mcp_servers_from_json(&j, "mcpServers");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["a"]["command"], "x");
+        // Absent key ⇒ empty (no user servers).
+        assert!(mcp_servers_from_json(&j, "mcp").is_empty());
+        // Wrong type ⇒ empty, never a panic.
+        let bad = json!({ "mcpServers": "not-an-object" });
+        assert!(mcp_servers_from_json(&bad, "mcpServers").is_empty());
+    }
+
+    #[test]
+    fn write_claude_mcp_config_none_when_no_user_servers() {
+        // No `~/.claude.json` mcpServers ⇒ None ⇒ NO `--mcp-config` flag ⇒ launch
+        // is byte-identical to before. Point HOME at an empty scratch dir.
+        let dir = std::env::temp_dir().join(format!("elanus-mcp-none-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let servers = mcp_servers_from_json(&json!({}), "mcpServers");
+        assert!(servers.is_empty());
+        // The generator writes nothing and returns None when the map is empty:
+        // exercise the file-writing half directly with an empty scratch.
+        let out = write_claude_mcp_config(&dir).unwrap();
+        // HOME in the test env may or may not carry mcpServers; assert only the
+        // structural contract: when Some, the file exists and names are sorted.
+        if let Some((path, names)) = out {
+            assert!(path.exists());
+            let mut sorted = names.clone();
+            sorted.sort();
+            assert_eq!(names, sorted);
+            let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(doc.get("mcpServers").is_some());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_jsonc_comments_preserves_strings() {
+        // Line + block comments outside strings are removed; a `//` inside a
+        // string literal (e.g. a URL) is preserved so the JSON stays valid.
+        let src = r#"{
+            // a leading comment
+            "mcp": { "s": { "url": "https://x/y" } }, /* trailing */
+            "note": "a // not-a-comment"
+        }"#;
+        let cleaned = strip_jsonc_comments(src);
+        let j: Value = serde_json::from_str(&cleaned).unwrap();
+        assert_eq!(j["mcp"]["s"]["url"], "https://x/y");
+        assert_eq!(j["note"], "a // not-a-comment");
+    }
+
+    #[test]
+    fn merged_mcp_names_unknown_tool_is_empty() {
+        assert!(merged_mcp_server_names("nope").is_empty());
     }
 
     #[test]

@@ -129,6 +129,24 @@ None of these → lifecycle brackets only ("it ran", not "what it's doing").
 - Isolate the tool from the user's global config: claude `--setting-sources ''`; codex a
   per-session `CODEX_HOME` (auth symlinked in); opencode `--pure` + `OPENCODE_CONFIG_DIR`.
   Find the tool's "use this home, not my global config" lever.
+- **MERGE the user's MCP servers back in — do NOT throw them out with the hooks/plugins.**
+  An MCP server is user-authority, not elanus-authority (safety = audit, not restriction):
+  the user configured it for this tool, so an elanus launch must not silently drop it. Carry
+  ONLY the MCP registrations; keep excluding hooks, plugins, and misc settings. Per harness
+  (verified live — docs/handoffs/mcp-on-launch.md):
+  - **claude** — the shadow is real: `--setting-sources ''` disables user/project settings
+    and `.mcp.json`. Read the user-scope registry (`~/.claude.json` → `mcpServers`) and hand
+    it back via `--mcp-config <generated-file>`, which COMPOSES with `--setting-sources ''`
+    (confirmed on Claude Code 2.1.198). The `--settings` object stays hooks-only.
+  - **codex** — NOT shadowed: `build_codex_skills_home` copies `config.toml` verbatim, so
+    `[mcp_servers]` is carried and the server LOADS. (Caveat: `codex exec` headless auto-
+    CANCELS an MCP tool call under its default approval/sandbox unless fully bypassed — a
+    codex cage-policy matter, not a config shadow; the interactive TUI approves and works.)
+  - **opencode** — NOT shadowed (on 1.17.9): `--pure` disables ONLY plugins, and
+    `OPENCODE_CONFIG_DIR` does not shadow config-file MCP — the user's `~/.config/opencode`
+    `mcp` block still loads and connects under the exact launch posture.
+  Record the merged server names on `session/start` (record-not-gate). A read/parse failure
+  degrades to no-user-MCP with ONE stderr line — never a launch failure.
 - elanus sets the session identity in your adapter's env (`ELANUS_CODE_SESSION`,
   `ELANUS_AGENT`, `ELANUS_ROOT`, `ELANUS_BUS_TOKEN`); `Ctx::from_env` reads it. A hook
   the tool spawns inherits this env and resolves the elanus session from it (never from
@@ -170,6 +188,8 @@ For the interactive TUI cell, in order:
 - [ ] Adapter: `Ctx::from_env`, launch the tool, translate events → `ctx.emit`.
 - [ ] Capture: per the decision tree (hooks / stream / served events / rollout).
 - [ ] Auth: `scrub_provider_creds`; isolate from the tool's global config.
+- [ ] MCP merge: carry the user's MCP registrations back into the session (see
+      requirement #2) and record the merged server names on `session/start`.
 - [ ] Edit-claims: `ctx.claim(path)` on every write the tool makes (this is what makes
       it sibling-aware).
 - [ ] (If skills) materialize the handed-over skills dir into the tool's skills location.
