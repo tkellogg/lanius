@@ -2883,7 +2883,9 @@ mod tests {
     // the in/human/<owner> event, so the projection has something to anchor an
     // agent-first thread on. The session travels in the payload (where
     // session_for_event reads it); this proves it lands non-null with no prior
-    // prompt to establish a correlation→session mapping.
+    // prompt to establish a correlation→session mapping. Drives the real
+    // send_message tool arm (run_tool), as send_message_records_format_on_the_ledger
+    // does, so this fails if that arm ever stops stamping the run's session.
     #[test]
     fn ambient_send_records_run_session() {
         let dir = std::env::temp_dir().join(format!("el-ambient-{}", uuid::Uuid::new_v4()));
@@ -2891,35 +2893,46 @@ mod tests {
         let root = Root { dir: dir.clone() };
         let conn = crate::db::open(&root).unwrap();
         crate::db::init_schema(&conn).unwrap();
-        let owner = "owner";
-        let topic = crate::topic::human_mailbox(owner);
+        let prof = profile::Profile::default();
+        let cage = sandbox::Cage::from_profile(&root, &prof.sandbox);
+        let pool = crate::mcp::Pool::default();
+        let topic = crate::topic::human_mailbox(&prof.owner);
 
-        // The shape the send_message handler emits: text + the run's session,
-        // no correlation (a timer-fired run has no owner turn to thread onto).
+        // A run with a session but NO preceding in/agent prompt: event_id and
+        // turn_correlation are both None, so there is nothing to establish a
+        // correlation→session mapping other than the send_message arm itself.
         let run_session = "run-ambient-01";
-        let id = emit_message(
+        let call = ToolCall {
+            call_id: "c1".to_string(),
+            fn_name: "send_message".to_string(),
+            fn_arguments: json!({ "text": "the build you asked about finished" }),
+            thought_signatures: None,
+        };
+        let mut self_emitted = HashSet::new();
+        let out = run_tool(
             &root,
             &conn,
+            &cage,
+            &prof,
+            run_session,
             None,
-            &OutboundMessage {
-                topic: topic.clone(),
-                payload: json!({ "text": "the build you asked about finished", "session": run_session }),
-                correlation: None,
-                deadline: None,
-                default_action: None,
-            },
-        )
-        .unwrap();
+            None,
+            true,
+            &call,
+            &mut self_emitted,
+            &pool,
+        );
+        assert!(matches!(out, ToolOutcome::Output(_)), "send_message yields Output");
 
-        let (etype, payload): (String, Option<String>) = conn
+        let (etype, payload): (String, String) = conn
             .query_row(
-                "SELECT type, payload FROM events WHERE id = ?1",
-                [id],
+                "SELECT type, payload FROM events WHERE type = ?1 ORDER BY id DESC LIMIT 1",
+                [&topic],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(etype, topic, "an ambient send lands on the owner mailbox");
-        let payload: Value = serde_json::from_str(&payload.expect("payload present")).unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(
             payload.get("session").and_then(Value::as_str),
             Some(run_session),
