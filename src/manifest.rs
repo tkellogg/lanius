@@ -406,6 +406,23 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
     // (relative path + contents, so a rename is also a change). A missing
     // script hashes as its path + a sentinel — its later appearance is itself
     // a code change that re-prompts.
+    //
+    // Harness adapters (`[[harness]] run`) are folded in ONLY when the
+    // manifest requests authority. code_hash exists to gate GRANT carry-over
+    // (see packages.rs): a capability request re-enters review when its
+    // authorizing code changes. A grant-less harness package has no stored
+    // grant row to protect, so hashing its adapter buys nothing — and costs
+    // everything: the stock adapters are multi-megabyte kernel-seeded copies
+    // of the elanus binary, so reading + SHA-256'ing them on every
+    // `packages`/discover made each CLI shell-out (and the web relay that
+    // fans several out) take seconds. A harness package that DOES declare
+    // [[request]] keeps the swap-detaches-grants property in full. Either
+    // way the `[[harness]]` declaration rides the manifest bytes in `hash`
+    // below, so a manifest edit still detaches. (regression fix)
+    let requests_authority = !(m.request.subscribe.is_empty()
+        && m.request.publish.is_empty()
+        && m.request.blocking.is_empty()
+        && m.request.fs_write.is_empty());
     let mut runs: Vec<String> = Vec::new();
     if let Some(p) = &m.process {
         runs.push(p.run.clone());
@@ -414,7 +431,9 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
     runs.extend(m.provider.iter().map(|p| p.run.clone()));
     runs.extend(m.stage.iter().map(|s| s.run.clone()));
     runs.extend(m.mcp.iter().map(|s| s.run.clone()));
-    runs.extend(m.harness.iter().map(|h| h.run.clone()));
+    if requests_authority {
+        runs.extend(m.harness.iter().map(|h| h.run.clone()));
+    }
     runs.sort();
     runs.dedup();
     let mut code = Sha256::new();
@@ -591,6 +610,73 @@ run  = "scripts/echo"
         assert_ne!(
             before, after,
             "editing the run script must change the grant hash"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn harness_adapter_bytes_are_not_hashed() {
+        // Regression: a `[[harness]] run` is a multi-megabyte kernel-seeded
+        // adapter binary and carries no grants, so its contents must NOT be
+        // folded into code_hash — doing so read + SHA-256'd the whole binary on
+        // every discover, stalling every CLI shell-out (and the web relay) by
+        // seconds. Proof: mutating the adapter file leaves both hashes fixed,
+        // which means load() never read it.
+        let dir =
+            std::env::temp_dir().join(format!("el-man-harness-nohash-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join("elanus.toml"),
+            "[[harness]]\nname = \"claude\"\nrun = \"bin/adapter\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("bin/adapter"), vec![0u8; 4 * 1024 * 1024]).unwrap();
+        let before = load(&dir).unwrap().unwrap();
+        // Swap the adapter's bytes entirely.
+        std::fs::write(dir.join("bin/adapter"), vec![1u8; 4 * 1024 * 1024]).unwrap();
+        let after = load(&dir).unwrap().unwrap();
+        assert_eq!(
+            before.code_hash, after.code_hash,
+            "harness adapter contents must not enter code_hash"
+        );
+        assert_eq!(
+            before.hash, after.hash,
+            "harness adapter contents must not enter the full manifest hash"
+        );
+        // A manifest edit still detaches (the declaration rides `raw`).
+        std::fs::write(
+            dir.join("elanus.toml"),
+            "[[harness]]\nname = \"codex\"\nrun = \"bin/adapter\"\n",
+        )
+        .unwrap();
+        let edited = load(&dir).unwrap().unwrap();
+        assert_ne!(before.hash, edited.hash, "a manifest edit must still detach");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn harness_adapter_is_hashed_when_the_package_requests_authority() {
+        // The other side of the conditional: a harness package that DECLARES a
+        // capability request keeps the swap-detaches-grants property — its
+        // adapter bytes DO enter code_hash, so swapping the binary re-gates
+        // any carried grants (the entry-19-style class).
+        let dir =
+            std::env::temp_dir().join(format!("el-man-harness-hash-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join("elanus.toml"),
+            "[request]\npublish = [\"obs/agent/#\"]\n\n[[harness]]\nname = \"gemini\"\nrun = \"bin/adapter\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("bin/adapter"), b"v1").unwrap();
+        let before = load(&dir).unwrap().unwrap();
+        std::fs::write(dir.join("bin/adapter"), b"v2").unwrap();
+        let after = load(&dir).unwrap().unwrap();
+        assert_ne!(
+            before.code_hash, after.code_hash,
+            "an authority-requesting harness package must re-gate on adapter swap"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
