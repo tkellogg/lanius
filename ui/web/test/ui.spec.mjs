@@ -1777,6 +1777,147 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
+// ── flow 6i: chat-follow — the feed follows the latest message, pin/unpin ─────
+// docs/handoffs/chat-follow.md M1. A classic chat contract: pinned to the
+// bottom by default, a deliberate scroll up unpins and shows a "new messages ↓"
+// chip, scrolling back down (by hand or via the chip) re-pins — all derived
+// from scroll POSITION (wonky bit 2, no suppress flag), keyed on the last
+// message id so an SSE reconnect replay can't yank the scroll (wonky bit 3).
+{
+  const scrollAgent = 'scroller';
+  const session = `web-${scrollAgent}-${Date.now().toString(36)}`;
+  const emitAs = (actor, ...a) =>
+    execFileSync(path.join(BIN, 'elanus'), a, { env: { ...ENV, ELANUS_ACTOR: actor }, encoding: 'utf8' });
+  const seedTurn = (n) => {
+    const corr = `scroll-${n}-${Date.now().toString(36)}`;
+    emitAs('owner', 'emit', `in/agent/${scrollAgent}`, '--correlation', corr, '--payload',
+      JSON.stringify({ prompt: `owner line ${n}: filling the feed so it scrolls, lorem ipsum dolor sit amet.`, session }));
+    emitAs(scrollAgent, 'emit', 'in/human/owner', '--correlation', corr, '--payload',
+      JSON.stringify({ text: `${scrollAgent} reply ${n}: acknowledged, still talking to fill the feed out.`, session }));
+  };
+
+  const seedPage = await newPage();
+  await seedPage.goto('/');
+  const created = await seedPage.evaluate(async (name) => {
+    const r = await fetch('/api/admin/agents', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return r.json().catch(() => ({}));
+  }, scrollAgent);
+  created.ok ? ok(`scroll: created agent ${scrollAgent}`) : fail(`scroll: could not create ${scrollAgent} (${JSON.stringify(created)})`);
+  await seedPage.close();
+
+  for (let n = 1; n <= 14; n++) seedTurn(n);
+
+  // A short viewport keeps the seeded feed reliably taller than the visible
+  // .conv-feed without needing hundreds of seeded turns.
+  const page = await newPage();
+  await page.setViewportSize({ width: 1100, height: 420 });
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+  await waitFor(`scroll: ${scrollAgent} in nav`, async () => {
+    const items = await page.$$('#nav-agents .nav-agent');
+    for (const item of items) {
+      if ((await item.getAttribute('data-sel')) === `agent:${scrollAgent}`) { await item.click(); return true; }
+    }
+    return false;
+  }, 10000);
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  await waitFor('scroll: seeded conversation opens with enough messages to scroll', async () => {
+    const rows = await page.$$('#nav-agents .nav-conversation');
+    for (const row of rows) {
+      const txt = (await row.textContent()) || '';
+      if (txt.includes('owner line 1:')) { await row.click(); return true; }
+    }
+    return false;
+  }, 10000);
+  await waitFor('scroll: the feed is tall enough to actually scroll', async () =>
+    page.$eval('.conv-feed', (el) => el.scrollHeight > el.clientHeight + 40), 8000);
+
+  const feedMetrics = () => page.$eval('.conv-feed', (el) => ({
+    scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight,
+  }));
+  const atBottom = (m) => m.scrollHeight - m.scrollTop - m.clientHeight < 40;
+  const scrollFeedTo = (top) => page.$eval('.conv-feed', (el, t) => { el.scrollTop = t; el.dispatchEvent(new Event('scroll')); }, top);
+
+  // (a) starting at the bottom (pinned by default), a new live message keeps
+  // the feed scrolled to the bottom.
+  await waitFor('scroll: starts pinned at the bottom', async () => atBottom(await feedMetrics()), 5000);
+  seedTurn(15);
+  await waitFor('scroll: (a) a new message while pinned keeps the feed at the bottom', async () => {
+    const t = await page.$eval('#conv-holder', (el) => el.textContent);
+    return t.includes('owner line 15:') && atBottom(await feedMetrics());
+  }, 8000);
+  !(await page.$('[data-sel="conv-jump"]'))
+    ? ok('scroll: the jump chip is hidden while pinned')
+    : fail('scroll: the jump chip showed while still pinned');
+
+  // (b) scroll up deliberately, then a new message must NOT move the scroll,
+  // and the jump chip appears.
+  await scrollFeedTo(0);
+  await waitFor('scroll: (b) scrolling up unpins', async () => !!(await page.$('[data-sel="conv-jump"]')), 5000);
+  const beforeMetrics = await feedMetrics();
+  seedTurn(16);
+  await waitFor('scroll: (b) the new message landed in the feed', async () =>
+    (await page.$eval('#conv-holder', (el) => el.textContent)).includes('owner line 16:'), 8000);
+  const afterMetrics = await feedMetrics();
+  Math.abs(afterMetrics.scrollTop - beforeMetrics.scrollTop) < 5
+    ? ok('scroll: (b) an unpinned scroll position does not move on a new message')
+    : fail(`scroll: (b) scroll moved while unpinned (${beforeMetrics.scrollTop} -> ${afterMetrics.scrollTop})`);
+  (await page.$('[data-sel="conv-jump"]'))
+    ? ok('scroll: (b) the "new messages ↓" chip appears while unpinned')
+    : fail('scroll: (b) the jump chip did not appear while unpinned');
+
+  // (c) clicking the chip lands at the bottom, hides the chip, and a further
+  // message keeps it pinned.
+  await page.click('[data-sel="conv-jump"]');
+  await waitFor('scroll: (c) clicking the chip returns to the bottom', async () => atBottom(await feedMetrics()), 5000);
+  !(await page.$('[data-sel="conv-jump"]'))
+    ? ok('scroll: (c) the chip disappears after returning to the bottom')
+    : fail('scroll: (c) the chip is still present after clicking it');
+  seedTurn(17);
+  await waitFor('scroll: (c) a further message stays pinned', async () => {
+    const t = await page.$eval('#conv-holder', (el) => el.textContent);
+    return t.includes('owner line 17:') && atBottom(await feedMetrics());
+  }, 8000);
+
+  // (d) manually scrolling back to the bottom (no chip click) also re-pins.
+  await scrollFeedTo(0);
+  await waitFor('scroll: (d) scrolled away unpins again', async () => !!(await page.$('[data-sel="conv-jump"]')), 5000);
+  await page.$eval('.conv-feed', (el) => { el.scrollTop = el.scrollHeight; el.dispatchEvent(new Event('scroll')); });
+  await waitFor('scroll: (d) manually returning to the bottom re-pins (chip hides)', async () => !(await page.$('[data-sel="conv-jump"]')), 5000);
+  seedTurn(18);
+  await waitFor('scroll: (d) after a manual re-pin, a further message still follows', async () => {
+    const t = await page.$eval('#conv-holder', (el) => el.textContent);
+    return t.includes('owner line 18:') && atBottom(await feedMetrics());
+  }, 8000);
+
+  // (e) a branched conversation opens pinned at the bottom, and the origin
+  // chip (sprint-2 reply-branching) still renders above the feed — pinning
+  // must not break it.
+  await scrollFeedTo(0);
+  await waitFor('scroll: (e) unpinned ahead of the branch', async () => !!(await page.$('[data-sel="conv-jump"]')), 5000);
+  await waitFor('scroll: (e) reply affordance forks a new thread', async () => {
+    const msgs = await page.$$('#conv-holder .msg');
+    for (const el of msgs) {
+      const t = (await el.textContent()) || '';
+      if (t.includes('owner line 1:')) {
+        const btn = await el.$('[data-sel="msg-reply"]');
+        if (btn) { await btn.click(); return true; }
+      }
+    }
+    return false;
+  }, 8000);
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  await waitFor('scroll: (e) the branch opens pinned at the bottom', async () => atBottom(await feedMetrics()), 8000);
+  (await page.$('[data-sel="conv-origin"]'))
+    ? ok('scroll: (e) the branch origin chip still renders above the feed')
+    : fail('scroll: (e) the branch origin chip is missing after the reply-branch switch');
+
+  await page.close();
+}
+
 // ── flow 7: history works out of the box ──────────────────────────────────────
 // history is stdlib, on at init, so the sessions tab is backed
 // by the real transcript view — NOT the unavailable-transcripts note —
@@ -2313,6 +2454,34 @@ const renamedAgent = 'falcon';
     ok('providers: the link navigates to the Providers page');
   } else {
     fail('providers: the "set up a provider →" link is missing from the empty model field');
+  }
+
+  // -- the configure-view ModelField gets the same "set up a provider →" link --
+  // chat-follow M2 (verify-only): model-providers M4 wired the link into BOTH
+  // ModelField call sites (App.tsx:1643 new-agent, App.tsx:2005 configure) —
+  // primitives.tsx:85-96 renders it in the same empty-list branch either way.
+  // Only the new-agent instance was previously asserted (above); this closes
+  // the configure-view gap. A separate page/tab so clicking it (which
+  // navigates to the Providers page) doesn't disturb the configure flow below.
+  {
+    const linkPage = await newPage();
+    await linkPage.goto('/');
+    await linkPage.waitForSelector('#nav-agents .nav-item');
+    await linkPage.click('#nav-agents .nav-item');
+    await linkPage.waitForSelector('#agent-tabs', { state: 'visible' });
+    await linkPage.click('[data-tab="configure"]');
+    await linkPage.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
+    await waitForConfigureLoaded(linkPage);
+    const cfgLink = await linkPage.$('#view-configure [data-providers-link]');
+    if (cfgLink) {
+      ok('providers: the configure-view model field also shows the "set up a provider →" link');
+      await cfgLink.click();
+      await linkPage.waitForSelector('#view-providers', { timeout: 5000 });
+      ok('providers: the configure-view link also navigates to the Providers page');
+    } else {
+      fail('providers: the configure-view model field is missing the "set up a provider →" link in its empty-list state');
+    }
+    await linkPage.close();
   }
 
   // -- the no-warning-for-native fix in an agent's configure provider section --

@@ -2326,6 +2326,31 @@ function KitAddRow({ kit, cfgForm, cfgPackages, detail, loadKitDetail, installKi
 
 function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation, startBranch, branchOrigin, selectCodeSessions, isTraceAgent, sendLabel, allowHtml }: any) {
   const [conversationSearch, setConversationSearch] = useState('');
+  // chat-follow M1: "pinned" is derived from scroll position, never a suppress
+  // flag (docs/handoffs/chat-follow.md wonky bit 2) — a programmatic scroll-to-
+  // bottom always lands within tolerance, so the scroll listener re-deriving
+  // pinned from position can't misread our own scroll as "the user scrolled up".
+  const feedRef = useRef<HTMLDivElement>(null);
+  const [pinned, setPinned] = useState(true);
+  const AT_BOTTOM_TOLERANCE = 40;
+  const isAtBottom = (el: HTMLDivElement) => el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_TOLERANCE;
+  const scrollToBottom = () => { const el = feedRef.current; if (el) el.scrollTop = el.scrollHeight; };
+  useEffect(() => {
+    const el = feedRef.current;
+    if (!el) return;
+    const onScroll = () => setPinned(isAtBottom(el));
+    el.addEventListener('scroll', onScroll);
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
+  // Switching conversations (a different agent, a different session, or a
+  // fresh branch) always resets to pinned-at-bottom — no per-conversation
+  // scroll memory (wonky bit 4, a stated non-goal).
+  useEffect(() => { scrollToBottom(); setPinned(true); }, [agent, current]);
+  // Keyed on the last message's id (wonky bit 3), not on every render: an SSE
+  // reconnect replay that merges to the same last message must not yank the
+  // scroll of someone who scrolled up to read history.
+  const lastMessageId = messages.length ? messages[messages.length - 1].id : null;
+  useEffect(() => { if (pinned) scrollToBottom(); }, [lastMessageId, pinned]);
   const allConversations = conversations?.list ?? [];
   const query = conversationSearch.trim().toLowerCase();
   const resultConversations = query
@@ -2404,10 +2429,11 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
             {branchOrigin.session && <button type="button" className="origin-link ghost" data-sel="conv-origin-link" onClick={() => openConversation(agent, branchOrigin.session)}>view the original conversation ⟶</button>}
           </div>
         )}
-        <div className="conv-feed" role="log" aria-live="polite" aria-label={`conversation with ${agent}`}>
+        <div ref={feedRef} className="conv-feed" role="log" aria-live="polite" aria-label={`conversation with ${agent}`}>
           {!messages.length && !branchOrigin && <div className="conv-empty"><p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p><p>Start a conversation with {agent}. Replies and asks stay in this thread.</p></div>}
           {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} allowHtml={allowHtml} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `conversation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span>{!m.failed && startBranch && <button type="button" className="msg-reply" data-sel="msg-reply" title="reply — branches a new conversation" onClick={() => startBranch(agent, m)}>↳ reply</button>}</div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : <Markdown text={String(m.text ?? '')} allowHtml={allowHtml} format={m.format} />}</div></div>)}
         </div>
+        {!pinned && <button type="button" className="conv-jump" data-sel="conv-jump" onClick={() => { scrollToBottom(); setPinned(true); }}>new messages ↓</button>}
       </div>
       <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><IconButton type="submit" id="compose-send" label={sendLabel} className="compose-send">➤</IconButton></form>
     </div>
