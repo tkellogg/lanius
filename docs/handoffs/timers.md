@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -214,3 +214,6 @@ replyably.
   authorization at schedule-time not fire-time (3); bus primitive for daemon agents
   + OS fallbacks for coding workers (4); the self-wake carries a prompt and acts,
   rather than a text-only shortcut that skips the turn (5).
+- 2026-07-02 — All milestones implemented and adversarially verified (Opus
+  impl/verify under Fable orchestration); landed on sprint-recon-2026-07.
+  Status flipped to done.

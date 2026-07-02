@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -164,3 +164,6 @@ reads trust in a second place (grep confirms only `platform` computes it).
   Fable: composition over a new computed block (1); `trust===full` stays the sole
   rendering gate, `format` is intent only (2); default-markdown keeps inline-HTML
   small touches while `format="html"` is whole-body (3).
+- 2026-07-02 — All milestones implemented and adversarially verified (Opus
+  impl/verify under Fable orchestration); landed on sprint-recon-2026-07.
+  Status flipped to done.

@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -167,3 +167,6 @@ server-computed posture (no re-implemented mapping in the client).
   existing single write path untouched (1); surface the keys + a per-agent posture
   on `profile get`, factoring the product-word mapping to one place (2, 3); keep the
   allow-list hidden + loud + un-"fixed" per single-cage's deliberate stance (4).
+- 2026-07-02 — All milestones implemented and adversarially verified (Opus
+  impl/verify under Fable orchestration); landed on sprint-recon-2026-07.
+  Status flipped to done.

@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -160,3 +160,6 @@ staleness note in memory).
   ledger field for graph reconstruction (1); kernel composes the agent-visible
   quote so the ledger stays structured (2); flat "branched from" subtitle over a
   nested tree this increment (3).
+- 2026-07-02 — All milestones implemented and adversarially verified (Opus
+  impl/verify under Fable orchestration); landed on sprint-recon-2026-07.
+  Status flipped to done.
