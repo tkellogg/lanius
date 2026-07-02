@@ -286,6 +286,16 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         content: include_str!("../kits/stdlib/packages/history/SKILL.md"),
         exec: false,
     },
+    PkgFile {
+        rel: "stdlib/packages/launching-agents/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/launching-agents/SKILL.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/explain-session/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/explain-session/SKILL.md"),
+        exec: false,
+    },
 ];
 
 const PROFILE_TOML: &str = include_str!("../templates/profile.toml");

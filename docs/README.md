@@ -103,8 +103,23 @@ that layer.
 - Web product and QA flows: [ui/web/src/App.tsx](../ui/web/src/App.tsx),
   [ui/web/server.mjs](../ui/web/server.mjs), and
   [ui/web/test/ui.spec.mjs](../ui/web/test/ui.spec.mjs).
-- Agent and profile CLIs: [src/agentcli.rs](../src/agentcli.rs) (`elanus agent`) and
-  [src/profilecli.rs](../src/profilecli.rs) (`elanus profile`).
+- Launching agents (agents launch agents, first-class):
+  [src/agentcli.rs](../src/agentcli.rs) is `elanus agent` — `elanus agent catalog`
+  inventories what you can launch (native profiles + the packages visible to each,
+  coding tools, providers; `--json` for a machine-readable pick), `elanus agent run`
+  executes a turn in the foreground (any profile, blocking), and `elanus agent spawn`
+  queues a durable background turn on the profile's mailbox (async — needs an approved exec handler,
+  i.e. `spawn-ready` in the catalog). Both `run` and `spawn` take launch-time
+  overrides that apply to that run only, leaving `profile.toml` untouched:
+  `--with-package <name>` widens the run's *visible* packages to an already-approved
+  package (visibility, never authority — the grants ledger still gates bus actions),
+  and `--provider <name>` pins the model provider. A **native** agent launches a
+  peer with the `launch_agent` tool ([src/exec.rs](../src/exec.rs); a raw
+  `emit_event` to another mailbox is refused, so this is the sanctioned door); a
+  **coding** worker shells out via `elanus code` (see below). The `launching-agents`
+  and `explain-session` skills in [kits/stdlib/](../kits/stdlib/) teach the how-to.
+  See [handoffs/agent-launching.md](handoffs/agent-launching.md).
+- Profile CLI: [src/profilecli.rs](../src/profilecli.rs) (`elanus profile`).
 - Example kits and packages: [kits/funnel/](../kits/funnel/),
   [kits/memory-blocks-demo/](../kits/memory-blocks-demo/), and
   [packages/triage-demo/](../packages/triage-demo/).
