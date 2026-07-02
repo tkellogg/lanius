@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -199,3 +199,12 @@ line so future adapters inherit the contract.
   verify-then-document, not build (3); universal any-time wake declared
   out of scope with reasons (4); the kill matrix distinguishes
   harness-child death from wrapper death (5).
+- 2026-07-02 — Implemented + verified (Opus impl / Opus xhigh verify, PASS
+  round 1). Live e2e per harness used the echo external-harness proxy (real
+  tools need credentials this sandbox lacks) — faithful because death and
+  wake ride the single launch_external_harness/resume_capture path all
+  harnesses share. The verifier proved the reaper live: real daemon, killed
+  pid, exactly one structured failure mail, idempotent on rerun. Residuals
+  logged: tiny claim-then-mail lost-completion window (strict improvement,
+  optional reconcile later); settled edges unpruned (matches existing
+  conventions).

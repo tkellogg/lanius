@@ -1108,6 +1108,144 @@ pub fn bump_last_active(root: &Root, session: &str) -> Result<()> {
     touch_record(root, session)
 }
 
+// ── Detached-spawn edges (cross-harness-death M1/M2) ──────────────────────────
+//
+// A durable record of an `elanus code spawn` detached worker: who it must report
+// to, the correlation the completion threads on, and its wrapper pid. The worker's
+// own completion (`emit_completion_delivery`) and the daemon reaper
+// (`reap_dead_spawn_edges`) both CLAIM the edge before mailing — an atomic
+// `UPDATE ... WHERE settled_at IS NULL` — so whichever fires first is the sole
+// producer of the spawner's completion mail; the loser sees 0 rows and stays
+// silent. This is the idempotency that makes a slow-worker/reaper race safe.
+
+/// A detached spawn edge that has not yet reported a completion.
+#[derive(Debug, Clone)]
+pub struct SpawnEdge {
+    pub worker_session: String,
+    pub spawner: String,
+    pub correlation: Option<String>,
+    pub worker_pid: i32,
+}
+
+/// The outcome of trying to claim a spawn edge's settle. `Claimed` means THIS
+/// caller won and must produce the completion mail; `AlreadySettled` means the
+/// other producer beat it (stay silent); `NoEdge` means no edge was recorded (a
+/// legacy/non-spawn completion — the caller mails unconditionally, there is no
+/// reaper to double it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleClaim {
+    Claimed,
+    AlreadySettled,
+    NoEdge,
+}
+
+/// Record the durable spawn edge for a detached worker, before it is left to run.
+/// Idempotent on the worker session (a re-record replaces the row) — the worker
+/// session is minted unique per spawn, so this only ever writes one live edge.
+pub fn record_spawn_edge(
+    root: &Root,
+    worker_session: &str,
+    spawner: &str,
+    correlation: Option<&str>,
+    worker_pid: i32,
+) -> Result<()> {
+    let conn = crate::db::open(root).context("opening the ledger to record a spawn edge")?;
+    crate::db::init_schema(&conn)?;
+    conn.execute(
+        "INSERT INTO code_spawn_edges (worker_session, spawner, correlation, worker_pid)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(worker_session) DO UPDATE SET
+           spawner = excluded.spawner,
+           correlation = excluded.correlation,
+           worker_pid = excluded.worker_pid,
+           settled_at = NULL",
+        rusqlite::params![worker_session, spawner, correlation, worker_pid],
+    )?;
+    Ok(())
+}
+
+/// Atomically claim a spawn edge's settle (the worker's own completion path).
+/// Opens its own connection (the worker wrapper has no daemon connection). Returns
+/// `NoEdge` when no edge is recorded (the caller mails unconditionally).
+pub fn claim_spawn_edge(root: &Root, worker_session: &str) -> SettleClaim {
+    let Ok(conn) = crate::db::open(root) else {
+        return SettleClaim::NoEdge;
+    };
+    if crate::db::init_schema(&conn).is_err() {
+        return SettleClaim::NoEdge;
+    }
+    claim_spawn_edge_on(&conn, worker_session).unwrap_or(SettleClaim::NoEdge)
+}
+
+/// The connection-level claim, shared by the worker path and the daemon reaper.
+pub fn claim_spawn_edge_on(conn: &rusqlite::Connection, worker_session: &str) -> Result<SettleClaim> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM code_spawn_edges WHERE worker_session = ?1",
+            [worker_session],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !exists {
+        return Ok(SettleClaim::NoEdge);
+    }
+    let n = conn.execute(
+        "UPDATE code_spawn_edges
+            SET settled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE worker_session = ?1 AND settled_at IS NULL",
+        [worker_session],
+    )?;
+    Ok(if n == 1 {
+        SettleClaim::Claimed
+    } else {
+        SettleClaim::AlreadySettled
+    })
+}
+
+/// Release a claimed settle back to unclaimed — used when the claimer WON the
+/// claim but then failed to mail the completion, so the fallback producer (the
+/// reaper, next tick) can retry rather than the completion being lost.
+pub fn unclaim_spawn_edge(root: &Root, worker_session: &str) {
+    if let Ok(conn) = crate::db::open(root) {
+        let _ = conn.execute(
+            "UPDATE code_spawn_edges SET settled_at = NULL WHERE worker_session = ?1",
+            [worker_session],
+        );
+    }
+}
+
+/// The unsettled spawn edges whose wrapper pid is dead — reap candidates for the
+/// daemon sweep. Liveness uses the same signal-0 probe as every other reaper
+/// (`pid_alive`, EPERM-as-alive), so a live cross-uid worker is never wrongly
+/// reaped. The caller must still CLAIM each (via `claim_spawn_edge_on`) before
+/// mailing, so it races safely with a worker finishing in the same tick.
+pub fn dead_unsettled_spawn_edges(conn: &rusqlite::Connection) -> Vec<SpawnEdge> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT worker_session, spawner, correlation, worker_pid
+           FROM code_spawn_edges WHERE settled_at IS NULL",
+    ) else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok(SpawnEdge {
+            worker_session: r.get(0)?,
+            spawner: r.get(1)?,
+            correlation: r.get::<_, Option<String>>(2)?,
+            worker_pid: r.get(3)?,
+        })
+    }) else {
+        return out;
+    };
+    for edge in rows.filter_map(|r| r.ok()) {
+        if !pid_alive(edge.worker_pid) {
+            out.push(edge);
+        }
+    }
+    out
+}
+
 /// The session-id prefix that marks a coding-session actor everywhere (CONNECT
 /// resolution, ACL, reaping). A principal name starting with this is resolved
 /// through this module, never the full-authority fenced-secret path.

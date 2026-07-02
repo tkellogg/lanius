@@ -537,6 +537,28 @@ CREATE TABLE IF NOT EXISTS code_session_tasks (
   PRIMARY KEY (elanus_session, item_id)
 );
 CREATE INDEX IF NOT EXISTS idx_code_session_tasks_session ON code_session_tasks(elanus_session);
+
+-- Detached-spawn edge (cross-harness-death M1/M2). `elanus code spawn <tool>` fires
+-- a DETACHED, unparented worker process (src/codeagent.rs `spawn`): nothing can
+-- `wait()` on it, so a worker whose WRAPPER is SIGKILL'd before it mails its
+-- completion would leave the spawner hung forever (the driven path's
+-- `reconcile_lost_routes` only covers `code_delivery_keys`, never the detached
+-- path). This row is the durable footprint of a detached spawn — the spawner it
+-- must report to, the correlation the completion threads on, and the wrapper pid —
+-- so the daemon's `reap_dead_spawn_edges` sweep can notice a dead wrapper that
+-- never reported and synthesize the same `{failed:true}` failure-mail the worker
+-- would have sent. `settled_at` is claimed ATOMICALLY (UPDATE ... WHERE settled_at
+-- IS NULL) by whichever of {the worker's own completion, the reaper} wins the race,
+-- so the spawner is mailed EXACTLY ONCE even when a slow worker and the reaper
+-- overlap. Keyed by the worker session (unique per spawn).
+CREATE TABLE IF NOT EXISTS code_spawn_edges (
+  worker_session TEXT PRIMARY KEY,   -- the detached worker's session (code-<id>)
+  spawner        TEXT NOT NULL,       -- the reply_to actor the completion is mailed to
+  correlation    TEXT,                -- the spawn correlation the completion threads on
+  worker_pid     INTEGER NOT NULL,    -- the detached wrapper pid; dead + unsettled → reaped
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  settled_at     TEXT                 -- set once (worker completion OR reaper); NULL = live
+);
 "#,
     )?;
     // M5: the room a coding session belongs to, stored on the durable record so a

@@ -76,6 +76,14 @@ use std::path::{Path, PathBuf};
 pub const ENV_SESSION: &str = "ELANUS_CODE_SESSION";
 pub const ENV_AGENT: &str = "ELANUS_CODE_AGENT";
 
+/// Set on the child when the launcher's own launch-time bus publish already
+/// failed (docs/handoffs/bus-resilience.md M2). The launcher and the tool child
+/// (or its per-hook subprocesses) are distinct processes with distinct
+/// once-per-session state; seeding the child "already warned + degraded" keeps a
+/// launch-time-down session to ONE warning across the pair instead of one per
+/// process, while a mid-session recovery still prints exactly one reconnect line.
+const ENV_BUS_DEGRADED: &str = "ELANUS_BUS_DEGRADED";
+
 /// Internal launch-control env vars used by `elanus code spawn`.
 ///
 /// `ELANUS_CODE_FORCE_SESSION` lets a detached wrapper process use the worker
@@ -1017,8 +1025,23 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str, provider: Option<&str>) -> R
         cmd.process_group(0);
     }
 
-    cmd.spawn()
+    let child = cmd
+        .spawn()
         .with_context(|| format!("starting detached {tool} worker {worker_session}"))?;
+
+    // Record the durable spawn edge (cross-harness-death M1): the spawner to report
+    // to, the correlation the completion threads on, and the detached wrapper pid.
+    // This is the detached analog of `code_delivery_keys` — the footprint the daemon
+    // reaper (`reap_dead_spawn_edges`) rides to notice a wrapper that dies without
+    // reporting and synthesize the failure-mail. Best-effort: a ledger hiccup here
+    // must not abort a spawn that already launched (the worker still mails for
+    // itself on a clean exit); it only forfeits the SIGKILL safety net.
+    let worker_pid = child.id() as i32;
+    if let Err(e) =
+        codesession::record_spawn_edge(root, &worker_session, &spawner, Some(&correlation), worker_pid)
+    {
+        eprintln!("[code] recording spawn edge for {worker_session} failed (continuing): {e:#}");
+    }
 
     println!(
         "spawned {tool} worker {worker_session}; its result will be delivered to \
@@ -1112,19 +1135,95 @@ fn emit_completion_delivery(
         )
     })?;
     let prompt = completion_delivery_prompt(worker_session, status, summary, launch_error);
+    // The structured completion contract (cross-harness-death M1): the same
+    // machine-readable shape the DRIVEN path's `route_completion` carries, so a
+    // consumer (planner / UI) learns a worker died without parsing the prose
+    // `Status:` line. `failed = !success` mirrors the driven path exactly (a launch
+    // error, a non-success exit, or an unavailable status all read `failed`); the
+    // human-readable `prompt` is unchanged (additive fields only).
+    let (failed, exit_code) = completion_outcome(status, launch_error);
     let conn = crate::db::open(root).context("opening the ledger to record the completion")?;
     crate::db::init_schema(&conn)?;
     crate::events::emit(
         root,
         &conn,
         crate::events::EmitOpts {
-            payload: Some(json!({ "prompt": prompt })),
+            payload: Some(json!({
+                "prompt": prompt,
+                "worker": worker_session,
+                "failed": failed,
+                "exit_code": exit_code,
+            })),
             correlation: correlation.map(str::to_string),
             sender: Some(worker_session.to_string()),
             ..crate::events::EmitOpts::new(&mailbox)
         },
     )
     .context("recording the spawned-worker completion on the ledger")
+}
+
+/// Classify a detached worker's outcome into the structured `(failed, exit_code)`
+/// the M1 completion payload carries, matching the driven path's `failed = !success`
+/// (`settle_code_deliveries`). A launch error, a non-success exit, and an
+/// unavailable status all read `failed`; the exit code is surfaced when the OS gave
+/// one (a signal death has none — `None`).
+fn completion_outcome(
+    status: Option<&std::process::ExitStatus>,
+    launch_error: Option<&str>,
+) -> (bool, Option<i32>) {
+    if launch_error.is_some() {
+        return (true, None);
+    }
+    match status {
+        Some(s) => (!s.success(), s.code()),
+        None => (true, None),
+    }
+}
+
+/// Emit the failure-mail for a detached worker the REAPER found dead without a
+/// report (cross-harness-death M2). Same structured shape + safe mailbox
+/// resolution as `emit_completion_delivery`, but the outcome is fixed `failed:true`
+/// with a plain reason — the worker's wrapper was SIGKILL'd (or crashed) before it
+/// could mail, so there is no captured final text or exit code. The daemon calls
+/// this only after atomically CLAIMING the spawn edge, so it never double-mails a
+/// worker that also reported for itself.
+pub fn emit_reaper_failure_delivery(
+    root: &Root,
+    conn: &rusqlite::Connection,
+    worker_session: &str,
+    spawner: &str,
+    correlation: Option<&str>,
+) -> Result<i64> {
+    let mailbox = mailbox_for_actor(root, spawner, correlation).with_context(|| {
+        format!(
+            "resolving reaped-worker completion mailbox for spawner {spawner:?} \
+             (worker {worker_session})"
+        )
+    })?;
+    let prompt = format!(
+        "Worker {worker_session} finished.\n\
+         Status: worker terminated without reporting (its process died before it \
+         could deliver a result)\n\n\
+         Final text:\n(none — the worker was killed before completing)\n\n\
+         Files changed: (unknown)"
+    );
+    crate::events::emit(
+        root,
+        conn,
+        crate::events::EmitOpts {
+            payload: Some(json!({
+                "prompt": prompt,
+                "worker": worker_session,
+                "failed": true,
+                "exit_code": Value::Null,
+                "reason": "worker terminated without reporting",
+            })),
+            correlation: correlation.map(str::to_string),
+            sender: Some(worker_session.to_string()),
+            ..crate::events::EmitOpts::new(&mailbox)
+        },
+    )
+    .context("recording the reaped-worker completion on the ledger")
 }
 
 // ── The launch-envelope briefing (M4-B) ───────────────────────────────────────
@@ -1400,6 +1499,248 @@ fn dirs_next_home_codex() -> Option<PathBuf> {
         }
     }
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex"))
+}
+
+// ── MCP-on-launch: the user's native MCP servers survive isolation ────────────
+//
+// The launch deliberately isolates the user's hooks/plugins/settings
+// (`--setting-sources ''` for claude, `--pure` for opencode, an ephemeral
+// CODEX_HOME for codex) so a session does not drag in the user's global hooks or
+// plugins. That isolation used to throw the user's MCP SERVER registrations out
+// with the bathwater. An MCP server is user-authority, not elanus-authority
+// (docs: safety = audit, not restriction; no trust boundary between the user's
+// own agents) — the user configured it for this tool, so an elanus launch
+// selectively MERGES the MCP registrations back in while still excluding
+// everything else (hooks, plugins, misc settings). record-not-gate: the merged
+// server names are recorded on session/start, never approved or filtered. See
+// docs/handoffs/mcp-on-launch.md.
+
+/// Read the user's Claude Code MCP server registrations from `~/.claude.json`
+/// (its top-level `mcpServers` — the user-scope registry that `claude mcp add
+/// --scope user` writes and that `--setting-sources ''` disables; pinned live
+/// against Claude Code 2.1.198). Returns the server map exactly as Claude stores
+/// it — the same `{command,args,env,type|url}` shape `--mcp-config` consumes, so
+/// it round-trips verbatim (MCP servers are user-authority; we carry, never
+/// filter). A missing file is simply empty (the user registered nothing); an
+/// unreadable/malformed file is empty WITH a human note the caller prints to
+/// stderr — a launch NEVER fails because the user's MCP config could not be read.
+fn claude_user_mcp_servers() -> (serde_json::Map<String, Value>, Option<String>) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return (Default::default(), None);
+    };
+    let path = home.join(".claude.json");
+    if !path.exists() {
+        return (Default::default(), None);
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                Default::default(),
+                Some(format!(
+                    "[code] couldn't read your Claude MCP config ({}): {e} — \
+                     launching with no user MCP servers",
+                    path.display()
+                )),
+            )
+        }
+    };
+    let json: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                Default::default(),
+                Some(format!(
+                    "[code] couldn't parse your Claude MCP config ({}): {e} — \
+                     launching with no user MCP servers",
+                    path.display()
+                )),
+            )
+        }
+    };
+    (mcp_servers_from_json(&json, "mcpServers"), None)
+}
+
+/// Extract an MCP-registrations object at `key` from a parsed config document,
+/// tolerating absence or a non-object value (both ⇒ empty). Shared by the claude
+/// (`mcpServers`) and opencode (`mcp`) readers.
+fn mcp_servers_from_json(json: &Value, key: &str) -> serde_json::Map<String, Value> {
+    json.get(key)
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Materialize the user's Claude MCP registrations into a per-session
+/// `--mcp-config` file — the channel that composes with `--setting-sources ''`
+/// (verified live against Claude Code 2.1.198: `--setting-sources '' --mcp-config
+/// <file>` loads the server while every other user setting stays disabled).
+/// Returns the file path and the sorted server names (for the session/start
+/// record), or None when the user has no MCP servers — in which case NO
+/// `--mcp-config` is added and the launch is byte-identical to before. Any
+/// read/parse note is printed to stderr here (never a launch failure).
+fn write_claude_mcp_config(scratch: &Path) -> Result<Option<(PathBuf, Vec<String>)>> {
+    let (servers, note) = claude_user_mcp_servers();
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    if servers.is_empty() {
+        return Ok(None);
+    }
+    let mut names: Vec<String> = servers.keys().cloned().collect();
+    names.sort();
+    let path = scratch.join("mcp-config.json");
+    let doc = json!({ "mcpServers": servers });
+    std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some((path, names)))
+}
+
+/// The path to the user's opencode config, in opencode's discovery order:
+/// `$OPENCODE_CONFIG` (an explicit file), else
+/// `$XDG_CONFIG_HOME/opencode/opencode.json[c]` (default `~/.config/opencode`).
+/// None if nothing is found.
+fn opencode_user_config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("OPENCODE_CONFIG") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    for name in ["opencode.json", "opencode.jsonc"] {
+        let p = base.join("opencode").join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Strip `//` line comments and `/* … */` block comments that sit OUTSIDE JSON
+/// string literals, so opencode's JSONC config can be parsed by serde_json.
+/// String contents (including escaped quotes) are preserved verbatim.
+fn strip_jsonc_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_str {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            out.push(c);
+            i += 1;
+        } else if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Read the user's opencode MCP registrations (the config's `mcp` section — the
+/// `{name: {type,command,enabled,…}}` block that `opencode mcp add` writes).
+/// JSONC comments are stripped before parsing. Same fail-open contract as the
+/// claude reader: missing ⇒ empty; unreadable/unparseable ⇒ empty + a note.
+fn opencode_user_mcp_servers() -> (serde_json::Map<String, Value>, Option<String>) {
+    let Some(path) = opencode_user_config_path() else {
+        return (Default::default(), None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                Default::default(),
+                Some(format!(
+                    "[code] couldn't read your opencode MCP config ({}): {e} — \
+                     launching with no user MCP servers",
+                    path.display()
+                )),
+            )
+        }
+    };
+    let json: Value = match serde_json::from_str::<Value>(&strip_jsonc_comments(&text)) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                Default::default(),
+                Some(format!(
+                    "[code] couldn't parse your opencode MCP config ({}): {e} — \
+                     launching with no user MCP servers",
+                    path.display()
+                )),
+            )
+        }
+    };
+    (mcp_servers_from_json(&json, "mcp"), None)
+}
+
+/// The user's codex MCP server names, read from `$CODEX_HOME/config.toml`'s
+/// `[mcp_servers]` table (the user's real codex home, before elanus copies it into
+/// the per-session home). Codex already carries these by COPYING config.toml
+/// verbatim into the session home (`build_codex_skills_home`), so this reader is
+/// only for the session/start record — the merge itself is the copy. Fail-open:
+/// any read/parse problem yields an empty list.
+fn codex_user_mcp_server_names() -> Vec<String> {
+    let Some(home) = dirs_next_home_codex() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(home.join("config.toml")) else {
+        return Vec::new();
+    };
+    let Ok(val) = text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    val.get("mcp_servers")
+        .and_then(|v| v.as_table())
+        .map(|t| {
+            let mut n: Vec<String> = t.keys().cloned().collect();
+            n.sort();
+            n
+        })
+        .unwrap_or_default()
+}
+
+/// The names of the user's native MCP servers a launch of `tool` merges back in,
+/// for the session/start record (record-not-gate — a session's MCP capability is
+/// reconstructable from its trace; the launch never approves or filters them).
+/// Best-effort and side-effect-free: a read failure yields an empty list (the
+/// stderr note is emitted on the generating path, not here).
+fn merged_mcp_server_names(tool: &str) -> Vec<String> {
+    let mut names: Vec<String> = match tool {
+        "claude" => claude_user_mcp_servers().0.keys().cloned().collect(),
+        "opencode" => opencode_user_mcp_servers().0.keys().cloned().collect(),
+        "codex" => codex_user_mcp_server_names(),
+        _ => Vec::new(),
+    };
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Should the launch-envelope briefing be injected? Default yes; a `--no-brief`
@@ -3102,7 +3443,7 @@ fn launch_external_harness(
     let summary_path = scratch.join("adapter-summary.json");
 
     let prompt = (!args.is_empty()).then(|| args.join(" "));
-    let brief_text = want_brief.then(|| briefing(&session));
+    let mut brief_text = want_brief.then(|| briefing(&session));
     // The workdir-derived coordination room (SA1) — same as a built-in session, so the
     // external adapter's auto-claims land where siblings see them.
     let room = resolve_room(room.as_deref(), &workdir);
@@ -3137,8 +3478,16 @@ fn launch_external_harness(
             std::process::id() as i32,
         );
 
-        // Emit the same launch envelope the direct path used to own.
-        publish_obs(
+        // Emit the same launch envelope the direct path used to own. If the
+        // launch-time publish already fails (the bus is down at launch), the
+        // session is uncaptured from turn one — tell the AGENT so via a briefing
+        // note, so it does not confidently claim "I filed my mail" against a dark
+        // trace (docs/handoffs/bus-resilience.md wonky bit 5; journey-14).
+        // MCP-on-launch (record-not-gate): the user's native MCP servers merged
+        // into this session, so a session's capabilities are reconstructable from
+        // its trace. Empty when the user configured none.
+        let mcp_merged = merged_mcp_server_names(&external.decl.name);
+        let captured = publish_obs_captured(
             root,
             &principal,
             &bus_token,
@@ -3152,8 +3501,23 @@ fn launch_external_harness(
                 "model": model,
                 "effort": effort,
                 "provider": provider,
+                "mcp_merged": mcp_merged,
             }),
         );
+        if !captured {
+            let note = "[elanus] NOTE: elanus can't reach its message bus, so this \
+                session is UNCAPTURED — nothing you do is being recorded, no sibling \
+                awareness, no mail can reach you, and any `spawn`/`deliver` you attempt \
+                will not be delivered. Do the work, but do NOT claim you filed mail or \
+                dispatched a worker; tell your human the bus is down.";
+            brief_text = Some(match brief_text.take() {
+                Some(b) => format!("{note}\n\n{b}"),
+                None => note.to_string(),
+            });
+        }
+        // Seed the child "already warned" when we launched into a down bus, so the
+        // launcher + adapter (or per-hook) processes print ONE warning, not one each.
+        let launched_degraded = !captured;
 
         let mut cmd = std::process::Command::new(&adapter);
         scrub_launch_control_env(&mut cmd);
@@ -3174,6 +3538,9 @@ fn launch_external_harness(
         }
         if let Some(provider) = provider {
             cmd.env(crate::harness::ENV_PROVIDER, provider);
+        }
+        if launched_degraded {
+            cmd.env(ENV_BUS_DEGRADED, "1");
         }
         cmd.env(crate::harness::ENV_SUMMARY_FILE, &summary_path);
         // The FULL raw argv (harness flags + prompt) — real adapters split it via
@@ -3218,28 +3585,47 @@ fn launch_external_harness(
         let correlation = std::env::var(ENV_REPLY_CORRELATION)
             .ok()
             .filter(|s| !s.is_empty());
-        let launch_error = status_result.as_ref().err().map(|e| format!("{e:#}"));
-        let fallback_summary;
-        let (status, summary) = match status_result.as_ref() {
-            Ok(status) => (Some(status), &summary),
-            Err(_) => {
-                fallback_summary = CaptureSummary {
-                    final_text: launch_error.as_deref().map(|e| clip(e, FINAL_TEXT_CAP)),
-                    file_changes: Vec::new(),
-                };
-                (None, &fallback_summary)
+        // Claim the spawn edge BEFORE mailing (cross-harness-death M2). The claim is
+        // an atomic `UPDATE ... WHERE settled_at IS NULL`: if the reaper already
+        // reported this worker as dead (we were slow / momentarily unschedulable),
+        // the claim comes back `AlreadySettled` and we stay silent — the spawner is
+        // mailed EXACTLY ONCE. `NoEdge` (no edge recorded — a legacy path) means no
+        // reaper can double us, so mail unconditionally.
+        let claim = codesession::claim_spawn_edge(root, &session);
+        if claim == codesession::SettleClaim::AlreadySettled {
+            eprintln!(
+                "[code] spawn edge for {session} already settled (reaper reported it dead first); \
+                 skipping duplicate completion mail"
+            );
+        } else {
+            let launch_error = status_result.as_ref().err().map(|e| format!("{e:#}"));
+            let fallback_summary;
+            let (status, summary) = match status_result.as_ref() {
+                Ok(status) => (Some(status), &summary),
+                Err(_) => {
+                    fallback_summary = CaptureSummary {
+                        final_text: launch_error.as_deref().map(|e| clip(e, FINAL_TEXT_CAP)),
+                        file_changes: Vec::new(),
+                    };
+                    (None, &fallback_summary)
+                }
+            };
+            if let Err(e) = emit_completion_delivery(
+                root,
+                &session,
+                &reply_to,
+                correlation.as_deref(),
+                status,
+                summary,
+                launch_error.as_deref(),
+            ) {
+                eprintln!("[code] delivering spawned-worker completion failed (continuing): {e:#}");
+                // We won the claim but failed to mail — release the edge so the
+                // reaper retries the completion next tick rather than losing it.
+                if claim == codesession::SettleClaim::Claimed {
+                    codesession::unclaim_spawn_edge(root, &session);
+                }
             }
-        };
-        if let Err(e) = emit_completion_delivery(
-            root,
-            &session,
-            &reply_to,
-            correlation.as_deref(),
-            status,
-            summary,
-            launch_error.as_deref(),
-        ) {
-            eprintln!("[code] delivering spawned-worker completion failed (continuing): {e:#}");
         }
     }
 
@@ -3416,6 +3802,11 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
         // delivered as a per-session plugin (the only channel that surfaces
         // skills under `--setting-sources ''` from an ephemeral path).
         let plugin_dir = build_claude_skill_plugin(&scratch, skills)?;
+        // MCP-on-launch: carry the user's native MCP registrations back in via
+        // `--mcp-config` (the one channel that composes with `--setting-sources
+        // ''`), while hooks/plugins/settings stay isolated. None when the user
+        // has no MCP servers ⇒ no flag added ⇒ byte-identical to before.
+        let mcp_config = write_claude_mcp_config(&scratch)?;
 
         // Launch the real binary with the generated, isolated config. The
         // TUI gets inherited stdio so it is a normal, fully usable session.
@@ -3431,6 +3822,10 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
                 "--plugin-dir".to_string(),
                 plugin_dir.display().to_string(),
             ];
+            if let Some((path, _)) = &mcp_config {
+                tool_args.push("--mcp-config".to_string());
+                tool_args.push(path.display().to_string());
+            }
             if let Some(brief) = &brief {
                 tool_args.push("--append-system-prompt".to_string());
                 tool_args.push(brief.to_string());
@@ -3498,6 +3893,9 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
                 .arg("")
                 .arg("--plugin-dir")
                 .arg(&plugin_dir);
+            if let Some((path, _)) = &mcp_config {
+                cmd.arg("--mcp-config").arg(path);
+            }
             // The launch-envelope briefing (M4-B): Claude Code injects it
             // out-of-band via --append-system-prompt (the system layer, after
             // the cached prefix — Appendix A), not the user message.
@@ -7207,6 +7605,47 @@ fn claude_settings(self_exe: &Path, root: &Root) -> Value {
 /// effort: a publish failure (broker down) never breaks the coding session —
 /// the observation plane is QoS-0-droppable telemetry (docs/bus.md).
 pub fn publish_obs(root: &Root, principal: &str, token: &str, topic_name: &str, body: Value) {
+    let _ = publish_obs_captured(root, principal, token, topic_name, body);
+}
+
+/// Per-process soft-degrade state (docs/handoffs/bus-resilience.md wonky bit 5).
+/// `DEGRADED` is set the moment a publish fails unreachable and cleared when one
+/// succeeds again; `WARNED` gates the once-per-session "uncaptured" warning so a
+/// down broker drips ONE line into a TUI, not one per publish.
+static BUS_DEGRADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BUS_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Publish one observation, returning whether it was CAPTURED (reached the
+/// broker). The soft-degrade contract (docs/handoffs/bus-resilience.md M2):
+/// - broker down: the FIRST failure prints one loud, plain warning that the
+///   session is now uncaptured; subsequent failures are silent; a later success
+///   (opportunistic — the next publish just dials fresh and connects) prints one
+///   "reconnected" line. Per-process, no config.
+/// - broker refuses the credential (Denied): LOUD every time — an auth fact,
+///   never soft-degraded, never opportunistically retried past.
+/// The launch path uses the return value to tell the agent itself its trace is
+/// dark (an uncaptured session that doesn't know it is uncaptured would
+/// confidently claim "I filed my mail" — journey-14: tell the agent).
+pub fn publish_obs_captured(
+    root: &Root,
+    principal: &str,
+    token: &str,
+    topic_name: &str,
+    body: Value,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    // Inherit the launcher's degraded verdict once per process: a child spawned by
+    // a launcher whose launch-time publish already failed starts "already warned"
+    // so the pair prints one warning, not one each. If the child then reaches the
+    // broker (recovery), the reconnect line fires exactly as for an in-process
+    // recovery — the DEGRADED flag is set here, so the first success clears it.
+    static DEGRADED_SEED: std::sync::Once = std::sync::Once::new();
+    DEGRADED_SEED.call_once(|| {
+        if std::env::var(ENV_BUS_DEGRADED).is_ok_and(|v| !v.is_empty()) {
+            BUS_WARNED.store(true, Ordering::SeqCst);
+            BUS_DEGRADED.store(true, Ordering::SeqCst);
+        }
+    });
     // buscli::publish reads ELANUS_PACKAGE/ELANUS_BUS_TOKEN from the environment.
     // In the launcher process those aren't set (only the child's were), so set
     // them for this publish; the hook process already has them. Setting them
@@ -7222,14 +7661,76 @@ pub fn publish_obs(root: &Root, principal: &str, token: &str, topic_name: &str, 
     let result = if tokio::runtime::Handle::try_current().is_ok() {
         let root = root.clone();
         let topic = topic_name.to_string();
-        std::thread::spawn(move || buscli::publish(&root, &topic, Some(&payload), 0, false, None))
-            .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("obs publish thread panicked")))
+        std::thread::spawn(move || {
+            buscli::publish_typed(&root, &topic, Some(&payload), 0, false, None)
+        })
+        .join()
+        .unwrap_or_else(|_| Err(buscli::BusError::Other("obs publish thread panicked".into())))
     } else {
-        buscli::publish(root, topic_name, Some(&payload), 0, false, None)
+        buscli::publish_typed(root, topic_name, Some(&payload), 0, false, None)
     };
-    if let Err(e) = result {
-        eprintln!("[code] obs publish to {topic_name} failed (continuing): {e:#}");
+    let (captured, notice) = degrade_decision(result.as_ref(), &BUS_WARNED, &BUS_DEGRADED);
+    if let Some(line) = notice {
+        eprintln!("{line}");
+    }
+    captured
+}
+
+/// The once-per-session soft-degrade state machine (docs/handoffs/bus-resilience.md
+/// M2), pure over its two atomics so it can be unit-tested without a broker.
+/// Returns `(captured, Some(line_to_print))` — the caller does the I/O.
+///
+/// - Ok: captured; if we WERE degraded, clear it and emit ONE reconnect line
+///   (the swap is what makes "exactly one" hold even across threads).
+/// - Denied: not captured; emit the auth warning EVERY time (an auth fact, never
+///   soft-degraded or opportunistically retried past — wonky bit 4).
+/// - Unreachable/Other: not captured; set degraded and emit the uncaptured
+///   warning ONLY on the first failure of a degraded stretch (the drip fix).
+fn degrade_decision(
+    result: std::result::Result<&(), &buscli::BusError>,
+    warned: &std::sync::atomic::AtomicBool,
+    degraded: &std::sync::atomic::AtomicBool,
+) -> (bool, Option<String>) {
+    use std::sync::atomic::Ordering;
+    match result {
+        Ok(()) => {
+            if degraded.swap(false, Ordering::SeqCst) {
+                warned.store(false, Ordering::SeqCst);
+                return (
+                    true,
+                    Some(
+                        "[elanus] message bus reachable again — capture resumed for this session."
+                            .to_string(),
+                    ),
+                );
+            }
+            (true, None)
+        }
+        Err(e) if e.is_denied() => (
+            false,
+            Some(format!(
+                "[elanus] message bus REFUSED this session's credential ({e}). \
+                 This is an authorization failure, not a bus-down — it will keep \
+                 failing until the credential is fixed; elanus will not silently \
+                 retry past it."
+            )),
+        ),
+        Err(_unreachable) => {
+            degraded.store(true, Ordering::SeqCst);
+            if warned.swap(true, Ordering::SeqCst) {
+                (false, None) // already warned this degraded stretch — stay quiet
+            } else {
+                (
+                    false,
+                    Some(
+                        "[elanus] can't reach the message bus — this session continues \
+                         UNCAPTURED (no record, no sibling awareness, no mail) until it \
+                         reconnects. Further bus errors are silenced until then."
+                            .to_string(),
+                    ),
+                )
+            }
+        }
     }
 }
 
@@ -7287,6 +7788,53 @@ fn clip(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    /// The soft-degrade state machine (docs/handoffs/bus-resilience.md M2): a
+    /// down bus warns ONCE per degraded stretch (not per publish — the drip fix),
+    /// a recovery emits ONE reconnect line, and a Denied credential is loud on
+    /// EVERY occurrence (an auth fact, never soft-degraded).
+    #[test]
+    fn degrade_decision_warns_once_reconnects_once_and_is_loud_on_denied() {
+        let warned = AtomicBool::new(false);
+        let degraded = AtomicBool::new(false);
+        let unreachable = buscli::BusError::Unreachable("down".into());
+        let denied = buscli::BusError::Denied("nope".into());
+
+        // First unreachable failure: not captured, ONE uncaptured warning.
+        let (cap, note) = degrade_decision(Err(&unreachable), &warned, &degraded);
+        assert!(!cap);
+        assert!(note.as_deref().unwrap().contains("UNCAPTURED"));
+
+        // Subsequent failures in the same degraded stretch are silent.
+        let (cap, note) = degrade_decision(Err(&unreachable), &warned, &degraded);
+        assert!(!cap);
+        assert!(note.is_none(), "second failure is silent, got {note:?}");
+
+        // Recovery: captured, ONE reconnect line, and the flags reset so a later
+        // outage warns again.
+        let (cap, note) = degrade_decision(Ok(&()), &warned, &degraded);
+        assert!(cap);
+        assert!(note.as_deref().unwrap().contains("reachable again"));
+
+        // A steady-state success (not degraded) is silent.
+        let (cap, note) = degrade_decision(Ok(&()), &warned, &degraded);
+        assert!(cap);
+        assert!(note.is_none());
+
+        // A new outage after recovery warns again (one warning per stretch).
+        let (_, note) = degrade_decision(Err(&unreachable), &warned, &degraded);
+        assert!(note.as_deref().unwrap().contains("UNCAPTURED"));
+
+        // Denied is loud EVERY time and names authorization, regardless of the
+        // warned/degraded flags — never soft-degraded.
+        for _ in 0..3 {
+            let (cap, note) = degrade_decision(Err(&denied), &warned, &degraded);
+            assert!(!cap);
+            let line = note.expect("denied always prints");
+            assert!(line.contains("authorization") && line.contains("REFUSED"));
+        }
+    }
 
     #[test]
     fn tool_aliases_normalize_for_dispatch() {
@@ -7773,6 +8321,80 @@ mod tests {
         // Tool hooks carry a matcher; session hooks do not.
         assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "*");
         assert!(s["hooks"]["SessionStart"][0].get("matcher").is_none());
+    }
+
+    // ── MCP-on-launch (docs/handoffs/mcp-on-launch.md) ───────────────────────
+
+    #[test]
+    fn settings_stay_hooks_only_even_with_mcp_merge() {
+        // The MCP merge rides `--mcp-config` (a separate file), NEVER the
+        // `--settings` object — so the hooks-only invariant is untouched by M2.
+        let root = Root {
+            dir: PathBuf::from("/tmp/fake-root"),
+        };
+        let s = claude_settings(Path::new("/usr/local/bin/elanus"), &root);
+        let obj = s.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
+        assert!(obj.contains_key("hooks"));
+        assert!(!obj.contains_key("mcpServers"));
+    }
+
+    #[test]
+    fn mcp_servers_from_json_tolerates_shape() {
+        // Present ⇒ carried verbatim.
+        let j = json!({ "mcpServers": { "a": { "command": "x" }, "b": { "url": "u" } } });
+        let m = mcp_servers_from_json(&j, "mcpServers");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["a"]["command"], "x");
+        // Absent key ⇒ empty (no user servers).
+        assert!(mcp_servers_from_json(&j, "mcp").is_empty());
+        // Wrong type ⇒ empty, never a panic.
+        let bad = json!({ "mcpServers": "not-an-object" });
+        assert!(mcp_servers_from_json(&bad, "mcpServers").is_empty());
+    }
+
+    #[test]
+    fn write_claude_mcp_config_none_when_no_user_servers() {
+        // No `~/.claude.json` mcpServers ⇒ None ⇒ NO `--mcp-config` flag ⇒ launch
+        // is byte-identical to before. Point HOME at an empty scratch dir.
+        let dir = std::env::temp_dir().join(format!("elanus-mcp-none-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let servers = mcp_servers_from_json(&json!({}), "mcpServers");
+        assert!(servers.is_empty());
+        // The generator writes nothing and returns None when the map is empty:
+        // exercise the file-writing half directly with an empty scratch.
+        let out = write_claude_mcp_config(&dir).unwrap();
+        // HOME in the test env may or may not carry mcpServers; assert only the
+        // structural contract: when Some, the file exists and names are sorted.
+        if let Some((path, names)) = out {
+            assert!(path.exists());
+            let mut sorted = names.clone();
+            sorted.sort();
+            assert_eq!(names, sorted);
+            let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(doc.get("mcpServers").is_some());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_jsonc_comments_preserves_strings() {
+        // Line + block comments outside strings are removed; a `//` inside a
+        // string literal (e.g. a URL) is preserved so the JSON stays valid.
+        let src = r#"{
+            // a leading comment
+            "mcp": { "s": { "url": "https://x/y" } }, /* trailing */
+            "note": "a // not-a-comment"
+        }"#;
+        let cleaned = strip_jsonc_comments(src);
+        let j: Value = serde_json::from_str(&cleaned).unwrap();
+        assert_eq!(j["mcp"]["s"]["url"], "https://x/y");
+        assert_eq!(j["note"], "a // not-a-comment");
+    }
+
+    #[test]
+    fn merged_mcp_names_unknown_tool_is_empty() {
+        assert!(merged_mcp_server_names("nope").is_empty());
     }
 
     #[test]
@@ -9127,6 +9749,131 @@ mod tests {
         assert!(prompt.contains("finished the task"));
         assert!(prompt.contains("src/lib.rs"));
         assert!(prompt.contains("src/main.rs"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// cross-harness-death M1 — the structured completion contract: a detached
+    /// worker that exits NONZERO delivers mail whose payload carries `failed:true`
+    /// and the exit code (beside the unchanged human-readable `prompt`).
+    #[cfg(unix)]
+    #[test]
+    fn completion_delivery_carries_structured_failed_and_exit_code() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let root = delivery_tmp_root();
+        record_session(&root, "code-planner2", "claude-code");
+        let summary = CaptureSummary {
+            final_text: Some("boom".into()),
+            file_changes: Vec::new(),
+        };
+
+        // Nonzero exit → failed:true + the exit code.
+        let bad = std::process::ExitStatus::from_raw(7 << 8);
+        let id = emit_completion_delivery(
+            &root,
+            "code-worker7",
+            "code-planner2",
+            Some("corr7"),
+            Some(&bad),
+            &summary,
+            None,
+        )
+        .unwrap();
+        let (_e, _s, payload, _c, _st) = read_event(&root, id);
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["failed"], json!(true));
+        assert_eq!(pv["exit_code"], json!(7));
+        assert_eq!(pv["worker"], json!("code-worker7"));
+        // The prose line is still the same shape the existing consumer reads.
+        assert!(pv["prompt"].as_str().unwrap().contains("Worker code-worker7 finished"));
+
+        // Clean exit → failed:false + exit_code 0.
+        let ok = std::process::ExitStatus::from_raw(0);
+        let id = emit_completion_delivery(
+            &root,
+            "code-worker0",
+            "code-planner2",
+            Some("corr0"),
+            Some(&ok),
+            &CaptureSummary {
+                final_text: Some("done".into()),
+                file_changes: Vec::new(),
+            },
+            None,
+        )
+        .unwrap();
+        let (_e, _s, payload, _c, _st) = read_event(&root, id);
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["failed"], json!(false));
+        assert_eq!(pv["exit_code"], json!(0));
+
+        // A launch error → failed:true + no exit code.
+        let id = emit_completion_delivery(
+            &root,
+            "code-workerE",
+            "code-planner2",
+            Some("corrE"),
+            None,
+            &summary,
+            Some("could not launch codex"),
+        )
+        .unwrap();
+        let (_e, _s, payload, _c, _st) = read_event(&root, id);
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["failed"], json!(true));
+        assert!(pv["exit_code"].is_null());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// `completion_outcome` classifies exactly as the driven path's `failed=!success`.
+    #[cfg(unix)]
+    #[test]
+    fn completion_outcome_matches_driven_semantics() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // Success.
+        let ok = std::process::ExitStatus::from_raw(0);
+        assert_eq!(completion_outcome(Some(&ok), None), (false, Some(0)));
+        // Nonzero exit.
+        let bad = std::process::ExitStatus::from_raw(3 << 8);
+        assert_eq!(completion_outcome(Some(&bad), None), (true, Some(3)));
+        // Signal death (SIGKILL = 9): no exit code, failed.
+        let killed = std::process::ExitStatus::from_raw(9);
+        assert_eq!(completion_outcome(Some(&killed), None), (true, None));
+        // Launch error dominates.
+        assert_eq!(completion_outcome(Some(&ok), Some("nope")), (true, None));
+        // No status at all → failed.
+        assert_eq!(completion_outcome(None, None), (true, None));
+    }
+
+    /// cross-harness-death M1/M2 — the spawn edge lifecycle: a recorded edge exists
+    /// unsettled; the FIRST claim wins (`Claimed`, settled_at set); a SECOND claim on
+    /// the same edge is `AlreadySettled`; an unknown edge is `NoEdge`.
+    #[test]
+    fn spawn_edge_claim_is_once_only() {
+        let root = delivery_tmp_root();
+        codesession::record_spawn_edge(&root, "code-edge0001", "code-boss1", Some("c"), 4242)
+            .unwrap();
+
+        // No edge → NoEdge (the legacy/unrecorded path mails unconditionally).
+        assert_eq!(
+            codesession::claim_spawn_edge(&root, "code-nosuchedge"),
+            codesession::SettleClaim::NoEdge
+        );
+        // First claim wins.
+        assert_eq!(
+            codesession::claim_spawn_edge(&root, "code-edge0001"),
+            codesession::SettleClaim::Claimed
+        );
+        // Second claim loses — the edge is already settled (the race guard).
+        assert_eq!(
+            codesession::claim_spawn_edge(&root, "code-edge0001"),
+            codesession::SettleClaim::AlreadySettled
+        );
+        // Unclaim re-arms it (the mail-failure retry path).
+        codesession::unclaim_spawn_edge(&root, "code-edge0001");
+        assert_eq!(
+            codesession::claim_spawn_edge(&root, "code-edge0001"),
+            codesession::SettleClaim::Claimed
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 

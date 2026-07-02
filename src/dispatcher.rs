@@ -257,6 +257,7 @@ fn tick(
     announce_ledger_events(root, conn)?;
     reap(root, conn, running)?;
     settle_code_deliveries(root, conn, code)?;
+    reap_dead_spawn_edges(root, conn)?;
     drive_code_deliveries(root, conn, code)?;
     resume_suspended(root, conn, running)?;
     dispatch_pending(root, conn, running)?;
@@ -1174,6 +1175,65 @@ fn route_completion(
     }
 }
 
+/// Reap detached-spawn workers that died without reporting (cross-harness-death
+/// M2). `elanus code spawn` fires a DETACHED, unparented worker: nothing can
+/// `wait()` on it, so if its wrapper is SIGKILL'd (or crashes) before its own
+/// `emit_completion_delivery`, the spawner would hang forever — the driven path's
+/// `reconcile_lost_routes` only covers `code_delivery_keys`. Each spawn records a
+/// durable `code_spawn_edges` row (spawner, correlation, wrapper pid); this sweep,
+/// beside `settle_code_deliveries` in the tick, finds unsettled edges whose wrapper
+/// pid is dead and synthesizes the SAME `{failed:true}` completion-mail the worker
+/// would have sent, then settles the edge.
+///
+/// Exactly-once: the settle is CLAIMED atomically (`claim_spawn_edge_on` —
+/// `UPDATE ... WHERE settled_at IS NULL`) before mailing. A worker finishing in the
+/// same tick claims the edge from its own process; whichever write commits first
+/// wins, and the loser's claim returns non-`Claimed` and mails nothing. (The reaper
+/// only ever sees a DEAD pid, so it never races a still-running worker — a live
+/// worker's own completion path owns the claim.) A mail failure releases the claim
+/// so the next tick retries rather than losing the completion.
+fn reap_dead_spawn_edges(root: &Root, conn: &Connection) -> Result<()> {
+    for edge in crate::codesession::dead_unsettled_spawn_edges(conn) {
+        match crate::codesession::claim_spawn_edge_on(conn, &edge.worker_session) {
+            Ok(crate::codesession::SettleClaim::Claimed) => {}
+            // The worker's own completion won the claim (or the edge vanished) —
+            // nothing to synthesize.
+            _ => continue,
+        }
+        match crate::codeagent::emit_reaper_failure_delivery(
+            root,
+            conn,
+            &edge.worker_session,
+            &edge.spawner,
+            edge.correlation.as_deref(),
+        ) {
+            Ok(rid) => trace::write(
+                root,
+                "obs/agent/code/spawn/reaped",
+                &trace::Ids {
+                    event_id: Some(rid),
+                    correlation_id: edge.correlation.clone(),
+                    ..Default::default()
+                },
+                json!({
+                    "worker": edge.worker_session,
+                    "spawner": edge.spawner,
+                    "pid": edge.worker_pid,
+                }),
+            ),
+            Err(e) => {
+                eprintln!(
+                    "[daemon] reaping dead spawn worker {} failed: {e:#}",
+                    edge.worker_session
+                );
+                // Release the claim so the next tick retries the completion.
+                crate::codesession::unclaim_spawn_edge(root, &edge.worker_session);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Recover any planner wake lost to a crash in the settle->route gap (M4-A
 /// reliability residual). The settle UPDATE (worker delivery -> done) and the
 /// routed completion emit are separate autocommit transactions; a crash between
@@ -1270,6 +1330,51 @@ fn reconcile_lost_routes(root: &Root, conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// How stale a pending coding-session delivery may be before it is HELD rather
+/// than auto-driven (docs/handoffs/bus-resilience.md M3). A normal driven
+/// round-trip (spawn → worker → completion mail → planner resume) settles in
+/// seconds-to-minutes, and an idle session resumed the same day should still get
+/// its mail; a full day is well past both, so a delivery older than this is
+/// "from a previous session" — the exact surprise report (b) describes.
+const STALE_DELIVERY_HORIZON: chrono::Duration = chrono::Duration::hours(24);
+
+/// Should this pending delivery be HELD for confirmation instead of driven?
+/// Returns `Some(reason)` when the mail is stale — older than the horizon, or
+/// addressed BEFORE the target session record existed (a prior incarnation of a
+/// reused durable id) — else `None` (drive it normally). Timestamps that fail to
+/// parse are treated as NOT stale (fail-open toward delivery: a legible-but-odd
+/// timestamp must never silently swallow real mail).
+fn stale_delivery_reason(
+    conn: &Connection,
+    delivery_created_at: &str,
+    session: &str,
+) -> Result<Option<&'static str>> {
+    let Ok(delivered) = chrono::DateTime::parse_from_rfc3339(delivery_created_at) else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now();
+    if now.signed_duration_since(delivered.with_timezone(&chrono::Utc)) > STALE_DELIVERY_HORIZON {
+        return Ok(Some("older than the 24h delivery horizon"));
+    }
+    // Predating the target session's creation: mail addressed before this record
+    // existed belongs to a prior incarnation of a reused id, not to this session.
+    let session_created: Option<String> = conn
+        .query_row(
+            "SELECT created_at FROM code_sessions WHERE elanus_session=?1",
+            [session],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(sc) = session_created {
+        if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&sc) {
+            if delivered < created {
+                return Ok(Some("addressed before this session was created"));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Claim pending coding-session deliveries and hand each to its session's worker
 /// thread. A `pending` event whose topic `recognize_delivery` matches an existing
 /// `code-*` record is a drive: we mark it `running` (durability — replays on
@@ -1287,10 +1392,11 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
         corr: Option<String>,
         payload: Option<String>,
         sender: Option<String>,
+        created_at: String,
     }
     let pending: Vec<PendingDelivery> = {
         let mut stmt = conn.prepare(
-            "SELECT id, type, correlation_id, payload, sender FROM events
+            "SELECT id, type, correlation_id, payload, sender, created_at FROM events
              WHERE state='pending' AND type LIKE 'in/agent/%'
              ORDER BY priority DESC, id ASC LIMIT 100",
         )?;
@@ -1302,6 +1408,7 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
                     corr: r.get(2)?,
                     payload: r.get(3)?,
                     sender: r.get(4)?,
+                    created_at: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1313,6 +1420,7 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
         corr,
         payload,
         sender,
+        created_at,
     } in pending
     {
         if code.claimed.contains(&id) {
@@ -1321,6 +1429,35 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
         let Some((session, _noun)) = crate::codeagent::recognize_delivery(root, &etype) else {
             continue; // not addressed to a known coding session — leave for dispatch_pending
         };
+        // Delivery scoping (docs/handoffs/bus-resilience.md M3, report (b)). The
+        // ledger scan has no time bound: an old `pending` in/agent/* row fires the
+        // instant its target session id resolves again — a `--resume` (or a boot
+        // re-pend) of a reused durable session id drives DAYS-old mail into what
+        // the human experiences as a fresh session. `recognize_delivery` already
+        // pins the address to the exact session id; the missing guard is age. Mail
+        // older than the horizon, or addressed BEFORE this session record existed
+        // (a prior incarnation of a reused id), is HELD — surfaced in the session's
+        // inbox for confirmation, never silently driven. A held row leaves the
+        // pending scan (state='held') so it neither re-fires nor drips; the human
+        // re-delivers it if they still want it.
+        if let Some(reason) = stale_delivery_reason(conn, &created_at, &session)? {
+            conn.execute(
+                "UPDATE events SET state='held', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id=?1 AND state='pending'",
+                [id],
+            )?;
+            trace::write(
+                root,
+                "obs/agent/code/delivery/held",
+                &trace::Ids {
+                    event_id: Some(id),
+                    correlation_id: corr.clone(),
+                    ..Default::default()
+                },
+                json!({ "session": session, "reason": reason, "created_at": created_at }),
+            );
+            continue;
+        }
         let pv: Value = payload
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
@@ -1944,6 +2081,154 @@ mod tests {
             "unrecognized in/agent event is left for dispatch"
         );
 
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// docs/handoffs/bus-resilience.md M3, report (b): the ledger scan had NO
+    /// time bound, so an old `pending` in/agent/* row fired the instant its target
+    /// session id resolved again — a resume (or boot re-pend) of a reused durable
+    /// id drove DAYS-old mail into a fresh-feeling session. The fix HOLDS a
+    /// stale delivery (older than the 24h horizon, or predating the session
+    /// record) instead of driving it, while a fresh delivery to the same session
+    /// still drives normally. This test FAILS on the old code (the stale row would
+    /// be claimed `running` and enqueued) and PASSES on the new.
+    #[test]
+    fn drive_holds_stale_delivery_and_drives_fresh() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-aaaa0001".into(),
+                native_session: "thread-1".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+                room: None,
+            },
+        )
+        .unwrap();
+
+        // Two deliveries to the SAME (recorded, drivable) session: one addressed
+        // days ago (the stale "previous session" prompt), one just now.
+        let stale = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "run the OLD task" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-aaaa0001")
+            },
+        )
+        .unwrap();
+        // Backdate it well past the 24h horizon.
+        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(48))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE events SET created_at=?1 WHERE id=?2",
+            params![old_ts, stale],
+        )
+        .unwrap();
+        let fresh = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "the task I just typed" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-aaaa0001")
+            },
+        )
+        .unwrap();
+
+        let mut code = CodeDrivers::default();
+        let (tx, rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-aaaa0001".into(), CodeWorker { tx, inflight: 0 });
+
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+
+        // The stale row is HELD, not driven: surfaced for confirmation, never a
+        // prompt the user didn't just type.
+        let stale_state: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [stale], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stale_state, "held", "stale mail is held, not driven");
+        assert!(
+            !code.claimed.contains(&stale),
+            "stale mail is never claimed for a resume"
+        );
+
+        // The fresh row drives normally.
+        let fresh_state: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [fresh], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fresh_state, "running", "fresh mail is claimed and driven");
+        assert!(code.claimed.contains(&fresh));
+
+        // Exactly the fresh delivery reached the worker — the stale one did not.
+        let job = rx.try_recv().expect("the fresh delivery was enqueued");
+        assert_eq!(job.event_id, fresh);
+        assert_eq!(job.message, "the task I just typed");
+        assert!(rx.try_recv().is_err(), "the stale delivery was NOT enqueued");
+
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// The "predates the session record" arm (docs/handoffs/bus-resilience.md M3):
+    /// mail addressed BEFORE this session id's record existed belongs to a prior
+    /// incarnation of a reused id, so it is held even when it is younger than the
+    /// 24h horizon.
+    #[test]
+    fn drive_holds_delivery_predating_session_creation() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-bbbb0002".into(),
+                native_session: "thread-2".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+                room: None,
+            },
+        )
+        .unwrap();
+        // Move the session record's creation to now+10min so the just-emitted
+        // delivery (now) predates it — the reused-id signature, without tripping
+        // the age horizon.
+        let future = (chrono::Utc::now() + chrono::Duration::minutes(10))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE code_sessions SET created_at=?1 WHERE elanus_session='code-bbbb0002'",
+            params![future],
+        )
+        .unwrap();
+
+        let mail = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "stale for a rebound id" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-bbbb0002")
+            },
+        )
+        .unwrap();
+
+        let mut code = CodeDrivers::default();
+        let (tx, rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-bbbb0002".into(), CodeWorker { tx, inflight: 0 });
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+
+        let state: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [mail], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "held", "mail predating the record is held");
+        assert!(rx.try_recv().is_err(), "nothing enqueued");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -2738,6 +3023,179 @@ mod tests {
         );
         assert!(pv["file_changes"].as_array().unwrap().is_empty());
         assert!(pv["worker_obs"].as_str().unwrap().contains("code-silent01"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// Record a recorded coding session (so `mailbox_for_actor` can address it).
+    fn record_code_session(root: &Root, sess: &str, noun: &str) {
+        crate::codesession::upsert_record(
+            root,
+            &crate::codesession::SessionRecord {
+                elanus_session: sess.into(),
+                native_session: "n".into(),
+                tool: if noun == "codex" { "codex" } else { "claude" }.into(),
+                agent_noun: noun.into(),
+                workdir: root.dir.display().to_string(),
+                room: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// cross-harness-death M2 — the reaper's core: a detached spawn edge whose
+    /// wrapper pid is dead and which never reported synthesizes a `{failed:true}`
+    /// completion-mail to the spawner and settles the edge. A DEAD pid is required —
+    /// a very high pid is guaranteed `ESRCH` (no such process).
+    #[test]
+    fn reaper_mails_failure_for_dead_unreported_spawn_worker() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        record_code_session(&root, "code-plannr09", "claude-code");
+        // A dead wrapper pid; the worker never mailed (unsettled edge).
+        crate::codesession::record_spawn_edge(
+            &root,
+            "code-wrkdead1",
+            "code-plannr09",
+            Some("corr-dead"),
+            i32::MAX,
+        )
+        .unwrap();
+
+        reap_dead_spawn_edges(&root, &conn).unwrap();
+
+        // Exactly one failure-mail to the planner's mailbox, structured failed:true.
+        let (payload, corr): (String, String) = conn
+            .query_row(
+                "SELECT payload, COALESCE(correlation_id,'') FROM events
+                   WHERE type='in/agent/claude-code/code-plannr09'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the reaper mailed the spawner");
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["failed"], json!(true), "structured failed:true");
+        assert_eq!(pv["worker"], json!("code-wrkdead1"));
+        assert!(pv["exit_code"].is_null(), "a killed worker has no exit code");
+        assert_eq!(corr, "corr-dead", "the completion threads on the spawn corr");
+        assert!(pv["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("terminated without reporting"));
+        // The edge is settled.
+        let settled: Option<String> = conn
+            .query_row(
+                "SELECT settled_at FROM code_spawn_edges WHERE worker_session='code-wrkdead1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(settled.is_some(), "the edge is settled after the reap");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// A LIVE worker (its wrapper pid still alive) is never reaped — the reaper only
+    /// ever acts on a dead pid, so a running worker's own completion path owns the
+    /// claim.
+    #[test]
+    fn reaper_leaves_a_live_spawn_worker_alone() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        record_code_session(&root, "code-plannr10", "claude-code");
+        crate::codesession::record_spawn_edge(
+            &root,
+            "code-wrklive1",
+            "code-plannr10",
+            Some("corr-live"),
+            std::process::id() as i32, // this test process — very much alive
+        )
+        .unwrap();
+
+        reap_dead_spawn_edges(&root, &conn).unwrap();
+
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type='in/agent/claude-code/code-plannr10'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "a live worker is not reaped");
+        let settled: Option<String> = conn
+            .query_row(
+                "SELECT settled_at FROM code_spawn_edges WHERE worker_session='code-wrklive1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(settled.is_none(), "a live worker's edge stays unsettled");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// Exactly-once under the slow-worker/reaper race (cross-harness-death M2
+    /// acceptance): if the WORKER'S own completion already claimed+settled the edge,
+    /// the reaper mails nothing — no double-mail. And running the reaper twice over a
+    /// dead worker mails exactly once (the second pass finds a settled edge).
+    #[test]
+    fn reaper_is_idempotent_and_never_double_mails() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        record_code_session(&root, "code-plannr11", "claude-code");
+
+        // (a) worker won the claim first → reaper is a no-op even for a dead pid.
+        crate::codesession::record_spawn_edge(
+            &root,
+            "code-wrkwon01",
+            "code-plannr11",
+            Some("corr-won"),
+            i32::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::codesession::claim_spawn_edge(&root, "code-wrkwon01"),
+            crate::codesession::SettleClaim::Claimed,
+            "the worker wins the claim"
+        );
+        reap_dead_spawn_edges(&root, &conn).unwrap();
+
+        // (b) a genuinely dead+unreported worker → reaper mails; a SECOND reap pass
+        // finds the edge settled and mails nothing more.
+        crate::codesession::record_spawn_edge(
+            &root,
+            "code-wrkdead2",
+            "code-plannr11",
+            Some("corr-dead2"),
+            i32::MAX,
+        )
+        .unwrap();
+        reap_dead_spawn_edges(&root, &conn).unwrap();
+        reap_dead_spawn_edges(&root, &conn).unwrap();
+
+        // The planner's mailbox holds EXACTLY ONE completion — for wrkdead2 only
+        // (wrkwon01 was claimed by the worker, so the reaper stayed silent).
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM events WHERE type='in/agent/claude-code/code-plannr11'",
+            )
+            .unwrap();
+        let workers: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|p| {
+                serde_json::from_str::<Value>(&p).unwrap()["worker"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            workers,
+            vec!["code-wrkdead2".to_string()],
+            "exactly one completion, and only for the unreported worker"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }
