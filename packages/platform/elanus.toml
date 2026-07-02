@@ -1,0 +1,23 @@
+# platform — the computed block that tells the agent where it is running
+# (docs/handoffs/platform-trust.md). A stock context stage: on every LLM call
+# it appends a `platform` system block stating the installation's trust level
+# and whether the web dashboard is reachable only from this machine or wider.
+#
+# Why the agent must see this: journey 07 (chatting) lets an agent answer with
+# raw HTML — but that only renders at FULL trust. This block tells the agent
+# whether its HTML will render, and how exposed the machine is, so it can decide
+# how to answer. The values are computed from bus.toml, which the cage fences
+# from agents (an agent cannot read this block and then raise its own trust).
+#
+# EXEC mode (docs/context.md): the values are cheap to read (one small file),
+# so a per-call spawn is enough — no warm daemon needed, unlike recent-history.
+#
+# A [[stage]] declaration is a request: this ships with the stock set but stays
+# inert until approved (`elanus approve platform`), because an approved stage
+# shapes every prompt the model sees.
+
+[[stage]]
+name  = "platform"
+run   = "scripts/main"
+order = 15
+mode  = "exec"

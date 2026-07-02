@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import CodeSessions from './CodeSessions';
 import CommsView from './CommsView';
+import Markdown from './Markdown';
 import ProvidersView from './ProvidersView';
 import AgentAssistant, { ClientTool } from './components/AgentAssistant';
 import { adminGet, adminPost, adminPut, history, publish, status as fetchStatus, liveness as fetchLiveness } from './api';
@@ -1297,6 +1298,7 @@ export function App() {
             selectCodeSessions={selectCodeSessions}
             isTraceAgent={sel.kind === 'agent' && (isWorkerAgentName(sel.agent) || [...(agents.get(sel.agent)?.sessions ?? [])].some((s) => isWorkerSessionId(s)))}
             sendLabel={L.send}
+            allowHtml={systemStatus?.trust === 'full'}
           />
           <SessionsView hidden={!(sel.kind === 'agent' && sel.tab === 'sessions')} state={sessionsState} agent={sel.agent} openTranscript={openTranscript} loadSessions={loadSessions} />
           <ConfigureView
@@ -2232,7 +2234,7 @@ function KitAddRow({ kit, cfgForm, cfgPackages, detail, loadKitDetail, installKi
   );
 }
 
-function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation, selectCodeSessions, isTraceAgent, sendLabel }: any) {
+function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation, selectCodeSessions, isTraceAgent, sendLabel, allowHtml }: any) {
   const [conversationSearch, setConversationSearch] = useState('');
   const allConversations = conversations?.list ?? [];
   const query = conversationSearch.trim().toLowerCase();
@@ -2302,7 +2304,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
       <div id="conv-holder" className="conv-feed-holder">
         <div className="conv-feed" role="log" aria-live="polite" aria-label={`conversation with ${agent}`}>
           {!messages.length && <div className="conv-empty"><p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p><p>Start a conversation with {agent}. Replies and asks stay in this thread.</p></div>}
-          {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `conversation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : m.text}</div></div>)}
+          {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `conversation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : <Markdown text={String(m.text ?? '')} allowHtml={allowHtml} />}</div></div>)}
         </div>
       </div>
       <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><IconButton type="submit" id="compose-send" label={sendLabel} className="compose-send">➤</IconButton></form>

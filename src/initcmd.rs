@@ -83,6 +83,19 @@ const PKG_FILES: &[PkgFile] = &[
         content: include_str!("../packages/window/scripts/stage"),
         exec: true,
     },
+    // Ships pending like the other stages: an approved stage shapes every
+    // prompt, so activating the platform block is the human's call
+    // (elanus approve platform). docs/handoffs/platform-trust.md M3.
+    PkgFile {
+        rel: "platform/elanus.toml",
+        content: include_str!("../packages/platform/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "platform/scripts/main",
+        content: include_str!("../packages/platform/scripts/main"),
+        exec: true,
+    },
 ];
 
 struct StockHarnessPackage {

@@ -352,7 +352,7 @@ async fn relay(hub: Arc<Hub>, mut eventloop: rumqttc::v5::EventLoop) {
 // ---- publish --------------------------------------------------------------
 
 async fn publish(hub: web::types::State<Arc<Hub>>, req: HttpRequest, body: Bytes) -> HttpResponse {
-    if !origin_ok(&req) {
+    if !human_proof_ok(&hub.root, &req) {
         return json_resp(
             403,
             json!({ "ok": false, "error": "cross-origin request refused" }),
@@ -483,6 +483,10 @@ async fn status(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
             "credential": if cred { "present" } else { "missing" },
             "broker": hub.broker,
             "broker_connected": hub.connected.load(Ordering::SeqCst),
+            // The platform trust level (docs/handoffs/platform-trust.md). The SPA
+            // gates raw-HTML rendering on this: full ⇒ agent HTML renders live,
+            // reduced ⇒ shown as escaped text. Read fresh from bus.toml.
+            "trust": trust_word(root),
             "web": { "port": Value::Null, "static_dir": "<embedded>", "dist_present": DIST.get_file("index.html").is_some() },
             "agent": hub.agent,
             "binary": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
@@ -1004,7 +1008,11 @@ async fn admin(
     body: Bytes,
 ) -> HttpResponse {
     let method = req.method().clone();
-    if method != ntex::http::Method::GET && !origin_ok(&req) {
+    // Mutations act as the human (approve/revoke are decided_by=ui, etc.). The
+    // origin guard is the CSRF/DNS-rebinding floor; at reduced trust it tightens
+    // to require a browser gesture so a caged agent's no-Origin curl cannot
+    // approve its own grants (M5, partial close of security.md entry 13).
+    if method != ntex::http::Method::GET && !human_proof_ok(&hub.root, &req) {
         return json_resp(
             403,
             json!({ "ok": false, "error": "cross-origin request refused (CSRF/DNS-rebinding guard)" }),
@@ -2017,6 +2025,39 @@ fn percent_decode(s: &str) -> String {
 /// rebound Host (evil.com → 127.0.0.1) fails the Host check above — so neither CSRF
 /// nor DNS-rebinding is weakened. curl and local agents send no Origin and pass
 /// (entry 3 already owns local processes).
+/// The platform trust level as the product word the SPA reads (M1/M4).
+fn trust_word(root: &Root) -> &'static str {
+    match bus::trust(root) {
+        bus::TrustLevel::Full => "full",
+        bus::TrustLevel::Reduced => "reduced",
+    }
+}
+
+/// Whether a MUTATING request that acts as the human may proceed (M5, partial
+/// close of docs/security.md entry 13). Layered on top of `origin_ok`:
+/// - at FULL trust nothing changes — a no-Origin local request still passes,
+///   the historical behavior (your own machine, you trust everything);
+/// - at REDUCED trust a mutation that spends the human credential
+///   (publish-as-human, approve/revoke, agent settings) requires a browser
+///   gesture, which we recognize as a present, local `Origin` header. A caged
+///   agent's `curl` to the loopback port carries no Origin and is refused, so
+///   the confused deputy is closed for high-stakes actions on shared/remote
+///   machines. Free reads (GET) and converse are unaffected — a browser fetch
+///   always sends Origin.
+fn human_proof_ok(root: &Root, req: &HttpRequest) -> bool {
+    if !origin_ok(req) {
+        return false;
+    }
+    if bus::trust(root) == bus::TrustLevel::Reduced {
+        return req
+            .headers()
+            .get("origin")
+            .and_then(|h| h.to_str().ok())
+            .is_some();
+    }
+    true
+}
+
 fn origin_ok(req: &HttpRequest) -> bool {
     let headers = req.headers();
     let host = headers
@@ -3247,5 +3288,54 @@ mod route_tests {
         ));
         // A rebound / non-local Host is refused outright by the Host check.
         assert!(!host_is_local("evil.example"));
+    }
+
+    // M5 (docs/handoffs/platform-trust.md, partial close of security.md entry
+    // 13): the reduced-trust gate on mutating routes. A no-Origin local request
+    // (a caged agent's `curl`) is refused at reduced trust but passes at full
+    // trust; a browser request (present, local Origin) passes at both.
+    #[test]
+    fn human_proof_gate_tightens_at_reduced_trust() {
+        use ntex::web::test::TestRequest;
+        let dir = std::env::temp_dir().join(format!("el-trustgate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+
+        let no_origin = || TestRequest::default().header("host", "127.0.0.1:7180").to_http_request();
+        let with_origin = || {
+            TestRequest::default()
+                .header("host", "127.0.0.1:7180")
+                .header("origin", "http://127.0.0.1:7180")
+                .to_http_request()
+        };
+
+        // Full trust (default / no bus.toml): a no-Origin local curl still passes
+        // — the historical behavior, unchanged.
+        assert!(
+            human_proof_ok(&root, &no_origin()),
+            "full trust: no-Origin local request passes (today's behavior)"
+        );
+        assert!(human_proof_ok(&root, &with_origin()));
+
+        // Reduced trust: the no-Origin curl is refused (no browser gesture); a
+        // browser request with a local Origin still passes so converse/reads work.
+        std::fs::write(root.bus_file(), "trust = \"reduced\"\n").unwrap();
+        assert!(
+            !human_proof_ok(&root, &no_origin()),
+            "reduced trust: a no-Origin local curl presents no human proof — refused"
+        );
+        assert!(
+            human_proof_ok(&root, &with_origin()),
+            "reduced trust: a browser gesture (present local Origin) passes"
+        );
+
+        // A foreign Origin is refused at either trust (the CSRF floor).
+        let foreign = TestRequest::default()
+            .header("host", "127.0.0.1:7180")
+            .header("origin", "http://evil.example")
+            .to_http_request();
+        assert!(!human_proof_ok(&root, &foreign));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

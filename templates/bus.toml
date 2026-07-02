@@ -13,5 +13,14 @@
 # Unix sockets are deliberately not offered — non-standard MQTT.
 #
 # Debugging surface: `elanus bus sub 'obs/#'` and `elanus bus pub <topic>`.
+#
+# trust: the one platform trust level for this whole installation
+# (docs/handoffs/platform-trust.md). It is deliberately NOT per-package and
+# NOT per-agent — one switch an agent must not be able to flip.
+#   "full"    (default) — this is my own computer. I trust everything: an
+#             agent's raw HTML in chat renders as real interface elements.
+#   "reduced" — a shared or remote machine. HTML is shown as escaped text and
+#             high-stakes web actions (approve, publish-as-me) need a gesture.
 enabled = true
 bind = "127.0.0.1:1883"
+trust = "full"

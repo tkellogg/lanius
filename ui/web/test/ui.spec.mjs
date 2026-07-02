@@ -961,6 +961,76 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
+// ── flow 6e: platform-trust M4 — the raw-HTML render gate ─────────────────────
+// docs/handoffs/platform-trust.md M4: agent messages render as markdown; raw HTML
+// is gated on the platform trust level (bus.toml). At FULL trust rehype-raw is on
+// and a message's raw <button> becomes a real element; at REDUCED trust the same
+// markup is shown as escaped text (no live element). The gate reads /api/status
+// `trust`, which the Rust server derives fresh from bus.toml per request.
+{
+  const htmlAgent = 'htmlprobe';
+  const seed = await newPage();
+  await seed.goto('/');
+  await seed.evaluate(async (name) => {
+    await fetch('/api/admin/agents', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }).catch(() => {});
+  }, htmlAgent);
+  await seed.close();
+
+  // The message carries a raw <button> with a data-sel probe (the same discipline
+  // the rest of the spec uses to find live elements).
+  const htmlMsg = '<button data-sel="rawhtml-probe">CLICKME-RAW</button>';
+  const openConverse = async (page) => {
+    await page.waitForSelector('#nav-agents .nav-agent');
+    await waitFor('trust-html: agent selectable', async () => {
+      const agents = await page.$$('#nav-agents .nav-agent');
+      for (const item of agents) {
+        if ((await item.getAttribute('data-sel')) === `agent:${htmlAgent}`) { await item.click(); return true; }
+      }
+      return false;
+    }, 8000);
+    await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  };
+
+  // FULL trust (the setup default — bus.toml has no `trust`, so full): the raw
+  // <button> renders as a REAL element inside the feed.
+  const full = await newPage();
+  await full.goto('/');
+  await openConverse(full);
+  await full.fill('#compose-input', htmlMsg);
+  await full.click('#compose-send');
+  await waitFor('trust-html: full trust renders raw <button> as a real element', async () => {
+    return (await full.$('#conv-holder button[data-sel="rawhtml-probe"]')) !== null;
+  }, 8000);
+  await full.close();
+
+  // Flip to REDUCED trust (keep the bind so the stack stays connected), reload so
+  // the SPA re-fetches /api/status, and re-send the same message: now the markup
+  // is visible TEXT and there is NO live <button>.
+  fs.writeFileSync(path.join(TMP, 'bus.toml'), `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\ntrust = "reduced"\n`);
+  const reduced = await newPage();
+  await reduced.goto('/');
+  await waitFor('trust-html: status reports reduced trust after flip', async () => {
+    try { return (await (await fetch(`${BASE}/api/status`)).json()).trust === 'reduced'; } catch { return false; }
+  }, 8000);
+  await openConverse(reduced);
+  await reduced.fill('#compose-input', htmlMsg);
+  await reduced.click('#compose-send');
+  await waitFor('trust-html: reduced trust shows the HTML as escaped text', async () => {
+    const t = await reduced.$eval('#conv-holder', (el) => el.textContent);
+    return t.includes('<button') && t.includes('CLICKME-RAW');
+  }, 8000);
+  const liveBtn = await reduced.$('#conv-holder button[data-sel="rawhtml-probe"]');
+  liveBtn === null
+    ? ok('trust-html: reduced trust does NOT create a live <button> (escaped)')
+    : fail('trust-html: reduced trust leaked a live <button> element');
+  await reduced.close();
+  // Restore full trust for the remaining flows (they assume the default posture).
+  fs.writeFileSync(path.join(TMP, 'bus.toml'), `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\n`);
+}
+
 // ── flow 6b: chat-rendering M2 — comms-plane-vs-trace decision ────────────────
 // docs/handoffs/chat-rendering.md M2: the converse view decides what to show by
 // WHETHER comms-plane traffic exists between the owner and the agent (a read off

@@ -31,6 +31,26 @@ const IO_TIMEOUT: Duration = Duration::from_millis(500);
 /// an obs/fs/ flood against a dead daemon must not pay a connect per event.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 
+/// The one platform trust level for the whole installation (docs/handoffs/
+/// platform-trust.md). It is NOT per-package (the config repo is agent-
+/// proposable — the wrong home for a safety switch) and NOT per-agent (a
+/// profile is the wrong altitude): it lives in `bus.toml`, the root-wide
+/// config the cage fences from agents (Protect::for_root), so an injected
+/// agent cannot raise its own trust.
+///
+/// - `Full` (default): your own computer — you trust everything, so an agent's
+///   raw HTML renders as real interface elements and the loopback web surface
+///   stays a free deputy.
+/// - `Reduced`: a shared or remote machine — HTML is shown as escaped text and
+///   high-stakes web actions (approve, publish-as-human) demand a human gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustLevel {
+    #[default]
+    Full,
+    Reduced,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BusConfig {
@@ -38,6 +58,9 @@ pub struct BusConfig {
     /// Listener bind address. Loopback by default; binding wider is possible
     /// but discouraged until grants land (no authentication yet).
     pub bind: String,
+    /// The platform trust level (docs/handoffs/platform-trust.md). One value
+    /// for the whole installation; default `full`.
+    pub trust: TrustLevel,
 }
 
 impl Default for BusConfig {
@@ -45,6 +68,7 @@ impl Default for BusConfig {
         BusConfig {
             enabled: true,
             bind: "127.0.0.1:1883".into(),
+            trust: TrustLevel::Full,
         }
     }
 }
@@ -61,6 +85,13 @@ pub fn config(root: &Root) -> BusConfig {
             BusConfig::default()
         }
     }
+}
+
+/// The platform trust level (docs/handoffs/platform-trust.md), read fresh from
+/// `bus.toml`. Both the daemon and the web server call this; a missing, empty,
+/// or unparseable file defaults to `full` (the config() default).
+pub fn trust(root: &Root) -> TrustLevel {
+    config(root).trust
 }
 
 /// Where local processes connect: the configured port on loopback when the
@@ -424,6 +455,7 @@ mod tests {
         let cfg = |bind: &str| BusConfig {
             enabled: true,
             bind: bind.into(),
+            trust: TrustLevel::Full,
         };
         assert_eq!(
             connect_addr(&cfg("127.0.0.1:1883")).unwrap().to_string(),
@@ -445,5 +477,36 @@ mod tests {
         let c = BusConfig::default();
         assert!(c.enabled);
         assert!(c.bind.starts_with("127.0.0.1:"));
+        // The platform trust default is full — your own computer (M1).
+        assert_eq!(c.trust, TrustLevel::Full);
+    }
+
+    /// M1 (docs/handoffs/platform-trust.md): the trust level reads full on a
+    /// default install and reduced only when bus.toml sets it; a missing or
+    /// empty file defaults to full.
+    #[test]
+    fn trust_level_from_bus_toml() {
+        let dir = std::env::temp_dir().join(format!("elanus-trust-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root {
+            dir: dir.canonicalize().unwrap(),
+        };
+        // Missing file → full.
+        assert_eq!(trust(&root), TrustLevel::Full, "no bus.toml ⇒ full");
+        // Empty file → full (serde default over deny_unknown_fields).
+        std::fs::write(root.bus_file(), "").unwrap();
+        assert_eq!(trust(&root), TrustLevel::Full, "empty bus.toml ⇒ full");
+        // Explicit full.
+        std::fs::write(root.bus_file(), "trust = \"full\"\n").unwrap();
+        assert_eq!(config(&root).trust, TrustLevel::Full);
+        // Explicit reduced.
+        std::fs::write(
+            root.bus_file(),
+            "enabled = true\nbind = \"127.0.0.1:1883\"\ntrust = \"reduced\"\n",
+        )
+        .unwrap();
+        assert_eq!(config(&root).trust, TrustLevel::Reduced, "reduced when set");
+        assert_eq!(trust(&root), TrustLevel::Reduced);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

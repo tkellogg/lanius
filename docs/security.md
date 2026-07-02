@@ -268,6 +268,31 @@ the owner name + secret once at startup; with the configurable owner name
 (entry-free identity work), a rename needs a re-read or per-request resolution
 so the surface follows the renamed owner without a restart.)
 
+**[PARTIAL CLOSE 2026-07-01 — reduced trust, docs/handoffs/platform-trust.md
+M5]** The platform trust level (`bus.toml` `trust`, fenced from agents by the
+cage — entry off the ledger/profiles fence) now gates this deputy by posture:
+
+- At **reduced** trust (a shared or remote machine) the mutating routes that
+  spend the human credential — `POST /api/publish` and every `POST
+  /api/admin/*` (approve/revoke, agent settings) — require a human gesture,
+  which the server recognizes as a present, *local* `Origin` header (a real
+  browser fetch always sends one). A caged agent's no-Origin loopback `curl`
+  presents no proof and is refused. So the confused-deputy side door is closed
+  for high-stakes actions on machines that declare themselves exposed. Free
+  reads (GET) and converse are unaffected — the browser sends Origin.
+- At **full** trust (your own computer) nothing changes: a no-Origin local
+  request still passes, the historical behavior. This is the deliberate choice
+  — on a trusted personal machine the loopback deputy is acceptable, exactly
+  the same call as rendering agent raw-HTML at full trust.
+
+**What remains open:** full trust is still a free deputy by design, so entry 13
+is not fully closed — a full-trust install has the same loopback exposure as
+before. The Origin-presence gesture is a coarse proxy for "a human did this,"
+not a cryptographic proof (a local process that forges a loopback `Origin`
+header would still pass); the stronger fixes named above (a passkey/notification
+tap, or an OS network-cage denying caged actors loopback egress to the web port)
+are still the endgame. Verified: `web::route_tests::human_proof_gate_tightens_at_reduced_trust`.
+
 ## 14. [LATENT] Phonebook identity directory over unauthenticated loopback HTTP
 
 The phonebook package (docs/identity.md) serves its read plane — `POST /query`

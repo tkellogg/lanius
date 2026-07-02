@@ -97,7 +97,10 @@ impl CagePolicy {
 ///   stops an actor granting itself authority by editing the database. The
 ///   `-shm` index is spared: read-only consumers (the history view) need it,
 ///   and it cannot conjure an approved row while the db and its log are
-///   write-denied.
+///   write-denied. `bus.toml` is fenced here too (docs/handoffs/platform-
+///   trust.md): it carries the platform trust level, so a caged agent that
+///   could write it would raise its own trust. Readable (the platform stage
+///   reads it), never writable.
 /// - `deny_write_trees`: the profiles directory — a profile confers authority
 ///   (writable prefixes, model, skill visibility) with no grant gate, so an
 ///   agent editing one would escalate — and the config repo (its `live` tree
@@ -122,7 +125,9 @@ impl Protect {
         let db = root.db();
         let wal = db.with_extension("db-wal");
         Protect {
-            deny_write_files: vec![db, wal],
+            // bus.toml carries the platform trust level (M2) — write-fenced so a
+            // caged agent cannot raise its own trust; still readable.
+            deny_write_files: vec![db, wal, root.bus_file()],
             // profiles confer authority; the config repo (live tree + .git) is
             // kernel-owned truth an agent must not silently rewrite — both are
             // readable but write-fenced (docs/config.md). The agent proposes
@@ -1072,6 +1077,29 @@ mod tests {
         assert!(
             db_read.status.success(),
             "reading the ledger from the cage must succeed"
+        );
+
+        // bus.toml carries the platform trust level (M2, platform-trust.md):
+        // fenced even though it sits in the write root — a caged actor may read
+        // it (the platform stage does) but never write it, so it cannot raise
+        // its own trust. Mirrors the ledger case above.
+        let bus = root.bus_file();
+        std::fs::write(&bus, "trust = \"full\"\n").unwrap(); // the human/kernel writes it uncaged
+        let bus_write = cage
+            .shell_command(&format!("echo x >> {}", bus.display()))
+            .output()
+            .unwrap();
+        assert!(
+            !bus_write.status.success(),
+            "writing bus.toml from the cage must fail (it holds the trust level)"
+        );
+        let bus_read = cage
+            .shell_command(&format!("cat {} > /dev/null", bus.display()))
+            .output()
+            .unwrap();
+        assert!(
+            bus_read.status.success(),
+            "reading bus.toml from the cage must succeed"
         );
 
         // The secret store is unreadable from the cage.
