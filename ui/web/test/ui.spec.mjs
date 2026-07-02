@@ -1428,7 +1428,7 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
-// ── flow 6d: timers — a scheduled self-wake fires, and its message is replyable ─
+// ── flow 6f: timers — a scheduled self-wake fires, and its message is replyable ─
 // docs/handoffs/timers.md M5 (the sanctioned split). Two halves, provider-free:
 //  (ledger) `elanus schedule` inserts a one-shot row; the LIVE daemon's
 //    tick_schedules fires it once into in/agent/<agent> — schedule→fire proven
