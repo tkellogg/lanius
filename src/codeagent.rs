@@ -76,6 +76,14 @@ use std::path::{Path, PathBuf};
 pub const ENV_SESSION: &str = "ELANUS_CODE_SESSION";
 pub const ENV_AGENT: &str = "ELANUS_CODE_AGENT";
 
+/// Set on the child when the launcher's own launch-time bus publish already
+/// failed (docs/handoffs/bus-resilience.md M2). The launcher and the tool child
+/// (or its per-hook subprocesses) are distinct processes with distinct
+/// once-per-session state; seeding the child "already warned + degraded" keeps a
+/// launch-time-down session to ONE warning across the pair instead of one per
+/// process, while a mid-session recovery still prints exactly one reconnect line.
+const ENV_BUS_DEGRADED: &str = "ELANUS_BUS_DEGRADED";
+
 /// Internal launch-control env vars used by `elanus code spawn`.
 ///
 /// `ELANUS_CODE_FORCE_SESSION` lets a detached wrapper process use the worker
@@ -3097,7 +3105,7 @@ fn launch_external_harness(
     let summary_path = scratch.join("adapter-summary.json");
 
     let prompt = (!args.is_empty()).then(|| args.join(" "));
-    let brief_text = want_brief.then(|| briefing(&session));
+    let mut brief_text = want_brief.then(|| briefing(&session));
     // The workdir-derived coordination room (SA1) — same as a built-in session, so the
     // external adapter's auto-claims land where siblings see them.
     let room = resolve_room(room.as_deref(), &workdir);
@@ -3132,8 +3140,12 @@ fn launch_external_harness(
             std::process::id() as i32,
         );
 
-        // Emit the same launch envelope the direct path used to own.
-        publish_obs(
+        // Emit the same launch envelope the direct path used to own. If the
+        // launch-time publish already fails (the bus is down at launch), the
+        // session is uncaptured from turn one — tell the AGENT so via a briefing
+        // note, so it does not confidently claim "I filed my mail" against a dark
+        // trace (docs/handoffs/bus-resilience.md wonky bit 5; journey-14).
+        let captured = publish_obs_captured(
             root,
             &principal,
             &bus_token,
@@ -3149,6 +3161,20 @@ fn launch_external_harness(
                 "provider": provider,
             }),
         );
+        if !captured {
+            let note = "[elanus] NOTE: elanus can't reach its message bus, so this \
+                session is UNCAPTURED — nothing you do is being recorded, no sibling \
+                awareness, no mail can reach you, and any `spawn`/`deliver` you attempt \
+                will not be delivered. Do the work, but do NOT claim you filed mail or \
+                dispatched a worker; tell your human the bus is down.";
+            brief_text = Some(match brief_text.take() {
+                Some(b) => format!("{note}\n\n{b}"),
+                None => note.to_string(),
+            });
+        }
+        // Seed the child "already warned" when we launched into a down bus, so the
+        // launcher + adapter (or per-hook) processes print ONE warning, not one each.
+        let launched_degraded = !captured;
 
         let mut cmd = std::process::Command::new(&adapter);
         scrub_launch_control_env(&mut cmd);
@@ -3169,6 +3195,9 @@ fn launch_external_harness(
         }
         if let Some(provider) = provider {
             cmd.env(crate::harness::ENV_PROVIDER, provider);
+        }
+        if launched_degraded {
+            cmd.env(ENV_BUS_DEGRADED, "1");
         }
         cmd.env(crate::harness::ENV_SUMMARY_FILE, &summary_path);
         // The FULL raw argv (harness flags + prompt) — real adapters split it via
@@ -7202,6 +7231,47 @@ fn claude_settings(self_exe: &Path, root: &Root) -> Value {
 /// effort: a publish failure (broker down) never breaks the coding session —
 /// the observation plane is QoS-0-droppable telemetry (docs/bus.md).
 pub fn publish_obs(root: &Root, principal: &str, token: &str, topic_name: &str, body: Value) {
+    let _ = publish_obs_captured(root, principal, token, topic_name, body);
+}
+
+/// Per-process soft-degrade state (docs/handoffs/bus-resilience.md wonky bit 5).
+/// `DEGRADED` is set the moment a publish fails unreachable and cleared when one
+/// succeeds again; `WARNED` gates the once-per-session "uncaptured" warning so a
+/// down broker drips ONE line into a TUI, not one per publish.
+static BUS_DEGRADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BUS_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Publish one observation, returning whether it was CAPTURED (reached the
+/// broker). The soft-degrade contract (docs/handoffs/bus-resilience.md M2):
+/// - broker down: the FIRST failure prints one loud, plain warning that the
+///   session is now uncaptured; subsequent failures are silent; a later success
+///   (opportunistic — the next publish just dials fresh and connects) prints one
+///   "reconnected" line. Per-process, no config.
+/// - broker refuses the credential (Denied): LOUD every time — an auth fact,
+///   never soft-degraded, never opportunistically retried past.
+/// The launch path uses the return value to tell the agent itself its trace is
+/// dark (an uncaptured session that doesn't know it is uncaptured would
+/// confidently claim "I filed my mail" — journey-14: tell the agent).
+pub fn publish_obs_captured(
+    root: &Root,
+    principal: &str,
+    token: &str,
+    topic_name: &str,
+    body: Value,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    // Inherit the launcher's degraded verdict once per process: a child spawned by
+    // a launcher whose launch-time publish already failed starts "already warned"
+    // so the pair prints one warning, not one each. If the child then reaches the
+    // broker (recovery), the reconnect line fires exactly as for an in-process
+    // recovery — the DEGRADED flag is set here, so the first success clears it.
+    static DEGRADED_SEED: std::sync::Once = std::sync::Once::new();
+    DEGRADED_SEED.call_once(|| {
+        if std::env::var(ENV_BUS_DEGRADED).is_ok_and(|v| !v.is_empty()) {
+            BUS_WARNED.store(true, Ordering::SeqCst);
+            BUS_DEGRADED.store(true, Ordering::SeqCst);
+        }
+    });
     // buscli::publish reads ELANUS_PACKAGE/ELANUS_BUS_TOKEN from the environment.
     // In the launcher process those aren't set (only the child's were), so set
     // them for this publish; the hook process already has them. Setting them
@@ -7217,14 +7287,76 @@ pub fn publish_obs(root: &Root, principal: &str, token: &str, topic_name: &str, 
     let result = if tokio::runtime::Handle::try_current().is_ok() {
         let root = root.clone();
         let topic = topic_name.to_string();
-        std::thread::spawn(move || buscli::publish(&root, &topic, Some(&payload), 0, false, None))
-            .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("obs publish thread panicked")))
+        std::thread::spawn(move || {
+            buscli::publish_typed(&root, &topic, Some(&payload), 0, false, None)
+        })
+        .join()
+        .unwrap_or_else(|_| Err(buscli::BusError::Other("obs publish thread panicked".into())))
     } else {
-        buscli::publish(root, topic_name, Some(&payload), 0, false, None)
+        buscli::publish_typed(root, topic_name, Some(&payload), 0, false, None)
     };
-    if let Err(e) = result {
-        eprintln!("[code] obs publish to {topic_name} failed (continuing): {e:#}");
+    let (captured, notice) = degrade_decision(result.as_ref(), &BUS_WARNED, &BUS_DEGRADED);
+    if let Some(line) = notice {
+        eprintln!("{line}");
+    }
+    captured
+}
+
+/// The once-per-session soft-degrade state machine (docs/handoffs/bus-resilience.md
+/// M2), pure over its two atomics so it can be unit-tested without a broker.
+/// Returns `(captured, Some(line_to_print))` — the caller does the I/O.
+///
+/// - Ok: captured; if we WERE degraded, clear it and emit ONE reconnect line
+///   (the swap is what makes "exactly one" hold even across threads).
+/// - Denied: not captured; emit the auth warning EVERY time (an auth fact, never
+///   soft-degraded or opportunistically retried past — wonky bit 4).
+/// - Unreachable/Other: not captured; set degraded and emit the uncaptured
+///   warning ONLY on the first failure of a degraded stretch (the drip fix).
+fn degrade_decision(
+    result: std::result::Result<&(), &buscli::BusError>,
+    warned: &std::sync::atomic::AtomicBool,
+    degraded: &std::sync::atomic::AtomicBool,
+) -> (bool, Option<String>) {
+    use std::sync::atomic::Ordering;
+    match result {
+        Ok(()) => {
+            if degraded.swap(false, Ordering::SeqCst) {
+                warned.store(false, Ordering::SeqCst);
+                return (
+                    true,
+                    Some(
+                        "[elanus] message bus reachable again — capture resumed for this session."
+                            .to_string(),
+                    ),
+                );
+            }
+            (true, None)
+        }
+        Err(e) if e.is_denied() => (
+            false,
+            Some(format!(
+                "[elanus] message bus REFUSED this session's credential ({e}). \
+                 This is an authorization failure, not a bus-down — it will keep \
+                 failing until the credential is fixed; elanus will not silently \
+                 retry past it."
+            )),
+        ),
+        Err(_unreachable) => {
+            degraded.store(true, Ordering::SeqCst);
+            if warned.swap(true, Ordering::SeqCst) {
+                (false, None) // already warned this degraded stretch — stay quiet
+            } else {
+                (
+                    false,
+                    Some(
+                        "[elanus] can't reach the message bus — this session continues \
+                         UNCAPTURED (no record, no sibling awareness, no mail) until it \
+                         reconnects. Further bus errors are silenced until then."
+                            .to_string(),
+                    ),
+                )
+            }
+        }
     }
 }
 
@@ -7282,6 +7414,53 @@ fn clip(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    /// The soft-degrade state machine (docs/handoffs/bus-resilience.md M2): a
+    /// down bus warns ONCE per degraded stretch (not per publish — the drip fix),
+    /// a recovery emits ONE reconnect line, and a Denied credential is loud on
+    /// EVERY occurrence (an auth fact, never soft-degraded).
+    #[test]
+    fn degrade_decision_warns_once_reconnects_once_and_is_loud_on_denied() {
+        let warned = AtomicBool::new(false);
+        let degraded = AtomicBool::new(false);
+        let unreachable = buscli::BusError::Unreachable("down".into());
+        let denied = buscli::BusError::Denied("nope".into());
+
+        // First unreachable failure: not captured, ONE uncaptured warning.
+        let (cap, note) = degrade_decision(Err(&unreachable), &warned, &degraded);
+        assert!(!cap);
+        assert!(note.as_deref().unwrap().contains("UNCAPTURED"));
+
+        // Subsequent failures in the same degraded stretch are silent.
+        let (cap, note) = degrade_decision(Err(&unreachable), &warned, &degraded);
+        assert!(!cap);
+        assert!(note.is_none(), "second failure is silent, got {note:?}");
+
+        // Recovery: captured, ONE reconnect line, and the flags reset so a later
+        // outage warns again.
+        let (cap, note) = degrade_decision(Ok(&()), &warned, &degraded);
+        assert!(cap);
+        assert!(note.as_deref().unwrap().contains("reachable again"));
+
+        // A steady-state success (not degraded) is silent.
+        let (cap, note) = degrade_decision(Ok(&()), &warned, &degraded);
+        assert!(cap);
+        assert!(note.is_none());
+
+        // A new outage after recovery warns again (one warning per stretch).
+        let (_, note) = degrade_decision(Err(&unreachable), &warned, &degraded);
+        assert!(note.as_deref().unwrap().contains("UNCAPTURED"));
+
+        // Denied is loud EVERY time and names authorization, regardless of the
+        // warned/degraded flags — never soft-degraded.
+        for _ in 0..3 {
+            let (cap, note) = degrade_decision(Err(&denied), &warned, &degraded);
+            assert!(!cap);
+            let line = note.expect("denied always prints");
+            assert!(line.contains("authorization") && line.contains("REFUSED"));
+        }
+    }
 
     #[test]
     fn tool_aliases_normalize_for_dispatch() {

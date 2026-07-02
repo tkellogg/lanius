@@ -367,7 +367,7 @@ fn encode_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
     frame(0x30, &body) // QoS 0, no dup, no retain — no packet id
 }
 
-fn read_connack(s: &mut TcpStream) -> std::io::Result<()> {
+fn read_connack<R: Read>(s: &mut R) -> std::io::Result<()> {
     let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
     let mut b0 = [0u8; 1];
     s.read_exact(&mut b0)?;
@@ -390,8 +390,20 @@ fn read_connack(s: &mut TcpStream) -> std::io::Result<()> {
     }
     let mut body = vec![0u8; len];
     s.read_exact(&mut body)?;
+    // body[1] is the CONNACK reason code (0x00 = success). Keep the down-vs-denied
+    // distinction legible even here on the mirror path, where the error is
+    // swallowed by design (the daemon never dies for the radio): an auth refusal
+    // (0x87 NotAuthorized / 0x86 bad credential / 0x85 bad client id) reads as
+    // "denied", anything else as a generic refusal — so a mirror that suddenly
+    // stops capturing on a credential fault says WHY in its (rare) log, rather than
+    // looking like a transient outage (docs/handoffs/bus-resilience.md wonky bit 4).
     if body.len() < 2 || body[1] != 0x00 {
-        return Err(bad("CONNACK refused"));
+        let reason = body.get(1).copied().unwrap_or(0xFF);
+        let msg = match reason {
+            0x85 | 0x86 | 0x87 => format!("CONNACK refused: not authorized (reason 0x{reason:02x})"),
+            other => format!("CONNACK refused (reason 0x{other:02x})"),
+        };
+        return Err(bad(&msg));
     }
     Ok(())
 }
@@ -448,6 +460,31 @@ mod tests {
         let tail = String::from_utf8_lossy(&f);
         assert!(tail.contains("kernel"));
         assert!(tail.contains("s3cr3t"));
+    }
+
+    // docs/handoffs/bus-resilience.md wonky bit 4: even on the swallowed mirror
+    // path the CONNACK refusal reason must be legible — an auth refusal names
+    // authorization so a suddenly-uncapturing mirror says WHY, not "outage".
+    #[test]
+    fn read_connack_distinguishes_success_auth_and_generic_refusal() {
+        // A clean CONNACK: fixed header 0x20, remaining length 2, flags 0, reason 0.
+        let ok = [0x20u8, 0x02, 0x00, 0x00];
+        assert!(read_connack(&mut &ok[..]).is_ok());
+
+        // NotAuthorized (0x87): refused, and the error names authorization.
+        let denied = [0x20u8, 0x02, 0x00, 0x87];
+        let err = read_connack(&mut &denied[..]).unwrap_err();
+        assert!(
+            err.to_string().contains("not authorized"),
+            "auth refusal is legible, got {err}"
+        );
+
+        // A non-auth failure reason (e.g. 0x80 unspecified) is a generic refusal,
+        // NOT labelled authorization.
+        let other = [0x20u8, 0x02, 0x00, 0x80];
+        let err = read_connack(&mut &other[..]).unwrap_err();
+        assert!(err.to_string().contains("refused"));
+        assert!(!err.to_string().contains("not authorized"));
     }
 
     #[test]

@@ -1262,6 +1262,51 @@ fn reconcile_lost_routes(root: &Root, conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// How stale a pending coding-session delivery may be before it is HELD rather
+/// than auto-driven (docs/handoffs/bus-resilience.md M3). A normal driven
+/// round-trip (spawn → worker → completion mail → planner resume) settles in
+/// seconds-to-minutes, and an idle session resumed the same day should still get
+/// its mail; a full day is well past both, so a delivery older than this is
+/// "from a previous session" — the exact surprise report (b) describes.
+const STALE_DELIVERY_HORIZON: chrono::Duration = chrono::Duration::hours(24);
+
+/// Should this pending delivery be HELD for confirmation instead of driven?
+/// Returns `Some(reason)` when the mail is stale — older than the horizon, or
+/// addressed BEFORE the target session record existed (a prior incarnation of a
+/// reused durable id) — else `None` (drive it normally). Timestamps that fail to
+/// parse are treated as NOT stale (fail-open toward delivery: a legible-but-odd
+/// timestamp must never silently swallow real mail).
+fn stale_delivery_reason(
+    conn: &Connection,
+    delivery_created_at: &str,
+    session: &str,
+) -> Result<Option<&'static str>> {
+    let Ok(delivered) = chrono::DateTime::parse_from_rfc3339(delivery_created_at) else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now();
+    if now.signed_duration_since(delivered.with_timezone(&chrono::Utc)) > STALE_DELIVERY_HORIZON {
+        return Ok(Some("older than the 24h delivery horizon"));
+    }
+    // Predating the target session's creation: mail addressed before this record
+    // existed belongs to a prior incarnation of a reused id, not to this session.
+    let session_created: Option<String> = conn
+        .query_row(
+            "SELECT created_at FROM code_sessions WHERE elanus_session=?1",
+            [session],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(sc) = session_created {
+        if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&sc) {
+            if delivered < created {
+                return Ok(Some("addressed before this session was created"));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Claim pending coding-session deliveries and hand each to its session's worker
 /// thread. A `pending` event whose topic `recognize_delivery` matches an existing
 /// `code-*` record is a drive: we mark it `running` (durability — replays on
@@ -1279,10 +1324,11 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
         corr: Option<String>,
         payload: Option<String>,
         sender: Option<String>,
+        created_at: String,
     }
     let pending: Vec<PendingDelivery> = {
         let mut stmt = conn.prepare(
-            "SELECT id, type, correlation_id, payload, sender FROM events
+            "SELECT id, type, correlation_id, payload, sender, created_at FROM events
              WHERE state='pending' AND type LIKE 'in/agent/%'
              ORDER BY priority DESC, id ASC LIMIT 100",
         )?;
@@ -1294,6 +1340,7 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
                     corr: r.get(2)?,
                     payload: r.get(3)?,
                     sender: r.get(4)?,
+                    created_at: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1305,6 +1352,7 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
         corr,
         payload,
         sender,
+        created_at,
     } in pending
     {
         if code.claimed.contains(&id) {
@@ -1313,6 +1361,35 @@ fn drive_code_deliveries(root: &Root, conn: &Connection, code: &mut CodeDrivers)
         let Some((session, _noun)) = crate::codeagent::recognize_delivery(root, &etype) else {
             continue; // not addressed to a known coding session — leave for dispatch_pending
         };
+        // Delivery scoping (docs/handoffs/bus-resilience.md M3, report (b)). The
+        // ledger scan has no time bound: an old `pending` in/agent/* row fires the
+        // instant its target session id resolves again — a `--resume` (or a boot
+        // re-pend) of a reused durable session id drives DAYS-old mail into what
+        // the human experiences as a fresh session. `recognize_delivery` already
+        // pins the address to the exact session id; the missing guard is age. Mail
+        // older than the horizon, or addressed BEFORE this session record existed
+        // (a prior incarnation of a reused id), is HELD — surfaced in the session's
+        // inbox for confirmation, never silently driven. A held row leaves the
+        // pending scan (state='held') so it neither re-fires nor drips; the human
+        // re-delivers it if they still want it.
+        if let Some(reason) = stale_delivery_reason(conn, &created_at, &session)? {
+            conn.execute(
+                "UPDATE events SET state='held', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id=?1 AND state='pending'",
+                [id],
+            )?;
+            trace::write(
+                root,
+                "obs/agent/code/delivery/held",
+                &trace::Ids {
+                    event_id: Some(id),
+                    correlation_id: corr.clone(),
+                    ..Default::default()
+                },
+                json!({ "session": session, "reason": reason, "created_at": created_at }),
+            );
+            continue;
+        }
         let pv: Value = payload
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
@@ -1905,6 +1982,154 @@ mod tests {
             "unrecognized in/agent event is left for dispatch"
         );
 
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// docs/handoffs/bus-resilience.md M3, report (b): the ledger scan had NO
+    /// time bound, so an old `pending` in/agent/* row fired the instant its target
+    /// session id resolved again — a resume (or boot re-pend) of a reused durable
+    /// id drove DAYS-old mail into a fresh-feeling session. The fix HOLDS a
+    /// stale delivery (older than the 24h horizon, or predating the session
+    /// record) instead of driving it, while a fresh delivery to the same session
+    /// still drives normally. This test FAILS on the old code (the stale row would
+    /// be claimed `running` and enqueued) and PASSES on the new.
+    #[test]
+    fn drive_holds_stale_delivery_and_drives_fresh() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-aaaa0001".into(),
+                native_session: "thread-1".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+                room: None,
+            },
+        )
+        .unwrap();
+
+        // Two deliveries to the SAME (recorded, drivable) session: one addressed
+        // days ago (the stale "previous session" prompt), one just now.
+        let stale = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "run the OLD task" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-aaaa0001")
+            },
+        )
+        .unwrap();
+        // Backdate it well past the 24h horizon.
+        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(48))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE events SET created_at=?1 WHERE id=?2",
+            params![old_ts, stale],
+        )
+        .unwrap();
+        let fresh = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "the task I just typed" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-aaaa0001")
+            },
+        )
+        .unwrap();
+
+        let mut code = CodeDrivers::default();
+        let (tx, rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-aaaa0001".into(), CodeWorker { tx, inflight: 0 });
+
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+
+        // The stale row is HELD, not driven: surfaced for confirmation, never a
+        // prompt the user didn't just type.
+        let stale_state: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [stale], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stale_state, "held", "stale mail is held, not driven");
+        assert!(
+            !code.claimed.contains(&stale),
+            "stale mail is never claimed for a resume"
+        );
+
+        // The fresh row drives normally.
+        let fresh_state: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [fresh], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fresh_state, "running", "fresh mail is claimed and driven");
+        assert!(code.claimed.contains(&fresh));
+
+        // Exactly the fresh delivery reached the worker — the stale one did not.
+        let job = rx.try_recv().expect("the fresh delivery was enqueued");
+        assert_eq!(job.event_id, fresh);
+        assert_eq!(job.message, "the task I just typed");
+        assert!(rx.try_recv().is_err(), "the stale delivery was NOT enqueued");
+
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// The "predates the session record" arm (docs/handoffs/bus-resilience.md M3):
+    /// mail addressed BEFORE this session id's record existed belongs to a prior
+    /// incarnation of a reused id, so it is held even when it is younger than the
+    /// 24h horizon.
+    #[test]
+    fn drive_holds_delivery_predating_session_creation() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::codesession::upsert_record(
+            &root,
+            &crate::codesession::SessionRecord {
+                elanus_session: "code-bbbb0002".into(),
+                native_session: "thread-2".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: root.dir.display().to_string(),
+                room: None,
+            },
+        )
+        .unwrap();
+        // Move the session record's creation to now+10min so the just-emitted
+        // delivery (now) predates it — the reused-id signature, without tripping
+        // the age horizon.
+        let future = (chrono::Utc::now() + chrono::Duration::minutes(10))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE code_sessions SET created_at=?1 WHERE elanus_session='code-bbbb0002'",
+            params![future],
+        )
+        .unwrap();
+
+        let mail = events::emit(
+            &root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({ "prompt": "stale for a rebound id" })),
+                pre_announced: true,
+                ..EmitOpts::new("in/agent/codex/code-bbbb0002")
+            },
+        )
+        .unwrap();
+
+        let mut code = CodeDrivers::default();
+        let (tx, rx) = std::sync::mpsc::channel::<CodeJob>();
+        code.workers
+            .insert("code-bbbb0002".into(), CodeWorker { tx, inflight: 0 });
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+
+        let state: String = conn
+            .query_row("SELECT state FROM events WHERE id=?1", [mail], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "held", "mail predating the record is held");
+        assert!(rx.try_recv().is_err(), "nothing enqueued");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 

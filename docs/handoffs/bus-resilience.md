@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -229,3 +229,71 @@ the captured obs trace). `cargo test` green.
   (b) hypotheses (2); M3 written as scoping criteria, mechanism chosen
   post-root-cause (3); loud-on-denied vs soft-on-down (4); once-per-session
   warning + the agent-visible "you are uncaptured" notice (5).
+
+- 2026-07-02 — **M1 root-cause (both reports).**
+  - **(a) NOT reproducible — already soft; closed with M2's visibility work
+    only.** Scripted probe `tests/bus_resilience_repro.sh` (scratch `ELANUS_ROOT`,
+    no daemon = broker down) launches `elanus code echo --headless`: the session
+    **survives** (exit 0, by the tool's own status), its work is **captured to
+    disk** (`code_claims` row present — capture is local sqlite, not the bus), and
+    the only defect the report was actually feeling surfaces as a **stderr drip** —
+    one `[code] obs publish … failed (continuing)` line *per publish* (five for a
+    one-turn echo). No hard-death path exists on this tree through any covered
+    route (`publish_obs` swallows at `codeagent.rs:7204`; `mint` is local; the
+    `session/start`/`stop` envelopes and all capture publishes are `publish_obs`;
+    the external-adapter child publishes through the same swallow). The genuine
+    hole confirmed: **down-vs-denied is indistinguishable** — a pure
+    connection-refused prints the same `connection failed (daemon running?)` a
+    refused CONNACK would (`buscli::publish` mapped every `ConnectionError`
+    through one anyhow `.context`; `bus::read_connack` returned an untyped
+    "CONNACK refused"). So (a) reduces to a *visibility* problem, exactly as
+    grounding predicted → fixed in M2, no hard-death fix needed.
+  - **(b) mechanism = the unbounded ledger scan driving stale mail into a reused
+    durable id (hypothesis ii, with (i) boot-re-pend as the same class).** Pinned
+    down deterministically in `src/dispatcher.rs`
+    `drive_holds_stale_delivery_and_drives_fresh`: an `in/agent/<noun>/<conv>`
+    delivery sits `pending` with **no time bound** (`drive_code_deliveries` scan,
+    `dispatcher.rs:1284-1287`), so the instant its target `code-*` record resolves
+    again — a `--resume`, or the boot `running→pending` re-pend
+    (`dispatcher.rs:189-192`) of a reused id — `recognize_delivery` matches it and
+    the daemon drives DAYS-old mail into what the human experiences as a fresh
+    session. QoS1/retained stays exonerated (the test needs no broker at all —
+    a ledger seed reproduces it). Hypothesis (iii), the native tool's *own*
+    `--resume` replaying its last prompt, is out of elanus's ledger and not
+    reproduced here; it is a tool-launch-flag concern, noted not fixed.
+
+- 2026-07-02 — **M2 shipped (soft-degrade contract + loud/quiet split).**
+  Typed the publish error (`buscli::BusError` = `Unreachable | Denied | Other`;
+  `publish_typed` classifies a rumqttc `ConnectionRefused` CONNACK as `Denied`,
+  everything else as `Unreachable`; `publish` unchanged for existing callers).
+  `read_connack` now makes an auth refusal legible even on the swallowed mirror
+  path. `publish_obs` collapses the drip via a pure, unit-tested state machine
+  (`degrade_decision` over two per-process atomics): **one** uncaptured warning
+  per degraded stretch, **one** reconnect line on the next successful publish,
+  and `Denied` is **loud every time** and named as authorization (never
+  "daemon running?"). The launch path tells the agent itself: when the
+  launch-time `session/start` publish fails, a briefing note warns the session it
+  is UNCAPTURED (do not claim mail was filed), and the child is seeded
+  `ELANUS_BUS_DEGRADED=1` so the launcher+adapter (and per-hook) processes emit
+  ONE warning, not one each. Verified: broker-down launch = exit 0, one warning,
+  zero drip, work on disk; broker-up = zero warnings. Tests:
+  `buscli::…refused_connack_is_denied…`,
+  `codeagent::…degrade_decision…`, `bus::…read_connack_distinguishes…`, and the
+  broker-down e2e `tests/external_harness.rs` re-runs green.
+
+- 2026-07-02 — **M3 shipped (delivery scoping).** `drive_code_deliveries` now
+  holds a stale delivery instead of driving it: a pending `in/agent/*` row older
+  than a 24h horizon, **or** addressed before its target session record existed
+  (a reused-id signature), is settled `state='held'` with an
+  `obs/agent/code/delivery/held` trace — surfaced in the session's inbox for
+  confirmation, never silently run. The horizon is generous enough that a normal
+  spawn→worker→completion round-trip and a same-day idle resume are unaffected
+  (existing delivery/idempotency tests stay green). Regression tests
+  `drive_holds_stale_delivery_and_drives_fresh` (fails on old code) and
+  `drive_holds_delivery_predating_session_creation`. **Deferred:** the boot
+  re-pend "settle-to-failure-mail when the target session is *gone*" variant was
+  not needed — a delivery to a vanished record already never drives
+  (`recognize_delivery` returns `None`, leaving it for `dispatch_pending`); the
+  hole was stale mail to a *surviving* record, which the hold closes. Report
+  (b)'s hypothesis (iii) (the native tool's own `--resume`) is also deferred —
+  it lives in launch-flag territory, not the ledger.
