@@ -1320,6 +1320,93 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
+// ── flow 6d: timers — a scheduled self-wake fires, and its message is replyable ─
+// docs/handoffs/timers.md M5 (the sanctioned split). Two halves, provider-free:
+//  (ledger) `elanus schedule` inserts a one-shot row; the LIVE daemon's
+//    tick_schedules fires it once into in/agent/<agent> — schedule→fire proven
+//    on the running stack, not just a unit test.
+//  (ui) the ambient message a woken agent would send (send_message → in/human/
+//    <owner> carrying the run's session, source=timer) renders as a replyable,
+//    agent-initiated thread in #view-converse — the wake→send→render outcome.
+// The wake TURN itself (the LLM call between fire and send) is out of scope here
+// exactly as the handoff prescribes: it needs a model, which this stack lacks.
+{
+  const timerAgent = 'chrono';
+  const timerSession = `run-${timerAgent}-${Date.now().toString(36)}`;
+  const timerText = `reminder: the kettle is done (${Date.now().toString(36)})`;
+  const emitAs = (actor, ...a) =>
+    execFileSync(path.join(BIN, 'elanus'), a, { env: { ...ENV, ELANUS_ACTOR: actor }, encoding: 'utf8' });
+
+  const seedPage = await newPage();
+  await seedPage.goto('/');
+  const created = await seedPage.evaluate(async (name) => {
+    const r = await fetch('/api/admin/agents', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return r.json().catch(() => ({}));
+  }, timerAgent);
+  created.ok ? ok(`timers: created agent ${timerAgent}`) : fail(`timers: could not create ${timerAgent} (${JSON.stringify(created)})`);
+  await seedPage.close();
+
+  // (ledger) The CLI schedules a one-shot wake; the running daemon fires it.
+  // --in 0 is due immediately; the next tick emits in/agent/chrono exactly once.
+  try {
+    elanus('schedule', '--agent', timerAgent, '--in', '0', '--message', 'wake up and post the reminder');
+    ok('timers: elanus schedule inserted a one-shot wake');
+  } catch (e) { fail(`timers: elanus schedule failed: ${e.message ?? e}`); }
+  const mailbox = `in/agent/${timerAgent}`;
+  await waitFor('timers: the live daemon fires the scheduled wake onto the mailbox', async () => {
+    // `elanus events` reads the ledger the daemon writes; the fired one-shot
+    // shows up as an in/agent/<agent> row (state is irrelevant — no LLM here).
+    try { return elanus('events', '--limit', '50').includes(mailbox); }
+    catch { return false; }
+  }, 10000);
+
+  // (ui) The message the woken agent would send renders as a replyable thread.
+  try {
+    emitAs(timerAgent, 'emit', 'in/human/owner', '--payload',
+      JSON.stringify({ text: timerText, session: timerSession, source: 'timer' }));
+  } catch (e) { fail(`timers: seeding the woken send failed: ${e.message ?? e}`); }
+
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+  const timerConv = await page.evaluate(async (name) => {
+    const r = await fetch(`/api/conversations?agent=${encodeURIComponent(name)}`);
+    const j = await r.json().catch(() => ({}));
+    const convs = j.conversations ?? [];
+    return { ok: !!j.ok, sessions: convs.map((c) => c.session), sources: convs.map((c) => c.source) };
+  }, timerAgent);
+  timerConv.ok && timerConv.sessions.includes(timerSession) && timerConv.sources.every((s) => s !== 'you')
+    ? ok(`timers: the wake's message is an agent-initiated conversation (${JSON.stringify(timerConv.sources)})`)
+    : fail(`timers: the wake's message did not surface replyably (${JSON.stringify(timerConv)})`);
+
+  await waitFor(`timers: ${timerAgent} in nav`, async () => {
+    const items = await page.$$('#nav-agents .nav-agent');
+    for (const item of items) {
+      if ((await item.getAttribute('data-sel')) === `agent:${timerAgent}`) { await item.click(); return true; }
+    }
+    return false;
+  }, 10000);
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  await waitFor('timers: the wake message opens a replyable thread', async () => {
+    const rows = await page.$$('#nav-agents .nav-conversation');
+    for (const row of rows) {
+      const txt = (await row.textContent()) || '';
+      if (txt.includes(timerText)) { await row.click(); return true; }
+    }
+    return false;
+  }, 10000);
+  await waitFor('timers: the thread carries the agent-first message and a compose box', async () => {
+    const msgs = await page.$$eval('.conv-feed .msg', (els) => els.length).catch(() => 0);
+    const text = await page.$eval('#conv-holder', (el) => el.textContent).catch(() => '');
+    const canReply = await page.$('#compose-input');
+    return msgs >= 1 && text.includes(timerText) && !!canReply;
+  }, 10000);
+  await page.close();
+}
+
 // ── flow 7: history works out of the box ──────────────────────────────────────
 // history is stdlib, on at init, so the sessions tab is backed
 // by the real transcript view — NOT the unavailable-transcripts note —

@@ -200,6 +200,25 @@ enum Cmd {
         #[arg(long)]
         cause: Option<i64>,
     },
+    /// Schedule a one-shot self-wake for an agent (docs/handoffs/timers.md):
+    /// at the given time the harness delivers in/agent/<agent> a message and
+    /// the agent runs a turn. A trusted operator gesture — unlike the self-only
+    /// `schedule_event` tool, this may target any named agent's mailbox. Give
+    /// exactly one of --in / --at.
+    Schedule {
+        /// The agent noun to wake (its mailbox is in/agent/<agent>).
+        #[arg(long, default_value = "main")]
+        agent: String,
+        /// Wake this many seconds from now.
+        #[arg(long)]
+        r#in: Option<f64>,
+        /// Absolute rfc3339 time to wake at.
+        #[arg(long)]
+        at: Option<String>,
+        /// What to do on wake (the prompt the woken turn receives).
+        #[arg(long)]
+        message: String,
+    },
     /// Append a line to the flight recorder (for handlers in any language)
     Trace {
         kind: String,
@@ -807,6 +826,38 @@ fn run(cli: Cli) -> Result<()> {
                 },
             )?;
             println!("{id}");
+        }
+        Cmd::Schedule {
+            agent,
+            r#in,
+            at,
+            message,
+        } => {
+            let fire_at = match (r#in, at) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("schedule: give exactly one of --in or --at, not both")
+                }
+                (None, None) => anyhow::bail!("schedule: give one of --in or --at"),
+                (Some(secs), None) => (chrono::Utc::now()
+                    + chrono::Duration::milliseconds((secs * 1000.0) as i64))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                (None, Some(at)) => chrono::DateTime::parse_from_rfc3339(&at)?
+                    .with_timezone(&chrono::Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            };
+            let conn = open(&root)?;
+            // Trusted operator surface ("CLI is the API"): may target any named
+            // agent's mailbox, reusing M2's row shape. The wake carries no
+            // conversation session — a CLI-initiated reminder isn't threaded to
+            // a chat, so the send that closes the loop lands on the mailbox.
+            let emit_type = elanus::topic::agent_mailbox(&agent);
+            let payload = serde_json::json!({ "prompt": message, "session": Value::Null });
+            conn.execute(
+                "INSERT INTO scheduled_events(fire_at, emit_type, payload, created_by, fired)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                rusqlite::params![fire_at, emit_type, payload.to_string(), "cli"],
+            )?;
+            println!("scheduled {} to wake at {fire_at}", elanus::topic::agent_mailbox(&agent));
         }
         Cmd::Trace { kind, payload } => {
             let ids = trace::Ids::from_env();

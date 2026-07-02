@@ -252,6 +252,7 @@ fn tick(
         eprintln!("[daemon] drift sync: {e:#}");
     }
     tick_crons(root, conn)?;
+    tick_schedules(root, conn)?;
     expire_deadlines(root, conn)?;
     announce_ledger_events(root, conn)?;
     reap(root, conn, running)?;
@@ -652,6 +653,44 @@ fn tick_crons(root: &Root, conn: &Connection) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// One-shot schedules (docs/handoffs/timers.md): fire each due row once as a
+/// plain kernel emit, then mark it fired. A sibling of tick_crons on the same
+/// tick — not a rival clock. Durable + idempotent: the sched:<id> key dedupes
+/// the same firing across a restart or a crash between emit and the fired
+/// flip, and the fired flag skips already-delivered rows on the fast path.
+/// Authorization was decided at schedule time (the tool / the CLI); the fire
+/// has no reliable actor to re-authorize, so it does not re-check here.
+pub(crate) fn tick_schedules(root: &Root, conn: &Connection) -> Result<()> {
+    let now = trace::now_iso();
+    let rows: Vec<(i64, String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, emit_type, payload FROM scheduled_events
+             WHERE fired = 0 AND fire_at <= ?1",
+        )?;
+        let r = stmt
+            .query_map([&now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+    for (id, emit_type, payload) in rows {
+        events::emit(
+            root,
+            conn,
+            EmitOpts {
+                payload: payload.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+                // Dedupes this firing across daemon restarts / mid-fire crash.
+                idempotency: Some(format!("sched:{id}")),
+                ..EmitOpts::new(&emit_type)
+            },
+        )?;
+        conn.execute(
+            "UPDATE scheduled_events SET fired = 1 WHERE id = ?1",
+            params![id],
+        )?;
     }
     Ok(())
 }
@@ -1865,6 +1904,84 @@ mod tests {
             st, "pending",
             "unrecognized in/agent event is left for dispatch"
         );
+
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M3/M5 (docs/handoffs/timers.md): a one-shot schedule → fire → wake on the
+    /// ledger. A due `scheduled_events` row (as `elanus schedule` / the tool
+    /// insert) fires exactly one `in/agent/main` event carrying {prompt,session};
+    /// that event is a plain pending delivery — drive_code_deliveries leaves it
+    /// for the chat exec handler (wonky bit 4: `main` is not a coding session);
+    /// a future row waits; the fired flag + `sched:<id>` idempotency make a
+    /// restart (reopen) + re-sweep a no-op. The wake-turn (LLM) is out of scope
+    /// here — this is the ledger half of the sanctioned split.
+    #[test]
+    fn one_shot_schedule_fires_wakes_and_is_idempotent() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        let main_mb = crate::topic::agent_mailbox("main");
+
+        // Two rows exactly as the CLI/tool insert them: one due (past), one future.
+        let payload = json!({ "prompt": "post here", "session": "conv-7" }).to_string();
+        conn.execute(
+            "INSERT INTO scheduled_events(fire_at, emit_type, payload, created_by, fired)
+             VALUES ('2000-01-01T00:00:00.000Z', ?1, ?2, 'cli', 0)",
+            params![main_mb, payload],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scheduled_events(fire_at, emit_type, payload, created_by, fired)
+             VALUES ('2999-01-01T00:00:00.000Z', ?1, '{}', 'cli', 0)",
+            params![main_mb],
+        )
+        .unwrap();
+
+        tick_schedules(&root, &conn).unwrap();
+
+        // Exactly one in/agent/main event, carrying the wake payload.
+        let (n, pl): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(payload) FROM events WHERE type = ?1",
+                [&main_mb],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the due schedule fires exactly one in/agent/main");
+        let pl: Value = serde_json::from_str(&pl.unwrap()).unwrap();
+        assert_eq!(pl["prompt"], "post here");
+        assert_eq!(pl["session"], "conv-7", "the wake carries the turn's session");
+        // The future row is untouched.
+        let unfired: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scheduled_events WHERE fired = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unfired, 1, "the future schedule has not fired");
+
+        // Wonky bit 4: the fired event is NOT a coding-session delivery, so
+        // drive_code_deliveries leaves it pending for the chat exec handler.
+        let mut code = CodeDrivers::default();
+        drive_code_deliveries(&root, &conn, &mut code).unwrap();
+        let st: String = conn
+            .query_row(
+                "SELECT state FROM events WHERE type = ?1",
+                [&main_mb],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st, "pending", "a self-wake falls through to dispatch, not code drive");
+        assert!(code.claimed.is_empty(), "no coding session claims a self-wake");
+
+        // Restart durability + idempotency: reopen the db and re-sweep — the
+        // fired row does not re-fire (fired flag; sched:<id> key backstops it).
+        drop(conn);
+        let conn2 = db::open(&root).unwrap();
+        db::init_schema(&conn2).unwrap();
+        tick_schedules(&root, &conn2).unwrap();
+        let n2: i64 = conn2
+            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&main_mb], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 1, "a fired schedule never re-fires across a restart");
 
         let _ = std::fs::remove_dir_all(&root.dir);
     }

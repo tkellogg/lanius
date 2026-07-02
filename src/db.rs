@@ -230,6 +230,22 @@ CREATE TABLE IF NOT EXISTS crons (
   UNIQUE(skill, emit_type, schedule)
 );
 
+-- One-shot schedules: fire a single event once at an absolute future time.
+-- Unlike crons (recurring 5-field expressions), these fire once and stay
+-- fired. Swept by tick_schedules() beside tick_crons() on the same daemon
+-- tick — a sibling sweep, not a second clock. Durable: rows persist a
+-- restart; the fired flag plus the sched:<id> idempotency key make a
+-- mid-fire crash replay a no-op.
+CREATE TABLE IF NOT EXISTS scheduled_events (
+  id         INTEGER PRIMARY KEY,
+  fire_at    TEXT NOT NULL,
+  emit_type  TEXT NOT NULL,
+  payload    TEXT,
+  created_by TEXT,
+  fired      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sched_pending ON scheduled_events(fired, fire_at);
+
 -- The grants ledger: capability requests and decisions, pinned to manifest
 -- hashes (docs/bus.md, Packages). Append-shaped: a revocation is a state
 -- flip with provenance, never a deletion — the ledger reads as a capability

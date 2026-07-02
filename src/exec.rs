@@ -1480,6 +1480,26 @@ fn tool_defs() -> Vec<Tool> {
                 },
                 "required": ["type"]
             })),
+        Tool::new("schedule_event")
+            .with_description(
+                "Schedule a one-shot self-wake: at the given time the harness delivers your own \
+                 mailbox a message and you run a turn to act on it. Use this to remind yourself or \
+                 to do something later — 'post here in 5 seconds', 'check back in an hour'. Give \
+                 exactly one of `in_seconds` (relative) or `at` (an rfc3339 timestamp), and a \
+                 `message` describing what to do on wake. It fires ONCE and does not repeat: to \
+                 recur, schedule again on each wake. The target is always YOU — you cannot wake \
+                 another agent with this. On wake, if you want to reach the person, call \
+                 send_message.",
+            )
+            .with_schema(json!({
+                "type": "object",
+                "properties": {
+                    "in_seconds": { "type": "number", "description": "wake this many seconds from now" },
+                    "at": { "type": "string", "description": "absolute rfc3339 time to wake at" },
+                    "message": { "type": "string", "description": "what to do when you wake" }
+                },
+                "required": ["message"]
+            })),
         Tool::new("fs_lease")
             .with_description(
                 "Acquire an exclusive write lease (&mut) on a directory subtree before mutating it. \
@@ -1878,7 +1898,16 @@ fn run_tool(
             // sender fallback). Without this refusal an agent could mint
             // in/dm/... or in/human/<owner> events and poison another
             // agent's recall or forge owner mail (security.md entry 15).
-            if etype.starts_with("in/") {
+            //
+            // Carve-out (journey 14, agent continuity): the running agent may
+            // address its OWN mailbox to wake itself — self-messaging is
+            // neither cross-agent poisoning nor owner forgery. Equality on
+            // agent_mailbox(prof.agent), NOT a prefix: prof.agent is the
+            // kernel-known noun (not agent-supplied), and a prefix check on
+            // "in/agent/" would let in/agent/<someone-else> through. Every
+            // other in/... — including another agent's mailbox — stays refused.
+            let own_mailbox = crate::topic::agent_mailbox(&prof.agent);
+            if etype.starts_with("in/") && etype != own_mailbox {
                 return err(
                     "emit_event: the in/ plane is reserved for ingress; use send_message or \
                      ask_human to reach your owner"
@@ -1901,6 +1930,52 @@ fn run_tool(
                 }
                 Err(e) => err(format!("emit failed: {e:#}")),
             }
+        }
+        "schedule_event" => {
+            let Some(message) = args["message"].as_str() else {
+                return err("schedule_event: missing 'message'".into());
+            };
+            // Require exactly one of in_seconds / at.
+            let in_seconds = args["in_seconds"].as_f64();
+            let at = args["at"].as_str();
+            let fire_at = match (in_seconds, at) {
+                (Some(_), Some(_)) => {
+                    return err(
+                        "schedule_event: give exactly one of 'in_seconds' or 'at', not both".into(),
+                    )
+                }
+                (None, None) => {
+                    return err("schedule_event: give one of 'in_seconds' or 'at'".into())
+                }
+                (Some(secs), None) => (chrono::Utc::now()
+                    + chrono::Duration::milliseconds((secs * 1000.0) as i64))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                (None, Some(at)) => match chrono::DateTime::parse_from_rfc3339(at) {
+                    Ok(dt) => dt
+                        .with_timezone(&chrono::Utc)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    Err(e) => return err(format!("schedule_event: 'at' is not rfc3339: {e}")),
+                },
+            };
+            // Target is SELF only — never taken from args (same guard as the
+            // emit_event carve-out): the row fires as a plain kernel emit with
+            // no reliable actor to re-authorize, so the "may I wake myself"
+            // decision is made once, here, where prof.agent is trustworthy
+            // (wonky bit 3). The wake carries the prompt + this turn's session
+            // so the woken turn threads its reply back to the right chat.
+            let emit_type = crate::topic::agent_mailbox(&prof.agent);
+            let payload = json!({ "prompt": message, "session": session });
+            if let Err(e) = conn.execute(
+                "INSERT INTO scheduled_events(fire_at, emit_type, payload, created_by, fired)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                params![fire_at, emit_type, payload.to_string(), prof.agent],
+            ) {
+                return err(format!("schedule_event: insert failed: {e:#}"));
+            }
+            let id = conn.last_insert_rowid();
+            ToolOutcome::Output(
+                json!({ "scheduled": true, "id": id, "fire_at": fire_at }).to_string(),
+            )
         }
         "send_message" => {
             let Some(text) = args["text"].as_str() else {
@@ -2676,6 +2751,54 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0, "a refused emit must not land a ledger row");
 
+        // A tiny driver so the carve-out cases read as a table.
+        let emit_type = |t: &str| {
+            let call = ToolCall {
+                call_id: "e".into(),
+                fn_name: "emit_event".into(),
+                fn_arguments: json!({ "type": t }),
+                thought_signatures: None,
+            };
+            let mut se = HashSet::new();
+            let out = run_tool(
+                &root, &conn, &cage, &prof, "s1", None, None, false, &call, &mut se, &mcp_pool,
+            );
+            let ToolOutcome::Output(raw) = out else {
+                panic!("expected an Output outcome");
+            };
+            serde_json::from_str::<Value>(&raw).unwrap()
+        };
+        let row_count = |t: &str| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [t], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+
+        // M1 carve-out: the running agent's OWN mailbox is permitted and lands.
+        let own = crate::topic::agent_mailbox(&prof.agent);
+        let v = emit_type(&own);
+        assert!(
+            v["emitted_event_id"].as_i64().is_some(),
+            "self-addressed wake must succeed: {v}"
+        );
+        assert_eq!(row_count(&own), 1, "the self-wake lands one ledger row");
+
+        // Everything else under in/ still refuses with no row — crucially
+        // ANOTHER agent's mailbox (guard is equality, not an in/agent/ prefix).
+        for forged in [
+            crate::topic::agent_mailbox("victim"),
+            "in/dm/bluesky/somebody".to_string(),
+            crate::topic::human_mailbox(&prof.owner),
+        ] {
+            let v = emit_type(&forged);
+            assert!(
+                v["error"].as_str().is_some(),
+                "in/... other than self must refuse: {forged} -> {v}"
+            );
+            assert_eq!(row_count(&forged), 0, "a refused emit lands no row: {forged}");
+        }
+
         let ok_call = ToolCall {
             call_id: "c2".into(),
             fn_name: "emit_event".into(),
@@ -2743,6 +2866,99 @@ mod tests {
             crate::topic::human_mailbox(&prof.owner),
             "send_message keeps landing on the owner's mailbox through its own arm"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // M2 (docs/handoffs/timers.md): the one-shot schedule primitive. The tool
+    // inserts a self-targeted row; tick_schedules fires a due row exactly once
+    // (idempotent across sweeps); a future row waits; the target is self-only
+    // regardless of what the args try to say.
+    #[test]
+    fn schedule_event_inserts_and_fires_once() {
+        let dir = std::env::temp_dir().join(format!("el-sched-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let prof = profile::Profile::default();
+        let cage = sandbox::Cage::from_profile(&root, &prof.sandbox);
+        let mcp_pool = crate::mcp::Pool::default();
+        let own = crate::topic::agent_mailbox(&prof.agent);
+
+        let call = |args: Value| {
+            let c = ToolCall {
+                call_id: "s".into(),
+                fn_name: "schedule_event".into(),
+                fn_arguments: args,
+                thought_signatures: None,
+            };
+            let mut se = HashSet::new();
+            let out = run_tool(
+                &root, &conn, &cage, &prof, "conv-1", None, None, false, &c, &mut se, &mcp_pool,
+            );
+            let ToolOutcome::Output(raw) = out else {
+                panic!("expected an Output outcome");
+            };
+            serde_json::from_str::<Value>(&raw).unwrap()
+        };
+
+        // in_seconds inserts one row targeting the caller's OWN mailbox, with a
+        // future fire_at and the wake payload (prompt + this turn's session).
+        let v = call(json!({ "in_seconds": 3600, "message": "check the oven" }));
+        assert!(v["scheduled"].as_bool().unwrap_or(false), "scheduled: {v}");
+        let (emit_type, payload, created_by, fired): (String, String, String, i64) = conn
+            .query_row(
+                "SELECT emit_type, payload, created_by, fired FROM scheduled_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(emit_type, own, "targets the caller's own mailbox");
+        assert_eq!(created_by, prof.agent, "provenance = the scheduling agent");
+        assert_eq!(fired, 0, "not fired yet");
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["prompt"], "check the oven");
+        assert_eq!(payload["session"], "conv-1", "carries the turn's session");
+
+        // A future row is NOT fired by a sweep.
+        crate::dispatcher::tick_schedules(&root, &conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&own], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "a future schedule does not fire");
+
+        // Self-only: even if the args try to name another target, the row lands
+        // on the caller's own mailbox (target is never taken from args).
+        let _ = call(json!({ "in_seconds": 3600, "message": "x", "type": crate::topic::agent_mailbox("victim"), "agent": "victim" }));
+        let victim: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scheduled_events WHERE emit_type = ?1",
+                [crate::topic::agent_mailbox("victim")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(victim, 0, "the tool cannot schedule another agent's mailbox");
+
+        // Force a due row and sweep: it fires exactly one event and flips fired.
+        conn.execute("UPDATE scheduled_events SET fire_at = '2000-01-01T00:00:00.000Z'", [])
+            .unwrap();
+        crate::dispatcher::tick_schedules(&root, &conn).unwrap();
+        let fired_events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&own], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fired_events, 2, "both due rows fired one in/agent/<noun> each");
+        let unfired: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scheduled_events WHERE fired = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unfired, 0, "every fired row flips fired = 1");
+
+        // A second sweep is a no-op — idempotent (the fired flag + sched:<id>).
+        crate::dispatcher::tick_schedules(&root, &conn).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&own], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 2, "a re-sweep does not re-fire");
 
         std::fs::remove_dir_all(&dir).ok();
     }

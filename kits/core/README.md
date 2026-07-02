@@ -18,6 +18,10 @@ running inside it, plus the escalation path to a stronger model.
   mid-cycle), shared-room edit claims and the opt-in channel block, and the
   failure-mail contract. Read before dispatching work or coordinating with
   siblings.
+- **self-scheduling** — wake yourself later: the `schedule_event` bus
+  primitive (a daemon-driven agent schedules a one-shot self-message; it
+  fires once, targets only you, and survives restarts) and the OS fallbacks
+  (`at`/`launchd`/`sleep`) for bus-less coding workers. Content-only.
 - **estimation** — work estimation as an additive bolt-on: `elanus estimate
   set/actual/retro`, the per-model `pricing.toml` that turns token usage into
   dollars, and a cron `sweep` backstop for the retro. No kernel data model —
