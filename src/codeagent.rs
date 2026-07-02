@@ -1020,8 +1020,23 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str, provider: Option<&str>) -> R
         cmd.process_group(0);
     }
 
-    cmd.spawn()
+    let child = cmd
+        .spawn()
         .with_context(|| format!("starting detached {tool} worker {worker_session}"))?;
+
+    // Record the durable spawn edge (cross-harness-death M1): the spawner to report
+    // to, the correlation the completion threads on, and the detached wrapper pid.
+    // This is the detached analog of `code_delivery_keys` — the footprint the daemon
+    // reaper (`reap_dead_spawn_edges`) rides to notice a wrapper that dies without
+    // reporting and synthesize the failure-mail. Best-effort: a ledger hiccup here
+    // must not abort a spawn that already launched (the worker still mails for
+    // itself on a clean exit); it only forfeits the SIGKILL safety net.
+    let worker_pid = child.id() as i32;
+    if let Err(e) =
+        codesession::record_spawn_edge(root, &worker_session, &spawner, Some(&correlation), worker_pid)
+    {
+        eprintln!("[code] recording spawn edge for {worker_session} failed (continuing): {e:#}");
+    }
 
     println!(
         "spawned {tool} worker {worker_session}; its result will be delivered to \
@@ -1115,19 +1130,95 @@ fn emit_completion_delivery(
         )
     })?;
     let prompt = completion_delivery_prompt(worker_session, status, summary, launch_error);
+    // The structured completion contract (cross-harness-death M1): the same
+    // machine-readable shape the DRIVEN path's `route_completion` carries, so a
+    // consumer (planner / UI) learns a worker died without parsing the prose
+    // `Status:` line. `failed = !success` mirrors the driven path exactly (a launch
+    // error, a non-success exit, or an unavailable status all read `failed`); the
+    // human-readable `prompt` is unchanged (additive fields only).
+    let (failed, exit_code) = completion_outcome(status, launch_error);
     let conn = crate::db::open(root).context("opening the ledger to record the completion")?;
     crate::db::init_schema(&conn)?;
     crate::events::emit(
         root,
         &conn,
         crate::events::EmitOpts {
-            payload: Some(json!({ "prompt": prompt })),
+            payload: Some(json!({
+                "prompt": prompt,
+                "worker": worker_session,
+                "failed": failed,
+                "exit_code": exit_code,
+            })),
             correlation: correlation.map(str::to_string),
             sender: Some(worker_session.to_string()),
             ..crate::events::EmitOpts::new(&mailbox)
         },
     )
     .context("recording the spawned-worker completion on the ledger")
+}
+
+/// Classify a detached worker's outcome into the structured `(failed, exit_code)`
+/// the M1 completion payload carries, matching the driven path's `failed = !success`
+/// (`settle_code_deliveries`). A launch error, a non-success exit, and an
+/// unavailable status all read `failed`; the exit code is surfaced when the OS gave
+/// one (a signal death has none — `None`).
+fn completion_outcome(
+    status: Option<&std::process::ExitStatus>,
+    launch_error: Option<&str>,
+) -> (bool, Option<i32>) {
+    if launch_error.is_some() {
+        return (true, None);
+    }
+    match status {
+        Some(s) => (!s.success(), s.code()),
+        None => (true, None),
+    }
+}
+
+/// Emit the failure-mail for a detached worker the REAPER found dead without a
+/// report (cross-harness-death M2). Same structured shape + safe mailbox
+/// resolution as `emit_completion_delivery`, but the outcome is fixed `failed:true`
+/// with a plain reason — the worker's wrapper was SIGKILL'd (or crashed) before it
+/// could mail, so there is no captured final text or exit code. The daemon calls
+/// this only after atomically CLAIMING the spawn edge, so it never double-mails a
+/// worker that also reported for itself.
+pub fn emit_reaper_failure_delivery(
+    root: &Root,
+    conn: &rusqlite::Connection,
+    worker_session: &str,
+    spawner: &str,
+    correlation: Option<&str>,
+) -> Result<i64> {
+    let mailbox = mailbox_for_actor(root, spawner, correlation).with_context(|| {
+        format!(
+            "resolving reaped-worker completion mailbox for spawner {spawner:?} \
+             (worker {worker_session})"
+        )
+    })?;
+    let prompt = format!(
+        "Worker {worker_session} finished.\n\
+         Status: worker terminated without reporting (its process died before it \
+         could deliver a result)\n\n\
+         Final text:\n(none — the worker was killed before completing)\n\n\
+         Files changed: (unknown)"
+    );
+    crate::events::emit(
+        root,
+        conn,
+        crate::events::EmitOpts {
+            payload: Some(json!({
+                "prompt": prompt,
+                "worker": worker_session,
+                "failed": true,
+                "exit_code": Value::Null,
+                "reason": "worker terminated without reporting",
+            })),
+            correlation: correlation.map(str::to_string),
+            sender: Some(worker_session.to_string()),
+            ..crate::events::EmitOpts::new(&mailbox)
+        },
+    )
+    .context("recording the reaped-worker completion on the ledger")
 }
 
 // ── The launch-envelope briefing (M4-B) ───────────────────────────────────────
@@ -3489,28 +3580,47 @@ fn launch_external_harness(
         let correlation = std::env::var(ENV_REPLY_CORRELATION)
             .ok()
             .filter(|s| !s.is_empty());
-        let launch_error = status_result.as_ref().err().map(|e| format!("{e:#}"));
-        let fallback_summary;
-        let (status, summary) = match status_result.as_ref() {
-            Ok(status) => (Some(status), &summary),
-            Err(_) => {
-                fallback_summary = CaptureSummary {
-                    final_text: launch_error.as_deref().map(|e| clip(e, FINAL_TEXT_CAP)),
-                    file_changes: Vec::new(),
-                };
-                (None, &fallback_summary)
+        // Claim the spawn edge BEFORE mailing (cross-harness-death M2). The claim is
+        // an atomic `UPDATE ... WHERE settled_at IS NULL`: if the reaper already
+        // reported this worker as dead (we were slow / momentarily unschedulable),
+        // the claim comes back `AlreadySettled` and we stay silent — the spawner is
+        // mailed EXACTLY ONCE. `NoEdge` (no edge recorded — a legacy path) means no
+        // reaper can double us, so mail unconditionally.
+        let claim = codesession::claim_spawn_edge(root, &session);
+        if claim == codesession::SettleClaim::AlreadySettled {
+            eprintln!(
+                "[code] spawn edge for {session} already settled (reaper reported it dead first); \
+                 skipping duplicate completion mail"
+            );
+        } else {
+            let launch_error = status_result.as_ref().err().map(|e| format!("{e:#}"));
+            let fallback_summary;
+            let (status, summary) = match status_result.as_ref() {
+                Ok(status) => (Some(status), &summary),
+                Err(_) => {
+                    fallback_summary = CaptureSummary {
+                        final_text: launch_error.as_deref().map(|e| clip(e, FINAL_TEXT_CAP)),
+                        file_changes: Vec::new(),
+                    };
+                    (None, &fallback_summary)
+                }
+            };
+            if let Err(e) = emit_completion_delivery(
+                root,
+                &session,
+                &reply_to,
+                correlation.as_deref(),
+                status,
+                summary,
+                launch_error.as_deref(),
+            ) {
+                eprintln!("[code] delivering spawned-worker completion failed (continuing): {e:#}");
+                // We won the claim but failed to mail — release the edge so the
+                // reaper retries the completion next tick rather than losing it.
+                if claim == codesession::SettleClaim::Claimed {
+                    codesession::unclaim_spawn_edge(root, &session);
+                }
             }
-        };
-        if let Err(e) = emit_completion_delivery(
-            root,
-            &session,
-            &reply_to,
-            correlation.as_deref(),
-            status,
-            summary,
-            launch_error.as_deref(),
-        ) {
-            eprintln!("[code] delivering spawned-worker completion failed (continuing): {e:#}");
         }
     }
 
@@ -9634,6 +9744,131 @@ mod tests {
         assert!(prompt.contains("finished the task"));
         assert!(prompt.contains("src/lib.rs"));
         assert!(prompt.contains("src/main.rs"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// cross-harness-death M1 — the structured completion contract: a detached
+    /// worker that exits NONZERO delivers mail whose payload carries `failed:true`
+    /// and the exit code (beside the unchanged human-readable `prompt`).
+    #[cfg(unix)]
+    #[test]
+    fn completion_delivery_carries_structured_failed_and_exit_code() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let root = delivery_tmp_root();
+        record_session(&root, "code-planner2", "claude-code");
+        let summary = CaptureSummary {
+            final_text: Some("boom".into()),
+            file_changes: Vec::new(),
+        };
+
+        // Nonzero exit → failed:true + the exit code.
+        let bad = std::process::ExitStatus::from_raw(7 << 8);
+        let id = emit_completion_delivery(
+            &root,
+            "code-worker7",
+            "code-planner2",
+            Some("corr7"),
+            Some(&bad),
+            &summary,
+            None,
+        )
+        .unwrap();
+        let (_e, _s, payload, _c, _st) = read_event(&root, id);
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["failed"], json!(true));
+        assert_eq!(pv["exit_code"], json!(7));
+        assert_eq!(pv["worker"], json!("code-worker7"));
+        // The prose line is still the same shape the existing consumer reads.
+        assert!(pv["prompt"].as_str().unwrap().contains("Worker code-worker7 finished"));
+
+        // Clean exit → failed:false + exit_code 0.
+        let ok = std::process::ExitStatus::from_raw(0);
+        let id = emit_completion_delivery(
+            &root,
+            "code-worker0",
+            "code-planner2",
+            Some("corr0"),
+            Some(&ok),
+            &CaptureSummary {
+                final_text: Some("done".into()),
+                file_changes: Vec::new(),
+            },
+            None,
+        )
+        .unwrap();
+        let (_e, _s, payload, _c, _st) = read_event(&root, id);
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["failed"], json!(false));
+        assert_eq!(pv["exit_code"], json!(0));
+
+        // A launch error → failed:true + no exit code.
+        let id = emit_completion_delivery(
+            &root,
+            "code-workerE",
+            "code-planner2",
+            Some("corrE"),
+            None,
+            &summary,
+            Some("could not launch codex"),
+        )
+        .unwrap();
+        let (_e, _s, payload, _c, _st) = read_event(&root, id);
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["failed"], json!(true));
+        assert!(pv["exit_code"].is_null());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// `completion_outcome` classifies exactly as the driven path's `failed=!success`.
+    #[cfg(unix)]
+    #[test]
+    fn completion_outcome_matches_driven_semantics() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // Success.
+        let ok = std::process::ExitStatus::from_raw(0);
+        assert_eq!(completion_outcome(Some(&ok), None), (false, Some(0)));
+        // Nonzero exit.
+        let bad = std::process::ExitStatus::from_raw(3 << 8);
+        assert_eq!(completion_outcome(Some(&bad), None), (true, Some(3)));
+        // Signal death (SIGKILL = 9): no exit code, failed.
+        let killed = std::process::ExitStatus::from_raw(9);
+        assert_eq!(completion_outcome(Some(&killed), None), (true, None));
+        // Launch error dominates.
+        assert_eq!(completion_outcome(Some(&ok), Some("nope")), (true, None));
+        // No status at all → failed.
+        assert_eq!(completion_outcome(None, None), (true, None));
+    }
+
+    /// cross-harness-death M1/M2 — the spawn edge lifecycle: a recorded edge exists
+    /// unsettled; the FIRST claim wins (`Claimed`, settled_at set); a SECOND claim on
+    /// the same edge is `AlreadySettled`; an unknown edge is `NoEdge`.
+    #[test]
+    fn spawn_edge_claim_is_once_only() {
+        let root = delivery_tmp_root();
+        codesession::record_spawn_edge(&root, "code-edge0001", "code-boss1", Some("c"), 4242)
+            .unwrap();
+
+        // No edge → NoEdge (the legacy/unrecorded path mails unconditionally).
+        assert_eq!(
+            codesession::claim_spawn_edge(&root, "code-nosuchedge"),
+            codesession::SettleClaim::NoEdge
+        );
+        // First claim wins.
+        assert_eq!(
+            codesession::claim_spawn_edge(&root, "code-edge0001"),
+            codesession::SettleClaim::Claimed
+        );
+        // Second claim loses — the edge is already settled (the race guard).
+        assert_eq!(
+            codesession::claim_spawn_edge(&root, "code-edge0001"),
+            codesession::SettleClaim::AlreadySettled
+        );
+        // Unclaim re-arms it (the mail-failure retry path).
+        codesession::unclaim_spawn_edge(&root, "code-edge0001");
+        assert_eq!(
+            codesession::claim_spawn_edge(&root, "code-edge0001"),
+            codesession::SettleClaim::Claimed
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 

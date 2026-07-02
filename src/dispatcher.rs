@@ -257,6 +257,7 @@ fn tick(
     announce_ledger_events(root, conn)?;
     reap(root, conn, running)?;
     settle_code_deliveries(root, conn, code)?;
+    reap_dead_spawn_edges(root, conn)?;
     drive_code_deliveries(root, conn, code)?;
     resume_suspended(root, conn, running)?;
     dispatch_pending(root, conn, running)?;
@@ -1164,6 +1165,65 @@ fn route_completion(
         ),
         Err(e) => eprintln!("[daemon] routing completion of {session} to {reply_to} failed: {e:#}"),
     }
+}
+
+/// Reap detached-spawn workers that died without reporting (cross-harness-death
+/// M2). `elanus code spawn` fires a DETACHED, unparented worker: nothing can
+/// `wait()` on it, so if its wrapper is SIGKILL'd (or crashes) before its own
+/// `emit_completion_delivery`, the spawner would hang forever — the driven path's
+/// `reconcile_lost_routes` only covers `code_delivery_keys`. Each spawn records a
+/// durable `code_spawn_edges` row (spawner, correlation, wrapper pid); this sweep,
+/// beside `settle_code_deliveries` in the tick, finds unsettled edges whose wrapper
+/// pid is dead and synthesizes the SAME `{failed:true}` completion-mail the worker
+/// would have sent, then settles the edge.
+///
+/// Exactly-once: the settle is CLAIMED atomically (`claim_spawn_edge_on` —
+/// `UPDATE ... WHERE settled_at IS NULL`) before mailing. A worker finishing in the
+/// same tick claims the edge from its own process; whichever write commits first
+/// wins, and the loser's claim returns non-`Claimed` and mails nothing. (The reaper
+/// only ever sees a DEAD pid, so it never races a still-running worker — a live
+/// worker's own completion path owns the claim.) A mail failure releases the claim
+/// so the next tick retries rather than losing the completion.
+fn reap_dead_spawn_edges(root: &Root, conn: &Connection) -> Result<()> {
+    for edge in crate::codesession::dead_unsettled_spawn_edges(conn) {
+        match crate::codesession::claim_spawn_edge_on(conn, &edge.worker_session) {
+            Ok(crate::codesession::SettleClaim::Claimed) => {}
+            // The worker's own completion won the claim (or the edge vanished) —
+            // nothing to synthesize.
+            _ => continue,
+        }
+        match crate::codeagent::emit_reaper_failure_delivery(
+            root,
+            conn,
+            &edge.worker_session,
+            &edge.spawner,
+            edge.correlation.as_deref(),
+        ) {
+            Ok(rid) => trace::write(
+                root,
+                "obs/agent/code/spawn/reaped",
+                &trace::Ids {
+                    event_id: Some(rid),
+                    correlation_id: edge.correlation.clone(),
+                    ..Default::default()
+                },
+                json!({
+                    "worker": edge.worker_session,
+                    "spawner": edge.spawner,
+                    "pid": edge.worker_pid,
+                }),
+            ),
+            Err(e) => {
+                eprintln!(
+                    "[daemon] reaping dead spawn worker {} failed: {e:#}",
+                    edge.worker_session
+                );
+                // Release the claim so the next tick retries the completion.
+                crate::codesession::unclaim_spawn_edge(root, &edge.worker_session);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Recover any planner wake lost to a crash in the settle->route gap (M4-A
@@ -2924,6 +2984,179 @@ mod tests {
         );
         assert!(pv["file_changes"].as_array().unwrap().is_empty());
         assert!(pv["worker_obs"].as_str().unwrap().contains("code-silent01"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// Record a recorded coding session (so `mailbox_for_actor` can address it).
+    fn record_code_session(root: &Root, sess: &str, noun: &str) {
+        crate::codesession::upsert_record(
+            root,
+            &crate::codesession::SessionRecord {
+                elanus_session: sess.into(),
+                native_session: "n".into(),
+                tool: if noun == "codex" { "codex" } else { "claude" }.into(),
+                agent_noun: noun.into(),
+                workdir: root.dir.display().to_string(),
+                room: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// cross-harness-death M2 — the reaper's core: a detached spawn edge whose
+    /// wrapper pid is dead and which never reported synthesizes a `{failed:true}`
+    /// completion-mail to the spawner and settles the edge. A DEAD pid is required —
+    /// a very high pid is guaranteed `ESRCH` (no such process).
+    #[test]
+    fn reaper_mails_failure_for_dead_unreported_spawn_worker() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        record_code_session(&root, "code-plannr09", "claude-code");
+        // A dead wrapper pid; the worker never mailed (unsettled edge).
+        crate::codesession::record_spawn_edge(
+            &root,
+            "code-wrkdead1",
+            "code-plannr09",
+            Some("corr-dead"),
+            i32::MAX,
+        )
+        .unwrap();
+
+        reap_dead_spawn_edges(&root, &conn).unwrap();
+
+        // Exactly one failure-mail to the planner's mailbox, structured failed:true.
+        let (payload, corr): (String, String) = conn
+            .query_row(
+                "SELECT payload, COALESCE(correlation_id,'') FROM events
+                   WHERE type='in/agent/claude-code/code-plannr09'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the reaper mailed the spawner");
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["failed"], json!(true), "structured failed:true");
+        assert_eq!(pv["worker"], json!("code-wrkdead1"));
+        assert!(pv["exit_code"].is_null(), "a killed worker has no exit code");
+        assert_eq!(corr, "corr-dead", "the completion threads on the spawn corr");
+        assert!(pv["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("terminated without reporting"));
+        // The edge is settled.
+        let settled: Option<String> = conn
+            .query_row(
+                "SELECT settled_at FROM code_spawn_edges WHERE worker_session='code-wrkdead1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(settled.is_some(), "the edge is settled after the reap");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// A LIVE worker (its wrapper pid still alive) is never reaped — the reaper only
+    /// ever acts on a dead pid, so a running worker's own completion path owns the
+    /// claim.
+    #[test]
+    fn reaper_leaves_a_live_spawn_worker_alone() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        record_code_session(&root, "code-plannr10", "claude-code");
+        crate::codesession::record_spawn_edge(
+            &root,
+            "code-wrklive1",
+            "code-plannr10",
+            Some("corr-live"),
+            std::process::id() as i32, // this test process — very much alive
+        )
+        .unwrap();
+
+        reap_dead_spawn_edges(&root, &conn).unwrap();
+
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type='in/agent/claude-code/code-plannr10'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "a live worker is not reaped");
+        let settled: Option<String> = conn
+            .query_row(
+                "SELECT settled_at FROM code_spawn_edges WHERE worker_session='code-wrklive1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(settled.is_none(), "a live worker's edge stays unsettled");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// Exactly-once under the slow-worker/reaper race (cross-harness-death M2
+    /// acceptance): if the WORKER'S own completion already claimed+settled the edge,
+    /// the reaper mails nothing — no double-mail. And running the reaper twice over a
+    /// dead worker mails exactly once (the second pass finds a settled edge).
+    #[test]
+    fn reaper_is_idempotent_and_never_double_mails() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        record_code_session(&root, "code-plannr11", "claude-code");
+
+        // (a) worker won the claim first → reaper is a no-op even for a dead pid.
+        crate::codesession::record_spawn_edge(
+            &root,
+            "code-wrkwon01",
+            "code-plannr11",
+            Some("corr-won"),
+            i32::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::codesession::claim_spawn_edge(&root, "code-wrkwon01"),
+            crate::codesession::SettleClaim::Claimed,
+            "the worker wins the claim"
+        );
+        reap_dead_spawn_edges(&root, &conn).unwrap();
+
+        // (b) a genuinely dead+unreported worker → reaper mails; a SECOND reap pass
+        // finds the edge settled and mails nothing more.
+        crate::codesession::record_spawn_edge(
+            &root,
+            "code-wrkdead2",
+            "code-plannr11",
+            Some("corr-dead2"),
+            i32::MAX,
+        )
+        .unwrap();
+        reap_dead_spawn_edges(&root, &conn).unwrap();
+        reap_dead_spawn_edges(&root, &conn).unwrap();
+
+        // The planner's mailbox holds EXACTLY ONE completion — for wrkdead2 only
+        // (wrkwon01 was claimed by the worker, so the reaper stayed silent).
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM events WHERE type='in/agent/claude-code/code-plannr11'",
+            )
+            .unwrap();
+        let workers: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|p| {
+                serde_json::from_str::<Value>(&p).unwrap()["worker"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            workers,
+            vec!["code-wrkdead2".to_string()],
+            "exactly one completion, and only for the unreported worker"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

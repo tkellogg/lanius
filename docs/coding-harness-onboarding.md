@@ -171,6 +171,64 @@ Point the tool at a chosen model/effort: claude `--model`; codex `-c model=…`,
 `ctx.record(native_session_id)` the tool's stable native session/thread id so elanus can
 resume it (codex thread id; opencode `sessionID`; claude session id).
 
+### 7. Death and wake — REQUIRED (report death honestly)
+A dead worker MUST always tell its spawner. You inherit this for free — it is
+harness-uniform and lives in the launcher/daemon, not your adapter — but know the
+contract so you don't break it (e.g. by swallowing a nonzero exit).
+
+**Death → failure-mail.** A worker's completion is classified `failed = !success`
+(exactly the driven path's `settle_code_deliveries`), and the completion mail carries
+the structured fields `{ "failed": bool, "exit_code": int|null, "worker": "<session>" }`
+beside the human-readable `prompt`. Two producers, one shape:
+- the **driven** path (daemon dispatch) sees your harness child through a single
+  `child.wait()` → `status.success()` (`resume_capture`), so a SIGKILL'd or
+  nonzero-exit child is `failed` for every harness;
+- the **detached** path (`elanus code spawn`) classifies the same way in the worker's
+  own `emit_completion_delivery`, AND — because a detached worker is unparented and
+  nothing can `wait()` on it — records a durable `code_spawn_edges` row so the daemon's
+  `reap_dead_spawn_edges` sweep can notice a **wrapper** that was SIGKILL'd before it
+  reported and synthesize the identical `failed:true` mail ("worker terminated without
+  reporting"). The settle is claimed atomically, so a slow worker and the reaper never
+  double-mail.
+
+**Death and wake, per (harness × mode)** — every cell is what the
+cross-harness-death M2 matrix verified (test names in parentheses):
+
+| harness × mode          | fail-mail on child death | fail-mail on wrapper death | parent wake-on-delivery       | mid-run injection |
+|-------------------------|--------------------------|----------------------------|-------------------------------|-------------------|
+| claude — headless/driven | yes (`status.success()`) | n/a (daemon is the driver; a daemon crash mid-drive is recovered by `reconcile_lost_routes`) | yes — uniform daemon resume | see `achievable_vector` |
+| claude — detached spawn  | yes (M1 `completion_outcome`; e2e `spawn_worker_that_exits_nonzero_mails_structured_failure`) | yes — reaper (`reaper_mails_failure_for_dead_unreported_spawn_worker`) | yes — spawner resumed via the same uniform daemon resume | see `achievable_vector` |
+| claude — interactive TUI | yes (child wait) | n/a (no wrapper) | **no wake — inbox-pull** (`inbox_for_session` + per-turn "N messages waiting") | Pre/PostToolUse while a turn runs |
+| codex — headless/driven  | yes (`status.success()`) | n/a (as above) | yes — uniform daemon resume (codex resume command exists) | see `achievable_vector` |
+| codex — detached spawn   | yes (M1; e2e echo proxy stands in — codex needs creds) | yes — reaper (same code path, harness-agnostic) | yes — uniform daemon resume | see `achievable_vector` |
+| codex — interactive TUI  | yes (child wait) | n/a | **no wake — inbox-pull** | degrades → next-turn (no live hook bridge) |
+| opencode — headless/driven | yes (`status.success()`) | n/a | yes — uniform daemon resume (opencode `sessionID` resume) | see `achievable_vector` |
+| opencode — detached spawn | yes (M1; echo proxy stands in) | yes — reaper (harness-agnostic) | yes — uniform daemon resume | see `achievable_vector` |
+| opencode — interactive TUI | yes (child wait) | n/a | **no wake — inbox-pull** | served `prompt_async` is a future path (deferred) |
+
+The reaper and structured fields are harness-agnostic (they key on the ledger edge
+and the process exit, not on the tool), so a NEW harness inherits every "yes" the
+moment its adapter funnels through `launch`/`spawn` — you do not re-implement any of
+it. The detached-spawn cells for codex/opencode were proven with the stock `echo`
+external-harness proxy (`tests/external_harness.rs`) because the real binaries need
+credentials; the path under test is identical across harnesses (one `spawn`, one
+`emit_completion_delivery`, one reaper). The mid-run injection column is NOT
+duplicated here — it is the `achievable_vector` matrix in `src/codeagent.rs` (the
+capability the memory-blocks / harness-modes work owns), cross-referenced so there is
+one source of truth.
+
+**Boundary — universal any-time message-wake is OUT of scope (not a gap to close).**
+A harness's **interactive TUI** blocked on user input cannot be made to act on mail
+that arrives while it sits idle: its event loop belongs to the vendor, not elanus.
+The honest answer for a TUI is **inbox-pull** — `elanus code inbox` plus the per-turn
+injection that surfaces "N messages waiting" — which fires while a turn is *running*,
+not at rest. The only mid-cycle wakes that exist (Claude's Pre/PostToolUse
+`additionalContext`; opencode's server `prompt_async`) all require the session to be
+mid-activity; none can rouse a session that is parked at a prompt. Chasing "always
+wake" would mean forking a vendor's binary or polling keystrokes — rejected. A
+**headless** parent has no such limit: it is resumed by the daemon on delivery, for
+every harness, which is why every headless/driven and detached cell above wakes.
+
 ## Capture decision tree
 ```
 Does the tool have a hook system that fires on tool/file events?
@@ -195,6 +253,10 @@ For the interactive TUI cell, in order:
 - [ ] (If skills) materialize the handed-over skills dir into the tool's skills location.
 - [ ] (If briefing) inject the briefing into the tool's context channel.
 - [ ] Resume: `ctx.record(native_id)`.
+- [ ] Report death honestly: funnel through `launch`/`spawn` (you inherit the
+      structured `{failed, exit_code, worker}` completion contract + the detached-worker
+      reaper for free) — do NOT swallow a nonzero exit or a signal death (see
+      requirement #7). A worker that dies must always mail its spawner.
 - [ ] Install: copy binary + `elanus.toml` into `<root>/packages/harness-<tool>/`;
       `elanus approve`; verify `elanus code <tool> --headless …` captures to
       `obs/agent/<noun>/<session>/…` and a sibling sees its edits (if live).
