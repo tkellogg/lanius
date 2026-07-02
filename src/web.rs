@@ -2829,6 +2829,11 @@ fn push_human_feed_message(messages: &mut Vec<Value>, seen: &mut HashSet<String>
                 "who": "agent",
                 "cls": "agent",
                 "text": t,
+                // Carry the agent's declared render intent through to the feed so
+                // the client renders deliberately, not by sniffing the body for
+                // angle brackets (docs/handoffs/html-messages.md M2). Absent →
+                // markdown. The trust gate, not this field, unlocks live HTML.
+                "format": payload.get("format").and_then(Value::as_str).unwrap_or("markdown"),
                 "corr": row.correlation_id,
                 "ts": row.created_at,
                 "event_id": row.id,

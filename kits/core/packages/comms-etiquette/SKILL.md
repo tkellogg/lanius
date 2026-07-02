@@ -111,6 +111,28 @@ transcript record. The only difference is run-scheduling: **`ask` blocks,
 `send_message` doesn't.** Pick by that question alone — "do I need to stop and
 wait?" If no, `send_message`; if yes, `ask_human`.
 
+### Answering with HTML
+
+Your reply to the human does not have to be plain prose. Both `send_message`
+and `ask_human` take an optional `format`:
+
+- **`format="html"`** — the whole body is an HTML fragment: a small form, a
+  button-bar, a table — interface the person can act on to continue the
+  conversation without you rebuilding context (journey 07). Reach for this
+  when the natural next step is a *choice or an input* the person makes, not
+  more text to read.
+- **`format="markdown"`** (the default) — ordinary prose. At full trust you
+  can still drop small inline HTML touches into it (a `<kbd>`, a colored
+  `<span>`) — that is the "small touches" mode; reach for it when you mostly
+  want words with a light flourish.
+
+Your HTML only becomes live interface at **full** trust. **Check the platform
+block first:** if it says trust is *reduced* (a shared or remote machine),
+your HTML shows to the person as escaped text, not clickable elements — so
+answer in plain markdown there and describe the choice in words instead. The
+platform block is the single source of truth for "may I right now?"; this
+skill only teaches the mechanics.
+
 **Feel alive, don't spam.** `send_message` exists so you can be present — say
 something when it earns the interruption (a milestone reached, a surprising
 finding, a decision you made and want on the record). It does **not** exist to

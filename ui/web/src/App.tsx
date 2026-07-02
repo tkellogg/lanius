@@ -2304,7 +2304,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
       <div id="conv-holder" className="conv-feed-holder">
         <div className="conv-feed" role="log" aria-live="polite" aria-label={`conversation with ${agent}`}>
           {!messages.length && <div className="conv-empty"><p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p><p>Start a conversation with {agent}. Replies and asks stay in this thread.</p></div>}
-          {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `conversation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : <Markdown text={String(m.text ?? '')} allowHtml={allowHtml} />}</div></div>)}
+          {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} allowHtml={allowHtml} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `conversation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : <Markdown text={String(m.text ?? '')} allowHtml={allowHtml} format={m.format} />}</div></div>)}
         </div>
       </div>
       <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><IconButton type="submit" id="compose-send" label={sendLabel} className="compose-send">➤</IconButton></form>
@@ -2312,12 +2312,16 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
   );
 }
 
-function AskMessage({ agent, message, answerAsk }: any) {
+function AskMessage({ agent, message, answerAsk, allowHtml }: any) {
   const [text, setText] = useState('');
   const p = message.payload ?? {};
   const send = (answer: string) => answer && answerAsk(agent, message.id, message.corr, answer);
+  // An ask draws in its own affordance, not the plain feed row, so the trust
+  // gate must be applied here too (docs/handoffs/html-messages.md wonky bit 4):
+  // render the question body through Markdown so format="html" at full trust
+  // becomes live DOM and reduced trust shows it escaped.
   return (
-    <div className="msg agent ask"><div className="msg-meta"><span className="msg-who">agent asks</span>{message.corr && <span className="msg-corr">{message.corr.slice(0, 18)}</span>}</div><div className="msg-body"><div className="ask-q">{p.question ?? summarize(p)}</div>{message.answered ? <div className="ask-done">{message.answered.includes(':') ? <>{message.answered.split(':')[0]}: <b>{message.answered.split(':').slice(1).join(':').trim()}</b></> : message.answered}</div> : <>{Array.isArray(p.options) && !!p.options.length && <div className="ask-options">{p.options.map((o: any) => <button key={String(o)} onClick={() => send(String(o))}>{String(o)}</button>)}</div>}<div className="ask-row"><input placeholder="answer…" value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && text.trim()) send(text.trim()); }} /><button onClick={(e) => { e.preventDefault(); send(text.trim()); }}>answer</button></div></>}</div></div>
+    <div className="msg agent ask"><div className="msg-meta"><span className="msg-who">agent asks</span>{message.corr && <span className="msg-corr">{message.corr.slice(0, 18)}</span>}</div><div className="msg-body"><div className="ask-q">{p.question != null ? <Markdown text={String(p.question)} allowHtml={allowHtml} format={p.format} /> : summarize(p)}</div>{message.answered ? <div className="ask-done">{message.answered.includes(':') ? <>{message.answered.split(':')[0]}: <b>{message.answered.split(':').slice(1).join(':').trim()}</b></> : message.answered}</div> : <>{Array.isArray(p.options) && !!p.options.length && <div className="ask-options">{p.options.map((o: any) => <button key={String(o)} onClick={() => send(String(o))}>{String(o)}</button>)}</div>}<div className="ask-row"><input placeholder="answer…" value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && text.trim()) send(text.trim()); }} /><button onClick={(e) => { e.preventDefault(); send(text.trim()); }}>answer</button></div></>}</div></div>
   );
 }
 

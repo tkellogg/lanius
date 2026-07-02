@@ -1210,6 +1210,114 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
+// ── flow 6d: html-messages — an agent's format="html" reply renders deliberately ─
+// docs/handoffs/html-messages.md M2: `format` records the agent's DELIBERATE
+// intent on the ledger and the feed renders BY it — but raw HTML becoming live
+// DOM stays gated on ONE thing: platform trust===full. So:
+//  - at FULL trust, a format="html" reply carrying a <button> renders a REAL
+//    <button> element, while a default (markdown) reply renders as markdown
+//    (no raw element leaks from it);
+//  - at REDUCED trust, the same format="html" body shows its markup as visible
+//    ESCAPED text, no live element — `format` never widens the trust gate.
+// Trust is flipped by rewriting bus.toml between renders (/api/status reads it
+// fresh); restored to full afterward so later flows are unaffected.
+{
+  const htmlAgent = 'formsmith';
+  const htmlSession = `web-${htmlAgent}-html`;
+  const htmlCorr = `htmlmsg-${Date.now().toString(36)}`;
+  const busReduced = `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\ntrust = "reduced"\n`;
+  const busFull = `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\n`;
+  // Create the comms agent (POST is a human gesture; do it while trust is full).
+  const seedPage = await newPage();
+  await seedPage.goto('/');
+  const created = await seedPage.evaluate(async (name) => {
+    const r = await fetch('/api/admin/agents', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return r.json().catch(() => ({}));
+  }, htmlAgent);
+  created.ok ? ok(`html-messages: created comms agent ${htmlAgent}`) : fail(`html-messages: could not create ${htmlAgent} (${JSON.stringify(created)})`);
+  await seedPage.close();
+  // Seed a comms conversation: an in/agent prompt + two correlated agent replies
+  // on in/human/<owner> — one format="html" carrying a <button>, one default.
+  try {
+    elanus('emit', `in/agent/${htmlAgent}`, '--correlation', htmlCorr, '--payload',
+      JSON.stringify({ prompt: 'give me a way to pick', session: htmlSession }));
+    elanus('emit', 'in/human/owner', '--correlation', htmlCorr, '--payload',
+      JSON.stringify({ text: '<button data-html-demo="1">Press me</button>', session: htmlSession, format: 'html' }));
+    elanus('emit', 'in/human/owner', '--correlation', htmlCorr, '--payload',
+      JSON.stringify({ text: '**plain markdown reply** <button data-html-plain="1">no</button>', session: htmlSession, format: 'markdown' }));
+  } catch (e) { fail(`html-messages: seeding failed: ${e.message ?? e}`); }
+
+  // Open the conversation and return the state of the two seeded replies.
+  const openConversation = async (page) => {
+    await page.goto('/');
+    await page.waitForSelector('#nav-agents .nav-item');
+    await waitFor(`html-messages: ${htmlAgent} in nav`, async () => {
+      const items = await page.$$('#nav-agents .nav-agent');
+      for (const item of items) {
+        if ((await item.getAttribute('data-sel')) === `agent:${htmlAgent}`) { await item.click(); return true; }
+      }
+      return false;
+    }, 10000);
+    await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+    // The nav lists EVERY agent's conversations, so scope to THIS one by its
+    // session title (the button's `title` is c.session) rather than rows[0].
+    await waitFor('html-messages: seeded conversation listed in nav', async () => {
+      const rows = await page.$$('#nav-agents .nav-conversation');
+      for (const row of rows) {
+        if ((await row.getAttribute('title')) === htmlSession) { await row.click(); return true; }
+      }
+      return false;
+    }, 10000);
+    await waitFor('html-messages: conversation feed has the seeded replies', async () => {
+      const msgs = await page.$$eval('.conv-feed .msg', (els) => els.length).catch(() => 0);
+      return msgs >= 2;
+    }, 10000);
+  };
+
+  // FULL trust (the stack default): the html reply is a live <button>; the
+  // markdown reply renders as markdown (its inline <button> stays escaped — only
+  // format="html" gets the whole-body HTML path).
+  {
+    const page = await newPage();
+    await openConversation(page);
+    // /api/status reports full so the SPA sets allowHtml=true.
+    const trust = await page.evaluate(async () => (await (await fetch('/api/status')).json()).trust);
+    trust === 'full' ? ok('html-messages: platform trust is full for the live-render case') : fail(`html-messages: expected full trust, got ${trust}`);
+    const liveBtn = await page.$('.conv-feed .msg-html button[data-html-demo="1"]');
+    liveBtn ? ok('html-messages: full trust renders format="html" as a real <button>') : fail('html-messages: full trust did not render the html reply as a live <button>');
+    // The default markdown reply renders markdown (a <strong>), and its inline
+    // <button> is NOT a live element (markdown text, not raw HTML block).
+    const strong = await page.$('.conv-feed strong');
+    strong ? ok('html-messages: default reply renders as markdown (<strong>)') : fail('html-messages: default reply did not render markdown');
+    // Decision 3 (small touches): at full trust, inline raw HTML inside an
+    // ORDINARY markdown message also renders live (today's rehype-raw path) —
+    // format="html" is the whole-body mode, not the only way HTML renders.
+    const plainBtn = await page.$('.conv-feed button[data-html-plain="1"]');
+    plainBtn ? ok('html-messages: full trust also renders inline HTML in a markdown reply (small touches)') : fail('html-messages: inline HTML in a markdown reply did not render at full trust');
+    await page.close();
+  }
+
+  // REDUCED trust: rewrite bus.toml and reload — the same html body now shows as
+  // visible escaped text, no live element. The trust gate, not `format`, decides.
+  fs.writeFileSync(path.join(TMP, 'bus.toml'), busReduced);
+  {
+    const page = await newPage();
+    await openConversation(page);
+    const trust = await page.evaluate(async () => (await (await fetch('/api/status')).json()).trust);
+    trust === 'reduced' ? ok('html-messages: platform trust flipped to reduced') : fail(`html-messages: expected reduced trust, got ${trust}`);
+    const liveBtn = await page.$('.conv-feed .msg-html button[data-html-demo="1"]');
+    liveBtn ? fail('html-messages: reduced trust must NOT render a live <button>') : ok('html-messages: reduced trust renders no live element for the html reply');
+    const escaped = await page.$eval('.conv-feed', (el) => el.textContent.includes('<button data-html-demo="1">Press me</button>')).catch(() => false);
+    escaped ? ok('html-messages: reduced trust shows the html markup as visible escaped text') : fail('html-messages: reduced trust did not show the html markup as escaped text');
+    await page.close();
+  }
+  // Restore full trust so later flows (which POST as the human) are unaffected.
+  fs.writeFileSync(path.join(TMP, 'bus.toml'), busFull);
+}
+
 // ── flow 6c: ambient-conversations — an agent that speaks first is replyable ───
 // docs/handoffs/ambient-conversations.md: an unprompted send_message (a timer or
 // event handler firing, no preceding in/agent prompt) must surface as its own

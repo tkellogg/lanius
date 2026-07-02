@@ -859,6 +859,19 @@ struct OutboundMessage {
     default_action: Option<Value>,
 }
 
+/// Coerce a caller-supplied `format` value to a known render mode. Only
+/// `"html"` is honored; anything else (absent, null, an unknown string, a
+/// non-string) becomes `"markdown"` so an invalid value never errors the run
+/// and never unlocks HTML (docs/handoffs/html-messages.md M1). The trust gate,
+/// not `format`, is what actually decides whether HTML renders live.
+fn coerce_format(v: &Value) -> &'static str {
+    if v.as_str() == Some("html") {
+        "html"
+    } else {
+        "markdown"
+    }
+}
+
 /// The shared emit path for the send/ask family. Emits the message to its
 /// channel and returns the new event id. Both verbs route through here so
 /// there is exactly one place that decides how a message reaches a channel.
@@ -1509,7 +1522,12 @@ fn tool_defs() -> Vec<Tool> {
             .with_schema(json!({
                 "type": "object",
                 "properties": {
-                    "text": { "type": "string", "description": "the message to send" }
+                    "text": { "type": "string", "description": "the message to send" },
+                    "format": {
+                        "type": "string",
+                        "enum": ["markdown", "html"],
+                        "description": "how to render the body: \"markdown\" (default) for text with small inline HTML touches, or \"html\" when the whole body is an HTML fragment (a form, a button-bar). Live HTML only renders at full trust — see the platform block."
+                    }
                 },
                 "required": ["text"]
             })),
@@ -1526,7 +1544,12 @@ fn tool_defs() -> Vec<Tool> {
                     "question": { "type": "string" },
                     "options": { "type": "array", "items": { "type": "string" } },
                     "deadline_minutes": { "type": "number" },
-                    "default": { "type": "string", "description": "what to assume if the deadline expires" }
+                    "default": { "type": "string", "description": "what to assume if the deadline expires" },
+                    "format": {
+                        "type": "string",
+                        "enum": ["markdown", "html"],
+                        "description": "how to render the question body: \"markdown\" (default), or \"html\" when the whole body is an HTML fragment (a form, a button-bar). Live HTML only renders at full trust — see the platform block."
+                    }
                 },
                 "required": ["question"]
             })),
@@ -1918,7 +1941,7 @@ fn run_tool(
                 event_id,
                 &OutboundMessage {
                     topic: crate::topic::human_mailbox(&prof.owner),
-                    payload: json!({ "text": text, "session": session }),
+                    payload: json!({ "text": text, "session": session, "format": coerce_format(&args["format"]) }),
                     correlation: turn_correlation.map(String::from),
                     deadline: None,
                     default_action: None,
@@ -1968,7 +1991,7 @@ fn run_tool(
                 (chrono::Utc::now() + chrono::Duration::seconds((m * 60.0) as i64))
                     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
             });
-            let mut payload = json!({ "question": question, "session": session });
+            let mut payload = json!({ "question": question, "session": session, "format": coerce_format(&args["format"]) });
             if !options.is_empty() {
                 payload["options"] = json!(options);
             }
@@ -2614,6 +2637,75 @@ mod tests {
             Some(run_session),
             "the ambient send carries its run's session (not null)"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // M1 (docs/handoffs/html-messages.md): the send_message tool arm carries the
+    // agent's declared `format` onto the emitted in/human/<owner> event payload —
+    // that payload IS the ledger event body, so recording it there is the whole
+    // "recorded on the ledger" requirement. Drives the real tool arm (run_tool)
+    // so the coerce + payload wiring is exercised, not just emit_message.
+    #[test]
+    fn send_message_records_format_on_the_ledger() {
+        let dir = std::env::temp_dir().join(format!("el-fmt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let prof = profile::Profile::default();
+        let cage = sandbox::Cage::from_profile(&root, &prof.sandbox);
+        let pool = crate::mcp::Pool::default();
+        let topic = crate::topic::human_mailbox(&prof.owner);
+
+        // Drive the send_message arm and return the format recorded on the
+        // newest owner-mailbox event.
+        let send = |args: Value| -> Option<String> {
+            let call = ToolCall {
+                call_id: "c1".to_string(),
+                fn_name: "send_message".to_string(),
+                fn_arguments: args,
+                thought_signatures: None,
+            };
+            let mut self_emitted = HashSet::new();
+            let out = run_tool(
+                &root, &conn, &cage, &prof, "s-fmt", None, None, true, &call,
+                &mut self_emitted, &pool,
+            );
+            // send_message never suspends: it always yields Output.
+            assert!(matches!(out, ToolOutcome::Output(_)), "send_message yields Output");
+            let payload: String = conn
+                .query_row(
+                    "SELECT payload FROM events WHERE type = ?1 ORDER BY id DESC LIMIT 1",
+                    [&topic],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let payload: Value = serde_json::from_str(&payload).unwrap();
+            payload
+                .get("format")
+                .and_then(Value::as_str)
+                .map(String::from)
+        };
+
+        // Explicit html is recorded verbatim.
+        assert_eq!(
+            send(json!({ "text": "<form></form>", "format": "html" })).as_deref(),
+            Some("html"),
+            "format=html lands on the ledger event"
+        );
+        // Omitted format records the markdown default.
+        assert_eq!(
+            send(json!({ "text": "plain" })).as_deref(),
+            Some("markdown"),
+            "absent format defaults to markdown on the ledger"
+        );
+        // An invalid value does not error the run; it coerces to markdown.
+        assert_eq!(
+            send(json!({ "text": "x", "format": "richtext" })).as_deref(),
+            Some("markdown"),
+            "an unknown format coerces to markdown, never errors"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

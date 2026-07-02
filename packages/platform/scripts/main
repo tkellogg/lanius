@@ -70,7 +70,11 @@ def block_text(trust, bind):
     else:
         line1 = ("Trust level: full — this is a trusted personal machine. "
                  "Raw HTML you put in a chat message renders as real interface "
-                 "elements (small UI and forms are fine).")
+                 "elements (small UI and forms are fine). You may reply with a "
+                 "whole HTML fragment — a form or button-bar that continues the "
+                 "conversation — by setting format=\"html\" on send_message or "
+                 "ask_human; inline HTML inside an ordinary markdown message "
+                 "renders too, for small touches.")
     if is_loopback(bind):
         line2 = "Web dashboard: reachable only from this machine (loopback)."
     else:
