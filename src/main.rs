@@ -608,6 +608,17 @@ enum KbCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Search the knowledge base index: elanus kb search <query>
+    Search {
+        /// The query — plain words, e.g. "who verifies".
+        query: Vec<String>,
+        /// Max hits to return.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Emit one JSON line per hit instead of the human list.
+        #[arg(long)]
+        json: bool,
+    },
     /// Write a file into a KB's kb/ tree and commit it: elanus kb write <pkg> <path>
     Write {
         /// The package that owns the KB (must be on the path).
@@ -1327,6 +1338,11 @@ fn run(cli: Cli) -> Result<()> {
         },
         Cmd::Kb { cmd } => match cmd {
             KbCmd::List { profile, json } => kbcli::list(&root, &profile, json)?,
+            KbCmd::Search {
+                query,
+                limit,
+                json,
+            } => kbcli::search(&root, &query.join(" "), limit, json)?,
             KbCmd::Write {
                 pkg,
                 path,

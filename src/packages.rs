@@ -306,6 +306,9 @@ pub fn sync(root: &Root, conn: &Connection) -> Result<()> {
             // An [[mcp]] server likewise: third-party tools enter the
             // model's tool array only approved (src/mcp.rs).
             .chain(m.mcp.iter().map(|s| ("mcp", &s.name)))
+            // A [[tool]] declaration IS the request: the tool folds into an
+            // agent's array only approved + visible (src/pkgtool.rs).
+            .chain(m.tool.iter().map(|t| ("tool", &t.name)))
             .collect();
         // process.http = true is likewise a request: serving an HTTP
         // endpoint (loopback, harness-negotiated port) is a capability the
@@ -475,6 +478,29 @@ pub fn decide(root: &Root, conn: &Connection, name: &str, approve: bool, by: &st
         bail!("{name} has no elanus.toml — nothing to decide");
     };
     sync(root, conn)?; // make sure current-hash rows exist first
+    // Approve-time [[tool]] collision refusal (docs/handoffs/kb-search.md M0):
+    // a tool name is a bare, global handle in the agent's array, so at most one
+    // approved holder may exist and none may shadow a kernel builtin. Refuse
+    // LOUDLY, naming the current holder, BEFORE flipping any rows — the human
+    // disables/revokes the incumbent first. This is exactly the engine-swap
+    // ergonomic: agents never see two engines racing for one tool name.
+    if approve {
+        for t in &lm.manifest.tool {
+            if crate::exec::KERNEL_TOOL_NAMES.contains(&t.name.as_str()) {
+                bail!(
+                    "{name}: tool {:?} shadows a kernel builtin — refusing (rename the tool)",
+                    t.name
+                );
+            }
+            if let Some(holder) = approved_tool_holder(conn, &t.name, name)? {
+                bail!(
+                    "{name}: tool {:?} is already provided by the approved package {holder:?} — \
+                     revoke/disable {holder} first, then approve {name} (one live holder per tool)",
+                    t.name
+                );
+            }
+        }
+    }
     let target = if approve { "approved" } else { "revoked" };
     let from = if approve { "requested" } else { "approved" };
     let rows: Vec<(String, String)> = {
@@ -508,6 +534,24 @@ pub fn decide(root: &Root, conn: &Connection, name: &str, approve: bool, by: &st
     }
     sync(root, conn)?; // hooks attach/detach live
     Ok(())
+}
+
+/// Any OTHER package that currently holds an APPROVED `[[tool]]` grant for
+/// `tool` under its recorded current hash (`pkg_hash:<name>`), for the
+/// approve-time collision refusal. `None` = the name is free to approve.
+fn approved_tool_holder(conn: &Connection, tool: &str, exclude: &str) -> Result<Option<String>> {
+    let holder: Option<String> = conn
+        .query_row(
+            "SELECT g.package FROM grants g
+             JOIN kv ON kv.key = 'pkg_hash:' || g.package
+             WHERE g.kind='tool' AND g.value=?1 AND g.state='approved'
+               AND g.manifest_hash = kv.value AND g.package <> ?2
+             LIMIT 1",
+            params![tool, exclude],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(holder)
 }
 
 pub fn is_approved(conn: &Connection, package: &str, kind: &str, value: &str) -> Result<bool> {
@@ -978,6 +1022,65 @@ mod tests {
             withheld_builtin_tools(&root, "default").is_empty(),
             "no package gates the tools, so none may be withheld"
         );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    fn write_tool_pkg(root: &Root, name: &str, tool: &str) {
+        let d = root.dir.join("packages").join(name);
+        std::fs::create_dir_all(d.join("scripts")).unwrap();
+        std::fs::write(
+            d.join("elanus.toml"),
+            format!("[[tool]]\nname = \"{tool}\"\nrun = \"scripts/s\"\n"),
+        )
+        .unwrap();
+        std::fs::write(d.join("scripts/s"), "#!/bin/sh\ncat\n").unwrap();
+    }
+
+    #[test]
+    fn tool_grant_is_a_request_and_second_holder_is_refused() {
+        // M0 (docs/handoffs/kb-search.md): a [[tool]] is a "tool" grant request,
+        // approved into the ledger like any capability. Approving a SECOND
+        // package with the same bare tool name is refused loudly, naming the
+        // incumbent — the engine-swap ergonomic (disable one, enable the other).
+        let root = scratch_root("tool-collide");
+        write_tool_pkg(&root, "eng1", "search_knowledge");
+        write_tool_pkg(&root, "eng2", "search_knowledge");
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        sync(&root, &conn).unwrap();
+        // A declaration is a request, not a grant.
+        assert!(!is_approved(&conn, "eng1", "tool", "search_knowledge").unwrap());
+        decide(&root, &conn, "eng1", true, "test").unwrap();
+        assert!(is_approved(&conn, "eng1", "tool", "search_knowledge").unwrap());
+
+        // The second holder cannot be approved while eng1 holds the name.
+        let err = decide(&root, &conn, "eng2", true, "test").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("eng1"), "refusal must name the holder: {msg}");
+        assert!(!is_approved(&conn, "eng2", "tool", "search_knowledge").unwrap());
+
+        // Revoke eng1, and eng2 approves cleanly — the swap.
+        decide(&root, &conn, "eng1", false, "test").unwrap();
+        decide(&root, &conn, "eng2", true, "test").unwrap();
+        assert!(is_approved(&conn, "eng2", "tool", "search_knowledge").unwrap());
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn tool_shadowing_a_kernel_builtin_is_refused() {
+        // M0: a package [[tool]] may not shadow a kernel builtin (exec::tool_defs).
+        let root = scratch_root("tool-shadow");
+        write_tool_pkg(&root, "sneaky", "shell");
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        sync(&root, &conn).unwrap();
+        let err = decide(&root, &conn, "sneaky", true, "test").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("kernel builtin"),
+            "must refuse kernel-builtin shadowing: {msg}"
+        );
+        assert!(!is_approved(&conn, "sneaky", "tool", "shell").unwrap());
         std::fs::remove_dir_all(&root.dir).ok();
     }
 

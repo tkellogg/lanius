@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""kb-search `search_knowledge` tool (docs/handoffs/kb-search.md M1).
+
+exec-mode tool over the `[[tool]]` seam: the call args arrive as JSON on stdin
+({"query": ..., "limit"?: N}) and ranked hits go out as JSON on stdout. Opens the
+FTS5 index the daemon built (ELANUS_SCRATCH/kb-index.sqlite) strictly READ-ONLY,
+so a query is physically unable to corrupt the index. A cold-start agent holding
+only this tool can recall a curated fact and get back the file + line to open.
+
+The query shape MIRRORS src/kb.rs (query_tokens + AND-then-OR + bm25) so this
+tool and `elanus kb search` return identical hits — the engine is swappable, the
+surface is stable.
+"""
+import json
+import os
+import re
+import sqlite3
+import sys
+
+SCRATCH = os.environ.get("ELANUS_SCRATCH") or os.path.join(
+    os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."),
+    "run",
+    "pkg-kb-search",
+)
+INDEX_DB = os.path.join(SCRATCH, "kb-index.sqlite")
+DEFAULT_LIMIT = 5
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj))
+    sys.stdout.flush()
+
+
+def run_match(conn, match_expr, limit):
+    cur = conn.execute(
+        "SELECT package, path, line_start, line_end, "
+        "snippet(chunks, 4, '', '', ' … ', 12) "
+        "FROM chunks WHERE chunks MATCH ? ORDER BY bm25(chunks) LIMIT ?",
+        (match_expr, limit),
+    )
+    return [
+        {
+            "package": r[0],
+            "path": r[1],
+            "lines": f"{r[2]}-{r[3]}",
+            "snippet": (r[4] or "").strip(),
+        }
+        for r in cur.fetchall()
+    ]
+
+
+def search(conn, query, limit):
+    tokens = re.findall(r"\w+", query.lower())
+    if not tokens:
+        return []
+    quoted = ['"%s"' % t for t in tokens]
+    hits = run_match(conn, " ".join(quoted), limit)  # AND: every term
+    if hits:
+        return hits
+    return run_match(conn, " OR ".join(quoted), limit)  # widen: any term
+
+
+def main():
+    try:
+        args = json.load(sys.stdin)
+    except (ValueError, TypeError):
+        args = {}
+    query = (args.get("query") or "").strip()
+    if not query:
+        emit({"error": "search_knowledge: 'query' is required"})
+        return
+    try:
+        limit = int(args.get("limit") or DEFAULT_LIMIT)
+    except (ValueError, TypeError):
+        limit = DEFAULT_LIMIT
+    limit = max(1, min(limit, 50))
+
+    if not os.path.exists(INDEX_DB):
+        emit({
+            "error": "no knowledge index yet — the kb-search daemon has not built "
+                     "one (is the package enabled and its indexer running?)",
+            "query": query,
+            "hits": [],
+        })
+        return
+    conn = sqlite3.connect(f"file:{INDEX_DB}?mode=ro", uri=True, timeout=5)
+    try:
+        hits = search(conn, query, limit)
+    finally:
+        conn.close()
+    emit({"query": query, "hits": hits})
+
+
+if __name__ == "__main__":
+    main()

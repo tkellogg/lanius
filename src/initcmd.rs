@@ -306,6 +306,31 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         content: include_str!("../kits/stdlib/packages/explain-session/SKILL.md"),
         exec: false,
     },
+    // kb-search — the default knowledge-search ENGINE (docs/handoffs/kb-search.md):
+    // a read-only indexing daemon (scripts/index) + the `search_knowledge` model
+    // tool via the [[tool]] seam (scripts/search). Ships in stdlib so a fresh root
+    // gets the index daemon and the tool folds into agents automatically; without
+    // this, `elanus kb search` errors "no knowledge index yet".
+    PkgFile {
+        rel: "stdlib/packages/kb-search/elanus.toml",
+        content: include_str!("../kits/stdlib/packages/kb-search/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-search/scripts/index",
+        content: include_str!("../kits/stdlib/packages/kb-search/scripts/index"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-search/scripts/search",
+        content: include_str!("../kits/stdlib/packages/kb-search/scripts/search"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-search/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/kb-search/SKILL.md"),
+        exec: false,
+    },
     // kb-llm-strengths — the first knowledge base (docs/handoffs/kb-core.md M2/D5):
     // the [kb] marker + a kb/ seeded with the model-tiering rules (one file per
     // model, one per role, cross-linked). Ships in stdlib so a default agent

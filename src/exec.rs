@@ -523,9 +523,14 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     if !withheld.is_empty() {
         tools.retain(|t| !withheld.contains(t.name.as_str()));
     }
+    // Package [[tool]] seam (docs/handoffs/kb-search.md M0): approved,
+    // profile-visible package tools fold into the array beside the builtins,
+    // dispatched exec-mode. Same visibility gate the builtins ride.
+    let pkgtool_pool = crate::pkgtool::Pool::load(root, &conn, &opts.profile, &prof);
     let client_tool_names: HashSet<String> = client_tools.iter().map(|t| t.name.clone()).collect();
     tools.extend(client_tool_defs(&client_tools));
     tools.extend(mcp_pool.tool_defs());
+    tools.extend(pkgtool_pool.tool_defs());
     let root_type = match event_id {
         Some(id) => db::root_type(&conn, id).unwrap_or_else(|_| "cli".into()),
         None => "cli".into(),
@@ -759,6 +764,7 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
                     &eff,
                     &mut self_emitted,
                     &mcp_pool,
+                    &pkgtool_pool,
                 )
             };
             match outcome {
@@ -1526,6 +1532,19 @@ fn build_request(doc: &context::Doc, tools: &[Tool]) -> Result<ChatRequest> {
         .with_tools(tools.to_vec()))
 }
 
+/// The kernel's built-in agent tool names (the `tool_defs` set). A package
+/// `[[tool]]` may not shadow one of these: the approve gate refuses it
+/// (packages::decide), and the kernel arm would win at dispatch anyway.
+pub const KERNEL_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "emit_event",
+    "schedule_event",
+    "fs_lease",
+    "send_message",
+    "ask_human",
+    "launch_agent",
+];
+
 fn tool_defs() -> Vec<Tool> {
     vec![
         Tool::new("shell")
@@ -1951,6 +1970,7 @@ fn run_tool(
     call: &ToolCall,
     self_emitted: &mut HashSet<i64>,
     mcp_pool: &crate::mcp::Pool,
+    pkgtool_pool: &crate::pkgtool::Pool,
 ) -> ToolOutcome {
     let args = &call.fn_arguments;
     let err = |msg: String| ToolOutcome::Output(json!({ "error": msg }).to_string());
@@ -2254,6 +2274,12 @@ fn run_tool(
             }
         }
         other => {
+            // Bare-name package [[tool]]s (docs/handoffs/kb-search.md M0) route
+            // to their pool first; it answers None when no approved+visible
+            // package claims the name.
+            if let Some(out) = pkgtool_pool.call(root, other, args) {
+                return ToolOutcome::Output(out);
+            }
             // Namespaced MCP tools (<server>__<tool>) route to the pool; the
             // pool answers None only when no approved server claims the name.
             if let Some(out) = mcp_pool.call(other, args) {
@@ -2466,6 +2492,17 @@ fn store_msg(conn: &Connection, session: &str, event_id: Option<i64>, msg: &Valu
 mod tests {
     use super::*;
     use crate::profile::SandboxCfg;
+
+    #[test]
+    fn kernel_tool_names_match_tool_defs() {
+        // The approve-gate's kernel-builtin shadow check (packages::decide) keys
+        // on KERNEL_TOOL_NAMES; it must stay in lockstep with the actual builtins.
+        let defs: std::collections::BTreeSet<String> =
+            tool_defs().iter().map(|t| t.name.to_string()).collect();
+        let named: std::collections::BTreeSet<String> =
+            KERNEL_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(defs, named, "KERNEL_TOOL_NAMES drifted from tool_defs()");
+    }
 
     #[test]
     fn emit_event_in_plane_guard_refuses_other_mailboxes() {
@@ -2921,6 +2958,7 @@ mod tests {
             &call,
             &mut self_emitted,
             &pool,
+            &crate::pkgtool::Pool::default(),
         );
         assert!(matches!(out, ToolOutcome::Output(_)), "send_message yields Output");
 
@@ -2970,7 +3008,7 @@ mod tests {
             let mut self_emitted = HashSet::new();
             let out = run_tool(
                 &root, &conn, &cage, &prof, "s-fmt", None, None, true, &call,
-                &mut self_emitted, &pool,
+                &mut self_emitted, &pool, &crate::pkgtool::Pool::default(),
             );
             // send_message never suspends: it always yields Output.
             assert!(matches!(out, ToolOutcome::Output(_)), "send_message yields Output");
@@ -3054,6 +3092,7 @@ mod tests {
             &forge_call,
             &mut self_emitted,
             &mcp_pool,
+            &crate::pkgtool::Pool::default(),
         );
         let ToolOutcome::Output(raw) = out else {
             panic!("expected an Output outcome");
@@ -3080,6 +3119,7 @@ mod tests {
             let mut se = HashSet::new();
             let out = run_tool(
                 &root, &conn, &cage, &prof, "s1", None, None, false, &call, &mut se, &mcp_pool,
+                &crate::pkgtool::Pool::default(),
             );
             let ToolOutcome::Output(raw) = out else {
                 panic!("expected an Output outcome");
@@ -3135,6 +3175,7 @@ mod tests {
             &ok_call,
             &mut self_emitted,
             &mcp_pool,
+            &crate::pkgtool::Pool::default(),
         );
         let ToolOutcome::Output(raw) = out else {
             panic!("expected an Output outcome");
@@ -3163,6 +3204,7 @@ mod tests {
             &send_call,
             &mut self_emitted,
             &mcp_pool,
+            &crate::pkgtool::Pool::default(),
         );
         let ToolOutcome::Output(raw) = out else {
             panic!("expected an Output outcome");
@@ -3214,6 +3256,7 @@ mod tests {
             let mut se = HashSet::new();
             let out = run_tool(
                 &root, &conn, &cage, &prof, "conv-1", None, None, false, &c, &mut se, &mcp_pool,
+                &crate::pkgtool::Pool::default(),
             );
             let ToolOutcome::Output(raw) = out else {
                 panic!("expected an Output outcome");

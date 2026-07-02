@@ -1,0 +1,45 @@
+# kb-search — the default knowledge-search engine (docs/handoffs/kb-search.md).
+#
+# Two surfaces, one package:
+#   - a read-only DAEMON (scripts/index) that indexes the union of every enabled
+#     package's kb/ into a package-local sqlite FTS5 index in its own state dir
+#     (ELANUS_SCRATCH) — zero kernel schema. It re-indexes by polling: a newly
+#     enabled/disabled kb-carrying package is picked up on the next pass.
+#   - a model TOOL (scripts/search) exposed through the first-party [[tool]] seam
+#     as `search_knowledge`, the primary agent surface for recall. Exec-mode: the
+#     args arrive as JSON on stdin, ranked hits go out as JSON on stdout, and the
+#     script opens the index strictly read-only.
+#
+# The tool NAME is bare (`search_knowledge`), so a different engine (an
+# embedding-based indexer, say) can declare the SAME [[tool]] and swap invisibly
+# to agents. The approve gate refuses two live holders — disable one, enable the
+# other. `elanus kb search <query>` reads the same index for the CLI.
+
+# NOTE: kb-search carries NO [kb] marker — it is the search ENGINE, not a
+# knowledge corpus. It indexes OTHER packages' kb/ trees.
+
+[process]
+mode    = "daemon"
+run     = "scripts/index"
+restart = "backoff"
+
+[[tool]]
+name = "search_knowledge"
+description = """Search the shared knowledge base — the union of every enabled \
+package's kb/ corpus — for a query. Returns ranked hits, each a {package, path, \
+lines, snippet} pointing at a file and a line range you can open to read more. \
+Use this to recall curated facts (model tiering, roles, conventions) before \
+guessing; it is read-only and safe to call freely."""
+run = "scripts/search"
+
+[tool.schema]
+type = "object"
+required = ["query"]
+
+[tool.schema.properties.query]
+type = "string"
+description = "the search query — plain words, e.g. \"who verifies\""
+
+[tool.schema.properties.limit]
+type = "integer"
+description = "maximum hits to return (default 5)"

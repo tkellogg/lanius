@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""kb-search index daemon (docs/handoffs/kb-search.md M2/M3).
+
+Read-only over the CORPUS: it discovers every enabled package that carries a
+`[kb]` marker (via `elanus kb list --json` — the ledger + manifest are the
+truth), reads each `kb/` file, chunks it per markdown heading, and (re)builds a
+package-local sqlite FTS5 index in its own state dir (ELANUS_SCRATCH). It NEVER
+writes a `kb/` file — it only writes its own index. Zero kernel schema.
+
+Re-index trigger (wonky bit 3): POLL. Every POLL_SECONDS the daemon re-derives
+the enabled kb set and each file's (size, mtime); if the fingerprint changed it
+rebuilds. Simple and robust to missed events — a newly enabled/disabled
+kb-carrying package is picked up on the next pass. The rebuild is atomic (build a
+temp db, fsync-rename over the live index) so the tool/CLI reader never sees a
+half-built index. Crash-only: any fault exits nonzero and the supervisor
+restarts us with backoff.
+
+The FTS5 index is the SAME shape src/kb.rs reads, so `elanus kb search` and the
+`search_knowledge` tool return identical hits:
+
+  CREATE VIRTUAL TABLE chunks USING fts5(
+    package UNINDEXED, path UNINDEXED, line_start UNINDEXED, line_end UNINDEXED,
+    chunk, tokenize = 'porter unicode61');
+"""
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+
+POLL_SECONDS = 5
+MAX_FILE_BYTES = 512 * 1024
+TEXT_EXT = {".md", ".markdown", ".mdx", ".txt", ".text", ""}
+
+SCRATCH = os.environ.get("ELANUS_SCRATCH") or os.path.join(
+    os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."),
+    "run",
+    "pkg-kb-search",
+)
+INDEX_DB = os.path.join(SCRATCH, "kb-index.sqlite")
+
+
+def log(msg):
+    print(f"[kb-search/index] {msg}", file=sys.stderr, flush=True)
+
+
+def enabled_kbs():
+    """The enabled knowledge bases: one dict per `elanus kb list --json` line."""
+    out = subprocess.run(
+        ["elanus", "kb", "list", "--json", "--profile", "default"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(f"`elanus kb list` failed: {out.stderr.strip()}")
+    kbs = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line:
+            kbs.append(json.loads(line))
+    return kbs
+
+
+def kb_files(kb_dir):
+    """Every readable text file under a kb/ tree, as (abs_path, rel_to_kb)."""
+    found = []
+    for root, _dirs, files in os.walk(kb_dir):
+        for f in sorted(files):
+            abs_path = os.path.join(root, f)
+            # Never follow a symlink out of the tree (agent-written content).
+            if os.path.islink(abs_path):
+                continue
+            _, ext = os.path.splitext(f)
+            if ext.lower() not in TEXT_EXT:
+                continue
+            rel = os.path.relpath(abs_path, kb_dir)
+            found.append((abs_path, rel))
+    return sorted(found, key=lambda t: t[1])
+
+
+def fingerprint(kbs):
+    """A cheap change-detector: (package, rel, size, mtime) over the corpus."""
+    fp = []
+    for kb in kbs:
+        pkg, kb_dir = kb["package"], kb["path"]
+        if not os.path.isdir(kb_dir):
+            continue
+        for abs_path, rel in kb_files(kb_dir):
+            try:
+                st = os.stat(abs_path)
+            except OSError:
+                continue
+            fp.append((pkg, rel, st.st_size, int(st.st_mtime)))
+    return sorted(fp)
+
+
+def chunk(text):
+    """Split into (line_start, line_end, chunk_text) sections at markdown
+    headings, so a hit returns a file + line range an agent can open. A leading
+    preamble before the first heading is its own chunk."""
+    lines = text.split("\n")
+    chunks = []
+    cur, cur_start = [], 1
+
+    def flush(end):
+        if cur and any(l.strip() for l in cur):
+            chunks.append((cur_start, end, "\n".join(cur)))
+
+    for i, line in enumerate(lines, start=1):
+        if line.startswith("#") and cur:
+            flush(i - 1)
+            cur, cur_start = [line], i
+        else:
+            if not cur:
+                cur_start = i
+            cur.append(line)
+    flush(len(lines))
+    return chunks
+
+
+def build(kbs):
+    """Build a fresh index into a temp db and atomically move it into place."""
+    os.makedirs(SCRATCH, exist_ok=True)
+    tmp = INDEX_DB + ".building"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    conn = sqlite3.connect(tmp)
+    try:
+        conn.execute(
+            "CREATE VIRTUAL TABLE chunks USING fts5("
+            "package UNINDEXED, path UNINDEXED, line_start UNINDEXED, "
+            "line_end UNINDEXED, chunk, tokenize = 'porter unicode61')"
+        )
+        n = 0
+        for kb in kbs:
+            pkg, kb_dir = kb["package"], kb["path"]
+            if not os.path.isdir(kb_dir):
+                continue
+            for abs_path, rel in kb_files(kb_dir):
+                try:
+                    with open(abs_path, "r", encoding="utf-8") as fh:
+                        text = fh.read(MAX_FILE_BYTES + 1)
+                except (OSError, UnicodeDecodeError):
+                    continue  # unreadable or binary — skip, don't fail the pass
+                if len(text) > MAX_FILE_BYTES:
+                    text = text[:MAX_FILE_BYTES]
+                stored_path = f"kb/{rel}"
+                for start, end, body in chunk(text):
+                    conn.execute(
+                        "INSERT INTO chunks(package, path, line_start, line_end, chunk)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (pkg, stored_path, start, end, body),
+                    )
+                    n += 1
+        conn.commit()
+    finally:
+        conn.close()
+    os.replace(tmp, INDEX_DB)
+    return n
+
+
+def main():
+    last_fp = None
+    log(f"indexing into {INDEX_DB}, polling every {POLL_SECONDS}s")
+    while True:
+        kbs = enabled_kbs()
+        fp = fingerprint(kbs)
+        if fp != last_fp:
+            n = build(kbs)
+            log(f"rebuilt index: {len(kbs)} kb(s), {n} chunk(s)")
+            last_fp = fp
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

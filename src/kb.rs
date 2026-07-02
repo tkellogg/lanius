@@ -22,6 +22,101 @@ use std::path::{Component, Path, PathBuf};
 /// The conventional subfolder that holds a package's knowledge base.
 pub const KB_DIR: &str = "kb";
 
+/// The package that ships the default (FTS5) knowledge-search engine, and the
+/// filename of the index its daemon builds inside its state dir. The CLI reads
+/// the index straight from that well-known location; the tool surface
+/// (`search_knowledge`) is an engine-swap seam, but `elanus kb search` is the
+/// convenience verb for the default engine (docs/handoffs/kb-search.md M3).
+pub const KB_SEARCH_PKG: &str = "kb-search";
+pub const INDEX_DB: &str = "kb-index.sqlite";
+
+/// The FTS5 index path the kb-search daemon writes and the CLI reads:
+/// `<root>/run/pkg-kb-search/kb-index.sqlite` — the daemon's ELANUS_SCRATCH.
+pub fn search_index_path(root: &Root) -> PathBuf {
+    root.run_dir()
+        .join(format!("pkg-{KB_SEARCH_PKG}"))
+        .join(INDEX_DB)
+}
+
+/// One ranked search hit: a file + line range an agent can open, plus a snippet.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Hit {
+    pub package: String,
+    pub path: String,
+    pub lines: String,
+    pub snippet: String,
+}
+
+/// Split a query into word tokens (lowercased, punctuation dropped). Mirrors
+/// `scripts/search`'s `re.findall(r"\w+", q.lower())` so the CLI and the tool
+/// build the SAME FTS5 MATCH expression and return the SAME hits.
+pub fn query_tokens(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in query.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            cur.extend(ch.to_lowercase());
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Query the FTS5 index the kb-search daemon builds — READ-ONLY, so the query
+/// path is physically unable to corrupt the index it reads. AND semantics first
+/// (a hit contains every term), falling back to OR when AND finds nothing;
+/// ranked by bm25. This is the exact shape `scripts/search` runs, so
+/// `elanus kb search` returns the same hits as the `search_knowledge` tool.
+pub fn search(index_db: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
+    if !index_db.exists() {
+        bail!(
+            "no knowledge index yet at {} — is the kb-search package enabled, and has its \
+             daemon run an index pass?",
+            index_db.display()
+        );
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        index_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening the kb index {}", index_db.display()))?;
+    let tokens = query_tokens(query);
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    let quoted: Vec<String> = tokens.iter().map(|t| format!("\"{t}\"")).collect();
+    let hits = run_match(&conn, &quoted.join(" "), limit)?;
+    if !hits.is_empty() {
+        return Ok(hits);
+    }
+    run_match(&conn, &quoted.join(" OR "), limit)
+}
+
+fn run_match(conn: &rusqlite::Connection, match_expr: &str, limit: usize) -> Result<Vec<Hit>> {
+    let mut stmt = conn.prepare(
+        "SELECT package, path, line_start, line_end, \
+                snippet(chunks, 4, '', '', ' … ', 12) \
+         FROM chunks WHERE chunks MATCH ?1 ORDER BY bm25(chunks) LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![match_expr, limit as i64], |r| {
+            let ls: i64 = r.get(2)?;
+            let le: i64 = r.get(3)?;
+            Ok(Hit {
+                package: r.get(0)?,
+                path: r.get(1)?,
+                lines: format!("{ls}-{le}"),
+                snippet: r.get::<_, String>(4)?.trim().to_string(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// One enabled knowledge base, for `elanus kb list`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct KbInfo {
@@ -532,6 +627,78 @@ mod tests {
 
         std::fs::remove_dir_all(&linked_root).ok();
         std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    /// Build a fixture FTS5 index with the SAME schema the daemon writes, so the
+    /// Rust query path (kb::search — the `elanus kb search` engine) is tested
+    /// deterministically without invoking python.
+    fn build_fixture_index(path: &Path, rows: &[(&str, &str, i64, i64, &str)]) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "CREATE VIRTUAL TABLE chunks USING fts5(\
+               package UNINDEXED, path UNINDEXED, line_start UNINDEXED, \
+               line_end UNINDEXED, chunk, tokenize = 'porter unicode61')",
+            [],
+        )
+        .unwrap();
+        for (pkg, p, ls, le, body) in rows {
+            conn.execute(
+                "INSERT INTO chunks(package, path, line_start, line_end, chunk) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![pkg, p, ls, le, body],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn search_ranks_the_verifier_chunk_top_and_returns_file_lines() {
+        // M1/M3 query correctness: "who verifies" returns kb/role-verifier.md with
+        // its line range — the file + line a cold-start agent opens.
+        let root = scratch("search");
+        let db = root.dir.join("kb-index.sqlite");
+        build_fixture_index(
+            &db,
+            &[
+                ("kb-llm-strengths", "kb/role-planner.md", 1, 8, "Role: planner. Only Claude or Fable plan; planning never flexes."),
+                ("kb-llm-strengths", "kb/role-verifier.md", 6, 14, "Who verifies\nOpus on high\nGPT-5.5 on high\nFable for the hardest verifications."),
+                ("kb-llm-strengths", "kb/claude.md", 1, 5, "Claude is a planning model with taste."),
+            ],
+        );
+        let hits = search(&db, "who verifies", 5).unwrap();
+        assert!(!hits.is_empty(), "a well-formed query returns hits");
+        assert_eq!(hits[0].package, "kb-llm-strengths");
+        assert_eq!(hits[0].path, "kb/role-verifier.md");
+        assert_eq!(hits[0].lines, "6-14", "the hit carries the openable line range");
+        assert!(hits[0].snippet.to_lowercase().contains("verif"));
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn search_falls_back_to_or_when_and_finds_nothing() {
+        // porter stemming + AND-then-OR: a query mixing a present stem with an
+        // absent term still returns the chunk carrying the present one.
+        let root = scratch("search-or");
+        let db = root.dir.join("kb-index.sqlite");
+        build_fixture_index(
+            &db,
+            &[("p", "kb/a.md", 1, 3, "verification is a stronger tier than implementation")],
+        );
+        // "stronger" is present; "zznope" is absent → AND (both terms) is empty,
+        // so the OR fallback (any term) recovers the chunk on "stronger".
+        let hits = search(&db, "stronger zznope", 5).unwrap();
+        assert_eq!(hits.len(), 1, "OR fallback recovers the chunk: {hits:?}");
+        assert_eq!(hits[0].path, "kb/a.md");
+        // A missing index is a legible error, not a panic.
+        assert!(search(&root.dir.join("nope.sqlite"), "x", 5).is_err());
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn query_tokens_strips_punctuation_and_lowercases() {
+        assert_eq!(query_tokens("Who verifies?"), vec!["who", "verifies"]);
+        assert_eq!(query_tokens("  GPT-5.5 on high!  "), vec!["gpt", "5", "5", "on", "high"]);
+        assert!(query_tokens("???").is_empty());
     }
 
     #[test]

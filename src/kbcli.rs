@@ -48,6 +48,35 @@ pub fn list(root: &Root, profile: &str, json_out: bool) -> Result<()> {
     Ok(())
 }
 
+/// `elanus kb search <query>`: ranked file+line hits from the kb-search FTS5
+/// index (the same index the `search_knowledge` tool reads, so identical hits).
+/// Human list or one JSON line per hit.
+pub fn search(root: &Root, query: &str, limit: usize, json_out: bool) -> Result<()> {
+    let hits = kb::search(&kb::search_index_path(root), query, limit)?;
+    if json_out {
+        for h in &hits {
+            println!(
+                "{}",
+                json!({
+                    "package": h.package,
+                    "path": h.path,
+                    "lines": h.lines,
+                    "snippet": h.snippet,
+                })
+            );
+        }
+        return Ok(());
+    }
+    if hits.is_empty() {
+        println!("no hits for {query:?}");
+        return Ok(());
+    }
+    for h in &hits {
+        println!("{}/{}:{}  {}", h.package, h.path, h.lines, h.snippet);
+    }
+    Ok(())
+}
+
 /// `elanus kb write <pkg> <path>`: write stdin (or `--content`) into `kb/<path>`
 /// and commit it. Write-then-commit is atomic with the KB's hardened git.
 pub fn write(root: &Root, pkg: &str, path: &str, content: &str) -> Result<()> {
