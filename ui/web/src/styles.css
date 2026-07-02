@@ -402,7 +402,19 @@ body {
 .conv-recent-row:hover { color: var(--ink); background: var(--hover); }
 .conv-recent-row span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv-recent-row em { display: flex; align-items: center; gap: 5px; color: var(--meta); font-style: normal; font-size: 9.5px; }
+/* docs/handoffs/reply-branching.md M3 — the flat "branched from …" subtitle on a
+   child conversation row (wonky bit 3: legible but flat, not a nested tree). */
+.conv-branched-sub { display: block; color: var(--meta); font-size: 9.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-left: 2px solid var(--panel-edge); padding-left: 5px; }
 .dim-inline { align-self: center; color: var(--meta); font-size: 11px; }
+
+/* M3 — the origin chip at the top of a branched thread: quotes the target and
+   links back to the parent conversation. */
+.conv-origin-chip { margin: 4px 0 8px; padding: 8px 10px; border: 1px solid var(--panel-edge); border-left: 3px solid var(--accent, var(--meta)); border-radius: 3px; background: var(--code-bg); display: flex; flex-direction: column; gap: 5px; }
+.conv-origin-chip .origin-label { font: 10px var(--mono); letter-spacing: 0.16em; text-transform: uppercase; color: var(--meta); }
+.conv-origin-chip .origin-quote { margin: 0; color: var(--dim); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+.conv-origin-chip .origin-link { align-self: flex-start; font-size: 11px; }
+.msg-reply { margin-left: auto; border: none; background: none; color: var(--meta); font: 10px var(--mono); cursor: pointer; opacity: 0; transition: opacity 0.12s; padding: 0; }
+.msg:hover .msg-reply, .msg-reply:focus { opacity: 1; color: var(--ink); }
 
 .msg { max-width: 86%; animation: arrive 0.25s ease-out both; }
 @keyframes arrive { from { opacity: 0; transform: translateY(5px); } }

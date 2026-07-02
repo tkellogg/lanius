@@ -1515,6 +1515,135 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
+// ── flow 6g: reply-branching — replying to a message forks a legible thread ───
+// docs/handoffs/reply-branching.md M3. Seed a conversation with an older
+// message; click its reply affordance; assert a fresh #view-converse thread
+// opens with an origin chip quoting the target and linking to the parent, the
+// conversations list shows the child with a "branched from" subtitle, and
+// sending in the branch publishes an in/agent event carrying the structured
+// `branched_from` (verified via the seeded ledger / a follow-up GET). The kernel
+// composes the agent-visible quote from that field — the client sends only the
+// structured anchor, so a third party can reconstruct child→parent from
+// `branched_from.event_id` alone.
+{
+  const branchAgent = 'brancher';
+  const parentSession = `web-${branchAgent}-parent-${Date.now().toString(36)}`;
+  const oldMsg = `about the friday ship date (${Date.now().toString(36)})`;
+  const parentCorr = `br-parent-${Date.now().toString(36)}`;
+  const emitAs = (actor, ...a) =>
+    execFileSync(path.join(BIN, 'elanus'), a, { env: { ...ENV, ELANUS_ACTOR: actor }, encoding: 'utf8' });
+
+  const seedPage = await newPage();
+  await seedPage.goto('/');
+  const created = await seedPage.evaluate(async (name) => {
+    const r = await fetch('/api/admin/agents', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return r.json().catch(() => ({}));
+  }, branchAgent);
+  created.ok ? ok(`branch: created agent ${branchAgent}`) : fail(`branch: could not create ${branchAgent} (${JSON.stringify(created)})`);
+  await seedPage.close();
+
+  // Seed conversation A: the owner's prompt (the message we later reply to) plus
+  // a correlated agent reply so the thread renders with a real, ledgered message.
+  emitAs('owner', 'emit', `in/agent/${branchAgent}`, '--correlation', parentCorr, '--payload',
+    JSON.stringify({ prompt: oldMsg, session: parentSession }));
+  emitAs(branchAgent, 'emit', 'in/human/owner', '--correlation', parentCorr, '--payload',
+    JSON.stringify({ text: 'noted — friday it is', session: parentSession }));
+
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+  const publishes = [];
+  page.on('request', (req) => {
+    if (!req.url().endsWith('/api/publish') || req.method() !== 'POST') return;
+    try { publishes.push(JSON.parse(req.postData() || '{}')); } catch {}
+  });
+
+  await waitFor(`branch: ${branchAgent} in nav`, async () => {
+    const items = await page.$$('#nav-agents .nav-agent');
+    for (const item of items) {
+      if ((await item.getAttribute('data-sel')) === `agent:${branchAgent}`) { await item.click(); return true; }
+    }
+    return false;
+  }, 10000);
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+
+  // Open conversation A from the nav and wait for the old message in the feed.
+  await waitFor('branch: the seeded conversation opens', async () => {
+    const rows = await page.$$('#nav-agents .nav-conversation');
+    for (const row of rows) {
+      const txt = (await row.textContent()) || '';
+      if (txt.includes(oldMsg)) { await row.click(); return true; }
+    }
+    return false;
+  }, 10000);
+  await waitFor('branch: the old message is in the feed', async () =>
+    (await page.$eval('#conv-holder', (el) => el.textContent)).includes(oldMsg), 8000);
+
+  // Click the reply affordance on the OLD message specifically.
+  await waitFor('branch: reply affordance forks a new thread', async () => {
+    const msgs = await page.$$('#conv-holder .msg');
+    for (const el of msgs) {
+      const t = (await el.textContent()) || '';
+      if (t.includes(oldMsg)) {
+        const btn = await el.$('[data-sel="msg-reply"]');
+        if (btn) { await btn.click(); return true; }
+      }
+    }
+    return false;
+  }, 8000);
+
+  // The fork opens with an origin chip quoting the target + a link to the parent.
+  await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  await waitFor('branch: origin chip quotes the target and links back', async () => {
+    const chip = await page.$('[data-sel="conv-origin"]');
+    if (!chip) return false;
+    const txt = (await chip.textContent()) || '';
+    const link = await page.$('[data-sel="conv-origin-link"]');
+    return txt.includes(oldMsg) && /branched from/i.test(txt) && !!link;
+  }, 8000);
+
+  // Sending in the branch publishes an in/agent carrying the structured edge.
+  const reply = `and the marketing copy? (${Date.now().toString(36)})`;
+  await page.fill('#compose-input', reply);
+  await page.click('#compose-send');
+  await waitFor('branch: the send carries a structured branched_from anchor', async () => {
+    const b = publishes.find((p) => p.payload?.branched_from);
+    return !!b
+      && b.topic === `in/agent/${branchAgent}`
+      && b.payload.prompt === reply
+      && b.payload.branched_from.event_id != null
+      && String(b.payload.branched_from.quote || '').includes(oldMsg)
+      && b.payload.branched_from.session === parentSession;
+  }, 8000);
+  const branchPublish = publishes.find((p) => p.payload?.branched_from);
+  const childSession = branchPublish.payload.session;
+
+  // The conversations list shows the child with a "branched from" subtitle.
+  await waitFor('branch: the list shows a "branched from" subtitle on the child', async () => {
+    const subs = await page.$$eval('[data-sel="conv-branched"]', (els) => els.map((e) => e.textContent || ''));
+    return subs.some((s) => /branched from/i.test(s) && s.includes(oldMsg.slice(0, 20)));
+  }, 8000);
+
+  // Ledger honesty: a third party reads branched_from.event_id off the child's
+  // seed and finds the parent — reconstructable from the raw projection alone.
+  const recon = await page.evaluate(async ({ name, child, parent }) => {
+    const r = await fetch(`/api/conversations?agent=${encodeURIComponent(name)}`);
+    const j = await r.json().catch(() => ({}));
+    const convs = j.conversations ?? [];
+    const c = convs.find((x) => x.session === child);
+    const p = convs.find((x) => x.session === parent);
+    return { childEdge: c?.branched_from ?? null, parentIsRoot: p ? p.branched_from == null : false };
+  }, { name: branchAgent, child: childSession, parent: parentSession });
+  recon.childEdge && recon.childEdge.event_id != null && recon.childEdge.session === parentSession && recon.parentIsRoot
+    ? ok(`branch: child→parent reconstructable from the ledger (event ${recon.childEdge.event_id})`)
+    : fail(`branch: branch edge not reconstructable from the projection (${JSON.stringify(recon)})`);
+
+  await page.close();
+}
+
 // ── flow 7: history works out of the box ──────────────────────────────────────
 // history is stdlib, on at init, so the sessions tab is backed
 // by the real transcript view — NOT the unavailable-transcripts note —

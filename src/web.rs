@@ -618,10 +618,24 @@ async fn conversation(
         );
     };
     let session_out = session.clone();
-    match web::block(move || conversation_messages(&session, &db)).await {
-        Ok(messages) => json_resp(
+    match web::block(move || {
+        // M2 (docs/handoffs/reply-branching.md): carry the branch origin on the
+        // conversation object so the feed can draw the origin chip — the quoted
+        // target + a link back to the parent — derived from the seed event's
+        // structured `branched_from`.
+        let branched_from = conversation_branched_from(&session, &db)?;
+        let messages = conversation_messages(&session, &db)?;
+        Ok::<_, anyhow::Error>((messages, branched_from))
+    })
+    .await
+    {
+        Ok((messages, branched_from)) => json_resp(
             200,
-            json!({ "ok": true, "conversation": { "session": session_out, "messages": messages } }),
+            json!({ "ok": true, "conversation": {
+                "session": session_out,
+                "messages": messages,
+                "branched_from": branched_from.unwrap_or(Value::Null),
+            } }),
         ),
         Err(e) => json_resp(
             503,
@@ -2368,6 +2382,12 @@ struct Conv {
     preview: String,
     last_role: String,
     first_ts: String,
+    // docs/handoffs/reply-branching.md M2 — the branch edge, derived from the
+    // seeding in/agent event's `branched_from` (never invented). `{ session,
+    // event_id, preview }`: the parent session, the parent message's ledger id
+    // (the anchor a third party reads to draw child→parent), and a short preview
+    // of the quoted text. None for a non-branched conversation.
+    branched_from: Option<Value>,
 }
 
 struct Convs {
@@ -2427,6 +2447,33 @@ impl Convs {
     }
 }
 
+// docs/handoffs/reply-branching.md M2 — the flat branch summary for a
+// conversation-list row, derived (never invented) from the seeding in/agent
+// event's structured `branched_from: { event_id, corr, session, quote }`. The
+// list shows a "branched from …" subtitle, so it needs the parent `session` (to
+// link back), the parent message's `event_id` (the anchor a third party reads to
+// draw child→parent), and a short `preview` of the quoted text. Returns None
+// when the payload carries no honest branch anchor.
+fn branch_row_summary(payload: &Value) -> Option<Value> {
+    let bf = payload.get("branched_from")?;
+    if !bf.is_object() {
+        return None;
+    }
+    let event_id = bf.get("event_id").filter(|v| !v.is_null());
+    let session = bf.get("session").and_then(Value::as_str);
+    let quote = bf.get("quote").and_then(Value::as_str).unwrap_or("");
+    // The edge is only reconstructable with a real anchor: no event_id AND no
+    // parent session means there is nothing to point at — treat as no branch.
+    if event_id.is_none() && session.is_none() {
+        return None;
+    }
+    Some(json!({
+        "session": session,
+        "event_id": event_id,
+        "preview": truncate_text(quote, 110),
+    }))
+}
+
 fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
     let conn = open_ro(db)?;
     // `source_for` labels the owner's own messages as "you"; it also matches the
@@ -2454,7 +2501,15 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
         }
         let source = source_for(&session, &row.sender, &payload, owner);
         let created = row.created_at.clone().unwrap_or_default();
-        convs.ensure(&session, Some(&source), &created);
+        let conv = convs.ensure(&session, Some(&source), &created);
+        // M2 (docs/handoffs/reply-branching.md): expose the branch edge from the
+        // seeding event's structured `branched_from`. First seed wins; a later
+        // reply into the same thread never overwrites the origin.
+        if conv.branched_from.is_none() {
+            if let Some(bf) = branch_row_summary(&payload) {
+                conv.branched_from = Some(bf);
+            }
+        }
         if let Some(prompt) = payload
             .get("prompt")
             .and_then(Value::as_str)
@@ -2580,6 +2635,8 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
                 "message_count": c.message_count,
                 "preview": c.preview,
                 "last_role": c.last_role,
+                // M2: the branch edge, or null for a root conversation.
+                "branched_from": c.branched_from.clone().unwrap_or(Value::Null),
             })
         })
         .collect();
@@ -2591,6 +2648,47 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
     });
     out.truncate(100);
     Ok(Value::Array(out))
+}
+
+// docs/handoffs/reply-branching.md M2 — the branch origin for a thread's feed,
+// derived from the seeding in/agent event's structured `branched_from`. Unlike
+// the list summary, the feed's origin chip quotes the full target text, so this
+// exposes `{ session, event_id, quote, preview }`. Reconstructable straight from
+// the ledger: `branched_from.event_id` is the raw anchor pointing at the parent
+// message row. Returns None for a root (non-branched) conversation.
+fn conversation_branched_from(session: &str, db: &FsPath) -> Result<Option<Value>> {
+    let conn = open_ro(db)?;
+    // The child's seed carries `"session":"<child>"` at the payload root; the
+    // parent id inside branched_from is a distinct nested field, so this LIKE
+    // matches the child seed, not the parent thread. Earliest wins.
+    let like = format!("%\"session\":\"{session}\"%");
+    let mut stmt = conn.prepare(
+        "SELECT payload FROM events WHERE type LIKE 'in/agent/%' AND payload LIKE ? ORDER BY id ASC LIMIT 200",
+    )?;
+    let rows = stmt.query_map([like], |row| Ok(col_string(row, 0)))?;
+    for r in rows {
+        let payload = parse_payload(&r?);
+        // Anchor only on the child's own seed (top-level session == this session).
+        if payload.get("session").and_then(Value::as_str) != Some(session) {
+            continue;
+        }
+        let Some(bf) = payload.get("branched_from").filter(|v| v.is_object()) else {
+            continue;
+        };
+        let event_id = bf.get("event_id").filter(|v| !v.is_null());
+        let parent = bf.get("session").and_then(Value::as_str);
+        if event_id.is_none() && parent.is_none() {
+            continue;
+        }
+        let quote = bf.get("quote").and_then(Value::as_str).unwrap_or("");
+        return Ok(Some(json!({
+            "session": parent,
+            "event_id": event_id,
+            "quote": quote,
+            "preview": truncate_text(quote, 110),
+        })));
+    }
+    Ok(None)
 }
 
 fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
@@ -3066,6 +3164,102 @@ mod ambient_tests {
             feed.iter().any(|m| m["text"].as_str() == Some("your build finished — all green")
                 && m["cls"].as_str() == Some("agent")),
             "the ambient send renders as an agent turn in the feed ({feed:?})"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // docs/handoffs/reply-branching.md M2 — a branched conversation carries the
+    // branch edge, reconstructable straight from the raw ledger payload: a third
+    // party reads `branched_from.event_id` off B's seed and finds the parent
+    // message row in A.
+    #[test]
+    fn branched_conversation_exposes_the_reconstructable_edge() {
+        let dir = std::env::temp_dir().join(format!("el-branchconv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let agent = "companion";
+        let owner = "owner";
+
+        // Conversation A: an ordinary prompted thread. Its prompt event is the
+        // message a person later replies to.
+        insert_event(
+            &conn,
+            &format!("in/agent/{agent}"),
+            Some("c-a"),
+            json!({ "prompt": "the plan is to ship on friday", "session": "web-A" }),
+            Some(owner),
+            "2026-07-01T09:00:00.000Z",
+        );
+        let parent_event_id = conn.last_insert_rowid();
+
+        // Conversation B: forked by replying to A's message. The seed carries ONLY
+        // the structured branch field (the kernel composes any quote), and the
+        // anchor is A's ledger event id.
+        insert_event(
+            &conn,
+            &format!("in/agent/{agent}"),
+            Some("c-b"),
+            json!({
+                "prompt": "and what about the cost?",
+                "session": "web-B",
+                "branched_from": {
+                    "event_id": parent_event_id,
+                    "corr": "c-a",
+                    "session": "web-A",
+                    "quote": "the plan is to ship on friday"
+                }
+            }),
+            Some(owner),
+            "2026-07-01T10:00:00.000Z",
+        );
+
+        // (1) The list row for B references A (parent session + the anchor id).
+        let out = conversation_rows(agent, &root.db(), owner).unwrap();
+        let convs = out.as_array().unwrap();
+        let b = convs.iter().find(|c| c["session"] == "web-B").unwrap();
+        let bf = &b["branched_from"];
+        assert!(bf.is_object(), "B carries a branch edge ({b})");
+        assert_eq!(bf["session"].as_str(), Some("web-A"));
+        assert_eq!(bf["event_id"].as_i64(), Some(parent_event_id));
+        assert!(
+            bf["preview"].as_str().unwrap().contains("ship on friday"),
+            "the row preview quotes the target ({bf})"
+        );
+        // A root conversation has a null edge.
+        let a = convs.iter().find(|c| c["session"] == "web-A").unwrap();
+        assert!(a["branched_from"].is_null(), "A is a root ({a})");
+
+        // (2) The thread detail exposes the origin + the full quoted text.
+        let origin = conversation_branched_from("web-B", &root.db()).unwrap().unwrap();
+        assert_eq!(origin["session"].as_str(), Some("web-A"));
+        assert_eq!(origin["event_id"].as_i64(), Some(parent_event_id));
+        assert_eq!(
+            origin["quote"].as_str(),
+            Some("the plan is to ship on friday")
+        );
+
+        // (3) Third-party reconstruction from RAW event payloads alone: read the
+        // edge off B's seed, then find the parent row it points at — no projection
+        // help, just `branched_from.event_id` -> the events table.
+        let raw_b: String = conn
+            .query_row(
+                "SELECT payload FROM events WHERE type=?1 AND correlation_id='c-b'",
+                [format!("in/agent/{agent}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let raw_b: Value = serde_json::from_str(&raw_b).unwrap();
+        let edge = raw_b["branched_from"]["event_id"].as_i64().unwrap();
+        let parent_topic: String = conn
+            .query_row("SELECT type FROM events WHERE id=?1", [edge], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            parent_topic,
+            format!("in/agent/{agent}"),
+            "the raw anchor resolves to the parent message row"
         );
 
         std::fs::remove_dir_all(&dir).ok();

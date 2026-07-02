@@ -166,10 +166,39 @@ fn envelope_to_context_event(env: &Value) -> Value {
 }
 
 fn event_prompt_from_payload(payload: &Value) -> Option<String> {
-    payload["prompt"]
+    let base = payload["prompt"]
         .as_str()
         .or_else(|| payload["text"].as_str())
-        .map(ToString::to_string)
+        .map(ToString::to_string)?;
+    Some(compose_branched_prompt(payload, base))
+}
+
+/// docs/handoffs/reply-branching.md M1 — the kernel composes the agent-visible
+/// quote from the structured `branched_from` field. A reply in the web UI forks
+/// a fresh conversation and publishes `in/agent/<agent>` carrying `branched_from:
+/// { event_id, corr, session, quote }` (the ledger anchor + the target text). The
+/// UI sends ONLY that structured field — never a pre-inlined blob — so the ledger
+/// stays reconstructable (a third party reads `branched_from.event_id` to draw
+/// child→parent). Composing the quote here, once, at the single prompt-build
+/// site, means every branched run (this UI or any future client) leads the
+/// model's prompt with the quoted target, and a client that forgot to inline the
+/// quote can never leak a context-less prompt. No `branched_from.quote` → the
+/// prompt is byte-identical to today.
+fn compose_branched_prompt(payload: &Value, base: String) -> String {
+    let Some(quote) = payload["branched_from"]["quote"].as_str() else {
+        return base;
+    };
+    let quote = quote.trim();
+    if quote.is_empty() {
+        return base;
+    }
+    // Blockquote each line so a multi-line target reads as one quoted unit.
+    let quoted: String = quote
+        .lines()
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("You were asked to respond to this earlier message:\n{quoted}\n\n{base}")
 }
 
 fn event_already_in_transcript(
@@ -2332,6 +2361,51 @@ mod tests {
         assert!(resolve_workdir(&cfg(None)).unwrap().is_none());
     }
 
+    // docs/handoffs/reply-branching.md M1 — the kernel composes the quote from
+    // `branched_from`; the UI only sends the structured field.
+    #[test]
+    fn branched_prompt_leads_with_the_quoted_target() {
+        let payload = json!({
+            "prompt": "and what about the cost?",
+            "session": "web-branch-1",
+            "branched_from": {
+                "event_id": 42,
+                "corr": "corr-abc",
+                "session": "web-parent-9",
+                "quote": "the plan is to ship on friday"
+            }
+        });
+        let prompt = event_prompt_from_payload(&payload).unwrap();
+        // The person's new text is present…
+        assert!(prompt.contains("and what about the cost?"), "{prompt}");
+        // …led by the quoted target, attributed as the message being replied to.
+        assert!(prompt.contains("the plan is to ship on friday"), "{prompt}");
+        assert!(prompt.contains("earlier message"), "{prompt}");
+        assert!(prompt.contains("> the plan is to ship on friday"), "{prompt}");
+        let quote_at = prompt.find("the plan is to ship on friday").unwrap();
+        let new_at = prompt.find("and what about the cost?").unwrap();
+        assert!(quote_at < new_at, "quote must lead the new text: {prompt}");
+    }
+
+    // An event with no `branched_from` is byte-identical to today.
+    #[test]
+    fn unbranched_prompt_is_unchanged() {
+        let payload = json!({ "prompt": "just a normal message", "session": "web-1" });
+        assert_eq!(
+            event_prompt_from_payload(&payload).as_deref(),
+            Some("just a normal message")
+        );
+        // `text` fallback path is equally untouched.
+        let payload = json!({ "text": "via text field" });
+        assert_eq!(
+            event_prompt_from_payload(&payload).as_deref(),
+            Some("via text field")
+        );
+        // An empty quote is treated as no branch (no context-less lead-in).
+        let payload = json!({ "prompt": "hi", "branched_from": { "quote": "   " } });
+        assert_eq!(event_prompt_from_payload(&payload).as_deref(), Some("hi"));
+    }
+
     #[test]
     fn workdir_must_be_absolute() {
         let e = resolve_workdir(&cfg(Some("relative/path"))).unwrap_err();
@@ -3179,10 +3253,10 @@ pub fn handle_exec(root: &Root) -> Result<()> {
             event: Some(event),
         }
     } else {
-        let prompt = payload["prompt"]
-            .as_str()
-            .or_else(|| payload["text"].as_str());
-        let Some(prompt) = prompt else {
+        // Kernel composes the agent-visible quote from `branched_from` here, the
+        // single prompt-build site (docs/handoffs/reply-branching.md M1). A run
+        // with no `branched_from` gets the byte-identical prompt to today.
+        let Some(prompt) = event_prompt_from_payload(payload) else {
             if !payload["answer"].is_null() {
                 // An answer addressed to the agent mailbox (in/agent/<noun>)
                 // shares the mailbox topic with ordinary work since v3; the
@@ -3196,7 +3270,6 @@ pub fn handle_exec(root: &Root) -> Result<()> {
             }
             bail!("agent mailbox (in/agent/<noun>) payload needs a 'prompt' (or 'text') field");
         };
-        let prompt = prompt.to_string();
         ExecOpts {
             session: Some(session),
             profile,

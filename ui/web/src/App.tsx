@@ -460,6 +460,13 @@ export function App() {
   const [paused, setPaused] = useState(false);
   const [conv, setConv] = useState(new Map());
   const [conversations, setConversations] = useState(new Map());
+  // docs/handoffs/reply-branching.md M3 — the branch origin to render for a
+  // session's thread (the origin chip): a Map<session, { session (parent),
+  // event_id, quote }>. Populated when a reply forks a fresh thread (pending,
+  // before the first send) AND from a loaded conversation's `branched_from`
+  // (persisted, from the ledger projection). One map so the chip renders the
+  // same whether the branch is still pending or already sent.
+  const [branchOrigins, setBranchOrigins] = useState(new Map());
   const [sessionsState, setSessionsState] = useState<any>({ status: 'idle', sessions: [], transcript: null, error: '' });
   const [modelOptions, setModelOptions] = useState<any[]>([]);
   const [modelsHint, setModelsHint] = useState('');
@@ -491,6 +498,11 @@ export function App() {
   refs.current = { sel, agents, diskProfiles, defaultAgent, historyOk, filter, paused, cfgForm, cfgPackages, cfgContextChain, conversations };
   const corrAgent = useRef(new Map());
   const corrSession = useRef(new Map());
+  // The pending branch target for a forked session, keyed by the new session id:
+  // { event_id, corr, quote, session (parent) }. submitCompose reads it to attach
+  // the structured `branched_from` to the FIRST publish, then consumes it (a
+  // branch seeds once; later replies in the same thread are ordinary sends).
+  const branchTargets = useRef(new Map());
   const sentCorrs = useRef(new Set());
   const seenAsks = useRef(new Set());
   const seenFailures = useRef(new Set());
@@ -654,6 +666,15 @@ export function App() {
         next.set(agent, mergeConvMessages(next.get(agent) ?? [], j.conversation?.messages ?? []));
         return next;
       });
+      // M3 (reply-branching): a loaded conversation may carry its branch origin
+      // (docs/handoffs/reply-branching.md M2). Record it so the origin chip
+      // renders for a branch opened from the list — not just a freshly forked
+      // one. Only overwrite when the ledger actually has an edge (never clobber a
+      // pending fork's origin with null).
+      const bf = j.conversation?.branched_from;
+      if (bf && (bf.event_id != null || bf.session)) {
+        setBranchOrigins((prev) => new Map(prev).set(session, { session: bf.session, event_id: bf.event_id, quote: bf.quote ?? bf.preview ?? '' }));
+      }
     } catch {
       /* live tail still works */
     }
@@ -665,6 +686,25 @@ export function App() {
   };
   const newConversation = (agent: string) => {
     const session = newWebConversationId(agent);
+    rememberConversation(agent, session);
+    setConv((prev) => new Map(prev).set(agent, []));
+    selectAgent(agent, 'converse');
+    requestAnimationFrame(() => document.querySelector<HTMLInputElement>('#compose-input')?.focus());
+  };
+
+  // docs/handoffs/reply-branching.md M3 — clicking reply on any message forks a
+  // brand-new conversation seeded with that message as context (Slack-style). We
+  // mint a fresh web-* session, stash the target as this session's pending branch
+  // (submitCompose attaches the structured `branched_from` to the first publish),
+  // and show the origin chip immediately from the target so the fork is legible
+  // before the first send. The kernel composes the agent-visible quote from the
+  // structured field — the UI never inlines it into the prompt.
+  const startBranch = (agent: string, m: any) => {
+    const parentSession = currentConversation(agent);
+    const session = newWebConversationId(agent);
+    const quote = String(m?.text ?? '');
+    branchTargets.current.set(session, { event_id: m?.event_id ?? null, corr: m?.corr ?? null, quote, session: parentSession });
+    setBranchOrigins((prev) => new Map(prev).set(session, { session: parentSession, event_id: m?.event_id ?? null, quote }));
     rememberConversation(agent, session);
     setConv((prev) => new Map(prev).set(agent, []));
     selectAgent(agent, 'converse');
@@ -1188,7 +1228,17 @@ export function App() {
     addConv(agent, { key: `live:${corr}:you:${text}`, who: 'you', cls: 'you', text, corr, ts: new Date().toISOString() });
     input.value = '';
     const btn = e.currentTarget.querySelector('#compose-send') as HTMLButtonElement;
-    const ok = await publish(`in/agent/${agent}`, { prompt: text, session }, corr);
+    // M3 (reply-branching): if this session is a pending fork, attach the
+    // structured `branched_from` to the seed publish (the kernel composes the
+    // agent-visible quote from it). Consumed after the first send — a branch
+    // seeds once.
+    const target = branchTargets.current.get(session);
+    const payload: any = { prompt: text, session };
+    if (target) {
+      payload.branched_from = { event_id: target.event_id, corr: target.corr, quote: target.quote, session: target.session };
+      branchTargets.current.delete(session);
+    }
+    const ok = await publish(`in/agent/${agent}`, payload, corr);
     void loadConversations(agent);
     btn.textContent = ok ? 'accepted ✓' : 'failed ✕';
     btn.classList.toggle('sent', ok);
@@ -1295,6 +1345,8 @@ export function App() {
             selectAgent={selectAgent}
             openConversation={openConversation}
             newConversation={newConversation}
+            startBranch={startBranch}
+            branchOrigin={sel.kind === 'agent' ? branchOrigins.get(currentConversation(sel.agent)) : undefined}
             selectCodeSessions={selectCodeSessions}
             isTraceAgent={sel.kind === 'agent' && (isWorkerAgentName(sel.agent) || [...(agents.get(sel.agent)?.sessions ?? [])].some((s) => isWorkerSessionId(s)))}
             sendLabel={L.send}
@@ -2234,7 +2286,7 @@ function KitAddRow({ kit, cfgForm, cfgPackages, detail, loadKitDetail, installKi
   );
 }
 
-function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation, selectCodeSessions, isTraceAgent, sendLabel, allowHtml }: any) {
+function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation, startBranch, branchOrigin, selectCodeSessions, isTraceAgent, sendLabel, allowHtml }: any) {
   const [conversationSearch, setConversationSearch] = useState('');
   const allConversations = conversations?.list ?? [];
   const query = conversationSearch.trim().toLowerCase();
@@ -2296,15 +2348,27 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
                 : resultConversations.map((c: any) => (
                   <button key={c.session} className={`conv-recent-row${c.session === current ? ' on' : ''}`} title={c.session} type="button" onClick={() => openConversation(agent, c.session)}>
                     <span>{c.title || c.preview || 'conversation'}</span>
+                    {c.branched_from && <span className="conv-branched-sub" data-sel="conv-branched">branched from: {c.branched_from.preview || 'an earlier message'}</span>}
                     <em><span className="source-badge">{c.source || 'you'}</span>{relativeTime(c.last_ts)}</em>
                   </button>
                 ))}
         </div>
       </div>
       <div id="conv-holder" className="conv-feed-holder">
+        {branchOrigin && (
+          // M3 (docs/handoffs/reply-branching.md): the origin chip quotes the
+          // message this thread branched from and links back to the parent.
+          // Rendered from `branchOrigin` (a pending fork or a loaded conversation's
+          // `branched_from`) — the quoted text + a human affordance, never a raw id.
+          <div id="conv-origin" className="conv-origin-chip" data-sel="conv-origin">
+            <span className="origin-label">branched from</span>
+            <blockquote className="origin-quote">{branchOrigin.quote || 'an earlier message'}</blockquote>
+            {branchOrigin.session && <button type="button" className="origin-link ghost" data-sel="conv-origin-link" onClick={() => openConversation(agent, branchOrigin.session)}>view the original conversation ⟶</button>}
+          </div>
+        )}
         <div className="conv-feed" role="log" aria-live="polite" aria-label={`conversation with ${agent}`}>
-          {!messages.length && <div className="conv-empty"><p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p><p>Start a conversation with {agent}. Replies and asks stay in this thread.</p></div>}
-          {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} allowHtml={allowHtml} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `conversation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : <Markdown text={String(m.text ?? '')} allowHtml={allowHtml} format={m.format} />}</div></div>)}
+          {!messages.length && !branchOrigin && <div className="conv-empty"><p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p><p>Start a conversation with {agent}. Replies and asks stay in this thread.</p></div>}
+          {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} allowHtml={allowHtml} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `conversation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span>{!m.failed && startBranch && <button type="button" className="msg-reply" data-sel="msg-reply" title="reply — branches a new conversation" onClick={() => startBranch(agent, m)}>↳ reply</button>}</div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : <Markdown text={String(m.text ?? '')} allowHtml={allowHtml} format={m.format} />}</div></div>)}
         </div>
       </div>
       <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><IconButton type="submit" id="compose-send" label={sendLabel} className="compose-send">➤</IconButton></form>
