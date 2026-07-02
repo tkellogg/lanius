@@ -27,12 +27,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-/// The committer identity stamped on every config commit. Deliberately a fixed,
-/// non-human name: the trustworthy "who accepted this" is the broker-stamped
-/// ledger event that references the commit SHA, never the commit author
-/// (docs/config.md "provenance from the ledger, not the commit").
-const COMMITTER_NAME: &str = "elanus";
-const COMMITTER_EMAIL: &str = "elanus@localhost";
+use crate::git_hardened::harden;
 /// The materialized-truth branch (docs/config.md). Readers read the working
 /// tree, which is always a checkout of this branch.
 const LIVE: &str = "live";
@@ -54,33 +49,11 @@ record who accepted them in the ledger. Package settings live at
 Agents never write live config; they only propose (a `proposal/<id>` branch).
 ";
 
-/// Apply the untrusted-input hardening every git invocation in this module
-/// shares (D2 / docs/security.md entry 18): no hooks, no signing, no fsmonitor,
-/// no operator global/system gitconfig (which can carry a `[filter] smudge=…`,
-/// alias, or pager that would execute under our flags — a real, reproduced
-/// leak), no system attributes file, no ambient GIT_DIR/GIT_WORK_TREE hijack,
-/// never prompt. Used for BOTH the live-repo ops and the clone of the untrusted
-/// agent tree — the clone round-trip is the reason this discipline exists.
-fn harden(c: &mut Command) {
-    c.arg("-c")
-        .arg("core.hooksPath=/dev/null")
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("-c")
-        .arg("commit.gpgsign=false")
-        .arg("-c")
-        .arg(format!("user.name={COMMITTER_NAME}"))
-        .arg("-c")
-        .arg(format!("user.email={COMMITTER_EMAIL}"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env("GIT_TERMINAL_PROMPT", "0");
-}
-
-/// A hardened `git` invocation rooted in the config (live) repo.
+/// A hardened `git` invocation rooted in the config (live) repo. The shared
+/// untrusted-input hardening (hooks off, ambient/global gitconfig neutralized,
+/// attribute filters off, never prompt) lives in `git_hardened::harden` — used
+/// for BOTH the live-repo ops and the clone of the untrusted agent tree, and by
+/// the KB write path (kb-core.md wonky bit 3).
 fn git(root: &Root) -> Command {
     let mut c = Command::new("git");
     harden(&mut c);

@@ -41,6 +41,11 @@ pub struct BlockOpts {
     /// (mirroring the `--by ui` trail every `/api/admin` mutation stamps). `None`
     /// for a plain agent/CLI write — the build log already records the owner/agent.
     pub by: Option<String>,
+    /// Free-JSON `meta` for the block (kb-core.md M3). A KB pointer block carries
+    /// `{ "kb": "<pkg>", "path": "kb/role-verifier.md", "lines": "12-28",
+    /// "sha": "<content-sha256>" }` here; a plain block leaves it `None` (empty
+    /// object). Must be a JSON object when present.
+    pub meta: Option<String>,
 }
 
 /// Resolve the owner identity for a write: explicit `--owner` (a self-attested
@@ -77,6 +82,14 @@ fn build_block(root: &Root, name: &str, content: &str, opts: &BlockOpts) -> Resu
     b.placement = placement;
     if let Some(p) = opts.priority {
         b.priority = p;
+    }
+    if let Some(m) = &opts.meta {
+        let parsed: serde_json::Value = serde_json::from_str(m)
+            .map_err(|e| anyhow::anyhow!("--meta must be valid JSON: {e}"))?;
+        if !parsed.is_object() {
+            anyhow::bail!("--meta must be a JSON object (e.g. a kb pointer)");
+        }
+        b.meta = parsed;
     }
     Ok(b)
 }
@@ -198,6 +211,59 @@ impl Default for BlockOpts {
             priority: None,
             owner: None,
             by: None,
+            meta: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> Root {
+        let dir = std::env::temp_dir().join(format!("el-blockcli-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        Root { dir }
+    }
+
+    // M3: `elanus block set --meta <json>` stores a machine-readable pointer.
+    #[test]
+    fn set_accepts_meta_json_and_round_trips() {
+        let root = scratch("meta");
+        let opts = BlockOpts {
+            owner: Some("architect".into()), // explicit owner: no profile load
+            meta: Some(
+                r#"{"kb":"kb-llm-strengths","path":"kb/role-verifier.md","lines":"1-26","sha":"abc"}"#
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        set(&root, "kb-ptr", "Pick by role.", &opts).unwrap();
+
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        let b = build_block(&root, "kb-ptr", "", &opts).unwrap();
+        let meta = context_store::get_block_meta(&conn, &b, &opts.session, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta["kb"], "kb-llm-strengths");
+        assert_eq!(meta["path"], "kb/role-verifier.md");
+        assert_eq!(meta["lines"], "1-26");
+
+        // Invalid / non-object meta is refused, not silently dropped.
+        let bad = BlockOpts {
+            owner: Some("architect".into()),
+            meta: Some("not json".into()),
+            ..Default::default()
+        };
+        assert!(set(&root, "x", "y", &bad).is_err());
+        let non_object = BlockOpts {
+            owner: Some("architect".into()),
+            meta: Some("[1,2,3]".into()),
+            ..Default::default()
+        };
+        assert!(set(&root, "x", "y", &non_object).is_err());
+        std::fs::remove_dir_all(&root.dir).ok();
     }
 }

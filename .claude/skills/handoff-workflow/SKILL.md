@@ -76,6 +76,11 @@ whatever remains.
 
 ## Models — choose per phase
 
+> Canonical copy: the `kb-llm-strengths` KB (`kb/role-*.md`, `kb/*.md`, in
+> `kits/stdlib/packages/kb-llm-strengths/`). This section configures Claude Code,
+> which cannot read that KB, so it keeps its own copy — update both when the
+> tiering changes.
+
 Model choice is a big deal; it is the main lever this skill exists to pull.
 
 - **Planning (phases 1–2): Claude, ideally high/xhigh effort — or Fable.** Claude

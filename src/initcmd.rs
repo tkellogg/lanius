@@ -188,6 +188,16 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         content: include_str!("../kits/core/profiles/architect/blocks/00-architect.md"),
         exec: false,
     },
+    // The seeded KB pointer block (kb-core.md M3): its JSON frontmatter carries
+    // `meta = {kb,path,lines,sha}` into kb-llm-strengths/kb/role-verifier.md, so
+    // the dispatching architect surfaces the model-tiering pointer.
+    PkgFile {
+        rel: "core/profiles/architect/blocks/10-kb-llm-strengths.md",
+        content: include_str!(
+            "../kits/core/profiles/architect/blocks/10-kb-llm-strengths.md"
+        ),
+        exec: false,
+    },
     PkgFile {
         rel: "dev/README.md",
         content: include_str!("../kits/dev/README.md"),
@@ -294,6 +304,67 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
     PkgFile {
         rel: "stdlib/packages/explain-session/SKILL.md",
         content: include_str!("../kits/stdlib/packages/explain-session/SKILL.md"),
+        exec: false,
+    },
+    // kb-llm-strengths — the first knowledge base (docs/handoffs/kb-core.md M2/D5):
+    // the [kb] marker + a kb/ seeded with the model-tiering rules (one file per
+    // model, one per role, cross-linked). Ships in stdlib so a default agent
+    // "just knows" the tiering.
+    // knowledge — the taught pattern (D6): a default agent "just knows" how to
+    // read, search, and write knowledge bases. Pure skill text, no scripts.
+    PkgFile {
+        rel: "stdlib/packages/knowledge/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/knowledge/SKILL.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/elanus.toml",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/SKILL.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/role-planner.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/role-planner.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/role-implementer.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/role-implementer.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/role-verifier.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/role-verifier.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/claude.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/claude.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/fable.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/fable.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/opus.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/opus.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/gpt-5.5.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/gpt-5.5.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/glm-5.2.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/glm-5.2.md"),
         exec: false,
     },
 ];

@@ -2,12 +2,21 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use elanus::{
     agentcli, blockcli, buscli, code_projection, codeagent, configcli, context, db, dev,
-    dispatcher, dotenv, envcompat, estimatecli, events, exec, human, initcmd, kit, mailcli,
+    dispatcher, dotenv, envcompat, estimatecli, events, exec, human, initcmd, kbcli, kit, mailcli,
     manifest, models, packages, paths, profile, profilecli, providercli, render, secrets, trace,
     web,
 };
 use serde_json::Value;
 use std::path::PathBuf;
+
+/// Read all of stdin as a UTF-8 string (used by `kb write` when `--content` is
+/// omitted, so a harness can pipe knowledge in).
+fn read_stdin() -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let mut s = String::new();
+    std::io::stdin().read_to_string(&mut s)?;
+    Ok(s)
+}
 
 fn leading_comment_summary(raw: &str) -> String {
     let mut lines = Vec::new();
@@ -121,6 +130,13 @@ enum Cmd {
     Block {
         #[command(subcommand)]
         cmd: BlockCmd,
+    },
+    /// Knowledge bases (docs/handoffs/kb-core.md): a `kb/` subfolder any package
+    /// carries and declares with a `[kb]` marker. list names the enabled ones;
+    /// write commits a file into a KB's `kb/` tree with the hardened git path.
+    Kb {
+        #[command(subcommand)]
+        cmd: KbCmd,
     },
     /// Work estimation (docs/handoffs/work-estimation.md): an agent records a
     /// multi-dimensional estimate (dollars/turns/tokens/wall-clock) right after it
@@ -524,6 +540,11 @@ struct BlockArgs {
     /// attributable — mirrors the `--by ui` trail every `/api/admin` mutation stamps.
     #[arg(long)]
     by: Option<String>,
+    /// Free-JSON meta for the block: a KB pointer block carries
+    /// {"kb":"<pkg>","path":"kb/role-verifier.md","lines":"12-28","sha":"<sha>"}
+    /// (kb-core.md M3). Must be a JSON object.
+    #[arg(long)]
+    meta: Option<String>,
 }
 
 impl BlockArgs {
@@ -536,6 +557,7 @@ impl BlockArgs {
             priority: self.priority,
             owner: self.owner.clone(),
             by: self.by.clone(),
+            meta: self.meta.clone(),
         }
     }
 }
@@ -572,6 +594,29 @@ enum BlockCmd {
         name: String,
         #[command(flatten)]
         args: BlockArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum KbCmd {
+    /// List the enabled knowledge bases (packages carrying a [kb] marker)
+    List {
+        /// The profile whose visible package set is enumerated.
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Emit one JSON line per KB instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a file into a KB's kb/ tree and commit it: elanus kb write <pkg> <path>
+    Write {
+        /// The package that owns the KB (must be on the path).
+        pkg: String,
+        /// The path INSIDE the package's kb/ tree (e.g. role-verifier.md or notes/x.md).
+        path: String,
+        /// The content to write inline; omit to read the content from stdin.
+        #[arg(long)]
+        content: Option<String>,
     },
 }
 
@@ -1279,6 +1324,20 @@ fn run(cli: Cli) -> Result<()> {
             BlockCmd::Get { name, args } => blockcli::get(&root, &name, &args.opts())?,
             BlockCmd::List { args } => blockcli::list(&root, &args.opts())?,
             BlockCmd::Rm { name, args } => blockcli::rm(&root, &name, &args.opts())?,
+        },
+        Cmd::Kb { cmd } => match cmd {
+            KbCmd::List { profile, json } => kbcli::list(&root, &profile, json)?,
+            KbCmd::Write {
+                pkg,
+                path,
+                content,
+            } => {
+                let content = match content {
+                    Some(c) => c,
+                    None => read_stdin()?,
+                };
+                kbcli::write(&root, &pkg, &path, &content)?;
+            }
         },
         Cmd::Estimate { cmd } => match cmd {
             EstimateCmd::Set {

@@ -32,6 +32,13 @@ pub struct Manifest {
     pub mcp: Vec<McpDecl>,
     #[serde(default)]
     pub harness: Vec<HarnessDecl>,
+    /// Presence declares "this package's `kb/` subfolder is a knowledge base"
+    /// (docs/handoffs/kb-core.md M1, D6): first-class via an explicit manifest
+    /// marker, the same move `[[harness]]` made. `elanus kb list` and the search
+    /// union key on the marker, not merely a `kb/` dir on disk, so a package may
+    /// still carry a private `kb/` without opting it in as knowledge.
+    #[serde(default)]
+    pub kb: Option<KbDecl>,
     #[serde(default)]
     pub throttle: BTreeMap<String, ThrottleDecl>,
     #[serde(default)]
@@ -71,6 +78,7 @@ impl Default for Manifest {
             stage: Vec::new(),
             mcp: Vec::new(),
             harness: Vec::new(),
+            kb: None,
             throttle: BTreeMap::new(),
             config: ConfigDecl::default(),
             inherit_to_subagents: default_inherit_to_subagents(),
@@ -274,6 +282,19 @@ pub struct HarnessDecl {
     #[serde(default)]
     pub agent_noun: String,
     pub run: String,
+}
+
+/// The `[kb]` marker (docs/handoffs/kb-core.md M1). Its mere presence enrolls the
+/// package's `kb/` subfolder as a knowledge base; the optional `title`/`description`
+/// are display metadata for `elanus kb list`. Mirrors the way `[[harness]]` names a
+/// capability without any kernel data model behind it (D6).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct KbDecl {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -756,6 +777,35 @@ run = "bin/adapter"
         assert_eq!(h.aliases, vec!["ec"]);
         assert_eq!(h.agent_noun, "echo");
         assert_eq!(h.run, "bin/adapter");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kb_declaration_parses_with_defaults() {
+        let dir = std::env::temp_dir().join(format!("el-man-kb-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("kb")).unwrap();
+        std::fs::write(
+            dir.join("elanus.toml"),
+            r#"
+[kb]
+title = "LLM strengths"
+description = "which model for what"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("kb/claude.md"), "# Claude\n").unwrap();
+        let lm = load(&dir).unwrap().unwrap();
+        let kb = lm.manifest.kb.as_ref().expect("[kb] marker present");
+        assert_eq!(kb.title.as_deref(), Some("LLM strengths"));
+        assert_eq!(kb.description.as_deref(), Some("which model for what"));
+
+        // A bare `[kb]` with no fields is still a valid marker (opt-in with
+        // defaults), and a package with NO `[kb]` table has kb = None.
+        std::fs::write(dir.join("elanus.toml"), "[kb]\n").unwrap();
+        assert!(load(&dir).unwrap().unwrap().manifest.kb.is_some());
+        std::fs::write(dir.join("elanus.toml"), "[request]\nsubscribe=[]\n").unwrap();
+        assert!(load(&dir).unwrap().unwrap().manifest.kb.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
