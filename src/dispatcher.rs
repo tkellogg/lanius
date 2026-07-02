@@ -695,20 +695,28 @@ pub(crate) fn tick_schedules(root: &Root, conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The scan `expire_deadlines` runs every tick. Its `WHERE` leads with
+/// `e.type = ?1 AND e.deadline IS NOT NULL AND … deadline < now`, which rides
+/// `idx_events_type_deadline (type, deadline)` (storage-hardening M3) instead of
+/// full-scanning `events` (9.3ms @ 200k rows → low µs); the correlated
+/// `NOT EXISTS` rides `idx_events_correlation`. Kept as a const so the
+/// EXPLAIN-plan regression test (`expire_deadlines_uses_type_deadline_index`)
+/// guards the EXACT production query against drift that would reintroduce the
+/// scan.
+const EXPIRE_DEADLINES_SELECT: &str = "SELECT e.id, e.correlation_id, e.default_action FROM events e
+             WHERE e.type = ?1 AND e.deadline IS NOT NULL
+               AND e.state != 'expired' AND e.correlation_id IS NOT NULL
+               AND e.deadline < strftime('%Y-%m-%dT%H:%M:%fZ','now')
+               AND NOT EXISTS (SELECT 1 FROM events a
+                               WHERE a.type = ?2 AND a.correlation_id = e.correlation_id)";
+
 /// Defaults are the big unblock: an expired ask executes its default and logs
 /// the assumption as an ordinary answer event (mail to the agent) —
 /// auditable, vetoable.
 fn expire_deadlines(root: &Root, conn: &Connection) -> Result<()> {
     let mb = profile::mailboxes(root);
     let rows: Vec<(i64, String, Option<String>)> = {
-        let mut stmt = conn.prepare(
-            "SELECT e.id, e.correlation_id, e.default_action FROM events e
-             WHERE e.type = ?1 AND e.deadline IS NOT NULL
-               AND e.state != 'expired' AND e.correlation_id IS NOT NULL
-               AND e.deadline < strftime('%Y-%m-%dT%H:%M:%fZ','now')
-               AND NOT EXISTS (SELECT 1 FROM events a
-                               WHERE a.type = ?2 AND a.correlation_id = e.correlation_id)",
-        )?;
+        let mut stmt = conn.prepare(EXPIRE_DEADLINES_SELECT)?;
         let r = stmt
             .query_map([&mb.human, &mb.agent], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -1822,6 +1830,37 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Root { dir }
+    }
+
+    // storage-hardening M3 acceptance: the exact `expire_deadlines` SELECT must
+    // ride `idx_events_type_deadline` (a SEARCH), never full-scan `events` (SCAN
+    // e). Prepares the production query const and asserts the plan — guarding
+    // against future query drift or an accidentally-dropped index reintroducing
+    // the O(ledger-age) scan the research probe measured (9.3ms @ 200k rows).
+    #[test]
+    fn expire_deadlines_uses_type_deadline_index() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {EXPIRE_DEADLINES_SELECT}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(["human", "agent"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let joined = plan.join("\n");
+        assert!(
+            joined.contains("idx_events_type_deadline"),
+            "expire_deadlines must ride idx_events_type_deadline; plan was:\n{joined}"
+        );
+        // The outer scan of `events e` must be a SEARCH via the index, not a SCAN.
+        assert!(
+            !joined.contains("SCAN e "),
+            "expire_deadlines must not full-scan events e; plan was:\n{joined}"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
     }
 
     /// drive_code_deliveries CLAIMS a recognized coding-session delivery (marks it
