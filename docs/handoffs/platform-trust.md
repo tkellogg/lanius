@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-01
 ---
@@ -153,4 +153,6 @@ what remains (full trust is still an open deputy by deliberate choice).
   the cage's protected set today (an escalation gap, now M2); agent messages
   render as plain text in `App.tsx:2235`. Judgment call for Fable: package-stage
   vs kernel-native block (decision 3), and whether reduced-trust web tightening
-  (M5) ships in this handoff or splits out.
+  (M5) ships in this handoff or splits out.- 2026-07-01 — All milestones implemented and adversarially verified (Opus
+  impl/verify under Fable orchestration); landed on sprint-recon-2026-07.
+  Status flipped to done.

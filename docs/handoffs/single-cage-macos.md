@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-01
 ---
@@ -200,3 +200,6 @@ the trust card renders it; a `ui.spec.mjs` assertion covers one state.
   experimental and baseline-less (wonky bit 2); three-value network policy with
   `loopback` as the bus-preserving middle (wonky bit 3); package/MCP cages left
   on today's posture this increment.
+- 2026-07-01 — All milestones implemented and adversarially verified (Opus
+  impl/verify under Fable orchestration); landed on sprint-recon-2026-07.
+  Status flipped to done.

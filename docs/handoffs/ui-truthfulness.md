@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-01
 ---
@@ -125,4 +125,6 @@ label logic.
   already renders in `CodeSessions.tsx`, so M3 is about the *setup cost fold* in
   `App.tsx` (the hard/soft mislabel + honestly surfacing the existing estimate),
   not about wiring estimation from scratch. Vocabulary leaks all confirmed at the
-  cited `App.tsx` lines.
+  cited `App.tsx` lines.- 2026-07-01 — All milestones implemented and adversarially verified (Opus
+  impl/verify under Fable orchestration); landed on sprint-recon-2026-07.
+  Status flipped to done.

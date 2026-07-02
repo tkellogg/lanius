@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-01
 ---
@@ -131,4 +131,6 @@ merge reconciliation against the sibling session's branch.
   consumers now live at `exec.rs:1160` / `codeagent.rs:3551`). Judgment calls:
   the emit_event guard refuses ALL of `in/*` at the tool arm rather than only
   `in/dm/*` inside `events::emit` (decision 1); the kit-unlink guard keys on the
-  kit's own `protected` flag rather than per-package membership (decision 2).
+  kit's own `protected` flag rather than per-package membership (decision 2).- 2026-07-01 — All milestones implemented and adversarially verified (Opus
+  impl/verify under Fable orchestration); landed on sprint-recon-2026-07.
+  Status flipped to done.

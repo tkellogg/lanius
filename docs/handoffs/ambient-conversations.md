@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-01
 ---
@@ -116,4 +116,6 @@ rebuild + re-embed the SPA before running (web-embed staleness note in memory).
   (`web.rs:2261`) and drops uncorrelated `in/human` rows (`web.rs:2293-2295`);
   `emit_message` (`exec.rs:865`) does not stamp a session, and events default
   `session_id: None` (`events.rs:116`) — so M1 (stamp the session) is a real
-  prerequisite for M2, which the parent handoffs assumed. No authority change.
+  prerequisite for M2, which the parent handoffs assumed. No authority change.- 2026-07-01 — All milestones implemented and adversarially verified (Opus
+  impl/verify under Fable orchestration); landed on sprint-recon-2026-07.
+  Status flipped to done.
