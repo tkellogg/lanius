@@ -534,42 +534,24 @@ fn read_camera_status(root: &Root) -> Value {
 /// open/this machine only/off. Off macOS `available` is false and each dimension
 /// reads "unavailable here" rather than implying a silent "on".
 fn cage_status(root: &Root) -> Value {
-    use crate::sandbox::{NetworkPolicy, ReadScope};
     let cfg = crate::profile::load(root, "default")
         .map(|(p, _)| p.sandbox)
         .unwrap_or_default();
-    let s = crate::sandbox::cage_status(&cfg);
-    let write = if !s.available {
-        "unavailable here"
-    } else if s.write_fenced {
-        "writes fenced"
-    } else {
-        "writes open"
-    };
-    let read = if !s.available {
-        "unavailable here"
-    } else {
-        match s.read {
-            ReadScope::Open => "reads open",
-            ReadScope::SomeHidden => "some folders hidden",
-            ReadScope::AllowList => "allow-list",
-        }
-    };
-    let network = if !s.available {
-        "unavailable here"
-    } else {
-        match s.network {
-            NetworkPolicy::Open => "network open",
-            NetworkPolicy::Loopback => "this machine only",
-            NetworkPolicy::None => "network off",
-        }
-    };
+    cage_status_json(&cfg)
+}
+
+/// Render a `[sandbox]` config's cage posture as the product-word JSON block,
+/// through the one shared enum→word mapping (`CageStatus::*_word`). Both
+/// `/api/status` (default profile) and `elanus profile get` (per-agent) emit
+/// this exact shape.
+pub fn cage_status_json(cfg: &crate::profile::SandboxCfg) -> Value {
+    let s = crate::sandbox::cage_status(cfg);
     json!({
         "available": s.available,
         "enforcing": s.enforcing,
-        "write": write,
-        "read": read,
-        "network": network,
+        "write": s.write_word(),
+        "read": s.read_word(),
+        "network": s.network_word(),
     })
 }
 

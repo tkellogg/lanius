@@ -415,6 +415,9 @@ const emptyForm = {
   workdir: '',
   fsWrite: '',
   captureExclude: '',
+  network: 'open',
+  fsReadDeny: '',
+  fsReadAllow: '',
   include: '#',
   exclude: '',
   varsRows: [{ id: uid(), key: '', value: '' }],
@@ -902,6 +905,9 @@ export function App() {
       workdir: d.workdir ?? '',
       fsWrite: csv(d.fs_write ?? []),
       captureExclude: csv(d.capture_exclude ?? []),
+      network: d.network ?? 'open',
+      fsReadDeny: csv(d.fs_read_deny ?? []),
+      fsReadAllow: csv(d.fs_read_allow ?? []),
       include: csv(d.skills?.include ?? ['#']),
       exclude: csv(d.skills?.exclude ?? []),
       varsRows: Object.entries(d.vars ?? {}).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => ({ id: uid(), key, value })) || [],
@@ -971,6 +977,12 @@ export function App() {
     set['sandbox.workdir'] = cfgForm.workdir.trim();
     set['sandbox.fs_write'] = arr(cfgForm.fsWrite);
     set['sandbox.capture_exclude'] = arr(cfgForm.captureExclude);
+    // Read/network cage (sandbox-config-ui M2) — product words map to the stored
+    // enums per the handoff: open/loopback/none. All three flow through the same
+    // agents/set → `elanus profile set` writer; no new write path.
+    set['sandbox.network'] = cfgForm.network;
+    set['sandbox.fs_read_deny'] = arr(cfgForm.fsReadDeny);
+    set['sandbox.fs_read_allow'] = arr(cfgForm.fsReadAllow);
     set['skills.include'] = arr(cfgForm.include).length ? arr(cfgForm.include) : ['#'];
     set['skills.exclude'] = arr(cfgForm.exclude);
     for (const row of cfgForm.varsRows) if (row.key.trim()) set[`vars.${row.key.trim()}`] = row.value ?? '';
@@ -988,6 +1000,13 @@ export function App() {
     setCfgNote('saved — applies on the next run');
     await loadDiskAgents();
     if (newAgentName && sel.kind === 'agent' && newAgentName !== sel.agent) selectAgent(newAgentName, 'configure');
+    else {
+      // Re-read just the parsed profile so the server-computed posture cards (M3)
+      // reflect the save — WITHOUT a full loadConfigure, which would reset the
+      // form and clobber the "saved" note. The rename branch re-selects instead.
+      const fresh = await adminGet(`profile?name=${encodeURIComponent(cfgProfile)}`);
+      if (fresh.ok && fresh.profile) setCfgParsed(fresh.profile);
+    }
   };
 
   const saveRawToml = async () => {
@@ -2094,6 +2113,25 @@ function ConfigureView(props: any) {
             <div className="cfg-grid">
               <label>writable prefixes <input id="cfg-fs-write" disabled={disabled} spellCheck={false} placeholder="comma separated" value={form.fsWrite} onChange={(e) => setForm({ fsWrite: e.target.value })} /></label>
               <label>capture exclude <input id="cfg-capture-exclude" disabled={disabled} spellCheck={false} placeholder="comma separated" value={form.captureExclude} onChange={(e) => setForm({ captureExclude: e.target.value })} /></label>
+              <label>network <select id="cfg-network" disabled={disabled} value={form.network} onChange={(e) => setForm({ network: e.target.value })}>
+                <option value="open">open</option>
+                <option value="loopback">this machine only</option>
+                <option value="none">off</option>
+              </select></label>
+              <label>hidden folders <input id="cfg-fs-read-deny" disabled={disabled} spellCheck={false} placeholder="comma separated — folders this agent may not read" value={form.fsReadDeny} onChange={(e) => setForm({ fsReadDeny: e.target.value })} /></label>
+            </div>
+            <details className="cfg-sandbox-advanced">
+              <summary className="dim-note">advanced — experimental</summary>
+              <p id="cfg-fs-read-allow-warning" className="cfg-warn" role="alert">Danger: this is an allow-list — it hides everything not listed. A list that's even slightly too tight will hide the interpreters, libraries, and files this agent needs, and break every task it runs. Leave it empty unless you know exactly what must stay readable.</p>
+              <label>what this agent may read <input id="cfg-fs-read-allow" disabled={disabled} spellCheck={false} placeholder="comma separated — leave empty for open reads" value={form.fsReadAllow} onChange={(e) => setForm({ fsReadAllow: e.target.value })} /></label>
+            </details>
+            {/* M3: per-agent posture, server-computed (profile get → cfgParsed.cage,
+                one shared product-word mapping). Reflects the last save, not each
+                keystroke. Distinct from the setup screen's install-default cards. */}
+            <div id="cfg-cage" className="setup-health-grid" aria-label="this agent's posture">
+              <div id="cfg-cage-write" className={`setup-health-card is-${cfgParsed.cage?.available === false ? 'warn' : 'ok'}`}><span>reads/writes</span><strong>{cfgParsed.cage?.write ?? 'checking...'}</strong></div>
+              <div id="cfg-cage-read" className={`setup-health-card is-${cfgParsed.cage?.available === false ? 'warn' : 'ok'}`}><span>what this agent may read</span><strong>{cfgParsed.cage?.read ?? 'checking...'}</strong></div>
+              <div id="cfg-cage-network" className={`setup-health-card is-${cfgParsed.cage?.available === false ? 'warn' : 'ok'}`}><span>network</span><strong>{cfgParsed.cage?.network ?? 'checking...'}</strong></div>
             </div>
           </section>
 

@@ -72,12 +72,17 @@ pub fn list(root: &Root) -> Result<()> {
 /// One profile: parsed summary plus the raw TOML (the UI shows the form
 /// AND offers the file).
 pub fn get(root: &Root, name: &str) -> Result<()> {
+    println!("{}", get_value(root, name)?);
+    Ok(())
+}
+
+/// The `get` JSON as a value (so tests can assert the surfaced fields without
+/// capturing stdout).
+fn get_value(root: &Root, name: &str) -> Result<serde_json::Value> {
     valid_name(name)?;
     let (p, pdir) = profile::load(root, name)?;
     let raw = std::fs::read_to_string(pdir.join("profile.toml")).unwrap_or_default();
-    println!(
-        "{}",
-        json!({
+    Ok(json!({
             "profile": name,
             "agent": p.agent,
             "owner": p.owner,
@@ -90,6 +95,14 @@ pub fn get(root: &Root, name: &str) -> Result<()> {
             "workdir": p.sandbox.workdir,
             "fs_write": p.sandbox.fs_write,
             "capture_exclude": p.sandbox.capture_exclude,
+            // The read/network cage keys — surfaced typed so the web UI reads
+            // them as fields instead of re-parsing the raw TOML blob (sandbox-
+            // config-ui M1). `cage` is this profile's computed posture in
+            // product words, through the one shared mapping.
+            "network": p.sandbox.network,
+            "fs_read_deny": p.sandbox.fs_read_deny,
+            "fs_read_allow": p.sandbox.fs_read_allow,
+            "cage": crate::web::cage_status_json(&p.sandbox),
             "skills": { "include": p.skills.include, "exclude": p.skills.exclude },
             "local_elanus_path": profile::local_elanus_path(root, name).unwrap_or(None),
             "elanus_path": p.elanus_path,
@@ -104,9 +117,7 @@ pub fn get(root: &Root, name: &str) -> Result<()> {
             "vars": p.vars,
             "throttle": p.throttle,
             "toml": raw,
-        })
-    );
-    Ok(())
+        }))
 }
 
 /// Set dotted keys: `elanus profile set default agent=kestrel
@@ -377,6 +388,37 @@ mod tests {
             p.subagents.max_depth, 2,
             "failed set must leave subagent config untouched"
         );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn get_surfaces_cage_keys_and_per_agent_posture() {
+        // M1: `profile get` emits the three read/network keys typed, plus a `cage`
+        // posture computed FOR THAT profile — not the default's.
+        let root = scratch("get-cage");
+        config_repo::init(&root).unwrap();
+        set(
+            &root,
+            "default",
+            &[
+                "sandbox.network=\"none\"".into(),
+                "sandbox.fs_read_deny=[\"/x\",\"/y\"]".into(),
+                "sandbox.fs_read_allow=[\"/z\"]".into(),
+            ],
+        )
+        .unwrap();
+        let v = get_value(&root, "default").unwrap();
+        assert_eq!(v["network"], json!("none"));
+        assert_eq!(v["fs_read_deny"], json!(["/x", "/y"]));
+        assert_eq!(v["fs_read_allow"], json!(["/z"]));
+        // The cage block agrees with the shared mapping over this profile's config.
+        let (p, _) = profile::load(&root, "default").unwrap();
+        assert_eq!(v["cage"], crate::web::cage_status_json(&p.sandbox));
+        // On the enforcement platform (macOS + sandbox-exec) the words are the
+        // policy words: network "none" reads "network off".
+        if crate::sandbox::enforcement_available() {
+            assert_eq!(v["cage"]["network"], json!("network off"));
+        }
         std::fs::remove_dir_all(&root.dir).ok();
     }
 

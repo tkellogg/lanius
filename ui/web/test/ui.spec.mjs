@@ -1644,6 +1644,139 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
+// ── flow 6h: sandbox-config-ui — read/network cage is editable per-agent ──────
+// docs/handoffs/sandbox-config-ui.md M2+M3. Open an agent's configure, set the
+// network and add a hidden folder, save through the existing agents/set path
+// (no new writer), and assert `elanus profile get` round-trips the stored enums
+// AND the per-agent posture cards (server-computed, one shared product-word
+// mapping) reflect the save — while the setup screen's install-default card is
+// unchanged. The dangerous allow-list lives behind an "advanced — experimental"
+// disclosure with a loud warning, never in the open.
+{
+  const cageAgent = 'cager';
+  const seedPage = await newPage();
+  await seedPage.goto('/');
+  const created = await seedPage.evaluate(async (name) => {
+    const r = await fetch('/api/admin/agents', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return r.json().catch(() => ({}));
+  }, cageAgent);
+  created.ok ? ok(`cage-ui: created agent ${cageAgent}`) : fail(`cage-ui: could not create ${cageAgent} (${JSON.stringify(created)})`);
+  await seedPage.close();
+
+  const getCage = () => JSON.parse(elanus('profile', 'get', cageAgent));
+  const cageWord = (dim) => getCage().cage?.[dim];
+
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+  await waitFor(`cage-ui: ${cageAgent} in nav`, async () => {
+    const items = await page.$$('#nav-agents .nav-agent');
+    for (const item of items) {
+      if ((await item.getAttribute('data-sel')) === `agent:${cageAgent}`) { await item.click(); return true; }
+    }
+    return false;
+  }, 10000);
+  await page.click('[data-tab="configure"]');
+  await page.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
+  await waitForConfigureLoaded(page);
+  // The sandbox controls live under the "advanced" disclosure — open it.
+  await page.click('#cfg-section-advanced > summary');
+
+  // The allow-list is dangerous: it must sit behind a closed "advanced —
+  // experimental" disclosure with a loud warning, never in the open.
+  const advancedOpen = await page.$eval('#cfg-fs-read-allow', (el) => {
+    const d = el.closest('details');
+    return d ? d.open : true;
+  });
+  advancedOpen === false
+    ? ok('cage-ui: allow-list is hidden behind a closed advanced disclosure')
+    : fail('cage-ui: allow-list control is not behind a closed disclosure');
+  const warnText = await page.$eval('#cfg-fs-read-allow-warning', (el) => el.textContent).catch(() => '');
+  /experimental/i.test(await page.$eval('.cfg-sandbox-advanced > summary', (el) => el.textContent)) && /break|danger|hide/i.test(warnText)
+    ? ok('cage-ui: the allow-list warning is loud and present')
+    : fail(`cage-ui: allow-list warning missing/weak: "${warnText}"`);
+
+  // Set network to "this machine only" (loopback) and add a hidden folder, then
+  // save through the normal configure path.
+  const hiddenFolder = '/tmp/cager-secret';
+  await page.selectOption('#cfg-network', 'loopback');
+  await page.fill('#cfg-fs-read-deny', hiddenFolder);
+  await page.click('#cfg-save');
+  await waitFor('cage-ui: saved note visible', async () =>
+    /saved/i.test(await page.$eval('#cfg-note', (el) => el.textContent)), 5000);
+
+  // The stored enums round-trip through the single writer (profile get).
+  await waitFor('cage-ui: network=loopback and hidden folder round-trip', async () => {
+    const c = getCage();
+    return c.network === 'loopback' && Array.isArray(c.fs_read_deny) && c.fs_read_deny.includes(hiddenFolder);
+  }, 5000);
+
+  // M3: the per-agent posture cards reflect the save (server-computed words).
+  await waitFor('cage-ui: network card reflects the edit', async () => {
+    const card = await page.$eval('#cfg-cage-network strong', (el) => el.textContent);
+    return card === cageWord('network');
+  }, 8000);
+  await waitFor('cage-ui: reads card shows hidden folders', async () => {
+    const card = await page.$eval('#cfg-cage-read strong', (el) => el.textContent);
+    return card === cageWord('read');
+  }, 8000);
+  // Where enforcement is available (macOS + sandbox-exec), the words are the
+  // policy words; off-platform they honestly read "unavailable here".
+  const available = getCage().cage?.available;
+  if (available) {
+    (await page.$eval('#cfg-cage-read strong', (el) => el.textContent)) === 'some folders hidden'
+      ? ok('cage-ui: reads card reads "some folders hidden"')
+      : fail('cage-ui: reads card did not flip to "some folders hidden"');
+  }
+
+  // Flip network to "off" and assert the card follows.
+  await page.selectOption('#cfg-network', 'none');
+  await page.click('#cfg-save');
+  await waitFor('cage-ui: network=none round-trips', async () => getCage().network === 'none', 5000);
+  await waitFor('cage-ui: network card follows to off', async () => {
+    const card = await page.$eval('#cfg-cage-network strong', (el) => el.textContent);
+    return card === cageWord('network');
+  }, 8000);
+  if (available) {
+    (await page.$eval('#cfg-cage-network strong', (el) => el.textContent)) === 'network off'
+      ? ok('cage-ui: network card reads "network off"')
+      : fail('cage-ui: network card did not read "network off"');
+  }
+
+  // An allow-list entry flips the reads posture to the allow-list mode.
+  await page.$eval('.cfg-sandbox-advanced', (el) => { el.open = true; });
+  await page.fill('#cfg-fs-read-allow', '/usr,/System');
+  await page.click('#cfg-save');
+  await waitFor('cage-ui: allow-list round-trips', async () => {
+    const c = getCage();
+    return Array.isArray(c.fs_read_allow) && c.fs_read_allow.includes('/usr');
+  }, 5000);
+  if (available) {
+    await waitFor('cage-ui: reads card reads "allow-list"', async () =>
+      (await page.$eval('#cfg-cage-read strong', (el) => el.textContent)) === 'allow-list', 8000);
+  }
+
+  // The setup screen's default-profile card is a distinct surface and must NOT
+  // move because we edited a per-agent profile.
+  const defaultCage = await page.evaluate(async () => {
+    const r = await fetch('/api/status');
+    const j = await r.json().catch(() => ({}));
+    return j.cage ?? {};
+  });
+  await page.click('.nav-setup');
+  await page.waitForSelector('.setup-home');
+  await waitFor('cage-ui: setup default network card is unchanged', async () => {
+    const text = await page.$eval('.setup-home', (el) => el.textContent);
+    // The default profile was never given a network, so its card is not "off".
+    return text.includes(defaultCage.network) && defaultCage.network !== 'network off';
+  }, 8000);
+
+  await page.close();
+}
+
 // ── flow 7: history works out of the box ──────────────────────────────────────
 // history is stdlib, on at init, so the sessions tab is backed
 // by the real transcript view — NOT the unavailable-transcripts note —

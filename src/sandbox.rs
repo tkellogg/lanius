@@ -658,6 +658,45 @@ pub fn cage_status(cfg: &SandboxCfg) -> CageStatus {
     }
 }
 
+impl CageStatus {
+    // Product-word posture strings — the ONE place the enum→product-word mapping
+    // lives (docs/handoffs/sandbox-config-ui.md M1). Both `/api/status` and
+    // `elanus profile get` render through these so the words never drift, and no
+    // client re-implements them. Never "SBPL"/"Seatbelt"/"cage"; off macOS every
+    // dimension reads "unavailable here" rather than implying a silent "on".
+    pub fn write_word(&self) -> &'static str {
+        if !self.available {
+            "unavailable here"
+        } else if self.write_fenced {
+            "writes fenced"
+        } else {
+            "writes open"
+        }
+    }
+    pub fn read_word(&self) -> &'static str {
+        if !self.available {
+            "unavailable here"
+        } else {
+            match self.read {
+                ReadScope::Open => "reads open",
+                ReadScope::SomeHidden => "some folders hidden",
+                ReadScope::AllowList => "allow-list",
+            }
+        }
+    }
+    pub fn network_word(&self) -> &'static str {
+        if !self.available {
+            "unavailable here"
+        } else {
+            match self.network {
+                NetworkPolicy::Open => "network open",
+                NetworkPolicy::Loopback => "this machine only",
+                NetworkPolicy::None => "network off",
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +805,55 @@ mod tests {
             auth_avail.read_flavor_honorable(),
             "authoritative available ⇒ honorable even with advisory off"
         );
+    }
+
+    #[test]
+    fn cage_status_product_words() {
+        // The enum→product-word mapping (sandbox-config-ui M1), tested portably by
+        // constructing a CageStatus with enforcement present so the words are the
+        // policy words rather than "unavailable here".
+        let s = CageStatus {
+            available: true,
+            enforcing: true,
+            write_fenced: true,
+            read: ReadScope::Open,
+            network: NetworkPolicy::None,
+        };
+        assert_eq!(s.write_word(), "writes fenced");
+        assert_eq!(s.read_word(), "reads open");
+        assert_eq!(s.network_word(), "network off");
+
+        let hidden = CageStatus {
+            read: ReadScope::SomeHidden,
+            network: NetworkPolicy::Loopback,
+            write_fenced: false,
+            enforcing: false,
+            ..s
+        };
+        assert_eq!(hidden.write_word(), "writes open");
+        assert_eq!(hidden.read_word(), "some folders hidden");
+        assert_eq!(hidden.network_word(), "this machine only");
+
+        let allow = CageStatus {
+            read: ReadScope::AllowList,
+            network: NetworkPolicy::Open,
+            ..s
+        };
+        assert_eq!(allow.read_word(), "allow-list");
+        assert_eq!(allow.network_word(), "network open");
+
+        // Off-platform: every dimension reads "unavailable here", never a silent on.
+        let inert = CageStatus { available: false, ..s };
+        assert_eq!(inert.write_word(), "unavailable here");
+        assert_eq!(inert.read_word(), "unavailable here");
+        assert_eq!(inert.network_word(), "unavailable here");
+
+        // cage_status() picks the right variants off a config.
+        let cfg = SandboxCfg {
+            network: Some("none".into()),
+            ..Default::default()
+        };
+        assert_eq!(cage_status(&cfg).network, NetworkPolicy::None);
     }
 
     #[test]

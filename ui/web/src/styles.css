@@ -811,6 +811,9 @@ details.setup-fold > summary .dim-note { padding: 0; flex: 1; min-width: 0; over
 .cfg-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--dim); letter-spacing: 0.04em; }
 .cfg-field-hint { color: var(--dim); font-size: 10.5px; letter-spacing: 0; line-height: 1.25; }
 .cfg-field-warn { color: var(--danger); }
+.cfg-sandbox-advanced { margin-top: 8px; }
+.cfg-sandbox-advanced > summary { cursor: pointer; }
+.cfg-warn { color: var(--danger-strong); background: var(--danger-bg); border: 1px solid var(--danger-border); border-radius: var(--r-sharp); padding: 8px 10px; font-size: 11.5px; line-height: 1.4; margin: 6px 0; }
 .cfg-link { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: var(--accent, var(--link)); text-decoration: underline; cursor: pointer; }
 .cfg-link:hover { color: var(--work); }
 .cfg-field-ok { color: var(--work); }
