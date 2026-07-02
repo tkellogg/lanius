@@ -22,6 +22,7 @@ pub struct RunOpts {
     pub prompt: String,
     pub session: Option<String>,
     pub with_packages: Vec<String>,
+    pub provider: Option<String>,
 }
 
 pub struct SpawnOpts {
@@ -30,6 +31,22 @@ pub struct SpawnOpts {
     pub session: Option<String>,
     pub priority: i64,
     pub with_packages: Vec<String>,
+    pub provider: Option<String>,
+}
+
+/// The shared spawn request (docs/handoffs/agent-launching.md M3): both
+/// `elanus agent spawn` and the native `launch_agent` tool build one of these
+/// and hand it to `spawn_core`, so the CLI door and the tool door cannot drift.
+pub struct SpawnRequest {
+    pub profile: String,
+    pub prompt: String,
+    pub session: Option<String>,
+    pub priority: i64,
+    pub with_packages: Vec<String>,
+    pub provider: Option<String>,
+    /// Provenance for the mailbox event's `sender` — the launching agent for the
+    /// `launch_agent` tool, else the ambient actor. `created_by` in the ledger.
+    pub created_by: Option<String>,
 }
 
 /// `elanus agent catalog` - one inventory surface for launchable things.
@@ -91,7 +108,10 @@ pub fn catalog(root: &Root, opts: CatalogOpts) -> Result<()> {
 /// `elanus agent run` - blocking native/profile-agent turn.
 pub fn run(root: &Root, opts: RunOpts) -> Result<()> {
     validate_profile_name(&opts.profile)?;
-    ensure_profile_packages(root, &opts.profile, &opts.with_packages)?;
+    let conn = db::open(root)?;
+    db::init_schema(&conn)?;
+    packages::sync(root, &conn)?;
+    validate_with_packages(root, &conn, &opts.profile, &opts.with_packages)?;
     exec::run(
         root,
         ExecOpts {
@@ -100,6 +120,8 @@ pub fn run(root: &Root, opts: RunOpts) -> Result<()> {
             prompt: Some(opts.prompt),
             resume: None,
             event: None,
+            with_packages: opts.with_packages,
+            provider: opts.provider,
         },
     )
 }
@@ -110,52 +132,82 @@ pub fn run(root: &Root, opts: RunOpts) -> Result<()> {
 /// an approved exec handler matching that mailbox; otherwise the event would be
 /// immediately marked done with no consumer by the daemon.
 pub fn spawn(root: &Root, opts: SpawnOpts) -> Result<()> {
-    validate_profile_name(&opts.profile)?;
-    ensure_profile_packages(root, &opts.profile, &opts.with_packages)?;
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
     packages::sync(root, &conn)?;
-    let (prof, _) = profile::load(root, &opts.profile)?;
+    let descriptor = spawn_core(
+        root,
+        &conn,
+        SpawnRequest {
+            profile: opts.profile,
+            prompt: opts.prompt,
+            session: opts.session,
+            priority: opts.priority,
+            with_packages: opts.with_packages,
+            provider: opts.provider,
+            created_by: None,
+        },
+    )?;
+    println!("{descriptor}");
+    Ok(())
+}
+
+/// Shared spawn core for the CLI (`elanus agent spawn`) and the native
+/// `launch_agent` tool (docs/handoffs/agent-launching.md M3). Validates the
+/// profile + `--with-package` names, gates on an approved exec handler for the
+/// profile's mailbox (otherwise the daemon would mark the event done with no
+/// consumer), and emits the work — with any launch overrides riding the payload —
+/// onto that mailbox. Assumes `packages::sync` already ran on `conn`. Returns the
+/// launch descriptor {event, correlation, session, profile, agent, mailbox}.
+pub fn spawn_core(root: &Root, conn: &Connection, req: SpawnRequest) -> Result<Value> {
+    validate_profile_name(&req.profile)?;
+    validate_with_packages(root, conn, &req.profile, &req.with_packages)?;
+    let (prof, _) = profile::load(root, &req.profile)?;
     let mailbox = topic::agent_mailbox(&prof.agent);
-    let handlers = packages::matching_exec_handlers(root, &conn, &mailbox)?;
+    let handlers = packages::matching_exec_handlers(root, conn, &mailbox)?;
     if handlers.is_empty() {
         bail!(
             "profile {:?} is not daemon-drivable: no approved exec package subscribes to {}",
-            opts.profile,
+            req.profile,
             mailbox
         );
     }
     let correlation = format!("agent-spawn-{}", uuid::Uuid::new_v4().simple());
-    let session = opts
+    let session = req
         .session
         .unwrap_or_else(|| format!("agent-{}", &uuid::Uuid::new_v4().to_string()[..8]));
+    let mut payload = json!({
+        "prompt": req.prompt,
+        "profile": req.profile,
+        "session": session,
+    });
+    // Launch overrides ride the payload (wonky bit 1): the exec side applies them
+    // for that run only. Omitted when empty so an ordinary spawn is byte-identical.
+    if !req.with_packages.is_empty() {
+        payload["with_packages"] = json!(req.with_packages);
+    }
+    if let Some(provider) = &req.provider {
+        payload["provider"] = json!(provider);
+    }
     let event_id = events::emit(
         root,
-        &conn,
+        conn,
         EmitOpts {
-            payload: Some(json!({
-                "prompt": opts.prompt,
-                "profile": opts.profile,
-                "session": session,
-            })),
-            priority: opts.priority,
+            payload: Some(payload),
+            priority: req.priority,
             correlation: Some(correlation.clone()),
-            sender: current_actor(),
+            sender: req.created_by.or_else(current_actor),
             ..EmitOpts::new(&mailbox)
         },
     )?;
-    println!(
-        "{}",
-        json!({
-            "event": event_id,
-            "correlation": correlation,
-            "session": session,
-            "profile": opts.profile,
-            "agent": prof.agent,
-            "mailbox": mailbox,
-        })
-    );
-    Ok(())
+    Ok(json!({
+        "event": event_id,
+        "correlation": correlation,
+        "session": session,
+        "profile": req.profile,
+        "agent": prof.agent,
+        "mailbox": mailbox,
+    }))
 }
 
 fn profile_rows(root: &Root, conn: &Connection) -> Result<Vec<Value>> {
@@ -249,7 +301,18 @@ fn packages_for_profile(root: &Root, profile_name: &str) -> Result<Vec<Value>> {
         .collect())
 }
 
-fn ensure_profile_packages(root: &Root, profile_name: &str, required: &[String]) -> Result<()> {
+/// Validate `--with-package` names for a run/spawn launch
+/// (docs/handoffs/agent-launching.md M2, wonky bit 1). A package already on the
+/// profile's path needs no extension. A package NOT on the path is allowed as a
+/// run-scoped VISIBILITY extension only when it is installed on the instance AND
+/// granted (approved) — widening what the run can SEE, never what it may DO
+/// (bus authority stays gated by the grants ledger). Anything else bails loudly.
+fn validate_with_packages(
+    root: &Root,
+    conn: &Connection,
+    profile_name: &str,
+    required: &[String],
+) -> Result<()> {
     if required.is_empty() {
         return Ok(());
     }
@@ -257,15 +320,27 @@ fn ensure_profile_packages(root: &Root, profile_name: &str, required: &[String])
         .into_iter()
         .map(|p| p.name)
         .collect();
+    let universe: BTreeSet<String> = packages::discover(root)?
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
     for pkg in required {
         if !topic::valid_name(pkg) || pkg.contains('/') {
             bail!("package {pkg:?} must be one topic level");
         }
-        if !visible.contains(pkg) {
+        if visible.contains(pkg) {
+            continue; // already on the profile's path — no extension needed
+        }
+        if !universe.contains(pkg) {
             bail!(
-                "package {:?} is not visible to profile {:?}; add it to that profile's elanus_path or choose another profile",
-                pkg,
-                profile_name
+                "package {pkg:?} is not installed on this instance; \
+                 `elanus agent catalog` lists what is available"
+            );
+        }
+        if !packages::is_granted(conn, pkg)? {
+            bail!(
+                "package {pkg:?} is not granted (approved) — a launch may widen visibility \
+                 only to approved packages; run `elanus approve {pkg}` first"
             );
         }
     }
@@ -303,6 +378,7 @@ fn current_actor() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     fn scratch(tag: &str) -> Root {
         let dir = std::env::temp_dir().join(format!("el-agentcli-{tag}-{}", std::process::id()));
@@ -313,21 +389,204 @@ mod tests {
             "agent = \"main\"\n[model]\nmodel = \"m\"\n",
         )
         .unwrap();
+        std::fs::create_dir_all(dir.join("packages")).unwrap();
         Root { dir }
     }
 
-    #[test]
-    fn with_package_requires_profile_visibility() {
-        let root = scratch("pkg");
-        let err = ensure_profile_packages(&root, "default", &["missing".to_string()])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not visible"));
+    fn write_pkg(root: &Root, name: &str, manifest: &str) {
+        let d = root.dir.join("packages").join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("elanus.toml"), manifest).unwrap();
     }
 
     #[test]
     fn validates_profile_names() {
         assert!(validate_profile_name("worker_1").is_ok());
         assert!(validate_profile_name("../x").is_err());
+    }
+
+    #[test]
+    fn catalog_profile_rows_are_machine_pickable() {
+        // M1 acceptance: `elanus agent catalog --json` must be complete enough for
+        // an agent to pick a profile AND its packages. Assert the per-profile row
+        // carries the fields that choice needs.
+        let root = scratch("catalog-json");
+        write_pkg(
+            &root,
+            "helper-pkg",
+            "[request]\nsubscribe = [\"in/package/helper/x\"]\n",
+        );
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        packages::sync(&root, &conn).unwrap();
+        let rows = profile_rows(&root, &conn).unwrap();
+        let default = rows
+            .iter()
+            .find(|r| r["profile"] == "default")
+            .expect("default profile in catalog");
+        for field in [
+            "profile",
+            "agent",
+            "model",
+            "provider",
+            "mailbox",
+            "daemon_drivable",
+            "packages",
+            "subagents",
+            "autonomy",
+        ] {
+            assert!(
+                default.get(field).is_some(),
+                "catalog row missing field {field:?}: {default}"
+            );
+        }
+        assert!(default["packages"].is_array(), "packages must be a list");
+        let has_pkg = default["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "helper-pkg");
+        assert!(has_pkg, "per-profile package list should name the package");
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn with_package_unknown_name_bails() {
+        let root = scratch("unknown-pkg");
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        packages::sync(&root, &conn).unwrap();
+        let err = validate_with_packages(&root, &conn, "default", &["missing".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not installed"), "got: {err}");
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn with_package_ungranted_bails_but_granted_passes() {
+        // M2 (wonky bit 1): a launch may widen visibility only to APPROVED
+        // packages. An installed-but-pending package refuses; approving it makes
+        // the same `--with-package` succeed. Visibility, not authority.
+        let root = scratch("granted-pkg");
+        write_pkg(
+            &root,
+            "extra",
+            "[request]\nsubscribe = [\"in/package/extra/x\"]\n",
+        );
+        // A profile whose path does NOT include `extra` (so it isn't already
+        // visible), while `extra` stays in the instance universe (the default
+        // `packages/` path). This is the case the extension exists for.
+        let wdir = root.dir.join("profiles/worker");
+        std::fs::create_dir_all(&wdir).unwrap();
+        std::fs::write(
+            wdir.join("profile.toml"),
+            "agent = \"w\"\nelanus_path = [\"empty\"]\n[model]\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        packages::sync(&root, &conn).unwrap();
+        // Installed but its request is still pending → not granted → refuse.
+        let err = validate_with_packages(&root, &conn, "worker", &["extra".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not granted"), "got: {err}");
+        // Approve it → the same launch is now allowed.
+        packages::decide(&root, &conn, "extra", true, "test").unwrap();
+        validate_with_packages(&root, &conn, "worker", &["extra".to_string()])
+            .expect("a granted package may be a run-scoped extension");
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn spawn_core_emits_mailbox_event_with_overrides_and_provenance() {
+        // M3: spawn_core (shared by the CLI and the launch_agent tool) gates on an
+        // approved exec handler, then emits ONE event onto the profile's mailbox
+        // carrying the prompt, launch overrides, correlation and provenance.
+        let root = scratch("spawn-core");
+        // An exec-mode package subscribed (and approved) for the default agent's
+        // mailbox makes the profile daemon-drivable.
+        let mailbox = topic::agent_mailbox("main");
+        write_pkg(
+            &root,
+            "runner",
+            &format!(
+                "[process]\nmode = \"exec\"\nrun = \"main\"\n[request]\nsubscribe = [\"{mailbox}\"]\n"
+            ),
+        );
+        // A granted extra package the launch will widen to.
+        write_pkg(
+            &root,
+            "extra",
+            "[request]\nsubscribe = [\"in/package/extra/x\"]\n",
+        );
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        packages::sync(&root, &conn).unwrap();
+        packages::decide(&root, &conn, "runner", true, "test").unwrap();
+        packages::decide(&root, &conn, "extra", true, "test").unwrap();
+
+        let desc = spawn_core(
+            &root,
+            &conn,
+            SpawnRequest {
+                profile: "default".into(),
+                prompt: "read the reactor logs".into(),
+                session: Some("sess-1".into()),
+                priority: 0,
+                with_packages: vec!["extra".into()],
+                provider: Some("deepseek".into()),
+                created_by: Some("launcher-agent".into()),
+            },
+        )
+        .expect("spawn_core should emit");
+        let corr = desc["correlation"].as_str().unwrap().to_string();
+        assert_eq!(desc["session"], "sess-1");
+        assert_eq!(desc["mailbox"], mailbox);
+
+        // Exactly one event on the mailbox, with the right payload + sender.
+        let (payload, sender): (String, Option<String>) = conn
+            .query_row(
+                "SELECT payload, sender FROM events WHERE type=?1 AND correlation_id=?2",
+                params![mailbox, corr],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let p: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(p["prompt"], "read the reactor logs");
+        assert_eq!(p["session"], "sess-1");
+        assert_eq!(p["with_packages"], json!(["extra"]));
+        assert_eq!(p["provider"], "deepseek");
+        assert_eq!(sender.as_deref(), Some("launcher-agent"));
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn spawn_core_refuses_profile_without_exec_handler() {
+        // M3: a profile whose mailbox has no approved exec handler is not
+        // daemon-drivable — spawn_core refuses clearly rather than dropping the
+        // event where the daemon would mark it done with no consumer.
+        let root = scratch("spawn-no-handler");
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        packages::sync(&root, &conn).unwrap();
+        let err = spawn_core(
+            &root,
+            &conn,
+            SpawnRequest {
+                profile: "default".into(),
+                prompt: "hi".into(),
+                session: None,
+                priority: 0,
+                with_packages: Vec::new(),
+                provider: None,
+                created_by: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not daemon-drivable"), "got: {err}");
+        std::fs::remove_dir_all(&root.dir).ok();
     }
 }

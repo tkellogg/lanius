@@ -82,7 +82,7 @@ pub fn discover_for_profile(root: &Root, profile_name: &str) -> Result<Vec<Packa
             .map(|p| p.name)
             .collect();
     let all = discover_from_paths(package_path_for_profile(root, profile_name))?;
-    Ok(all
+    let mut visible: Vec<Package> = all
         .into_iter()
         .filter(|p| {
             // Keep unless: inherited-only AND manifest opted out of inheritance.
@@ -95,7 +95,92 @@ pub fn discover_for_profile(root: &Root, profile_name: &str) -> Result<Vec<Packa
                 None => true,
             }
         })
-        .collect())
+        .collect();
+    extend_run_scoped(root, &mut visible)?;
+    Ok(visible)
+}
+
+/// Env carrying the run-scoped visibility extension
+/// (docs/handoffs/agent-launching.md M2): a comma-separated list of package
+/// names a launch asked to make visible for THIS run only. Set by the exec side
+/// from the spawn/launch_agent payload; unset in every other context (CLI
+/// catalog, daemon dispatch of unrelated runs). Visibility only — the package's
+/// bus capabilities stay gated by the grants ledger.
+pub const RUN_SCOPED_PACKAGES_ENV: &str = "ELANUS_WITH_PACKAGES";
+
+fn run_scoped_package_names() -> std::collections::BTreeSet<String> {
+    std::env::var(RUN_SCOPED_PACKAGES_ENV)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Union in any run-scoped extension packages not already visible, sourced from
+/// the instance-wide package path (the launcher's own universe). A launch may
+/// only widen to packages the instance actually installs; a name that resolves
+/// to nothing on disk is silently a no-op (the launch-time validation in
+/// `agentcli` is where an unknown/un-granted name is rejected loudly). Re-sorts
+/// by name so the returned order stays stable.
+fn extend_run_scoped(root: &Root, visible: &mut Vec<Package>) -> Result<()> {
+    let extra = run_scoped_package_names();
+    if extra.is_empty() {
+        return Ok(());
+    }
+    let present: std::collections::BTreeSet<String> =
+        visible.iter().map(|p| p.name.clone()).collect();
+    for pkg in discover_from_paths(package_path(root))? {
+        if extra.contains(&pkg.name) && !present.contains(&pkg.name) {
+            visible.push(pkg);
+        }
+    }
+    visible.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(())
+}
+
+/// Is a package "granted" for run-scoped visibility extension
+/// (docs/handoffs/agent-launching.md M2, wonky bit 1)? True when the human has
+/// approved it: no capability request under its current manifest hash is still
+/// pending, and — if it declares any capabilities — at least one is approved. A
+/// pure-skill package (no manifest, nothing to approve) is trivially granted.
+/// Widening to a granted package adds VISIBILITY only; the grants ledger still
+/// gates what it may do on the bus, so this is never an authority grant.
+pub fn is_granted(conn: &Connection, package: &str) -> Result<bool> {
+    let Some(hash) = crate::db::kv_get(conn, &format!("pkg_hash:{package}"))? else {
+        // No recorded hash: a manifest-less (pure-skill) package, or one never
+        // synced. Granted only if it carries no grant rows at all.
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM grants WHERE package=?1", [package], |r| {
+                r.get(0)
+            })?;
+        return Ok(rows == 0);
+    };
+    let pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM grants WHERE package=?1 AND manifest_hash=?2 AND state='requested'",
+        params![package, hash],
+        |r| r.get(0),
+    )?;
+    if pending > 0 {
+        return Ok(false);
+    }
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM grants WHERE package=?1 AND manifest_hash=?2",
+        params![package, hash],
+        |r| r.get(0),
+    )?;
+    if total == 0 {
+        return Ok(true);
+    }
+    let approved: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM grants WHERE package=?1 AND manifest_hash=?2 AND state='approved'",
+        params![package, hash],
+        |r| r.get(0),
+    )?;
+    Ok(approved > 0)
 }
 
 /// Built-in agent tools to WITHHOLD from a profile's tool array (M3,
@@ -892,6 +977,76 @@ mod tests {
         assert!(
             withheld_builtin_tools(&root, "default").is_empty(),
             "no package gates the tools, so none may be withheld"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn is_granted_tracks_approval() {
+        // M2 (docs/handoffs/agent-launching.md): a package is grantable for a
+        // run-scoped visibility extension only once approved. Pending → false;
+        // approved → true; a manifest-less pure-skill package → true (nothing to
+        // approve).
+        let root = scratch_root("is-granted");
+        write_pkg(
+            &root,
+            "cap",
+            "[request]\nsubscribe = [\"in/package/cap/x\"]\n",
+        );
+        // A pure-skill package: a bare dir, no elanus.toml.
+        std::fs::create_dir_all(root.dir.join("packages/skillonly")).unwrap();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        sync(&root, &conn).unwrap();
+        assert!(!is_granted(&conn, "cap").unwrap(), "pending is not granted");
+        assert!(
+            is_granted(&conn, "skillonly").unwrap(),
+            "a pure-skill package has nothing to approve → granted"
+        );
+        decide(&root, &conn, "cap", true, "test").unwrap();
+        assert!(is_granted(&conn, "cap").unwrap(), "approved is granted");
+        decide(&root, &conn, "cap", false, "test").unwrap();
+        assert!(
+            !is_granted(&conn, "cap").unwrap(),
+            "revoked is not granted"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn run_scoped_env_widens_visibility() {
+        // M2: ELANUS_WITH_PACKAGES unions instance-universe packages into a
+        // profile's visible set for the run, even when the profile's own path
+        // excludes them — the run-scoped analog of elanus_path. Unique package
+        // name so the process-global env can't contaminate a parallel test.
+        let root = scratch_root("runscope");
+        write_pkg(
+            &root,
+            "runscopeextra",
+            "[request]\nsubscribe = [\"in/package/runscopeextra/x\"]\n",
+        );
+        // A profile whose path excludes packages/ → cannot see runscopeextra.
+        let wdir = root.dir.join("profiles/worker");
+        std::fs::create_dir_all(&wdir).unwrap();
+        std::fs::write(wdir.join("profile.toml"), "elanus_path = [\"empty\"]\n").unwrap();
+
+        let base: Vec<String> = discover_for_profile(&root, "worker")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(!base.contains(&"runscopeextra".to_string()));
+
+        std::env::set_var(RUN_SCOPED_PACKAGES_ENV, "runscopeextra");
+        let widened: Vec<String> = discover_for_profile(&root, "worker")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        std::env::remove_var(RUN_SCOPED_PACKAGES_ENV);
+        assert!(
+            widened.contains(&"runscopeextra".to_string()),
+            "run-scoped env must widen the visible set (got {widened:?})"
         );
         std::fs::remove_dir_all(&root.dir).ok();
     }

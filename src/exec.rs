@@ -33,6 +33,14 @@ pub struct ExecOpts {
     /// The dispatching event for the context document's `event` field
     /// ({topic, payload, correlation_id}); None for CLI-direct runs.
     pub event: Option<Value>,
+    /// Launch-time overrides (docs/handoffs/agent-launching.md M2) that ride the
+    /// spawn/launch_agent payload and apply to THIS run only.
+    /// `with_packages`: granted packages made visible for the run (a run-scoped
+    /// analog of the profile's `elanus_path`, visibility not authority);
+    /// `provider`: a named provider that overrides the profile's `[model].provider`
+    /// for the run's model resolution.
+    pub with_packages: Vec<String>,
+    pub provider: Option<String>,
 }
 
 pub struct ContextRenderOpts {
@@ -370,7 +378,23 @@ fn report_agent_failure(
 async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
-    let (prof, _pdir) = profile::load(root, &opts.profile)?;
+    let (mut prof, _pdir) = profile::load(root, &opts.profile)?;
+    // Launch-time overrides (docs/handoffs/agent-launching.md M2), applied to
+    // THIS run only. `provider` overrides `[model].provider` at model resolution
+    // (same seam the dispatcher's named provider uses). `with_packages` rides an
+    // env var that `packages::discover_for_profile` unions into the visible set
+    // for every downstream reader (skills inventory, context stages, MCP), and is
+    // recorded on the obs trace for audit — safety is the record, not a gate: the
+    // launcher already had the authority to widen this durably (wonky bit 1).
+    if let Some(provider) = &opts.provider {
+        prof.model.provider = Some(provider.clone());
+    }
+    if !opts.with_packages.is_empty() {
+        std::env::set_var(
+            crate::packages::RUN_SCOPED_PACKAGES_ENV,
+            opts.with_packages.join(","),
+        );
+    }
     // Provenance (docs/identity.md): events this run emits — its reply mail,
     // failure mail, ask_human, any emit_event tool call, and anything the
     // shell tool runs via `elanus emit` — attribute to the agent. This is
@@ -388,6 +412,16 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     ids.session_id = Some(session.clone());
     let event_id = ids.event_id;
     let in_handler = event_id.is_some();
+    if !opts.with_packages.is_empty() {
+        // Audit the run-scoped visibility extension: safety here is the record
+        // (docs/handoffs/agent-launching.md M2), not a gate.
+        trace::write(
+            root,
+            &obs(&prof.agent, &session, "launch/with_packages"),
+            &ids,
+            json!({ "packages": opts.with_packages, "provider": opts.provider }),
+        );
+    }
 
     let prompt = match opts.prompt {
         Some(p) if p == "-" => {
@@ -1602,6 +1636,32 @@ fn tool_defs() -> Vec<Tool> {
                 },
                 "required": ["question"]
             })),
+        Tool::new("launch_agent")
+            .with_description(
+                "Launch a native elanus agent to run a durable background turn — the sanctioned \
+                 way to put another agent's mailbox to work (a raw emit_event to in/agent/<other> \
+                 is refused). Pick a `profile` from `elanus agent catalog` (it must be spawn-ready: \
+                 an approved exec handler drives its mailbox). The launch is ASYNC and its own flow: \
+                 it returns immediately with {correlation, session, mailbox}; the agent's result \
+                 (or a failure) arrives later as mail on that correlation — do not block waiting. \
+                 Optionally widen the run's VISIBLE packages with `with_packages` (each must be an \
+                 approved package — visibility, not new authority) and pin a `provider` for the run's \
+                 model. Provenance: the launched run is attributed to you.",
+            )
+            .with_schema(json!({
+                "type": "object",
+                "properties": {
+                    "profile": { "type": "string", "description": "the native profile to run (see `elanus agent catalog`)" },
+                    "prompt": { "type": "string", "description": "the self-contained task for the launched agent" },
+                    "with_packages": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "granted packages to make visible for this run only"
+                    },
+                    "provider": { "type": "string", "description": "named provider overriding the profile's model provider for this run" }
+                },
+                "required": ["profile", "prompt"]
+            })),
     ]
 }
 
@@ -1868,6 +1928,16 @@ fn client_tool_result_from_payload(raw: &[u8], call_id: &str) -> Option<String> 
     })
 }
 
+/// The in/ ingress guard for the agent-reachable `emit_event` tool (timers M1;
+/// docs/handoffs/agent-launching.md M3 keeps it intact). An agent may address
+/// ONLY its own mailbox on the in/ plane; every other in/... — including another
+/// agent's mailbox — is refused, so an agent cannot hand-forge a sibling's work
+/// or owner mail. `launch_agent` is the sanctioned door to a peer's mailbox.
+/// Returns true when the emit must be refused.
+fn emit_event_in_plane_refused(etype: &str, own_mailbox: &str) -> bool {
+    etype.starts_with("in/") && etype != own_mailbox
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tool(
     root: &Root,
@@ -1959,10 +2029,10 @@ fn run_tool(
             // "in/agent/" would let in/agent/<someone-else> through. Every
             // other in/... — including another agent's mailbox — stays refused.
             let own_mailbox = crate::topic::agent_mailbox(&prof.agent);
-            if etype.starts_with("in/") && etype != own_mailbox {
+            if emit_event_in_plane_refused(etype, &own_mailbox) {
                 return err(
                     "emit_event: the in/ plane is reserved for ingress; use send_message or \
-                     ask_human to reach your owner"
+                     ask_human to reach your owner (to launch another agent, use launch_agent)"
                         .into(),
                 );
             }
@@ -2134,6 +2204,54 @@ fn run_tool(
             );
             eprintln!("suspending: waiting on human (ask #{ask_id}, correlation {corr})");
             ToolOutcome::Suspend
+        }
+        "launch_agent" => {
+            // The sanctioned door to another agent's mailbox (docs/handoffs/agent-launching.md
+            // M3): emit_event refuses in/agent/<other>, so an agent cannot hand-spawn a
+            // sibling — this tool routes through the shared spawn core the CLI uses, so the
+            // two paths cannot drift. Async by construction (a blocking run inside this
+            // turn would invite deadlock); the reply/failure comes back as mail on the
+            // returned correlation. Provenance = this agent (created_by).
+            let Some(profile) = args["profile"].as_str() else {
+                return err("launch_agent: missing 'profile'".into());
+            };
+            let Some(prompt) = args["prompt"].as_str() else {
+                return err("launch_agent: missing 'prompt'".into());
+            };
+            let with_packages: Vec<String> = args["with_packages"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let provider = args["provider"].as_str().map(String::from);
+            match crate::agentcli::spawn_core(
+                root,
+                conn,
+                crate::agentcli::SpawnRequest {
+                    profile: profile.to_string(),
+                    prompt: prompt.to_string(),
+                    session: None,
+                    priority: 0,
+                    with_packages,
+                    provider,
+                    created_by: Some(prof.agent.clone()),
+                },
+            ) {
+                Ok(desc) => {
+                    if let Some(id) = desc["event"].as_i64() {
+                        self_emitted.insert(id);
+                    }
+                    ToolOutcome::Output(
+                        json!({
+                            "launched": true,
+                            "correlation": desc["correlation"],
+                            "session": desc["session"],
+                            "mailbox": desc["mailbox"],
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => err(format!("launch_agent: {e:#}")),
+            }
         }
         other => {
             // Namespaced MCP tools (<server>__<tool>) route to the pool; the
@@ -2348,6 +2466,27 @@ fn store_msg(conn: &Connection, session: &str, event_id: Option<i64>, msg: &Valu
 mod tests {
     use super::*;
     use crate::profile::SandboxCfg;
+
+    #[test]
+    fn emit_event_in_plane_guard_refuses_other_mailboxes() {
+        // timers-M1 invariant kept by agent-launching M3: an agent may emit to its
+        // OWN mailbox but nothing else on the in/ plane — launch_agent, not a raw
+        // emit_event, is the door to a sibling's mailbox.
+        let own = crate::topic::agent_mailbox("main");
+        assert!(!emit_event_in_plane_refused(&own, &own), "self mailbox allowed");
+        assert!(
+            emit_event_in_plane_refused(&crate::topic::agent_mailbox("architect"), &own),
+            "another agent's mailbox is refused"
+        );
+        assert!(
+            emit_event_in_plane_refused("in/human/owner", &own),
+            "owner mail is refused"
+        );
+        assert!(
+            !emit_event_in_plane_refused("signal/pain", &own),
+            "non-in/ topics are unaffected"
+        );
+    }
 
     fn cfg(workdir: Option<&str>) -> SandboxCfg {
         SandboxCfg {
@@ -3225,6 +3364,14 @@ pub fn handle_exec(root: &Root) -> Result<()> {
     let requested_profile = payload["profile"].as_str().unwrap_or("default");
     let profile = resolve_exec_profile(root, requested_profile);
     let resume = env.get("resume").filter(|r| !r.is_null());
+    // Launch-time overrides ride the mailbox payload (docs/handoffs/agent-launching.md
+    // M2): a spawn/launch_agent may widen this run's package visibility and/or pin a
+    // provider. Applied for this run only in run_turn.
+    let with_packages: Vec<String> = payload["with_packages"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let launch_provider = payload["provider"].as_str().map(String::from);
     // The dispatching event rides into the context document verbatim
     // (docs/context.md): stages see topic, payload, correlation — and the
     // broker-verified `sender` (docs/identity.md), so a stage can tell who the
@@ -3251,6 +3398,8 @@ pub fn handle_exec(root: &Root) -> Result<()> {
             prompt: None,
             resume: Some(ans),
             event: Some(event),
+            with_packages,
+            provider: launch_provider,
         }
     } else {
         // Kernel composes the agent-visible quote from `branched_from` here, the
@@ -3276,6 +3425,8 @@ pub fn handle_exec(root: &Root) -> Result<()> {
             prompt: Some(prompt),
             resume: None,
             event: Some(event),
+            with_packages,
+            provider: launch_provider,
         }
     };
     run(root, opts)

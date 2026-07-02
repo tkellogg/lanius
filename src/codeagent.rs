@@ -126,6 +126,11 @@ Use this cheatsheet when you need another coding worker:
 
 For async `spawn` or `deliver`, end your turn after dispatch. Do not poll, sleep,
 or wait; elanus wakes you later with the result.
+
+You can also launch NATIVE elanus agents (not just coding workers): run
+`elanus agent catalog` to see launchable profiles, then `elanus agent spawn
+--profile <p> "<task>"` (durable, async) or `--with-package` /
+`--provider` for launch-time overrides. See the `launching-agents` skill.
 "#;
 
 /// Provider-credential env vars scrubbed from EVERY launched/resumed coding-agent

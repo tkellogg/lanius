@@ -218,6 +218,47 @@ agents can I launch?" to a successful spawn without human help.
   not launch args); [configuration-ux.md](configuration-ux.md).
 
 ## Log
+- 2026-07-02 — Implemented M1–M5. **M1:** real `--help` on `elanus agent` +
+  `catalog`/`run`/`spawn` (args, spawn-ready requirement, emitted descriptor);
+  `catalog --json` already carries per-profile package lists — a test
+  (`agentcli::catalog_profile_rows_are_machine_pickable`) pins the fields; the
+  README CLI index grew from one line to an honest "Launching agents" paragraph.
+  **M2:** `--with-package` on `run`/`spawn` is now a run-scoped VISIBILITY
+  extension — a granted package not on the profile's path rides the mailbox
+  payload (`with_packages`) and `packages::discover_for_profile` unions it in for
+  that run only via `ELANUS_WITH_PACKAGES` (env is the run-scoped bridge, same
+  idiom as `ELANUS_ACTOR`/`ELANUS_CONFIG_DIR`); recorded on
+  `obs/…/launch/with_packages`; an un-granted/uninstalled package refuses
+  (`agentcli::validate_with_packages` + `packages::is_granted`). `profile.toml`
+  is never written. Native `--provider` added to `RunOpts`/`SpawnOpts`/`AgentCmd`
+  and applied by overriding `prof.model.provider` in `run_turn` (the same seam as
+  the dispatcher's `[model].provider`). Coding-side `--provider` **verified by
+  code inspection** (`codeagent::spawn` signature takes `provider`, re-injects
+  `--provider <name>` before the tool token ~`:984`; `main.rs:1385`
+  `take_provider_flag`) — no change; a live provider spawn is DEFERRED (needs real
+  credentials + a daemon; must not run against the live root). **M3:** seventh
+  tool `launch_agent{profile,prompt,with_packages?,provider?}` in `tool_defs`
+  with a `run_tool` arm delegating to the shared `agentcli::spawn_core` (CLI and
+  tool cannot drift); returns `{correlation,session,mailbox}`, `created_by` = the
+  launching agent; the timers-M1 `in/*` `emit_event` guard was extracted to
+  `emit_event_in_plane_refused` and unit-tested (self-mailbox allowed, sibling +
+  owner-mail refused) — no regression. Tests: `spawn_core_emits_mailbox_event_
+  with_overrides_and_provenance`, `spawn_core_refuses_profile_without_exec_handler`,
+  `with_package_ungranted_bails_but_granted_passes`, `run_scoped_env_widens_
+  visibility`, `is_granted_tracks_approval`. **M4:** `explain-session` skill
+  (kits/stdlib) — the read-only-reader recipe over the history DSL /
+  `session_detail`; renders (verified via `elanus agent catalog --json` in a
+  scratch root). **M5:** `launching-agents` skill (kits/stdlib) — catalog→choose→
+  run/spawn, `launch_agent` vs `elanus code`, launch-time overrides, pointer to
+  `explain-session`; cross-linked from the coding-session `elanus` dispatch skill
+  (`codeagent.rs` `ELANUS_SKILL`). No memory block (per wonky bit 5). DEFERRED:
+  the live LLM dry-runs in M4/M5 acceptance (dispatch a real reader over a dead
+  session; fresh-agent question→spawn) — both need a running daemon with provider
+  credentials over a populated ledger, which the containment rules keep off the
+  live root; mechanics are covered by unit tests + the render check. `cargo test
+  --lib` green (434). NOTE: a pre-existing flaky `dev::first_free_port…` test can
+  fail under a full parallel `cargo test` (port race) but passes in isolation —
+  unrelated to this work.
 - 2026-07-02 — Created from Tim's `_questions.md` sprint-3 pull. Grounded
   against the worktree: `elanus agent catalog/run/spawn` fully exists but is
   undocumented (one line at `docs/README.md:106`); no native tool launches an
