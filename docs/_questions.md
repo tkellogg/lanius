@@ -45,3 +45,34 @@ Each coding agent's native MCP servers seem to not be able to load on launch. At
 
 When I start a new codex or claude code session through elanus, it starts running one of my prompts from some
 previous session, i think. Maybe it's related to QoS 1?? it's a strange behavior when in TUI mode.
+
+
+I think when a subagent is invoked cross-coding harness, the parent harnesses have issues handling them properly.
+I'm pretty sure if codex subshells to opencode, a dead opencode won't notify codex. I'm more confident in claude
+code handling the death cycle better. Ideally, messages would arrive any time and the harness would just wake up
+and handle them. I think with codex, there's a way for a subshell termination to cause the main agent to resume
+processing (it's a weird UX interaction tbqh). We need to do this for all coding agents, figure out how they can
+receive messages when dead and resume. Also, need to update the docs around what it takes to impl a new coding 
+agent.
+
+
+Realistically, what are the scaling bottlenecks? Like, if we had 100 agents all trying to modify the same memory
+blocks, does that make memory blocks a scaling bottleneck? What would that look like?
+
+
+Dolt might be worth considering. It's got Git-style history built-in, which might make it a much better option than
+SQLite https://github.com/dolthub/dolt
+
+
+Tests — do we have bullshit tests? Like those tests that only look at the text of the code rather than the 
+functionality. Or tests with dumb asserts. Or tests that use too many mocks, etc.
+
+
+I added the concept of a knowledge base in journey 14; we should also add an OOTB agent process type for 
+consolidation. Like checking that links make sense, missing links, conflicting info, etc. And then use some cheap
+tier of LLM.
+
+
+Have an LLM knowledge base. Basically, go use benchmarks & online anecdotes to seed ideas for how certain LLMs
+should be used. Different ones have different strengths. But it needs to be a mutable KB because the user probably
+has a lot of preferences, and those preferences drive most of what they think.
