@@ -378,6 +378,22 @@ agent with a broad publish grant can still forge `in/dm/...` on the bus itself
 (not through the tool), reaching another agent's dispatch — that is the
 reserved-ingress-prefix work described above, still open.
 
+**[UPDATE 2026-07-02] Self-mailbox carve-out (timers).** The `emit_event` tool
+arm now permits exactly ONE `in/` type: the running agent's own mailbox,
+`type == topic::agent_mailbox(&prof.agent)` — so an agent may put mail in its
+own inbox to wake itself later (docs/handoffs/timers.md, journey 14, agent
+continuity). This does NOT widen entry 15's threat: `prof.agent` is the
+kernel-known noun of the running agent (not an agent-supplied field), and the
+check is an EQUALITY, not an `in/agent/` prefix — so `in/agent/<someone-else>`,
+`in/dm/*`, and `in/human/<owner>` all still refuse. A self-addressed wake is
+neither cross-agent recall poisoning (recall's self-sender gate already drops a
+self-forged dispatch, above) nor owner forgery. The `schedule_event` tool and
+the `elanus schedule` CLI share this discipline: the tool targets self only
+(the mailbox is `agent_mailbox(prof.agent)`, never taken from args); the CLI is
+a trusted operator surface that may target any named agent, decided at
+schedule-time because the deferred fire has no reliable actor to re-authorize.
+The bus-grant half above stays the remaining residual.
+
 ## 16. [LEGS / LATENT] Exec handlers publish as the owner, not as themselves
 
 Reacting (`mode = "exec"`) package handlers are spawned by the dispatcher

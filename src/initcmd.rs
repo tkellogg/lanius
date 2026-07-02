@@ -164,6 +164,11 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: false,
     },
     PkgFile {
+        rel: "core/packages/self-scheduling/SKILL.md",
+        content: include_str!("../kits/core/packages/self-scheduling/SKILL.md"),
+        exec: false,
+    },
+    PkgFile {
         rel: "core/packages/sibling-coordination/SKILL.md",
         content: include_str!("../kits/core/packages/sibling-coordination/SKILL.md"),
         exec: false,
