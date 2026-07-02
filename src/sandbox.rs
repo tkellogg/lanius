@@ -351,8 +351,19 @@ fn read_network_arms(write_roots: &[PathBuf], protect: &Protect, policy: &CagePo
         NetworkPolicy::Open => {}
         NetworkPolicy::None => arms.push_str("(deny network*)\n"),
         NetworkPolicy::Loopback => arms.push_str(
+            // Deny all, then re-allow ONLY the loopback plane, split by
+            // operation: OUTBOUND is gated on the REMOTE address (a connect to
+            // an external host is denied), while INBOUND/BIND are gated on the
+            // LOCAL address (a caged actor can still stand up a loopback
+            // listener). A single combined `(allow network* (local ip …)
+            // (remote ip …))` does NOT block egress: the `local ip
+            // "localhost:*"` filter matches an unbound outbound socket and
+            // re-opens ALL external egress — verified live against sandbox-exec
+            // on macOS 26 (see seatbelt_network_loopback_blocks_external).
             "(deny network*)\n\
-             (allow network* (local ip \"localhost:*\") (remote ip \"localhost:*\"))\n",
+             (allow network-outbound (remote ip \"localhost:*\"))\n\
+             (allow network-inbound (local ip \"localhost:*\"))\n\
+             (allow network-bind (local ip \"localhost:*\"))\n",
         ),
     }
     // Read allow-list (experimental): flip to deny-by-default reads. The allow
@@ -983,12 +994,31 @@ mod tests {
             ..Default::default()
         };
         let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
-        // Deny all, then re-allow the local planes — order matters (allow wins).
+        // Deny all, then re-allow the loopback plane — order matters (allow wins).
         let deny_at = p.find("(deny network*)").unwrap();
-        let allow_at = p.find("(allow network*").unwrap();
+        let allow_at = p.find("(allow network-outbound").unwrap();
         assert!(deny_at < allow_at, "deny then allow loopback: {p}");
-        assert!(p.contains("(local ip \"localhost:*\")"), "{p}");
-        assert!(p.contains("(remote ip \"localhost:*\")"), "{p}");
+        // Outbound is gated on the REMOTE address so external egress stays denied;
+        // inbound/bind on the LOCAL address so a loopback listener still works. A
+        // combined `local+remote` rule would re-open all egress (see the live test
+        // seatbelt_network_loopback_blocks_external).
+        assert!(
+            p.contains("(allow network-outbound (remote ip \"localhost:*\"))"),
+            "{p}"
+        );
+        assert!(
+            p.contains("(allow network-inbound (local ip \"localhost:*\"))"),
+            "{p}"
+        );
+        assert!(
+            p.contains("(allow network-bind (local ip \"localhost:*\"))"),
+            "{p}"
+        );
+        // The old too-broad combined rule must be gone (it re-opened egress).
+        assert!(
+            !p.contains("(allow network* (local ip"),
+            "combined local+remote allow re-opens external egress: {p}"
+        );
     }
 
     #[test]
@@ -1349,6 +1379,54 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&out.stdout).contains("HELLO"),
             "loopback connect must read the listener's line: {out:?}"
+        );
+    }
+
+    /// The egress half of the loopback fence: a caged connect to an EXTERNAL
+    /// (non-loopback) address must FAIL while loopback stays reachable. This is
+    /// the property the codex cage leans on (docs/handoffs/codex-cage.md M2) and
+    /// the one the original combined `(local ip …)(remote ip …)` loopback rule
+    /// silently did NOT provide — that rule re-opened all egress. A self-hosted
+    /// listener cannot stand in for "external" (macOS loops a connect to the
+    /// machine's own IP back internally), so this needs a genuine external host;
+    /// it SKIPS (never fails) when sandbox-exec is absent or the host has no
+    /// outbound route, so it is not internet-flaky.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_network_loopback_blocks_external() {
+        if !have_sandbox_exec() {
+            return;
+        }
+        // Baseline: is an external host reachable at all right now? If not (no
+        // internet), skip honestly rather than assert a block the network gives
+        // for free. 1.1.1.1:80 is a stable, always-on anycast endpoint.
+        let reachable = std::process::Command::new("nc")
+            .args(["-w", "3", "-z", "1.1.1.1", "80"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !reachable {
+            return;
+        }
+        let root = tmp_root();
+        let cfg = SandboxCfg {
+            fs_write: vec![root.dir.display().to_string()],
+            capture_exclude: vec![],
+            workdir: None,
+            network: Some("loopback".into()),
+            ..Default::default()
+        };
+        let cage = Cage::from_profile(&root, &cfg);
+        assert!(cage.enforcing());
+        // The SAME connect that succeeds uncaged must FAIL under network=loopback:
+        // outbound is gated on the remote address, and 1.1.1.1 is not loopback.
+        let out = cage
+            .shell_command("nc -w 3 -z 1.1.1.1 80")
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "network=loopback must BLOCK an external connect (egress control): {out:?}"
         );
     }
 

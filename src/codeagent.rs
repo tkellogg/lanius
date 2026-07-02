@@ -3510,6 +3510,14 @@ fn launch_external_harness(
             start_record["approvals"] = json!(approvals);
             start_record["sandbox"] = json!(sandbox);
         }
+        // The vendor sandbox is off (above), but elanus's OWN cage is on for this
+        // cell (docs/handoffs/codex-cage.md M3): record its posture so a session's
+        // authority stays fully reconstructable from its trace — showing BOTH that
+        // codex's gate is off AND that elanus's cage fences writes to the workdir
+        // and cuts external egress.
+        if let Some(cage) = codex_headless_cage_posture(&external.decl.name, mode) {
+            start_record["elanus_cage"] = cage;
+        }
         let captured = publish_obs_captured(
             root,
             &principal,
@@ -4164,6 +4172,56 @@ fn codex_headless_approval_posture(tool: &str, mode: Mode) -> Option<(&'static s
     }
 }
 
+/// The `elanus_cage` posture object stamped on `session/start` for a headless
+/// codex worker (docs/handoffs/codex-cage.md M3) — `None` for every other
+/// tool/mode (the codex TUI is human-approved; claude/opencode keep their own
+/// vendor sandbox). Emitted for exactly the same cell as
+/// `codex_headless_approval_posture` so the audit trail records "vendor gate OFF
+/// but elanus's cage ON" together. `enforced` reflects the platform probe
+/// (`enforcement_available`): off macOS it is `false`, never a silent "on".
+fn codex_headless_cage_posture(tool: &str, mode: Mode) -> Option<serde_json::Value> {
+    if tool == "codex" && mode == Mode::Headless {
+        Some(json!({
+            "write": "workdir",
+            "network": "loopback",
+            "enforced": crate::sandbox::enforcement_available(),
+        }))
+    } else {
+        None
+    }
+}
+
+/// elanus's own cage around the HEADLESS codex spawn (docs/handoffs/codex-cage.md).
+/// Headless `codex exec` runs with its vendor sandbox deliberately OFF
+/// (`danger-full-access`, docs/security.md entry 24) so an MCP tool call can
+/// complete — leaving the one matrix cell with no sandbox at all. This fills that
+/// hole by reusing single-cage's live-tested machinery: write = the session
+/// workdir (a headless worker's whole job is its workdir), network = loopback
+/// (the broker, the local HTTP read planes, and any loopback MCP daemon stay
+/// reachable while external egress is cut), and the `Protect` fence keeps the
+/// ledger/secrets/config un-writable even inside a root. Reads stay OPEN (no
+/// fs_read scoping) so the per-session `CODEX_HOME` auth symlinks and codex's own
+/// config/credential reads resolve (wonky bit 5). Enforced on macOS; camera-only
+/// elsewhere (warned by `from_roots_with_policy`, never silent). The interactive
+/// TUI (`run_codex_tui_import`) is deliberately NOT caged — a human approves there.
+fn codex_headless_cage(root: &Root, workdir: &Path) -> crate::sandbox::Cage {
+    // Canonical write root: SBPL `subpath` rules and the Protect fence match the
+    // real (inode) path, so a symlinked workdir component would not bind.
+    let write_root = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
+    crate::sandbox::Cage::from_roots_with_policy(
+        vec![write_root],
+        vec![],
+        true,
+        &crate::sandbox::Protect::for_root(root),
+        crate::sandbox::CagePolicy {
+            network: crate::sandbox::NetworkPolicy::Loopback,
+            ..Default::default()
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_codex_capture(
     root: &Root,
@@ -4179,7 +4237,7 @@ fn run_codex_capture(
     skills: &[(String, PathBuf)],
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::io::Write as _;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     let args = codex_args_with_prompt_from_stdin(args)?;
     let prompt_env = split_codex_seed_prompt(&args).1;
@@ -4206,7 +4264,18 @@ fn run_codex_capture(
         ("codex".to_string(), codex_args)
     };
 
-    let mut cmd = Command::new(&program);
+    // Cage the headless codex spawn (docs/handoffs/codex-cage.md M1). The
+    // sandbox-exec wrapper must be the OUTERMOST layer so BOTH the timeout wrap and
+    // the real codex run caged (wonky bit 4): `cage.command()` yields
+    // `sandbox-exec -p <profile> <program>` and we thread the existing args onto
+    // it, so the composed argv is `sandbox-exec -p … timeout -s TERM <secs> codex …`
+    // (or `sandbox-exec -p … codex …` with no timeout). Off macOS (or without
+    // sandbox-exec) `cage.command()` is a plain `Command::new(program)` —
+    // byte-identical to the pre-cage spawn. The env/stdin/timeout wiring below is
+    // unchanged; sandbox-exec inherits and passes the environment to the child, so
+    // CODEX_HOME et al. still reach codex.
+    let cage = codex_headless_cage(root, workdir);
+    let mut cmd = cage.command(std::path::Path::new(&program));
     cmd.args(&codex_args);
     // The launch-envelope briefing (M4-B): Codex exec has no --append-system-prompt,
     // so we deliver it on STDIN. Codex appends piped stdin as a `<stdin>` block
@@ -10066,6 +10135,163 @@ mod tests {
         assert_eq!(codex_headless_approval_posture("codex", Mode::Tui), None);
         assert_eq!(codex_headless_approval_posture("claude-code", Mode::Headless), None);
         assert_eq!(codex_headless_approval_posture("opencode", Mode::Headless), None);
+    }
+
+    // ── codex cage (docs/handoffs/codex-cage.md) ──────────────────────────────
+
+    /// M1: the headless codex cage targets ONLY the session workdir for writes
+    /// and runs the loopback network policy — reachable bus/local read planes,
+    /// external egress cut. Portable (no enforcement needed to inspect the shape).
+    #[test]
+    fn codex_headless_cage_targets_workdir_and_loopback() {
+        let root = delivery_tmp_root();
+        let workdir = root.dir.join("wd");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let cage = codex_headless_cage(&root, &workdir);
+        // Loopback (not open — egress control; not none — MCP/HTTP/bus stay up).
+        assert_eq!(cage.policy.network, crate::sandbox::NetworkPolicy::Loopback);
+        // The one write root is the canonical session workdir — nothing wider.
+        let canon = workdir.canonicalize().unwrap();
+        assert_eq!(cage.write_roots, vec![canon]);
+        // No read scoping: auth symlinks + codex's config/credential reads resolve.
+        assert!(cage.policy.fs_read_allow.is_empty());
+        assert!(cage.policy.fs_read_deny.is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M1 (live, macOS): a headless codex worker cannot write outside its workdir;
+    /// a write inside succeeds; the ledger + secrets stay fenced even when they sit
+    /// inside the write root. Mirrors `sandbox::seatbelt_actually_cages`; skipped
+    /// (not failed) where sandbox-exec is absent.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn codex_headless_cage_fences_writes_live() {
+        use std::path::Path;
+        if !Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        // A CANONICAL root so the Protect fence (inode-matched subpaths) binds.
+        let base = delivery_tmp_root();
+        let root = Root {
+            dir: base.dir.canonicalize().unwrap(),
+        };
+        // The worker's workdir IS the root here, so the ledger/secrets sit inside a
+        // write root — exactly the case the Protect fence must still deny.
+        let cage = codex_headless_cage(&root, &root.dir);
+        assert!(cage.enforcing());
+        // Write inside the workdir: allowed.
+        let ok = cage
+            .shell_command(&format!("echo hi > {}/in.txt", root.dir.display()))
+            .output()
+            .unwrap();
+        assert!(ok.status.success(), "write inside workdir must succeed: {ok:?}");
+        // Write outside (home): denied — process-tree inheritance covers the
+        // timeout+codex wrap the real spawn threads through this same cage.
+        let home_target = format!(
+            "{}/elanus-codex-cage-escape-{}.txt",
+            std::env::var("HOME").unwrap(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let denied = cage
+            .shell_command(&format!("echo escape > {home_target}"))
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&home_target);
+        assert!(!denied.status.success(), "write outside the workdir must fail");
+        // The ledger is fenced even though it sits inside the write root: an actor
+        // may read it but never write it (no self-granted authority).
+        let db = root.db();
+        std::fs::write(&db, "seed").unwrap();
+        let db_write = cage
+            .shell_command(&format!("echo x >> {}", db.display()))
+            .output()
+            .unwrap();
+        assert!(!db_write.status.success(), "writing the ledger from the cage must fail");
+        // The secret store is unreadable from the cage.
+        std::fs::create_dir_all(root.secrets()).unwrap();
+        let tok = root.secrets().join("tok");
+        std::fs::write(&tok, "s3cr3t").unwrap();
+        let sec = cage
+            .shell_command(&format!("cat {}", tok.display()))
+            .output()
+            .unwrap();
+        assert!(!sec.status.success(), "reading a secret from the cage must fail");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M2 (live, macOS): the loopback fence does not break MCP. A stdio MCP server
+    /// is a pipe child (no socket), so a request/response round-trip must complete
+    /// under the cage; a loopback listener (stand-in for the broker / an `http.json`
+    /// read-plane daemon) stays reachable. The egress half — an external connect is
+    /// blocked — is proven in `sandbox::seatbelt_network_loopback_blocks_external`.
+    /// Skipped (not failed) where sandbox-exec is absent.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn codex_headless_cage_mcp_and_loopback_live() {
+        use std::io::Write as _;
+        use std::path::Path;
+        if !Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let base = delivery_tmp_root();
+        let root = Root {
+            dir: base.dir.canonicalize().unwrap(),
+        };
+        let cage = codex_headless_cage(&root, &root.dir);
+        assert!(cage.enforcing());
+
+        // (a) stdio MCP round-trip: a pipe child reading one line and echoing a
+        // `pong` back (the scratch_ping pattern) must COMPLETE under the cage —
+        // stdio servers need no network, so loopback never touches them.
+        let server = root.dir.join("ping.sh");
+        std::fs::write(&server, "#!/bin/sh\nread line\necho \"pong:$line\"\n").unwrap();
+        let mcp = cage
+            .shell_command(&format!("printf 'PING\\n' | sh {}", server.display()))
+            .output()
+            .unwrap();
+        assert!(
+            mcp.status.success()
+                && String::from_utf8_lossy(&mcp.stdout).contains("pong:PING"),
+            "a stdio MCP tool call must complete under the loopback cage: {mcp:?}"
+        );
+
+        // (b) a loopback listener (broker / http.json read-plane stand-in) stays
+        // reachable — the caged child connects to 127.0.0.1 and reads its line.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let mut s = conn;
+                let _ = s.write_all(b"HELLO\n");
+            }
+        });
+        let loop_out = cage
+            .shell_command(&format!("nc -w 2 127.0.0.1 {port}"))
+            .output()
+            .unwrap();
+        assert!(
+            loop_out.status.success()
+                && String::from_utf8_lossy(&loop_out.stdout).contains("HELLO"),
+            "the caged child must reach a loopback listener (bus/read planes): {loop_out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M3: the `elanus_cage` posture is stamped on `session/start` for a headless
+    /// codex worker only, with `enforced` reflecting the platform probe — off macOS
+    /// it reports `false`, never a silent "on".
+    #[test]
+    fn codex_headless_cage_posture_only_for_headless_codex() {
+        let p = codex_headless_cage_posture("codex", Mode::Headless).unwrap();
+        assert_eq!(p["write"], "workdir");
+        assert_eq!(p["network"], "loopback");
+        assert_eq!(p["enforced"], json!(crate::sandbox::enforcement_available()));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(p["enforced"], json!(false), "off macOS never a silent on");
+        // Every other cell gets no cage stamp.
+        assert!(codex_headless_cage_posture("codex", Mode::Tui).is_none());
+        assert!(codex_headless_cage_posture("claude-code", Mode::Headless).is_none());
+        assert!(codex_headless_cage_posture("opencode", Mode::Headless).is_none());
     }
 
     // ── The launch-envelope briefing (M4-B) ──────────────────────────────────

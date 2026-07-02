@@ -896,3 +896,21 @@ codex offers no narrower lever today. Revisit when the `codex app-server`
 driver lands (`docs/notes-headless-elicitation.md` §3): a real bidirectional
 RPC session can hold approval requests open and relay them to elanus's
 mailbox/`ask_human` rail, which removes the need for this bypass entirely.
+
+## 25. [FIXED 2026-07-02] The loopback network cage leaked all egress
+
+Found during codex-cage (sprint 4) verification: single-cage's
+`NetworkPolicy::Loopback` SBPL — `(deny network*)(allow network* (local ip
+"localhost:*") (remote ip "localhost:*"))` — did NOT block external egress.
+Verified live on macOS 26.5: a caged connect to 8.8.8.8:53 / 1.1.1.1:80
+SUCCEEDED under that grammar, because the `(local ip "localhost:*")` clause
+matches an unbound outbound socket and re-opens everything. "This machine
+only" was allow-all in practice, for every Loopback consumer, since the
+single-cage increment landed. Root cause of the test gap: sprint 1's live
+matrix asserted loopback-allows-local but never loopback-blocks-external
+(the deliberate "don't depend on external network in tests" choice hid the
+hole). FIX: `read_network_arms` splits the policy into network-outbound /
+network-inbound / network-bind arms; new live regression
+`sandbox::seatbelt_network_loopback_blocks_external` (a real external
+connect must fail; skips without sandbox-exec or an outbound route).
+Residual: none known; policy `none` was never affected.
