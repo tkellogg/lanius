@@ -6,7 +6,7 @@ last-updated: 2026-07-02
 
 # Handoff: a one-shot scheduler, and letting an agent wake itself
 
-Journey [../journeys/14-agent-messaging-itself.md](../journeys/14-agent-messaging-itself.md)
+Journey [../journeys/15-agent-messaging-itself.md](../journeys/15-agent-messaging-itself.md)
 (stub): Tim types "schedule a message to post here in 5 seconds" and it happens —
 the agent sets a timer, ends its turn, and *wakes itself* five seconds later to
 act. Two things are missing today: there is **no one-shot scheduler** (packages
@@ -180,7 +180,7 @@ on the ledger, plus a ui.spec assertion that the resulting ambient message rende
 replyably.
 
 ## Read these first
-- The why: [../journeys/14-agent-messaging-itself.md](../journeys/14-agent-messaging-itself.md)
+- The why: [../journeys/15-agent-messaging-itself.md](../journeys/15-agent-messaging-itself.md)
   (self-messages as continuity; the `in/agent/main` incident; the guard nuance).
 - The guard being relaxed: [small-fixes.md](small-fixes.md) M2 and its decision 1;
   the arm at `src/exec.rs:1870-1904`; the test at `:2635`; security.md entry 15
