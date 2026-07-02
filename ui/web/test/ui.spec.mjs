@@ -442,6 +442,14 @@ const testAgentProfile = 'harrier';
   await waitFor('configure: kit add list loads in modal', async () => {
     return /core|dev|stdlib/.test(await page.$eval('#cfg-kit-add-list', (el) => el.textContent));
   }, 8000);
+  // M2 (ui-truthfulness): the add-capability modal header must not leak the
+  // internal words "kit"/"package" — it speaks in product words (capability).
+  {
+    const head = await page.$eval('#cfg-kit-add-modal .cfg-modal-head', (el) => el.textContent || '');
+    (!/\bkit\b/i.test(head) && !/\bpackages?\b/i.test(head) && /capabilit/i.test(head))
+      ? ok('vocabulary: add-capability modal header avoids "kit"/"package"')
+      : fail(`vocabulary: internal words leaked into the add modal header (${head})`);
+  }
   const devKit = page.locator('#cfg-kit-add-list details', { hasText: 'dev' }).first();
   await devKit.locator('summary').click();
   await waitFor('configure: kit modal previews package actors', async () => {
@@ -718,8 +726,67 @@ const renamedAgent = 'falcon';
   }, 10000);
   await waitFor('risk: installed capabilities show approval/risk badges', async () => {
     const text = await page.$eval('#setup-configs', (el) => el.textContent);
-    return /approved|needs review|hook|daemon|local http|broad publish|low surface/i.test(text);
+    // M2: trust wording is "allowed"/"needs review", never the internal "approved".
+    return /allowed|needs review|hook|daemon|local http|broad publish|low surface/i.test(text);
   }, 10000);
+  // ── M2 (ui-truthfulness): the internal word "approved" must not appear as a
+  // capability status badge — trust reads as "allowed"/"on"/"needs review".
+  {
+    const configsText = await page.$eval('#setup-configs', (el) => el.textContent);
+    !/\bapproved\b/i.test(configsText)
+      ? ok('vocabulary: capability badges avoid the internal word "approved"')
+      : fail('vocabulary: "approved" leaked into capability badges');
+    const signalsTitle = await page.$eval('.nav-signals', (el) => el.getAttribute('title') || '');
+    !/\btopic\b/i.test(signalsTitle)
+      ? ok('vocabulary: signals nav tooltip avoids the internal word "topic"')
+      : fail(`vocabulary: "topic" leaked into the signals nav tooltip (${signalsTitle})`);
+  }
+  // ── M1 (ui-truthfulness): liveness — a stopped/failed capability must be
+  // visibly distinct from a running one, and a never-run one reads "not started".
+  // Seed status on the bus for two installed capabilities (the same
+  // obs/package/<name>/status the dispatcher publishes), leaving others unseeded.
+  // Publish through the web server's own authenticated bus connection (/api/publish)
+  // rather than shelling `elanus bus pub`, so the seed does not depend on the CLI's
+  // ambient identity env (ELANUS_PACKAGE/ELANUS_BUS_TOKEN when run inside a session).
+  await page.evaluate(async () => {
+    const pub = (topic, payload) => fetch('/api/publish', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic, payload }) });
+    await pub('obs/package/git-protect/status', { state: 'alive', pid: 4242 });
+    await pub('obs/package/window/status', { state: 'dead', exit_code: 1 });
+  });
+  await waitFor('liveness: /api/liveness reflects the seeded running/failed states', async () => {
+    const j = await page.evaluate(async () => (await fetch('/api/liveness')).json());
+    return j?.actors?.['git-protect']?.status === 'running' && j?.actors?.['window']?.status === 'failed';
+  }, 8000);
+  await page.reload();
+  await page.waitForSelector('.nav-setup');
+  await page.click('.nav-setup');
+  await page.waitForSelector('#view-setup:not([hidden])');
+  await waitFor('liveness: installed vs running vs failed vs not-started are distinguishable', async () => {
+    const gp = await page.locator('#setup-configs .setup-pending-pkg', { hasText: 'git-protect' }).first().textContent().catch(() => '');
+    const win = await page.locator('#setup-configs .setup-pending-pkg', { hasText: 'window' }).first().textContent().catch(() => '');
+    const all = await page.$eval('#setup-configs', (el) => el.textContent);
+    return /running/i.test(gp) && /failed/i.test(win) && /not started/i.test(all);
+  }, 10000);
+  // ── M3 (ui-truthfulness): cost honesty — a run-step limit is a HARD CAP, a
+  // throttle is a SOFT LIMIT; they must render as separate groups, and the
+  // estimate is honestly "unknown" (never a fake $0) until pricing is known.
+  elanus('profile', 'set', 'default', 'model.max_turns=24', 'throttle.work.llm_tokens_per_hour=50000');
+  await page.reload();
+  await page.waitForSelector('.nav-setup');
+  await page.click('.nav-setup');
+  await page.waitForSelector('#view-setup:not([hidden])');
+  await page.$eval('.setup-cost', (el) => { el.open = true; });
+  await waitFor('cost: hard cap and soft limit render as separate groups', async () => {
+    const hard = await page.$eval('.setup-cost .cost-hard', (el) => el.textContent).catch(() => '');
+    const soft = await page.$eval('.setup-cost .cost-soft', (el) => el.textContent).catch(() => '');
+    return /hard cap/i.test(hard) && /run steps/i.test(hard) && /soft limit/i.test(soft) && /tokens\/hour/i.test(soft);
+  }, 8000);
+  {
+    const est = await page.$eval('.setup-cost .cost-estimate', (el) => el.textContent).catch(() => '');
+    (/estimate/i.test(est) && /unknown/i.test(est) && !/\$0\b/.test(est))
+      ? ok('cost: estimate is labeled and honest (unknown, never $0)')
+      : fail(`cost: estimate wording is not honest (${est})`);
+  }
   const savedCard = page.locator('#setup-configs .setup-pending-pkg', { hasText: 'window' }).first();
   await savedCard.locator('button', { hasText: 'settings' }).click();
   await waitFor('add-ons: instance package settings render typed manifest inputs', async () => {
@@ -878,7 +945,13 @@ const renamedAgent = 'falcon';
   // A labeled failure (harness emits these when an agent run breaks) renders
   // as an explicit error bubble in the thread, not silence. Inject one with
   // the correlation of the message we just sent so it threads here.
-  const corr = await page.$eval('#conv-holder .msg.you', (el) => (el.title || '').replace('correlation ', '')).catch(() => '');
+  // M2: the message tooltip says "conversation <id>" (never the internal
+  // "correlation") — strip that product-word prefix to recover the flow id.
+  const msgTitle = await page.$eval('#conv-holder .msg.you', (el) => el.title || '').catch(() => '');
+  (/^conversation /.test(msgTitle) && !/correlation/i.test(msgTitle))
+    ? ok('vocabulary: message tooltip says "conversation", not the internal "correlation"')
+    : fail(`vocabulary: message tooltip wording leaks internal vocabulary (${msgTitle})`);
+  const corr = msgTitle.replace('conversation ', '');
   const agentName = await page.$eval('#nav-agents .nav-agent.on', (el) => el.getAttribute('data-sel')?.replace(/^agent:/, '') || 'main').catch(() => 'main');
   elanus('emit', `in/human/owner`, '--correlation', corr || 'spec-fail', '--payload',
     JSON.stringify({ failed: true, error: 'spec-injected failure', agent: agentName }));

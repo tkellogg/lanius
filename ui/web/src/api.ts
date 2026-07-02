@@ -30,6 +30,13 @@ export function status<T = ApiResult>(): Promise<T> {
   return json<T>('/api/status').catch(() => ({ ok: false, error: 'server unreachable' }) as T);
 }
 
+// UI-truthfulness M1: latest retained liveness per capability (running/stopped/
+// failed), keyed by package name. Capabilities with no status are absent (the UI
+// renders those as "not started").
+export function liveness<T = ApiResult>(): Promise<T> {
+  return json<T>('/api/liveness').catch(() => ({ ok: false, actors: {} }) as T);
+}
+
 export function publish(topic: string, payload: unknown, correlation?: string): Promise<boolean> {
   return json<{ ok?: boolean }>('/api/publish', {
     method: 'POST',

@@ -74,6 +74,12 @@ struct Hub {
     ring: Mutex<VecDeque<String>>,
     next_client_id: AtomicU64,
     clients: Mutex<Vec<(u64, tokio::sync::mpsc::UnboundedSender<Bytes>)>>,
+    // UI-truthfulness M1: latest retained liveness per capability actor, keyed by
+    // package name. Fed from the relay's obs/package/<name>/status subscription
+    // (retained, so a status published before the web server connected still
+    // replays on subscribe). The read endpoint /api/liveness projects this to the
+    // product words the interface shows (running/stopped/failed).
+    liveness: Mutex<HashMap<String, Value>>,
 }
 
 impl Hub {
@@ -170,6 +176,7 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
             ring: Mutex::new(VecDeque::new()),
             next_client_id: AtomicU64::new(0),
             clients: Mutex::new(Vec::new()),
+            liveness: Mutex::new(HashMap::new()),
         });
 
         // The bus relay runs on its OWN real-tokio thread, NOT the ntex runtime:
@@ -206,6 +213,7 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
                     .state(hub)
                     .route("/api/stream", web::get().to(stream))
                     .route("/api/status", web::get().to(status))
+                    .route("/api/liveness", web::get().to(liveness))
                     .route("/api/conversations", web::get().to(conversations))
                     .route("/api/conversations/{session}", web::get().to(conversation))
                     .route("/api/code/sessions", web::get().to(code_sessions))
@@ -317,6 +325,13 @@ async fn relay(hub: Arc<Hub>, mut eventloop: rumqttc::v5::EventLoop) {
                 let env = serde_json::from_slice::<Value>(&p.payload).unwrap_or_else(
                     |_| json!({ "payload": String::from_utf8_lossy(&p.payload).into_owned() }),
                 );
+                if let Some(pkg) = liveness_package(&topic) {
+                    // The retained status payload rides either as the raw
+                    // status_event body ({state,...}) or wrapped in an envelope
+                    // ({kind,payload:{state,...}}). Store the inner status object.
+                    let status = env.get("payload").cloned().unwrap_or_else(|| env.clone());
+                    hub.liveness.lock().unwrap().insert(pkg.to_string(), status);
+                }
                 hub.ingest(topic, env);
             }
             Ok(_) => {}
@@ -374,6 +389,76 @@ async fn publish(hub: web::types::State<Arc<Hub>>, req: HttpRequest, body: Bytes
         Ok(()) => json_resp(200, json!({ "ok": true })),
         Err(e) => json_resp(502, json!({ "ok": false, "error": e.to_string() })),
     }
+}
+
+// ---- liveness (UI-truthfulness M1) -----------------------------------------
+
+/// If `topic` is a capability liveness topic (obs/package/<name>/status), return
+/// the package-name segment. Package names are validated to a simple charset
+/// (lowercase alnum + hyphen), so the encoded segment equals the name — no decode
+/// needed. Anything else (a status topic under a different noun, a nested topic)
+/// returns None.
+fn liveness_package(topic: &str) -> Option<&str> {
+    let inner = topic.strip_prefix("obs/package/")?;
+    let name = inner.strip_suffix("/status")?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(name)
+}
+
+/// Project a raw dispatcher liveness state (`obs/package/<name>/status` payloads:
+/// "alive"/"dead"/"reloading", src/dispatcher.rs) onto the product words the
+/// interface shows. A stopped daemon must never look identical to a running one:
+/// - alive → running
+/// - reloading → restarting
+/// - dead + exit_code 0 → stopped (a clean exit the person asked for)
+/// - dead + non-zero exit_code, or a spawn_error → failed
+/// Any other state passes through verbatim so a new dispatcher state degrades to
+/// its own word rather than a wrong one.
+fn liveness_product_word(status: &Value) -> &'static str {
+    match status.get("state").and_then(Value::as_str).unwrap_or("") {
+        "alive" => "running",
+        "reloading" => "restarting",
+        "dead" => {
+            if status.get("spawn_error").is_some() {
+                return "failed";
+            }
+            match status.get("exit_code").and_then(Value::as_i64) {
+                Some(0) => "stopped",
+                Some(_) => "failed",
+                // A `dead` with no recorded code (e.g. killed by signal) is not a
+                // clean stop; report it as failed rather than implying "stopped".
+                None => "failed",
+            }
+        }
+        // Already a product word (a future dispatcher state) passes through; an
+        // unrecognized state degrades to "unknown" rather than a wrong word.
+        "running" => "running",
+        "stopped" => "stopped",
+        "failed" => "failed",
+        "restarting" => "restarting",
+        _ => "unknown",
+    }
+}
+
+/// `GET /api/liveness` — the read surface for M1. Reports each capability actor's
+/// latest retained status as a product word, keyed by package name. Capabilities
+/// with no status simply do not appear (the interface renders those as "not
+/// started"), so a never-run capability is distinguishable from a running one.
+async fn liveness(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
+    let map = hub.liveness.lock().unwrap();
+    let mut actors = serde_json::Map::new();
+    for (name, status) in map.iter() {
+        actors.insert(
+            name.clone(),
+            json!({
+                "status": liveness_product_word(status),
+                "state": status.get("state").cloned().unwrap_or(Value::Null),
+            }),
+        );
+    }
+    json_resp(200, json!({ "ok": true, "actors": Value::Object(actors) }))
 }
 
 // ---- status ---------------------------------------------------------------
@@ -3001,6 +3086,36 @@ mod route_tests {
         assert_eq!(v["session"], "code-x");
         assert_eq!(v["dollars"]["delta"], 0.2);
         assert_eq!(v["dollars_unavailable"], false);
+    }
+
+    // UI-truthfulness M1: the liveness topic extractor only fires on the exact
+    // obs/package/<name>/status shape, and the state projection maps each raw
+    // dispatcher state onto the product word the interface shows — so a stopped
+    // daemon never looks identical to a running one.
+    #[test]
+    fn liveness_topic_extractor_is_exact() {
+        assert_eq!(liveness_package("obs/package/git-protect/status"), Some("git-protect"));
+        assert_eq!(liveness_package("obs/package/window/status"), Some("window"));
+        // Not a status topic, or a nested/denied topic under the same noun.
+        assert_eq!(liveness_package("obs/package/git-protect/denied"), None);
+        assert_eq!(liveness_package("obs/package//status"), None);
+        assert_eq!(liveness_package("obs/agent/main/s1/tool/shell/call"), None);
+        assert_eq!(liveness_package("obs/package/git-protect/sub/status"), None);
+    }
+
+    #[test]
+    fn liveness_states_map_to_distinguishable_product_words() {
+        assert_eq!(liveness_product_word(&json!({ "state": "alive", "pid": 4242 })), "running");
+        assert_eq!(liveness_product_word(&json!({ "state": "reloading" })), "restarting");
+        // A clean exit is "stopped"; a non-zero exit or a spawn failure is "failed"
+        // — the exact distinction journey 04 requires.
+        assert_eq!(liveness_product_word(&json!({ "state": "dead", "exit_code": 0 })), "stopped");
+        assert_eq!(liveness_product_word(&json!({ "state": "dead", "exit_code": 1 })), "failed");
+        assert_eq!(liveness_product_word(&json!({ "state": "dead", "spawn_error": "no such file" })), "failed");
+        // Killed by signal (no code recorded) is not a clean stop.
+        assert_eq!(liveness_product_word(&json!({ "state": "dead" })), "failed");
+        // An unrecognized state degrades to "unknown", never a wrong word.
+        assert_eq!(liveness_product_word(&json!({ "state": "mystery" })), "unknown");
     }
 
     // The session-id guard the blocks/estimate routes apply before shelling the

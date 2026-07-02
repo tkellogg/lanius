@@ -671,6 +671,19 @@ details.setup-fold > summary .dim-note { padding: 0; flex: 1; min-width: 0; over
   opacity: 0.85;
 }
 .badge-wait { color: var(--agent); }
+/* UI-truthfulness M1: liveness chip — running/stopped/failed/not-started must be
+   distinguishable at a glance, not just by word. */
+.badge.live-ok { color: var(--work); }
+.badge.live-bad { color: var(--danger); opacity: 1; }
+.badge.live-warn { color: var(--agent); }
+.badge.live-idle { color: var(--meta); }
+/* Cost honesty (M3): hard cap / soft limit / estimate as visually separate
+   groups so hard limits are never conflated with estimates. */
+.cost-limits { display: flex; flex-wrap: wrap; gap: 10px 18px; padding-top: 6px; }
+.cost-group { display: flex; flex-direction: column; gap: 3px; min-width: 140px; }
+.cost-group-label { font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--meta); }
+.cost-group.cost-hard .cost-group-label { color: var(--danger); }
+.cost-group.cost-soft .cost-group-label { color: var(--agent); }
 .setup-kit { display: flex; flex-direction: column; padding: 6px 8px; border-bottom: 1px solid var(--subtle-border); }
 .setup-kit-coming { background: var(--hover-soft); }
 .setup-kit-head { display: flex; align-items: baseline; gap: 12px; }

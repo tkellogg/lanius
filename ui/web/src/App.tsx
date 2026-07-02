@@ -3,7 +3,7 @@ import CodeSessions from './CodeSessions';
 import CommsView from './CommsView';
 import ProvidersView from './ProvidersView';
 import AgentAssistant, { ClientTool } from './components/AgentAssistant';
-import { adminGet, adminPost, adminPut, history, publish, status as fetchStatus } from './api';
+import { adminGet, adminPost, adminPut, history, publish, status as fetchStatus, liveness as fetchLiveness } from './api';
 import { openLiveStream } from './live';
 import { Button, IconButton, ModelField, WorkdirInput } from './components/primitives';
 
@@ -176,7 +176,7 @@ function actorDetail(pkg: any) {
   if (publishes) bits.push(`can emit ${publishes}`);
   const blocking = shortList(request.blocking);
   if (blocking) bits.push(`can block ${blocking}`);
-  if (process?.http) bits.push('serves an approved local HTTP endpoint');
+  if (process?.http) bits.push('serves a local HTTP endpoint');
   if (manifest.hooks) bits.push(`declares ${manifest.hooks} hook${manifest.hooks === 1 ? '' : 's'}`);
   if ((manifest.stages ?? []).length) bits.push(`adds ${manifest.stages.length} context helper${manifest.stages.length === 1 ? '' : 's'}`);
   if ((manifest.mcp ?? []).length) bits.push(`exposes ${manifest.mcp.length} MCP server${manifest.mcp.length === 1 ? '' : 's'}`);
@@ -204,8 +204,23 @@ function grantState(pkg: any) {
   const grants = pkg.grants ?? [];
   if (!grants.length) return 'no review record';
   if (grants.some((g: any) => g.state === 'requested')) return 'needs review';
-  if (grants.some((g: any) => g.state === 'approved')) return 'approved';
+  if (grants.some((g: any) => g.state === 'approved')) return 'allowed';
   return grants[0]?.state ?? 'unknown';
+}
+
+// UI-truthfulness M1: turn a capability's latest liveness (from /api/liveness,
+// keyed by package name) into the product word the interface shows. A capability
+// the dispatcher has never spawned has no status entry → "not started", which is
+// visibly distinct from "running". `state` drives a CSS class so failed/stopped
+// read differently from running at a glance.
+function livenessState(liveness: any, name: string) {
+  const status = liveness?.actors?.[name]?.status;
+  if (!status) return { label: 'not started', cls: 'idle' };
+  if (status === 'running') return { label: 'running', cls: 'ok' };
+  if (status === 'failed') return { label: 'failed', cls: 'bad' };
+  if (status === 'stopped') return { label: 'stopped', cls: 'idle' };
+  if (status === 'restarting') return { label: 'restarting', cls: 'warn' };
+  return { label: status, cls: 'idle' };
 }
 
 function riskBadges(pkg: any) {
@@ -222,7 +237,7 @@ function riskBadges(pkg: any) {
   if ((request.publish ?? []).some((v: string) => v === '#' || v.endsWith('/#'))) badges.push('broad publish');
   const state = grantState(pkg);
   if (state === 'needs review') badges.unshift('needs review');
-  else if (state === 'approved') badges.unshift('approved');
+  else if (state === 'allowed') badges.unshift('allowed');
   return badges.length ? badges : ['low surface'];
 }
 
@@ -235,22 +250,32 @@ function capabilityOutcome(kit: any) {
   return 'adds reusable behavior to your agents';
 }
 
+// Cost honesty (journey 03): the label set is hard cap / soft limit / estimate /
+// unknown, and they must not be conflated. A run-step limit truly bounds one
+// activation's model/tool loop — a HARD CAP. A throttle (tokens/hour, max
+// concurrent) only SLOWS an agent — a SOFT LIMIT, not an activation cap. Keeping
+// them in separate lists is what lets the UI separate hard limits from estimates.
 function costSummary(profile: any, fallbackModel = '') {
   const model = profile?.model ?? fallbackModel;
   const turns = profile?.max_turns;
   const autonomy = profile?.autonomy ?? 'off';
   const hardCaps = [];
   if (turns) hardCaps.push(`${turns} run steps`);
+  const softLimits = [];
   const throttle = profile?.throttle ?? {};
   for (const [name, t] of Object.entries(throttle) as any) {
-    if (t?.llm_tokens_per_hour) hardCaps.push(`${name}: ${t.llm_tokens_per_hour} tokens/hour`);
-    if (t?.max_concurrent) hardCaps.push(`${name}: ${t.max_concurrent} concurrent`);
+    if (t?.llm_tokens_per_hour) softLimits.push(`${name}: ${t.llm_tokens_per_hour} tokens/hour`);
+    if (t?.max_concurrent) softLimits.push(`${name}: ${t.max_concurrent} concurrent`);
   }
+  const parts = [];
+  if (hardCaps.length) parts.push('hard cap set');
+  if (softLimits.length) parts.push('soft limit set');
   return {
     model: model || 'provider default',
     autonomy,
     hardCaps,
-    label: hardCaps.length ? 'hard caps configured' : 'no hard cap visible yet',
+    softLimits,
+    label: parts.length ? parts.join(' · ') : 'no limits set yet',
   };
 }
 
@@ -439,6 +464,7 @@ export function App() {
   const [modelsHint, setModelsHint] = useState('');
 
   const [systemStatus, setSystemStatus] = useState<any>(null);
+  const [liveness, setLiveness] = useState<any>({ actors: {} });
   const [setup, setSetup] = useState<any>({ status: '', statusKind: '', kits: null, packages: null, proposals: null, loading: false });
   const [newAgent, setNewAgent] = useState({ name: '', purpose: '', workdir: '', model: '', turns: '24', autonomy: 'off', capability: '' });
   const [newAgentNote, setNewAgentNote] = useState('');
@@ -503,6 +529,11 @@ export function App() {
     setSystemStatus(j);
   };
 
+  const loadLiveness = async () => {
+    const j = await fetchLiveness();
+    if (j?.ok) setLiveness(j);
+  };
+
   const setHistoryState = (v: boolean) => setHistoryOk((prev) => prev === v ? prev : v);
 
   const refreshAgents = async () => {
@@ -515,10 +546,11 @@ export function App() {
 
   useEffect(() => {
     void loadSystemStatus();
+    void loadLiveness();
     void loadDiskAgents();
     void refreshAgents();
     const iv = setInterval(refreshAgents, 15000);
-    const statusIv = setInterval(loadSystemStatus, 10000);
+    const statusIv = setInterval(() => { void loadSystemStatus(); void loadLiveness(); }, 10000);
     return () => { clearInterval(iv); clearInterval(statusIv); };
   }, []);
 
@@ -1311,6 +1343,7 @@ export function App() {
             hidden={sel.kind !== 'setup'}
             setup={setup}
             systemStatus={systemStatus}
+            liveness={liveness}
             provenance={provenance}
             profiles={diskProfiles}
             newAgent={newAgent}
@@ -1380,7 +1413,7 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
         <IconButton id="nav-toggle" label={navOpen ? 'collapse navigation' : `expand navigation: ${stageLabel}`} className="ghost cfg-icon-btn nav-toggle-btn" aria-expanded={navOpen} onClick={() => setNavOpen(!navOpen)}>{navOpen ? '✕' : '≡'}</IconButton>
       </div>
       <div id="nav-list" className="nav-list" onKeyDown={onKey}>
-        <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" title="live activity across every agent and topic" onClick={selectSignals}><span className="nav-sigil">◮</span> signals</button>
+        <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" title="live activity across every agent" onClick={selectSignals}><span className="nav-sigil">◮</span> signals</button>
         <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" title="health check, agent setup, capabilities, and trust footprint" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
         <button className={`nav-item nav-workers${sel.kind === 'code-sessions' ? ' on' : ''}`} data-sel="code-sessions" title="coding runs and the workers they spawned" onClick={() => selectCodeSessions && selectCodeSessions()}><span className="nav-sigil">⚙</span> runs</button>
         <button className={`nav-item nav-comms${sel.kind === 'comms' ? ' on' : ''}`} data-sel="comms" title="the cross-agent comms plane — what the agents are saying to each other" onClick={() => selectComms && selectComms()}><span className="nav-sigil">⇄</span> comms</button>
@@ -1458,7 +1491,7 @@ function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, se
   );
 }
 
-function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent, setNewAgent, newAgentNote, createAgent, modelsHint, modelOptions, loadSetup, selectAgent, selectProviders }: any) {
+function SetupView({ hidden, setup, systemStatus, liveness, provenance, profiles, newAgent, setNewAgent, newAgentNote, createAgent, modelsHint, modelOptions, loadSetup, selectAgent, selectProviders }: any) {
   const kits = setup.kits;
   const pkgs = setup.packages;
   const proposals = setup.proposals;
@@ -1555,8 +1588,25 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
             <div><span>autonomy</span><strong>{cost.autonomy}</strong></div>
             <div><span>limits</span><strong>{cost.label}</strong></div>
           </div>
-          <p className="dim-note">Run-step caps are hard activation limits. Dollar estimates are not shown until provider pricing is known; unknown is better than fake precision.</p>
-          {!!cost.hardCaps.length && <div className="risk-badges">{cost.hardCaps.map((cap: string) => <span key={cap} className="badge">{cap}</span>)}</div>}
+          <div className="cost-limits">
+            <div className="cost-group cost-hard">
+              <span className="cost-group-label">hard cap</span>
+              {cost.hardCaps.length
+                ? <div className="risk-badges">{cost.hardCaps.map((cap: string) => <span key={cap} className="badge">{cap}</span>)}</div>
+                : <span className="dim-note">none set</span>}
+            </div>
+            <div className="cost-group cost-soft">
+              <span className="cost-group-label">soft limit</span>
+              {cost.softLimits.length
+                ? <div className="risk-badges">{cost.softLimits.map((cap: string) => <span key={cap} className="badge badge-wait">{cap}</span>)}</div>
+                : <span className="dim-note">none set</span>}
+            </div>
+            <div className="cost-group cost-estimate">
+              <span className="cost-group-label">estimate</span>
+              <span className="dim-note">unknown until provider pricing is known — per-run dollar estimates show in the runs view when a model is priced.</span>
+            </div>
+          </div>
+          <p className="dim-note">Run-step caps are hard activation limits; throttles are soft limits that slow an agent, not activation caps. Dollar estimates are not shown until provider pricing is known; unknown is better than fake precision.</p>
         </details>
 
         <section className="setup-block">
@@ -1570,11 +1620,11 @@ function SetupView({ hidden, setup, systemStatus, provenance, profiles, newAgent
         </section>
         <details className="setup-block setup-fold" open>
           <summary><h3>installed capabilities</h3><span className="dim-note">add-ons already on this installation and their trust state</span></summary>
-          <p className="dim-note">Installed is not the same as approved/running. Use the badges to see current trust state.</p>
+          <p className="dim-note">Installed is not the same as allowed or running. Use the badges to see current trust state.</p>
           <div id="setup-configs">
             {setup.loading || !pkgs ? 'checking…' : pkgs.ok === false ? <div className="dim-note">could not load installed capabilities: {pkgs.error ?? 'unknown error'}</div>
               : !(pkgs.packages ?? []).length ? <div className="dim-note">nothing added yet</div>
-                : pkgs.packages.map((p: any) => <SetupPackageConfig key={p.name} pkg={p} loadSetup={loadSetup} />)}
+                : pkgs.packages.map((p: any) => <SetupPackageConfig key={p.name} pkg={p} loadSetup={loadSetup} liveness={liveness} />)}
           </div>
         </details>
         <details className="setup-block setup-trust setup-fold">
@@ -1667,7 +1717,7 @@ function SetupKit({ kit, installed, loadSetup }: any) {
   );
 }
 
-function SetupPackageConfig({ pkg, loadSetup }: any) {
+function SetupPackageConfig({ pkg, loadSetup, liveness }: any) {
   const params = declaredConfigParams(pkg);
   const [rows, setRows] = useState<any[] | null>(null);
   const [note, setNote] = useState('');
@@ -1677,6 +1727,7 @@ function SetupPackageConfig({ pkg, loadSetup }: any) {
   const kit = (pkg.grants ?? []).map((g: any) => String(g.decided_by ?? '')).find((v: string) => v.startsWith('kit:'))?.slice(4) ?? '';
   const canUnlink = !!kit && source.kind === 'linked' && source.label === kit;
   const active = (pkg.grants ?? []).some((g: any) => g.state === 'approved');
+  const live = livenessState(liveness, pkg.name);
   const loadRaw = async () => {
     setRaw('loading...');
     const r = await adminGet(`configs?package=${encodeURIComponent(pkg.name)}`);
@@ -1715,7 +1766,7 @@ function SetupPackageConfig({ pkg, loadSetup }: any) {
   };
   return (
     <div className="setup-pending-pkg">
-      <div className="setup-kit-head"><span className="setup-kit-name">{pkg.name}</span><span className={active ? 'badge' : 'badge badge-wait'}>{active ? 'on' : 'off'}</span><span className="dim-note">{grantState(pkg)}{kit ? ` · from ${kit}` : ''}</span>{canUnlink && <button className="ghost" onClick={() => setConfirmOff(!confirmOff)}>{confirmOff ? 'cancel' : 'turn off'}</button>}</div>
+      <div className="setup-kit-head"><span className="setup-kit-name">{pkg.name}</span><span className={active ? 'badge' : 'badge badge-wait'}>{active ? 'on' : 'off'}</span><span className={`badge live-${live.cls}`} title="whether this capability's background service is currently running">{live.label}</span><span className="dim-note">{grantState(pkg)}{kit ? ` · from ${kit}` : ''}</span>{canUnlink && <button className="ghost" onClick={() => setConfirmOff(!confirmOff)}>{confirmOff ? 'cancel' : 'turn off'}</button>}</div>
       <div className="cfg-package-detail">{packageDescription(pkg)}</div>
       <div className="risk-badges">{riskBadges(pkg).map((b) => <span key={b} className={`badge${/pending|broad|writes|daemon|http|hook|mcp|prompt/.test(b) ? ' badge-wait' : ''}`}>{b}</span>)}</div>
       <p className="dim-note">These settings apply to every agent that uses this add-on. Use an agent's configure tab when only one agent should change.</p>
@@ -2161,7 +2212,7 @@ function PackageCard({ pkg, disabled, canConfigure, toggle, sharedRows, setCfgSh
 function KitModal({ modalRef, open, close, kits, cfgForm, cfgPackages, cfgKitDetails, loadKitDetail, installKitForAgent }: any) {
   return (
     <dialog id="cfg-kit-add-modal" className="cfg-modal" ref={modalRef} onClick={(e) => { if (e.target === e.currentTarget) close(); }}>
-      <div className="cfg-modal-head"><div><h3>add kit</h3><p className="dim-note">kits expand into packages for this agent.</p></div><button id="cfg-kit-add-close" className="cfg-icon-btn" type="button" aria-label="close add kit" onClick={close}>×</button></div>
+      <div className="cfg-modal-head"><div><h3>add capability</h3><p className="dim-note">A capability adds a ready-made bundle of abilities to this agent.</p></div><button id="cfg-kit-add-close" className="cfg-icon-btn" type="button" aria-label="close add capability" onClick={close}>×</button></div>
       <div id="cfg-kit-add-list" className="cfg-tree cfg-kit-add-list">{!kits.length ? <div className="dim-note">no kits found</div> : kits.map((k: any) => <KitAddRow key={k.name} kit={k} cfgForm={cfgForm} cfgPackages={cfgPackages} detail={cfgKitDetails.get(k.name)} loadKitDetail={loadKitDetail} installKitForAgent={installKitForAgent} />)}</div>
     </dialog>
   );
@@ -2175,7 +2226,7 @@ function KitAddRow({ kit, cfgForm, cfgPackages, detail, loadKitDetail, installKi
   return (
     <details className="cfg-add-kit" onToggle={(e) => e.currentTarget.open && !detail && void loadKitDetail(kit)}>
       <summary className="cfg-kit-summary cfg-kit-head"><span>{kit.name}</span><span className="cfg-pkg-desc">{kit.hook || ''}</span><span className="cfg-kit-actions"><span className="cfg-split-action" hidden={installed}><button className="cfg-split-primary cfg-kit-add-btn" type="button" aria-label={`link ${kit.name}`} title={`link ${kit.name}`} onClick={(e) => { e.preventDefault(); installKitForAgent(kit, 'link', setNote); }}>link</button><button className="cfg-split-caret" type="button" aria-label={`more add actions for ${kit.name}`} title={`more add actions for ${kit.name}`} onClick={(e) => { e.preventDefault(); setMenu(!menu); }}>⌄</button><div className="cfg-action-menu" hidden={!menu}>{['link', 'copy'].map((action) => <button key={action} type="button" aria-label={`${action} ${kit.name}`} onClick={(e) => { e.preventDefault(); setMenu(false); installKitForAgent(kit, action, setNote); }}>{action}</button>)}</div></span><span className="badge" hidden={!installed}>installed</span><button className="cfg-icon-btn cfg-kit-gear" type="button" aria-label={`configure ${kit.name}`} hidden={!installed}>⚙</button></span></summary>
-      <div className="cfg-skill-table">{!detail ? <div className="dim-note">expand to load packages</div> : !(detail.packages ?? []).length ? <div className="dim-note">{detail.error ?? 'no packages in this kit'}</div> : detail.packages.map((p: any) => <div key={p.name} className="cfg-skill-row cfg-kit-preview-row"><span className="cfg-pkg-name">{p.name}<span className="cfg-preview-badges">{p.skill && <span className="badge">skill</span>}{p.manifest?.actor && <span className="badge badge-wait">{p.manifest.actor}</span>}</span></span><span className="cfg-pkg-desc">{actorDetail(p.manifest?.process || !p.manifest?.mode ? p : { ...p, manifest: { ...p.manifest, process: { mode: p.manifest.mode, run: p.manifest.run, http: p.manifest.http } } })}</span><span className="cfg-skill-actions" /></div>)}</div>
+      <div className="cfg-skill-table">{!detail ? <div className="dim-note">expand to load abilities</div> : !(detail.packages ?? []).length ? <div className="dim-note">{detail.error ?? 'no abilities in this capability'}</div> : detail.packages.map((p: any) => <div key={p.name} className="cfg-skill-row cfg-kit-preview-row"><span className="cfg-pkg-name">{p.name}<span className="cfg-preview-badges">{p.skill && <span className="badge">skill</span>}{p.manifest?.actor && <span className="badge badge-wait">{p.manifest.actor}</span>}</span></span><span className="cfg-pkg-desc">{actorDetail(p.manifest?.process || !p.manifest?.mode ? p : { ...p, manifest: { ...p.manifest, process: { mode: p.manifest.mode, run: p.manifest.run, http: p.manifest.http } } })}</span><span className="cfg-skill-actions" /></div>)}</div>
       <div className="dim-note">{note}</div>
     </details>
   );
@@ -2251,7 +2302,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
       <div id="conv-holder" className="conv-feed-holder">
         <div className="conv-feed" role="log" aria-live="polite" aria-label={`conversation with ${agent}`}>
           {!messages.length && <div className="conv-empty"><p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p><p>Start a conversation with {agent}. Replies and asks stay in this thread.</p></div>}
-          {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `correlation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : m.text}</div></div>)}
+          {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `conversation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span></div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : m.text}</div></div>)}
         </div>
       </div>
       <form id="compose" className="compose" autoComplete="off" onSubmit={submitCompose} aria-label={`message ${agent}`}><span className="compose-sigil">»</span><input id="compose-input" type="text" aria-label={`message ${agent}`} placeholder={`message ${agent}...`} spellCheck={false} /><IconButton type="submit" id="compose-send" label={sendLabel} className="compose-send">➤</IconButton></form>
