@@ -1,0 +1,26 @@
+# kb-compactor — the CHEAP half of the KB diff pipeline (docs/handoffs/kb-groundskeeper.md M3).
+# It sweeps the knowledge corpus and drafts UNIFIED DIFFS (consolidations, link
+# fixes, conflict annotations) — it applies nothing. Its own memory (the
+# `ratifier-bounces` agent-scope block) accumulates the ratifier's feedback so
+# each pass learns.
+#
+# The [model] line below is a DEFAULT. The live pipeline threads the operator's
+# configured `kb-groundskeeper.compactor_model` (and per-pass token budget) onto
+# the spawn payload, so the running model is the config choice, not this line.
+
+agent = "kb-compactor"
+owner = "owner"
+
+[model]
+model = "claude-haiku"
+max_turns = 20
+
+[skills]
+# It needs the KB search + write surfaces, and its own caretaker skill.
+include = ["knowledge", "kb-search", "kb-groundskeeper"]
+exclude = []
+
+[throttle."in/agent/kb-compactor"]
+# A cheap, ambient sweep — cap concurrency so a pass never fans out.
+max_concurrent = 1
+llm_tokens_per_hour = 400000

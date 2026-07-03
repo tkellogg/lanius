@@ -1,0 +1,25 @@
+# kb-ratifier — the EXPENSIVE half of the KB diff pipeline (docs/handoffs/kb-groundskeeper.md M3).
+# It is the TRUST BOUNDARY of elanus's first auto-approve pipeline: for each diff
+# the compactor proposes, it either APPLIES it (`elanus kb apply-diff <pkg>` — one
+# git commit via the kb write path) or BOUNCES it with concrete feedback that it
+# appends to the compactor's `ratifier-bounces` memory block. It stands in for the
+# human at a quality tier the human chose and turned on deliberately.
+#
+# The [model] line is a DEFAULT; the live pipeline threads the operator's
+# configured `kb-groundskeeper.ratifier_model` onto the spawn payload.
+
+agent = "kb-ratifier"
+owner = "owner"
+
+[model]
+model = "claude-fable-5"
+max_turns = 20
+
+[skills]
+include = ["knowledge", "kb-search", "kb-groundskeeper"]
+exclude = []
+
+[throttle."in/agent/kb-ratifier"]
+# The strong tier is expensive by design; the throttle bounds the pipeline's spend.
+max_concurrent = 1
+llm_tokens_per_hour = 300000

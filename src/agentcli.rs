@@ -47,6 +47,15 @@ pub struct SpawnRequest {
     /// Provenance for the mailbox event's `sender` — the launching agent for the
     /// `launch_agent` tool, else the ambient actor. `created_by` in the ledger.
     pub created_by: Option<String>,
+    /// Optional per-run model override, rides the payload (docs/handoffs/kb-groundskeeper.md
+    /// M3): the groundskeeper pipeline threads the config-chosen cheap/expensive
+    /// model into the compactor/ratifier spawn. `None` (the default) leaves the
+    /// spawn byte-identical — the profile's own `[model]` decides.
+    pub model: Option<String>,
+    /// Optional per-pass token budget, rides the payload (docs/handoffs/kb-groundskeeper.md
+    /// M3): the groundskeeper threads its configured budget so a pass is bounded.
+    /// `None` omits it entirely (byte-identical default).
+    pub budget: Option<i64>,
 }
 
 /// `elanus agent catalog` - one inventory surface for launchable things.
@@ -122,6 +131,8 @@ pub fn run(root: &Root, opts: RunOpts) -> Result<()> {
             event: None,
             with_packages: opts.with_packages,
             provider: opts.provider,
+            model: None,
+            budget: None,
         },
     )
 }
@@ -146,6 +157,8 @@ pub fn spawn(root: &Root, opts: SpawnOpts) -> Result<()> {
             with_packages: opts.with_packages,
             provider: opts.provider,
             created_by: None,
+            model: None,
+            budget: None,
         },
     )?;
     println!("{descriptor}");
@@ -188,6 +201,15 @@ pub fn spawn_core(root: &Root, conn: &Connection, req: SpawnRequest) -> Result<V
     }
     if let Some(provider) = &req.provider {
         payload["provider"] = json!(provider);
+    }
+    // The groundskeeper pipeline (docs/handoffs/kb-groundskeeper.md M3) threads its
+    // config-chosen model + per-pass budget onto the spawn payload. Omitted when
+    // None so an ordinary spawn stays byte-identical.
+    if let Some(model) = &req.model {
+        payload["model"] = json!(model);
+    }
+    if let Some(budget) = req.budget {
+        payload["budget"] = json!(budget);
     }
     let event_id = events::emit(
         root,
@@ -538,6 +560,8 @@ mod tests {
                 with_packages: vec!["extra".into()],
                 provider: Some("deepseek".into()),
                 created_by: Some("launcher-agent".into()),
+                model: Some("claude-haiku".into()),
+                budget: Some(4096),
             },
         )
         .expect("spawn_core should emit");
@@ -558,6 +582,9 @@ mod tests {
         assert_eq!(p["session"], "sess-1");
         assert_eq!(p["with_packages"], json!(["extra"]));
         assert_eq!(p["provider"], "deepseek");
+        // The groundskeeper's model + budget thread onto the spawn payload (M3).
+        assert_eq!(p["model"], "claude-haiku");
+        assert_eq!(p["budget"], 4096);
         assert_eq!(sender.as_deref(), Some("launcher-agent"));
         std::fs::remove_dir_all(&root.dir).ok();
     }
@@ -582,6 +609,8 @@ mod tests {
                 with_packages: Vec::new(),
                 provider: None,
                 created_by: None,
+                model: None,
+                budget: None,
             },
         )
         .unwrap_err()

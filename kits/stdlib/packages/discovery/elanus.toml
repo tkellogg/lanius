@@ -1,0 +1,41 @@
+# discovery — the privileged capability search (docs/handoffs/kb-discovery.md).
+#
+# Supplies ONE privileged tool, `find_capability`, through the first-party
+# [[tool]] seam. It answers the introspection gap: an agent that does not have a
+# capability (a KB, skill, tool, stage, MCP server, harness) enabled cannot
+# discover it by ordinary means — so this tool searches the instance's package
+# UNIVERSE, not just the agent's own visible set, and reports "you don't have the
+# discord package enabled, but it exists and matches your query," with what
+# enabling it would add and the enable path.
+#
+# Privileged = it reads package metadata across everything installed, not the
+# caller's filtered visibility set. This is a READ; it grants nothing (visibility,
+# not authority). Getting the capability still rides the config-proposal flow.
+# Because supplying the tool is grant-gated (kind "tool"), the human approves this
+# privileged surface into existence explicitly — the right place for "privileged"
+# to be visible and decided.
+#
+# The tool script is a THIN wrapper over `elanus discover --json` (the kernel CLI
+# owns the single universe-scan implementation — no manifest re-scanning here).
+
+# NOTE: no [kb] marker — discovery is a search FACILITY, not a knowledge corpus.
+
+[[tool]]
+name = "find_capability"
+description = """Search the whole instance for a capability you may NOT have \
+enabled — a knowledge base, skill, tool, context stage, MCP server, or coding \
+harness carried by some package that is not on your profile's path. Returns each \
+matching package with what enabling it would add (kb/, skills, tools, stages) and \
+how to request enablement. Reach for this when you lack something the task in \
+front of you needs: a package you don't have may carry it. Read-only; it grants \
+nothing — getting the capability rides the config-proposal flow."""
+run = "scripts/find"
+timeout_ms = 15000
+
+[tool.schema]
+type = "object"
+required = ["query"]
+
+[tool.schema.properties.query]
+type = "string"
+description = "what you need, in plain words — e.g. \"discord api\" or \"pager escalation\""

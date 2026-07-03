@@ -61,12 +61,15 @@ pub fn render_parts(
     // if no stored row exists, seed one from the file; thereafter the stored
     // (possibly agent-edited) row wins and the file is no longer rendered for
     // that stem. A file with no matching durable stem renders as before.
-    let mut defaults: Vec<(String, String, i32)> = Vec::new();
+    let mut defaults: Vec<(String, String, i32, serde_json::Value)> = Vec::new();
     for f in &static_files {
         if let Some(stem) = block_stem(f) {
             let raw = std::fs::read_to_string(f)?;
-            let text = substitute(&raw, root, profile_name, session, &prof);
-            defaults.push((stem, text, file_priority(f)));
+            // Optional JSON frontmatter carries a KB pointer block's `meta`
+            // (kb-core.md M3: {kb,path,lines,sha}); a plain block file has none.
+            let (meta, body) = parse_block_front(&raw);
+            let text = substitute(body, root, profile_name, session, &prof);
+            defaults.push((stem, text, file_priority(f), meta));
         }
     }
     let seeded = match context_store::seed_defaults(conn, &prof, &defaults, profile_name, session) {
@@ -108,7 +111,10 @@ pub fn render_parts(
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let text = substitute(&raw, root, profile_name, session, &prof);
+        // Strip any JSON frontmatter here too — a pointer-block file with no
+        // durable counterpart must still render only its body, not the meta.
+        let (_, body) = parse_block_front(&raw);
+        let text = substitute(body, root, profile_name, session, &prof);
         ordered.push((file_priority(f), sub, name, text));
         sub += 1;
     }
@@ -176,6 +182,43 @@ pub fn render_parts(
     }
 
     Ok(parts)
+}
+
+/// Optional JSON frontmatter on a profile block file (kb-core.md M3). A KB
+/// pointer block ships its `meta` (`{kb,path,lines,sha}`) as a JSON object between
+/// a leading `---` line and a closing `---` line; the rest is the concept summary
+/// (the block content). Returns `(meta, body)`. A file that does NOT open with a
+/// `---` delimiter whose fence encloses a valid JSON object is treated as pure
+/// content (empty meta) — so every existing plain block file is unchanged.
+fn parse_block_front(raw: &str) -> (serde_json::Value, &str) {
+    let empty = serde_json::Value::Object(Default::default());
+    // Must start with a `---` line (allow a leading BOM-free exact match).
+    let rest = match raw.strip_prefix("---\n") {
+        Some(r) => r,
+        None => match raw.strip_prefix("---\r\n") {
+            Some(r) => r,
+            None => return (empty, raw),
+        },
+    };
+    // Find the closing `---` line and split there.
+    let mut idx = 0usize;
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == "---" {
+            let front = &rest[..idx];
+            let body = &rest[idx + line.len()..];
+            // Strip one leading newline from the body for a clean summary.
+            let body = body.strip_prefix('\n').unwrap_or(body);
+            match serde_json::from_str::<serde_json::Value>(front) {
+                Ok(v) if v.is_object() => return (v, body),
+                // Malformed/non-object frontmatter: treat the whole file as
+                // content rather than silently dropping it.
+                _ => return (empty, raw),
+            }
+        }
+        idx += line.len();
+    }
+    (empty, raw)
 }
 
 /// The durable block name a static `blocks/<file>.md` seeds: the file stem with
@@ -309,6 +352,55 @@ mod tests {
             .into_iter()
             .map(|(name, _)| name)
             .collect()
+    }
+
+    #[test]
+    fn parse_block_front_reads_json_meta() {
+        // A pointer block file: JSON frontmatter meta + a body.
+        let raw = "---\n{ \"kb\": \"kb-llm-strengths\", \"path\": \"kb/role-verifier.md\" }\n---\nsummary body\n";
+        let (meta, body) = parse_block_front(raw);
+        assert_eq!(meta["kb"], "kb-llm-strengths");
+        assert_eq!(meta["path"], "kb/role-verifier.md");
+        assert_eq!(body, "summary body\n");
+        // A plain file with no frontmatter is unchanged (empty meta).
+        let plain = "just content\nmore\n";
+        let (m2, b2) = parse_block_front(plain);
+        assert!(m2.as_object().unwrap().is_empty());
+        assert_eq!(b2, plain);
+        // A markdown file that merely starts with a `---` rule (no closing fence
+        // enclosing JSON) stays pure content.
+        let rule = "---\nnot json\nstill text\n";
+        let (m3, b3) = parse_block_front(rule);
+        assert!(m3.as_object().unwrap().is_empty());
+        assert_eq!(b3, rule);
+    }
+
+    // M3 acceptance: a profile blocks/ file with JSON frontmatter seeds a durable
+    // pointer block whose content renders AND whose meta resolves to file/line/sha.
+    #[test]
+    fn m3_pointer_block_seeds_with_meta() {
+        let root = scratch("m3");
+        std::fs::write(
+            root.dir.join("profiles/default/blocks/10-kb-ptr.md"),
+            "---\n{ \"kb\": \"kb-llm-strengths\", \"path\": \"kb/role-verifier.md\", \"lines\": \"1-26\", \"sha\": \"deadbeef\" }\n---\nPick the model by role.\n",
+        )
+        .unwrap();
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        // Render seeds + shows the block content.
+        let text = render(&root, &conn, "default", "s1").unwrap();
+        assert!(text.contains("Pick the model by role."));
+        // The meta resolves to machine-readable fields.
+        let mut b = ContextBlock::new("kb-ptr", "", "lily");
+        b.scope = Scope::Agent;
+        let meta = context_store::get_block_meta(&conn, &b, "s1", None)
+            .unwrap()
+            .expect("pointer block exists");
+        assert_eq!(meta["kb"], "kb-llm-strengths");
+        assert_eq!(meta["path"], "kb/role-verifier.md");
+        assert_eq!(meta["lines"], "1-26");
+        assert_eq!(meta["sha"], "deadbeef");
+        std::fs::remove_dir_all(&root.dir).ok();
     }
 
     #[test]

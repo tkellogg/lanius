@@ -357,6 +357,29 @@ pub fn get_block(
     }))
 }
 
+/// Read a block's `meta` JSON back out (kb-core.md M3 — `LoadedBlock` carries no
+/// meta, so this is the focused reader that resolves a pointer block's
+/// `{kb,path,lines,sha}`). `None` when the block does not exist; an empty object
+/// for a block with no meta.
+pub fn get_block_meta(
+    conn: &Connection,
+    block: &ContextBlock,
+    session: &str,
+    run: Option<&str>,
+) -> Result<Option<serde_json::Value>> {
+    let (sid, rid) = scope_binding(&block.scope, session, run);
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT meta FROM context_blocks
+              WHERE scope = ?1 AND owner = ?2
+                AND session_id = ?3 AND run_id = ?4 AND name = ?5",
+            params![scope_str(&block.scope), block.owner, sid, rid, block.name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)))
+}
+
 /// Whether a block row already exists for this exact key.
 fn exists(
     conn: &Connection,
@@ -510,16 +533,19 @@ pub fn remove_block(
 pub fn seed_defaults(
     conn: &Connection,
     prof: &Profile,
-    defaults: &[(String, String, i32)],
+    defaults: &[(String, String, i32, serde_json::Value)],
     profile: &str,
     session: &str,
 ) -> Result<Vec<String>> {
     let mut seeded = Vec::new();
-    for (name, content, priority) in defaults {
+    for (name, content, priority, meta) in defaults {
         let mut block = ContextBlock::new(name, content, &prof.agent);
         block.scope = Scope::Agent;
         block.placement = Placement::System;
         block.priority = *priority;
+        // A KB pointer block (kb-core.md M3) ships `meta = {kb,path,lines,sha}`;
+        // an ordinary default ships an empty object. Seed-once carries it in.
+        block.meta = meta.clone();
         if block.validate().is_err() {
             continue; // a malformed default name is a no-op, never an error
         }
@@ -704,7 +730,12 @@ mod tests {
     fn seed_defaults_is_seed_once() {
         let c = conn();
         let p = prof("lily", "owner");
-        let defaults = vec![("identity".to_string(), "default text".to_string(), 0)];
+        let defaults = vec![(
+            "identity".to_string(),
+            "default text".to_string(),
+            0,
+            serde_json::json!({}),
+        )];
         let seeded = seed_defaults(&c, &p, &defaults, "default", "s1").unwrap();
         assert_eq!(seeded, vec!["identity".to_string()]);
         // Evolve it.

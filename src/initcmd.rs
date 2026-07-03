@@ -188,6 +188,61 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         content: include_str!("../kits/core/profiles/architect/blocks/00-architect.md"),
         exec: false,
     },
+    // The seeded KB pointer block (kb-core.md M3): its JSON frontmatter carries
+    // `meta = {kb,path,lines,sha}` into kb-llm-strengths/kb/role-verifier.md, so
+    // the dispatching architect surfaces the model-tiering pointer.
+    PkgFile {
+        rel: "core/profiles/architect/blocks/10-kb-llm-strengths.md",
+        content: include_str!(
+            "../kits/core/profiles/architect/blocks/10-kb-llm-strengths.md"
+        ),
+        exec: false,
+    },
+    // kb-groundskeeper — the KB's caretaker (docs/handoffs/kb-groundskeeper.md):
+    // a no-LLM sweep cron (pointers/orphans/staleness → owner report) plus the
+    // setup-gated diff pipeline. Ships in core, pending; `elanus approve` turns on
+    // rung 1, the [config] keys + approve gate rung 2.
+    PkgFile {
+        rel: "core/packages/kb-groundskeeper/elanus.toml",
+        content: include_str!("../kits/core/packages/kb-groundskeeper/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/packages/kb-groundskeeper/scripts/dispatch",
+        content: include_str!("../kits/core/packages/kb-groundskeeper/scripts/dispatch"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "core/packages/kb-groundskeeper/SKILL.md",
+        content: include_str!("../kits/core/packages/kb-groundskeeper/SKILL.md"),
+        exec: false,
+    },
+    // kb-pipeline — the exec handler that makes the compactor/ratifier agent
+    // mailboxes daemon-drivable (docs/handoffs/kb-groundskeeper.md M3). Without an
+    // approved exec package subscribing to in/agent/kb-compactor / in/agent/kb-ratifier,
+    // `spawn_core` refuses to launch and `elanus kb groundskeep` cannot spawn the
+    // compactor. Mirrors packages/chat; ships pending, approved as part of setup.
+    PkgFile {
+        rel: "core/packages/kb-pipeline/elanus.toml",
+        content: include_str!("../kits/core/packages/kb-pipeline/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/packages/kb-pipeline/scripts/run",
+        content: include_str!("../kits/core/packages/kb-pipeline/scripts/run"),
+        exec: true,
+    },
+    // The compactor + ratifier profiles the diff pipeline spawns (M3).
+    PkgFile {
+        rel: "core/profiles/kb-compactor/profile.toml",
+        content: include_str!("../kits/core/profiles/kb-compactor/profile.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/profiles/kb-ratifier/profile.toml",
+        content: include_str!("../kits/core/profiles/kb-ratifier/profile.toml"),
+        exec: false,
+    },
     PkgFile {
         rel: "dev/README.md",
         content: include_str!("../kits/dev/README.md"),
@@ -296,6 +351,112 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         content: include_str!("../kits/stdlib/packages/explain-session/SKILL.md"),
         exec: false,
     },
+    // kb-search — the default knowledge-search ENGINE (docs/handoffs/kb-search.md):
+    // a read-only indexing daemon (scripts/index) + the `search_knowledge` model
+    // tool via the [[tool]] seam (scripts/search). Ships in stdlib so a fresh root
+    // gets the index daemon and the tool folds into agents automatically; without
+    // this, `elanus kb search` errors "no knowledge index yet".
+    PkgFile {
+        rel: "stdlib/packages/kb-search/elanus.toml",
+        content: include_str!("../kits/stdlib/packages/kb-search/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-search/scripts/index",
+        content: include_str!("../kits/stdlib/packages/kb-search/scripts/index"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-search/scripts/search",
+        content: include_str!("../kits/stdlib/packages/kb-search/scripts/search"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-search/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/kb-search/SKILL.md"),
+        exec: false,
+    },
+    // discovery — the privileged capability search (docs/handoffs/kb-discovery.md):
+    // the `find_capability` model tool via the [[tool]] seam (scripts/find), a thin
+    // wrapper over `elanus discover --json`. Ships in stdlib so a fresh root can tell
+    // an agent "you don't have the discord package enabled, but it exists and matches
+    // your query." Its taught availability rides the seeded 20-discovery block.
+    PkgFile {
+        rel: "stdlib/packages/discovery/elanus.toml",
+        content: include_str!("../kits/stdlib/packages/discovery/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/discovery/scripts/find",
+        content: include_str!("../kits/stdlib/packages/discovery/scripts/find"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "stdlib/packages/discovery/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/discovery/SKILL.md"),
+        exec: false,
+    },
+    // kb-llm-strengths — the first knowledge base (docs/handoffs/kb-core.md M2/D5):
+    // the [kb] marker + a kb/ seeded with the model-tiering rules (one file per
+    // model, one per role, cross-linked). Ships in stdlib so a default agent
+    // "just knows" the tiering.
+    // knowledge — the taught pattern (D6): a default agent "just knows" how to
+    // read, search, and write knowledge bases. Pure skill text, no scripts.
+    PkgFile {
+        rel: "stdlib/packages/knowledge/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/knowledge/SKILL.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/elanus.toml",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/SKILL.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/role-planner.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/role-planner.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/role-implementer.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/role-implementer.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/role-verifier.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/role-verifier.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/claude.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/claude.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/fable.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/fable.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/opus.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/opus.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/gpt-5.5.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/gpt-5.5.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/kb-llm-strengths/kb/glm-5.2.md",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/kb/glm-5.2.md"),
+        exec: false,
+    },
 ];
 
 const PROFILE_TOML: &str = include_str!("../templates/profile.toml");
@@ -303,6 +464,12 @@ const RECORDER_TOML: &str = include_str!("../templates/recorder.toml");
 const BUS_TOML: &str = include_str!("../templates/bus.toml");
 const BLOCK_SYSTEM: &str = include_str!("../templates/block-00-system.md");
 const BLOCK_CONTEXT: &str = include_str!("../templates/block-10-context.md");
+// The seeded high-awareness block that TEACHES discovery's own availability
+// (docs/handoffs/kb-discovery.md M2, journey-14): discovery's whole reason to
+// exist is that an agent doesn't know a capability exists, so its own presence
+// cannot itself be discovered — it must be taught. This block, static on the
+// default/dispatching profile, is that teaching.
+const BLOCK_DISCOVERY: &str = include_str!("../templates/block-20-discovery.md");
 
 pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
@@ -363,6 +530,11 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     write_if_missing(
         &root.profile_dir("default").join("blocks/10-context.md"),
         BLOCK_CONTEXT,
+        false,
+    )?;
+    write_if_missing(
+        &root.profile_dir("default").join("blocks/20-discovery.md"),
+        BLOCK_DISCOVERY,
         false,
     )?;
     let _ =

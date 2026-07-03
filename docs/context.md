@@ -368,6 +368,52 @@ error. No silent skip: context stages can rewrite the opening message —
 skipping one corrupts meaning. (Providers fail open; that's why providers stay
 the append-only sugar and context stages are the real seam.)
 
+## [DECIDED 2026-07-02] The `[[tool]]` seam — a package supplies an agent tool
+
+A package may supply a **model tool**, not just a context stage. It is the same
+move `[[stage]]`/`[[harness]]` made — a declaration is a grant request, dispatch
+is the exec-mode contract — applied to the agent's tool array. This is a
+**first-party** mechanism: MCP stays the border protocol for third-party tool
+servers (`docs/mcp.md`), and a stock stdlib capability must not sit on the wrong
+side of that border, so it rides `[[tool]]`, not `<server>__<tool>`.
+
+```toml
+[[tool]]
+name        = "search_knowledge"   # ONE topic level, BARE — no <pkg>__ prefix
+description = "Search the knowledge base for a query."
+run         = "scripts/search"     # package-relative; exec-mode dispatch
+timeout_ms  = 10000                # default 10s
+
+# The input JSON schema, inline as a TOML table…
+[tool.schema]
+type = "object"
+required = ["query"]
+[tool.schema.properties.query]
+type = "string"
+# …or out of line: schema_file = "search.schema.json" (its bytes join code_hash).
+```
+
+- **Declaration is the request.** Each `[[tool]]` registers a grant of `kind =
+  "tool"` (registered beside `[[stage]]`/`[[mcp]]` in `src/packages.rs`). The
+  tool enters **no** agent's array until the human approves it into the ledger.
+- **Availability = approved + visible.** The kernel folds approved packages' tool
+  defs into the agent's array for profiles that can **see** the package — the
+  same visibility gate `provides_builtin_tools` rides (`src/pkgtool.rs`).
+- **Dispatch is exec-mode**, the `[[stage]]` contract: on a call the kernel
+  spawns the `run` script with the call args as **JSON on stdin**; the script's
+  **stdout JSON becomes the tool result**, under the `timeout_ms` budget (killed
+  on the deadline). A nonzero exit or an overrun degrades that **one call** into
+  a legible error result the model sees — it never wrecks the run.
+- **`run` (and any `schema_file`) join `code_hash`**, so an edit re-enters review
+  like any process, hook, or stage.
+- **Bare name, one live holder.** The tool is `search_knowledge`, period. A
+  **second** package declaring the **same** name swaps the engine behind the tool
+  invisibly to agents; the approve gate refuses two live holders (and any
+  kernel-builtin shadow) **loudly, naming the incumbent** (`src/packages.rs`
+  `decide()`) — disable/revoke one, approve the other. Exec-mode only for now:
+  a resident dispatch mode (the bus-consult shape stages have) is deferred until
+  a tool needs held state.
+
 ## [DECIDED] Wire validation — what context stages may do to `messages`
 
 After the chain, the kernel validates before building the provider request:

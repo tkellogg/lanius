@@ -1,13 +1,22 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use elanus::{
-    agentcli, blockcli, buscli, code_projection, codeagent, configcli, context, db, dev,
-    dispatcher, dotenv, envcompat, estimatecli, events, exec, human, initcmd, kit, mailcli,
+    agentcli, blockcli, buscli, code_projection, codeagent, configcli, context, db, dev, discover,
+    dispatcher, dotenv, envcompat, estimatecli, events, exec, human, initcmd, kbcli, kit, mailcli,
     manifest, models, packages, paths, profile, profilecli, providercli, render, secrets, trace,
     web,
 };
 use serde_json::Value;
 use std::path::PathBuf;
+
+/// Read all of stdin as a UTF-8 string (used by `kb write` when `--content` is
+/// omitted, so a harness can pipe knowledge in).
+fn read_stdin() -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let mut s = String::new();
+    std::io::stdin().read_to_string(&mut s)?;
+    Ok(s)
+}
 
 fn leading_comment_summary(raw: &str) -> String {
     let mut lines = Vec::new();
@@ -121,6 +130,28 @@ enum Cmd {
     Block {
         #[command(subcommand)]
         cmd: BlockCmd,
+    },
+    /// Knowledge bases (docs/handoffs/kb-core.md): a `kb/` subfolder any package
+    /// carries and declares with a `[kb]` marker. list names the enabled ones;
+    /// write commits a file into a KB's `kb/` tree with the hardened git path.
+    Kb {
+        #[command(subcommand)]
+        cmd: KbCmd,
+    },
+    /// Capability discovery (docs/handoffs/kb-discovery.md): search the instance's
+    /// package UNIVERSE — not just the agent's visible set — for a capability the
+    /// caller lacks. "You don't have the discord package enabled, but it exists and
+    /// matches your query." Reports what enabling it would add (kb/, skills, tools,
+    /// stages) and the enable path. Privileged (universe read); grants nothing.
+    Discover {
+        /// The query — plain words, e.g. "discord api".
+        query: Vec<String>,
+        /// The profile whose visible set is the "already have it" baseline.
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Emit the machine-stable JSON report (the find_capability tool's input).
+        #[arg(long)]
+        json: bool,
     },
     /// Work estimation (docs/handoffs/work-estimation.md): an agent records a
     /// multi-dimensional estimate (dollars/turns/tokens/wall-clock) right after it
@@ -524,6 +555,11 @@ struct BlockArgs {
     /// attributable — mirrors the `--by ui` trail every `/api/admin` mutation stamps.
     #[arg(long)]
     by: Option<String>,
+    /// Free-JSON meta for the block: a KB pointer block carries
+    /// {"kb":"<pkg>","path":"kb/role-verifier.md","lines":"12-28","sha":"<sha>"}
+    /// (kb-core.md M3). Must be a JSON object.
+    #[arg(long)]
+    meta: Option<String>,
 }
 
 impl BlockArgs {
@@ -536,6 +572,7 @@ impl BlockArgs {
             priority: self.priority,
             owner: self.owner.clone(),
             by: self.by.clone(),
+            meta: self.meta.clone(),
         }
     }
 }
@@ -572,6 +609,66 @@ enum BlockCmd {
         name: String,
         #[command(flatten)]
         args: BlockArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum KbCmd {
+    /// List the enabled knowledge bases (packages carrying a [kb] marker)
+    List {
+        /// The profile whose visible package set is enumerated.
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Emit one JSON line per KB instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search the knowledge base index: elanus kb search <query>
+    Search {
+        /// The query — plain words, e.g. "who verifies".
+        query: Vec<String>,
+        /// Max hits to return.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Emit one JSON line per hit instead of the human list.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a file into a KB's kb/ tree and commit it: elanus kb write <pkg> <path>
+    Write {
+        /// The package that owns the KB (must be on the path).
+        pkg: String,
+        /// The path INSIDE the package's kb/ tree (e.g. role-verifier.md or notes/x.md).
+        path: String,
+        /// The content to write inline; omit to read the content from stdin.
+        #[arg(long)]
+        content: Option<String>,
+    },
+    /// The groundskeeper sweep (no LLM): validate pointer blocks, find orphans, flag staleness
+    Check {
+        /// The profile whose visible KBs are swept.
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Emit the report as JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+        /// Mail the report to the owner (in/human/owner) when there are findings.
+        #[arg(long)]
+        mail: bool,
+    },
+    /// Apply a unified diff into a KB's kb/ tree and commit it (the ratifier's apply path)
+    ApplyDiff {
+        /// The package that owns the KB (must be on the path).
+        pkg: String,
+        /// The unified diff inline; omit to read it from stdin.
+        #[arg(long)]
+        content: Option<String>,
+    },
+    /// Run the diff-pipeline dispatch (setup-gated): spawn the compactor if set up
+    Groundskeep {
+        /// The profile whose visible KBs the compactor sweeps.
+        #[arg(long, default_value = "default")]
+        profile: String,
     },
 }
 
@@ -903,6 +1000,8 @@ fn run(cli: Cli) -> Result<()> {
                     event: None,
                     with_packages: Vec::new(),
                     provider: None,
+                    model: None,
+                    budget: None,
                 },
             );
             if let Ok(conn) = open(&root) {
@@ -1280,6 +1379,80 @@ fn run(cli: Cli) -> Result<()> {
             BlockCmd::List { args } => blockcli::list(&root, &args.opts())?,
             BlockCmd::Rm { name, args } => blockcli::rm(&root, &name, &args.opts())?,
         },
+        Cmd::Kb { cmd } => match cmd {
+            KbCmd::List { profile, json } => kbcli::list(&root, &profile, json)?,
+            KbCmd::Search {
+                query,
+                limit,
+                json,
+            } => kbcli::search(&root, &query.join(" "), limit, json)?,
+            KbCmd::Write {
+                pkg,
+                path,
+                content,
+            } => {
+                let content = match content {
+                    Some(c) => c,
+                    None => read_stdin()?,
+                };
+                kbcli::write(&root, &pkg, &path, &content)?;
+            }
+            KbCmd::Check {
+                profile,
+                json,
+                mail,
+            } => kbcli::check(&root, &profile, json, mail)?,
+            KbCmd::ApplyDiff { pkg, content } => {
+                let content = match content {
+                    Some(c) => c,
+                    None => read_stdin()?,
+                };
+                kbcli::apply_diff(&root, &pkg, &content)?;
+            }
+            KbCmd::Groundskeep { profile } => kbcli::groundskeep(&root, &profile)?,
+        },
+        Cmd::Discover {
+            query,
+            profile,
+            json,
+        } => {
+            let report = discover::scan(&root, &profile, &query.join(" "))?;
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else if report.matches.is_empty() {
+                println!(
+                    "no available-but-disabled capability matches {:?} (everything matching is already on your path)",
+                    report.query
+                );
+            } else {
+                for m in &report.matches {
+                    println!("{} (not enabled) — matches: {}", m.package, m.matched.join(", "));
+                    let mut adds = Vec::new();
+                    if !m.adds.kb.is_empty() {
+                        adds.push(format!("kb ({})", m.adds.kb.join(", ")));
+                    }
+                    if !m.adds.skills.is_empty() {
+                        adds.push(format!("skill {}", m.adds.skills.join(", ")));
+                    }
+                    if !m.adds.tools.is_empty() {
+                        adds.push(format!("tool {}", m.adds.tools.join(", ")));
+                    }
+                    if !m.adds.stages.is_empty() {
+                        adds.push(format!("stage {}", m.adds.stages.join(", ")));
+                    }
+                    if !m.adds.mcp.is_empty() {
+                        adds.push(format!("mcp {}", m.adds.mcp.join(", ")));
+                    }
+                    if !m.adds.harnesses.is_empty() {
+                        adds.push(format!("harness {}", m.adds.harnesses.join(", ")));
+                    }
+                    if !adds.is_empty() {
+                        println!("  enabling adds: {}", adds.join("; "));
+                    }
+                    println!("  enable: {}", m.enable);
+                }
+            }
+        }
         Cmd::Estimate { cmd } => match cmd {
             EstimateCmd::Set {
                 dollars,
