@@ -187,20 +187,37 @@ pub fn scrub_provider_creds(cmd: &mut std::process::Command) -> &mut std::proces
 ///
 /// When running from the main binary, this is just the current executable. When
 /// one of the thin adapter binaries runs beside it, prefer the sibling `elanus`
-/// binary in the same directory so generated hook configs still call the real
-/// `elanus code hook ...` entrypoint.
+/// binary in the same directory. Packaged stock adapters live under
+/// `~/.elanus/root/packages/.../bin/adapter` without that sibling, so fall back
+/// to PATH before giving up. Generated hook configs must call the real
+/// `elanus code hook ...` entrypoint, never the adapter itself.
 fn elanus_command_path() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("locating the running elanus binary")?;
+    Ok(resolve_elanus_command_path_from_exe(
+        &exe,
+        std::env::var_os("PATH").as_deref(),
+    ))
+}
+
+fn resolve_elanus_command_path_from_exe(exe: &Path, path: Option<&std::ffi::OsStr>) -> PathBuf {
     if exe.file_stem().and_then(|s| s.to_str()) == Some("elanus") {
-        return Ok(exe);
+        return exe.to_path_buf();
     }
     if let Some(dir) = exe.parent() {
         let sibling = dir.join("elanus");
         if sibling.exists() {
-            return Ok(sibling);
+            return sibling;
         }
     }
-    Ok(exe)
+    if let Some(path) = path {
+        for dir in std::env::split_paths(path) {
+            let candidate = dir.join("elanus");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    exe.to_path_buf()
 }
 
 /// Remove internal launch-control variables from a real coding-tool child. They
@@ -9503,6 +9520,20 @@ mod tests {
         // Tool hooks carry a matcher; session hooks do not.
         assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "*");
         assert!(s["hooks"]["SessionStart"][0].get("matcher").is_none());
+    }
+
+    #[test]
+    fn packaged_adapter_resolves_hook_command_to_path_elanus() {
+        let dir = std::env::temp_dir().join(format!("elanus-path-bin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let elanus = dir.join("elanus");
+        std::fs::write(&elanus, "").unwrap();
+
+        let adapter = Path::new("/home/me/.elanus/root/packages/harness-claude/bin/adapter");
+        let resolved = resolve_elanus_command_path_from_exe(adapter, Some(dir.as_os_str()));
+        assert_eq!(resolved, elanus);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── MCP-on-launch (docs/handoffs/mcp-on-launch.md) ───────────────────────
