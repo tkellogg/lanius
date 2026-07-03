@@ -102,6 +102,13 @@ fn init_seeds_stock_harness_packages() -> Result<()> {
         "kits/stdlib/packages/kb-search/elanus.toml",
         "kits/stdlib/packages/kb-search/scripts/index",
         "kits/stdlib/packages/kb-search/scripts/search",
+        // discovery — the privileged capability search (docs/handoffs/kb-discovery.md):
+        // stdlib, so a fresh root gets the find_capability tool + the taught block.
+        "kits/stdlib/packages/discovery/elanus.toml",
+        "kits/stdlib/packages/discovery/scripts/find",
+        "kits/stdlib/packages/discovery/SKILL.md",
+        // the seeded high-awareness block that TEACHES find_capability (M2/journey-14).
+        "profiles/default/blocks/20-discovery.md",
         "kits/stdlib/packages/kb-llm-strengths/elanus.toml",
         "kits/stdlib/packages/kb-llm-strengths/kb/role-verifier.md",
         "kits/core/packages/kb-groundskeeper/elanus.toml",

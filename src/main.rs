@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use elanus::{
-    agentcli, blockcli, buscli, code_projection, codeagent, configcli, context, db, dev,
+    agentcli, blockcli, buscli, code_projection, codeagent, configcli, context, db, dev, discover,
     dispatcher, dotenv, envcompat, estimatecli, events, exec, human, initcmd, kbcli, kit, mailcli,
     manifest, models, packages, paths, profile, profilecli, providercli, render, secrets, trace,
     web,
@@ -137,6 +137,21 @@ enum Cmd {
     Kb {
         #[command(subcommand)]
         cmd: KbCmd,
+    },
+    /// Capability discovery (docs/handoffs/kb-discovery.md): search the instance's
+    /// package UNIVERSE — not just the agent's visible set — for a capability the
+    /// caller lacks. "You don't have the discord package enabled, but it exists and
+    /// matches your query." Reports what enabling it would add (kb/, skills, tools,
+    /// stages) and the enable path. Privileged (universe read); grants nothing.
+    Discover {
+        /// The query — plain words, e.g. "discord api".
+        query: Vec<String>,
+        /// The profile whose visible set is the "already have it" baseline.
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Emit the machine-stable JSON report (the find_capability tool's input).
+        #[arg(long)]
+        json: bool,
     },
     /// Work estimation (docs/handoffs/work-estimation.md): an agent records a
     /// multi-dimensional estimate (dollars/turns/tokens/wall-clock) right after it
@@ -1396,6 +1411,48 @@ fn run(cli: Cli) -> Result<()> {
             }
             KbCmd::Groundskeep { profile } => kbcli::groundskeep(&root, &profile)?,
         },
+        Cmd::Discover {
+            query,
+            profile,
+            json,
+        } => {
+            let report = discover::scan(&root, &profile, &query.join(" "))?;
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else if report.matches.is_empty() {
+                println!(
+                    "no available-but-disabled capability matches {:?} (everything matching is already on your path)",
+                    report.query
+                );
+            } else {
+                for m in &report.matches {
+                    println!("{} (not enabled) — matches: {}", m.package, m.matched.join(", "));
+                    let mut adds = Vec::new();
+                    if !m.adds.kb.is_empty() {
+                        adds.push(format!("kb ({})", m.adds.kb.join(", ")));
+                    }
+                    if !m.adds.skills.is_empty() {
+                        adds.push(format!("skill {}", m.adds.skills.join(", ")));
+                    }
+                    if !m.adds.tools.is_empty() {
+                        adds.push(format!("tool {}", m.adds.tools.join(", ")));
+                    }
+                    if !m.adds.stages.is_empty() {
+                        adds.push(format!("stage {}", m.adds.stages.join(", ")));
+                    }
+                    if !m.adds.mcp.is_empty() {
+                        adds.push(format!("mcp {}", m.adds.mcp.join(", ")));
+                    }
+                    if !m.adds.harnesses.is_empty() {
+                        adds.push(format!("harness {}", m.adds.harnesses.join(", ")));
+                    }
+                    if !adds.is_empty() {
+                        println!("  enabling adds: {}", adds.join("; "));
+                    }
+                    println!("  enable: {}", m.enable);
+                }
+            }
+        }
         Cmd::Estimate { cmd } => match cmd {
             EstimateCmd::Set {
                 dollars,

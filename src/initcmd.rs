@@ -376,6 +376,26 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         content: include_str!("../kits/stdlib/packages/kb-search/SKILL.md"),
         exec: false,
     },
+    // discovery — the privileged capability search (docs/handoffs/kb-discovery.md):
+    // the `find_capability` model tool via the [[tool]] seam (scripts/find), a thin
+    // wrapper over `elanus discover --json`. Ships in stdlib so a fresh root can tell
+    // an agent "you don't have the discord package enabled, but it exists and matches
+    // your query." Its taught availability rides the seeded 20-discovery block.
+    PkgFile {
+        rel: "stdlib/packages/discovery/elanus.toml",
+        content: include_str!("../kits/stdlib/packages/discovery/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/discovery/scripts/find",
+        content: include_str!("../kits/stdlib/packages/discovery/scripts/find"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "stdlib/packages/discovery/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/discovery/SKILL.md"),
+        exec: false,
+    },
     // kb-llm-strengths — the first knowledge base (docs/handoffs/kb-core.md M2/D5):
     // the [kb] marker + a kb/ seeded with the model-tiering rules (one file per
     // model, one per role, cross-linked). Ships in stdlib so a default agent
@@ -444,6 +464,12 @@ const RECORDER_TOML: &str = include_str!("../templates/recorder.toml");
 const BUS_TOML: &str = include_str!("../templates/bus.toml");
 const BLOCK_SYSTEM: &str = include_str!("../templates/block-00-system.md");
 const BLOCK_CONTEXT: &str = include_str!("../templates/block-10-context.md");
+// The seeded high-awareness block that TEACHES discovery's own availability
+// (docs/handoffs/kb-discovery.md M2, journey-14): discovery's whole reason to
+// exist is that an agent doesn't know a capability exists, so its own presence
+// cannot itself be discovered — it must be taught. This block, static on the
+// default/dispatching profile, is that teaching.
+const BLOCK_DISCOVERY: &str = include_str!("../templates/block-20-discovery.md");
 
 pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
@@ -504,6 +530,11 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     write_if_missing(
         &root.profile_dir("default").join("blocks/10-context.md"),
         BLOCK_CONTEXT,
+        false,
+    )?;
+    write_if_missing(
+        &root.profile_dir("default").join("blocks/20-discovery.md"),
+        BLOCK_DISCOVERY,
         false,
     )?;
     let _ =

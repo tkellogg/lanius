@@ -36,6 +36,12 @@ pub struct PkgTool {
     /// the daemon side gets, so a tool script reads what its own daemon indexed.
     pub scratch: PathBuf,
     pub timeout_ms: u64,
+    /// The calling agent's profile name, exported as `ELANUS_PROFILE` on dispatch.
+    /// A per-agent tool (e.g. discovery's `find_capability`, which scans the
+    /// package universe MINUS this profile's visible set) needs to know whose
+    /// visibility set to subtract; without it, the tool would fall back to the
+    /// default profile and mis-report what a worker actually lacks.
+    pub profile: String,
 }
 
 #[derive(Default)]
@@ -68,13 +74,20 @@ impl Pool {
                 if !approved {
                     continue;
                 }
-                pool.push_tool(root, &pkg.name, &pkg.dir, decl);
+                pool.push_tool(root, profile_name, &pkg.name, &pkg.dir, decl);
             }
         }
         pool
     }
 
-    fn push_tool(&mut self, root: &Root, package: &str, pkg_dir: &Path, decl: &ToolDecl) {
+    fn push_tool(
+        &mut self,
+        root: &Root,
+        profile_name: &str,
+        package: &str,
+        pkg_dir: &Path,
+        decl: &ToolDecl,
+    ) {
         if let Some(prev) = self.tools.iter().find(|t| t.name == decl.name) {
             eprintln!(
                 "[tool] {package}: {:?} already provided by {} — dropping the duplicate \
@@ -91,6 +104,7 @@ impl Pool {
             script: pkg_dir.join(&decl.run),
             scratch: root.run_dir().join(format!("pkg-{package}")),
             timeout_ms: decl.timeout_ms,
+            profile: profile_name.to_string(),
         });
     }
 
@@ -138,6 +152,7 @@ fn dispatch(root: &Root, t: &PkgTool, args: &Value) -> Result<String> {
         .env_dual("DB", root.db())
         .env("ELANUS_PACKAGE", &t.package)
         .env("ELANUS_TOOL", &t.name)
+        .env("ELANUS_PROFILE", &t.profile)
         .env("ELANUS_SCRATCH", &t.scratch)
         .spawn()
         .with_context(|| format!("spawning {}", t.script.display()))?;
@@ -205,6 +220,7 @@ mod tests {
             script,
             scratch: root.run_dir().join("pkg-eng"),
             timeout_ms,
+            profile: "default".into(),
         }
     }
 

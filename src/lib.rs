@@ -13,6 +13,7 @@ pub mod context_blocks;
 pub mod context_store;
 pub mod db;
 pub mod dev;
+pub mod discover;
 pub mod dispatcher;
 pub mod dotenv;
 pub mod envcompat;
