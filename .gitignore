@@ -20,3 +20,4 @@ ui/web/dist/
 
 # I like linking these instead
 CLAUDE.md
+!kits/stdlib/packages/kb-llm-strengths/kb/claude.md
