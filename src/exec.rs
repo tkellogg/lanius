@@ -41,6 +41,16 @@ pub struct ExecOpts {
     /// for the run's model resolution.
     pub with_packages: Vec<String>,
     pub provider: Option<String>,
+    /// Per-run overrides threaded by the groundskeeper pipeline
+    /// (docs/handoffs/kb-groundskeeper.md M3), applied to THIS run only.
+    /// `model`: overrides the profile's `[model].model` for the run's request
+    /// assembly (the string handed to `context::Meta.model` and `exec_chat`), so
+    /// the operator's configured compactor/ratifier model actually decides — `None`
+    /// leaves the run byte-identical to the profile's own model.
+    /// `budget`: a per-run token cap; once this run's cumulative tokens reach it the
+    /// tool loop stops, bounding a single pass. `None` leaves the run uncapped.
+    pub model: Option<String>,
+    pub budget: Option<i64>,
 }
 
 pub struct ContextRenderOpts {
@@ -375,6 +385,28 @@ fn report_agent_failure(
     );
 }
 
+/// Resolve the model a run assembles its request with: a launch-time override
+/// (the groundskeeper pipeline's configured model) wins; otherwise the profile's
+/// own `[model].model`, byte-identical. This single string flows into
+/// `context::Meta.model` and the `exec_chat` call, so overriding it here retargets
+/// the whole request.
+fn run_model(profile_model: &str, override_model: Option<&str>) -> String {
+    match override_model {
+        Some(m) if !m.trim().is_empty() => m.to_string(),
+        _ => profile_model.to_string(),
+    }
+}
+
+/// Parse the launch-time `model` + `budget` overrides off a spawn payload
+/// (docs/handoffs/kb-groundskeeper.md M3) — the fields `spawn_core` threads for
+/// the groundskeeper pipeline. Absent fields parse to `None` (no override).
+fn launch_overrides(payload: &Value) -> (Option<String>, Option<i64>) {
+    (
+        payload["model"].as_str().map(String::from),
+        payload["budget"].as_i64(),
+    )
+}
+
 async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
@@ -389,6 +421,11 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     if let Some(provider) = &opts.provider {
         prof.model.provider = Some(provider.clone());
     }
+    // A launch-time `model` override (the groundskeeper's configured compactor/
+    // ratifier model) replaces the profile's own `[model].model` for THIS run, so
+    // it reaches both `build_client`'s provider/adapter resolution and the request
+    // model string uniformly. Absent → the profile's model is left untouched.
+    prof.model.model = run_model(&prof.model.model, opts.model.as_deref());
     if !opts.with_packages.is_empty() {
         std::env::set_var(
             crate::packages::RUN_SCOPED_PACKAGES_ENV,
@@ -544,9 +581,34 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     // emitting signal/pain doesn't get its own scream echoed back (feedback loop).
     let mut self_emitted: HashSet<i64> = HashSet::new();
 
+    // Per-run token budget (docs/handoffs/kb-groundskeeper.md M3): a launch-time
+    // cap on the tokens THIS run may spend across its turns, bounding one pipeline
+    // pass. Accumulated after each LLM call; checked at the top of the loop next to
+    // max_turns. `None` leaves the run uncapped (byte-identical to today).
+    let mut run_tokens: i64 = 0;
     let mut turns = 0u32;
     loop {
         turns += 1;
+        if let Some(budget) = opts.budget {
+            if run_tokens >= budget {
+                events::emit(
+                    root,
+                    &conn,
+                    EmitOpts {
+                        payload: Some(json!({
+                            "reason": "per-run token budget reached",
+                            "session": session, "used": run_tokens, "budget": budget,
+                        })),
+                        cause: event_id,
+                        ..EmitOpts::new("signal/pain")
+                    },
+                )?;
+                bail!(
+                    "per-run token budget ({budget}) reached for session {session}: \
+                     {run_tokens} tokens spent"
+                );
+            }
+        }
         if turns > prof.model.max_turns {
             events::emit(
                 root,
@@ -601,6 +663,7 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![event_id, root_type, model, tokens_in, tokens_out],
         )?;
+        run_tokens += i64::from(tokens_in) + i64::from(tokens_out);
         let text = res.first_text().map(|s| s.to_string());
         // Reasoning is RECORDED, never replayed: the transcript is the
         // flight recorder's truth (and the history DSL projects it), but
@@ -2254,6 +2317,8 @@ fn run_tool(
                     with_packages,
                     provider,
                     created_by: Some(prof.agent.clone()),
+                    model: None,
+                    budget: None,
                 },
             ) {
                 Ok(desc) => {
@@ -2492,6 +2557,67 @@ fn store_msg(conn: &Connection, session: &str, event_id: Option<i64>, msg: &Valu
 mod tests {
     use super::*;
     use crate::profile::SandboxCfg;
+
+    #[test]
+    fn payload_model_override_reaches_request_assembly() {
+        // kb-groundskeeper M3: the spawn payload's `model` rides handle_exec's
+        // parse (launch_overrides) into run_turn's model resolution (run_model) and
+        // from there into the assembled context document's meta.model — the same
+        // string handed to exec_chat — so the operator's configured compactor/
+        // ratifier model actually decides the run. `budget` parses alongside.
+        let root = Root {
+            dir: std::env::temp_dir().join(format!("el-exec-ovr-{}", std::process::id())),
+        };
+        std::fs::remove_dir_all(&root.dir).ok();
+        std::fs::create_dir_all(&root.dir).unwrap();
+        let assemble_with = |model: String| -> Value {
+            let doc = crate::context::assemble(
+                &root,
+                &[("seed".to_string(), "s".to_string())],
+                vec![json!({ "role": "user", "text": "hi" })],
+                Value::Null,
+                crate::context::Meta {
+                    profile: "kb-compactor".into(),
+                    agent: "kb-compactor".into(),
+                    session: "s-test".into(),
+                    turn: 1,
+                    model,
+                    vars: Default::default(),
+                },
+                &[],
+                &trace::Ids::default(),
+            )
+            .unwrap();
+            serde_json::to_value(&doc).unwrap()
+        };
+
+        // A spawn payload carrying the groundskeeper's overrides (what spawn_core
+        // emits): the model reaches the doc's meta.model; the budget parses.
+        let payload = json!({
+            "profile": "kb-compactor", "prompt": "p",
+            "model": "cheap-model", "budget": 12345,
+        });
+        let (model, budget) = launch_overrides(&payload);
+        assert_eq!(budget, Some(12345), "the per-run budget rides the payload");
+        let doc = assemble_with(run_model("profile-own-model", model.as_deref()));
+        assert_eq!(
+            doc["meta"]["model"], "cheap-model",
+            "the payload override is the model the request is assembled with"
+        );
+
+        // An absent field stays byte-identical: no override parsed, the profile's
+        // own model reaches assembly untouched, no budget cap.
+        let bare = json!({ "profile": "kb-compactor", "prompt": "p" });
+        let (model, budget) = launch_overrides(&bare);
+        assert_eq!(model, None);
+        assert_eq!(budget, None, "no payload budget → the run is uncapped");
+        let doc = assemble_with(run_model("profile-own-model", model.as_deref()));
+        assert_eq!(doc["meta"]["model"], "profile-own-model");
+
+        // A blank override is not an override (defensive; treated as absent).
+        assert_eq!(run_model("profile-own-model", Some("  ")), "profile-own-model");
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
 
     #[test]
     fn kernel_tool_names_match_tool_defs() {
@@ -3428,6 +3554,12 @@ pub fn handle_exec(root: &Root) -> Result<()> {
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
     let launch_provider = payload["provider"].as_str().map(String::from);
+    // The groundskeeper pipeline (docs/handoffs/kb-groundskeeper.md M3) threads
+    // `model` + `budget` onto the spawn payload (dispatch-shape verified in
+    // agentcli). Consumed here for THIS run: `model` retargets the request model
+    // (run_turn overrides the profile's `[model].model`); `budget` caps the run's
+    // cumulative tokens. Absent fields leave the run byte-identical.
+    let (launch_model, launch_budget) = launch_overrides(payload);
     // The dispatching event rides into the context document verbatim
     // (docs/context.md): stages see topic, payload, correlation — and the
     // broker-verified `sender` (docs/identity.md), so a stage can tell who the
@@ -3456,6 +3588,8 @@ pub fn handle_exec(root: &Root) -> Result<()> {
             event: Some(event),
             with_packages,
             provider: launch_provider,
+            model: launch_model,
+            budget: launch_budget,
         }
     } else {
         // Kernel composes the agent-visible quote from `branched_from` here, the
@@ -3483,6 +3617,8 @@ pub fn handle_exec(root: &Root) -> Result<()> {
             event: Some(event),
             with_packages,
             provider: launch_provider,
+            model: launch_model,
+            budget: launch_budget,
         }
     };
     run(root, opts)

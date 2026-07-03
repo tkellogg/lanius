@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""kb-groundskeeper dispatch (docs/handoffs/kb-groundskeeper.md).
+
+One exec handler for both crons; it branches on the delivered event's `type`:
+
+  in/package/kb-groundskeeper/sweep     — RUNG 1 (M1), no LLM. Runs
+      `elanus kb check --mail`: validate pointer blocks, find orphans, flag
+      staleness, and mail the owner a report when there are findings. Works with
+      ZERO configuration — this is the rung that ships first.
+
+  in/package/kb-groundskeeper/pipeline  — RUNG 2 (M3), the diff pipeline. Runs
+      `elanus kb groundskeep`, which is INERT (spawns nothing) until the setup
+      gate is satisfied: the [config] model keys are set AND the package is
+      approved. The kernel verb is the gate — this script never spawns directly.
+
+The script shells out to the kernel CLI verbs only. The one piece of state it
+keeps is the pipeline's LAST-PASS timestamp (<root>/run/kb-groundskeeper.last-pass
+— runtime state, never inside the package tree, which is approval-hashed): the
+hourly cron kick is throttled down to the operator's configured `cadence` by an
+interval compare against that timestamp, so a daily cadence gets ONE pass per
+day. An inert verb result (setup incomplete) does NOT consume the cadence — the
+first kick after setup completes runs immediately. The setup gate, not this
+throttle, is what keeps the pipeline off before setup.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+ROOT = os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT")
+# The kernel CLI to shell to; overridable so the script can be driven directly
+# in tests (a scratch root + a stub `elanus`).
+BIN = os.environ.get("ELANUS_BIN", "elanus")
+
+PKG = "kb-groundskeeper"
+HOUR, DAY, WEEK = 3600, 86400, 7 * 86400
+# Tolerance for cron jitter/drift: a pass due "in under 5 minutes" runs now
+# rather than slipping a whole kick period.
+SLACK = 300
+
+
+def elanus(*args):
+    cmd = [BIN]
+    if ROOT:
+        cmd += ["--root", ROOT]
+    cmd += list(args)
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def cadence_interval(cadence):
+    """The minimum seconds between passes a cron-shaped cadence implies.
+
+    A coarse reading of the five fields — the coarsest constrained field wins:
+    a constrained month or day-of-month reads as monthly, day-of-week weekly,
+    hour daily, minute-only hourly; `*/N` steps scale the unit (`0 */6 * * *`
+    → six-hourly). Unparseable → 0 (no throttle; every kick reaches the verb,
+    whose setup gate still bounds it)."""
+    parts = cadence.split()
+    if len(parts) != 5:
+        return 0
+    minute, hour, dom, month, dow = parts
+
+    def step(field, unit_seconds):
+        if field.startswith("*/"):
+            try:
+                return max(1, int(field[2:])) * unit_seconds
+            except ValueError:
+                return None
+        return None
+
+    if month != "*":
+        return 28 * DAY
+    if dom != "*":
+        return step(dom, DAY) or 28 * DAY
+    if dow != "*":
+        return WEEK
+    if hour != "*":
+        return step(hour, HOUR) or DAY
+    if minute != "*":
+        return step(minute, 60) or HOUR
+    return 0
+
+
+def last_pass_file():
+    return os.path.join(ROOT, "run", f"{PKG}.last-pass") if ROOT else None
+
+
+def cadence_skip_reason():
+    """Why this pipeline kick should be skipped (the configured cadence has not
+    elapsed since the last real pass), or None to proceed."""
+    path = last_pass_file()
+    if not path:
+        return None  # no root, no state — let the verb decide
+    r = elanus("config", "get", PKG, "cadence")
+    if r.returncode != 0:
+        return None  # cadence unset → the verb prints why it is inert
+    cadence = r.stdout.strip().strip('"')
+    interval = cadence_interval(cadence)
+    if interval <= 0:
+        return None
+    try:
+        with open(path) as f:
+            last = float(f.read().strip())
+    except (OSError, ValueError):
+        return None  # no pass recorded yet → run
+    elapsed = time.time() - last
+    if elapsed < interval - SLACK:
+        return (
+            f"cadence {cadence!r}: last pass {int(elapsed)}s ago, "
+            f"next due in ~{int(interval - elapsed)}s"
+        )
+    return None
+
+
+def record_pass():
+    path = last_pass_file()
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(str(time.time()))
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        event = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        event = {}
+    etype = event.get("type", "")
+
+    if etype.endswith("/sweep"):
+        # Rung 1: the no-LLM sweep, mailing the owner on findings.
+        r = elanus("kb", "check", "--mail")
+        sys.stderr.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        return 0 if r.returncode == 0 else 1
+
+    if etype.endswith("/pipeline"):
+        # Rung 2: the diff pipeline. The hourly kick is throttled to the
+        # operator's configured cadence (one pass per interval); the verb
+        # itself is setup-gated — inert until the config keys are set AND
+        # the package is approved.
+        reason = cadence_skip_reason()
+        if reason:
+            sys.stderr.write(f"skipped: {reason}\n")
+            return 0
+        r = elanus("kb", "groundskeep")
+        sys.stderr.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        # Only a real pass consumes the cadence: an inert result (setup
+        # incomplete) leaves the timestamp alone, so the first kick after
+        # setup completes runs immediately.
+        if r.returncode == 0 and not r.stdout.lstrip().startswith("inert"):
+            record_pass()
+        return 0 if r.returncode == 0 else 1
+
+    # An unknown kick type is a no-op (defensive).
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -24,6 +24,7 @@ pub mod harness;
 pub mod hooks;
 pub mod human;
 pub mod git_hardened;
+pub mod groundskeeper;
 pub mod initcmd;
 pub mod kb;
 pub mod kbcli;

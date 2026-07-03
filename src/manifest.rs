@@ -105,6 +105,33 @@ impl Default for Manifest {
 pub struct ConfigDecl {
     #[serde(default)]
     pub agent_tunable: Vec<String>,
+    /// Config keys this package declares (docs/handoffs/kb-groundskeeper.md M2).
+    /// The human sets each with `elanus config set <pkg>.<key>`; a `required` key
+    /// gates a setup-dependent capability — the package stays inert until every
+    /// required key carries a value (the kb-groundskeeper pipeline's absolute setup
+    /// gate: no cron fire, no LLM call before setup). This is the gate's source of
+    /// truth and human-facing documentation; it does NOT itself validate a
+    /// `config set` (the config repo accepts any dotted key).
+    #[serde(default)]
+    pub keys: Vec<ConfigKeyDecl>,
+}
+
+/// One declared config key (docs/handoffs/kb-groundskeeper.md M2).
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigKeyDecl {
+    /// The dotted key name, e.g. "compactor_model".
+    pub name: String,
+    /// Human-facing description of what the key controls.
+    #[serde(default)]
+    pub description: String,
+    /// Whether the package's setup gate treats this key as required (default true).
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// What the package asks to be allowed to do. Every field is a request the
@@ -824,6 +851,40 @@ agent_tunable = true
         assert_eq!(cfg.kind, "number");
         assert!(cfg.agent_tunable);
         assert_eq!(cfg.default.as_ref().and_then(|v| v.as_integer()), Some(80));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn package_config_keys_parse_with_defaults() {
+        // docs/handoffs/kb-groundskeeper.md M2: a package declares [config] keys the
+        // human sets. `required` defaults to true; the gate reads these.
+        let dir = std::env::temp_dir().join(format!("el-man-pkg-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("elanus.toml"),
+            r#"
+[config]
+agent_tunable = ["cadence"]
+
+[[config.keys]]
+name = "compactor_model"
+description = "The cheap model that drafts consolidations."
+
+[[config.keys]]
+name = "cadence"
+description = "How often the pipeline sweeps (a cron schedule)."
+required = false
+"#,
+        )
+        .unwrap();
+        let lm = load(&dir).unwrap().unwrap();
+        let keys = &lm.manifest.config.keys;
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].name, "compactor_model");
+        assert!(keys[0].required, "required defaults to true");
+        assert_eq!(keys[1].name, "cadence");
+        assert!(!keys[1].required);
+        assert_eq!(lm.manifest.config.agent_tunable, vec!["cadence"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

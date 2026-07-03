@@ -91,6 +91,51 @@ fn init_seeds_stock_harness_packages() -> Result<()> {
         }
     }
 
+    // The KB arc must survive init (docs/handoffs/kb-search.md + kb-groundskeeper.md
+    // follow-up: pin the KB packages into the init-seeding regression). kb-search is
+    // stdlib — auto-installed on EVERY root — so it must be both seeded into the
+    // stdlib kit AND discoverable via `elanus kb`/`packages`; kb-llm-strengths (the
+    // corpus) rides the same stdlib install. kb-groundskeeper is a core package, so
+    // plain init seeds it into <root>/kits/core (installable via `init --kit core`)
+    // rather than <root>/packages.
+    for rel in [
+        "kits/stdlib/packages/kb-search/elanus.toml",
+        "kits/stdlib/packages/kb-search/scripts/index",
+        "kits/stdlib/packages/kb-search/scripts/search",
+        "kits/stdlib/packages/kb-llm-strengths/elanus.toml",
+        "kits/stdlib/packages/kb-llm-strengths/kb/role-verifier.md",
+        "kits/core/packages/kb-groundskeeper/elanus.toml",
+        "kits/core/packages/kb-groundskeeper/scripts/dispatch",
+        "kits/core/packages/kb-groundskeeper/SKILL.md",
+        "kits/core/packages/kb-pipeline/elanus.toml",
+        "kits/core/packages/kb-pipeline/scripts/run",
+        "kits/core/profiles/kb-compactor/profile.toml",
+        "kits/core/profiles/kb-ratifier/profile.toml",
+    ] {
+        let p = root_dir.join(rel);
+        assert!(p.exists(), "init must seed {rel}, missing at {}", p.display());
+    }
+
+    // The stdlib KB is not just on disk — it is auto-installed, so `elanus kb list`
+    // names kb-llm-strengths on a fresh root (the concrete regression the kb-search
+    // verifier flagged: init round 1 failed to seed/install the package).
+    let kb_list = Command::new(&elanus_bin)
+        .args(["kb", "list", "--json"])
+        .env("ELANUS_ROOT", &root_dir)
+        .current_dir(&workdir)
+        .output()
+        .context("running elanus kb list")?;
+    assert!(
+        kb_list.status.success(),
+        "elanus kb list failed\nstderr:\n{}",
+        String::from_utf8_lossy(&kb_list.stderr)
+    );
+    let listed = String::from_utf8_lossy(&kb_list.stdout);
+    assert!(
+        listed.contains("kb-llm-strengths"),
+        "kb-llm-strengths must be auto-installed + listed after init: {listed}"
+    );
+
     let _ = std::fs::remove_dir_all(&root_dir);
     let _ = std::fs::remove_dir_all(&workdir);
     Ok(())

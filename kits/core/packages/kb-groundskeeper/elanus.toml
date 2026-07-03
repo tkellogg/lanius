@@ -1,0 +1,81 @@
+# kb-groundskeeper — the knowledge base's caretaker (docs/handoffs/kb-groundskeeper.md).
+#
+# Two rungs on the variety ladder over the KB that kb-core + kb-search built:
+#
+#   1. THE SCRIPT RUNG (M1) — no LLM, works with ZERO configuration. A daily sweep
+#      validates every pointer block's meta.{path,lines,sha} (kb-core M3), finds
+#      orphan kb/ files, and flags staleness (a file changed since its recorded
+#      sha), then mails the owner a report. `elanus kb check` is the verb; the
+#      `sweep` cron below fires it. This rung needs only `elanus approve`.
+#
+#   2. THE DIFF PIPELINE (M3) — elanus's FIRST auto-approve pipeline, and so
+#      absolutely SETUP-GATED. A cheap "compactor" drafts unified diffs; an
+#      expensive "ratifier" applies-or-bounces them WITH feedback. NOTHING runs —
+#      no cron fire that spawns anything, no LLM call — until the human has set the
+#      two model choices (informed by reading the llm-strengths KB), a cadence, and
+#      a token budget (the [config] keys below) AND approved this package. The
+#      `pipeline` cron fires on a fixed schedule, but `elanus kb groundskeep` is
+#      INERT (spawns nothing, prints why) until setup is complete.
+#
+# Ships pending like every package. `elanus approve kb-groundskeeper` turns on the
+# sweep cron (rung 1). The pipeline (rung 2) additionally needs the [config] keys.
+
+[request]
+# The crons emit internal kick topics this package also subscribes to (the
+# cron→exec self-kick pattern, mirroring estimation/watchdog/escalation). It mails
+# the owner (rung 1's report). Per-pass cost is NOT emitted on a bespoke topic —
+# each spawned compactor/ratifier run records its tokens into the general llm_usage
+# trail, which is where the human reads what the pipeline spends.
+subscribe = [
+  "in/package/kb-groundskeeper/sweep",
+  "in/package/kb-groundskeeper/pipeline",
+]
+publish = [
+  "in/package/kb-groundskeeper/sweep",
+  "in/package/kb-groundskeeper/pipeline",
+  "in/human/owner",
+]
+
+[process]
+mode  = "exec"
+run   = "scripts/dispatch"
+order = 50
+
+# Rung 1 (M1): the pointer/orphan/staleness sweep. Daily at 09:00. No config, no
+# LLM — the report is a courtesy the KB owner reads. Fires even before setup.
+[[cron]]
+schedule = "0 9 * * *"
+emit     = "in/package/kb-groundskeeper/sweep"
+
+# Rung 2 (M3): the diff-pipeline kick. Hourly, but the dispatch is INERT until the
+# [config] keys are set and the package is approved (the absolute setup gate). The
+# configured `cadence` is honored by scripts/dispatch: each hourly kick compares a
+# last-pass timestamp (<root>/run/kb-groundskeeper.last-pass) against the cadence's
+# implied interval and skips until it has elapsed — a daily cadence gets one pass
+# per day. The setup gate, not the schedule, keeps the pipeline off before setup.
+[[cron]]
+schedule = "0 * * * *"
+emit     = "in/package/kb-groundskeeper/pipeline"
+
+# The pipeline's setup surface (docs/handoffs/kb-groundskeeper.md M2, wonky bit 1):
+# the human sets each with `elanus config set kb-groundskeeper.<key> ...`. All four
+# are REQUIRED — the pipeline stays inert until every one carries a value. None is
+# agent_tunable: an agent may not turn its own auto-approve pipeline on or retune it.
+[config]
+agent_tunable = []
+
+[[config.keys]]
+name = "compactor_model"
+description = "The CHEAP model that drafts consolidation diffs (a fast/cheap tier — consult the llm-strengths KB: `elanus kb search 'implementer model'`)."
+
+[[config.keys]]
+name = "ratifier_model"
+description = "The EXPENSIVE model that ratifies diffs — the trust boundary (a strong/verifier tier — `elanus kb search 'who verifies'`)."
+
+[[config.keys]]
+name = "cadence"
+description = "How often a pipeline pass should run (a cron schedule, e.g. '0 3 * * *'). Throttles the hourly pipeline kick: one pass per implied interval."
+
+[[config.keys]]
+name = "token_budget"
+description = "The per-pass token budget threaded onto each compactor/ratifier spawn — the pipeline's cost bound."

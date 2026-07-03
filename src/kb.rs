@@ -241,6 +241,112 @@ pub fn write(root: &Root, pkg: &str, rel: &str, content: &str) -> Result<WriteOu
     })
 }
 
+/// Apply a unified diff to a package's `kb/` tree and commit exactly the paths it
+/// touches — the ratifier's apply path (docs/handoffs/kb-groundskeeper.md M3). The
+/// compactor's deliverable is a unified diff; ratification is `git apply` + one
+/// commit under the fixed kernel identity, so every applied consolidation is an
+/// auditable, revertible commit (kb-core D2). Every path the diff touches MUST be
+/// under `kb/` with no traversal — an agent-authored diff is untrusted, so a diff
+/// that reaches for `elanus.toml`, a `..`, or an absolute path is refused before
+/// any file is touched.
+pub fn apply_diff(root: &Root, pkg: &str, diff: &str) -> Result<WriteOutcome> {
+    let package = packages::find(root, pkg)
+        .with_context(|| format!("resolving package {pkg:?} for a kb diff apply"))?;
+    let touched = diff_touched_paths(diff)?;
+    if touched.is_empty() {
+        bail!("diff touches no files under kb/");
+    }
+    // Path-discipline on every target: under kb/, no '..', no absolute root. Reuse
+    // safe_kb_rel, which already strips a leading kb/ and rejects traversal.
+    for rel in &touched {
+        let under_kb = rel
+            .strip_prefix(&format!("{KB_DIR}/"))
+            .ok_or_else(|| anyhow::anyhow!("diff path {rel:?} is not under kb/"))?;
+        safe_kb_rel(under_kb)
+            .with_context(|| format!("diff path {rel:?} fails kb path-discipline"))?;
+        // No symlink anywhere on the chain (a planted link could redirect writes).
+        reject_symlink_chain(&kb_dir(&package), Path::new(under_kb))?;
+    }
+    ensure_repo(&package.dir)?;
+    // `git apply --index` applies to the working tree AND stages, so the subsequent
+    // commit records exactly the applied hunks. -p1 strips the a/ b/ prefixes.
+    let mut child = std::process::Command::new("git");
+    git_hardened::harden(&mut child);
+    child
+        .arg("-C")
+        .arg(&package.dir)
+        .args(["apply", "--index", "--whitespace=nowarn", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut proc = child.spawn().context("spawning git apply")?;
+    {
+        use std::io::Write;
+        proc.stdin
+            .take()
+            .context("git apply stdin")?
+            .write_all(diff.as_bytes())?;
+    }
+    let out = proc.wait_with_output().context("git apply")?;
+    if !out.status.success() {
+        bail!(
+            "git apply failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // Nothing staged (an empty/no-op diff) is not an error but not a commit either.
+    if git_hardened::ok_in(&package.dir, &["diff", "--cached", "--quiet"]) {
+        let commit = head_sha(&package.dir).unwrap_or_default();
+        return Ok(WriteOutcome {
+            package: package.name,
+            rel: touched.join(", "),
+            commit,
+            changed: false,
+        });
+    }
+    let msg = format!("kb: ratify diff ({})", touched.join(", "));
+    git_hardened::run_in(&package.dir, &["commit", "-m", &msg], "kb ratify commit")?;
+    let commit = head_sha(&package.dir)?;
+    Ok(WriteOutcome {
+        package: package.name,
+        rel: touched.join(", "),
+        commit,
+        changed: true,
+    })
+}
+
+/// The set of repo-relative paths a unified diff touches, read from its `+++ b/…`
+/// (and `--- a/…`) headers. `/dev/null` (a pure add/delete side) is skipped. The
+/// `a/`/`b/` prefixes are stripped so the returned paths are repo-relative.
+fn diff_touched_paths(diff: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for line in diff.lines() {
+        let rest = if let Some(r) = line.strip_prefix("+++ ") {
+            r
+        } else if let Some(r) = line.strip_prefix("--- ") {
+            r
+        } else {
+            continue;
+        };
+        // Drop a trailing tab-delimited timestamp some diff tools append.
+        let rest = rest.split('\t').next().unwrap_or(rest).trim();
+        if rest == "/dev/null" {
+            continue;
+        }
+        let path = rest
+            .strip_prefix("a/")
+            .or_else(|| rest.strip_prefix("b/"))
+            .unwrap_or(rest);
+        if path.is_empty() {
+            bail!("diff header has an empty path");
+        }
+        if !out.contains(&path.to_string()) {
+            out.push(path.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// Validate a KB-relative path: a normal relative path under `kb/`, no absolute
 /// root, no `..`, no empty/`.` components. Returns the cleaned relative path,
 /// which is ALWAYS relative to the `kb/` dir (not the package root). A leading
@@ -699,6 +805,59 @@ mod tests {
         assert_eq!(query_tokens("Who verifies?"), vec!["who", "verifies"]);
         assert_eq!(query_tokens("  GPT-5.5 on high!  "), vec!["gpt", "5", "5", "on", "high"]);
         assert!(query_tokens("???").is_empty());
+    }
+
+    #[test]
+    fn apply_diff_ratifies_a_change_and_refuses_off_tree_paths() {
+        // M3: the ratifier's apply path — a unified diff into kb/ becomes one commit;
+        // a diff reaching outside kb/ (or with '..') is refused before any write.
+        let root = scratch("applydiff");
+        install_kb_pkg(&root, "kb-demo", "Demo KB");
+        // Seed an initial file (this also inits the package repo + first commit).
+        write(&root, "kb-demo", "a.md", "line1\nline2\n").unwrap();
+        let pkg_dir = root.packages().join("kb-demo");
+        let before = head_sha(&pkg_dir).unwrap();
+
+        // A well-formed unified diff editing line2 → applies + commits.
+        let diff = "\
+--- a/kb/a.md
++++ b/kb/a.md
+@@ -1,2 +1,2 @@
+ line1
+-line2
++line2-edited
+";
+        let out = apply_diff(&root, "kb-demo", diff).unwrap();
+        assert!(out.changed, "the diff produced a commit");
+        assert_ne!(out.commit, before, "a new ratifier commit");
+        let now = std::fs::read_to_string(pkg_dir.join("kb/a.md")).unwrap();
+        assert!(now.contains("line2-edited"), "the diff was applied: {now:?}");
+        // The commit subject records ratification.
+        let subj = git_hardened::run_in(&pkg_dir, &["log", "-1", "--format=%s"], "log").unwrap();
+        assert!(subj.contains("ratify"), "commit subject: {subj}");
+
+        // A diff that reaches OUTSIDE kb/ is refused before any file is touched.
+        let escape = "\
+--- a/elanus.toml
++++ b/elanus.toml
+@@ -1 +1 @@
+-x
++y
+";
+        assert!(
+            apply_diff(&root, "kb-demo", escape).is_err(),
+            "a diff touching elanus.toml must be refused"
+        );
+        // A traversal diff is refused too.
+        let traverse = "\
+--- a/kb/../escape.md
++++ b/kb/../escape.md
+@@ -1 +1 @@
+-x
++y
+";
+        assert!(apply_diff(&root, "kb-demo", traverse).is_err(), "traversal refused");
+        std::fs::remove_dir_all(&root.dir).ok();
     }
 
     #[test]

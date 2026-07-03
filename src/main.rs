@@ -629,6 +629,32 @@ enum KbCmd {
         #[arg(long)]
         content: Option<String>,
     },
+    /// The groundskeeper sweep (no LLM): validate pointer blocks, find orphans, flag staleness
+    Check {
+        /// The profile whose visible KBs are swept.
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Emit the report as JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+        /// Mail the report to the owner (in/human/owner) when there are findings.
+        #[arg(long)]
+        mail: bool,
+    },
+    /// Apply a unified diff into a KB's kb/ tree and commit it (the ratifier's apply path)
+    ApplyDiff {
+        /// The package that owns the KB (must be on the path).
+        pkg: String,
+        /// The unified diff inline; omit to read it from stdin.
+        #[arg(long)]
+        content: Option<String>,
+    },
+    /// Run the diff-pipeline dispatch (setup-gated): spawn the compactor if set up
+    Groundskeep {
+        /// The profile whose visible KBs the compactor sweeps.
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
 }
 
 /// Shared addressing for the estimate verbs (the agent/session a block belongs to).
@@ -959,6 +985,8 @@ fn run(cli: Cli) -> Result<()> {
                     event: None,
                     with_packages: Vec::new(),
                     provider: None,
+                    model: None,
+                    budget: None,
                 },
             );
             if let Ok(conn) = open(&root) {
@@ -1354,6 +1382,19 @@ fn run(cli: Cli) -> Result<()> {
                 };
                 kbcli::write(&root, &pkg, &path, &content)?;
             }
+            KbCmd::Check {
+                profile,
+                json,
+                mail,
+            } => kbcli::check(&root, &profile, json, mail)?,
+            KbCmd::ApplyDiff { pkg, content } => {
+                let content = match content {
+                    Some(c) => c,
+                    None => read_stdin()?,
+                };
+                kbcli::apply_diff(&root, &pkg, &content)?;
+            }
+            KbCmd::Groundskeep { profile } => kbcli::groundskeep(&root, &profile)?,
         },
         Cmd::Estimate { cmd } => match cmd {
             EstimateCmd::Set {

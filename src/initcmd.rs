@@ -198,6 +198,51 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         ),
         exec: false,
     },
+    // kb-groundskeeper — the KB's caretaker (docs/handoffs/kb-groundskeeper.md):
+    // a no-LLM sweep cron (pointers/orphans/staleness → owner report) plus the
+    // setup-gated diff pipeline. Ships in core, pending; `elanus approve` turns on
+    // rung 1, the [config] keys + approve gate rung 2.
+    PkgFile {
+        rel: "core/packages/kb-groundskeeper/elanus.toml",
+        content: include_str!("../kits/core/packages/kb-groundskeeper/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/packages/kb-groundskeeper/scripts/dispatch",
+        content: include_str!("../kits/core/packages/kb-groundskeeper/scripts/dispatch"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "core/packages/kb-groundskeeper/SKILL.md",
+        content: include_str!("../kits/core/packages/kb-groundskeeper/SKILL.md"),
+        exec: false,
+    },
+    // kb-pipeline — the exec handler that makes the compactor/ratifier agent
+    // mailboxes daemon-drivable (docs/handoffs/kb-groundskeeper.md M3). Without an
+    // approved exec package subscribing to in/agent/kb-compactor / in/agent/kb-ratifier,
+    // `spawn_core` refuses to launch and `elanus kb groundskeep` cannot spawn the
+    // compactor. Mirrors packages/chat; ships pending, approved as part of setup.
+    PkgFile {
+        rel: "core/packages/kb-pipeline/elanus.toml",
+        content: include_str!("../kits/core/packages/kb-pipeline/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/packages/kb-pipeline/scripts/run",
+        content: include_str!("../kits/core/packages/kb-pipeline/scripts/run"),
+        exec: true,
+    },
+    // The compactor + ratifier profiles the diff pipeline spawns (M3).
+    PkgFile {
+        rel: "core/profiles/kb-compactor/profile.toml",
+        content: include_str!("../kits/core/profiles/kb-compactor/profile.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "core/profiles/kb-ratifier/profile.toml",
+        content: include_str!("../kits/core/profiles/kb-ratifier/profile.toml"),
+        exec: false,
+    },
     PkgFile {
         rel: "dev/README.md",
         content: include_str!("../kits/dev/README.md"),

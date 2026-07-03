@@ -6,6 +6,9 @@
 //! pattern (so a default agent "just knows" how to write knowledge) lives in the
 //! stdlib `knowledge` skill; this verb is the sharp edge behind it.
 
+use crate::db;
+use crate::events::{self, EmitOpts};
+use crate::groundskeeper;
 use crate::kb;
 use crate::paths::Root;
 use anyhow::Result;
@@ -91,6 +94,97 @@ pub fn write(root: &Root, pkg: &str, path: &str, content: &str) -> Result<()> {
     } else {
         println!("{}/{} unchanged — no commit", out.package, out.rel);
     }
+    Ok(())
+}
+
+/// `elanus kb check [--profile] [--json] [--mail]`: the M1 groundskeeper sweep
+/// (docs/handoffs/kb-groundskeeper.md) — validate pointer blocks, find orphans,
+/// flag staleness. ZERO LLM calls. With `--mail`, emit the report to the owner's
+/// mailbox (in/human/owner) when there are findings — the cron sweep's deliverable.
+pub fn check(root: &Root, profile: &str, json_out: bool, mail: bool) -> Result<()> {
+    let conn = db::open(root)?;
+    db::init_schema(&conn)?;
+    let report = groundskeeper::sweep(root, &conn, profile)?;
+    if json_out {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        print!("{}", groundskeeper::report_summary(&report));
+    }
+    if mail && report.has_findings() {
+        events::emit(
+            root,
+            &conn,
+            EmitOpts {
+                payload: Some(json!({
+                    "text": groundskeeper::report_summary(&report),
+                    "report": report,
+                    "source": groundskeeper::PKG,
+                })),
+                ..EmitOpts::new("in/human/owner")
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// `elanus kb apply-diff <pkg>`: apply a unified diff (from stdin, or `--content`)
+/// into a KB's `kb/` tree and commit exactly what it touches — the ratifier's
+/// apply path (docs/handoffs/kb-groundskeeper.md M3). Path-disciplined: a diff that
+/// reaches outside `kb/` is refused before any file is touched.
+pub fn apply_diff(root: &Root, pkg: &str, diff: &str) -> Result<()> {
+    let out = kb::apply_diff(root, pkg, diff)?;
+    if out.changed {
+        println!(
+            "ratified {} in {} — committed {}",
+            out.rel,
+            out.package,
+            short(&out.commit)
+        );
+    } else {
+        println!("{} — diff applied no changes, no commit", out.package);
+    }
+    Ok(())
+}
+
+/// `elanus kb groundskeep [--profile]`: the pipeline dispatch (M3) the cron calls.
+/// The absolute setup gate first: if the pipeline is not set up (config keys unset,
+/// the package unapproved, OR the pipeline exec handler `kb-pipeline` unapproved so
+/// the compactor mailbox is not daemon-drivable) it is INERT — it prints why and
+/// spawns nothing. Once set up, it spawns the compactor (spawn_core) with the
+/// configured cheap model + per-pass token budget threaded onto the payload; the
+/// compactor's sweep and the ratifier round-trip are the live work (a documented
+/// smoke step).
+pub fn groundskeep(root: &Root, profile: &str) -> Result<()> {
+    let conn = db::open(root)?;
+    db::init_schema(&conn)?;
+    crate::packages::sync(root, &conn)?;
+    let cfg = match groundskeeper::load_config(root)? {
+        Ok(cfg) => cfg,
+        Err(reason) => {
+            println!("inert: {reason}");
+            return Ok(());
+        }
+    };
+    if !crate::packages::is_granted(&conn, groundskeeper::PKG)? {
+        println!(
+            "inert: {} is not approved (run `elanus approve {}`)",
+            groundskeeper::PKG,
+            groundskeeper::PKG
+        );
+        return Ok(());
+    }
+    // The compactor mailbox must have an approved exec handler or spawn_core would
+    // refuse to launch (src/agentcli.rs). Treat a missing/unapproved handler as an
+    // inert state with a clear reason rather than a hard error, so the hourly cron
+    // kick stays quiet until the human finishes setup.
+    if let Some(reason) = groundskeeper::handler_gap(root, &conn)? {
+        println!("inert: {reason}");
+        return Ok(());
+    }
+    let corpus = groundskeeper::corpus_digest(root, profile)?;
+    let req = groundskeeper::compactor_request(&cfg, &corpus);
+    let descriptor = crate::agentcli::spawn_core(root, &conn, req)?;
+    println!("{descriptor}");
     Ok(())
 }
 
