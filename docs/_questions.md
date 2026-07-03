@@ -25,6 +25,15 @@ user prompt (heavily modified, uses more duplicate tokens, avoid unless you need
 
 KB should have a README that instructs what sorts of information go into it.
 
+
+Coding agent support for ACP. That's how we got Codex to fully work, and seems like the best path. Maybe redo
+opencode if ACP is a better interface.
+
+do docs/journeys/15-agentic-configuration.md
+
+
+Redo docs/notes-dolt-spike.md but in relation to it replacing SQLite, not Git
+
 <!--
 Sprint-3 pull (2026-07-02): every other item moved into agreed handoffs / delivered docs.
 - agent-launching.md — launch/introspect agents, --provider on spawn, explain-session skill (Q1, Q5, Q6 remainder)
