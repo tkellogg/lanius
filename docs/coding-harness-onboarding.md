@@ -231,6 +231,9 @@ every harness, which is why every headless/driven and detached cell above wakes.
 
 ## Capture decision tree
 ```
+FIRST: does the tool speak ACP (Agent Client Protocol), natively or via an
+adapter?
+  └─ yes → strongly consider the RPC-driver shape below before anything else.
 Does the tool have a hook system that fires on tool/file events?
   └─ yes → hooks for BOTH cells (best; live even in the TUI). [claude, codex]
 Else, does it have a non-interactive JSON event stream (--json run)?
@@ -240,6 +243,42 @@ For the interactive TUI cell, in order:
   ├─ writes a session transcript file? → import it post-hoc (not live). [codex rollout]
   └─ none of the above? → lifecycle brackets only (last resort).
 ```
+
+## The RPC-driver shape (ACP and its dialects) — read this before building a new adapter
+
+The codex app-server driver (`run_codex_app_server_capture`, sprint 4) is the
+worked example of a fundamentally better capture + control channel than hooks
+or stream-parsing: the adapter holds a **bidirectional JSON-RPC session** with
+the tool, receives every lifecycle/tool/message event as a protocol
+notification (perfect capture, no sniffing), and — the part nothing else
+offers — receives **permission requests as blocking RPC calls** it can relay
+to the owner's mailbox and answer when the human replies. That is what makes a
+headless worker *approval-elicited* instead of auto-approving (see
+`docs/notes-headless-elicitation.md` and the live transcripts in
+`docs/appserver-spike/`).
+
+This shape is not codex-specific. Codex's app-server is the native dialect
+that the standard **Agent Client Protocol** (ACP,
+https://agentclientprotocol.com — JSON-RPC over stdio; `session/new`,
+`session/prompt`, `session/update`, and crucially
+`session/request_permission`) wraps via the `codex-acp` adapter. ACP is at
+protocol v1 with 25+ compatible agents: Gemini CLI, Copilot CLI, Goose,
+Cline, OpenHands and others speak it natively; Claude Code and codex have
+maintained adapters. So before writing a bespoke adapter for a new tool,
+check for ACP support: **one generic `acp` harness package —
+`session/update` → `ctx.emit`, `session/request_permission` → the
+ask/mailbox relay, MCP endpoints passed at `session/new` — would onboard
+every ACP agent at once, with elicitation included.** That generic adapter
+does not exist yet; it is the highest-leverage harness anyone could
+contribute (journey 13's "remaining dozen" collapses into it).
+
+Requirements mapping for an RPC driver: capture = the notification stream
+(requirement #1, best-in-class); death = the RPC session dropping or a
+failed-turn notification (requirement #7 — still funnel through
+`launch`/`spawn` for the completion contract); approvals = relay-and-wait
+in-process (the driver holds a live socket and cannot exit-and-resume; reuse
+the ask emit shape with `default_action = deny` on timeout, never silent
+approve); resume = protocol thread ids via `ctx.record`.
 
 ## Checklist
 - [ ] Pick the verb + `agent_noun`; write `elanus.toml` with `[[harness]]` + `[request]`.

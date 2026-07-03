@@ -22,6 +22,9 @@ so it looks less hacker vibe and more professional / butcher birds.
 Memory blocks need 2 levels. Those that go in the system prompt (infrequently modified) and those that go in the 
 user prompt (heavily modified, uses more duplicate tokens, avoid unless you need this).
 
+
+KB should have a README that instructs what sorts of information go into it.
+
 <!--
 Sprint-3 pull (2026-07-02): every other item moved into agreed handoffs / delivered docs.
 - agent-launching.md — launch/introspect agents, --provider on spawn, explain-session skill (Q1, Q5, Q6 remainder)
@@ -39,3 +42,10 @@ Dolt — hands-on spike, not just the paper verdict. notes-scaling-and-storage.m
 (ledger doesn't need versioning, config already has real git, blocks/KB closest fit but Rust embedding weak).
 Tim wants to actually run it and see. Natural moment: when the KB (knowledge-base.md) gets built — stand the
 KB corpus up on Dolt vs files-in-package side by side and judge with hands, not citations.
+
+ACP harness (from Fable, sprint-4 discovery): codex app-server turned out to be the native dialect that
+codex-acp wraps into the standard Agent Client Protocol (agentclientprotocol.com, v1, 25+ agents — Gemini CLI,
+Copilot CLI, Goose, Cline, OpenHands native; claude/codex via adapters). Our app-server driver is essentially
+an ACP client already. One generic `acp` harness package would onboard every ACP agent at once WITH elicitation
+(session/request_permission -> the ask/mailbox relay). Journey 13's "remaining dozen" collapses into one package.
+See coding-harness-onboarding.md "The RPC-driver shape".
