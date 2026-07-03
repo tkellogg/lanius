@@ -190,6 +190,161 @@ byte-identical to today. `cargo test` green.
   bit 1 (per-profile opt-in, no flag day).
 
 ## Log
+- 2026-07-02 — **TWO VERIFIER HIGHs CLOSED (fixer).**
+  - **(HIGH 1) The cage no longer blocks codex's model API.** The loopback cage
+    (`codex_headless_cage`) previously cut ALL egress including codex's own model
+    API (chatgpt.com), so no headless codex turn (exec OR app-server) could
+    complete under the cage on macOS — leaving M2/M3/M4's live legs unprovable
+    against the delivered driver. FIX: added `CagePolicy.allow_https_egress`
+    (`src/sandbox.rs`), a NARROW model-API egress hole that re-opens ONLY outbound
+    TLS (`(allow network-outbound (remote tcp "*:443"))`) + the resolver unix
+    socket DNS needs, on top of the loopback fence — every other port/protocol
+    stays denied. `codex_headless_cage` sets it (the network floor codex requires,
+    the analogue of security.md entry 24's sandbox floor); the `session/start`
+    stamp is honest (`"egress": "https-only"`). **Live-verified** against
+    `sandbox-exec` on macOS 26.5: `seatbelt_https_egress_allows_tls_blocks_other`
+    (`src/sandbox.rs`) confirms a caged `curl https://chatgpt.com/` connects (HTTP
+    403) while a caged `:80` connect is refused; plus SBPL-emission unit tests
+    (`sbpl_https_egress_reopens_only_tls_over_loopback`,
+    `sbpl_https_egress_noop_under_open`). So the network blocker the verifier named
+    is REMOVED and proven. **Still outstanding (honest):** one FULL live-driver
+    turn — `run_codex_app_server_capture` end-to-end against live codex through the
+    daemon/bus stack — was NOT executed here; it is no longer cage-blocked, just
+    not yet run. **Flagged to Fable:** the :443 egress hole cannot pin the model
+    host by name (SBPL limitation), so a caged worker can reach any host on :443 —
+    the accepted floor, recorded in security.md entry 24; confirm this posture (or
+    the "state-machine-proven, live-driver-turn deferred" acceptance) before
+    marking the handoff done.
+  - **(HIGH 2) M4's MCP-elicitation gate now has end-to-end coverage.** The
+    `mcpServer/elicitation/request` gate (the exact entry-24 scenario) was only
+    unit-tested (classifier + reply), never driven through the loop. FIX: added
+    `appserver_mcp_server_script` + `appserver_driver_end_to_end_mcp_elicitation_
+    {accept,decline_and_timeout}` (`src/codeagent.rs`) — they drive an
+    `mcpServer/elicitation/request` server-request through `drive_codex_app_server`
+    and assert the relayed ask (stamped `kind: "mcp tool call"`, method
+    `mcpServer/elicitation/request`, on the owner's mailbox with a deadline +
+    fail-closed default), the v2 `{action:"accept"}` on owner-allow /
+    `{action:"decline"}` on owner-deny AND on timeout (never an auto-approve),
+    mirroring the commandExecution e2e tests. `cargo test --lib` green (482).
+- 2026-07-02 — **M2–M4 DRIVER LANDED (implementer).** `run_codex_app_server_capture`
+  (`src/codeagent.rs`) speaks `codex app-server` JSON-RPC, maps its notification
+  stream into the existing obs grammar (`fidelity: "app-server-live"`), relays
+  `item/*/requestApproval` + `mcpServer/elicitation/request` gates to the owner's
+  mailbox with a fresh correlation + deadline + fail-closed `default_action`
+  (default DENY on timeout), and stamps the elicited posture on `session/start`
+  (`"approvals":"elicited","sandbox":"workspace-write"`, no `danger-full-access`).
+  Flag/config-gated (`[codex] app_server` / `--app-server`, default OFF; `codex
+  exec` stays the fallback). `cargo test` green (unit coverage: `appserver_*`
+  tests — notification→obs mapping, mapper agreement with exec, lifecycle
+  mapping, answer→v2-decision fail-closed, approval classifier + detail, summary
+  harvest, flag override/strip).
+  **VERIFICATION STATUS — do not overstate.** The approval/elicitation
+  round-trip (allow → action runs, decline/timeout → declined, incl. the MCP
+  gate) was verified against the wire by the **M1 stdio probe run WITHOUT the
+  cage** (below). The delivered driver ALWAYS composes with `codex_headless_cage`
+  (`NetworkPolicy::Loopback`), which on macOS blocks codex's own model API
+  (chatgpt.com) — confirmed for both exec and app-server — so a live headless
+  turn under the cage cannot reach the model and never completes or reaches an
+  approval.
+- 2026-07-02 — **DRIVER STATE MACHINE NOW PROVEN END-TO-END (fixer, no network).**
+  The verifier flagged that M2/M3/M4's live-behavior acceptances (turn completes/
+  routes back; a gated action pauses; allow→accept, deny→decline, timeout→default;
+  the answer reaches the driver) had ZERO execution coverage — only the pure
+  mapper/classifier/reply fns were tested, and the driver cannot run live under the
+  cage on macOS. TWO fixes:
+  - **Coverage.** The JSON-RPC loop was extracted into `drive_codex_app_server`
+    (`src/codeagent.rs`) so it runs against ANY frame source/sink. New
+    `appserver_driver_end_to_end_{allow_relays_accept,deny_relays_decline,
+    timeout_defaults_deny,no_approval_completes}` tests drive it against an
+    **in-process mock app-server** speaking the pinned JSON-RPC over a real
+    temp-root ledger, asserting: the handshake→thread→turn/start drive; that a
+    gated command approval PAUSES and relays to the owner's mailbox (with deadline
+    + fail-closed default); allow→v2 `accept`, deny→`decline`, no-answer→default
+    `decline`; the turn then completes and the `CaptureSummary` routes back.
+  - **Routing seam (verifier's 2nd HIGH).** The old await polled ONLY the codex
+    noun mailbox (`in/agent/codex`), so the dispatcher's expire-default (emitted to
+    the canonical `in/agent/main`) and a web-UI reply that resolved to a different
+    selected agent could NEVER reach the driver → the allow-path could silently
+    default-deny. `codex_appserver_await_answer` now matches the answer by
+    correlation across ANY topic (the fresh correlation is unique to the ask, and
+    the ask event — `question`, no `answer` — is skipped). Covered by
+    `appserver_await_answer_matches_reply_on_any_topic` (codex mailbox / canonical
+    `in/agent/main` / owner `in/human/*` all resolve) +
+    `appserver_extract_answer_unwraps_dispatcher_default`.
+  `cargo test --lib` green (477). The ONLY residual is a LIVE codex turn under the
+  cage (blocked by the loopback cage's model-API egress) — a codex-cage concern,
+  NOT a state-machine gap. security.md entry 24's addendum updated to match.
+  **Residual for the next step:** add a codex-API egress allowance to
+  `codex_headless_cage` and run `run_codex_app_server_capture` against a LIVE codex
+  once to also close the network-egress leg.
+- 2026-07-02 — **M1 SPIKE COMPLETE (implementer). No fix code; all four §4
+  unknowns pinned live against installed `codex-cli 0.142.5`** via a stdio
+  JSON-RPC driver (Python probe, scratchpad; transcripts captured). The TS
+  protocol was also dumped with `codex app-server generate-ts` to cross-check the
+  wire types. Findings:
+
+  **(i) Approval wire name + shapes.** This version emits the **v2** names, NOT
+  the legacy `execCommandApproval`/`applyPatchApproval` — and it emits them
+  **regardless of `capabilities.experimentalApi` (tested true AND false)**: legacy
+  is dead in 0.142.5.
+    - Shell command approval → server REQUEST `item/commandExecution/requestApproval`
+      (params: `threadId,turnId,itemId,startedAtMs,environmentId,reason,command,
+      cwd,commandActions,proposedExecpolicyAmendment,availableDecisions`). Reply
+      `{decision: <CommandExecutionApprovalDecision>}` where decision ∈
+      `"accept" | "acceptForSession" | {"acceptWithExecpolicyAmendment":…} |
+      {"applyNetworkPolicyAmendment":…} | "decline" | "cancel"`.
+    - File patch approval → `item/fileChange/requestApproval`; reply
+      `{decision}` ∈ `"accept"|"acceptForSession"|"decline"|"cancel"`.
+    - MCP tool-call approval (the entry-24 scenario, M4) → **NOT** the exec
+      channel: it arrives as server REQUEST `mcpServer/elicitation/request`,
+      `mode:"form"`, with `_meta.codex_approval_kind:"mcp_tool_call"` +
+      `tool_params`/`message`. Reply `{action: "accept"|"decline"|"cancel",
+      content, _meta}` (`McpServerElicitationAction`). Live-confirmed: a scratch
+      stdio MCP server's tool ran only after `{action:"accept"}` (item
+      `mcpToolCall` → `completed`, tool actually invoked); with no/ wrong answer
+      the tool `failed`.
+    - **FOOTGUN (record it):** replying with the *legacy* keyword `"approved"` to
+      the v2 `item/commandExecution/requestApproval` is silently treated as
+      **decline** (command item → `declined`, turn still `completed`). The driver
+      MUST use the v2 keywords; a wrong keyword fails closed, not open.
+
+  **(ii) Blocking behavior.** The approval request blocks **unboundedly** — held
+  a pending `item/commandExecution/requestApproval` for **70 s** with zero
+  server-side timeout/turn-failure, and a late `{decision:"accept"}` after 70 s
+  still completed the turn. Confirms the design: codex imposes NO deadline;
+  elanus must impose its own (wonky bit 3).
+
+  **(iii) Thread/turn lifecycle + reattach.** Lifecycle:
+  `initialize` → (recv init result) → `initialized` notif → `thread/start`
+  {approvalPolicy,sandbox,cwd} → notif `thread/started`{thread.id} →
+  `turn/start`{threadId,input:[{type:"text",text,text_elements:[]}]} → notif
+  `turn/started`{turn.id} → per-item `item/started`+`item/completed`
+  (item types: `userMessage`,`reasoning`,`commandExecution`,`fileChange`,
+  `mcpToolCall`,`agentMessage`,`webSearch`) → `turn/completed`{turn.status}.
+  **REATTACH DOES NOT WORK in co-located stdio** — decisive for wonky bit 2:
+  `codex app-server` is spawned as a **child of the client**, so dropping the
+  client kills the server AND the in-flight turn. Live test: killed the client
+  mid-approval (no reply), reconnected a fresh app-server client, `thread/resume`
+  by threadId SUCCEEDED but returned the thread as **`idle`** (loaded from the
+  on-disk rollout) — the pending approval was **not** re-emitted; the turn was
+  gone. There is no daemon to reattach to on the stdio path. **⇒ the driver MUST
+  hold the socket and block in-process (wonky bit 2's safe assumption is
+  correct); exit-and-resume is impossible here.** (A shared `codex app-server
+  daemon` + `proxy` control socket exists and *might* support reattach, but that
+  is the remote/daemon model, explicitly out of scope per §3.)
+
+  **(iv) Notification schema (to map in M2).** All notifications carry
+  `threadId`; item notifs also carry `turnId` + `startedAtMs`/`completedAtMs` and
+  a `ThreadItem` under `item` (`item.type` camelCase as above; command output
+  streams via `item/commandExecution/outputDelta`; `agentMessage` text settles on
+  `item/completed`). Turn cost/usage rides `turn/completed`'s `turn`.
+
+  **Design verdict: M1 CONFIRMS the handoff; M2–M4 are green-lit unchanged**
+  except the concrete decision keywords are v2 (`accept`/`decline`/`cancel` for
+  exec+patch; `{action:…}` for the MCP-elicitation gate), not the legacy
+  `approved`/`denied`. Transcripts + probe scripts live in the implementer's
+  scratchpad (spike.py / spike_block.py / spike_mcp.py, transcript-*.jsonl). All
+  codex/app-server processes killed; scratchpad-only.
 - 2026-07-02 — Decomposed from notes-headless-elicitation.md §3/§4 + security.md
   entry 24 by Opus (planner) under Fable. Grounded against the sprint-4 worktree:
   the exec transport (`run_codex_capture`, `src/codeagent.rs:4168`) and its obs

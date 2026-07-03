@@ -78,6 +78,20 @@ pub struct CagePolicy {
     /// Experimental allow-list mode: nonempty flips reads to deny-by-default
     /// with these canonical trees (plus write roots + the fixed holes) allowed.
     pub fs_read_allow: Vec<PathBuf>,
+    /// Punch a NARROW outbound HTTPS hole through a non-`Open` network policy: a
+    /// hosted-model client (e.g. `codex`/`codex app-server`) MUST reach its model
+    /// API over TLS or it cannot run at all, but the rest of the loopback fence
+    /// (arbitrary ports, plaintext egress) stays shut. Emits `(allow
+    /// network-outbound (remote tcp "*:443"))` plus the resolver-socket allowance
+    /// DNS needs (mDNSResponder is reached over a unix socket, so getaddrinfo
+    /// works without opening raw :53 egress). No-op under `Open` (already
+    /// allow-all) and irrelevant off macOS (camera-only). This is the network
+    /// analogue of the sandbox "floor" a headless codex worker requires
+    /// (docs/security.md entry 24): the minimum egress the tool needs to
+    /// function, recorded — not a discretionary widening. The residual (a caged
+    /// worker can reach ANY host on 443, since SBPL cannot pin the model host by
+    /// name) is noted in docs/security.md.
+    pub allow_https_egress: bool,
 }
 
 impl CagePolicy {
@@ -85,6 +99,7 @@ impl CagePolicy {
         self.network == NetworkPolicy::Open
             && self.fs_read_deny.is_empty()
             && self.fs_read_allow.is_empty()
+            && !self.allow_https_egress
     }
 }
 
@@ -285,6 +300,10 @@ fn policy_from_cfg(root: &Root, cfg: &SandboxCfg) -> CagePolicy {
             .unwrap_or_default(),
         fs_read_deny: canon_read_list(root, "fs_read_deny", &cfg.fs_read_deny),
         fs_read_allow: canon_read_list(root, "fs_read_allow", &cfg.fs_read_allow),
+        // Not a profile-`[sandbox]` key: the model-API egress hole is set in code
+        // only where a hosted-model client is caged (codex_headless_cage), never
+        // via generic profile config. A profile-driven cage keeps the tight fence.
+        allow_https_egress: false,
     }
 }
 
@@ -365,6 +384,19 @@ fn read_network_arms(write_roots: &[PathBuf], protect: &Protect, policy: &CagePo
              (allow network-inbound (local ip \"localhost:*\"))\n\
              (allow network-bind (local ip \"localhost:*\"))\n",
         ),
+    }
+    // Narrow model-API egress hole (docs/security.md entry 24, network floor).
+    // Re-allow ONLY outbound TLS (:443) + the resolver unix socket so a hosted-
+    // model client can reach its API and resolve hostnames, while every other
+    // port/protocol stays denied by the loopback fence above. Last-match-wins, so
+    // these allows sit AFTER `(deny network*)`. Verified live against sandbox-exec
+    // on macOS 26 (see seatbelt_https_egress_allows_tls_blocks_other). No-op under
+    // Open (nothing was denied to re-open).
+    if policy.allow_https_egress && policy.network != NetworkPolicy::Open {
+        arms.push_str(
+            "(allow network-outbound (remote tcp \"*:443\"))\n\
+             (allow network-outbound (remote unix-socket))\n",
+        );
     }
     // Read allow-list (experimental): flip to deny-by-default reads. The allow
     // set is the write roots (an agent must read what it writes) + the fixed
@@ -1022,6 +1054,58 @@ mod tests {
     }
 
     #[test]
+    fn sbpl_https_egress_reopens_only_tls_over_loopback() {
+        let protect = test_protect();
+        let policy = CagePolicy {
+            network: NetworkPolicy::Loopback,
+            allow_https_egress: true,
+            ..Default::default()
+        };
+        let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
+        // The loopback fence is still there (deny all, re-allow local)...
+        assert!(p.contains("(deny network*)"), "{p}");
+        assert!(p.contains("(allow network-outbound (remote ip \"localhost:*\"))"), "{p}");
+        // ...plus the narrow model-API hole: outbound TLS (:443) + resolver socket.
+        assert!(
+            p.contains("(allow network-outbound (remote tcp \"*:443\"))"),
+            "https egress re-allows outbound :443: {p}"
+        );
+        assert!(
+            p.contains("(allow network-outbound (remote unix-socket))"),
+            "https egress re-allows the resolver unix socket for DNS: {p}"
+        );
+        // The egress arms come AFTER `(deny network*)` (last-match-wins).
+        let deny_at = p.find("(deny network*)").unwrap();
+        let tls_at = p.find("(allow network-outbound (remote tcp \"*:443\"))").unwrap();
+        assert!(deny_at < tls_at, "the :443 allow must follow the deny: {p}");
+        // No blanket egress re-open: only :443 (not `remote ip "*"` / other ports).
+        assert!(
+            !p.contains("(allow network-outbound (remote ip \"*"),
+            "https egress must NOT open all egress: {p}"
+        );
+    }
+
+    #[test]
+    fn sbpl_https_egress_noop_under_open() {
+        // Open already allows everything, so there is nothing to re-open: the flag
+        // emits NO :443 arm and the SBPL stays byte-identical to a default cage.
+        let protect = test_protect();
+        let roots = vec![PathBuf::from("/tmp/ws")];
+        let with_flag = CagePolicy {
+            network: NetworkPolicy::Open,
+            allow_https_egress: true,
+            ..Default::default()
+        };
+        let p = sbpl(&roots, &protect, &with_flag);
+        assert!(!p.contains("*:443"), "no :443 arm under Open: {p}");
+        assert_eq!(
+            p,
+            sbpl(&roots, &protect, &CagePolicy::default()),
+            "https-egress under Open must not perturb the SBPL"
+        );
+    }
+
+    #[test]
     fn sbpl_read_deny_list_adds_denies_keeps_reads_open() {
         let protect = test_protect();
         let policy = CagePolicy {
@@ -1078,6 +1162,7 @@ mod tests {
             network: NetworkPolicy::None,
             fs_read_deny: vec![PathBuf::from("/tmp/ws/private")],
             fs_read_allow: vec![PathBuf::from("/usr")],
+            ..Default::default()
         };
         let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
         assert!(p.contains("(deny network*)"), "{p}");
@@ -1427,6 +1512,65 @@ mod tests {
         assert!(
             !out.status.success(),
             "network=loopback must BLOCK an external connect (egress control): {out:?}"
+        );
+    }
+
+    /// Live (macOS): the model-API egress hole (`allow_https_egress`) re-opens
+    /// outbound TLS (:443) through the loopback fence — so a hosted-model client
+    /// like codex can reach its API — while a NON-443 external port stays blocked.
+    /// This is the leg that lets a headless codex turn actually complete under the
+    /// cage. Skipped honestly with no internet / no sandbox-exec.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_https_egress_allows_tls_blocks_other() {
+        if !have_sandbox_exec() {
+            return;
+        }
+        // Baseline: is external TLS reachable right now? If not, skip (don't assert
+        // an allow the network can't demonstrate). chatgpt.com is codex's own API
+        // host; a plain unauthenticated GET returns quickly (403) but PROVES reach.
+        let reachable = std::process::Command::new("nc")
+            .args(["-w", "3", "-z", "1.1.1.1", "443"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !reachable {
+            return;
+        }
+        let root = tmp_root();
+        // A loopback cage WITH the model-API egress hole (what codex_headless_cage
+        // builds): write = the root, network = loopback, plus allow_https_egress.
+        let cage = Cage::from_roots_with_policy(
+            vec![root.dir.clone()],
+            vec![],
+            true,
+            &Protect::for_root(&root),
+            CagePolicy {
+                network: NetworkPolicy::Loopback,
+                allow_https_egress: true,
+                ..Default::default()
+            },
+        );
+        assert!(cage.enforcing());
+        // (a) outbound :443 to an external host now SUCCEEDS (the model-API reach).
+        let tls = cage
+            .shell_command("curl -sS -m 12 -o /dev/null -w '%{http_code}' https://chatgpt.com/")
+            .output()
+            .unwrap();
+        let code = String::from_utf8_lossy(&tls.stdout);
+        assert!(
+            tls.status.success() && code.trim() != "000",
+            "allow_https_egress must let outbound :443 reach the model API (got {code:?}): {tls:?}"
+        );
+        // (b) a NON-443 external port stays BLOCKED — the hole is TLS-only, not
+        // blanket egress.
+        let other = cage
+            .shell_command("nc -w 3 -z 1.1.1.1 80")
+            .output()
+            .unwrap();
+        assert!(
+            !other.status.success(),
+            "allow_https_egress must NOT open non-443 egress: {other:?}"
         );
     }
 
