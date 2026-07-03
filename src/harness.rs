@@ -21,6 +21,18 @@ pub const ENV_PROMPT: &str = "ELANUS_CODE_PROMPT";
 pub const ENV_ARGS: &str = "ELANUS_CODE_ARGS";
 pub const ENV_BRIEFING: &str = "ELANUS_CODE_BRIEFING";
 pub const ENV_SKILLS_DIR: &str = "ELANUS_CODE_SKILLS_DIR";
+/// The human owner's noun (profile `owner`): where a codex app-server driver
+/// routes approval elicitations (`in/human/<owner>`, docs/handoffs/codex-app-server.md
+/// M3). Absent ⇒ the default owner.
+pub const ENV_OWNER: &str = "ELANUS_CODE_OWNER";
+/// Per-launch gate for the codex app-server transport (docs/handoffs/codex-app-server.md
+/// M4). Set to `1` by the launcher ONLY for a headless codex worker whose profile
+/// (or a `--app-server` launch flag) opted in; absent ⇒ the `codex exec` fallback.
+pub const ENV_CODEX_APP_SERVER: &str = "ELANUS_CODE_CODEX_APP_SERVER";
+/// The app-server approval elicitation deadline (seconds) + fail-closed default,
+/// threaded from the profile's `[codex]` table so the adapter need not re-read it.
+pub const ENV_CODEX_AS_TIMEOUT: &str = "ELANUS_CODE_CODEX_APP_SERVER_TIMEOUT";
+pub const ENV_CODEX_AS_DEFAULT: &str = "ELANUS_CODE_CODEX_APP_SERVER_DEFAULT";
 
 /// The session context elanus hands an adapter. Built from the launch-contract env.
 #[derive(Clone, Debug)]
@@ -39,6 +51,10 @@ pub struct Ctx {
     prompt: Option<String>,
     briefing: Option<String>,
     skills_dir: Option<PathBuf>,
+    owner: Option<String>,
+    codex_app_server: bool,
+    codex_as_timeout: Option<u64>,
+    codex_as_default: Option<String>,
 }
 
 impl Ctx {
@@ -68,6 +84,12 @@ impl Ctx {
         let prompt = env_optional(ENV_PROMPT);
         let briefing = env_optional(ENV_BRIEFING);
         let skills_dir = env_optional(ENV_SKILLS_DIR).map(PathBuf::from);
+        let owner = env_optional(ENV_OWNER);
+        let codex_app_server = env_optional(ENV_CODEX_APP_SERVER)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let codex_as_timeout = env_optional(ENV_CODEX_AS_TIMEOUT).and_then(|v| v.parse().ok());
+        let codex_as_default = env_optional(ENV_CODEX_AS_DEFAULT);
 
         Ok(Ctx {
             root,
@@ -84,6 +106,10 @@ impl Ctx {
             prompt,
             briefing,
             skills_dir,
+            owner,
+            codex_app_server,
+            codex_as_timeout,
+            codex_as_default,
         })
     }
 
@@ -143,6 +169,31 @@ impl Ctx {
 
     pub fn skills_dir(&self) -> Option<&Path> {
         self.skills_dir.as_deref()
+    }
+
+    /// The human owner's noun (where a codex app-server driver routes approval
+    /// elicitations). Falls back to the default owner when the launcher did not
+    /// stamp one.
+    pub fn owner(&self) -> &str {
+        self.owner.as_deref().unwrap_or("owner")
+    }
+
+    /// Whether this headless codex launch opted into the app-server transport
+    /// (docs/handoffs/codex-app-server.md M4). Default false ⇒ `codex exec`.
+    pub fn codex_app_server(&self) -> bool {
+        self.codex_app_server
+    }
+
+    /// The app-server approval elicitation deadline (seconds); `None` ⇒ the
+    /// driver's built-in default.
+    pub fn codex_as_timeout(&self) -> Option<u64> {
+        self.codex_as_timeout
+    }
+
+    /// The app-server fail-closed default on a timed-out approval; `None` ⇒ the
+    /// driver's built-in default (`deny`).
+    pub fn codex_as_default(&self) -> Option<&str> {
+        self.codex_as_default.as_deref()
     }
 
     /// Publish an observation: obs/agent/<noun>/<session>/<leaf>.

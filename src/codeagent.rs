@@ -1818,6 +1818,27 @@ fn take_headless_flag(args: &[String]) -> (bool, Vec<String>) {
     (headless, out)
 }
 
+/// The codex app-server transport gate as an OVERRIDE flag (docs/handoffs/
+/// codex-app-server.md M4/wonky bit 4). `--app-server` forces the driver on and
+/// `--no-app-server` forces it off for THIS launch; absent, the profile's
+/// `[codex] app_server` decides. Returns `Some(true)`/`Some(false)`/`None` plus
+/// the argv with the flag stripped (the coding tool never sees it). The last
+/// occurrence wins if both are passed.
+fn take_app_server_flag(args: &[String]) -> (Option<bool>, Vec<String>) {
+    let mut over = None;
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        if a == "--app-server" {
+            over = Some(true);
+        } else if a == "--no-app-server" {
+            over = Some(false);
+        } else {
+            out.push(a.clone());
+        }
+    }
+    (over, out)
+}
+
 /// Best-effort model / reasoning-effort metadata from explicit launch flags
 /// only. The launcher cannot see the coding tool's configured defaults, so absent
 /// flags are recorded as null rather than guessed.
@@ -3392,6 +3413,7 @@ fn build_resume_message(root: &Root, agent_noun: &str, session: &str, message: &
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_external_harness(
     root: &Root,
     external: ExternalHarness,
@@ -3405,6 +3427,9 @@ fn launch_external_harness(
     effort: Option<&str>,
     provider: Option<&str>,
     skills: &[(String, PathBuf)],
+    owner: &str,
+    app_server: bool,
+    codex_cfg: &crate::profile::CodexCfg,
 ) -> Result<()> {
     let session = launch_session_id(root);
     let principal = session.clone();
@@ -3505,10 +3530,19 @@ fn launch_external_harness(
             "provider": provider,
             "mcp_merged": mcp_merged,
         });
-        if let Some((approvals, sandbox)) = codex_headless_approval_posture(&external.decl.name, mode)
+        if let Some((approvals, sandbox)) =
+            codex_headless_approval_posture(&external.decl.name, mode, app_server)
         {
             start_record["approvals"] = json!(approvals);
             start_record["sandbox"] = json!(sandbox);
+        }
+        // The vendor sandbox is off (above), but elanus's OWN cage is on for this
+        // cell (docs/handoffs/codex-cage.md M3): record its posture so a session's
+        // authority stays fully reconstructable from its trace — showing BOTH that
+        // codex's gate is off AND that elanus's cage fences writes to the workdir
+        // and cuts external egress.
+        if let Some(cage) = codex_headless_cage_posture(&external.decl.name, mode) {
+            start_record["elanus_cage"] = cage;
         }
         let captured = publish_obs_captured(
             root,
@@ -3545,7 +3579,24 @@ fn launch_external_harness(
             .env(crate::harness::ENV_BUS_TOKEN, &bus_token)
             .env(crate::harness::ENV_WORKDIR, &workdir)
             .env(crate::harness::ENV_MODE, mode_str)
-            .env(crate::harness::ENV_TOOL, &external.decl.name);
+            .env(crate::harness::ENV_TOOL, &external.decl.name)
+            .env(crate::harness::ENV_OWNER, owner);
+        // The codex app-server transport gate (docs/handoffs/codex-app-server.md M4):
+        // set ONLY for a headless codex worker whose profile/flag opted in, so
+        // run_codex_adapter dispatches the JSON-RPC driver instead of `codex exec`.
+        // The deadline + fail-closed default ride alongside so the adapter uses the
+        // profile's `[codex]` policy without re-loading it.
+        if app_server && external.decl.name == "codex" && mode == Mode::Headless {
+            cmd.env(crate::harness::ENV_CODEX_APP_SERVER, "1")
+                .env(
+                    crate::harness::ENV_CODEX_AS_TIMEOUT,
+                    codex_cfg.app_server_timeout_secs.to_string(),
+                )
+                .env(
+                    crate::harness::ENV_CODEX_AS_DEFAULT,
+                    &codex_cfg.app_server_default,
+                );
+        }
         if let Some(model) = model {
             cmd.env(crate::harness::ENV_MODEL, model);
         }
@@ -3689,9 +3740,22 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
     let (want_brief, args) = take_brief_flag(&args);
     let (room, args) = take_room_flag(&args);
     let (headless, args) = take_headless_flag(&args);
+    let (app_server_override, args) = take_app_server_flag(&args);
     let (profile_name, args) = take_profile_flag(&args);
     let args = &args[..];
     let (model, effort) = extract_model_effort(args);
+
+    // The profile decides the owner mailbox (asks/elicitations route there) and,
+    // for a headless codex worker, whether the app-server transport is opted in
+    // (docs/handoffs/codex-app-server.md M4). A `--app-server`/`--no-app-server`
+    // launch flag overrides the profile for this launch. Best-effort load: a
+    // profile error falls back to the defaults (owner "owner", exec transport) so
+    // a launch is never fatal-blocked on config it can proceed without.
+    let (owner, codex_cfg) = match crate::profile::load(root, &profile_name) {
+        Ok((p, _)) => (p.owner.clone(), p.codex),
+        Err(_) => ("owner".to_string(), crate::profile::CodexCfg::default()),
+    };
+    let app_server = app_server_override.unwrap_or(codex_cfg.app_server);
 
     // The profile's visible skills, materialized into the harness's per-session
     // skills dir below (Claude `--plugin-dir` plugin / Codex `$CODEX_HOME` /
@@ -3714,6 +3778,9 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
         effort.as_deref(),
         provider,
         &skills,
+        &owner,
+        app_server,
+        &codex_cfg,
     );
 }
 
@@ -4006,6 +4073,27 @@ pub fn run_codex_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::Exit
     let args = adapter_args(ctx);
     let injection = adapter_provider_injection(ctx)?;
     let (status, summary) = match ctx.mode() {
+        // Headless with the app-server transport gate on (docs/handoffs/
+        // codex-app-server.md M4): the JSON-RPC driver — codex's own approval
+        // posture elicited onto the owner's mailbox, no danger-full-access bypass.
+        Mode::Headless if ctx.codex_app_server() => run_codex_app_server_capture(
+            ctx.root(),
+            ctx.session(),
+            bus_token,
+            ctx.agent_noun(),
+            ctx.session(),
+            ctx.owner(),
+            ctx.workdir(),
+            &args,
+            ctx.briefing(),
+            None,
+            injection.as_ref(),
+            &skills,
+            CodexAppServerPolicy {
+                deadline_secs: ctx.codex_as_timeout().unwrap_or(300),
+                default_deny: !matches!(ctx.codex_as_default(), Some("allow")),
+            },
+        )?,
         Mode::Headless => run_codex_capture(
             ctx.root(),
             ctx.session(),
@@ -4149,19 +4237,94 @@ fn codex_tui_base_args() -> Vec<String> {
     vec!["--dangerously-bypass-hook-trust".to_string()]
 }
 
-/// The `(approvals, sandbox)` pair to stamp on `session/start` when this launch
-/// runs ungated (Tim's ruling) — `Some(("auto", "danger-full-access"))` for a
-/// headless codex worker only, `None` for every other tool/mode (nothing to
-/// record: claude/opencode's posture is untouched by this ruling, and the codex
-/// TUI is human-approved). Kept in lockstep with `codex_headless_base_args` via
-/// the same constants so the audit record can't drift from what was actually
-/// passed to the child process.
-fn codex_headless_approval_posture(tool: &str, mode: Mode) -> Option<(&'static str, &'static str)> {
+/// The `(approvals, sandbox)` pair to stamp on `session/start` for a headless
+/// codex worker; `None` for every other tool/mode (claude/opencode's posture is
+/// untouched, and the codex TUI is human-approved). Two postures:
+///   - `app_server = false` (the `codex exec` fallback): `("auto",
+///     "danger-full-access")` — codex's own gate is OFF (Tim's ruling,
+///     docs/security.md entry 24), kept in lockstep with `codex_headless_base_args`
+///     via the same constants so the audit record can't drift from what was passed.
+///   - `app_server = true` (the app-server driver, docs/handoffs/codex-app-server.md
+///     M4): `("elicited", "workspace-write")` — codex's OWN approval posture is in
+///     force and elicited onto the owner's mailbox, retiring entry 24 where active.
+///     `workspace-write` matches the sandbox mode the driver hands `thread/start`
+///     (`CODEX_APP_SERVER_SANDBOX_MODE`).
+fn codex_headless_approval_posture(
+    tool: &str,
+    mode: Mode,
+    app_server: bool,
+) -> Option<(&'static str, &'static str)> {
     if tool == "codex" && mode == Mode::Headless {
-        Some(("auto", CODEX_HEADLESS_SANDBOX_MODE_VALUE))
+        if app_server {
+            Some(("elicited", CODEX_APP_SERVER_SANDBOX_MODE))
+        } else {
+            Some(("auto", CODEX_HEADLESS_SANDBOX_MODE_VALUE))
+        }
     } else {
         None
     }
+}
+
+/// The `elanus_cage` posture object stamped on `session/start` for a headless
+/// codex worker (docs/handoffs/codex-cage.md M3) — `None` for every other
+/// tool/mode (the codex TUI is human-approved; claude/opencode keep their own
+/// vendor sandbox). Emitted for exactly the same cell as
+/// `codex_headless_approval_posture` so the audit trail records "vendor gate OFF
+/// but elanus's cage ON" together. `enforced` reflects the platform probe
+/// (`enforcement_available`): off macOS it is `false`, never a silent "on".
+fn codex_headless_cage_posture(tool: &str, mode: Mode) -> Option<serde_json::Value> {
+    if tool == "codex" && mode == Mode::Headless {
+        Some(json!({
+            "write": "workdir",
+            "network": "loopback",
+            // Honest about the one egress hole: codex reaches ONLY its model API
+            // over TLS (:443) + the DNS resolver; every other port/protocol stays
+            // fenced (docs/security.md entry 24, the network floor).
+            "egress": "https-only",
+            "enforced": crate::sandbox::enforcement_available(),
+        }))
+    } else {
+        None
+    }
+}
+
+/// elanus's own cage around the HEADLESS codex spawn (docs/handoffs/codex-cage.md).
+/// Headless `codex exec` runs with its vendor sandbox deliberately OFF
+/// (`danger-full-access`, docs/security.md entry 24) so an MCP tool call can
+/// complete — leaving the one matrix cell with no sandbox at all. This fills that
+/// hole by reusing single-cage's live-tested machinery: write = the session
+/// workdir (a headless worker's whole job is its workdir), network = loopback
+/// (the broker, the local HTTP read planes, and any loopback MCP daemon stay
+/// reachable while external egress is cut), and the `Protect` fence keeps the
+/// ledger/secrets/config un-writable even inside a root. Reads stay OPEN (no
+/// fs_read scoping) so the per-session `CODEX_HOME` auth symlinks and codex's own
+/// config/credential reads resolve (wonky bit 5). Enforced on macOS; camera-only
+/// elsewhere (warned by `from_roots_with_policy`, never silent). The interactive
+/// TUI (`run_codex_tui_import`) is deliberately NOT caged — a human approves there.
+fn codex_headless_cage(root: &Root, workdir: &Path) -> crate::sandbox::Cage {
+    // Canonical write root: SBPL `subpath` rules and the Protect fence match the
+    // real (inode) path, so a symlinked workdir component would not bind.
+    let write_root = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
+    crate::sandbox::Cage::from_roots_with_policy(
+        vec![write_root],
+        vec![],
+        true,
+        &crate::sandbox::Protect::for_root(root),
+        crate::sandbox::CagePolicy {
+            network: crate::sandbox::NetworkPolicy::Loopback,
+            // codex is a hosted-model client: it CANNOT complete a turn without
+            // reaching its model API (chatgpt.com) over TLS, so a pure loopback
+            // fence blocks every headless codex run on macOS (confirmed for BOTH
+            // the exec and app-server transports). Punch the narrow HTTPS(+DNS)
+            // egress hole codex requires — the network analogue of entry 24's
+            // sandbox floor — while keeping all other egress shut. Off macOS this
+            // whole cage is camera-only, so the flag is inert there.
+            allow_https_egress: true,
+            ..Default::default()
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4179,7 +4342,7 @@ fn run_codex_capture(
     skills: &[(String, PathBuf)],
 ) -> Result<(std::process::ExitStatus, CaptureSummary)> {
     use std::io::Write as _;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     let args = codex_args_with_prompt_from_stdin(args)?;
     let prompt_env = split_codex_seed_prompt(&args).1;
@@ -4206,7 +4369,18 @@ fn run_codex_capture(
         ("codex".to_string(), codex_args)
     };
 
-    let mut cmd = Command::new(&program);
+    // Cage the headless codex spawn (docs/handoffs/codex-cage.md M1). The
+    // sandbox-exec wrapper must be the OUTERMOST layer so BOTH the timeout wrap and
+    // the real codex run caged (wonky bit 4): `cage.command()` yields
+    // `sandbox-exec -p <profile> <program>` and we thread the existing args onto
+    // it, so the composed argv is `sandbox-exec -p … timeout -s TERM <secs> codex …`
+    // (or `sandbox-exec -p … codex …` with no timeout). Off macOS (or without
+    // sandbox-exec) `cage.command()` is a plain `Command::new(program)` —
+    // byte-identical to the pre-cage spawn. The env/stdin/timeout wiring below is
+    // unchanged; sandbox-exec inherits and passes the environment to the child, so
+    // CODEX_HOME et al. still reach codex.
+    let cage = codex_headless_cage(root, workdir);
+    let mut cmd = cage.command(std::path::Path::new(&program));
     cmd.args(&codex_args);
     // The launch-envelope briefing (M4-B): Codex exec has no --append-system-prompt,
     // so we deliver it on STDIN. Codex appends piped stdin as a `<stdin>` block
@@ -4293,6 +4467,926 @@ fn run_codex_capture(
 
     let status = child.wait().context("waiting for codex exec to finish")?;
     Ok((status, summary))
+}
+
+// ── codex app-server driver (docs/handoffs/codex-app-server.md) ──────────────
+//
+// The HEADLESS codex transport that speaks `codex app-server` JSON-RPC instead of
+// shelling out to `codex exec`, so a gated action runs APPROVAL-ELICITED — real
+// pause/ask/resume onto elanus's owner mailbox — with NO danger-full-access
+// bypass (retiring security.md entry 24 where active). Flag/profile-gated;
+// `codex exec` stays the default fallback.
+//
+// M1 SPIKE FACTS pinned live against codex-cli 0.142.5 (see the handoff Log):
+//   - Approval requests are the v2 server-REQUEST names (legacy
+//     `execCommandApproval` is DEAD in this version, even with experimentalApi
+//     off): `item/commandExecution/requestApproval`,
+//     `item/fileChange/requestApproval` → reply `{decision: "accept"|"decline"}`
+//     (v2 keywords; the legacy `"approved"` is silently treated as DECLINE — a
+//     wrong keyword fails CLOSED). An MCP tool call (the entry-24 case) is gated
+//     via `mcpServer/elicitation/request` with `_meta.codex_approval_kind =
+//     "mcp_tool_call"` → reply `{action: "accept"|"decline", …}`.
+//   - The request blocks UNBOUNDEDLY (held 70s, no server timeout) — elanus
+//     imposes its own deadline + fail-closed default (wonky bit 3).
+//   - A thread CANNOT be reattached after a client reconnect on the co-located
+//     stdio path (killing the client kills the server + the in-flight turn;
+//     `thread/resume` reloads the thread as `idle`) — so the driver HOLDS the
+//     socket and blocks IN-PROCESS on the mailbox answer (wonky bit 2). This is
+//     the genuine divergence from the exec/resume rail: it reuses the ask EMIT
+//     shape (owner mailbox + correlation + deadline + default_action) but
+//     consumes it in-process rather than exit-and-resume.
+
+/// The sandbox mode + approval policy the driver hands `thread/start`: codex's
+/// OWN gate is IN FORCE (`on-request` ⇒ a risky action elicits) and its sandbox
+/// is `workspace-write` (writes in the workdir; anything wider prompts). NOT
+/// `danger-full-access` — that bypass is exactly what this driver retires. Kept
+/// in lockstep with `codex_headless_approval_posture`'s app-server branch so the
+/// `session/start` stamp matches what the driver actually requested.
+const CODEX_APP_SERVER_SANDBOX_MODE: &str = "workspace-write";
+const CODEX_APP_SERVER_APPROVAL_POLICY: &str = "on-request";
+/// The honest fidelity stamp on EVERY obs body the driver projects (mirrors the
+/// `rollout-import` / `server-events-live` precedents): the wire names differ
+/// from the exec `--json` stream, so a consumer must know this cell is the live
+/// app-server transport, mapped into the shared obs vocabulary.
+const CODEX_APP_SERVER_FIDELITY: &str = "app-server-live";
+
+/// The elicitation policy for one app-server driver run: how long to hold an
+/// approval open on the owner's mailbox, and the fail-closed default applied on a
+/// non-answer by the deadline (wonky bit 3 — default DENY).
+#[derive(Debug, Clone, Copy)]
+pub struct CodexAppServerPolicy {
+    pub deadline_secs: u64,
+    pub default_deny: bool,
+}
+
+/// Whether a server→client method is an approval/elicitation the driver must
+/// answer (vs a plain notification). The `requestApproval` family + the MCP
+/// tool-call elicitation gate are the ones a gated action pauses on.
+fn codex_appserver_is_approval(method: &str) -> bool {
+    method.ends_with("/requestApproval") || method == "mcpServer/elicitation/request"
+}
+
+/// Map a human answer string to allow/deny. Anything in the affirmative set is an
+/// allow; EVERYTHING ELSE (including an empty/unparseable answer) is a deny —
+/// fail-closed, so an ambiguous reply never grants (matches the safety doctrine).
+fn codex_answer_is_allow(answer: &str) -> bool {
+    matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "allow" | "accept" | "approve" | "approved" | "yes" | "y" | "ok" | "grant"
+    )
+}
+
+/// Build the JSON-RPC reply body for an approval server-request given the
+/// allow/deny decision. `Ok(result)` is a normal `{result}`; `Err(error)` is a
+/// JSON-RPC `{error}` (used for approval families elanus cannot honestly grant —
+/// e.g. a permission-profile grant whose response shape it does not synthesize —
+/// so those fail CLOSED rather than reply with a guessed/malformed grant).
+fn codex_approval_reply(method: &str, allow: bool) -> std::result::Result<Value, Value> {
+    // v2 decision keywords (M1 spike): accept lets the action run; decline
+    // rejects THIS action without aborting the turn (codex reports the
+    // declination and continues). `"approved"` would be silently declined.
+    let decision = if allow { "accept" } else { "decline" };
+    if method.ends_with("/requestApproval") {
+        // commandExecution / fileChange approvals share the `{decision}` shape.
+        // A permission-profile grant (`item/permissions/requestApproval`) has a
+        // different response (a granted profile, not a decision) that elanus
+        // cannot honestly synthesize — deny it closed with a JSON-RPC error
+        // regardless of the answer, and record that it could not be granted.
+        if method == "item/permissions/requestApproval" {
+            return Err(json!({
+                "code": -32000,
+                "message": "elanus does not grant permission profiles; denied (fail-closed)"
+            }));
+        }
+        Ok(json!({ "decision": decision }))
+    } else if method == "mcpServer/elicitation/request" {
+        // The MCP tool-call gate (entry-24 scenario): accept/decline via `action`.
+        Ok(json!({ "action": decision, "content": null, "_meta": null }))
+    } else {
+        // An unmodeled server request: fail closed with an error reply.
+        Err(json!({
+            "code": -32601,
+            "message": format!("elanus app-server driver does not handle {method}")
+        }))
+    }
+}
+
+/// A short legible summary of what an approval request is asking, for the ask
+/// payload the owner sees on their mailbox: `(kind, detail)`. Reads only fields
+/// the M1 spike confirmed present per family.
+fn codex_approval_detail(method: &str, params: &Value) -> (String, String) {
+    match method {
+        "item/commandExecution/requestApproval" => (
+            "command".into(),
+            params
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("(command)")
+                .to_string(),
+        ),
+        "item/fileChange/requestApproval" => (
+            "file change".into(),
+            params
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("(edit files)")
+                .to_string(),
+        ),
+        "mcpServer/elicitation/request" => {
+            let server = params
+                .get("serverName")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp");
+            let tool = params
+                .get("_meta")
+                .and_then(|m| m.get("tool_params"))
+                .map(|_| "")
+                .unwrap_or("");
+            let msg = params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("(mcp tool call)");
+            ("mcp tool call".into(), format!("{server}: {msg}{tool}"))
+        }
+        "item/permissions/requestApproval" => (
+            "permissions".into(),
+            params
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("(permission grant)")
+                .to_string(),
+        ),
+        _ => (method.to_string(), String::new()),
+    }
+}
+
+/// Write a JSON-RPC request frame (with a fresh id) to the app-server's stdin and
+/// return the id. A free fn (not a closure) so it borrows stdin only for the call
+/// — the driver loop also writes replies to the same stdin.
+fn appserver_send_req<W: std::io::Write>(
+    stdin: &mut W,
+    next_id: &mut i64,
+    method: &str,
+    params: Value,
+) -> Result<i64> {
+    let id = *next_id;
+    *next_id += 1;
+    let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    writeln!(stdin, "{msg}").context("writing app-server request")?;
+    stdin.flush().ok();
+    Ok(id)
+}
+
+/// Write a pre-built JSON-RPC frame (a notification or a reply) to the
+/// app-server's stdin.
+fn appserver_send_frame<W: std::io::Write>(stdin: &mut W, frame: &Value) -> Result<()> {
+    writeln!(stdin, "{frame}").context("writing app-server frame")?;
+    stdin.flush().ok();
+    Ok(())
+}
+
+/// Run a HEADLESS codex worker over the `codex app-server` JSON-RPC transport,
+/// mapping its notification stream into the SAME obs grammar the exec path uses
+/// (stamped `app-server-live`) and eliciting each approval onto the owner's
+/// mailbox. Mirrors `run_codex_capture`'s process wiring (per-session
+/// `CODEX_HOME`, the elanus cage, credential scrub, briefing) but composes it
+/// with codex's own in-force approval posture instead of the danger-full-access
+/// bypass. Returns the child's exit status + the harvested `CaptureSummary`.
+#[allow(clippy::too_many_arguments)]
+fn run_codex_app_server_capture(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    owner: &str,
+    workdir: &Path,
+    args: &[String],
+    brief: Option<&str>,
+    worker_timeout: Option<u64>,
+    injection: Option<&crate::provider::HarnessInjection>,
+    skills: &[(String, PathBuf)],
+    policy: CodexAppServerPolicy,
+) -> Result<(std::process::ExitStatus, CaptureSummary)> {
+    use std::io::BufRead;
+    use std::process::Stdio;
+
+    // The user prompt is a positional (or promoted from the launcher's stdin, as
+    // the exec path does); the briefing rides IN the turn input (app-server has no
+    // stdin-briefing channel — see the turn/start composition below).
+    let args = codex_args_with_prompt_from_stdin(args)?;
+    let (_flags, seed_prompt) = split_codex_seed_prompt(&args);
+    let seed_prompt = seed_prompt.unwrap_or_default();
+
+    let codex_home = build_codex_skills_home(root, session, skills)?;
+
+    // `codex app-server` process args: NO exec/approval/sandbox overrides — the
+    // posture is set per-thread on `thread/start`. A `--provider` injection's
+    // `-c model_provider…` config flags ride the process (the secret rides env).
+    let mut server_args = vec!["app-server".to_string()];
+    if let Some(inj) = injection {
+        server_args.extend(inj.args.iter().cloned());
+    }
+
+    // Same cage as the exec path (docs/handoffs/codex-cage.md) — the driver
+    // COMPOSES with it (the handoff: "the cage stays"). Cage is the outermost
+    // layer; off macOS it is a plain spawn.
+    let cage = codex_headless_cage(root, workdir);
+    let mut cmd = cage.command(std::path::Path::new("codex"));
+    cmd.args(&server_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    scrub_provider_creds(&mut cmd);
+    scrub_launch_control_env(&mut cmd);
+    if let Some(inj) = injection {
+        apply_provider_injection_env(&mut cmd, inj);
+    }
+    cmd.env_remove("ELANUS_PACKAGE").env_remove("ELANUS_BUS_TOKEN");
+    cmd.env(ENV_SESSION, session)
+        .env(ENV_AGENT, agent)
+        .env("ELANUS_ROOT", &root.dir)
+        .env(crate::harness::ENV_WORKDIR, workdir)
+        .env(crate::harness::ENV_MODE, "headless")
+        .env(crate::harness::ENV_TOOL, "codex");
+    if !skills.is_empty() {
+        cmd.env(crate::harness::ENV_SKILLS_DIR, codex_home.join("skills"));
+    }
+    cmd.env("CODEX_HOME", &codex_home);
+    eprintln!("[code] launching codex app-server as session {session} (elicited)");
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| "launching codex app-server (is it installed and on PATH?)")?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("codex app-server stdin unavailable")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("codex app-server stdout unavailable")?;
+
+    // Reader thread: parse each stdout line as a JSON-RPC frame and hand it to the
+    // driver loop over an unbounded channel. On EOF the channel closes, which the
+    // loop reads as "server gone".
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    let reader: std::thread::JoinHandle<()> = std::thread::spawn(move || {
+        let buf = std::io::BufReader::new(stdout);
+        for line in buf.lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                if tx.send(v).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // The turn input: the briefing envelope (if any) then the user prompt, as one
+    // text input. app-server has no separate stdin-briefing channel like `codex
+    // exec`, so the envelope leads the prompt in-band.
+    let turn_text = match brief {
+        Some(b) => format!("{}\n{seed_prompt}", codex_briefing_block(b)),
+        None => seed_prompt.clone(),
+    };
+
+    // Overall wall-clock backstop so a wedged server never hangs the adapter
+    // forever: the caller's worker_timeout if set, else a generous default.
+    let overall_deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(worker_timeout.unwrap_or(3600));
+
+    // Drive the JSON-RPC state machine to completion over the reader channel + the
+    // server's stdin. Extracted so it can be exercised end-to-end against an
+    // in-process mock app-server (no network, no cage) — see the `appserver_driver_*`
+    // tests.
+    let summary = drive_codex_app_server(
+        root,
+        principal,
+        bus_token,
+        agent,
+        session,
+        owner,
+        workdir,
+        &turn_text,
+        policy,
+        overall_deadline,
+        &rx,
+        &mut stdin,
+    )?;
+
+    // Close stdin so the server winds down, then reap.
+    drop(stdin);
+    let _ = child.kill();
+    let status = child.wait().context("waiting for codex app-server to finish")?;
+    drop(reader); // detached; the channel already closed on EOF.
+    print_stream_worker_result(agent, session, &summary);
+    Ok((status, summary))
+}
+
+/// The codex app-server JSON-RPC driver loop, factored out of
+/// `run_codex_app_server_capture` so it can run against ANY frame source/sink —
+/// the real child process in production, or an in-process mock in tests. Reads
+/// server frames off `rx`, writes requests/replies to `stdin`, projects the
+/// notification stream into obs, relays approvals onto the ask/mailbox rail, and
+/// returns the harvested `CaptureSummary` when the turn completes (or the overall
+/// deadline / a dropped channel ends it).
+#[allow(clippy::too_many_arguments)]
+fn drive_codex_app_server<W: std::io::Write>(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    owner: &str,
+    workdir: &Path,
+    turn_text: &str,
+    policy: CodexAppServerPolicy,
+    overall_deadline: std::time::Instant,
+    rx: &std::sync::mpsc::Receiver<Value>,
+    stdin: &mut W,
+) -> Result<CaptureSummary> {
+    let mut next_id = 1i64;
+    let mut summary = CaptureSummary::default();
+    let mut thread_id: Option<String> = None;
+    let mut turn_started = false;
+    let mut token_usage: Value = Value::Null;
+    let mut turn_done = false;
+
+    // Kick off the handshake.
+    appserver_send_req(stdin, &mut next_id, "initialize", json!({
+        "clientInfo": { "name": "elanus", "title": null, "version": env!("CARGO_PKG_VERSION") },
+        "capabilities": { "experimentalApi": true, "requestAttestation": false },
+    }))?;
+
+    loop {
+        if turn_done {
+            break;
+        }
+        if std::time::Instant::now() >= overall_deadline {
+            eprintln!("[code] codex app-server overall deadline reached; ending session {session}");
+            break;
+        }
+        let msg = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(m) => m,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let method = msg.get("method").and_then(Value::as_str).map(str::to_string);
+        let has_id = msg.get("id").is_some();
+
+        match (method.as_deref(), has_id) {
+            // A server→client REQUEST (has both method + id): an approval/
+            // elicitation the driver must answer.
+            (Some(m), true) => {
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                // Only an approval/elicitation is relayed to the owner; any other
+                // server request the driver does not model is refused with a
+                // JSON-RPC error (fail-closed — never a guessed grant).
+                let reply = if codex_appserver_is_approval(m) {
+                    codex_appserver_handle_approval(
+                        root, principal, bus_token, agent, session, owner, m, &params, policy,
+                    )
+                } else {
+                    Err(json!({
+                        "code": -32601,
+                        "message": format!("elanus app-server driver does not handle {m}")
+                    }))
+                };
+                let frame = match reply {
+                    Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                    Err(error) => json!({ "jsonrpc": "2.0", "id": id, "error": error }),
+                };
+                appserver_send_frame(stdin, &frame)?;
+            }
+            // A RESPONSE to one of our requests (id, no method).
+            (None, true) => {
+                if let Some(result) = msg.get("result") {
+                    // The initialize response is the first result; follow it with
+                    // `initialized` + `thread/start`.
+                    if thread_id.is_none() && result.get("thread").is_none() {
+                        appserver_send_frame(
+                            stdin,
+                            &json!({ "jsonrpc": "2.0", "method": "initialized" }),
+                        )?;
+                        appserver_send_req(stdin, &mut next_id, "thread/start", json!({
+                            "cwd": workdir.display().to_string(),
+                            "approvalPolicy": CODEX_APP_SERVER_APPROVAL_POLICY,
+                            "sandbox": CODEX_APP_SERVER_SANDBOX_MODE,
+                        }))?;
+                    }
+                    // The thread/start response also carries the thread id.
+                    if let Some(id) = result.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
+                        thread_id.get_or_insert_with(|| id.to_string());
+                    }
+                }
+            }
+            // A NOTIFICATION (method, no id).
+            (Some(m), false) => {
+                // Capture the thread id + persist the durable, resumable record.
+                if m == "thread/started" {
+                    if let Some(id) = msg
+                        .get("params")
+                        .and_then(|p| p.get("thread"))
+                        .and_then(|t| t.get("id"))
+                        .and_then(Value::as_str)
+                    {
+                        thread_id.get_or_insert_with(|| id.to_string());
+                        let rec = codesession::SessionRecord {
+                            elanus_session: session.to_string(),
+                            native_session: id.to_string(),
+                            tool: "codex".to_string(),
+                            agent_noun: agent.to_string(),
+                            workdir: workdir.display().to_string(),
+                            room: None,
+                        };
+                        if let Err(e) = codesession::upsert_record(root, &rec) {
+                            eprintln!("[code] recording codex app-server session (continuing): {e:#}");
+                        }
+                    }
+                }
+                if m == "thread/tokenUsage/updated" {
+                    token_usage = msg.get("params").cloned().unwrap_or(Value::Null);
+                }
+                // Harvest the legible summary + auto-claim writes from settled items.
+                if m == "item/completed" {
+                    if let Some(item) = msg.get("params").and_then(|p| p.get("item")) {
+                        codex_appserver_collect_summary(item, &mut summary);
+                        for path in codex_appserver_file_change_paths(item) {
+                            auto_claim_write(root, session, &path, Some(&workdir.to_string_lossy()));
+                        }
+                    }
+                }
+                if m == "turn/completed" || m == "turn/failed" {
+                    turn_done = true;
+                }
+                // Project the notification into the shared obs vocabulary.
+                let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                if let Some((leaf, mut body)) =
+                    codex_appserver_map_notification(m, &params, &now_iso())
+                {
+                    if m == "turn/completed" || m == "turn/failed" {
+                        if let Value::Object(map) = &mut body {
+                            map.insert("usage".into(), token_usage.clone());
+                        }
+                    }
+                    publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
+                    let _ = codesession::bump_last_active(root, session);
+                }
+                // Once the thread exists, start the single turn (guarded so it
+                // fires exactly once).
+                if !turn_started {
+                    if let Some(tid) = thread_id.clone() {
+                        turn_started = true;
+                        appserver_send_req(stdin, &mut next_id, "turn/start", json!({
+                            "threadId": tid,
+                            "input": [{ "type": "text", "text": turn_text, "text_elements": [] }],
+                        }))?;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // A late `thread/start` result (handled above) may set thread_id without a
+        // notification in between; start the turn here too if still pending.
+        if !turn_started {
+            if let Some(tid) = thread_id.clone() {
+                turn_started = true;
+                appserver_send_req(stdin, &mut next_id, "turn/start", json!({
+                    "threadId": tid,
+                    "input": [{ "type": "text", "text": turn_text, "text_elements": [] }],
+                }))?;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Handle one approval/elicitation server-request (M3): emit the ask to the
+/// owner's mailbox with a fresh correlation + deadline + fail-closed
+/// default_action (reusing the `ask_human` EMIT shape), then wait IN-PROCESS for
+/// the answer on that correlation — the socket must stay open, so exit/resume is
+/// impossible (wonky bit 2) — and map the answer to the codex reply. On no answer
+/// by the deadline, apply the configured default (default DENY). The whole
+/// exchange lands in the obs trail on the one correlation.
+#[allow(clippy::too_many_arguments)]
+fn codex_appserver_handle_approval(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+    owner: &str,
+    method: &str,
+    params: &Value,
+    policy: CodexAppServerPolicy,
+) -> std::result::Result<Value, Value> {
+    let correlation = uuid::Uuid::new_v4().to_string();
+    let (kind, detail) = codex_approval_detail(method, params);
+    let deadline_iso = (chrono::Utc::now()
+        + chrono::Duration::seconds(policy.deadline_secs as i64))
+    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let default_answer = if policy.default_deny { "deny" } else { "allow" };
+
+    // Emit the ask to the owner's mailbox (in/human/<owner>) with the correlation,
+    // deadline and default_action — the SAME data model ask_human uses. Direct
+    // ledger emit (like `elanus code deliver`); the daemon announces it to the
+    // owner's mailbox and a reply on `in/agent/<noun>` threads by correlation.
+    let ask_payload = json!({
+        "question": format!("codex worker {session} asks approval for a {kind}: {detail}"),
+        "session": session,
+        "format": "decision",
+        "options": ["allow", "deny"],
+        "approval": { "method": method, "kind": kind, "detail": detail },
+    });
+    let emitted = (|| -> Result<()> {
+        let conn = crate::db::open(root).context("opening the ledger to emit the approval ask")?;
+        crate::db::init_schema(&conn)?;
+        crate::events::emit(
+            root,
+            &conn,
+            crate::events::EmitOpts {
+                payload: Some(ask_payload.clone()),
+                correlation: Some(correlation.clone()),
+                deadline: Some(deadline_iso.clone()),
+                default_action: Some(json!({ "answer": default_answer })),
+                sender: Some(session.to_string()),
+                ..crate::events::EmitOpts::new(&crate::topic::human_mailbox(owner))
+            },
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = emitted {
+        // If the ask cannot even be recorded, fail CLOSED (deny) — never silently
+        // proceed on an un-elicitable approval.
+        eprintln!("[code] app-server approval emit failed ({e:#}); denying (fail-closed)");
+        publish_obs(
+            root,
+            principal,
+            bus_token,
+            &obs_topic(agent, session, "approval/decision"),
+            json!({ "ts": now_iso(), "correlation": correlation, "method": method,
+                    "allow": false, "reason": "ask-emit-failed",
+                    "fidelity": CODEX_APP_SERVER_FIDELITY }),
+        );
+        return codex_approval_reply(method, false);
+    }
+    publish_obs(
+        root,
+        principal,
+        bus_token,
+        &obs_topic(agent, session, "approval/ask"),
+        json!({ "ts": now_iso(), "correlation": correlation, "method": method,
+                "kind": kind, "detail": detail, "deadline": deadline_iso,
+                "default": default_answer, "fidelity": CODEX_APP_SERVER_FIDELITY }),
+    );
+    eprintln!(
+        "[code] codex worker {session} elicited a {kind} approval (correlation {correlation}); \
+         waiting on {owner} up to {}s",
+        policy.deadline_secs
+    );
+
+    // Wait in-process for the answer on this correlation. The reply may land on
+    // in/agent/<noun> (web UI answerAsk), the canonical in/agent/<main> (the
+    // dispatcher's expire-default), or in/human/<owner> (a free-form reply) — the
+    // await matches by correlation across all of them. Poll until the deadline.
+    let answer = codex_appserver_await_answer(root, &correlation, policy.deadline_secs);
+    let (allow, answer_str, timed_out) = match answer {
+        Some(a) => (codex_answer_is_allow(&a), a, false),
+        None => (!policy.default_deny, format!("(timeout:{default_answer})"), true),
+    };
+    publish_obs(
+        root,
+        principal,
+        bus_token,
+        &obs_topic(agent, session, "approval/answer"),
+        json!({ "ts": now_iso(), "correlation": correlation, "answer": answer_str,
+                "timed_out": timed_out, "fidelity": CODEX_APP_SERVER_FIDELITY }),
+    );
+    let reply = codex_approval_reply(method, allow);
+    publish_obs(
+        root,
+        principal,
+        bus_token,
+        &obs_topic(agent, session, "approval/decision"),
+        json!({ "ts": now_iso(), "correlation": correlation, "method": method,
+                "allow": allow, "granted": reply.is_ok(), "timed_out": timed_out,
+                "fidelity": CODEX_APP_SERVER_FIDELITY }),
+    );
+    reply
+}
+
+/// Extract an answer string from a reply payload, or `None` if the payload is not
+/// answer-shaped (e.g. the ask itself, which carries `question` and no `answer`).
+/// Handles the three shapes a reply on this correlation can take:
+///  - `{answer:"<text>"}` — the web UI's answerAsk (App.tsx).
+///  - `{answer:{answer:"deny"},assumed:true}` — the dispatcher's expire-default
+///    (`src/dispatcher.rs`), which double-wraps the `default_action` object we set;
+///    unwrap one level to the leaf.
+///  - `{prompt|text:"<text>"}` — a free-form human reply.
+fn codex_appserver_extract_answer(payload: &Value) -> Option<String> {
+    if let Some(a) = payload.get("answer") {
+        let leaf = a.get("answer").unwrap_or(a);
+        return Some(match leaf {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
+    }
+    payload
+        .get("prompt")
+        .or_else(|| payload.get("text"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Poll the ledger for a human answer to the approval ask on `correlation`.
+/// Matches by `correlation_id` across ANY topic + an answer-shaped payload — the
+/// owner's reply may legitimately land on several topics and the driver must catch
+/// all of them:
+///  - `in/agent/<noun>` — the web UI's answerAsk (App.tsx) when the corr is
+///    attributed to the codex thread;
+///  - `in/agent/<main>`  — the dispatcher's expire-default (`expire_deadlines`
+///    emits to the canonical `mb.agent`, `src/dispatcher.rs`, which is NOT the
+///    codex noun's mailbox);
+///  - `in/human/<owner>` — a free-form human reply on the ask's own mailbox.
+/// The correlation is a fresh uuid unique to THIS ask, so a correlation +
+/// answer-field match is unambiguous and skips the ask event itself (which carries
+/// `question`, no `answer`). Returns the answer string, or `None` if none arrives
+/// within `deadline_secs`.
+fn codex_appserver_await_answer(
+    root: &Root,
+    correlation: &str,
+    deadline_secs: u64,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
+    loop {
+        if let Ok(conn) = crate::db::open(root) {
+            let rows: Vec<String> = conn
+                .prepare(
+                    "SELECT payload FROM events \
+                     WHERE correlation_id = ?1 AND payload IS NOT NULL ORDER BY id ASC",
+                )
+                .and_then(|mut stmt| {
+                    let mapped = stmt
+                        .query_map(rusqlite::params![correlation], |r| {
+                            r.get::<_, Option<String>>(0)
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(mapped.into_iter().flatten().collect())
+                })
+                .unwrap_or_default();
+            for payload in rows {
+                let v: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+                if let Some(ans) = codex_appserver_extract_answer(&v) {
+                    return Some(ans);
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(750));
+    }
+}
+
+/// Harvest the legible summary from a settled app-server `ThreadItem`: the last
+/// `agentMessage` text (the worker's final word, capped) + each `fileChange`
+/// path. The app-server item shapes are camelCase where the exec `--json` stream
+/// is snake_case, so this is a parallel of `codex_collect_summary`.
+fn codex_appserver_collect_summary(item: &Value, summary: &mut CaptureSummary) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("agentMessage") => {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    summary.final_text = Some(clip(text, FINAL_TEXT_CAP));
+                }
+            }
+        }
+        Some("fileChange") => {
+            if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+                for change in changes {
+                    if let Some(path) = change.get("path").and_then(Value::as_str) {
+                        summary.note_change(path);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The file paths of a settled app-server `fileChange` item (for auto-claiming),
+/// mirroring `codex_file_change_paths` on the camelCase shape.
+fn codex_appserver_file_change_paths(item: &Value) -> Vec<String> {
+    if item.get("type").and_then(Value::as_str) != Some("fileChange") {
+        return Vec::new();
+    }
+    item.get("changes")
+        .and_then(Value::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(|c| c.get("path").and_then(Value::as_str))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Map one `codex app-server` JSON-RPC NOTIFICATION (method + params) to the SAME
+/// obs leaf + body vocabulary the exec `--json` stream maps into
+/// (`codex_map_event`), so obs stay uniform across transports. Every body carries
+/// the honest `fidelity: "app-server-live"` stamp (the wire names differ). Wire
+/// method + item.type names pinned by the M1 spike (codex 0.142.5). Returns None
+/// for notifications deliberately dropped (bare `turn/started`, deltas).
+fn codex_appserver_map_notification(method: &str, params: &Value, ts: &str) -> Option<(String, Value)> {
+    let stamp = |mut body: Value| -> Value {
+        if let Value::Object(m) = &mut body {
+            m.insert("fidelity".into(), json!(CODEX_APP_SERVER_FIDELITY));
+        }
+        body
+    };
+    match method {
+        "thread/started" => {
+            let tid = params
+                .get("thread")
+                .and_then(|t| t.get("id"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Some(("session/thread".into(), stamp(json!({ "ts": ts, "codex_thread": tid }))))
+        }
+        // Bare turn start: skip (no payload of value), same as the exec path.
+        "turn/started" => None,
+        "turn/completed" => Some((
+            "session/idle".into(),
+            stamp(json!({ "ts": ts, "event": "turn.completed",
+                          "status": params.get("turn").and_then(|t| t.get("status")).cloned().unwrap_or(Value::Null) })),
+        )),
+        "turn/failed" => Some((
+            "session/idle".into(),
+            stamp(json!({ "ts": ts, "event": "turn.failed",
+                          "error": clip_value(params.get("turn").and_then(|t| t.get("error")), 4000) })),
+        )),
+        "error" => Some((
+            "session/idle".into(),
+            stamp(json!({ "ts": ts, "event": "error",
+                          "error": clip_value(params.get("message").or_else(|| params.get("error")), 4000) })),
+        )),
+        "item/started" => {
+            let (leaf, body) = codex_appserver_map_item(params.get("item")?, false, ts)?;
+            Some((leaf, stamp(body)))
+        }
+        "item/completed" => {
+            let (leaf, body) = codex_appserver_map_item(params.get("item")?, true, ts)?;
+            Some((leaf, stamp(body)))
+        }
+        // Streaming deltas + lifecycle chatter: dropped (the settled item carries
+        // the state). Anything else still lands generically, tagged by method.
+        m if m.contains("Delta")
+            || m.contains("/delta")
+            || m == "item/updated"
+            || m.starts_with("thread/status")
+            || m.starts_with("thread/tokenUsage") =>
+        {
+            None
+        }
+        other => {
+            let (leaf, mut body) = generic_event(other, params);
+            if let Value::Object(m) = &mut body {
+                m.insert("codex_event".into(), json!(other));
+            }
+            Some((leaf, stamp(body)))
+        }
+    }
+}
+
+/// Map one settled app-server `ThreadItem` to an obs leaf + body, reusing the
+/// exec path's leaf vocabulary (`assistant/message`, `assistant/reasoning`,
+/// `tool/<n>/{call,result}`, `file/write`). `completed` distinguishes a call
+/// (started) from its result (completed). Item type + field names (camelCase)
+/// pinned by the M1 spike; an unmodeled type files generically.
+fn codex_appserver_map_item(item: &Value, completed: bool, ts: &str) -> Option<(String, Value)> {
+    let itype = item.get("type").and_then(Value::as_str).unwrap_or("");
+    let item_id = item.get("id").cloned().unwrap_or(Value::Null);
+    match itype {
+        // The launcher already recorded the prompt; the echoed user message item
+        // is dropped (the exec stream has no such item).
+        "userMessage" => None,
+        "agentMessage" => {
+            if !completed {
+                return None;
+            }
+            Some((
+                "assistant/message".into(),
+                json!({ "ts": ts, "item_id": item_id, "text": clip_opt(item.get("text"), 4000) }),
+            ))
+        }
+        "reasoning" => {
+            if !completed {
+                return None;
+            }
+            // app-server splits reasoning into summary[]/content[]; join for parity
+            // with the exec stream's single `text`.
+            let text = item
+                .get("summary")
+                .or_else(|| item.get("content"))
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            Some((
+                "assistant/reasoning".into(),
+                json!({ "ts": ts, "item_id": item_id, "text": clip(&text, 4000) }),
+            ))
+        }
+        "commandExecution" => {
+            let leaf = if completed {
+                "tool/command_execution/result"
+            } else {
+                "tool/command_execution/call"
+            };
+            let mut body = json!({
+                "ts": ts,
+                "item_id": item_id,
+                "tool": "command_execution",
+                "command": clip_value(item.get("command"), 2000),
+            });
+            if let Value::Object(m) = &mut body {
+                let status = item.get("status").and_then(Value::as_str);
+                if completed {
+                    m.insert("failed".into(), json!(status != Some("completed")));
+                    m.insert("exit_code".into(), item.get("exitCode").cloned().unwrap_or(Value::Null));
+                    m.insert("output".into(), clip_value(item.get("aggregatedOutput"), 4000));
+                }
+                m.insert("status".into(), item.get("status").cloned().unwrap_or(Value::Null));
+            }
+            Some((leaf.into(), body))
+        }
+        "fileChange" => {
+            if !completed {
+                return None;
+            }
+            Some((
+                "file/write".into(),
+                json!({ "ts": ts, "item_id": item_id,
+                        "changes": clip_value(item.get("changes"), 4000),
+                        "status": item.get("status").cloned().unwrap_or(Value::Null) }),
+            ))
+        }
+        "mcpToolCall" => {
+            let name = item.get("tool").and_then(Value::as_str).unwrap_or("mcp_tool");
+            let leaf = if completed {
+                format!("tool/{}/result", topic::encode_segment(name))
+            } else {
+                format!("tool/{}/call", topic::encode_segment(name))
+            };
+            let mut body = json!({
+                "ts": ts,
+                "item_id": item_id,
+                "tool": name,
+                "server": item.get("server").cloned().unwrap_or(Value::Null),
+                "arguments": clip_value(item.get("arguments"), 2000),
+            });
+            if completed {
+                if let Value::Object(m) = &mut body {
+                    m.insert("result".into(), clip_value(item.get("result"), 4000));
+                    m.insert("status".into(), item.get("status").cloned().unwrap_or(Value::Null));
+                }
+            }
+            Some((leaf, body))
+        }
+        "webSearch" => {
+            if !completed {
+                return None;
+            }
+            Some((
+                "tool/web_search/result".into(),
+                json!({ "ts": ts, "item_id": item_id, "tool": "web_search",
+                        "query": clip_value(item.get("query"), 1000) }),
+            ))
+        }
+        other => {
+            let (leaf, mut body) = generic_event(other, item);
+            if let Value::Object(m) = &mut body {
+                m.insert("codex_item".into(), json!(other));
+                m.insert("completed".into(), json!(completed));
+            }
+            Some((leaf, body))
+        }
+    }
 }
 
 // ── HM2: codex TUI (RolloutImport) ────────────────────────────────────────────
@@ -10059,13 +11153,868 @@ mod tests {
 
     #[test]
     fn codex_headless_approval_posture_only_for_headless_codex() {
+        // exec fallback (app_server=false): codex's gate OFF at danger-full-access.
         assert_eq!(
-            codex_headless_approval_posture("codex", Mode::Headless),
+            codex_headless_approval_posture("codex", Mode::Headless, false),
             Some(("auto", "danger-full-access"))
         );
-        assert_eq!(codex_headless_approval_posture("codex", Mode::Tui), None);
-        assert_eq!(codex_headless_approval_posture("claude-code", Mode::Headless), None);
-        assert_eq!(codex_headless_approval_posture("opencode", Mode::Headless), None);
+        // app-server driver (app_server=true): elicited, codex's own workspace-write.
+        assert_eq!(
+            codex_headless_approval_posture("codex", Mode::Headless, true),
+            Some(("elicited", "workspace-write"))
+        );
+        // The gate is irrelevant off the headless-codex cell.
+        assert_eq!(codex_headless_approval_posture("codex", Mode::Tui, false), None);
+        assert_eq!(codex_headless_approval_posture("codex", Mode::Tui, true), None);
+        assert_eq!(
+            codex_headless_approval_posture("claude-code", Mode::Headless, true),
+            None
+        );
+        assert_eq!(
+            codex_headless_approval_posture("opencode", Mode::Headless, true),
+            None
+        );
+    }
+
+    // ── codex app-server driver (docs/handoffs/codex-app-server.md) ───────────
+    //
+    // The live JSON-RPC round trip needs codex credits + network, so (like the
+    // rollout-import path) the live end-to-end is proven by the M1 spike, not
+    // cargo test; these tests pin the PURE pieces against the wire shapes the M1
+    // spike captured from codex-cli 0.142.5.
+
+    /// M2: an app-server `item/*` notification projects into the SAME obs leaf as
+    /// the exec `--json` stream, and every body carries the honest
+    /// `fidelity: "app-server-live"` stamp.
+    #[test]
+    fn appserver_items_map_to_exec_leaves_with_fidelity_stamp() {
+        let ts = "2026-07-02T00:00:00Z";
+        // agentMessage (settled) → assistant/message.
+        let agent = json!({ "type": "agentMessage", "id": "m1", "text": "done", "phase": "final_answer" });
+        let n = json!({ "item": agent, "threadId": "t", "turnId": "u", "completedAtMs": 1 });
+        let (leaf, body) = codex_appserver_map_notification("item/completed", &n, ts).unwrap();
+        assert_eq!(leaf, "assistant/message");
+        assert_eq!(body["text"], json!("done"));
+        assert_eq!(body["fidelity"], json!("app-server-live"));
+
+        // commandExecution started → tool/command_execution/call; completed →
+        // .../result carrying failed/exit_code/output.
+        let cmd_started = json!({ "type": "commandExecution", "id": "c1",
+            "command": "/bin/zsh -lc 'ls'", "status": "inProgress" });
+        let (leaf, body) = codex_appserver_map_notification(
+            "item/started",
+            &json!({ "item": cmd_started, "threadId": "t", "turnId": "u", "startedAtMs": 1 }),
+            ts,
+        )
+        .unwrap();
+        assert_eq!(leaf, "tool/command_execution/call");
+        assert_eq!(body["fidelity"], json!("app-server-live"));
+        let cmd_done = json!({ "type": "commandExecution", "id": "c1",
+            "command": "/bin/zsh -lc 'ls'", "status": "completed",
+            "exitCode": 0, "aggregatedOutput": "a\nb" });
+        let (leaf, body) = codex_appserver_map_notification(
+            "item/completed",
+            &json!({ "item": cmd_done, "threadId": "t", "turnId": "u", "completedAtMs": 1 }),
+            ts,
+        )
+        .unwrap();
+        assert_eq!(leaf, "tool/command_execution/result");
+        assert_eq!(body["failed"], json!(false));
+        assert_eq!(body["exit_code"], json!(0));
+        assert_eq!(body["output"], json!("a\nb"));
+
+        // A declined command is failed=true.
+        let declined = json!({ "type": "commandExecution", "id": "c2",
+            "command": "x", "status": "declined", "exitCode": Value::Null });
+        let (_leaf, body) = codex_appserver_map_notification(
+            "item/completed",
+            &json!({ "item": declined }),
+            ts,
+        )
+        .unwrap();
+        assert_eq!(body["failed"], json!(true));
+
+        // fileChange (settled) → file/write; mcpToolCall → tool/<name>/{call,result};
+        // webSearch → tool/web_search/result.
+        let fc = json!({ "type": "fileChange", "id": "f1", "status": "completed",
+            "changes": [{ "path": "src/a.rs", "kind": "update", "diff": "" }] });
+        let (leaf, _b) = codex_appserver_map_notification("item/completed", &json!({ "item": fc }), ts).unwrap();
+        assert_eq!(leaf, "file/write");
+        let mcp_started = json!({ "type": "mcpToolCall", "id": "x1", "server": "probe",
+            "tool": "probe_write", "status": "inProgress", "arguments": { "p": 1 } });
+        let (leaf, _b) = codex_appserver_map_notification("item/started", &json!({ "item": mcp_started }), ts).unwrap();
+        assert_eq!(leaf, "tool/probe_write/call");
+        let mcp_done = json!({ "type": "mcpToolCall", "id": "x1", "server": "probe",
+            "tool": "probe_write", "status": "completed", "result": { "ok": true } });
+        let (leaf, _b) = codex_appserver_map_notification("item/completed", &json!({ "item": mcp_done }), ts).unwrap();
+        assert_eq!(leaf, "tool/probe_write/result");
+        let ws = json!({ "type": "webSearch", "id": "w1", "query": "rust", "action": Value::Null });
+        let (leaf, _b) = codex_appserver_map_notification("item/completed", &json!({ "item": ws }), ts).unwrap();
+        assert_eq!(leaf, "tool/web_search/result");
+    }
+
+    /// M2: the app-server mapper and the exec `--json` mapper land the SAME logical
+    /// event on the SAME obs leaf (a structural diff of the two transports).
+    #[test]
+    fn appserver_and_exec_mappers_agree_on_leaves() {
+        let ts = "2026-07-02T00:00:00Z";
+        // agent message.
+        let (as_leaf, _) = codex_appserver_map_item(
+            &json!({ "type": "agentMessage", "id": "m", "text": "hi" }),
+            true,
+            ts,
+        )
+        .unwrap();
+        let (exec_leaf, _) =
+            codex_map_item(&json!({ "type": "agent_message", "id": "m", "text": "hi" }), true, ts).unwrap();
+        assert_eq!(as_leaf, exec_leaf);
+        // command result.
+        let (as_leaf, _) = codex_appserver_map_item(
+            &json!({ "type": "commandExecution", "id": "c", "command": "ls", "status": "completed" }),
+            true,
+            ts,
+        )
+        .unwrap();
+        let (exec_leaf, _) = codex_map_item(
+            &json!({ "type": "command_execution", "id": "c", "command": "ls", "status": "completed" }),
+            true,
+            ts,
+        )
+        .unwrap();
+        assert_eq!(as_leaf, exec_leaf);
+        // file write.
+        let (as_leaf, _) = codex_appserver_map_item(
+            &json!({ "type": "fileChange", "id": "f", "status": "completed", "changes": [] }),
+            true,
+            ts,
+        )
+        .unwrap();
+        let (exec_leaf, _) = codex_map_item(
+            &json!({ "type": "file_change", "id": "f", "status": "completed", "changes": [] }),
+            true,
+            ts,
+        )
+        .unwrap();
+        assert_eq!(as_leaf, exec_leaf);
+    }
+
+    /// The turn lifecycle notifications map like the exec stream: bare `turn/started`
+    /// drops, `turn/completed` → session/idle, `thread/started` → session/thread,
+    /// deltas drop, `userMessage` items drop.
+    #[test]
+    fn appserver_lifecycle_notifications_map_like_exec() {
+        let ts = "2026-07-02T00:00:00Z";
+        assert!(codex_appserver_map_notification("turn/started", &json!({ "turn": {} }), ts).is_none());
+        let (leaf, body) = codex_appserver_map_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "completed" } }),
+            ts,
+        )
+        .unwrap();
+        assert_eq!(leaf, "session/idle");
+        assert_eq!(body["event"], json!("turn.completed"));
+        let (leaf, body) = codex_appserver_map_notification(
+            "thread/started",
+            &json!({ "thread": { "id": "abc" } }),
+            ts,
+        )
+        .unwrap();
+        assert_eq!(leaf, "session/thread");
+        assert_eq!(body["codex_thread"], json!("abc"));
+        // A streaming delta is dropped.
+        assert!(codex_appserver_map_notification(
+            "item/commandExecution/outputDelta",
+            &json!({}),
+            ts
+        )
+        .is_none());
+        // The echoed user message item is dropped (exec has no such item).
+        assert!(codex_appserver_map_notification(
+            "item/started",
+            &json!({ "item": { "type": "userMessage", "id": "u", "content": [] } }),
+            ts
+        )
+        .is_none());
+    }
+
+    /// M3: an answer maps to the v2 accept/decline keyword, fail-closed on anything
+    /// ambiguous — and the LEGACY `"approved"` keyword the wire would silently
+    /// decline is treated by elanus as an ALLOW (so the human's plain "approved"
+    /// still grants, and the reply uses the correct v2 `"accept"`).
+    #[test]
+    fn appserver_answer_maps_to_v2_decision_fail_closed() {
+        for yes in ["allow", "accept", "approve", "approved", "yes", "Y", " ok ", "grant"] {
+            assert!(codex_answer_is_allow(yes), "{yes:?} should allow");
+        }
+        for no in ["deny", "decline", "no", "reject", "", "maybe", "later", "cancel"] {
+            assert!(!codex_answer_is_allow(no), "{no:?} should deny (fail-closed)");
+        }
+        // The exec-family reply uses the v2 keyword, NOT the legacy "approved".
+        let ok = codex_approval_reply("item/commandExecution/requestApproval", true).unwrap();
+        assert_eq!(ok, json!({ "decision": "accept" }));
+        let no = codex_approval_reply("item/commandExecution/requestApproval", false).unwrap();
+        assert_eq!(no, json!({ "decision": "decline" }));
+        // The MCP tool-call gate uses the `{action}` shape.
+        let ok = codex_approval_reply("mcpServer/elicitation/request", true).unwrap();
+        assert_eq!(ok["action"], json!("accept"));
+        let no = codex_approval_reply("mcpServer/elicitation/request", false).unwrap();
+        assert_eq!(no["action"], json!("decline"));
+        // A permission-profile grant is refused CLOSED with a JSON-RPC error even on
+        // an allow — elanus cannot synthesize a granted profile.
+        assert!(codex_approval_reply("item/permissions/requestApproval", true).is_err());
+        // An unmodeled server request fails closed too.
+        assert!(codex_approval_reply("some/other/request", true).is_err());
+    }
+
+    /// The approval-classifier recognizes exactly the requestApproval family + the
+    /// MCP elicitation gate; plain notifications are not approvals.
+    #[test]
+    fn appserver_approval_classifier() {
+        assert!(codex_appserver_is_approval("item/commandExecution/requestApproval"));
+        assert!(codex_appserver_is_approval("item/fileChange/requestApproval"));
+        assert!(codex_appserver_is_approval("item/permissions/requestApproval"));
+        assert!(codex_appserver_is_approval("mcpServer/elicitation/request"));
+        assert!(!codex_appserver_is_approval("item/completed"));
+        assert!(!codex_appserver_is_approval("turn/completed"));
+    }
+
+    /// The ask detail is a legible one-liner per approval family (what the owner
+    /// sees on their mailbox).
+    #[test]
+    fn appserver_approval_detail_is_legible() {
+        let (kind, detail) = codex_approval_detail(
+            "item/commandExecution/requestApproval",
+            &json!({ "command": "/bin/zsh -lc 'rm x'" }),
+        );
+        assert_eq!(kind, "command");
+        assert!(detail.contains("rm x"));
+        let (kind, _d) = codex_approval_detail(
+            "mcpServer/elicitation/request",
+            &json!({ "serverName": "probe", "message": "run probe_write?" }),
+        );
+        assert_eq!(kind, "mcp tool call");
+    }
+
+    /// The legible summary harvest reads the app-server camelCase item shapes:
+    /// last agentMessage text + fileChange paths.
+    #[test]
+    fn appserver_summary_harvest_reads_camelcase_items() {
+        let mut s = CaptureSummary::default();
+        codex_appserver_collect_summary(&json!({ "type": "agentMessage", "text": "first" }), &mut s);
+        codex_appserver_collect_summary(&json!({ "type": "agentMessage", "text": "final" }), &mut s);
+        codex_appserver_collect_summary(
+            &json!({ "type": "fileChange", "changes": [
+                { "path": "a.rs", "kind": "add", "diff": "" },
+                { "path": "b.rs", "kind": "update", "diff": "" }
+            ] }),
+            &mut s,
+        );
+        assert_eq!(s.final_text.as_deref(), Some("final"));
+        assert_eq!(s.file_changes, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert_eq!(
+            codex_appserver_file_change_paths(&json!({ "type": "fileChange",
+                "changes": [{ "path": "c.rs", "kind": "add", "diff": "" }] })),
+            vec!["c.rs".to_string()]
+        );
+        // A non-fileChange item yields no paths.
+        assert!(codex_appserver_file_change_paths(&json!({ "type": "agentMessage" })).is_empty());
+    }
+
+    /// M4: the `--app-server` / `--no-app-server` launch flags override the profile
+    /// gate and are stripped from the argv the coding tool sees.
+    #[test]
+    fn take_app_server_flag_overrides_and_strips() {
+        let (over, rest) = take_app_server_flag(&["--app-server".into(), "do it".into()]);
+        assert_eq!(over, Some(true));
+        assert_eq!(rest, vec!["do it".to_string()]);
+        let (over, rest) = take_app_server_flag(&["--no-app-server".into(), "x".into()]);
+        assert_eq!(over, Some(false));
+        assert_eq!(rest, vec!["x".to_string()]);
+        let (over, rest) = take_app_server_flag(&["plain".into()]);
+        assert_eq!(over, None);
+        assert_eq!(rest, vec!["plain".to_string()]);
+    }
+
+    // ── The app-server DRIVER state machine, exercised end-to-end (no network) ──
+    //
+    // The verifier flagged that the M2/M3/M4 acceptance clauses (turn completes +
+    // routes back; a gated action pauses; allow→accept / deny→decline / timeout→
+    // default; the answer deterministically reaches the driver) were asserted only
+    // by a WIRE probe, never against this Rust driver — the driver cannot run live
+    // under the cage on macOS. These tests close that gap by driving the extracted
+    // `drive_codex_app_server` loop against an in-process MOCK app-server that speaks
+    // the pinned JSON-RPC, over a temp-root ledger.
+
+    fn appserver_tmp_root() -> Root {
+        let dir = std::env::temp_dir().join(format!(
+            "elanus-appsrv-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::db::open(&Root { dir: dir.clone() }).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        Root { dir }
+    }
+
+    /// Emit one event onto the ledger of a temp root (the shape the web UI /
+    /// dispatcher use to reply to an ask).
+    fn appserver_emit(root: &Root, topic: &str, payload: Value, correlation: &str) {
+        let conn = crate::db::open(root).unwrap();
+        crate::events::emit(
+            root,
+            &conn,
+            crate::events::EmitOpts {
+                payload: Some(payload),
+                correlation: Some(correlation.to_string()),
+                ..crate::events::EmitOpts::new(topic)
+            },
+        )
+        .unwrap();
+    }
+
+    /// The standard mock-server frame script: init result → `thread/started` →
+    /// (optionally) one command-execution approval REQUEST → a settled agentMessage
+    /// item → `turn/completed`. Buffered up-front; the driver processes them FIFO and
+    /// blocks in-process on the approval until the ledger answer lands.
+    fn appserver_server_script(with_approval: bool) -> Vec<Value> {
+        let mut v = vec![
+            // initialize RESULT (a response: has id, no method, no `thread`).
+            json!({ "jsonrpc": "2.0", "id": 1, "result": { "userAgent": "codex-cli/0.142.5" } }),
+            // thread/started NOTIFICATION carries the thread id.
+            json!({ "jsonrpc": "2.0", "method": "thread/started",
+                    "params": { "thread": { "id": "th-1" } } }),
+        ];
+        if with_approval {
+            v.push(json!({ "jsonrpc": "2.0", "id": 100,
+                "method": "item/commandExecution/requestApproval",
+                "params": { "threadId": "th-1", "turnId": "tu-1", "itemId": "c1",
+                            "command": "/bin/zsh -lc 'rm -rf build'", "cwd": "/tmp/proj" } }));
+        }
+        v.push(json!({ "jsonrpc": "2.0", "method": "item/completed",
+            "params": { "item": { "type": "agentMessage", "id": "m1", "text": "all done" } } }));
+        v.push(json!({ "jsonrpc": "2.0", "method": "turn/completed",
+            "params": { "turn": { "status": "completed" } } }));
+        v
+    }
+
+    /// Drive the extracted loop against a mock server. If `reply` is set, a
+    /// concurrent "owner" thread watches the ledger for the emitted ask and answers
+    /// it on the given topic (mimicking the web UI / dispatcher), so the in-process
+    /// await resolves. Returns the harvested summary + every JSON frame the driver
+    /// WROTE (handshake, turn/start, the approval reply).
+    fn appserver_drive_mock(
+        root: &Root,
+        owner: &str,
+        server_frames: Vec<Value>,
+        reply: Option<(String, String)>,
+        deadline_secs: u64,
+    ) -> (CaptureSummary, Vec<Value>) {
+        let (tx, rx) = std::sync::mpsc::channel::<Value>();
+        for f in server_frames {
+            tx.send(f).unwrap();
+        }
+        let responder = reply.map(|(topic, answer)| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                // Wait for the ask on the owner's mailbox, read its (fresh) correlation,
+                // then answer on the requested topic with the SAME correlation.
+                let corr = loop {
+                    if let Ok(conn) = crate::db::open(&root) {
+                        let c: Option<String> = conn
+                            .query_row(
+                                "SELECT correlation_id FROM events \
+                                 WHERE type LIKE 'in/human/%' AND payload LIKE '%question%' \
+                                   AND correlation_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+                                [],
+                                |r| r.get(0),
+                            )
+                            .ok()
+                            .flatten();
+                        if let Some(c) = c {
+                            break c;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                };
+                appserver_emit(&root, &topic, json!({ "answer": answer }), &corr);
+            })
+        });
+
+        let mut out = Vec::<u8>::new();
+        let policy = CodexAppServerPolicy { deadline_secs, default_deny: true };
+        let overall_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let summary = drive_codex_app_server(
+            root,
+            "test-principal",
+            "test-token",
+            "codex",
+            "code-appsrv01",
+            owner,
+            Path::new("/tmp/proj"),
+            "do the thing",
+            policy,
+            overall_deadline,
+            &rx,
+            &mut out,
+        )
+        .unwrap();
+        if let Some(h) = responder {
+            h.join().unwrap();
+        }
+        drop(tx);
+        let frames: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (summary, frames)
+    }
+
+    fn appserver_frame_methods(frames: &[Value]) -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|f| f.get("method").and_then(Value::as_str).map(String::from))
+            .collect()
+    }
+
+    /// Issue-2 routing: the in-process await matches the answer by correlation
+    /// REGARDLESS of which topic it lands on — the codex noun mailbox (web UI), the
+    /// canonical `in/agent/main` (the dispatcher's expire-default), OR the owner's
+    /// own `in/human/*` (a free-form reply) — and NEVER mistakes the ask itself
+    /// (which has no `answer`) for a reply.
+    #[test]
+    fn appserver_await_answer_matches_reply_on_any_topic() {
+        for topic in [
+            crate::topic::agent_mailbox("codex"), // web UI answerAsk, codex thread selected
+            crate::topic::agent_mailbox("main"),  // dispatcher expire-default (canonical mb.agent)
+            crate::topic::human_mailbox("owner"), // free-form human reply
+        ] {
+            let root = appserver_tmp_root();
+            let corr = uuid::Uuid::new_v4().to_string();
+            // The ask itself (question, no answer) must be ignored.
+            appserver_emit(
+                &root,
+                &crate::topic::human_mailbox("owner"),
+                json!({ "question": "approve?", "options": ["allow", "deny"] }),
+                &corr,
+            );
+            assert_eq!(
+                codex_appserver_await_answer(&root, &corr, 0),
+                None,
+                "the ask alone is not an answer (topic under test: {topic})"
+            );
+            // Now the reply lands on the topic under test → the await resolves to it.
+            appserver_emit(&root, &topic, json!({ "answer": "allow" }), &corr);
+            assert_eq!(
+                codex_appserver_await_answer(&root, &corr, 5).as_deref(),
+                Some("allow"),
+                "a reply on {topic} must reach the driver"
+            );
+            let _ = std::fs::remove_dir_all(&root.dir);
+        }
+    }
+
+    /// Issue-2: the dispatcher's expire-default double-wraps our `default_action`
+    /// object as `{answer:{answer:"deny"},assumed:true}` — the extractor must unwrap
+    /// it to the leaf, not stringify the object.
+    #[test]
+    fn appserver_extract_answer_unwraps_dispatcher_default() {
+        // Dispatcher expire shape.
+        assert_eq!(
+            codex_appserver_extract_answer(&json!({ "answer": { "answer": "deny" }, "assumed": true }))
+                .as_deref(),
+            Some("deny")
+        );
+        // Web UI shape.
+        assert_eq!(
+            codex_appserver_extract_answer(&json!({ "answer": "allow" })).as_deref(),
+            Some("allow")
+        );
+        // Free-form reply.
+        assert_eq!(
+            codex_appserver_extract_answer(&json!({ "prompt": "yes" })).as_deref(),
+            Some("yes")
+        );
+        // The ask itself is NOT answer-shaped.
+        assert_eq!(
+            codex_appserver_extract_answer(&json!({ "question": "approve?" })),
+            None
+        );
+    }
+
+    /// Issue-1 (M2 + M3 allow): the full driver loop handshakes, opens a thread,
+    /// starts the turn, PAUSES on a gated command approval, relays it to the owner,
+    /// and on an owner `allow` (delivered on the CANONICAL `in/agent/main`, the seam
+    /// the driver previously did not watch) replies the v2 `accept`, then the turn
+    /// completes and the CaptureSummary routes back.
+    #[test]
+    fn appserver_driver_end_to_end_allow_relays_accept() {
+        let root = appserver_tmp_root();
+        let (summary, frames) = appserver_drive_mock(
+            &root,
+            "owner",
+            appserver_server_script(true),
+            Some((crate::topic::agent_mailbox("main"), "allow".to_string())),
+            10,
+        );
+        // Handshake + turn were driven in order.
+        let methods = appserver_frame_methods(&frames);
+        for m in ["initialize", "initialized", "thread/start", "turn/start"] {
+            assert!(methods.iter().any(|x| x == m), "driver must send {m}: {methods:?}");
+        }
+        let turn = frames
+            .iter()
+            .find(|f| f.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .unwrap();
+        assert_eq!(turn["params"]["threadId"], json!("th-1"));
+        // The approval was answered ALLOW → the v2 `accept` decision on request id 100.
+        let reply = frames
+            .iter()
+            .find(|f| f.get("id") == Some(&json!(100)))
+            .expect("driver must reply to the approval request");
+        assert_eq!(reply["result"]["decision"], json!("accept"));
+        // The turn completed and its legible result routed back.
+        assert_eq!(summary.final_text.as_deref(), Some("all done"));
+        // The ask was recorded on the owner's mailbox with a deadline + default.
+        let conn = crate::db::open(&root).unwrap();
+        let (deadline, default): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT deadline, default_action FROM events \
+                 WHERE type = 'in/human/owner' AND payload LIKE '%question%' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(deadline.is_some(), "the ask carries a deadline");
+        assert!(default.unwrap_or_default().contains("deny"), "fail-closed default is deny");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// Issue-1 (M3 deny): an owner `deny` (here on the owner's OWN mailbox, a
+    /// free-form reply path) maps to the v2 `decline`; the turn still completes.
+    #[test]
+    fn appserver_driver_end_to_end_deny_relays_decline() {
+        let root = appserver_tmp_root();
+        let (summary, frames) = appserver_drive_mock(
+            &root,
+            "owner",
+            appserver_server_script(true),
+            Some((crate::topic::human_mailbox("owner"), "deny".to_string())),
+            10,
+        );
+        let reply = frames
+            .iter()
+            .find(|f| f.get("id") == Some(&json!(100)))
+            .expect("driver must reply to the approval request");
+        assert_eq!(reply["result"]["decision"], json!("decline"));
+        assert_eq!(summary.final_text.as_deref(), Some("all done"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// Issue-1 (M3 timeout): with NO owner answer by the deadline, the driver applies
+    /// the configured default (fail-closed deny → v2 `decline`) and the turn still
+    /// completes — no unbounded hang.
+    #[test]
+    fn appserver_driver_end_to_end_timeout_defaults_deny() {
+        let root = appserver_tmp_root();
+        let (summary, frames) =
+            appserver_drive_mock(&root, "owner", appserver_server_script(true), None, 1);
+        let reply = frames
+            .iter()
+            .find(|f| f.get("id") == Some(&json!(100)))
+            .expect("driver must reply to the approval request even on timeout");
+        assert_eq!(reply["result"]["decision"], json!("decline"));
+        assert_eq!(summary.final_text.as_deref(), Some("all done"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// Issue-1 (M2 no-approval): a plain turn (no gate) handshakes, runs, and routes
+    /// its summary back — the driver does not require an approval to complete.
+    #[test]
+    fn appserver_driver_end_to_end_no_approval_completes() {
+        let root = appserver_tmp_root();
+        let (summary, frames) =
+            appserver_drive_mock(&root, "owner", appserver_server_script(false), None, 5);
+        let methods = appserver_frame_methods(&frames);
+        assert!(methods.iter().any(|m| m == "turn/start"));
+        // No approval request → no id-100 reply frame.
+        assert!(frames.iter().all(|f| f.get("id") != Some(&json!(100))));
+        assert_eq!(summary.final_text.as_deref(), Some("all done"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// The mock-server frame script for the M4 headline scenario: instead of a
+    /// commandExecution approval, the worker attempts an MCP tool call that needs
+    /// approval — the server sends the `mcpServer/elicitation/request` server-request
+    /// (`_meta.codex_approval_kind = "mcp_tool_call"`, the exact entry-24 case) —
+    /// then a settled agentMessage + `turn/completed`. Request id 100 mirrors the
+    /// command script so the reply frame is found the same way.
+    fn appserver_mcp_server_script() -> Vec<Value> {
+        vec![
+            json!({ "jsonrpc": "2.0", "id": 1, "result": { "userAgent": "codex-cli/0.142.5" } }),
+            json!({ "jsonrpc": "2.0", "method": "thread/started",
+                    "params": { "thread": { "id": "th-1" } } }),
+            // The MCP tool-call gate: a server REQUEST (has id) the driver must
+            // answer with an McpServerElicitationAction `{action}`, NOT a `{decision}`.
+            json!({ "jsonrpc": "2.0", "id": 100,
+                "method": "mcpServer/elicitation/request",
+                "params": { "threadId": "th-1", "turnId": "tu-1", "itemId": "e1",
+                            "serverName": "scratch", "mode": "form",
+                            "message": "run tool `deploy`?",
+                            "tool_params": { "target": "prod" },
+                            "_meta": { "codex_approval_kind": "mcp_tool_call" } } }),
+            json!({ "jsonrpc": "2.0", "method": "item/completed",
+                "params": { "item": { "type": "agentMessage", "id": "m1", "text": "all done" } } }),
+            json!({ "jsonrpc": "2.0", "method": "turn/completed",
+                "params": { "turn": { "status": "completed" } } }),
+        ]
+    }
+
+    /// Issue-2 / M4 headline (accept): a headless codex worker attempts an MCP tool
+    /// call that would have needed approval; the driver ELICITS it to the owner (not
+    /// auto-approves) via `mcpServer/elicitation/request`, and an owner `allow` maps
+    /// to the v2 McpServerElicitation `{action:"accept"}` — driven end-to-end through
+    /// `drive_codex_app_server`, the leg the unit tests never exercised. Mirrors the
+    /// commandExecution e2e tests.
+    #[test]
+    fn appserver_driver_end_to_end_mcp_elicitation_accept() {
+        let root = appserver_tmp_root();
+        let (summary, frames) = appserver_drive_mock(
+            &root,
+            "owner",
+            appserver_mcp_server_script(),
+            Some((crate::topic::agent_mailbox("codex"), "allow".to_string())),
+            10,
+        );
+        // The turn was driven and the MCP gate was relayed + answered.
+        let methods = appserver_frame_methods(&frames);
+        assert!(methods.iter().any(|m| m == "turn/start"), "{methods:?}");
+        let reply = frames
+            .iter()
+            .find(|f| f.get("id") == Some(&json!(100)))
+            .expect("driver must reply to the MCP elicitation request");
+        // The MCP gate uses `{action}` (accept/decline), NOT `{decision}`.
+        assert_eq!(reply["result"]["action"], json!("accept"));
+        assert!(reply["result"].get("decision").is_none(),
+            "the MCP gate is answered with action, not decision: {reply}");
+        assert_eq!(summary.final_text.as_deref(), Some("all done"));
+        // The relayed ask landed on the owner's mailbox, stamped as an MCP tool call
+        // (so the owner sees WHAT they are approving), with a deadline + fail-closed
+        // default — the reconstructable obs/ledger trail on the one correlation.
+        let conn = crate::db::open(&root).unwrap();
+        let (payload, deadline, default): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT payload, deadline, default_action FROM events \
+                 WHERE type = 'in/human/owner' AND payload LIKE '%question%' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let ask: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(ask["approval"]["method"], json!("mcpServer/elicitation/request"));
+        assert_eq!(ask["approval"]["kind"], json!("mcp tool call"));
+        assert!(deadline.is_some(), "the MCP ask carries a deadline");
+        assert!(default.unwrap_or_default().contains("deny"), "fail-closed default is deny");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// Issue-2 / M4 headline (decline + timeout): an owner `deny` on the MCP gate
+    /// maps to `{action:"decline"}`, and with NO answer by the deadline the driver
+    /// applies the fail-closed default (also `decline`) — never an auto-approve.
+    #[test]
+    fn appserver_driver_end_to_end_mcp_elicitation_decline_and_timeout() {
+        // (a) explicit deny.
+        let root = appserver_tmp_root();
+        let (summary, frames) = appserver_drive_mock(
+            &root,
+            "owner",
+            appserver_mcp_server_script(),
+            Some((crate::topic::human_mailbox("owner"), "deny".to_string())),
+            10,
+        );
+        let reply = frames.iter().find(|f| f.get("id") == Some(&json!(100))).unwrap();
+        assert_eq!(reply["result"]["action"], json!("decline"));
+        assert_eq!(summary.final_text.as_deref(), Some("all done"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+
+        // (b) no answer by the deadline → fail-closed default decline (not accept).
+        let root = appserver_tmp_root();
+        let (summary, frames) =
+            appserver_drive_mock(&root, "owner", appserver_mcp_server_script(), None, 1);
+        let reply = frames
+            .iter()
+            .find(|f| f.get("id") == Some(&json!(100)))
+            .expect("driver must reply to the MCP gate even on timeout");
+        assert_eq!(reply["result"]["action"], json!("decline"),
+            "an unanswered MCP gate must fail closed (decline), never auto-approve");
+        assert_eq!(summary.final_text.as_deref(), Some("all done"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── codex cage (docs/handoffs/codex-cage.md) ──────────────────────────────
+
+    /// M1: the headless codex cage targets ONLY the session workdir for writes
+    /// and runs the loopback network policy — reachable bus/local read planes,
+    /// external egress cut. Portable (no enforcement needed to inspect the shape).
+    #[test]
+    fn codex_headless_cage_targets_workdir_and_loopback() {
+        let root = delivery_tmp_root();
+        let workdir = root.dir.join("wd");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let cage = codex_headless_cage(&root, &workdir);
+        // Loopback (not open — egress control; not none — MCP/HTTP/bus stay up).
+        assert_eq!(cage.policy.network, crate::sandbox::NetworkPolicy::Loopback);
+        // ...with the narrow model-API egress hole codex needs to reach chatgpt.com
+        // (the network floor, entry 24) — a pure loopback fence would block every
+        // headless codex turn on macOS.
+        assert!(cage.policy.allow_https_egress);
+        // The one write root is the canonical session workdir — nothing wider.
+        let canon = workdir.canonicalize().unwrap();
+        assert_eq!(cage.write_roots, vec![canon]);
+        // No read scoping: auth symlinks + codex's config/credential reads resolve.
+        assert!(cage.policy.fs_read_allow.is_empty());
+        assert!(cage.policy.fs_read_deny.is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M1 (live, macOS): a headless codex worker cannot write outside its workdir;
+    /// a write inside succeeds; the ledger + secrets stay fenced even when they sit
+    /// inside the write root. Mirrors `sandbox::seatbelt_actually_cages`; skipped
+    /// (not failed) where sandbox-exec is absent.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn codex_headless_cage_fences_writes_live() {
+        use std::path::Path;
+        if !Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        // A CANONICAL root so the Protect fence (inode-matched subpaths) binds.
+        let base = delivery_tmp_root();
+        let root = Root {
+            dir: base.dir.canonicalize().unwrap(),
+        };
+        // The worker's workdir IS the root here, so the ledger/secrets sit inside a
+        // write root — exactly the case the Protect fence must still deny.
+        let cage = codex_headless_cage(&root, &root.dir);
+        assert!(cage.enforcing());
+        // Write inside the workdir: allowed.
+        let ok = cage
+            .shell_command(&format!("echo hi > {}/in.txt", root.dir.display()))
+            .output()
+            .unwrap();
+        assert!(ok.status.success(), "write inside workdir must succeed: {ok:?}");
+        // Write outside (home): denied — process-tree inheritance covers the
+        // timeout+codex wrap the real spawn threads through this same cage.
+        let home_target = format!(
+            "{}/elanus-codex-cage-escape-{}.txt",
+            std::env::var("HOME").unwrap(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let denied = cage
+            .shell_command(&format!("echo escape > {home_target}"))
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&home_target);
+        assert!(!denied.status.success(), "write outside the workdir must fail");
+        // The ledger is fenced even though it sits inside the write root: an actor
+        // may read it but never write it (no self-granted authority).
+        let db = root.db();
+        std::fs::write(&db, "seed").unwrap();
+        let db_write = cage
+            .shell_command(&format!("echo x >> {}", db.display()))
+            .output()
+            .unwrap();
+        assert!(!db_write.status.success(), "writing the ledger from the cage must fail");
+        // The secret store is unreadable from the cage.
+        std::fs::create_dir_all(root.secrets()).unwrap();
+        let tok = root.secrets().join("tok");
+        std::fs::write(&tok, "s3cr3t").unwrap();
+        let sec = cage
+            .shell_command(&format!("cat {}", tok.display()))
+            .output()
+            .unwrap();
+        assert!(!sec.status.success(), "reading a secret from the cage must fail");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M2 (live, macOS): the loopback fence does not break MCP. A stdio MCP server
+    /// is a pipe child (no socket), so a request/response round-trip must complete
+    /// under the cage; a loopback listener (stand-in for the broker / an `http.json`
+    /// read-plane daemon) stays reachable. The egress half — an external connect is
+    /// blocked — is proven in `sandbox::seatbelt_network_loopback_blocks_external`.
+    /// Skipped (not failed) where sandbox-exec is absent.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn codex_headless_cage_mcp_and_loopback_live() {
+        use std::io::Write as _;
+        use std::path::Path;
+        if !Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let base = delivery_tmp_root();
+        let root = Root {
+            dir: base.dir.canonicalize().unwrap(),
+        };
+        let cage = codex_headless_cage(&root, &root.dir);
+        assert!(cage.enforcing());
+
+        // (a) stdio MCP round-trip: a pipe child reading one line and echoing a
+        // `pong` back (the scratch_ping pattern) must COMPLETE under the cage —
+        // stdio servers need no network, so loopback never touches them.
+        let server = root.dir.join("ping.sh");
+        std::fs::write(&server, "#!/bin/sh\nread line\necho \"pong:$line\"\n").unwrap();
+        let mcp = cage
+            .shell_command(&format!("printf 'PING\\n' | sh {}", server.display()))
+            .output()
+            .unwrap();
+        assert!(
+            mcp.status.success()
+                && String::from_utf8_lossy(&mcp.stdout).contains("pong:PING"),
+            "a stdio MCP tool call must complete under the loopback cage: {mcp:?}"
+        );
+
+        // (b) a loopback listener (broker / http.json read-plane stand-in) stays
+        // reachable — the caged child connects to 127.0.0.1 and reads its line.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let mut s = conn;
+                let _ = s.write_all(b"HELLO\n");
+            }
+        });
+        let loop_out = cage
+            .shell_command(&format!("nc -w 2 127.0.0.1 {port}"))
+            .output()
+            .unwrap();
+        assert!(
+            loop_out.status.success()
+                && String::from_utf8_lossy(&loop_out.stdout).contains("HELLO"),
+            "the caged child must reach a loopback listener (bus/read planes): {loop_out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// M3: the `elanus_cage` posture is stamped on `session/start` for a headless
+    /// codex worker only, with `enforced` reflecting the platform probe — off macOS
+    /// it reports `false`, never a silent "on".
+    #[test]
+    fn codex_headless_cage_posture_only_for_headless_codex() {
+        let p = codex_headless_cage_posture("codex", Mode::Headless).unwrap();
+        assert_eq!(p["write"], "workdir");
+        assert_eq!(p["network"], "loopback");
+        // The narrow model-API egress hole is stamped honestly (entry 24 floor).
+        assert_eq!(p["egress"], "https-only");
+        assert_eq!(p["enforced"], json!(crate::sandbox::enforcement_available()));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(p["enforced"], json!(false), "off macOS never a silent on");
+        // Every other cell gets no cage stamp.
+        assert!(codex_headless_cage_posture("codex", Mode::Tui).is_none());
+        assert!(codex_headless_cage_posture("claude-code", Mode::Headless).is_none());
+        assert!(codex_headless_cage_posture("opencode", Mode::Headless).is_none());
     }
 
     // ── The launch-envelope briefing (M4-B) ──────────────────────────────────

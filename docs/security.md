@@ -896,3 +896,84 @@ codex offers no narrower lever today. Revisit when the `codex app-server`
 driver lands (`docs/notes-headless-elicitation.md` §3): a real bidirectional
 RPC session can hold approval requests open and relay them to elanus's
 mailbox/`ask_human` rail, which removes the need for this bypass entirely.
+
+**RETIRED WHERE THE DRIVER IS ACTIVE (2026-07-02, docs/handoffs/codex-app-server.md).**
+The `codex app-server` JSON-RPC driver landed. When a headless codex worker's
+profile opts into it (`[codex] app_server = true`, or a `--app-server` launch
+flag; default OFF — `codex exec` stays the fallback), the worker runs
+APPROVAL-ELICITED: codex's own approval posture is in force (`approvalPolicy =
+on-request`, `sandbox = workspace-write`, NO `danger-full-access` override), and
+each gated action (a shell command / file patch via
+`item/*/requestApproval`, or an MCP tool call via `mcpServer/elicitation/request`
+with `_meta.codex_approval_kind = "mcp_tool_call"` — the very case above) is
+relayed to the owner's mailbox with a fresh correlation + deadline +
+fail-closed `default_action` and answered on the RPC when the owner replies
+(default DENY on a timeout). The `session/start` stamp reflects this: `"approvals":
+"elicited", "sandbox": "workspace-write"` instead of `"auto" /
+"danger-full-access"`. So entry 24's ungated posture applies ONLY where `codex
+exec` still runs (the default, un-opted-in path). The elanus cage stays on both
+paths.
+
+**Verification status (honest — do not overstate).** The app-server approval
+wire protocol — allow → action runs, decline/timeout → action declined,
+including the MCP-elicitation gate — was verified against codex-cli 0.142.5 by
+the **M1 stdio JSON-RPC probe, run WITHOUT the cage** (docs/handoffs/codex-app-
+server.md Log, M1). The delivered Rust driver's **state machine is now proven
+end-to-end**: the loop was factored into `drive_codex_app_server`
+(`src/codeagent.rs`) and is exercised by the `appserver_driver_end_to_end_*`
+tests against an **in-process mock app-server** that speaks the pinned JSON-RPC
+over a real temp-root ledger — asserting the handshake→thread→turn drive, that a
+gated command approval PAUSES the turn and relays to the owner's mailbox, that an
+owner `allow` → v2 `accept` / `deny` → `decline` / no-answer-by-deadline →
+fail-closed default (`decline`), that the turn then completes and the
+`CaptureSummary` routes back, and that the answer reaches the driver whichever
+topic it lands on (the codex noun mailbox, the canonical `in/agent/main` the
+dispatcher's expire-default uses, or the owner's `in/human/*`). The prior
+correlation-routing seam (the await polled only the codex noun mailbox, so the
+dispatcher default and a mis-attributed web-UI reply could miss it) is closed:
+`codex_appserver_await_answer` now matches by correlation across any topic. The
+notification→obs mapping, answer→v2-decision fail-closed path, and approval
+classifier remain unit-covered.
+**Model-API egress hole added (2026-07-02, fixer).** The prior residual — the
+loopback cage (`NetworkPolicy::Loopback`) blocked codex's OWN model API
+(chatgpt.com), so NO headless codex turn (exec OR app-server) could complete under
+the cage on macOS — is now closed at the network layer. `codex_headless_cage`
+(`src/codeagent.rs`) sets `CagePolicy.allow_https_egress`, which re-opens ONLY
+outbound TLS (`(allow network-outbound (remote tcp "*:443"))`) plus the resolver
+unix socket DNS needs, while every other port/protocol stays denied by the
+loopback fence. This is the **network analogue of this entry's sandbox floor**:
+the minimum egress codex mechanically requires to run at all, recorded — not a
+discretionary widening. **Residual it introduces (recorded, not a bug):** SBPL
+cannot pin the model host by name, so a caged worker can reach ANY host on :443;
+this is the accepted floor (the app-server path is still a net improvement — it
+removes `danger-full-access` and elicits approvals). The `session/start` stamp is
+honest about it (`"egress": "https-only"`). **Live-verified** against
+`sandbox-exec` on macOS 26.5 (`seatbelt_https_egress_allows_tls_blocks_other`,
+`src/sandbox.rs`): a caged `curl https://chatgpt.com/` reaches the API (HTTP 403,
+i.e. connected) while a caged `:80` connect is refused.
+The ONE remaining leg is a **full live driver turn**: running
+`run_codex_app_server_capture` against a live codex end-to-end (real turn →
+elicited approval → answer) — no longer blocked by the cage (the egress hole is
+proven), just not yet executed through the whole daemon/bus stack. So M2/M3/M4 are
+**verified end-to-end at the driver/protocol level (uncaged probe + in-process
+mock, incl. the MCP-elicitation gate driven through `drive_codex_app_server`) with
+the cage's model-egress now live-proven**, leaving only the one full live-driver
+turn as an execution (not a design or network) gap.
+
+## 25. [FIXED 2026-07-02] The loopback network cage leaked all egress
+
+Found during codex-cage (sprint 4) verification: single-cage's
+`NetworkPolicy::Loopback` SBPL — `(deny network*)(allow network* (local ip
+"localhost:*") (remote ip "localhost:*"))` — did NOT block external egress.
+Verified live on macOS 26.5: a caged connect to 8.8.8.8:53 / 1.1.1.1:80
+SUCCEEDED under that grammar, because the `(local ip "localhost:*")` clause
+matches an unbound outbound socket and re-opens everything. "This machine
+only" was allow-all in practice, for every Loopback consumer, since the
+single-cage increment landed. Root cause of the test gap: sprint 1's live
+matrix asserted loopback-allows-local but never loopback-blocks-external
+(the deliberate "don't depend on external network in tests" choice hid the
+hole). FIX: `read_network_arms` splits the policy into network-outbound /
+network-inbound / network-bind arms; new live regression
+`sandbox::seatbelt_network_loopback_blocks_external` (a real external
+connect must fail; skips without sandbox-exec or an outbound route).
+Residual: none known; policy `none` was never affected.

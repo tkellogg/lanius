@@ -33,6 +33,8 @@ pub struct Profile {
     #[serde(default)]
     pub sandbox: SandboxCfg,
     #[serde(default)]
+    pub codex: CodexCfg,
+    #[serde(default)]
     pub vars: BTreeMap<String, String>,
     #[serde(default)]
     pub context: ContextCfg,
@@ -83,6 +85,7 @@ impl Default for Profile {
             skills: SkillsCfg::default(),
             throttle: BTreeMap::new(),
             sandbox: SandboxCfg::default(),
+            codex: CodexCfg::default(),
             vars: BTreeMap::new(),
             context: ContextCfg::default(),
             subagents: SubagentCfg::default(),
@@ -222,6 +225,53 @@ impl Default for SandboxCfg {
             network: None,
             fs_read_deny: Vec::new(),
             fs_read_allow: Vec::new(),
+        }
+    }
+}
+
+/// Per-profile codex transport opt-in (docs/handoffs/codex-app-server.md).
+/// ABSENT (no `[codex]` table) = today's `codex exec` transport, byte-identical
+/// — `codex exec` stays the default fallback. `app_server = true` opts a HEADLESS
+/// codex worker into the `codex app-server` JSON-RPC driver: codex's own approval
+/// posture is in force and **elicited** onto the owner's mailbox (real
+/// pause/ask/resume) instead of auto-approved at `danger-full-access`, retiring
+/// docs/security.md entry 24 where active. Per-profile so a not-yet-soaked
+/// transport only ever breaks the one agent whose profile asked for it (mirrors
+/// single-cage's rollout gate; docs/handoffs/single-cage-macos.md wonky bit 1).
+/// The elanus cage stays on either way; this only changes codex's own gate.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CodexCfg {
+    /// Opt this profile's headless codex workers into the app-server driver.
+    #[serde(default)]
+    pub app_server: bool,
+    /// The in-process elicitation deadline (seconds) for an app-server approval:
+    /// codex blocks the turn unboundedly (M1 spike — no server timeout), so
+    /// elanus imposes its own. On no answer by the deadline the driver replies
+    /// with `app_server_default`.
+    #[serde(default = "default_app_server_timeout")]
+    pub app_server_timeout_secs: u64,
+    /// The fail-closed default applied when an app-server approval goes
+    /// unanswered by the deadline: `"deny"` (the default — an unattended
+    /// non-answer must NOT auto-approve; wonky bit 3) or `"allow"`.
+    #[serde(default = "default_app_server_default")]
+    pub app_server_default: String,
+}
+
+fn default_app_server_timeout() -> u64 {
+    300
+}
+
+fn default_app_server_default() -> String {
+    "deny".into()
+}
+
+impl Default for CodexCfg {
+    fn default() -> Self {
+        CodexCfg {
+            app_server: false,
+            app_server_timeout_secs: default_app_server_timeout(),
+            app_server_default: default_app_server_default(),
         }
     }
 }
@@ -602,5 +652,25 @@ mod tests {
         assert!(!off.sandbox.read_camera, "explicit false ⇒ OFF");
         let on: Profile = toml::from_str("[sandbox]\nread_camera = true\n").unwrap();
         assert!(on.sandbox.read_camera, "explicit true ⇒ ON");
+    }
+
+    /// docs/handoffs/codex-app-server.md M4: absent `[codex]` ⇒ the exec fallback
+    /// (app_server OFF), fail-closed default DENY, and the default deadline. An
+    /// explicit opt-in flips only the gate.
+    #[test]
+    fn codex_app_server_gate_defaults_off_deny() {
+        // No [codex] table at all ⇒ exec fallback, byte-identical to before.
+        let p: Profile = toml::from_str("").unwrap();
+        assert!(!p.codex.app_server, "absent ⇒ exec transport");
+        assert_eq!(p.codex.app_server_default, "deny", "fail-closed default");
+        assert_eq!(p.codex.app_server_timeout_secs, 300);
+        // A [codex] table that omits the key ⇒ still off.
+        let p2: Profile = toml::from_str("[codex]\napp_server_timeout_secs = 120\n").unwrap();
+        assert!(!p2.codex.app_server, "omitted key ⇒ still off");
+        assert_eq!(p2.codex.app_server_timeout_secs, 120);
+        // Explicit opt-in flips only the gate; the default stays deny.
+        let on: Profile = toml::from_str("[codex]\napp_server = true\n").unwrap();
+        assert!(on.codex.app_server);
+        assert_eq!(on.codex.app_server_default, "deny");
     }
 }
