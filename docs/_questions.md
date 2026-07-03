@@ -8,6 +8,20 @@ expect. Right now it's all one giant app, lol.
 *(sprint-3 note: NOT pulled — session code-e993edd0 holds the web-ui-routing.md handoff and App.tsx claims and is
 actively building this.)*
 
+
+Can I run DeepSeek in Claude Code without logging out of Claude.AI? What about DeepSeek in Codex without logging
+out of ChatGPT? This is super important. If I can do that, then the harness becomes significantly more decoupled
+from the model and deserves more representation in the UI. This also deserves mentioning inside the "how to onboard
+a new harness" docs. I guess that's what --provider does, but does it actually set the env vars correctly?
+
+
+Rename elanus to Lanius (sorry, but spanish? el anus? yea no). Plus, butcher birds go hard.. Also, do a UX overhaul
+so it looks less hacker vibe and more professional / butcher birds.
+
+
+Memory blocks need 2 levels. Those that go in the system prompt (infrequently modified) and those that go in the 
+user prompt (heavily modified, uses more duplicate tokens, avoid unless you need this).
+
 <!--
 Sprint-3 pull (2026-07-02): every other item moved into agreed handoffs / delivered docs.
 - agent-launching.md — launch/introspect agents, --provider on spawn, explain-session skill (Q1, Q5, Q6 remainder)

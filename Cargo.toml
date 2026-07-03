@@ -2,6 +2,7 @@
 name = "elanus"
 version = "0.1.0"
 edition = "2021"
+default-run = "elanus"
 description = "elanus: a minimal event-driven agent harness (inetd + cron + git hooks + sqlite + a flight recorder)"
 
 # What ships in the published crate. `include` is an explicit allowlist (it
