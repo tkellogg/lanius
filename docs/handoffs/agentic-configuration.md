@@ -242,6 +242,15 @@ hang.
 
 ## Log
 
+- 2026-07-06 (Codex): fixed M1 verifier defects. `elanus init` now seeds every
+  non-generated `kits/helper` file into `<root>/kits/helper`, so fresh roots no
+  longer depend on repo fallback. `kit add helper` keeps the existing link-mode
+  semantics for shared helper packages but vendors `kb-user` into
+  `<root>/packages/kb-user`, because it is a per-root writable KB; kit tree
+  copies skip `.git` metadata so source-package commit state is never copied.
+  The context renderer's no-`--event` empty transcript path remains unchanged
+  under the scoped-file repair rule; M1 inspection was verified with an explicit
+  `--event` payload, which exercises the accepted render path.
 - 2026-07-03 (Fable): explored web UI / packages+blocks+KB / LLM paths; wrote
   this handoff. Key finds: synthetic `helper` profile already exists
   (`web.rs:2120`); `AgentAssistant` client-tool loop already round-trips over

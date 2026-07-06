@@ -2122,7 +2122,8 @@ fn profiles_with_helper(root: &Root, text: &str) -> Vec<Value> {
     let has_helper = profiles
         .iter()
         .any(|p| p["profile"].as_str() == Some("helper"));
-    if has_helper {
+    let helper_on_disk = root.profile_dir("helper").join("profile.toml").exists();
+    if has_helper || helper_on_disk {
         return profiles;
     }
     let Some(default) = profiles
@@ -2831,7 +2832,10 @@ fn fold_human_payload(convs: &mut Convs, session: &str, payload: &Value, created
             .unwrap_or("the agent failed");
         convs.touch(session, "failed", err, true, created);
     } else if payload.get("question").is_some_and(|v| !v.is_null()) {
-        let q = payload.get("question").and_then(Value::as_str).unwrap_or("");
+        let q = payload
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         convs.touch(session, "ask", q, true, created);
     } else if let Some(t) = payload.get("text").and_then(Value::as_str) {
         convs.touch(session, "agent", t, true, created);
@@ -3121,10 +3125,7 @@ mod ambient_tests {
 
         // The ambient conversation is honest about who started it: title is the
         // agent's message preview and the badge is not "you".
-        let ambient = convs
-            .iter()
-            .find(|c| c["session"] == "run-amb-1")
-            .unwrap();
+        let ambient = convs.iter().find(|c| c["session"] == "run-amb-1").unwrap();
         assert_eq!(
             ambient["title"].as_str().unwrap(),
             "your build finished — all green",
@@ -3143,8 +3144,10 @@ mod ambient_tests {
         let feed = conversation_messages("run-amb-1", &root.db()).unwrap();
         let feed = feed.as_array().unwrap();
         assert!(
-            feed.iter().any(|m| m["text"].as_str() == Some("your build finished — all green")
-                && m["cls"].as_str() == Some("agent")),
+            feed.iter().any(
+                |m| m["text"].as_str() == Some("your build finished — all green")
+                    && m["cls"].as_str() == Some("agent")
+            ),
             "the ambient send renders as an agent turn in the feed ({feed:?})"
         );
 
@@ -3215,7 +3218,9 @@ mod ambient_tests {
         assert!(a["branched_from"].is_null(), "A is a root ({a})");
 
         // (2) The thread detail exposes the origin + the full quoted text.
-        let origin = conversation_branched_from("web-B", &root.db()).unwrap().unwrap();
+        let origin = conversation_branched_from("web-B", &root.db())
+            .unwrap()
+            .unwrap();
         assert_eq!(origin["session"].as_str(), Some("web-A"));
         assert_eq!(origin["event_id"].as_i64(), Some(parent_event_id));
         assert_eq!(
@@ -3261,6 +3266,75 @@ fn truthy(v: &Value) -> bool {
 #[cfg(test)]
 mod route_tests {
     use super::*;
+
+    #[test]
+    fn helper_profile_is_synthetic_only_when_absent_on_disk() {
+        let dir = std::env::temp_dir().join(format!("el-helper-profile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let input =
+            r#"{"profile":"default","dir":"/tmp/root/profiles/default","spawn_ready":false}"#;
+
+        let synthetic = profiles_with_helper(&root, input);
+        assert_eq!(synthetic.len(), 2, "absent helper gets a synthetic row");
+        let helper = synthetic
+            .iter()
+            .find(|p| p["profile"].as_str() == Some("helper"))
+            .unwrap();
+        assert_eq!(helper["mirrors"].as_str(), Some("default"));
+
+        let helper_dir = root.profile_dir("helper");
+        std::fs::create_dir_all(&helper_dir).unwrap();
+        std::fs::write(helper_dir.join("profile.toml"), "agent = \"helper\"\n").unwrap();
+
+        let disk_backed = profiles_with_helper(&root, input);
+        assert_eq!(
+            disk_backed.len(),
+            1,
+            "an on-disk helper profile suppresses the degraded synthetic row"
+        );
+        assert!(
+            disk_backed
+                .iter()
+                .all(|p| p["profile"].as_str() != Some("helper")),
+            "profiles_with_helper must not invent a duplicate synthetic helper when a real profile exists"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn catalog_helper_row_wins_without_duplicate() {
+        let dir = std::env::temp_dir().join(format!("el-helper-catalog-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let helper_dir = root.profile_dir("helper");
+        std::fs::create_dir_all(&helper_dir).unwrap();
+        std::fs::write(helper_dir.join("profile.toml"), "agent = \"helper\"\n").unwrap();
+        let input = r#"{"profile":"default","dir":"/tmp/root/profiles/default","spawn_ready":false}
+{"profile":"helper","dir":"/tmp/root/profiles/helper","spawn_ready":true}"#;
+
+        let profiles = profiles_with_helper(&root, input);
+        assert_eq!(
+            profiles
+                .iter()
+                .filter(|p| p["profile"].as_str() == Some("helper"))
+                .count(),
+            1,
+            "the real catalog row wins with no duplicate helper"
+        );
+        let helper = profiles
+            .iter()
+            .find(|p| p["profile"].as_str() == Some("helper"))
+            .unwrap();
+        assert_eq!(helper["spawn_ready"], true);
+        assert!(
+            helper.get("mirrors").is_none(),
+            "real helper is not synthetic"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // M1/M3/M4: the comms/blocks read routes shell a CLI projection that prints a
     // JSON array; `map_cli_json` is the mapping the route bodies rely on. Empty
@@ -3316,8 +3390,14 @@ mod route_tests {
     // daemon never looks identical to a running one.
     #[test]
     fn liveness_topic_extractor_is_exact() {
-        assert_eq!(liveness_package("obs/package/git-protect/status"), Some("git-protect"));
-        assert_eq!(liveness_package("obs/package/window/status"), Some("window"));
+        assert_eq!(
+            liveness_package("obs/package/git-protect/status"),
+            Some("git-protect")
+        );
+        assert_eq!(
+            liveness_package("obs/package/window/status"),
+            Some("window")
+        );
         // Not a status topic, or a nested/denied topic under the same noun.
         assert_eq!(liveness_package("obs/package/git-protect/denied"), None);
         assert_eq!(liveness_package("obs/package//status"), None);
@@ -3327,17 +3407,35 @@ mod route_tests {
 
     #[test]
     fn liveness_states_map_to_distinguishable_product_words() {
-        assert_eq!(liveness_product_word(&json!({ "state": "alive", "pid": 4242 })), "running");
-        assert_eq!(liveness_product_word(&json!({ "state": "reloading" })), "restarting");
+        assert_eq!(
+            liveness_product_word(&json!({ "state": "alive", "pid": 4242 })),
+            "running"
+        );
+        assert_eq!(
+            liveness_product_word(&json!({ "state": "reloading" })),
+            "restarting"
+        );
         // A clean exit is "stopped"; a non-zero exit or a spawn failure is "failed"
         // — the exact distinction journey 04 requires.
-        assert_eq!(liveness_product_word(&json!({ "state": "dead", "exit_code": 0 })), "stopped");
-        assert_eq!(liveness_product_word(&json!({ "state": "dead", "exit_code": 1 })), "failed");
-        assert_eq!(liveness_product_word(&json!({ "state": "dead", "spawn_error": "no such file" })), "failed");
+        assert_eq!(
+            liveness_product_word(&json!({ "state": "dead", "exit_code": 0 })),
+            "stopped"
+        );
+        assert_eq!(
+            liveness_product_word(&json!({ "state": "dead", "exit_code": 1 })),
+            "failed"
+        );
+        assert_eq!(
+            liveness_product_word(&json!({ "state": "dead", "spawn_error": "no such file" })),
+            "failed"
+        );
         // Killed by signal (no code recorded) is not a clean stop.
         assert_eq!(liveness_product_word(&json!({ "state": "dead" })), "failed");
         // An unrecognized state degrades to "unknown", never a wrong word.
-        assert_eq!(liveness_product_word(&json!({ "state": "mystery" })), "unknown");
+        assert_eq!(
+            liveness_product_word(&json!({ "state": "mystery" })),
+            "unknown"
+        );
     }
 
     // The session-id guard the blocks/estimate routes apply before shelling the
@@ -3482,7 +3580,11 @@ mod route_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root { dir: dir.clone() };
 
-        let no_origin = || TestRequest::default().header("host", "127.0.0.1:7180").to_http_request();
+        let no_origin = || {
+            TestRequest::default()
+                .header("host", "127.0.0.1:7180")
+                .to_http_request()
+        };
         let with_origin = || {
             TestRequest::default()
                 .header("host", "127.0.0.1:7180")

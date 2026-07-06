@@ -1,0 +1,26 @@
+# helper - setup companion and general-purpose assistant.
+# Copied only if profiles/helper/ does not already exist; edit freely,
+# especially the model/provider after setup chooses an LLM path.
+
+agent = "helper"
+owner = "owner"
+
+[model]
+# Mirrors the default profile's model posture. If no dispatcher-usable API
+# provider exists yet, later milestones route helper turns through a logged-in
+# coding CLI; this profile stays the same.
+model = "claude-sonnet-4-6"
+max_turns = 24
+
+[skills]
+# The helper needs the knowledge surface, capability discovery, and launch
+# instructions more than broad package lore. The default profile's package path
+# is inherited, so these names become visible once the helper kit and stdlib are
+# installed.
+include = ["knowledge", "kb-search", "discovery", "launching-agents"]
+exclude = []
+
+[throttle."in/agent/helper"]
+# Setup help is interactive but should not fan out into parallel billing.
+max_concurrent = 1
+llm_tokens_per_hour = 300000

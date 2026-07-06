@@ -21,6 +21,8 @@ use rusqlite::Connection;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+const ROOT_LOCAL_KIT_PACKAGES: &[(&str, &[&str])] = &[("helper", &["kb-user"])];
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
     Link,
@@ -105,6 +107,7 @@ pub fn install(
     crate::config_repo::init(root)?;
 
     let mut names: Vec<String> = Vec::new();
+    let root_local = root_local_packages(&name);
     // Canonical from the start: discovery returns canonicalized dirs (and
     // macOS aliases /var -> /private/var), so the shadow check below must
     // compare like with like.
@@ -120,6 +123,13 @@ pub fn install(
                 }
             }
             Mode::Link => {
+                for e in sorted_dirs(&pkgs)? {
+                    let pkg = e.file_name().unwrap().to_string_lossy().to_string();
+                    if root_local.contains(&pkg.as_str()) {
+                        copy_tree_if_missing(&e, &root.packages().join(&pkg))?;
+                    }
+                    names.push(pkg);
+                }
                 link_elanus_path(root, kit_dir)?;
                 let (sha, changed) = crate::config_repo::commit_agent(
                     root,
@@ -128,9 +138,6 @@ pub fn install(
                 )?;
                 if changed {
                     emit_agent_change(root, conn, "default", &sha, &by)?;
-                }
-                for e in sorted_dirs(&pkgs)? {
-                    names.push(e.file_name().unwrap().to_string_lossy().to_string());
                 }
             }
         }
@@ -165,11 +172,16 @@ pub fn install(
             // SHADOWING code under this kit's name — skip loudly instead.
             if mode == Mode::Link {
                 let found = packages::find(root, pkg)?;
-                if !found.dir.starts_with(&pkgs) {
+                let is_root_local_copy = root_local.contains(&pkg.as_str())
+                    && found.dir.starts_with(root.packages().join(pkg));
+                if !found.dir.starts_with(&pkgs) && !is_root_local_copy {
                     eprintln!(
                         "[kit] {pkg}: shadowed by {} — linked copy is inert, no grant decided",
                         found.dir.display()
                     );
+                    continue;
+                }
+                if is_root_local_copy {
                     continue;
                 }
             }
@@ -191,6 +203,14 @@ pub fn install(
         return Ok(Some(std::fs::read_to_string(readme)?));
     }
     Ok(None)
+}
+
+fn root_local_packages(kit_name: &str) -> std::collections::BTreeSet<&'static str> {
+    ROOT_LOCAL_KIT_PACKAGES
+        .iter()
+        .find(|(name, _)| *name == kit_name)
+        .map(|(_, pkgs)| pkgs.iter().copied().collect())
+        .unwrap_or_default()
 }
 
 fn emit_agent_change(
@@ -423,6 +443,9 @@ fn sorted_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
 fn copy_tree_if_missing(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for e in std::fs::read_dir(src)?.filter_map(|e| e.ok()) {
+        if e.file_name() == ".git" {
+            continue;
+        }
         let from = e.path();
         let to = dst.join(e.file_name());
         if from.is_dir() {
@@ -510,6 +533,58 @@ mod tests {
         let (prof, _) = crate::profile::load(&root, "default").unwrap();
         assert_eq!(prof.elanus_path.len(), 2);
         std::fs::remove_dir_all(root.dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn helper_link_install_vendors_kb_user_only() {
+        let base = std::env::temp_dir().join(format!("el-kit-helper-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let root = Root {
+            dir: base.join("root"),
+        };
+        std::fs::create_dir_all(root.dir.join("packages")).unwrap();
+        std::fs::create_dir_all(root.dir.join("profiles/default")).unwrap();
+        std::fs::write(
+            root.profile_dir("default").join("profile.toml"),
+            "agent = \"main\"\n",
+        )
+        .unwrap();
+
+        let kit = base.join("helper");
+        std::fs::create_dir_all(kit.join("packages/kb-user/kb")).unwrap();
+        std::fs::write(kit.join("packages/kb-user/elanus.toml"), "[kb]\n").unwrap();
+        std::fs::write(kit.join("packages/kb-user/kb/README.md"), "# user\n").unwrap();
+        std::fs::create_dir_all(kit.join("packages/kb-user/.git")).unwrap();
+        std::fs::write(kit.join("packages/kb-user/.git/config"), "do not copy\n").unwrap();
+        std::fs::create_dir_all(kit.join("packages/helper-chat/scripts")).unwrap();
+        std::fs::write(
+            kit.join("packages/helper-chat/elanus.toml"),
+            "[request]\nsubscribe=[\"in/agent/helper\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/run\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            kit.join("packages/helper-chat/scripts/run"),
+            "#!/bin/sh\ncat\n",
+        )
+        .unwrap();
+
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        install(&root, &conn, &kit, Mode::Link, true).unwrap();
+
+        assert!(root.packages().join("kb-user/elanus.toml").exists());
+        assert!(!root.packages().join("kb-user/.git").exists());
+        assert!(!root.packages().join("helper-chat/elanus.toml").exists());
+        let found = packages::find(&root, "kb-user").unwrap();
+        assert!(found.dir.starts_with(root.packages()));
+        let found = packages::find(&root, "helper-chat").unwrap();
+        assert!(found
+            .dir
+            .starts_with(kit.join("packages").canonicalize().unwrap()));
+        assert!(
+            packages::is_approved(&conn, "helper-chat", "subscribe", "in/agent/helper").unwrap()
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

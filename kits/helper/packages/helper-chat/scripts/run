@@ -1,0 +1,5 @@
+#!/bin/sh
+# in/agent/helper -> an agent turn under the helper profile. All event JSON
+# parsing lives in the binary; this script keeps the handler visible in package
+# wiring, matching packages/chat and kb-pipeline.
+exec elanus handle-exec

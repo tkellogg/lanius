@@ -311,6 +311,81 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         content: include_str!("../kits/funnel/profiles/scout/blocks/00-scout.md"),
         exec: false,
     },
+    PkgFile {
+        rel: "helper/packages/helper-chat/elanus.toml",
+        content: include_str!("../kits/helper/packages/helper-chat/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/packages/helper-chat/scripts/run",
+        content: include_str!("../kits/helper/packages/helper-chat/scripts/run"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "helper/packages/kb-elanus/elanus.toml",
+        content: include_str!("../kits/helper/packages/kb-elanus/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/packages/kb-elanus/kb/kits-and-packages.md",
+        content: include_str!("../kits/helper/packages/kb-elanus/kb/kits-and-packages.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/packages/kb-elanus/kb/llm-access.md",
+        content: include_str!("../kits/helper/packages/kb-elanus/kb/llm-access.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/packages/kb-elanus/kb/model-guidance.md",
+        content: include_str!("../kits/helper/packages/kb-elanus/kb/model-guidance.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/packages/kb-elanus/kb/mutation-doctrine.md",
+        content: include_str!("../kits/helper/packages/kb-elanus/kb/mutation-doctrine.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/packages/kb-elanus/kb/overview.md",
+        content: include_str!("../kits/helper/packages/kb-elanus/kb/overview.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/packages/kb-elanus/kb/setup-checklist.md",
+        content: include_str!("../kits/helper/packages/kb-elanus/kb/setup-checklist.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/packages/kb-user/elanus.toml",
+        content: include_str!("../kits/helper/packages/kb-user/elanus.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/packages/kb-user/kb/README.md",
+        content: include_str!("../kits/helper/packages/kb-user/kb/README.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/profiles/helper/profile.toml",
+        content: include_str!("../kits/helper/profiles/helper/profile.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/profiles/helper/blocks/00-charter.md",
+        content: include_str!("../kits/helper/profiles/helper/blocks/00-charter.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/profiles/helper/blocks/10-setup-progress.md",
+        content: include_str!("../kits/helper/profiles/helper/blocks/10-setup-progress.md"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "helper/profiles/helper/blocks/20-kb-elanus.md",
+        content: include_str!("../kits/helper/profiles/helper/blocks/20-kb-elanus.md"),
+        exec: false,
+    },
     // stdlib: the protected, always-on kit (docs/config.md). Installed and
     // auto-approved unconditionally in init(); history (the transcript view) is
     // its first member, so the web UI's sessions tab always has something to read.

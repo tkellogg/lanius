@@ -313,3 +313,11 @@ driver-mode addition, not a table row. **Defer**; A2 records the id so nothing i
   could NOT be fetched (sandbox blocked curl/WebFetch/WebSearch in this non-interactive
   session), so A1 is the gate that pins them. Local ACP agents could not be probed
   (sandbox restricts paths to the workdir); A5 checks what's installed.
+- 2026-07-06 — A1-A3 implementation pass (Codex). A1 fetched the live ACP v1 docs
+  and schema release `schema-v1.19.0`, captured a real `codex-acp` initialize
+  response, and checked the divergence table into `docs/acp-wire-notes.md`. A2/A3
+  added `src/acp.rs` plus the `harness-acp` bin: newline JSON-RPC driver,
+  initialize -> session/new -> session/prompt, chunk-buffered obs projection,
+  fail-closed `-32601` for unmodeled server requests, and ACP permission
+  elicitations relayed to `in/human/<owner>` with optionId mapping. A4-A6 remain
+  deferred.

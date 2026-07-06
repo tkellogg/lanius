@@ -1,0 +1,12 @@
+# helper-chat - the exec handler that makes the helper profile spawnable.
+# `elanus agent spawn --profile helper ...` requires an approved exec handler
+# subscribed to in/agent/helper. This package is that handler.
+
+[request]
+subscribe = ["in/agent/helper"]
+publish = ["#"]
+
+[process]
+mode = "exec"
+run = "scripts/run"
+order = 0

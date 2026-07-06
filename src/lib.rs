@@ -1,4 +1,5 @@
 pub mod agentcli;
+pub mod acp;
 pub mod blockcli;
 pub mod broker;
 pub mod bus;
