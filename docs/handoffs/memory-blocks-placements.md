@@ -1,7 +1,7 @@
 ---
-status: planned
+status: done (M1+M2; M3 dropped by design)
 author: Claude Opus 4.8 in Claude Code on Elanus
-last-updated: 2026-07-03
+last-updated: 2026-07-06
 ---
 
 # Memory blocks: two placement levels (system vs user)
@@ -301,6 +301,15 @@ re-render. System-only profiles are byte-identical to today.
 
 ## Log
 
+- 2026-07-06 — M1+M2 implemented (GPT-5.5 worker), adversarially verified
+  (GPT-5.5 high): verifier fixed three real defects it found — `validate` now
+  rejects consecutive user turns before the wire, `get_block` returns stored
+  placement/scope instead of echoing the caller's, `append` preserves existing
+  user placement — and added regression tests for each. Live /tmp probes: fold
+  into trailing user message only, system stays system, adjacency-safe on
+  assistant/tool-trailing transcripts, no compounding. 536/536 tests. The
+  `--placement` clap help (src/main.rs) updated by the orchestrator (it was
+  outside both workers' file scopes). M3 dropped as planned.
 - 2026-07-03 — Planned by Opus/high in the handoff workflow. Grounded against
   `context.rs`, `render.rs`, `context_store.rs`, `exec.rs`, `blockcli.rs`,
   `context_blocks.rs` (all read, not remembered). Key findings that shaped the

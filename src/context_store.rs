@@ -6,9 +6,10 @@
 //! A **memory block** is a named, durable chunk of prompt: `name -> content`,
 //! keyed by `(scope, owner, session_id, run_id, name)`, ordered by `priority`,
 //! placed by `placement`. M1 seeds the `system`-placement rows visible to a
-//! `(scope, owner, session)` into the native Doc system seed; M2 is the write
-//! surface (`elanus block …`) plus the seed-once "default that evolves"; M3
-//! records every mutation in `context_build_log`.
+//! `(scope, owner, session)` into the native Doc system seed; the follow-on user
+//! placement loads the same visible slice into `Doc.user` before the stage chain.
+//! M2 is the write surface (`elanus block …`) plus the seed-once "default that
+//! evolves"; M3 records every mutation in `context_build_log`.
 //!
 //! M4 adds the coding-agent projection surface here: `load_session_blocks`
 //! (blocks visible to a coding session keyed by agent noun + session, no Profile),
@@ -97,16 +98,11 @@ fn scope_binding<'a>(scope: &Scope, session: &'a str, run: Option<&'a str>) -> (
     }
 }
 
-/// M1 — load the `system`-placement blocks visible to `(scope, owner, session)`
-/// for this profile, ordered by `priority` (then name for stability). Visibility
-/// today is the homogeneous-authority slice: a block is visible if it is the
-/// profile owner's or its agent's, and bound to no session OR to this session.
-/// (Richer placements live in the table but have no Doc home yet — M1 honors
-/// `system` only, per handoff decision 2.)
-pub fn load_system_blocks(
+fn load_profile_blocks(
     conn: &Connection,
     prof: &Profile,
     session: &str,
+    placement: Placement,
 ) -> Result<Vec<LoadedBlock>> {
     // Dedup-on-read guard (storage-hardening M2): collapse to one row per logical
     // key (max `id` wins) BEFORE ordering, so a DB restored from a pre-migration
@@ -123,22 +119,25 @@ pub fn load_system_blocks(
                     ORDER BY id DESC
                   ) AS rn
              FROM context_blocks
-            WHERE placement = 'system'
-              AND owner IN (?1, ?2)
-              AND (session_id = '' OR session_id IS NULL OR session_id = ?3)
+            WHERE placement = ?1
+              AND owner IN (?2, ?3)
+              AND (session_id = '' OR session_id IS NULL OR session_id = ?4)
          ) WHERE rn = 1
          ORDER BY priority ASC, name ASC, id ASC",
     )?;
-    let rows = stmt.query_map(params![prof.agent, prof.owner, session], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i32>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        params![placement_str(&placement), prof.agent, prof.owner, session],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i32>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        },
+    )?;
     let mut out = Vec::new();
     for row in rows {
         let (name, content, priority, placement, owner, scope) = row?;
@@ -152,6 +151,29 @@ pub fn load_system_blocks(
         });
     }
     Ok(out)
+}
+
+/// M1 — load the `system`-placement blocks visible to `(scope, owner, session)`
+/// for this profile, ordered by `priority` (then name for stability). Visibility
+/// today is the homogeneous-authority slice: a block is visible if it is the
+/// profile owner's or its agent's, and bound to no session OR to this session.
+pub fn load_system_blocks(
+    conn: &Connection,
+    prof: &Profile,
+    session: &str,
+) -> Result<Vec<LoadedBlock>> {
+    load_profile_blocks(conn, prof, session, Placement::System)
+}
+
+/// Load the `user`-placement blocks visible to `(scope, owner, session)` for this
+/// profile, using the same visibility, deduplication, and priority order as
+/// `load_system_blocks`.
+pub fn load_user_blocks(
+    conn: &Connection,
+    prof: &Profile,
+    session: &str,
+) -> Result<Vec<LoadedBlock>> {
+    load_profile_blocks(conn, prof, session, Placement::User)
 }
 
 /// The well-known name of the per-session memory note block (M2 decision 5). The
@@ -337,24 +359,20 @@ pub fn get_block(
                 AND session_id = ?3 AND run_id = ?4 AND name = ?5",
             params![scope_str(&block.scope), block.owner, sid, rid, block.name],
             |r| {
+                let placement: String = r.get(3)?;
+                let scope: String = r.get(5)?;
                 Ok(LoadedBlock {
                     name: r.get(0)?,
                     content: r.get(1)?,
                     priority: r.get(2)?,
-                    placement: Placement::System,
+                    placement: parse_placement(&placement).unwrap_or(Placement::System),
                     owner: r.get(4)?,
-                    scope: Scope::Agent,
+                    scope: parse_scope(&scope).unwrap_or(Scope::Agent),
                 })
             },
         )
         .optional()?;
-    Ok(row.map(|mut lb| {
-        // placement/scope re-parsed from the row's own strings (the closure
-        // can't fallibly parse, so re-read here).
-        lb.placement = block.placement.clone();
-        lb.scope = block.scope.clone();
-        lb
-    }))
+    Ok(row)
 }
 
 /// Read a block's `meta` JSON back out (kb-core.md M3 — `LoadedBlock` carries no
@@ -704,6 +722,63 @@ mod tests {
             !visible.iter().any(|b| b.owner == "scout"),
             "a peer's row is not visible to lily's profile"
         );
+    }
+
+    #[test]
+    fn load_user_blocks_matches_system_visibility_and_order() {
+        let c = conn();
+        let mut early = block("early", "hot first", "lily");
+        early.placement = Placement::User;
+        early.priority = -10;
+        upsert_block(&c, "default", &early, "s1", None).unwrap();
+
+        let mut late = block("late", "hot late", "owner");
+        late.placement = Placement::User;
+        late.priority = 10;
+        upsert_block(&c, "default", &late, "s1", None).unwrap();
+
+        let mut other_session = block("other-session", "wrong session", "lily");
+        other_session.scope = Scope::Session;
+        other_session.placement = Placement::User;
+        upsert_block(&c, "default", &other_session, "s2", None).unwrap();
+
+        let mut peer = block("peer", "wrong owner", "scout");
+        peer.placement = Placement::User;
+        upsert_block(&c, "default", &peer, "s1", None).unwrap();
+
+        let mut system = block("system", "not user", "lily");
+        system.placement = Placement::System;
+        upsert_block(&c, "default", &system, "s1", None).unwrap();
+
+        let visible = load_user_blocks(&c, &prof("lily", "owner"), "s1").unwrap();
+        let names: Vec<_> = visible.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["early", "late"]);
+        assert!(visible.iter().all(|b| b.placement == Placement::User));
+        assert_eq!(visible[0].content, "hot first");
+        assert_eq!(visible[1].content, "hot late");
+    }
+
+    #[test]
+    fn load_user_blocks_dedups_duplicate_logical_key() {
+        let c = conn();
+        for (content, sha) in [
+            ("first", sha256_hex(b"first")),
+            ("second", sha256_hex(b"second")),
+        ] {
+            c.execute(
+                "INSERT INTO context_blocks
+                   (scope, owner, session_id, run_id, name, placement, priority, content, content_sha256, meta)
+                 VALUES ('agent','lily',NULL,NULL,'scratch','user',0,?1,?2,'{}')",
+                params![content, sha],
+            )
+            .unwrap();
+        }
+
+        let visible = load_user_blocks(&c, &prof("lily", "owner"), "s1").unwrap();
+        let scratch: Vec<&LoadedBlock> = visible.iter().filter(|b| b.name == "scratch").collect();
+        assert_eq!(scratch.len(), 1, "user load must collapse the duplicate");
+        assert_eq!(scratch[0].content, "second", "max-id (newest) content wins");
+        assert_eq!(scratch[0].placement, Placement::User);
     }
 
     #[test]

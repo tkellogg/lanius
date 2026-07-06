@@ -94,6 +94,7 @@ pub fn render_context(root: &Root, opts: ContextRenderOpts) -> Result<Value> {
     let (event_doc, event_prompt, event_source) =
         context_render_event(&conn, opts.event.as_deref())?;
     let system_seed = render::render_parts(root, &conn, &opts.profile, &opts.session)?;
+    let user_seed = render::render_user_parts(root, &conn, &opts.profile, &opts.session)?;
     let stages = context::chain(root, &conn, &opts.profile, &prof)?;
     let mut messages = transcript_rows(&conn, &opts.session)?;
     if let Some(prompt) = event_prompt {
@@ -104,6 +105,7 @@ pub fn render_context(root: &Root, opts: ContextRenderOpts) -> Result<Value> {
     let assembly = context::assemble_detailed(
         root,
         &system_seed,
+        &user_seed,
         messages,
         event_doc,
         context::Meta {
@@ -123,6 +125,7 @@ pub fn render_context(root: &Root, opts: ContextRenderOpts) -> Result<Value> {
         "event_source": event_source,
         "seed": {
             "system_blocks": system_seed.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
+            "user_blocks": user_seed.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
             "message_count": assembly.doc.messages.len(),
         },
         "resolved_stages": stages,
@@ -538,6 +541,7 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     // semantics, providers don't re-spawn per call); the chain runs before
     // every LLM call over the freshly re-read transcript.
     let system_seed = render::render_parts(root, &conn, &opts.profile, &session)?;
+    let user_seed = render::render_user_parts(root, &conn, &opts.profile, &session)?;
     let stages = context::chain(root, &conn, &opts.profile, &prof)?;
     let event_doc = opts.event.clone().unwrap_or(Value::Null);
     let client_tools = client_tools_from_event(&event_doc);
@@ -632,6 +636,7 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
         let doc = context::assemble(
             root,
             &system_seed,
+            &user_seed,
             transcript_rows(&conn, &session)?,
             event_doc.clone(),
             context::Meta {
@@ -2053,7 +2058,7 @@ fn run_tool(
                 Err(e) => {
                     return err(format!(
                         "shell: cannot read active leases, refusing to run: {e:#}"
-                    ))
+                    ));
                 }
             };
             let cage = narrowed.as_ref().unwrap_or(cage);
@@ -2147,10 +2152,10 @@ fn run_tool(
                 (Some(_), Some(_)) => {
                     return err(
                         "schedule_event: give exactly one of 'in_seconds' or 'at', not both".into(),
-                    )
+                    );
                 }
                 (None, None) => {
-                    return err("schedule_event: give one of 'in_seconds' or 'at'".into())
+                    return err("schedule_event: give one of 'in_seconds' or 'at'".into());
                 }
                 (Some(secs), None) => (chrono::Utc::now()
                     + chrono::Duration::milliseconds((secs * 1000.0) as i64))
@@ -2578,6 +2583,7 @@ mod tests {
             let doc = crate::context::assemble(
                 &root,
                 &[("seed".to_string(), "s".to_string())],
+                &[],
                 vec![json!({ "role": "user", "text": "hi" })],
                 Value::Null,
                 crate::context::Meta {
@@ -2623,6 +2629,71 @@ mod tests {
             run_model("profile-own-model", Some("  ")),
             "profile-own-model"
         );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn user_block_fold_never_persists_to_transcript() {
+        let root = Root {
+            dir: std::env::temp_dir().join(format!("el-exec-user-fold-{}", std::process::id())),
+        };
+        std::fs::remove_dir_all(&root.dir).ok();
+        std::fs::create_dir_all(&root.dir).unwrap();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        store_msg(
+            &conn,
+            "s-user-fold",
+            None,
+            &json!({"role":"user","text":"raw prompt"}),
+        )
+        .unwrap();
+
+        let user_seed = vec![("scratch".to_string(), "hot notes".to_string())];
+        let raw_before = transcript_rows(&conn, "s-user-fold").unwrap();
+        let assemble_from = |rows: Vec<Value>| {
+            crate::context::assemble(
+                &root,
+                &[],
+                &user_seed,
+                rows,
+                Value::Null,
+                crate::context::Meta {
+                    profile: "default".into(),
+                    agent: "main".into(),
+                    session: "s-user-fold".into(),
+                    turn: 1,
+                    model: "m".into(),
+                    vars: Default::default(),
+                },
+                &[],
+                &trace::Ids::default(),
+            )
+            .unwrap()
+        };
+        let doc1 = assemble_from(raw_before.clone());
+        let raw_after = transcript_rows(&conn, "s-user-fold").unwrap();
+        let doc2 = assemble_from(raw_after.clone());
+
+        assert_eq!(raw_before, raw_after, "assembly must not rewrite messages");
+        assert_eq!(doc1.messages, doc2.messages, "folding must not compound");
+        assert_eq!(
+            doc1.messages[0]["text"]
+                .as_str()
+                .unwrap()
+                .matches("hot notes")
+                .count(),
+            1
+        );
+        let stored: String = conn
+            .query_row(
+                "SELECT content FROM messages WHERE session_id='s-user-fold'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!stored.contains("hot notes"));
+        assert!(stored.contains("raw prompt"));
         std::fs::remove_dir_all(&root.dir).ok();
     }
 

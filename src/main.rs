@@ -537,8 +537,12 @@ struct BlockArgs {
     /// global | agent | session | run (run is stage-only).
     #[arg(long, default_value = "agent")]
     scope: String,
-    /// system | before_messages | after_messages | user | scratch (M1 renders
-    /// system only).
+    /// system | before_messages | after_messages | user | scratch. Prefer
+    /// `system` (the default): it rides the cached system prefix, cheap until
+    /// edited. `user` folds into the user turn each activation — edits land
+    /// immediately but the block is re-sent in full every turn; pick it only
+    /// for a block that changes nearly every turn. The other three placements
+    /// are stored but not yet rendered.
     #[arg(long, default_value = "system")]
     placement: String,
     /// Render order relative to the profile's static blocks (negative = before).

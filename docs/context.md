@@ -129,6 +129,23 @@ The harness owns block semantics: validation, hashing, placement, budgeting,
 and build-log writes. Package executables can produce blocks or transforms, but
 the meaning of a block must be understood by the harness and shared libraries.
 
+Block placement has two live render levels today:
+
+- `system` is the default. The block lands in `Doc.system`, then in the provider
+  system prompt. It benefits from provider prefix caching across turns, so it is
+  the right home for identity, stable instructions, long-lived notes, and most
+  memory.
+- `user` is for genuinely hot memory that changes almost every turn. The block
+  is seeded into `Doc.user` before context stages run, then folded into the
+  trailing user message at the end of assembly. It avoids invalidating the
+  cached system prefix when edited, but the full block is re-sent in the user
+  turn every time.
+
+Default to `system`; choose `user` only when the block changes often enough
+that avoiding system-prefix cache churn is worth paying duplicate tokens every
+turn. The raw transcript remains the source of truth: folded user-block text is
+not written back to `messages`.
+
 Implementation lean: create a Rust library crate for the block/context data
 model and algorithms, with optional binaries for package actors. Do not make
 the block model only an executable service. Future JS/Python libraries should
@@ -235,6 +252,7 @@ program already has an explicit caller and an explicit ordered chain.
 ```json
 { "v": 1,
   "system":   [ {"name": "00-system.md", "text": "..."} ],
+  "user":     [ {"name": "scratch", "text": "..."} ],
   "messages": [ {"role": "user", "text": "..."},
                 {"role": "assistant", "text": "...", "tool_calls": [...]},
                 {"role": "tool", "tool_call_id": "...", "name": "...", "content": "..."} ],
@@ -246,6 +264,10 @@ program already has an explicit caller and an explicit ordered chain.
 - `system` is an ordered list of named blocks; the final system prompt is
   their texts joined with blank lines. Names exist so context stages can address
   blocks ("drop the skills inventory", "insert before 00-system.md").
+- `user` is an ordered list of named hot blocks. Context stages see it as
+  structured data. After the stage chain, the kernel folds those blocks into the
+  most recent user message and clears `user`, so the provider wire still has one
+  user turn there.
 - `messages` uses the *transcript row shape* (the normalized form stored in
   sqlite), not the provider wire shape — context stages transform dialogue, the
   kernel owns the conversion to the provider protocol afterward.

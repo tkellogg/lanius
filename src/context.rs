@@ -46,6 +46,8 @@ pub struct Meta {
 pub struct Doc {
     pub v: u32,
     pub system: Vec<Block>,
+    #[serde(default)]
+    pub user: Vec<Block>,
     pub messages: Vec<Value>,
     pub event: Value,
     pub meta: Meta,
@@ -188,20 +190,30 @@ pub struct Assembly {
     pub stages: Vec<StageSummary>,
 }
 
-/// Seed the document and run the chain. `system_seed` is computed once per
-/// run (render_parts — blocks, providers, skills inventory); messages are
-/// re-read from the transcript by the caller each call. Returns the
-/// transformed, wire-validated document.
+/// Seed the document and run the chain. `system_seed` and `user_seed` are
+/// computed once per run; messages are re-read from the transcript by the caller
+/// each call. Returns the transformed, wire-validated document.
 pub fn assemble(
     root: &Root,
     system_seed: &[(String, String)],
+    user_seed: &[(String, String)],
     messages: Vec<Value>,
     event: Value,
     meta: Meta,
     stages: &[StageRef],
     ids: &crate::trace::Ids,
 ) -> Result<Doc> {
-    Ok(assemble_detailed(root, system_seed, messages, event, meta, stages, Some(ids))?.doc)
+    Ok(assemble_detailed(
+        root,
+        system_seed,
+        user_seed,
+        messages,
+        event,
+        meta,
+        stages,
+        Some(ids),
+    )?
+    .doc)
 }
 
 /// Same assembly path as `assemble`, but returns context-stage summaries.
@@ -210,6 +222,7 @@ pub fn assemble(
 pub fn assemble_detailed(
     root: &Root,
     system_seed: &[(String, String)],
+    user_seed: &[(String, String)],
     messages: Vec<Value>,
     event: Value,
     meta: Meta,
@@ -219,6 +232,13 @@ pub fn assemble_detailed(
     let mut doc = Doc {
         v: 1,
         system: system_seed
+            .iter()
+            .map(|(name, text)| Block {
+                name: name.clone(),
+                text: text.clone(),
+            })
+            .collect(),
+        user: user_seed
             .iter()
             .map(|(name, text)| Block {
                 name: name.clone(),
@@ -348,10 +368,40 @@ pub fn assemble_detailed(
         }
         summaries.push(summary);
     }
+    fold_user_blocks(&mut doc)?;
+    validate(&doc).context("folded user blocks broke a wire invariant (kernel bug)")?;
     Ok(Assembly {
         doc,
         stages: summaries,
     })
+}
+
+fn fold_user_blocks(doc: &mut Doc) -> Result<()> {
+    if doc.user.is_empty() {
+        return Ok(());
+    }
+    let blocks = doc
+        .user
+        .iter()
+        .map(|b| format!("[elanus user block: {}]\n{}", b.name, b.text))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let Some(msg) = doc
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|m| m["role"].as_str() == Some("user"))
+    else {
+        bail!("cannot fold user blocks: no user message");
+    };
+    let original = msg["text"].as_str().unwrap_or_default();
+    msg["text"] = Value::String(if original.is_empty() {
+        blocks
+    } else {
+        format!("{blocks}\n\n{original}")
+    });
+    doc.user.clear();
+    Ok(())
 }
 
 /// Record this stage's system-block adds/rewrites in `context_build_log`
@@ -490,9 +540,14 @@ pub fn validate(doc: &Doc) -> Result<()> {
         bail!("first message must have role \"user\"");
     }
     let mut pending: Vec<String> = Vec::new();
+    let mut prev_role: Option<&str> = None;
     for (i, m) in doc.messages.iter().enumerate() {
-        match m["role"].as_str().unwrap_or("") {
+        let role = m["role"].as_str().unwrap_or("");
+        match role {
             "user" => {
+                if prev_role == Some("user") {
+                    bail!("message {i}: consecutive user turns");
+                }
                 if !pending.is_empty() {
                     bail!("message {i}: user turn while tool calls {pending:?} are unanswered");
                 }
@@ -516,12 +571,15 @@ pub fn validate(doc: &Doc) -> Result<()> {
             "tool" => {
                 let id = m["tool_call_id"].as_str().unwrap_or("");
                 let Some(pos) = pending.iter().position(|p| p == id) else {
-                    bail!("message {i}: tool result for {id:?} which is not an open call of the previous assistant turn");
+                    bail!(
+                        "message {i}: tool result for {id:?} which is not an open call of the previous assistant turn"
+                    );
                 };
                 pending.remove(pos);
             }
             other => bail!("message {i}: unknown role {other:?}"),
         }
+        prev_role = Some(role);
     }
     if !pending.is_empty() {
         bail!("transcript ends with unanswered tool calls {pending:?}");
@@ -548,6 +606,7 @@ mod tests {
         Doc {
             v: 1,
             system: vec![],
+            user: vec![],
             messages,
             event: Value::Null,
             meta: meta(),
@@ -589,6 +648,12 @@ mod tests {
         assert!(validate(&d).is_err());
         // First message not user.
         let d = doc(vec![json!({"role":"assistant","text":"hello"})]);
+        assert!(validate(&d).is_err());
+        // Consecutive user turns would reach providers as adjacent user roles.
+        let d = doc(vec![
+            json!({"role":"user","text":"first"}),
+            json!({"role":"user","text":"second"}),
+        ]);
         assert!(validate(&d).is_err());
         // Double-answering one call.
         let d = doc(vec![
@@ -639,6 +704,7 @@ mod tests {
         let doc = assemble(
             &root,
             &parts,
+            &[],
             rows.clone(),
             Value::Null,
             meta(),
@@ -662,6 +728,71 @@ mod tests {
             got, want,
             "default-chain output changed — every agent's prompt just changed"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn user_seed_folds_into_last_user_message_once() {
+        let dir = std::env::temp_dir().join(format!("el-ctx-user-fold-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = crate::paths::Root { dir: dir.clone() };
+        let system_seed = vec![("identity".to_string(), "stable system".to_string())];
+        let user_seed = vec![
+            ("scratch".to_string(), "hot notes".to_string()),
+            ("focus".to_string(), "ship M1".to_string()),
+        ];
+        let rows = vec![
+            json!({"role":"user","text":"first"}),
+            json!({"role":"assistant","text":"answer"}),
+            json!({"role":"user","text":"actual ask"}),
+        ];
+
+        let doc1 = assemble(
+            &root,
+            &system_seed,
+            &user_seed,
+            rows.clone(),
+            Value::Null,
+            meta(),
+            &[],
+            &crate::trace::Ids::default(),
+        )
+        .unwrap();
+        let doc2 = assemble(
+            &root,
+            &system_seed,
+            &user_seed,
+            rows.clone(),
+            Value::Null,
+            meta(),
+            &[],
+            &crate::trace::Ids::default(),
+        )
+        .unwrap();
+
+        assert_eq!(doc1.messages, doc2.messages, "folding must not compound");
+        assert!(doc1.user.is_empty(), "folded blocks have one final home");
+        assert_eq!(
+            doc1.messages
+                .iter()
+                .filter(|m| m["role"].as_str() == Some("user"))
+                .count(),
+            2,
+            "folding must not append a separate user message"
+        );
+        assert_eq!(
+            doc1.messages[0]["text"].as_str().unwrap(),
+            "first",
+            "only the trailing user message is folded"
+        );
+        let folded = doc1.messages[2]["text"].as_str().unwrap();
+        assert!(folded.starts_with("[elanus user block: scratch]\nhot notes"));
+        assert!(folded.contains("[elanus user block: focus]\nship M1"));
+        assert!(folded.ends_with("\n\nactual ask"));
+        assert_eq!(folded.matches("hot notes").count(), 1);
+        assert_eq!(rows[2]["text"], "actual ask", "raw input rows stay raw");
+        assert!(!doc1.system_text().contains("hot notes"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -789,6 +920,7 @@ default = false
         let assembly = assemble_detailed(
             &root,
             &[],
+            &[],
             vec![json!({"role":"user","text":"hi"})],
             Value::Null,
             m,
@@ -862,6 +994,7 @@ default = false
         ];
         let assembly = assemble_detailed(
             &root,
+            &[],
             &[],
             vec![json!({"role":"user","text":"hi"})],
             Value::Null,

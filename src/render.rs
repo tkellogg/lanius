@@ -22,6 +22,22 @@ pub fn render(root: &Root, conn: &Connection, profile_name: &str, session: &str)
         .join("\n\n"))
 }
 
+/// The seed of the context pipeline's `user` array. This is intentionally only
+/// durable user-placement blocks in this cut: static profile block files,
+/// providers, and skills inventory remain system concepts.
+pub fn render_user_parts(
+    root: &Root,
+    conn: &Connection,
+    profile_name: &str,
+    session: &str,
+) -> Result<Vec<(String, String)>> {
+    let (prof, _) = profile::load(root, profile_name)?;
+    Ok(context_store::load_user_blocks(conn, &prof, session)?
+        .into_iter()
+        .map(|b| (b.name, b.content))
+        .collect())
+}
+
 /// The same assembly as named parts — the seed of the context pipeline's
 /// `system` array (docs/context.md): each profile block, provider output,
 /// and the skills inventory is one (name, text) entry, in the order render()
@@ -331,7 +347,7 @@ fn run_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context_blocks::{ContextBlock, Scope};
+    use crate::context_blocks::{ContextBlock, Placement, Scope};
     use crate::context_store;
 
     fn scratch(tag: &str) -> Root {
@@ -454,6 +470,37 @@ mod tests {
         let text = render(&root, &conn, "default", "s1").unwrap();
         assert!(text.contains("I am Lily."));
         assert!(text.contains("Body block."));
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn user_parts_load_only_durable_user_blocks() {
+        let root = scratch("user-parts");
+        std::fs::write(
+            root.dir.join("profiles/default/blocks/50-body.md"),
+            "Body block.",
+        )
+        .unwrap();
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+
+        let mut user = ContextBlock::new("scratch", "hot notes", "lily");
+        user.scope = Scope::Agent;
+        user.placement = Placement::User;
+        context_store::upsert_block(&conn, "default", &user, "s1", None).unwrap();
+
+        let mut system = ContextBlock::new("identity", "stable system", "lily");
+        system.scope = Scope::Agent;
+        system.placement = Placement::System;
+        context_store::upsert_block(&conn, "default", &system, "s1", None).unwrap();
+
+        let user_parts = render_user_parts(&root, &conn, "default", "s1").unwrap();
+        assert_eq!(user_parts, vec![("scratch".into(), "hot notes".into())]);
+
+        let system_text = render(&root, &conn, "default", "s1").unwrap();
+        assert!(system_text.contains("stable system"));
+        assert!(system_text.contains("Body block."));
+        assert!(!system_text.contains("hot notes"));
         std::fs::remove_dir_all(&root.dir).ok();
     }
 

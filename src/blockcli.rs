@@ -20,6 +20,7 @@
 //! established by the broker elsewhere (principal=identity), that path verifies;
 //! this hand-write path deliberately does not.
 
+use crate::context_blocks::Placement;
 use crate::context_blocks::{ContextBlock, Scope};
 use crate::context_store::{self, parse_placement, parse_scope, placement_str, scope_str};
 use crate::db;
@@ -94,11 +95,20 @@ fn build_block(root: &Root, name: &str, content: &str, opts: &BlockOpts) -> Resu
     Ok(b)
 }
 
+pub const USER_PLACEMENT_NOTE: &str = "note: `user` placement re-sends this block every turn; prefer `system` unless it changes each turn";
+
+fn warn_user_placement(block: &ContextBlock) {
+    if block.placement == Placement::User {
+        eprintln!("{USER_PLACEMENT_NOTE}");
+    }
+}
+
 /// `elanus block set <name> <content>`: upsert a block (last-writer-wins).
 pub fn set(root: &Root, name: &str, content: &str, opts: &BlockOpts) -> Result<()> {
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
     let block = build_block(root, name, content, opts)?;
+    warn_user_placement(&block);
     let action = context_store::upsert_block(&conn, &opts.profile, &block, &opts.session, None)?;
     // Decided-by attribution (e.g. `--by ui`): record a `validate`-action build-log
     // row whose summary names the driver, so a human edit through the web UI is
@@ -139,6 +149,7 @@ pub fn append(root: &Root, name: &str, content: &str, opts: &BlockOpts) -> Resul
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
     let mut block = build_block(root, name, content, opts)?;
+    let requested_user_placement = block.placement == Placement::User;
     if let Some(existing) = context_store::get_block(&conn, &block, &opts.session, None)? {
         block.content = if existing.content.is_empty() {
             content.to_string()
@@ -148,6 +159,9 @@ pub fn append(root: &Root, name: &str, content: &str, opts: &BlockOpts) -> Resul
         // Preserve the prior placement/priority on append (only content grows).
         block.priority = opts.priority.unwrap_or(existing.priority);
         block.placement = existing.placement;
+    }
+    if requested_user_placement || block.placement == Placement::User {
+        eprintln!("{USER_PLACEMENT_NOTE}");
     }
     context_store::upsert_block(&conn, &opts.profile, &block, &opts.session, None)?;
     println!("appended to block {name}");
@@ -264,6 +278,40 @@ mod tests {
             ..Default::default()
         };
         assert!(set(&root, "x", "y", &non_object).is_err());
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn user_placement_note_states_the_tradeoff() {
+        assert!(USER_PLACEMENT_NOTE.contains("re-sends this block every turn"));
+        assert!(USER_PLACEMENT_NOTE.contains("prefer `system`"));
+        assert!(USER_PLACEMENT_NOTE.contains("changes each turn"));
+    }
+
+    #[test]
+    fn append_preserves_existing_user_placement_when_flag_omitted() {
+        let root = scratch("append-user-placement");
+        let user_opts = BlockOpts {
+            owner: Some("architect".into()),
+            placement: "user".into(),
+            ..Default::default()
+        };
+        set(&root, "scratch", "one", &user_opts).unwrap();
+
+        let default_opts = BlockOpts {
+            owner: Some("architect".into()),
+            ..Default::default()
+        };
+        append(&root, "scratch", "two", &default_opts).unwrap();
+
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        let b = build_block(&root, "scratch", "", &default_opts).unwrap();
+        let stored = context_store::get_block(&conn, &b, &default_opts.session, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.content, "one\ntwo");
+        assert_eq!(stored.placement, Placement::User);
         std::fs::remove_dir_all(&root.dir).ok();
     }
 }
