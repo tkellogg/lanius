@@ -231,7 +231,10 @@ mod tests {
         let t = tool(&root, "#!/bin/sh\ncat\n", 5_000);
         let out = dispatch(&root, &t, &json!({ "query": "who verifies" })).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["query"], "who verifies", "the args round-trip through stdin");
+        assert_eq!(
+            v["query"], "who verifies",
+            "the args round-trip through stdin"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -259,7 +262,10 @@ mod tests {
         let mut pool = Pool::default();
         pool.tools.push(t);
         let out = pool.call(&root, "echo_args", &json!({})).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(5), "killed at the deadline");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "killed at the deadline"
+        );
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(
             v["error"].as_str().unwrap_or("").contains("timed out"),
@@ -297,7 +303,10 @@ mod tests {
 
         // Requested but not approved: absent from the array.
         let pool = Pool::load(&root, &conn, "default", &prof);
-        assert!(pool.tools.is_empty(), "unapproved tool is invisible to the agent");
+        assert!(
+            pool.tools.is_empty(),
+            "unapproved tool is invisible to the agent"
+        );
 
         packages::decide(&root, &conn, "echoer", true, "test").unwrap();
         let pool = Pool::load(&root, &conn, "default", &prof);
@@ -309,7 +318,9 @@ mod tests {
         let t = &pool.tools[0];
         assert_eq!(t.schema["properties"]["x"]["type"], "string");
         // A call round-trips.
-        let out = pool.call(&root, "echo_args", &json!({ "x": "hi" })).unwrap();
+        let out = pool
+            .call(&root, "echo_args", &json!({ "x": "hi" }))
+            .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["x"], "hi");
         std::fs::remove_dir_all(&root.dir).ok();
@@ -365,7 +376,9 @@ mod tests {
         let pool = Pool::load(&root, &conn, "default", &prof);
         assert_eq!(pool.tools.len(), 1);
         assert_eq!(pool.tools[0].name.to_string(), "search_knowledge");
-        let out = pool.call(&root, "search_knowledge", &json!({ "query": "x" })).unwrap();
+        let out = pool
+            .call(&root, "search_knowledge", &json!({ "query": "x" }))
+            .unwrap();
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["engine"], "a");
 
         // Dual-enable refused, naming the incumbent.
@@ -379,13 +392,19 @@ mod tests {
         packages::decide(&root, &conn, "engine-a", false, "test").unwrap();
         packages::decide(&root, &conn, "engine-b", true, "test").unwrap();
         let pool = Pool::load(&root, &conn, "default", &prof);
-        assert_eq!(pool.tools.len(), 1, "still exactly one holder after the swap");
+        assert_eq!(
+            pool.tools.len(),
+            1,
+            "still exactly one holder after the swap"
+        );
         assert_eq!(
             pool.tools[0].name.to_string(),
             "search_knowledge",
             "the tool NAME the agent sees is unchanged across the engine swap"
         );
-        let out = pool.call(&root, "search_knowledge", &json!({ "query": "x" })).unwrap();
+        let out = pool
+            .call(&root, "search_knowledge", &json!({ "query": "x" }))
+            .unwrap();
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["engine"], "b");
         std::fs::remove_dir_all(&root.dir).ok();
     }

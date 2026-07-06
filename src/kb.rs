@@ -390,7 +390,10 @@ fn safe_kb_rel(rel: &str) -> Result<PathBuf> {
 /// symlink — a planted link could redirect the write outside the package tree.
 fn reject_symlink_chain(kb: &Path, rel: &Path) -> Result<()> {
     if is_symlink(kb) {
-        bail!("kb directory {} is a symlink — refusing to write", kb.display());
+        bail!(
+            "kb directory {} is a symlink — refusing to write",
+            kb.display()
+        );
     }
     let mut cur = kb.to_path_buf();
     // Walk every intermediate directory of `rel` (not the final leaf file, which
@@ -405,13 +408,19 @@ fn reject_symlink_chain(kb: &Path, rel: &Path) -> Result<()> {
     for seg in &comps[..comps.len().saturating_sub(1)] {
         cur = cur.join(seg);
         if is_symlink(&cur) {
-            bail!("kb path component {} is a symlink — refusing", cur.display());
+            bail!(
+                "kb path component {} is a symlink — refusing",
+                cur.display()
+            );
         }
     }
     // The leaf, if it already exists, must be a regular file we can replace.
     let leaf = kb.join(rel);
     if is_symlink(&leaf) {
-        bail!("kb target {} is a symlink — refusing to overwrite", leaf.display());
+        bail!(
+            "kb target {} is a symlink — refusing to overwrite",
+            leaf.display()
+        );
     }
     Ok(())
 }
@@ -504,8 +513,14 @@ mod tests {
             "log",
         )
         .unwrap();
-        assert!(log.contains("elanus <elanus@localhost>"), "kernel committer: {log}");
-        assert!(log.contains("kb: write kb/notes/topic.md"), "commit subject: {log}");
+        assert!(
+            log.contains("elanus <elanus@localhost>"),
+            "kernel committer: {log}"
+        );
+        assert!(
+            log.contains("kb: write kb/notes/topic.md"),
+            "commit subject: {log}"
+        );
 
         // A second write is a new commit; the git log reconstructs who-what-when.
         let out2 = write(&root, "kb-demo", "notes/topic.md", "second\n").unwrap();
@@ -529,10 +544,7 @@ mod tests {
         let b = write(&root, "kb-demo", "role-verifier.md", "x\n").unwrap();
         assert_eq!(b.rel, "kb/role-verifier.md");
         assert!(!b.changed, "same file, same content — no second commit");
-        assert!(root
-            .packages()
-            .join("kb-demo/kb/role-verifier.md")
-            .exists());
+        assert!(root.packages().join("kb-demo/kb/role-verifier.md").exists());
         assert!(!root.packages().join("kb-demo/kb/kb").exists(), "no kb/kb/");
         std::fs::remove_dir_all(&root.dir).ok();
     }
@@ -569,9 +581,12 @@ mod tests {
         // root and shows in `elanus kb list`; its role/model files exist and
         // cross-link; the verifier facts are grep-able with a file; the invariants
         // are encoded verbatim.
-        let shipped = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("kits/stdlib/packages/kb-llm-strengths");
-        assert!(shipped.join("elanus.toml").exists(), "package ships in stdlib");
+        let shipped =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("kits/stdlib/packages/kb-llm-strengths");
+        assert!(
+            shipped.join("elanus.toml").exists(),
+            "package ships in stdlib"
+        );
 
         let root = scratch("seed");
         copy_tree(&shipped, &root.packages().join("kb-llm-strengths"));
@@ -588,15 +603,24 @@ mod tests {
         // One file per model and one per role, all present.
         let kb = e.path.clone();
         for f in [
-            "claude.md", "fable.md", "opus.md", "gpt-5.5.md", "glm-5.2.md",
-            "role-planner.md", "role-implementer.md", "role-verifier.md",
+            "claude.md",
+            "fable.md",
+            "opus.md",
+            "gpt-5.5.md",
+            "glm-5.2.md",
+            "role-planner.md",
+            "role-implementer.md",
+            "role-verifier.md",
         ] {
             assert!(kb.join(f).exists(), "kb/{f} exists");
         }
 
         // Cross-linking: a role file links a model file by relative path.
         let planner = std::fs::read_to_string(kb.join("role-planner.md")).unwrap();
-        assert!(planner.contains("(claude.md)"), "role links model by rel path");
+        assert!(
+            planner.contains("(claude.md)"),
+            "role links model by rel path"
+        );
         assert!(planner.contains("(fable.md)"));
         let opus = std::fs::read_to_string(kb.join("opus.md")).unwrap();
         assert!(opus.contains("role-implementer.md") && opus.contains("role-verifier.md"));
@@ -614,8 +638,7 @@ mod tests {
 
         // Planning never flexes; plan = Claude/Fable only.
         assert!(planner.contains("Only Claude or Fable plan"));
-        assert!(planner.to_lowercase().contains("never")
-            && planner.contains("GPT-5.5"));
+        assert!(planner.to_lowercase().contains("never") && planner.contains("GPT-5.5"));
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -687,8 +710,8 @@ mod tests {
         // the temp write-holes seatbelt always allows, so under $HOME (the same
         // "definitely outside" trick seatbelt_actually_cages uses).
         let home = std::env::var("HOME").unwrap();
-        let linked_root = std::path::Path::new(&home)
-            .join(format!("el-kb-linked-{}", std::process::id()));
+        let linked_root =
+            std::path::Path::new(&home).join(format!("el-kb-linked-{}", std::process::id()));
         let external_kb = linked_root.join("kb");
         std::fs::create_dir_all(&external_kb).unwrap();
         let external_kb = external_kb.canonicalize().unwrap();
@@ -708,7 +731,10 @@ mod tests {
         );
         assert!(ungranted.enforcing());
         let denied = ungranted
-            .shell_command(&format!("echo sneak > {}", external_kb.join("x.md").display()))
+            .shell_command(&format!(
+                "echo sneak > {}",
+                external_kb.join("x.md").display()
+            ))
             .output()
             .unwrap();
         assert!(
@@ -726,10 +752,16 @@ mod tests {
         );
         assert!(granted.enforcing());
         let ok = granted
-            .shell_command(&format!("echo knowledge > {}", external_kb.join("x.md").display()))
+            .shell_command(&format!(
+                "echo knowledge > {}",
+                external_kb.join("x.md").display()
+            ))
             .output()
             .unwrap();
-        assert!(ok.status.success(), "granted external kb write must succeed: {ok:?}");
+        assert!(
+            ok.status.success(),
+            "granted external kb write must succeed: {ok:?}"
+        );
 
         std::fs::remove_dir_all(&linked_root).ok();
         std::fs::remove_dir_all(&root.dir).ok();
@@ -775,7 +807,10 @@ mod tests {
         assert!(!hits.is_empty(), "a well-formed query returns hits");
         assert_eq!(hits[0].package, "kb-llm-strengths");
         assert_eq!(hits[0].path, "kb/role-verifier.md");
-        assert_eq!(hits[0].lines, "6-14", "the hit carries the openable line range");
+        assert_eq!(
+            hits[0].lines, "6-14",
+            "the hit carries the openable line range"
+        );
         assert!(hits[0].snippet.to_lowercase().contains("verif"));
         std::fs::remove_dir_all(&root.dir).ok();
     }
@@ -788,7 +823,13 @@ mod tests {
         let db = root.dir.join("kb-index.sqlite");
         build_fixture_index(
             &db,
-            &[("p", "kb/a.md", 1, 3, "verification is a stronger tier than implementation")],
+            &[(
+                "p",
+                "kb/a.md",
+                1,
+                3,
+                "verification is a stronger tier than implementation",
+            )],
         );
         // "stronger" is present; "zznope" is absent → AND (both terms) is empty,
         // so the OR fallback (any term) recovers the chunk on "stronger".
@@ -803,7 +844,10 @@ mod tests {
     #[test]
     fn query_tokens_strips_punctuation_and_lowercases() {
         assert_eq!(query_tokens("Who verifies?"), vec!["who", "verifies"]);
-        assert_eq!(query_tokens("  GPT-5.5 on high!  "), vec!["gpt", "5", "5", "on", "high"]);
+        assert_eq!(
+            query_tokens("  GPT-5.5 on high!  "),
+            vec!["gpt", "5", "5", "on", "high"]
+        );
         assert!(query_tokens("???").is_empty());
     }
 
@@ -831,7 +875,10 @@ mod tests {
         assert!(out.changed, "the diff produced a commit");
         assert_ne!(out.commit, before, "a new ratifier commit");
         let now = std::fs::read_to_string(pkg_dir.join("kb/a.md")).unwrap();
-        assert!(now.contains("line2-edited"), "the diff was applied: {now:?}");
+        assert!(
+            now.contains("line2-edited"),
+            "the diff was applied: {now:?}"
+        );
         // The commit subject records ratification.
         let subj = git_hardened::run_in(&pkg_dir, &["log", "-1", "--format=%s"], "log").unwrap();
         assert!(subj.contains("ratify"), "commit subject: {subj}");
@@ -856,7 +903,10 @@ mod tests {
 -x
 +y
 ";
-        assert!(apply_diff(&root, "kb-demo", traverse).is_err(), "traversal refused");
+        assert!(
+            apply_diff(&root, "kb-demo", traverse).is_err(),
+            "traversal refused"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -881,7 +931,10 @@ mod tests {
         )
         .unwrap();
         let pushed = git_hardened::run_in(&pkg_dir, &["push", "backup", "main"], "push");
-        assert!(pushed.is_ok(), "kb repo must push to a configured remote: {pushed:?}");
+        assert!(
+            pushed.is_ok(),
+            "kb repo must push to a configured remote: {pushed:?}"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 }

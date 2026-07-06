@@ -343,7 +343,10 @@ pub fn report_summary(report: &Report) -> String {
         ));
     }
     for o in &report.orphans {
-        out.push_str(&format!("  ORPHAN  {}/{} (no pointer references it)\n", o.kb, o.path));
+        out.push_str(&format!(
+            "  ORPHAN  {}/{} (no pointer references it)\n",
+            o.kb, o.path
+        ));
     }
     out
 }
@@ -634,8 +637,7 @@ mod tests {
             report
                 .broken
                 .iter()
-                .any(|i| i.path == "kb/gone.md"
-                    && matches!(i.status, PointerStatus::MissingPath)),
+                .any(|i| i.path == "kb/gone.md" && matches!(i.status, PointerStatus::MissingPath)),
             "broken-path pointer must appear: {:?}",
             report.broken
         );
@@ -657,7 +659,10 @@ mod tests {
         );
         // The healthy pointer's file is NOT an orphan (it is referenced) and NOT
         // in broken/stale.
-        assert!(!report.orphans.iter().any(|o| o.path == "kb/role-verifier.md"));
+        assert!(!report
+            .orphans
+            .iter()
+            .any(|o| o.path == "kb/role-verifier.md"));
         assert!(report.has_findings());
         assert_eq!(report.checked_pointers, 3);
         std::fs::remove_dir_all(&root.dir).ok();
@@ -670,7 +675,10 @@ mod tests {
         std::fs::write(&f, "a\nb\nc\n").unwrap();
         let sha = sha_of("a\nb\nc\n");
         assert_eq!(classify_pointer(&f, "1-3", &sha), PointerStatus::Ok);
-        assert_eq!(classify_pointer(&f, "1-3", "wrong"), PointerStatus::StaleSha);
+        assert_eq!(
+            classify_pointer(&f, "1-3", "wrong"),
+            PointerStatus::StaleSha
+        );
         assert_eq!(classify_pointer(&f, "1-99", &sha), PointerStatus::BadLines);
         assert_eq!(
             classify_pointer(&root.dir.join("nope.md"), "1-3", &sha),
@@ -699,8 +707,8 @@ mod tests {
         // M2 acceptance: with no config and no approval the pipeline is inert; the
         // gate flips live ONLY when every required key is set AND the package is
         // approved. Drives the REAL shipped package on a scratch root.
-        let shipped = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("kits/core/packages/kb-groundskeeper");
+        let shipped =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("kits/core/packages/kb-groundskeeper");
         let root = scratch("gate");
         copy_tree(&shipped, &root.packages().join(PKG));
         crate::config_repo::init(&root).unwrap();
@@ -710,12 +718,23 @@ mod tests {
 
         // The required keys are the manifest-declared ones (all four).
         let req = required_keys(&root);
-        for k in ["compactor_model", "ratifier_model", "cadence", "token_budget"] {
-            assert!(req.contains(&k.to_string()), "{k} is a declared required key");
+        for k in [
+            "compactor_model",
+            "ratifier_model",
+            "cadence",
+            "token_budget",
+        ] {
+            assert!(
+                req.contains(&k.to_string()),
+                "{k} is a declared required key"
+            );
         }
 
         // No config → load_config is inert (Err with a reason), and the gate is off.
-        assert!(matches!(load_config(&root), Ok(Err(_))), "inert before config");
+        assert!(
+            matches!(load_config(&root), Ok(Err(_))),
+            "inert before config"
+        );
         assert!(!is_setup_complete(&root, &conn), "gate off with no config");
 
         // Set every required key.
@@ -829,7 +848,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "the compactor launch emitted exactly one mailbox event");
+        assert_eq!(
+            count, 1,
+            "the compactor launch emitted exactly one mailbox event"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -849,14 +871,24 @@ mod tests {
         assert_eq!(c.model.as_deref(), Some("cheap-model"));
         assert_eq!(c.budget, Some(12345));
         assert_eq!(c.created_by.as_deref(), Some(PKG));
-        assert!(c.prompt.contains("kb/a.md"), "the corpus digest rides the prompt");
+        assert!(
+            c.prompt.contains("kb/a.md"),
+            "the corpus digest rides the prompt"
+        );
         assert!(c.prompt.to_lowercase().contains("unified diff"));
 
         let r = ratifier_request(&cfg, "--- a/kb/a.md\n+++ b/kb/a.md\n");
         assert_eq!(r.profile, RATIFIER_PROFILE);
-        assert_eq!(r.model.as_deref(), Some("strong-model"), "the EXPENSIVE model");
+        assert_eq!(
+            r.model.as_deref(),
+            Some("strong-model"),
+            "the EXPENSIVE model"
+        );
         assert_eq!(r.budget, Some(12345));
-        assert!(r.prompt.contains("+++ b/kb/a.md"), "the one diff rides the prompt");
+        assert!(
+            r.prompt.contains("+++ b/kb/a.md"),
+            "the one diff rides the prompt"
+        );
         assert!(r.prompt.contains("apply-diff") && r.prompt.contains(BOUNCE_BLOCK));
     }
 
@@ -874,7 +906,10 @@ mod tests {
             json!({"kb":"kb-demo","path":"kb/a.md","lines":"1-2","sha":sha_of(body)}),
         );
         let report = sweep(&root, &conn, "default").unwrap();
-        assert!(!report.has_findings(), "clean corpus has no findings: {report:?}");
+        assert!(
+            !report.has_findings(),
+            "clean corpus has no findings: {report:?}"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 }

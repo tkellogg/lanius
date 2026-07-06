@@ -110,15 +110,25 @@ fn m1_discover_cli_surfaces_a_missing_package_and_spares_a_visible_one() -> Resu
 
     // The worker lacks discord → it surfaces, naming what enabling adds + the path.
     let out = fx.run(&["discover", "--profile", "worker", "discord api"]);
-    assert!(out.status.success(), "discover failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "discover failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("discord"), "discord package named: {text}");
-    assert!(text.contains("send_discord"), "the tool enabling adds is named: {text}");
+    assert!(
+        text.contains("send_discord"),
+        "the tool enabling adds is named: {text}"
+    );
     assert!(
         text.contains("discord-api-notes.md"),
         "the kb file enabling adds is named: {text}"
     );
-    assert!(text.contains("config-proposal"), "the enable path rides config-proposal: {text}");
+    assert!(
+        text.contains("config-proposal"),
+        "the enable path rides config-proposal: {text}"
+    );
 
     // The default profile CAN see discord → it is not "missing".
     let out = fx.run(&["discover", "--profile", "default", "discord api"]);
@@ -130,8 +140,12 @@ fn m1_discover_cli_surfaces_a_missing_package_and_spares_a_visible_one() -> Resu
 
     // --json is machine-stable and shape-correct.
     let out = fx.run(&["discover", "--profile", "worker", "--json", "discord api"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .with_context(|| format!("parsing discover --json: {}", String::from_utf8_lossy(&out.stdout)))?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| {
+        format!(
+            "parsing discover --json: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })?;
     assert_eq!(v["profile"], "worker");
     let m = v["matches"]
         .as_array()
@@ -140,7 +154,11 @@ fn m1_discover_cli_surfaces_a_missing_package_and_spares_a_visible_one() -> Resu
         .find(|m| m["package"] == "discord")
         .expect("discord in the json matches");
     assert_eq!(m["enabled"], false);
-    assert!(m["adds"]["tools"].as_array().unwrap().iter().any(|t| t == "send_discord"));
+    assert!(m["adds"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t == "send_discord"));
     Ok(())
 }
 
@@ -152,15 +170,23 @@ fn m2_find_capability_tool_is_approved_taught_and_wraps_the_cli() -> Result<()> 
     // M0 grant gate is satisfied, so find_capability can fold into an agent array.
     let out = fx.run(&["packages", "--json", "--profile", "default"]);
     let listed = String::from_utf8_lossy(&out.stdout);
-    let approved = listed.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).any(|o| {
-        o["name"] == "discovery"
-            && o["grants"].as_array().map_or(false, |gs| {
-                gs.iter().any(|g| {
-                    g["kind"] == "tool" && g["value"] == "find_capability" && g["state"] == "approved"
+    let approved = listed
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|o| {
+            o["name"] == "discovery"
+                && o["grants"].as_array().map_or(false, |gs| {
+                    gs.iter().any(|g| {
+                        g["kind"] == "tool"
+                            && g["value"] == "find_capability"
+                            && g["state"] == "approved"
+                    })
                 })
-            })
-    });
-    assert!(approved, "discovery's find_capability tool grant is approved at init: {listed}");
+        });
+    assert!(
+        approved,
+        "discovery's find_capability tool grant is approved at init: {listed}"
+    );
 
     // The seeded high-awareness block teaches the tool on the default profile.
     let out = fx.run(&["render", "--profile", "default"]);
@@ -174,27 +200,56 @@ fn m2_find_capability_tool_is_approved_taught_and_wraps_the_cli() -> Result<()> 
     // (as the calling profile) → reshaped {query, found:[...]}. Drive it the way
     // the [[tool]] seam dispatches (args JSON on stdin, ELANUS_PROFILE in env).
     let find = fx.root.join("kits/stdlib/packages/discovery/scripts/find");
-    assert!(find.exists(), "the linked stdlib find script exists at {}", find.display());
+    assert!(
+        find.exists(),
+        "the linked stdlib find script exists at {}",
+        find.display()
+    );
     let mut child = Command::new("python3")
         .arg(&find)
         .env("ELANUS_ROOT", &fx.root)
         .env("ELANUS_PROFILE", "worker")
-        .env("PATH", format!("{}:{}", target_debug_dir()?.display(), std::env::var("PATH").unwrap_or_default()))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                target_debug_dir()?.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .current_dir(&fx.work)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .context("spawning the find tool script")?;
     use std::io::Write;
-    child.stdin.take().unwrap().write_all(br#"{"query":"discord api"}"#)?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"query":"discord api"}"#)?;
     let out = child.wait_with_output()?;
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .with_context(|| format!("parsing find output: {}", String::from_utf8_lossy(&out.stdout)))?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| {
+        format!(
+            "parsing find output: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })?;
     assert_eq!(v["query"], "discord api");
     let found = v["found"].as_array().expect("found array");
-    let discord = found.iter().find(|f| f["package"] == "discord").expect("discord in found");
-    assert!(discord["adds"]["tools"].as_array().unwrap().iter().any(|t| t == "send_discord"));
-    assert!(discord["enable"].as_str().unwrap().contains("config-proposal"));
+    let discord = found
+        .iter()
+        .find(|f| f["package"] == "discord")
+        .expect("discord in found");
+    assert!(discord["adds"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t == "send_discord"));
+    assert!(discord["enable"]
+        .as_str()
+        .unwrap()
+        .contains("config-proposal"));
     Ok(())
 }
 

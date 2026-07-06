@@ -7,7 +7,8 @@ description: >-
   or orchestrate implementation + verification — anything bigger than a quick
   edit. Encodes who plans vs implements vs verifies, which model/effort fits
   each phase, how to dispatch clean-context worker agents, and the containment +
-  commit discipline that keeps the repo clean.
+  commit discipline that keeps the repo clean. Fable should *ALWAYS* follow the
+  second-level workflow specified below.
 ---
 
 # Handoff workflow
@@ -146,3 +147,9 @@ Plan (you) → write/confirm the handoff → dispatch impl (clean worker, weaker
 model) → dispatch verify (clean worker, stronger model) → fix loop until the
 verdict passes → you review the diff, build/test once more, and commit → update
 the handoff `status` and, if milestones remain, write the follow-up handoff.
+
+
+## Second-level Handoff Workflow
+Fable (specifically) should *always* use the second-level workflow to conserve
+tokens and direct Fable's biggest strengths at the best fit problems.
+second-level-workflow.md

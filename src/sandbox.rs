@@ -886,7 +886,10 @@ mod tests {
         assert_eq!(allow.network_word(), "network open");
 
         // Off-platform: every dimension reads "unavailable here", never a silent on.
-        let inert = CageStatus { available: false, ..s };
+        let inert = CageStatus {
+            available: false,
+            ..s
+        };
         assert_eq!(inert.write_word(), "unavailable here");
         assert_eq!(inert.read_word(), "unavailable here");
         assert_eq!(inert.network_word(), "unavailable here");
@@ -956,7 +959,11 @@ mod tests {
     #[test]
     fn sbpl_contains_roots_and_denies_writes() {
         let protect = test_protect();
-        let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &CagePolicy::default());
+        let p = sbpl(
+            &[PathBuf::from("/tmp/ws")],
+            &protect,
+            &CagePolicy::default(),
+        );
         assert!(p.contains("(deny file-write*)"));
         assert!(p.contains("(subpath \"/tmp/ws\")"));
         assert!(p.contains("(subpath \"/dev\")"));
@@ -1064,7 +1071,10 @@ mod tests {
         let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
         // The loopback fence is still there (deny all, re-allow local)...
         assert!(p.contains("(deny network*)"), "{p}");
-        assert!(p.contains("(allow network-outbound (remote ip \"localhost:*\"))"), "{p}");
+        assert!(
+            p.contains("(allow network-outbound (remote ip \"localhost:*\"))"),
+            "{p}"
+        );
         // ...plus the narrow model-API hole: outbound TLS (:443) + resolver socket.
         assert!(
             p.contains("(allow network-outbound (remote tcp \"*:443\"))"),
@@ -1076,7 +1086,9 @@ mod tests {
         );
         // The egress arms come AFTER `(deny network*)` (last-match-wins).
         let deny_at = p.find("(deny network*)").unwrap();
-        let tls_at = p.find("(allow network-outbound (remote tcp \"*:443\"))").unwrap();
+        let tls_at = p
+            .find("(allow network-outbound (remote tcp \"*:443\"))")
+            .unwrap();
         assert!(deny_at < tls_at, "the :443 allow must follow the deny: {p}");
         // No blanket egress re-open: only :443 (not `remote ip "*"` / other ports).
         assert!(
@@ -1114,11 +1126,23 @@ mod tests {
         };
         let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
         // Deny-list mode NEVER flips to deny-by-default: baseline reads stay open.
-        assert!(!p.contains("(deny file-read*)\n"), "no blanket read deny: {p}");
-        assert!(p.contains("(deny file-read* (subpath \"/home/.ssh\"))"), "{p}");
-        assert!(p.contains("(deny file-read* (subpath \"/home/.aws\"))"), "{p}");
+        assert!(
+            !p.contains("(deny file-read*)\n"),
+            "no blanket read deny: {p}"
+        );
+        assert!(
+            p.contains("(deny file-read* (subpath \"/home/.ssh\"))"),
+            "{p}"
+        );
+        assert!(
+            p.contains("(deny file-read* (subpath \"/home/.aws\"))"),
+            "{p}"
+        );
         // The secrets fence survives alongside the new denies.
-        assert!(p.contains("(deny file-read* (subpath \"/r/.secrets\"))"), "{p}");
+        assert!(
+            p.contains("(deny file-read* (subpath \"/r/.secrets\"))"),
+            "{p}"
+        );
     }
 
     #[test]
@@ -1130,7 +1154,10 @@ mod tests {
         };
         let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
         // Allow-list mode flips reads to deny-by-default.
-        assert!(p.contains("(deny file-read*)\n"), "flips to deny-by-default: {p}");
+        assert!(
+            p.contains("(deny file-read*)\n"),
+            "flips to deny-by-default: {p}"
+        );
         // `(literal "/")` is required for root-path traversal (M1 spike).
         assert!(p.contains("(allow file-read*\n  (literal \"/\")"), "{p}");
         // The write roots are readable (an agent must read what it writes).
@@ -1138,14 +1165,19 @@ mod tests {
         let ws_read = p[allow_read_at..].find("(subpath \"/tmp/ws\")");
         assert!(ws_read.is_some(), "write root is read-allowed: {p}");
         // The always-needed holes mirror the write side.
-        assert!(p[allow_read_at..].contains("(subpath \"/private/tmp\")"), "{p}");
+        assert!(
+            p[allow_read_at..].contains("(subpath \"/private/tmp\")"),
+            "{p}"
+        );
         assert!(p[allow_read_at..].contains("(subpath \"/dev\")"), "{p}");
         // The caller's allow trees are present.
         assert!(p[allow_read_at..].contains("(subpath \"/usr\")"), "{p}");
         // The secrets fence is RE-ASSERTED after the allow-list so it still wins
         // even if an allow root is a parent of the secret store (last-match).
         let deny_flip = p.find("(deny file-read*)\n").unwrap();
-        let last_secret_deny = p.rfind("(deny file-read* (subpath \"/r/.secrets\"))").unwrap();
+        let last_secret_deny = p
+            .rfind("(deny file-read* (subpath \"/r/.secrets\"))")
+            .unwrap();
         assert!(
             last_secret_deny > deny_flip && last_secret_deny > allow_read_at,
             "secrets fence re-asserted after the allow-list: {p}"
@@ -1167,8 +1199,13 @@ mod tests {
         let p = sbpl(&[PathBuf::from("/tmp/ws")], &protect, &policy);
         assert!(p.contains("(deny network*)"), "{p}");
         let allow_read_at = p.find("(allow file-read*").unwrap();
-        let deny_entry_at = p.find("(deny file-read* (subpath \"/tmp/ws/private\"))").unwrap();
-        assert!(deny_entry_at > allow_read_at, "deny-list wins over allow-list: {p}");
+        let deny_entry_at = p
+            .find("(deny file-read* (subpath \"/tmp/ws/private\"))")
+            .unwrap();
+        assert!(
+            deny_entry_at > allow_read_at,
+            "deny-list wins over allow-list: {p}"
+        );
     }
 
     #[test]

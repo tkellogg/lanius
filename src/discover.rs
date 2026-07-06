@@ -174,7 +174,11 @@ fn walk_kb(base: &Path, dir: &Path, out: &mut Vec<String>) {
 /// description, a tool/stage/mcp/harness name, a gated builtin tool name).
 fn match_package(pkg: &Package, adds: &Adds, tokens: &[String]) -> Vec<String> {
     let mut matched = Vec::new();
-    let hit = |hay: &str| tokens.iter().any(|t| hay.to_lowercase().contains(t.as_str()));
+    let hit = |hay: &str| {
+        tokens
+            .iter()
+            .any(|t| hay.to_lowercase().contains(t.as_str()))
+    };
 
     if hit(&pkg.name) {
         matched.push("package name".to_string());
@@ -204,7 +208,11 @@ fn match_package(pkg: &Package, adds: &Adds, tokens: &[String]) -> Vec<String> {
     matched
 }
 
-fn collect_manifest_hits(lm: &LoadedManifest, hit: &impl Fn(&str) -> bool, matched: &mut Vec<String>) {
+fn collect_manifest_hits(
+    lm: &LoadedManifest,
+    hit: &impl Fn(&str) -> bool,
+    matched: &mut Vec<String>,
+) {
     let m = &lm.manifest;
     for t in &m.tool {
         if hit(&format!("{} {}", t.name, t.description)) {

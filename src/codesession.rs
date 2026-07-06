@@ -922,7 +922,10 @@ fn session_identity(conn: &rusqlite::Connection, session: &str) -> (String, Stri
         .ok()
         .flatten();
     let (agent_noun, last_active) = rec.unwrap_or_default();
-    let last_active = fresher_iso(&last_active, session_stats_updated_at(conn, session).as_deref());
+    let last_active = fresher_iso(
+        &last_active,
+        session_stats_updated_at(conn, session).as_deref(),
+    );
     (agent_noun, last_active)
 }
 
@@ -1178,7 +1181,10 @@ pub fn claim_spawn_edge(root: &Root, worker_session: &str) -> SettleClaim {
 }
 
 /// The connection-level claim, shared by the worker path and the daemon reaper.
-pub fn claim_spawn_edge_on(conn: &rusqlite::Connection, worker_session: &str) -> Result<SettleClaim> {
+pub fn claim_spawn_edge_on(
+    conn: &rusqlite::Connection,
+    worker_session: &str,
+) -> Result<SettleClaim> {
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM code_spawn_edges WHERE worker_session = ?1",

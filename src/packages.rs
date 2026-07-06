@@ -153,10 +153,11 @@ pub fn is_granted(conn: &Connection, package: &str) -> Result<bool> {
     let Some(hash) = crate::db::kv_get(conn, &format!("pkg_hash:{package}"))? else {
         // No recorded hash: a manifest-less (pure-skill) package, or one never
         // synced. Granted only if it carries no grant rows at all.
-        let rows: i64 =
-            conn.query_row("SELECT COUNT(*) FROM grants WHERE package=?1", [package], |r| {
-                r.get(0)
-            })?;
+        let rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM grants WHERE package=?1",
+            [package],
+            |r| r.get(0),
+        )?;
         return Ok(rows == 0);
     };
     let pending: i64 = conn.query_row(
@@ -478,12 +479,12 @@ pub fn decide(root: &Root, conn: &Connection, name: &str, approve: bool, by: &st
         bail!("{name} has no elanus.toml — nothing to decide");
     };
     sync(root, conn)?; // make sure current-hash rows exist first
-    // Approve-time [[tool]] collision refusal (docs/handoffs/kb-search.md M0):
-    // a tool name is a bare, global handle in the agent's array, so at most one
-    // approved holder may exist and none may shadow a kernel builtin. Refuse
-    // LOUDLY, naming the current holder, BEFORE flipping any rows — the human
-    // disables/revokes the incumbent first. This is exactly the engine-swap
-    // ergonomic: agents never see two engines racing for one tool name.
+                       // Approve-time [[tool]] collision refusal (docs/handoffs/kb-search.md M0):
+                       // a tool name is a bare, global handle in the agent's array, so at most one
+                       // approved holder may exist and none may shadow a kernel builtin. Refuse
+                       // LOUDLY, naming the current holder, BEFORE flipping any rows — the human
+                       // disables/revokes the incumbent first. This is exactly the engine-swap
+                       // ergonomic: agents never see two engines racing for one tool name.
     if approve {
         for t in &lm.manifest.tool {
             if crate::exec::KERNEL_TOOL_NAMES.contains(&t.name.as_str()) {
@@ -1109,10 +1110,7 @@ mod tests {
         decide(&root, &conn, "cap", true, "test").unwrap();
         assert!(is_granted(&conn, "cap").unwrap(), "approved is granted");
         decide(&root, &conn, "cap", false, "test").unwrap();
-        assert!(
-            !is_granted(&conn, "cap").unwrap(),
-            "revoked is not granted"
-        );
+        assert!(!is_granted(&conn, "cap").unwrap(), "revoked is not granted");
         std::fs::remove_dir_all(&root.dir).ok();
     }
 

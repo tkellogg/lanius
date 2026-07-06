@@ -56,8 +56,8 @@ fn init_seeds_stock_harness_packages() -> Result<()> {
         let manifest_path = pkg.join("elanus.toml");
         let raw = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("reading {}", manifest_path.display()))?;
-        let manifest: Manifest = toml::from_str(&raw)
-            .with_context(|| format!("parsing {}", manifest_path.display()))?;
+        let manifest: Manifest =
+            toml::from_str(&raw).with_context(|| format!("parsing {}", manifest_path.display()))?;
         assert_eq!(
             manifest.harness.len(),
             1,
@@ -75,7 +75,11 @@ fn init_seeds_stock_harness_packages() -> Result<()> {
         assert_eq!(harness.aliases, expected_aliases);
 
         let adapter = pkg.join("bin/adapter");
-        assert!(adapter.exists(), "missing adapter binary {}", adapter.display());
+        assert!(
+            adapter.exists(),
+            "missing adapter binary {}",
+            adapter.display()
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -120,7 +124,11 @@ fn init_seeds_stock_harness_packages() -> Result<()> {
         "kits/core/profiles/kb-ratifier/profile.toml",
     ] {
         let p = root_dir.join(rel);
-        assert!(p.exists(), "init must seed {rel}, missing at {}", p.display());
+        assert!(
+            p.exists(),
+            "init must seed {rel}, missing at {}",
+            p.display()
+        );
     }
 
     // The stdlib KB is not just on disk — it is auto-installed, so `elanus kb list`

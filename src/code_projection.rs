@@ -479,12 +479,21 @@ fn item_text_status(item: &Value) -> Option<(String, String)> {
         return Some((t.to_string(), "todo".to_string()));
     }
     let obj = item.as_object()?;
-    let text = ["content", "text", "step", "title", "name", "description", "task", "label"]
-        .iter()
-        .find_map(|k| obj.get(*k).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
+    let text = [
+        "content",
+        "text",
+        "step",
+        "title",
+        "name",
+        "description",
+        "task",
+        "label",
+    ]
+    .iter()
+    .find_map(|k| obj.get(*k).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|s| !s.is_empty())?
+    .to_string();
     Some((text, normalize_status(obj)))
 }
 
@@ -1541,7 +1550,10 @@ mod tests {
         );
         project_trace(&root).unwrap();
         let cur = crate::codesession::current_task(&root, "code-si2cc").unwrap();
-        assert_eq!(cur, ("write the fold".to_string(), "in_progress".to_string()));
+        assert_eq!(
+            cur,
+            ("write the fold".to_string(), "in_progress".to_string())
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 }

@@ -179,7 +179,11 @@ fn spawn_worker_delivers_structured_completion_and_settles_edge() -> Result<()> 
     let payload = poll_completion(&conn, "in/agent/claude-code/code-spawner1")
         .context("detached worker never delivered its completion")?;
     let pv: serde_json::Value = serde_json::from_str(&payload)?;
-    assert_eq!(pv["failed"], serde_json::json!(false), "clean exit → failed:false");
+    assert_eq!(
+        pv["failed"],
+        serde_json::json!(false),
+        "clean exit → failed:false"
+    );
     assert_eq!(pv["exit_code"], serde_json::json!(0));
     assert!(pv["worker"].as_str().unwrap().starts_with("code-"));
     assert!(pv["prompt"].as_str().unwrap().contains("finished"));
@@ -193,7 +197,10 @@ fn spawn_worker_delivers_structured_completion_and_settles_edge() -> Result<()> 
         )
         .optional()?
         .flatten();
-    assert!(settled.is_some(), "the spawn edge is settled after delivery");
+    assert!(
+        settled.is_some(),
+        "the spawn edge is settled after delivery"
+    );
 
     let _ = std::fs::remove_dir_all(&root_dir);
     let _ = std::fs::remove_dir_all(&workdir);
@@ -230,15 +237,26 @@ fn spawn_worker_that_exits_nonzero_mails_structured_failure() -> Result<()> {
         .current_dir(&workdir)
         .output()
         .context("running elanus code spawn echo (failure)")?;
-    assert!(out.status.success(), "the SPAWN command itself still returns 0");
+    assert!(
+        out.status.success(),
+        "the SPAWN command itself still returns 0"
+    );
 
     let conn = elanus::db::open(&root)?;
     elanus::db::init_schema(&conn)?;
     let payload = poll_completion(&conn, "in/agent/claude-code/code-spawner2")
         .context("failing worker never delivered its completion")?;
     let pv: serde_json::Value = serde_json::from_str(&payload)?;
-    assert_eq!(pv["failed"], serde_json::json!(true), "nonzero exit → failed:true");
-    assert_eq!(pv["exit_code"], serde_json::json!(5), "the exit code is carried");
+    assert_eq!(
+        pv["failed"],
+        serde_json::json!(true),
+        "nonzero exit → failed:true"
+    );
+    assert_eq!(
+        pv["exit_code"],
+        serde_json::json!(5),
+        "the exit code is carried"
+    );
 
     let _ = std::fs::remove_dir_all(&root_dir);
     let _ = std::fs::remove_dir_all(&workdir);

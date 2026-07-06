@@ -973,7 +973,10 @@ fn run(cli: Cli) -> Result<()> {
                  VALUES (?1, ?2, ?3, ?4, 0)",
                 rusqlite::params![fire_at, emit_type, payload.to_string(), "cli"],
             )?;
-            println!("scheduled {} to wake at {fire_at}", elanus::topic::agent_mailbox(&agent));
+            println!(
+                "scheduled {} to wake at {fire_at}",
+                elanus::topic::agent_mailbox(&agent)
+            );
         }
         Cmd::Trace { kind, payload } => {
             let ids = trace::Ids::from_env();
@@ -1381,16 +1384,10 @@ fn run(cli: Cli) -> Result<()> {
         },
         Cmd::Kb { cmd } => match cmd {
             KbCmd::List { profile, json } => kbcli::list(&root, &profile, json)?,
-            KbCmd::Search {
-                query,
-                limit,
-                json,
-            } => kbcli::search(&root, &query.join(" "), limit, json)?,
-            KbCmd::Write {
-                pkg,
-                path,
-                content,
-            } => {
+            KbCmd::Search { query, limit, json } => {
+                kbcli::search(&root, &query.join(" "), limit, json)?
+            }
+            KbCmd::Write { pkg, path, content } => {
                 let content = match content {
                     Some(c) => c,
                     None => read_stdin()?,
@@ -1426,7 +1423,11 @@ fn run(cli: Cli) -> Result<()> {
                 );
             } else {
                 for m in &report.matches {
-                    println!("{} (not enabled) — matches: {}", m.package, m.matched.join(", "));
+                    println!(
+                        "{} (not enabled) — matches: {}",
+                        m.package,
+                        m.matched.join(", ")
+                    );
                     let mut adds = Vec::new();
                     if !m.adds.kb.is_empty() {
                         adds.push(format!("kb ({})", m.adds.kb.join(", ")));

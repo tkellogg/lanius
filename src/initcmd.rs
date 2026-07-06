@@ -193,9 +193,7 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
     // the dispatching architect surfaces the model-tiering pointer.
     PkgFile {
         rel: "core/profiles/architect/blocks/10-kb-llm-strengths.md",
-        content: include_str!(
-            "../kits/core/profiles/architect/blocks/10-kb-llm-strengths.md"
-        ),
+        content: include_str!("../kits/core/profiles/architect/blocks/10-kb-llm-strengths.md"),
         exec: false,
     },
     // kb-groundskeeper — the KB's caretaker (docs/handoffs/kb-groundskeeper.md):

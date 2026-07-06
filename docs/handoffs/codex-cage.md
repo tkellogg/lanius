@@ -39,12 +39,14 @@ reused: `Cage::from_roots_with_policy` with `NetworkPolicy::Loopback` and the
    cage** today. `run_codex_tui_import` (`:4326`) stays untouched (the human
    approves). No other harness/mode changes. *Confirm the narrow scope.*
 
-2. **Cage shape: write = workdir, network = loopback.** Write roots = the
-   session's `workdir` (a headless worker's whole job is its workdir); the
-   `Protect` fence keeps the ledger + secrets un-writable/un-readable even inside
-   a root. `network = loopback` (not `none`) because the codex child must reach
-   the broker + local HTTP read planes + any loopback-HTTP MCP daemon. **My call:
-   `{ write_roots: [workdir], network: loopback }`, `Protect::for_root`.**
+2. **Cage shape: write = workdir + generated CODEX_HOME, network = loopback.**
+   Write roots = the session's `workdir` (a headless worker's whole job is its
+   workdir) plus the per-session generated `CODEX_HOME` (codex >=0.142 writes
+   startup state there); the `Protect` fence keeps the ledger + secrets
+   un-writable/un-readable even inside a root. `network = loopback` (not `none`)
+   because the codex child must reach the broker + local HTTP read planes + any
+   loopback-HTTP MCP daemon. **My call: `{ write_roots: [workdir,
+   codex_home], network: loopback }`, `Protect::for_root`.**
    *Confirm — `none` would cut MCP/HTTP; `open` would defeat egress control.*
 
 3. **macOS-only enforcement, honest off-macOS.** `can_enforce`
@@ -74,10 +76,10 @@ reused: `Cage::from_roots_with_policy` with `NetworkPolicy::Loopback` and the
 
 ### M1 — cage the headless codex spawn
 Wrap `run_codex_capture`'s `codex` spawn (`src/codeagent.rs:4209`) in a `Cage`
-built with `write_roots = [workdir]`, `NetworkPolicy::Loopback`, and
-`Protect::for_root(root)`, enforced on macOS (camera-only elsewhere). The TUI path
-(`run_codex_tui_import`) is untouched. Preserve the existing timeout wrap, provider
-injection, stdin briefing, and env (wonky bit 4).
+built with `write_roots = [workdir, codex_home]`, `NetworkPolicy::Loopback`, and
+`Protect::for_root(root)`, enforced on macOS (camera-only elsewhere). The TUI
+path (`run_codex_tui_import`) is untouched. Preserve the existing timeout wrap,
+provider injection, stdin briefing, and env (wonky bit 4).
 
 **Acceptance:** a headless codex worker **cannot write outside its workdir**
 (a write to `$HOME/x` under the cage fails; a write inside the workdir succeeds);
@@ -101,7 +103,7 @@ sockets; loopback covers any HTTP-port MCP daemon). Skipped, not failed, where
 ### M3 — posture stamp reflects the cage
 Update the `session/start` obs record (`src/codeagent.rs:3490-3519`) so that when
 the headless codex cage is applied, the stamp records elanus's cage posture
-(e.g. an `elanus_cage: { write: "workdir", network: "loopback", enforced: <bool> }`
+(e.g. an `elanus_cage: { write: "workdir+codex-home", network: "loopback", enforced: <bool> }`
 field) **alongside** the existing `approvals: "auto", sandbox:
 "danger-full-access"` from `codex_headless_approval_posture` (`:4159`). A
 session's authority stays fully reconstructable from its trace — now showing both
@@ -134,6 +136,15 @@ false` (never a silent "on"). `cargo test` green.
   [codex-app-server.md](codex-app-server.md).
 
 ## Log
+- 2026-07-03 — Codex 0.142 startup write regression found in the caged headless
+  paths: the generated session `CODEX_HOME` is not just read material; codex
+  writes startup/client state there and exits under a read-only home. Adjusted
+  the cage posture to allow writes to the session-local generated `CODEX_HOME`
+  in addition to the workdir, and stamp it as `write: "workdir+codex-home"`.
+  Auth symlinks inside that home still resolve to the user's real codex home,
+  which remains outside the write roots; `Protect::for_root` still fences the
+  ledger, bus file, config, profiles, and secrets. Verified with the focused
+  live macOS cage tests and full `cargo test --lib`.
 - 2026-07-02 — Decomposed from security.md entry 24 + single-cage-macos.md's
   deferred "deliberate step" by Opus (planner) under Fable. Grounded against the
   sprint-4 worktree: `run_codex_capture` (`src/codeagent.rs:4168`) spawns `codex`

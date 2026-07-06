@@ -83,41 +83,41 @@ fn get_value(root: &Root, name: &str) -> Result<serde_json::Value> {
     let (p, pdir) = profile::load(root, name)?;
     let raw = std::fs::read_to_string(pdir.join("profile.toml")).unwrap_or_default();
     Ok(json!({
-            "profile": name,
-            "agent": p.agent,
-            "owner": p.owner,
-            "parent": p.parent,
-            "model": p.model.model,
-            "max_turns": p.model.max_turns,
-            "provider": p.model.provider,
-            "base_url": p.model.base_url,
-            "api_key_env": p.model.api_key_env,
-            "workdir": p.sandbox.workdir,
-            "fs_write": p.sandbox.fs_write,
-            "capture_exclude": p.sandbox.capture_exclude,
-            // The read/network cage keys — surfaced typed so the web UI reads
-            // them as fields instead of re-parsing the raw TOML blob (sandbox-
-            // config-ui M1). `cage` is this profile's computed posture in
-            // product words, through the one shared mapping.
-            "network": p.sandbox.network,
-            "fs_read_deny": p.sandbox.fs_read_deny,
-            "fs_read_allow": p.sandbox.fs_read_allow,
-            "cage": crate::web::cage_status_json(&p.sandbox),
-            "skills": { "include": p.skills.include, "exclude": p.skills.exclude },
-            "local_elanus_path": profile::local_elanus_path(root, name).unwrap_or(None),
-            "elanus_path": p.elanus_path,
-            "package_path": p.elanus_path,
-            "autonomy": p.autonomy,
-            "context": {
-                "program": p.context.program,
-                "max_total_ms": p.context.max_total_ms,
-                "stages": p.context.stages,
-            },
-            "subagents": p.subagents,
-            "vars": p.vars,
-            "throttle": p.throttle,
-            "toml": raw,
-        }))
+        "profile": name,
+        "agent": p.agent,
+        "owner": p.owner,
+        "parent": p.parent,
+        "model": p.model.model,
+        "max_turns": p.model.max_turns,
+        "provider": p.model.provider,
+        "base_url": p.model.base_url,
+        "api_key_env": p.model.api_key_env,
+        "workdir": p.sandbox.workdir,
+        "fs_write": p.sandbox.fs_write,
+        "capture_exclude": p.sandbox.capture_exclude,
+        // The read/network cage keys — surfaced typed so the web UI reads
+        // them as fields instead of re-parsing the raw TOML blob (sandbox-
+        // config-ui M1). `cage` is this profile's computed posture in
+        // product words, through the one shared mapping.
+        "network": p.sandbox.network,
+        "fs_read_deny": p.sandbox.fs_read_deny,
+        "fs_read_allow": p.sandbox.fs_read_allow,
+        "cage": crate::web::cage_status_json(&p.sandbox),
+        "skills": { "include": p.skills.include, "exclude": p.skills.exclude },
+        "local_elanus_path": profile::local_elanus_path(root, name).unwrap_or(None),
+        "elanus_path": p.elanus_path,
+        "package_path": p.elanus_path,
+        "autonomy": p.autonomy,
+        "context": {
+            "program": p.context.program,
+            "max_total_ms": p.context.max_total_ms,
+            "stages": p.context.stages,
+        },
+        "subagents": p.subagents,
+        "vars": p.vars,
+        "throttle": p.throttle,
+        "toml": raw,
+    }))
 }
 
 /// Set dotted keys: `elanus profile set default agent=kestrel

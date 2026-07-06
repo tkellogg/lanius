@@ -1099,7 +1099,10 @@ mod tests {
         let c = conn();
         // Two agent-scope 'identity' rows for owner 'lily', NULL-keyed so they
         // bypass the UNIQUE constraint; the higher id carries the newer content.
-        for (content, sha) in [("first", sha256_hex(b"first")), ("second", sha256_hex(b"second"))] {
+        for (content, sha) in [
+            ("first", sha256_hex(b"first")),
+            ("second", sha256_hex(b"second")),
+        ] {
             c.execute(
                 "INSERT INTO context_blocks
                    (scope, owner, session_id, run_id, name, placement, priority, content, content_sha256, meta)

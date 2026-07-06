@@ -682,7 +682,9 @@ pub(crate) fn tick_schedules(root: &Root, conn: &Connection) -> Result<()> {
             root,
             conn,
             EmitOpts {
-                payload: payload.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+                payload: payload
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok()),
                 // Dedupes this firing across daemon restarts / mid-fire crash.
                 idempotency: Some(format!("sched:{id}")),
                 ..EmitOpts::new(&emit_type)
@@ -704,7 +706,8 @@ pub(crate) fn tick_schedules(root: &Root, conn: &Connection) -> Result<()> {
 /// EXPLAIN-plan regression test (`expire_deadlines_uses_type_deadline_index`)
 /// guards the EXACT production query against drift that would reintroduce the
 /// scan.
-const EXPIRE_DEADLINES_SELECT: &str = "SELECT e.id, e.correlation_id, e.default_action FROM events e
+const EXPIRE_DEADLINES_SELECT: &str =
+    "SELECT e.id, e.correlation_id, e.default_action FROM events e
              WHERE e.type = ?1 AND e.deadline IS NOT NULL
                AND e.state != 'expired' AND e.correlation_id IS NOT NULL
                AND e.deadline < strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -2151,7 +2154,9 @@ mod tests {
         // The stale row is HELD, not driven: surfaced for confirmation, never a
         // prompt the user didn't just type.
         let stale_state: String = conn
-            .query_row("SELECT state FROM events WHERE id=?1", [stale], |r| r.get(0))
+            .query_row("SELECT state FROM events WHERE id=?1", [stale], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(stale_state, "held", "stale mail is held, not driven");
         assert!(
@@ -2161,7 +2166,9 @@ mod tests {
 
         // The fresh row drives normally.
         let fresh_state: String = conn
-            .query_row("SELECT state FROM events WHERE id=?1", [fresh], |r| r.get(0))
+            .query_row("SELECT state FROM events WHERE id=?1", [fresh], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(fresh_state, "running", "fresh mail is claimed and driven");
         assert!(code.claimed.contains(&fresh));
@@ -2170,7 +2177,10 @@ mod tests {
         let job = rx.try_recv().expect("the fresh delivery was enqueued");
         assert_eq!(job.event_id, fresh);
         assert_eq!(job.message, "the task I just typed");
-        assert!(rx.try_recv().is_err(), "the stale delivery was NOT enqueued");
+        assert!(
+            rx.try_recv().is_err(),
+            "the stale delivery was NOT enqueued"
+        );
 
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -2275,10 +2285,17 @@ mod tests {
         assert_eq!(n, 1, "the due schedule fires exactly one in/agent/main");
         let pl: Value = serde_json::from_str(&pl.unwrap()).unwrap();
         assert_eq!(pl["prompt"], "post here");
-        assert_eq!(pl["session"], "conv-7", "the wake carries the turn's session");
+        assert_eq!(
+            pl["session"], "conv-7",
+            "the wake carries the turn's session"
+        );
         // The future row is untouched.
         let unfired: i64 = conn
-            .query_row("SELECT COUNT(*) FROM scheduled_events WHERE fired = 0", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM scheduled_events WHERE fired = 0",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(unfired, 1, "the future schedule has not fired");
 
@@ -2293,8 +2310,14 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(st, "pending", "a self-wake falls through to dispatch, not code drive");
-        assert!(code.claimed.is_empty(), "no coding session claims a self-wake");
+        assert_eq!(
+            st, "pending",
+            "a self-wake falls through to dispatch, not code drive"
+        );
+        assert!(
+            code.claimed.is_empty(),
+            "no coding session claims a self-wake"
+        );
 
         // Restart durability + idempotency: reopen the db and re-sweep — the
         // fired row does not re-fire (fired flag; sched:<id> key backstops it).
@@ -2303,7 +2326,11 @@ mod tests {
         db::init_schema(&conn2).unwrap();
         tick_schedules(&root, &conn2).unwrap();
         let n2: i64 = conn2
-            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&main_mb], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = ?1",
+                [&main_mb],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n2, 1, "a fired schedule never re-fires across a restart");
 
@@ -3076,8 +3103,14 @@ mod tests {
         let pv: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(pv["failed"], json!(true), "structured failed:true");
         assert_eq!(pv["worker"], json!("code-wrkdead1"));
-        assert!(pv["exit_code"].is_null(), "a killed worker has no exit code");
-        assert_eq!(corr, "corr-dead", "the completion threads on the spawn corr");
+        assert!(
+            pv["exit_code"].is_null(),
+            "a killed worker has no exit code"
+        );
+        assert_eq!(
+            corr, "corr-dead",
+            "the completion threads on the spawn corr"
+        );
         assert!(pv["prompt"]
             .as_str()
             .unwrap()
@@ -3176,9 +3209,7 @@ mod tests {
         // The planner's mailbox holds EXACTLY ONE completion — for wrkdead2 only
         // (wrkwon01 was claimed by the worker, so the reaper stayed silent).
         let mut stmt = conn
-            .prepare(
-                "SELECT payload FROM events WHERE type='in/agent/claude-code/code-plannr11'",
-            )
+            .prepare("SELECT payload FROM events WHERE type='in/agent/claude-code/code-plannr11'")
             .unwrap();
         let workers: Vec<String> = stmt
             .query_map([], |r| r.get::<_, String>(0))

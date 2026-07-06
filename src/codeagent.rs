@@ -255,7 +255,10 @@ const HARNESS_CONFIG_VARS: &[&str] = &[
 /// position in argv (codex `-c` flags before the prompt); claude/opencode carry no
 /// args today. Env VALUES carry the decrypted secret — they reach the child's env
 /// here and are never logged (the injection's `Debug` redacts them).
-fn apply_provider_injection_env(cmd: &mut std::process::Command, inj: &crate::provider::HarnessInjection) {
+fn apply_provider_injection_env(
+    cmd: &mut std::process::Command,
+    inj: &crate::provider::HarnessInjection,
+) {
     for var in HARNESS_CONFIG_VARS {
         cmd.env_remove(var);
     }
@@ -428,7 +431,11 @@ pub fn session_resume_hint(root: &Root, elanus_session: &str) -> String {
     }
 }
 
-fn resolve_external_harness(root: &Root, profile_name: &str, tool: &str) -> Result<ExternalHarness> {
+fn resolve_external_harness(
+    root: &Root,
+    profile_name: &str,
+    tool: &str,
+) -> Result<ExternalHarness> {
     find_external_harness(root, profile_name, tool)?.ok_or_else(|| {
         anyhow::anyhow!(
             "no harness named {tool} — is it installed? (run `elanus init` to seed the stock claude/codex/opencode harness packages)"
@@ -1054,9 +1061,13 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str, provider: Option<&str>) -> R
     // must not abort a spawn that already launched (the worker still mails for
     // itself on a clean exit); it only forfeits the SIGKILL safety net.
     let worker_pid = child.id() as i32;
-    if let Err(e) =
-        codesession::record_spawn_edge(root, &worker_session, &spawner, Some(&correlation), worker_pid)
-    {
+    if let Err(e) = codesession::record_spawn_edge(
+        root,
+        &worker_session,
+        &spawner,
+        Some(&correlation),
+        worker_pid,
+    ) {
         eprintln!("[code] recording spawn edge for {worker_session} failed (continuing): {e:#}");
     }
 
@@ -1931,7 +1942,9 @@ fn extract_reasoning_effort_config(config: &str) -> Option<String> {
 /// validated absolute + non-empty here, at construction, so an empty/relative
 /// prefix — which would be a silent root-wildcard footgun in `path_covered` —
 /// is rejected before it reaches `mint`.
-fn take_grants_flags(args: &[String]) -> anyhow::Result<(codesession::RequestedGrants, Vec<String>)> {
+fn take_grants_flags(
+    args: &[String],
+) -> anyhow::Result<(codesession::RequestedGrants, Vec<String>)> {
     let mut budget: Option<u64> = None;
     let mut publish: Vec<String> = Vec::new();
     let mut subscribe: Vec<String> = Vec::new();
@@ -1946,19 +1959,13 @@ fn take_grants_flags(args: &[String]) -> anyhow::Result<(codesession::RequestedG
         let flag = args[i].as_str();
         // Value-taking flags: consume flag + next token, reject if next token is missing.
         match flag {
-            "--budget" | "--grant-publish" | "--grant-subscribe"
-            | "--grant-fs-write" | "--grant-fs-read"
-            | "--grant-tool" | "--grant-blocking" => {
-                let value = args
-                    .get(i + 1)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
+            "--budget" | "--grant-publish" | "--grant-subscribe" | "--grant-fs-write"
+            | "--grant-fs-read" | "--grant-tool" | "--grant-blocking" => {
+                let value = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
                 // A bare trailing flag (no value) or a value that itself looks like a
                 // flag is a usage error.
                 if value.is_empty() || value.starts_with("--") {
-                    anyhow::bail!(
-                        "flag `{flag}` requires a value but none was provided"
-                    );
+                    anyhow::bail!("flag `{flag}` requires a value but none was provided");
                 }
                 match flag {
                     "--budget" => {
@@ -2005,7 +2012,9 @@ fn take_grants_flags(args: &[String]) -> anyhow::Result<(codesession::RequestedG
                     }
                     "--grant-blocking" => {
                         if value.is_empty() {
-                            anyhow::bail!("--grant-blocking requires a non-empty blocking-class name");
+                            anyhow::bail!(
+                                "--grant-blocking requires a non-empty blocking-class name"
+                            );
                         }
                         blocking.push(value.to_string());
                     }
@@ -2023,12 +2032,36 @@ fn take_grants_flags(args: &[String]) -> anyhow::Result<(codesession::RequestedG
 
     let grants = codesession::RequestedGrants {
         budget,
-        publish: if publish.is_empty() { None } else { Some(publish) },
-        subscribe: if subscribe.is_empty() { None } else { Some(subscribe) },
-        fs_write: if fs_write.is_empty() { None } else { Some(fs_write) },
-        fs_read: if fs_read.is_empty() { None } else { Some(fs_read) },
-        tool_allowlist: if tool_allowlist.is_empty() { None } else { Some(tool_allowlist) },
-        blocking: if blocking.is_empty() { None } else { Some(blocking) },
+        publish: if publish.is_empty() {
+            None
+        } else {
+            Some(publish)
+        },
+        subscribe: if subscribe.is_empty() {
+            None
+        } else {
+            Some(subscribe)
+        },
+        fs_write: if fs_write.is_empty() {
+            None
+        } else {
+            Some(fs_write)
+        },
+        fs_read: if fs_read.is_empty() {
+            None
+        } else {
+            Some(fs_read)
+        },
+        tool_allowlist: if tool_allowlist.is_empty() {
+            None
+        } else {
+            Some(tool_allowlist)
+        },
+        blocking: if blocking.is_empty() {
+            None
+        } else {
+            Some(blocking)
+        },
     };
     Ok((grants, out))
 }
@@ -2482,7 +2515,10 @@ pub fn whose_cmd(root: &Root, args: &[String]) -> Result<()> {
         bail!("usage: elanus code whose <path>   |   elanus code whose --dirty [--json]");
     };
     if want_json {
-        println!("{}", serde_json::to_string_pretty(&whose_json(root, path, viewer))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&whose_json(root, path, viewer))?
+        );
     } else {
         println!("{}", whose_line(root, path, viewer));
     }
@@ -3512,13 +3548,7 @@ fn launch_external_harness(
         // Join the coordination room so this session's advisory claims are REAPED when
         // it dies (reap_dead_members keys on code_room_members) — parity with built-ins.
         let _ = codesession::set_room(root, &session, &room);
-        let _ = codesession::join_room(
-            root,
-            &room,
-            &session,
-            &agent,
-            std::process::id() as i32,
-        );
+        let _ = codesession::join_room(root, &room, &session, &agent, std::process::id() as i32);
 
         // Emit the same launch envelope the direct path used to own. If the
         // launch-time publish already fails (the bus is down at launch), the
@@ -3967,9 +3997,9 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
             );
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit());
-            let output = cmd.output().with_context(|| {
-                format!("launching {program} (is it installed and on PATH?)")
-            })?;
+            let output = cmd
+                .output()
+                .with_context(|| format!("launching {program} (is it installed and on PATH?)"))?;
             let text = String::from_utf8_lossy(&output.stdout);
             print_claude_worker_result(session, &text);
             let final_text = (!text.trim().is_empty()).then(|| clip(&text, FINAL_TEXT_CAP));
@@ -4021,9 +4051,9 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
                 .env("ELANUS_ROOT", &root.dir);
             eprintln!("[code] launching {} as session {session}", binary);
             cmd.args(args);
-            let status = cmd.status().with_context(|| {
-                format!("launching {} (is it installed and on PATH?)", binary)
-            })?;
+            let status = cmd
+                .status()
+                .with_context(|| format!("launching {} (is it installed and on PATH?)", binary))?;
             Ok((status, CaptureSummary::default()))
         }
     })();
@@ -4055,9 +4085,9 @@ fn adapter_provider_injection(
         ctx.model(),
     )? {
         crate::provider::Injection::Harness(h) => Ok(Some(h)),
-        crate::provider::Injection::Dispatcher(_) => unreachable!(
-            "materialize(Consumer::Harness) always returns Injection::Harness"
-        ),
+        crate::provider::Injection::Dispatcher(_) => {
+            unreachable!("materialize(Consumer::Harness) always returns Injection::Harness")
+        }
     }
 }
 
@@ -4228,8 +4258,7 @@ pub fn run_opencode_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::E
 /// argv builder can't drift apart.
 const CODEX_HEADLESS_SANDBOX_MODE_VALUE: &str = "danger-full-access";
 const CODEX_HEADLESS_APPROVAL_POLICY: &str = "approval_policy=never";
-const CODEX_HEADLESS_SANDBOX_MODE: &str =
-    concat!("sandbox_mode=", "danger-full-access");
+const CODEX_HEADLESS_SANDBOX_MODE: &str = concat!("sandbox_mode=", "danger-full-access");
 
 /// Pure, unit-testable: the base `codex exec` argv (before provider injection /
 /// the user's own args are appended) for the HEADLESS capture path only. Carries
@@ -4730,7 +4759,8 @@ fn run_codex_app_server_capture(
     if let Some(inj) = injection {
         apply_provider_injection_env(&mut cmd, inj);
     }
-    cmd.env_remove("ELANUS_PACKAGE").env_remove("ELANUS_BUS_TOKEN");
+    cmd.env_remove("ELANUS_PACKAGE")
+        .env_remove("ELANUS_BUS_TOKEN");
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
         .env("ELANUS_ROOT", &root.dir)
@@ -4786,8 +4816,8 @@ fn run_codex_app_server_capture(
 
     // Overall wall-clock backstop so a wedged server never hangs the adapter
     // forever: the caller's worker_timeout if set, else a generous default.
-    let overall_deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(worker_timeout.unwrap_or(3600));
+    let overall_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(worker_timeout.unwrap_or(3600));
 
     // Drive the JSON-RPC state machine to completion over the reader channel + the
     // server's stdin. Extracted so it can be exercised end-to-end against an
@@ -4811,7 +4841,9 @@ fn run_codex_app_server_capture(
     // Close stdin so the server winds down, then reap.
     drop(stdin);
     let _ = child.kill();
-    let status = child.wait().context("waiting for codex app-server to finish")?;
+    let status = child
+        .wait()
+        .context("waiting for codex app-server to finish")?;
     drop(reader); // detached; the channel already closed on EOF.
     print_stream_worker_result(agent, session, &summary);
     Ok((status, summary))
@@ -4847,10 +4879,15 @@ fn drive_codex_app_server<W: std::io::Write>(
     let mut turn_done = false;
 
     // Kick off the handshake.
-    appserver_send_req(stdin, &mut next_id, "initialize", json!({
-        "clientInfo": { "name": "elanus", "title": null, "version": env!("CARGO_PKG_VERSION") },
-        "capabilities": { "experimentalApi": true, "requestAttestation": false },
-    }))?;
+    appserver_send_req(
+        stdin,
+        &mut next_id,
+        "initialize",
+        json!({
+            "clientInfo": { "name": "elanus", "title": null, "version": env!("CARGO_PKG_VERSION") },
+            "capabilities": { "experimentalApi": true, "requestAttestation": false },
+        }),
+    )?;
 
     loop {
         if turn_done {
@@ -4865,7 +4902,10 @@ fn drive_codex_app_server<W: std::io::Write>(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        let method = msg.get("method").and_then(Value::as_str).map(str::to_string);
+        let method = msg
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let has_id = msg.get("id").is_some();
 
         match (method.as_deref(), has_id) {
@@ -4903,14 +4943,23 @@ fn drive_codex_app_server<W: std::io::Write>(
                             stdin,
                             &json!({ "jsonrpc": "2.0", "method": "initialized" }),
                         )?;
-                        appserver_send_req(stdin, &mut next_id, "thread/start", json!({
-                            "cwd": workdir.display().to_string(),
-                            "approvalPolicy": CODEX_APP_SERVER_APPROVAL_POLICY,
-                            "sandbox": CODEX_APP_SERVER_SANDBOX_MODE,
-                        }))?;
+                        appserver_send_req(
+                            stdin,
+                            &mut next_id,
+                            "thread/start",
+                            json!({
+                                "cwd": workdir.display().to_string(),
+                                "approvalPolicy": CODEX_APP_SERVER_APPROVAL_POLICY,
+                                "sandbox": CODEX_APP_SERVER_SANDBOX_MODE,
+                            }),
+                        )?;
                     }
                     // The thread/start response also carries the thread id.
-                    if let Some(id) = result.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
+                    if let Some(id) = result
+                        .get("thread")
+                        .and_then(|t| t.get("id"))
+                        .and_then(Value::as_str)
+                    {
                         thread_id.get_or_insert_with(|| id.to_string());
                     }
                 }
@@ -4935,7 +4984,9 @@ fn drive_codex_app_server<W: std::io::Write>(
                             room: None,
                         };
                         if let Err(e) = codesession::upsert_record(root, &rec) {
-                            eprintln!("[code] recording codex app-server session (continuing): {e:#}");
+                            eprintln!(
+                                "[code] recording codex app-server session (continuing): {e:#}"
+                            );
                         }
                     }
                 }
@@ -4947,7 +4998,12 @@ fn drive_codex_app_server<W: std::io::Write>(
                     if let Some(item) = msg.get("params").and_then(|p| p.get("item")) {
                         codex_appserver_collect_summary(item, &mut summary);
                         for path in codex_appserver_file_change_paths(item) {
-                            auto_claim_write(root, session, &path, Some(&workdir.to_string_lossy()));
+                            auto_claim_write(
+                                root,
+                                session,
+                                &path,
+                                Some(&workdir.to_string_lossy()),
+                            );
                         }
                     }
                 }
@@ -4964,7 +5020,13 @@ fn drive_codex_app_server<W: std::io::Write>(
                             map.insert("usage".into(), token_usage.clone());
                         }
                     }
-                    publish_obs(root, principal, bus_token, &obs_topic(agent, session, &leaf), body);
+                    publish_obs(
+                        root,
+                        principal,
+                        bus_token,
+                        &obs_topic(agent, session, &leaf),
+                        body,
+                    );
                     let _ = codesession::bump_last_active(root, session);
                 }
                 // Once the thread exists, start the single turn (guarded so it
@@ -4972,10 +5034,15 @@ fn drive_codex_app_server<W: std::io::Write>(
                 if !turn_started {
                     if let Some(tid) = thread_id.clone() {
                         turn_started = true;
-                        appserver_send_req(stdin, &mut next_id, "turn/start", json!({
-                            "threadId": tid,
-                            "input": [{ "type": "text", "text": turn_text, "text_elements": [] }],
-                        }))?;
+                        appserver_send_req(
+                            stdin,
+                            &mut next_id,
+                            "turn/start",
+                            json!({
+                                "threadId": tid,
+                                "input": [{ "type": "text", "text": turn_text, "text_elements": [] }],
+                            }),
+                        )?;
                     }
                 }
             }
@@ -4987,10 +5054,15 @@ fn drive_codex_app_server<W: std::io::Write>(
         if !turn_started {
             if let Some(tid) = thread_id.clone() {
                 turn_started = true;
-                appserver_send_req(stdin, &mut next_id, "turn/start", json!({
-                    "threadId": tid,
-                    "input": [{ "type": "text", "text": turn_text, "text_elements": [] }],
-                }))?;
+                appserver_send_req(
+                    stdin,
+                    &mut next_id,
+                    "turn/start",
+                    json!({
+                        "threadId": tid,
+                        "input": [{ "type": "text", "text": turn_text, "text_elements": [] }],
+                    }),
+                )?;
             }
         }
     }
@@ -5089,7 +5161,11 @@ fn codex_appserver_handle_approval(
     let answer = codex_appserver_await_answer(root, &correlation, policy.deadline_secs);
     let (allow, answer_str, timed_out) = match answer {
         Some(a) => (codex_answer_is_allow(&a), a, false),
-        None => (!policy.default_deny, format!("(timeout:{default_answer})"), true),
+        None => (
+            !policy.default_deny,
+            format!("(timeout:{default_answer})"),
+            true,
+        ),
     };
     publish_obs(
         root,
@@ -5236,7 +5312,11 @@ fn codex_appserver_file_change_paths(item: &Value) -> Vec<String> {
 /// the honest `fidelity: "app-server-live"` stamp (the wire names differ). Wire
 /// method + item.type names pinned by the M1 spike (codex 0.142.5). Returns None
 /// for notifications deliberately dropped (bare `turn/started`, deltas).
-fn codex_appserver_map_notification(method: &str, params: &Value, ts: &str) -> Option<(String, Value)> {
+fn codex_appserver_map_notification(
+    method: &str,
+    params: &Value,
+    ts: &str,
+) -> Option<(String, Value)> {
     let stamp = |mut body: Value| -> Value {
         if let Value::Object(m) = &mut body {
             m.insert("fidelity".into(), json!(CODEX_APP_SERVER_FIDELITY));
@@ -5250,7 +5330,10 @@ fn codex_appserver_map_notification(method: &str, params: &Value, ts: &str) -> O
                 .and_then(|t| t.get("id"))
                 .cloned()
                 .unwrap_or(Value::Null);
-            Some(("session/thread".into(), stamp(json!({ "ts": ts, "codex_thread": tid }))))
+            Some((
+                "session/thread".into(),
+                stamp(json!({ "ts": ts, "codex_thread": tid })),
+            ))
         }
         // Bare turn start: skip (no payload of value), same as the exec path.
         "turn/started" => None,
@@ -5356,10 +5439,19 @@ fn codex_appserver_map_item(item: &Value, completed: bool, ts: &str) -> Option<(
                 let status = item.get("status").and_then(Value::as_str);
                 if completed {
                     m.insert("failed".into(), json!(status != Some("completed")));
-                    m.insert("exit_code".into(), item.get("exitCode").cloned().unwrap_or(Value::Null));
-                    m.insert("output".into(), clip_value(item.get("aggregatedOutput"), 4000));
+                    m.insert(
+                        "exit_code".into(),
+                        item.get("exitCode").cloned().unwrap_or(Value::Null),
+                    );
+                    m.insert(
+                        "output".into(),
+                        clip_value(item.get("aggregatedOutput"), 4000),
+                    );
                 }
-                m.insert("status".into(), item.get("status").cloned().unwrap_or(Value::Null));
+                m.insert(
+                    "status".into(),
+                    item.get("status").cloned().unwrap_or(Value::Null),
+                );
             }
             Some((leaf.into(), body))
         }
@@ -5375,7 +5467,10 @@ fn codex_appserver_map_item(item: &Value, completed: bool, ts: &str) -> Option<(
             ))
         }
         "mcpToolCall" => {
-            let name = item.get("tool").and_then(Value::as_str).unwrap_or("mcp_tool");
+            let name = item
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp_tool");
             let leaf = if completed {
                 format!("tool/{}/result", topic::encode_segment(name))
             } else {
@@ -5391,7 +5486,10 @@ fn codex_appserver_map_item(item: &Value, completed: bool, ts: &str) -> Option<(
             if completed {
                 if let Value::Object(m) = &mut body {
                     m.insert("result".into(), clip_value(item.get("result"), 4000));
-                    m.insert("status".into(), item.get("status").cloned().unwrap_or(Value::Null));
+                    m.insert(
+                        "status".into(),
+                        item.get("status").cloned().unwrap_or(Value::Null),
+                    );
                 }
             }
             Some((leaf, body))
@@ -7884,7 +7982,9 @@ fn resume_stream_capture_for(
     match harness_id_for_tool(&rec.tool).unwrap_or("claude") {
         "claude" => capture_claude_stream(root, principal, bus_token, agent, session, child),
         "codex" => capture_codex_stream(root, principal, bus_token, agent, session, child, None),
-        "opencode" => capture_opencode_stream(root, principal, bus_token, agent, session, child, None),
+        "opencode" => {
+            capture_opencode_stream(root, principal, bus_token, agent, session, child, None)
+        }
         _ => unreachable!("harness_id_for_tool only yields known tool ids"),
     }
 }
@@ -8082,13 +8182,7 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
         // the CC `-p --output-format stream-json` mapper). The daemon resolves the
         // capture path from the recorded tool.
         summary = resume_stream_capture_for(
-            root,
-            &principal,
-            &bus_token,
-            &agent,
-            &session,
-            &rec,
-            &mut child,
+            root, &principal, &bus_token, &agent, &session, &rec, &mut child,
         );
         child.wait().context("waiting for the resume to finish")
     })();
@@ -8301,9 +8395,7 @@ fn claude_stream_message(event: &Value, ts: &str) -> Option<(String, Value)> {
 fn map_hook_event(noun: &str, event: &str, payload: &Value) -> (String, Value) {
     match noun {
         n if n == claude_agent_noun() => claude_map_event(event, payload),
-        n if n == codex_agent_noun() || n == opencode_agent_noun() => {
-            generic_event(event, payload)
-        }
+        n if n == codex_agent_noun() || n == opencode_agent_noun() => generic_event(event, payload),
         _ => generic_event(event, payload),
     }
 }
@@ -8875,7 +8967,11 @@ pub fn publish_obs_captured(
             buscli::publish_typed(&root, &topic, Some(&payload), 0, false, None)
         })
         .join()
-        .unwrap_or_else(|_| Err(buscli::BusError::Other("obs publish thread panicked".into())))
+        .unwrap_or_else(|_| {
+            Err(buscli::BusError::Other(
+                "obs publish thread panicked".into(),
+            ))
+        })
     } else {
         buscli::publish_typed(root, topic_name, Some(&payload), 0, false, None)
     };
@@ -9506,7 +9602,11 @@ mod tests {
 
     #[test]
     fn unknown_event_still_lands() {
-        let (leaf, body) = map_hook_event(claude_agent_noun(), "PreCompact", &json!({ "session_id": "cc" }));
+        let (leaf, body) = map_hook_event(
+            claude_agent_noun(),
+            "PreCompact",
+            &json!({ "session_id": "cc" }),
+        );
         assert_eq!(leaf, "event/PreCompact");
         assert_eq!(body["event"], "PreCompact");
     }
@@ -9595,7 +9695,8 @@ mod tests {
             let mut sorted = names.clone();
             sorted.sort();
             assert_eq!(names, sorted);
-            let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let doc: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             assert!(doc.get("mcpServers").is_some());
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -11008,7 +11109,10 @@ mod tests {
         assert_eq!(pv["exit_code"], json!(7));
         assert_eq!(pv["worker"], json!("code-worker7"));
         // The prose line is still the same shape the existing consumer reads.
-        assert!(pv["prompt"].as_str().unwrap().contains("Worker code-worker7 finished"));
+        assert!(pv["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Worker code-worker7 finished"));
 
         // Clean exit → failed:false + exit_code 0.
         let ok = std::process::ExitStatus::from_raw(0);
@@ -11178,7 +11282,9 @@ mod tests {
     #[test]
     fn codex_headless_args_carry_auto_approve_posture() {
         let args = codex_headless_base_args();
-        assert!(args.windows(2).any(|w| w[0] == "-c" && w[1] == "approval_policy=never"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "approval_policy=never"));
         assert!(args
             .windows(2)
             .any(|w| w[0] == "-c" && w[1] == "sandbox_mode=danger-full-access"));
@@ -11206,8 +11312,14 @@ mod tests {
             Some(("elicited", "workspace-write"))
         );
         // The gate is irrelevant off the headless-codex cell.
-        assert_eq!(codex_headless_approval_posture("codex", Mode::Tui, false), None);
-        assert_eq!(codex_headless_approval_posture("codex", Mode::Tui, true), None);
+        assert_eq!(
+            codex_headless_approval_posture("codex", Mode::Tui, false),
+            None
+        );
+        assert_eq!(
+            codex_headless_approval_posture("codex", Mode::Tui, true),
+            None
+        );
         assert_eq!(
             codex_headless_approval_posture("claude-code", Mode::Headless, true),
             None
@@ -11232,7 +11344,8 @@ mod tests {
     fn appserver_items_map_to_exec_leaves_with_fidelity_stamp() {
         let ts = "2026-07-02T00:00:00Z";
         // agentMessage (settled) → assistant/message.
-        let agent = json!({ "type": "agentMessage", "id": "m1", "text": "done", "phase": "final_answer" });
+        let agent =
+            json!({ "type": "agentMessage", "id": "m1", "text": "done", "phase": "final_answer" });
         let n = json!({ "item": agent, "threadId": "t", "turnId": "u", "completedAtMs": 1 });
         let (leaf, body) = codex_appserver_map_notification("item/completed", &n, ts).unwrap();
         assert_eq!(leaf, "assistant/message");
@@ -11268,30 +11381,33 @@ mod tests {
         // A declined command is failed=true.
         let declined = json!({ "type": "commandExecution", "id": "c2",
             "command": "x", "status": "declined", "exitCode": Value::Null });
-        let (_leaf, body) = codex_appserver_map_notification(
-            "item/completed",
-            &json!({ "item": declined }),
-            ts,
-        )
-        .unwrap();
+        let (_leaf, body) =
+            codex_appserver_map_notification("item/completed", &json!({ "item": declined }), ts)
+                .unwrap();
         assert_eq!(body["failed"], json!(true));
 
         // fileChange (settled) → file/write; mcpToolCall → tool/<name>/{call,result};
         // webSearch → tool/web_search/result.
         let fc = json!({ "type": "fileChange", "id": "f1", "status": "completed",
             "changes": [{ "path": "src/a.rs", "kind": "update", "diff": "" }] });
-        let (leaf, _b) = codex_appserver_map_notification("item/completed", &json!({ "item": fc }), ts).unwrap();
+        let (leaf, _b) =
+            codex_appserver_map_notification("item/completed", &json!({ "item": fc }), ts).unwrap();
         assert_eq!(leaf, "file/write");
         let mcp_started = json!({ "type": "mcpToolCall", "id": "x1", "server": "probe",
             "tool": "probe_write", "status": "inProgress", "arguments": { "p": 1 } });
-        let (leaf, _b) = codex_appserver_map_notification("item/started", &json!({ "item": mcp_started }), ts).unwrap();
+        let (leaf, _b) =
+            codex_appserver_map_notification("item/started", &json!({ "item": mcp_started }), ts)
+                .unwrap();
         assert_eq!(leaf, "tool/probe_write/call");
         let mcp_done = json!({ "type": "mcpToolCall", "id": "x1", "server": "probe",
             "tool": "probe_write", "status": "completed", "result": { "ok": true } });
-        let (leaf, _b) = codex_appserver_map_notification("item/completed", &json!({ "item": mcp_done }), ts).unwrap();
+        let (leaf, _b) =
+            codex_appserver_map_notification("item/completed", &json!({ "item": mcp_done }), ts)
+                .unwrap();
         assert_eq!(leaf, "tool/probe_write/result");
         let ws = json!({ "type": "webSearch", "id": "w1", "query": "rust", "action": Value::Null });
-        let (leaf, _b) = codex_appserver_map_notification("item/completed", &json!({ "item": ws }), ts).unwrap();
+        let (leaf, _b) =
+            codex_appserver_map_notification("item/completed", &json!({ "item": ws }), ts).unwrap();
         assert_eq!(leaf, "tool/web_search/result");
     }
 
@@ -11307,8 +11423,12 @@ mod tests {
             ts,
         )
         .unwrap();
-        let (exec_leaf, _) =
-            codex_map_item(&json!({ "type": "agent_message", "id": "m", "text": "hi" }), true, ts).unwrap();
+        let (exec_leaf, _) = codex_map_item(
+            &json!({ "type": "agent_message", "id": "m", "text": "hi" }),
+            true,
+            ts,
+        )
+        .unwrap();
         assert_eq!(as_leaf, exec_leaf);
         // command result.
         let (as_leaf, _) = codex_appserver_map_item(
@@ -11346,7 +11466,9 @@ mod tests {
     #[test]
     fn appserver_lifecycle_notifications_map_like_exec() {
         let ts = "2026-07-02T00:00:00Z";
-        assert!(codex_appserver_map_notification("turn/started", &json!({ "turn": {} }), ts).is_none());
+        assert!(
+            codex_appserver_map_notification("turn/started", &json!({ "turn": {} }), ts).is_none()
+        );
         let (leaf, body) = codex_appserver_map_notification(
             "turn/completed",
             &json!({ "turn": { "status": "completed" } }),
@@ -11385,11 +11507,18 @@ mod tests {
     /// still grants, and the reply uses the correct v2 `"accept"`).
     #[test]
     fn appserver_answer_maps_to_v2_decision_fail_closed() {
-        for yes in ["allow", "accept", "approve", "approved", "yes", "Y", " ok ", "grant"] {
+        for yes in [
+            "allow", "accept", "approve", "approved", "yes", "Y", " ok ", "grant",
+        ] {
             assert!(codex_answer_is_allow(yes), "{yes:?} should allow");
         }
-        for no in ["deny", "decline", "no", "reject", "", "maybe", "later", "cancel"] {
-            assert!(!codex_answer_is_allow(no), "{no:?} should deny (fail-closed)");
+        for no in [
+            "deny", "decline", "no", "reject", "", "maybe", "later", "cancel",
+        ] {
+            assert!(
+                !codex_answer_is_allow(no),
+                "{no:?} should deny (fail-closed)"
+            );
         }
         // The exec-family reply uses the v2 keyword, NOT the legacy "approved".
         let ok = codex_approval_reply("item/commandExecution/requestApproval", true).unwrap();
@@ -11412,9 +11541,15 @@ mod tests {
     /// MCP elicitation gate; plain notifications are not approvals.
     #[test]
     fn appserver_approval_classifier() {
-        assert!(codex_appserver_is_approval("item/commandExecution/requestApproval"));
-        assert!(codex_appserver_is_approval("item/fileChange/requestApproval"));
-        assert!(codex_appserver_is_approval("item/permissions/requestApproval"));
+        assert!(codex_appserver_is_approval(
+            "item/commandExecution/requestApproval"
+        ));
+        assert!(codex_appserver_is_approval(
+            "item/fileChange/requestApproval"
+        ));
+        assert!(codex_appserver_is_approval(
+            "item/permissions/requestApproval"
+        ));
         assert!(codex_appserver_is_approval("mcpServer/elicitation/request"));
         assert!(!codex_appserver_is_approval("item/completed"));
         assert!(!codex_appserver_is_approval("turn/completed"));
@@ -11442,8 +11577,14 @@ mod tests {
     #[test]
     fn appserver_summary_harvest_reads_camelcase_items() {
         let mut s = CaptureSummary::default();
-        codex_appserver_collect_summary(&json!({ "type": "agentMessage", "text": "first" }), &mut s);
-        codex_appserver_collect_summary(&json!({ "type": "agentMessage", "text": "final" }), &mut s);
+        codex_appserver_collect_summary(
+            &json!({ "type": "agentMessage", "text": "first" }),
+            &mut s,
+        );
+        codex_appserver_collect_summary(
+            &json!({ "type": "agentMessage", "text": "final" }),
+            &mut s,
+        );
         codex_appserver_collect_summary(
             &json!({ "type": "fileChange", "changes": [
                 { "path": "a.rs", "kind": "add", "diff": "" },
@@ -11584,9 +11725,11 @@ mod tests {
         });
 
         let mut out = Vec::<u8>::new();
-        let policy = CodexAppServerPolicy { deadline_secs, default_deny: true };
-        let overall_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let policy = CodexAppServerPolicy {
+            deadline_secs,
+            default_deny: true,
+        };
+        let overall_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
         let summary = drive_codex_app_server(
             root,
             "test-principal",
@@ -11666,8 +11809,10 @@ mod tests {
     fn appserver_extract_answer_unwraps_dispatcher_default() {
         // Dispatcher expire shape.
         assert_eq!(
-            codex_appserver_extract_answer(&json!({ "answer": { "answer": "deny" }, "assumed": true }))
-                .as_deref(),
+            codex_appserver_extract_answer(
+                &json!({ "answer": { "answer": "deny" }, "assumed": true })
+            )
+            .as_deref(),
             Some("deny")
         );
         // Web UI shape.
@@ -11705,7 +11850,10 @@ mod tests {
         // Handshake + turn were driven in order.
         let methods = appserver_frame_methods(&frames);
         for m in ["initialize", "initialized", "thread/start", "turn/start"] {
-            assert!(methods.iter().any(|x| x == m), "driver must send {m}: {methods:?}");
+            assert!(
+                methods.iter().any(|x| x == m),
+                "driver must send {m}: {methods:?}"
+            );
         }
         let turn = frames
             .iter()
@@ -11731,7 +11879,10 @@ mod tests {
             )
             .unwrap();
         assert!(deadline.is_some(), "the ask carries a deadline");
-        assert!(default.unwrap_or_default().contains("deny"), "fail-closed default is deny");
+        assert!(
+            default.unwrap_or_default().contains("deny"),
+            "fail-closed default is deny"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -11840,8 +11991,10 @@ mod tests {
             .expect("driver must reply to the MCP elicitation request");
         // The MCP gate uses `{action}` (accept/decline), NOT `{decision}`.
         assert_eq!(reply["result"]["action"], json!("accept"));
-        assert!(reply["result"].get("decision").is_none(),
-            "the MCP gate is answered with action, not decision: {reply}");
+        assert!(
+            reply["result"].get("decision").is_none(),
+            "the MCP gate is answered with action, not decision: {reply}"
+        );
         assert_eq!(summary.final_text.as_deref(), Some("all done"));
         // The relayed ask landed on the owner's mailbox, stamped as an MCP tool call
         // (so the owner sees WHAT they are approving), with a deadline + fail-closed
@@ -11856,10 +12009,16 @@ mod tests {
             )
             .unwrap();
         let ask: Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(ask["approval"]["method"], json!("mcpServer/elicitation/request"));
+        assert_eq!(
+            ask["approval"]["method"],
+            json!("mcpServer/elicitation/request")
+        );
         assert_eq!(ask["approval"]["kind"], json!("mcp tool call"));
         assert!(deadline.is_some(), "the MCP ask carries a deadline");
-        assert!(default.unwrap_or_default().contains("deny"), "fail-closed default is deny");
+        assert!(
+            default.unwrap_or_default().contains("deny"),
+            "fail-closed default is deny"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -11877,7 +12036,10 @@ mod tests {
             Some((crate::topic::human_mailbox("owner"), "deny".to_string())),
             10,
         );
-        let reply = frames.iter().find(|f| f.get("id") == Some(&json!(100))).unwrap();
+        let reply = frames
+            .iter()
+            .find(|f| f.get("id") == Some(&json!(100)))
+            .unwrap();
         assert_eq!(reply["result"]["action"], json!("decline"));
         assert_eq!(summary.final_text.as_deref(), Some("all done"));
         let _ = std::fs::remove_dir_all(&root.dir);
@@ -11890,8 +12052,11 @@ mod tests {
             .iter()
             .find(|f| f.get("id") == Some(&json!(100)))
             .expect("driver must reply to the MCP gate even on timeout");
-        assert_eq!(reply["result"]["action"], json!("decline"),
-            "an unanswered MCP gate must fail closed (decline), never auto-approve");
+        assert_eq!(
+            reply["result"]["action"],
+            json!("decline"),
+            "an unanswered MCP gate must fail closed (decline), never auto-approve"
+        );
         assert_eq!(summary.final_text.as_deref(), Some("all done"));
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -11960,7 +12125,10 @@ mod tests {
             .shell_command(&format!("echo hi > {}/in.txt", root.dir.display()))
             .output()
             .unwrap();
-        assert!(ok.status.success(), "write inside workdir must succeed: {ok:?}");
+        assert!(
+            ok.status.success(),
+            "write inside workdir must succeed: {ok:?}"
+        );
         // Write inside the per-session CODEX_HOME: allowed (codex >=0.142 writes
         // PATH aliases + app-server client state there at startup and exits 1
         // otherwise — the regression that motivated the second write root).
@@ -11984,7 +12152,10 @@ mod tests {
             .output()
             .unwrap();
         let _ = std::fs::remove_file(&home_target);
-        assert!(!denied.status.success(), "write outside the workdir must fail");
+        assert!(
+            !denied.status.success(),
+            "write outside the workdir must fail"
+        );
         // The ledger is fenced even though it sits inside the write root: an actor
         // may read it but never write it (no self-granted authority).
         let db = root.db();
@@ -11993,7 +12164,10 @@ mod tests {
             .shell_command(&format!("echo x >> {}", db.display()))
             .output()
             .unwrap();
-        assert!(!db_write.status.success(), "writing the ledger from the cage must fail");
+        assert!(
+            !db_write.status.success(),
+            "writing the ledger from the cage must fail"
+        );
         // The secret store is unreadable from the cage.
         std::fs::create_dir_all(root.secrets()).unwrap();
         let tok = root.secrets().join("tok");
@@ -12002,7 +12176,10 @@ mod tests {
             .shell_command(&format!("cat {}", tok.display()))
             .output()
             .unwrap();
-        assert!(!sec.status.success(), "reading a secret from the cage must fail");
+        assert!(
+            !sec.status.success(),
+            "reading a secret from the cage must fail"
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -12039,8 +12216,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(
-            mcp.status.success()
-                && String::from_utf8_lossy(&mcp.stdout).contains("pong:PING"),
+            mcp.status.success() && String::from_utf8_lossy(&mcp.stdout).contains("pong:PING"),
             "a stdio MCP tool call must complete under the loopback cage: {mcp:?}"
         );
 
@@ -12076,7 +12252,10 @@ mod tests {
         assert_eq!(p["network"], "loopback");
         // The narrow model-API egress hole is stamped honestly (entry 24 floor).
         assert_eq!(p["egress"], "https-only");
-        assert_eq!(p["enforced"], json!(crate::sandbox::enforcement_available()));
+        assert_eq!(
+            p["enforced"],
+            json!(crate::sandbox::enforcement_available())
+        );
         #[cfg(not(target_os = "macos"))]
         assert_eq!(p["enforced"], json!(false), "off macOS never a silent on");
         // Every other cell gets no cage stamp.
@@ -12153,8 +12332,7 @@ mod tests {
         assert_eq!(plugin, dir.join("plugin"));
 
         // The plugin manifest makes `--plugin-dir` recognize it.
-        let manifest =
-            std::fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap();
+        let manifest = std::fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap();
         assert!(manifest.contains("\"name\":\"elanus\""));
 
         // The bootstrap `/elanus` skill is a real file under skills/elanus.
@@ -12166,7 +12344,10 @@ mod tests {
         // The profile skill is SYMLINKED alongside it (live, not copied) and its
         // SKILL.md is reachable through the link.
         let link = plugin.join("skills/wiring-probe");
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(std::fs::read_link(&link).unwrap(), pkg);
         assert!(link.join("SKILL.md").exists());
 
@@ -12345,8 +12526,12 @@ mod tests {
 
     // ── M4: take_grants_flags unit tests ─────────────────────────────────────
 
-    fn s(v: &str) -> String { v.to_string() }
-    fn sv(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+    fn sv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
 
     // ── M2: take_provider_flag + injection-application unit tests ─────────────
 
@@ -12372,7 +12557,12 @@ mod tests {
         // Everything after the tool token forwards verbatim — including a token that
         // happens to look like our flag (it's the tool's arg now, not ours).
         let (p, rest) = take_provider_flag(&sv(&[
-            "--provider", "ds", "codex", "--provider", "not-ours", "do it",
+            "--provider",
+            "ds",
+            "codex",
+            "--provider",
+            "not-ours",
+            "do it",
         ]))
         .unwrap();
         assert_eq!(p.as_deref(), Some("ds"));
@@ -12389,7 +12579,9 @@ mod tests {
 
     #[test]
     fn take_provider_flag_missing_value_errors() {
-        let err = take_provider_flag(&sv(&["--provider"])).unwrap_err().to_string();
+        let err = take_provider_flag(&sv(&["--provider"]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("requires a value"), "{err}");
         // A flag as the value is also a usage error (would swallow the next flag).
         let err = take_provider_flag(&sv(&["--provider", "--headless", "claude"]))
@@ -12457,8 +12649,9 @@ mod tests {
             .collect();
         // The env_key pair carries the secret to the child (this is where it lives).
         assert!(
-            envs.iter().any(|(k, v)| k == "ELANUS_PV_DEEPSEEK_ANTHROPIC_KEY"
-                && v.as_deref() == Some("sk-secret-xyz")),
+            envs.iter()
+                .any(|(k, v)| k == "ELANUS_PV_DEEPSEEK_ANTHROPIC_KEY"
+                    && v.as_deref() == Some("sk-secret-xyz")),
             "env_key pair must be set: {envs:?}"
         );
         // Inherited harness-config vars are scheduled for removal (None).
@@ -12478,9 +12671,7 @@ mod tests {
         // NativeLogin yields an empty injection, but applying it still scrubs the
         // harness-config vars so an explicit native-login child is clean (the
         // nesting guarantee for the "named default").
-        use crate::provider::{
-            materialize, Consumer, Credential, HarnessId, Injection,
-        };
+        use crate::provider::{materialize, Consumer, Credential, HarnessId, Injection};
         let Injection::Harness(inj) = materialize(
             "native",
             &Credential::NativeLogin { tool: None },
@@ -12497,7 +12688,10 @@ mod tests {
         let scrubbed = cmd
             .get_envs()
             .any(|(k, v)| k.to_string_lossy() == "CODEX_HOME" && v.is_none());
-        assert!(scrubbed, "native-login apply must still scrub harness-config vars");
+        assert!(
+            scrubbed,
+            "native-login apply must still scrub harness-config vars"
+        );
     }
 
     #[test]
@@ -12541,19 +12735,31 @@ mod tests {
 
     #[test]
     fn take_grants_flags_publish_accumulates() {
-        let (grants, rest) = take_grants_flags(
-            &sv(&["--grant-publish", "obs/#", "--grant-publish", "work/+/status", "go"])
-        ).unwrap();
+        let (grants, rest) = take_grants_flags(&sv(&[
+            "--grant-publish",
+            "obs/#",
+            "--grant-publish",
+            "work/+/status",
+            "go",
+        ]))
+        .unwrap();
         assert_eq!(grants.publish, Some(vec![s("obs/#"), s("work/+/status")]));
         assert_eq!(rest, sv(&["go"]));
     }
 
     #[test]
     fn take_grants_flags_subscribe_accumulates() {
-        let (grants, _) = take_grants_flags(
-            &sv(&["--grant-subscribe", "in/agent/#", "--grant-subscribe", "obs/agent/+/code-abc/#"])
-        ).unwrap();
-        assert_eq!(grants.subscribe, Some(vec![s("in/agent/#"), s("obs/agent/+/code-abc/#")]));
+        let (grants, _) = take_grants_flags(&sv(&[
+            "--grant-subscribe",
+            "in/agent/#",
+            "--grant-subscribe",
+            "obs/agent/+/code-abc/#",
+        ]))
+        .unwrap();
+        assert_eq!(
+            grants.subscribe,
+            Some(vec![s("in/agent/#"), s("obs/agent/+/code-abc/#")])
+        );
     }
 
     #[test]
@@ -12571,18 +12777,16 @@ mod tests {
 
     #[test]
     fn take_grants_flags_fs_write_absolute_ok() {
-        let (grants, rest) = take_grants_flags(
-            &sv(&["--grant-fs-write", "/home/user/proj", "extra"])
-        ).unwrap();
+        let (grants, rest) =
+            take_grants_flags(&sv(&["--grant-fs-write", "/home/user/proj", "extra"])).unwrap();
         assert_eq!(grants.fs_write, Some(vec![s("/home/user/proj")]));
         assert_eq!(rest, sv(&["extra"]));
     }
 
     #[test]
     fn take_grants_flags_fs_write_accumulates() {
-        let (grants, _) = take_grants_flags(
-            &sv(&["--grant-fs-write", "/a", "--grant-fs-write", "/b"])
-        ).unwrap();
+        let (grants, _) =
+            take_grants_flags(&sv(&["--grant-fs-write", "/a", "--grant-fs-write", "/b"])).unwrap();
         assert_eq!(grants.fs_write, Some(vec![s("/a"), s("/b")]));
     }
 
@@ -12606,7 +12810,8 @@ mod tests {
         // An empty path would also be the root-wildcard footgun (path_covered rejects it).
         // In practice the shell won't pass an empty arg, but validate anyway.
         // A flag whose next token looks like another flag triggers the "no value" error.
-        let err = take_grants_flags(&sv(&["--grant-fs-write", "--grant-fs-read", "/ok"])).unwrap_err();
+        let err =
+            take_grants_flags(&sv(&["--grant-fs-write", "--grant-fs-read", "/ok"])).unwrap_err();
         assert!(err.to_string().contains("--grant-fs-write"), "msg: {err}");
     }
 
@@ -12632,33 +12837,55 @@ mod tests {
 
     #[test]
     fn take_grants_flags_fs_read_accumulates() {
-        let (grants, _) = take_grants_flags(
-            &sv(&["--grant-fs-read", "/read/a", "--grant-fs-read", "/read/b"])
-        ).unwrap();
+        let (grants, _) = take_grants_flags(&sv(&[
+            "--grant-fs-read",
+            "/read/a",
+            "--grant-fs-read",
+            "/read/b",
+        ]))
+        .unwrap();
         assert_eq!(grants.fs_read, Some(vec![s("/read/a"), s("/read/b")]));
     }
 
     #[test]
     fn take_grants_flags_tool_allowlist_accumulates() {
-        let (grants, rest) = take_grants_flags(
-            &sv(&["--grant-tool", "bash", "--grant-tool", "read_file", "arg"])
-        ).unwrap();
+        let (grants, rest) = take_grants_flags(&sv(&[
+            "--grant-tool",
+            "bash",
+            "--grant-tool",
+            "read_file",
+            "arg",
+        ]))
+        .unwrap();
         assert_eq!(grants.tool_allowlist, Some(vec![s("bash"), s("read_file")]));
         assert_eq!(rest, sv(&["arg"]));
     }
 
     #[test]
     fn take_grants_flags_blocking_accumulates() {
-        let (grants, _) = take_grants_flags(
-            &sv(&["--grant-blocking", "disk-io", "--grant-blocking", "network"])
-        ).unwrap();
+        let (grants, _) = take_grants_flags(&sv(&[
+            "--grant-blocking",
+            "disk-io",
+            "--grant-blocking",
+            "network",
+        ]))
+        .unwrap();
         assert_eq!(grants.blocking, Some(vec![s("disk-io"), s("network")]));
     }
 
     #[test]
     fn take_grants_flags_remaining_args_preserved_in_order() {
         // Non-M4 args pass through untouched and in original order.
-        let args = sv(&["--budget", "5", "claude", "--model", "opus", "--grant-publish", "obs/#", "task"]);
+        let args = sv(&[
+            "--budget",
+            "5",
+            "claude",
+            "--model",
+            "opus",
+            "--grant-publish",
+            "obs/#",
+            "task",
+        ]);
         let (grants, rest) = take_grants_flags(&args).unwrap();
         assert_eq!(grants.budget, Some(5));
         assert_eq!(grants.publish, Some(vec![s("obs/#")]));
@@ -12668,13 +12895,20 @@ mod tests {
     #[test]
     fn take_grants_flags_all_fields_together() {
         let args = sv(&[
-            "--budget", "10",
-            "--grant-publish", "obs/#",
-            "--grant-subscribe", "in/agent/#",
-            "--grant-fs-write", "/tmp/work",
-            "--grant-fs-read", "/src",
-            "--grant-tool", "grep",
-            "--grant-blocking", "shell",
+            "--budget",
+            "10",
+            "--grant-publish",
+            "obs/#",
+            "--grant-subscribe",
+            "in/agent/#",
+            "--grant-fs-write",
+            "/tmp/work",
+            "--grant-fs-read",
+            "/src",
+            "--grant-tool",
+            "grep",
+            "--grant-blocking",
+            "shell",
             "the-task",
         ]);
         let (grants, rest) = take_grants_flags(&args).unwrap();
@@ -12696,9 +12930,17 @@ mod tests {
         let root = m3_tmp_root();
         let pid = std::process::id() as i32;
         let tok = codesession::mint(
-            &root, "code-m4owner1", "claude-code", pid, None,
-            codesession::RequestedGrants { budget: Some(4), ..Default::default() }
-        ).unwrap();
+            &root,
+            "code-m4owner1",
+            "claude-code",
+            pid,
+            None,
+            codesession::RequestedGrants {
+                budget: Some(4),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(tok.grants.turn_budget, Some(4));
         assert_eq!(tok.grants.remaining_budget, Some(4));
     }
@@ -12709,14 +12951,29 @@ mod tests {
         let root = m3_tmp_root();
         let pid = std::process::id() as i32;
         codesession::mint(
-            &root, "code-m4par2", "claude-code", pid, None,
-            codesession::RequestedGrants { budget: Some(4), ..Default::default() }
-        ).unwrap();
+            &root,
+            "code-m4par2",
+            "claude-code",
+            pid,
+            None,
+            codesession::RequestedGrants {
+                budget: Some(4),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let err = codesession::mint(
-            &root, "code-m4child2", "claude-code", pid,
+            &root,
+            "code-m4child2",
+            "claude-code",
+            pid,
             Some("code-m4par2"),
-            codesession::RequestedGrants { budget: Some(10), ..Default::default() }
-        ).unwrap_err();
+            codesession::RequestedGrants {
+                budget: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("budget") || msg.contains("remaining") || msg.contains("exceed"),
@@ -12731,22 +12988,31 @@ mod tests {
         let pid = std::process::id() as i32;
         // Owner has fs_write limited to /tmp/work.
         codesession::mint(
-            &root, "code-m4fspar", "claude-code", pid, None,
+            &root,
+            "code-m4fspar",
+            "claude-code",
+            pid,
+            None,
             codesession::RequestedGrants {
                 fs_write: Some(vec!["/tmp/work".to_string()]),
                 ..Default::default()
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
         // Child tries to widen to /tmp (a broader prefix that would cover /tmp/work
         // and more) — refused because /tmp is not covered by /tmp/work.
         let err = codesession::mint(
-            &root, "code-m4fschild", "claude-code", pid,
+            &root,
+            "code-m4fschild",
+            "claude-code",
+            pid,
             Some("code-m4fspar"),
             codesession::RequestedGrants {
                 fs_write: Some(vec!["/tmp".to_string()]),
                 ..Default::default()
-            }
-        ).unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("fs_write") || err.to_string().contains("not covered"),
             "expected fs_write widening error, got: {err}"
@@ -12763,19 +13029,29 @@ mod tests {
         // Owner mint → publish defaults to the parent's own structural subtree.
         let own_pub = "obs/agent/claude-code/code-m4pubpar/#".to_string();
         codesession::mint(
-            &root, "code-m4pubpar", "claude-code", pid, None,
-            codesession::RequestedGrants { ..Default::default() }
-        ).unwrap();
+            &root,
+            "code-m4pubpar",
+            "claude-code",
+            pid,
+            None,
+            codesession::RequestedGrants {
+                ..Default::default()
+            },
+        )
+        .unwrap();
         // Setup (asserted unconditionally so the refusal check below can never be
         // skipped vacuously): a child requesting exactly the spawner's own publish
         // filter is covered by the spawner → granted.
         let child_ok = codesession::mint(
-            &root, "code-m4pubchok", "claude-code", pid,
+            &root,
+            "code-m4pubchok",
+            "claude-code",
+            pid,
             Some("code-m4pubpar"),
             codesession::RequestedGrants {
                 publish: Some(vec![own_pub.clone()]),
                 ..Default::default()
-            }
+            },
         );
         assert!(
             child_ok.is_ok(),
@@ -12784,12 +13060,15 @@ mod tests {
         // The real check: a child requesting obs/# (wider than the parent's narrow
         // scope, and not its own subtree) must be REFUSED.
         let err = codesession::mint(
-            &root, "code-m4pubchfail", "claude-code", pid,
+            &root,
+            "code-m4pubchfail",
+            "claude-code",
+            pid,
             Some("code-m4pubpar"),
             codesession::RequestedGrants {
                 publish: Some(vec!["obs/#".to_string()]),
                 ..Default::default()
-            }
+            },
         );
         assert!(
             err.is_err(),
@@ -13608,8 +13887,7 @@ mod tests {
     ) {
         let conn = crate::db::open(root).unwrap();
         crate::db::init_schema(&conn).unwrap();
-        let mut b =
-            crate::context_blocks::ContextBlock::new(name, content, claude_agent_noun());
+        let mut b = crate::context_blocks::ContextBlock::new(name, content, claude_agent_noun());
         b.scope = if session_scope {
             crate::context_blocks::Scope::Session
         } else {
@@ -14041,11 +14319,7 @@ mod tests {
         assert_eq!(rest, vec!["-p".to_string(), "say hi".to_string()]);
 
         // `--profile <name>` selects the profile and is stripped (value too).
-        let (p, rest) = take_profile_flag(&[
-            "--profile".into(),
-            "dev".into(),
-            "task".into(),
-        ]);
+        let (p, rest) = take_profile_flag(&["--profile".into(), "dev".into(), "task".into()]);
         assert_eq!(p, "dev");
         assert_eq!(rest, vec!["task".to_string()]);
 
@@ -14083,11 +14357,17 @@ mod tests {
         for (name, src) in &skills {
             let link = target.join(name);
             assert!(
-                std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
                 "{name} should be a symlink"
             );
             assert_eq!(&std::fs::read_link(&link).unwrap(), src);
-            assert!(link.join("SKILL.md").exists(), "{name}/SKILL.md via the link");
+            assert!(
+                link.join("SKILL.md").exists(),
+                "{name}/SKILL.md via the link"
+            );
         }
 
         // Empty set: no dir is created, no error.
@@ -14137,7 +14417,10 @@ mod tests {
         for entry in ["auth.json", "version.json"] {
             let link = home.join(entry);
             assert!(
-                std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
                 "{entry} should be a symlink into the real codex home"
             );
             assert_eq!(&std::fs::read_link(&link).unwrap(), &real_codex.join(entry));

@@ -17,22 +17,54 @@ a new harness" docs. I guess that's what --provider does, but does it actually s
 
 Rename elanus to Lanius (sorry, but spanish? el anus? yea no). Plus, butcher birds go hard.. Also, do a UX overhaul
 so it looks less hacker vibe and more professional / butcher birds.
+  1. Yeah, rename when ever you want.
+  2. Journey — okay fine I don't actually mean a UX overhaul, just how it looks. Basically reference Lily & Daniel 
+     in the journeys and target them. Especially Lily.
+  3. Oh, while you're at it, see if you can do a few SVG logos
 
 
 Memory blocks need 2 levels. Those that go in the system prompt (infrequently modified) and those that go in the 
 user prompt (heavily modified, uses more duplicate tokens, avoid unless you need this).
+1. yes you got it. And the semantics of user vs system mean that context programs can stack together more neatly.
 
 
 KB should have a README that instructs what sorts of information go into it.
+  1. Yeah, basically the README acts like the `description` field of a skill. I'm undecided if it actually goes
+     into the system prompt. Lean toward not. Probably just have it guide KB introspection. So if an agent wants
+     to write something down, use KB introspection to locate the right place to write it down, then cache that 
+     decision in a memory block.
 
 
 Coding agent support for ACP. That's how we got Codex to fully work, and seems like the best path. Maybe redo
 opencode if ACP is a better interface.
+  1. Should ACP be preferred? Yeah, probably. Less code to maintain, right?
+  2. Does ACP actually buy us enough integration? I feel like we need to integrate a bit deeper, e.g. with hooks.
+     Or maybe ACP actually gets us that??
 
 do docs/journeys/15-agentic-configuration.md
 
 
 Redo docs/notes-dolt-spike.md but in relation to it replacing SQLite, not Git
+
+
+The secret store -- I think we have a secret store that's useful for storing API keys, I believe that's how we
+do it. We should make sure it can be easily attached to the profiles. Ideally, I'd want to be able to replicate
+something like the permission walls behind Claude Tag. Like a request comes in (maybe not from Slack) and based on
+some criteria (e.g. the room the request comes from), it parameterizes the profile to enable certain sandboxes.
+
+
+Probably unify the sandbox across files + network + external resources. Probably creates some URI scheme to
+represent all of them. Make it feel like one system. I think the external resources could plausibly be permission
+to use credentials in another system.
+
+
+See if we can replicate the _questions.md/_responses.md pattern via Lanius & the web UI._ Would be nice, for our
+personal install, to attach Lanius to Signal or whatever people use these days, so that Fable can message me direct.
+
+
+Stale adapter binaries (this was Fable)
+  1. My general soft preference is that it be quiet from my end, and generally trend toward staying up-to-date. So
+     I guess I'm agreeing on (b).
 
 <!--
 Sprint-3 pull (2026-07-02): every other item moved into agreed handoffs / delivered docs.

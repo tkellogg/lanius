@@ -69,7 +69,10 @@ fn kick(root: &Path, stub: &Path, log: &Path, reply: &Path) -> (bool, String) {
         .write_all(br#"{"type":"in/package/kb-groundskeeper/pipeline"}"#)
         .unwrap();
     let out = child.wait_with_output().unwrap();
-    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// How many times the stub saw `kb groundskeep`.
@@ -98,7 +101,10 @@ fn daily_cadence_gets_one_pass_per_interval() {
     let (ok, err) = kick(&root, &stub, &log, &reply);
     assert!(ok, "first kick succeeds: {err}");
     assert_eq!(groundskeep_calls(&log), 1, "first kick reaches the verb");
-    assert!(last_pass_file(&root).exists(), "a real pass records its timestamp");
+    assert!(
+        last_pass_file(&root).exists(),
+        "a real pass records its timestamp"
+    );
 
     // Kick 2, immediately (the next hourly cron fire): the daily cadence
     // ('0 3 * * *') has not elapsed → skipped, the verb is NOT called again.
@@ -120,7 +126,11 @@ fn daily_cadence_gets_one_pass_per_interval() {
     std::fs::write(last_pass_file(&root), yesterday.to_string()).unwrap();
     let (ok, err) = kick(&root, &stub, &log, &reply);
     assert!(ok, "a due kick succeeds: {err}");
-    assert_eq!(groundskeep_calls(&log), 2, "once the cadence elapses the pass runs");
+    assert_eq!(
+        groundskeep_calls(&log),
+        2,
+        "once the cadence elapses the pass runs"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

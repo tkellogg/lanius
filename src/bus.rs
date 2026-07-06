@@ -400,7 +400,9 @@ fn read_connack<R: Read>(s: &mut R) -> std::io::Result<()> {
     if body.len() < 2 || body[1] != 0x00 {
         let reason = body.get(1).copied().unwrap_or(0xFF);
         let msg = match reason {
-            0x85 | 0x86 | 0x87 => format!("CONNACK refused: not authorized (reason 0x{reason:02x})"),
+            0x85 | 0x86 | 0x87 => {
+                format!("CONNACK refused: not authorized (reason 0x{reason:02x})")
+            }
             other => format!("CONNACK refused (reason 0x{other:02x})"),
         };
         return Err(bad(&msg));

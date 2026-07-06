@@ -2303,7 +2303,11 @@ fn run_tool(
             };
             let with_packages: Vec<String> = args["with_packages"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let provider = args["provider"].as_str().map(String::from);
             match crate::agentcli::spawn_core(
@@ -2615,7 +2619,10 @@ mod tests {
         assert_eq!(doc["meta"]["model"], "profile-own-model");
 
         // A blank override is not an override (defensive; treated as absent).
-        assert_eq!(run_model("profile-own-model", Some("  ")), "profile-own-model");
+        assert_eq!(
+            run_model("profile-own-model", Some("  ")),
+            "profile-own-model"
+        );
         std::fs::remove_dir_all(&root.dir).ok();
     }
 
@@ -2636,7 +2643,10 @@ mod tests {
         // OWN mailbox but nothing else on the in/ plane — launch_agent, not a raw
         // emit_event, is the door to a sibling's mailbox.
         let own = crate::topic::agent_mailbox("main");
-        assert!(!emit_event_in_plane_refused(&own, &own), "self mailbox allowed");
+        assert!(
+            !emit_event_in_plane_refused(&own, &own),
+            "self mailbox allowed"
+        );
         assert!(
             emit_event_in_plane_refused(&crate::topic::agent_mailbox("architect"), &own),
             "another agent's mailbox is refused"
@@ -2683,7 +2693,10 @@ mod tests {
         // …led by the quoted target, attributed as the message being replied to.
         assert!(prompt.contains("the plan is to ship on friday"), "{prompt}");
         assert!(prompt.contains("earlier message"), "{prompt}");
-        assert!(prompt.contains("> the plan is to ship on friday"), "{prompt}");
+        assert!(
+            prompt.contains("> the plan is to ship on friday"),
+            "{prompt}"
+        );
         let quote_at = prompt.find("the plan is to ship on friday").unwrap();
         let new_at = prompt.find("and what about the cost?").unwrap();
         assert!(quote_at < new_at, "quote must lead the new text: {prompt}");
@@ -3086,7 +3099,10 @@ mod tests {
             &pool,
             &crate::pkgtool::Pool::default(),
         );
-        assert!(matches!(out, ToolOutcome::Output(_)), "send_message yields Output");
+        assert!(
+            matches!(out, ToolOutcome::Output(_)),
+            "send_message yields Output"
+        );
 
         let (etype, payload): (String, String) = conn
             .query_row(
@@ -3133,11 +3149,24 @@ mod tests {
             };
             let mut self_emitted = HashSet::new();
             let out = run_tool(
-                &root, &conn, &cage, &prof, "s-fmt", None, None, true, &call,
-                &mut self_emitted, &pool, &crate::pkgtool::Pool::default(),
+                &root,
+                &conn,
+                &cage,
+                &prof,
+                "s-fmt",
+                None,
+                None,
+                true,
+                &call,
+                &mut self_emitted,
+                &pool,
+                &crate::pkgtool::Pool::default(),
             );
             // send_message never suspends: it always yields Output.
-            assert!(matches!(out, ToolOutcome::Output(_)), "send_message yields Output");
+            assert!(
+                matches!(out, ToolOutcome::Output(_)),
+                "send_message yields Output"
+            );
             let payload: String = conn
                 .query_row(
                     "SELECT payload FROM events WHERE type = ?1 ORDER BY id DESC LIMIT 1",
@@ -3224,7 +3253,10 @@ mod tests {
             panic!("expected an Output outcome");
         };
         let v: Value = serde_json::from_str(&raw).unwrap();
-        assert!(v["error"].as_str().is_some(), "forged in/... must refuse: {raw}");
+        assert!(
+            v["error"].as_str().is_some(),
+            "forged in/... must refuse: {raw}"
+        );
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM events WHERE type = 'in/dm/bluesky/somebody'",
@@ -3244,7 +3276,17 @@ mod tests {
             };
             let mut se = HashSet::new();
             let out = run_tool(
-                &root, &conn, &cage, &prof, "s1", None, None, false, &call, &mut se, &mcp_pool,
+                &root,
+                &conn,
+                &cage,
+                &prof,
+                "s1",
+                None,
+                None,
+                false,
+                &call,
+                &mut se,
+                &mcp_pool,
                 &crate::pkgtool::Pool::default(),
             );
             let ToolOutcome::Output(raw) = out else {
@@ -3280,7 +3322,11 @@ mod tests {
                 v["error"].as_str().is_some(),
                 "in/... other than self must refuse: {forged} -> {v}"
             );
-            assert_eq!(row_count(&forged), 0, "a refused emit lands no row: {forged}");
+            assert_eq!(
+                row_count(&forged),
+                0,
+                "a refused emit lands no row: {forged}"
+            );
         }
 
         let ok_call = ToolCall {
@@ -3381,7 +3427,17 @@ mod tests {
             };
             let mut se = HashSet::new();
             let out = run_tool(
-                &root, &conn, &cage, &prof, "conv-1", None, None, false, &c, &mut se, &mcp_pool,
+                &root,
+                &conn,
+                &cage,
+                &prof,
+                "conv-1",
+                None,
+                None,
+                false,
+                &c,
+                &mut se,
+                &mcp_pool,
                 &crate::pkgtool::Pool::default(),
             );
             let ToolOutcome::Output(raw) = out else {
@@ -3411,13 +3467,17 @@ mod tests {
         // A future row is NOT fired by a sweep.
         crate::dispatcher::tick_schedules(&root, &conn).unwrap();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&own], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&own], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n, 0, "a future schedule does not fire");
 
         // Self-only: even if the args try to name another target, the row lands
         // on the caller's own mailbox (target is never taken from args).
-        let _ = call(json!({ "in_seconds": 3600, "message": "x", "type": crate::topic::agent_mailbox("victim"), "agent": "victim" }));
+        let _ = call(
+            json!({ "in_seconds": 3600, "message": "x", "type": crate::topic::agent_mailbox("victim"), "agent": "victim" }),
+        );
         let victim: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM scheduled_events WHERE emit_type = ?1",
@@ -3425,25 +3485,42 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(victim, 0, "the tool cannot schedule another agent's mailbox");
+        assert_eq!(
+            victim, 0,
+            "the tool cannot schedule another agent's mailbox"
+        );
 
         // Force a due row and sweep: it fires exactly one event and flips fired.
-        conn.execute("UPDATE scheduled_events SET fire_at = '2000-01-01T00:00:00.000Z'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE scheduled_events SET fire_at = '2000-01-01T00:00:00.000Z'",
+            [],
+        )
+        .unwrap();
         crate::dispatcher::tick_schedules(&root, &conn).unwrap();
         let fired_events: i64 = conn
-            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&own], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&own], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(fired_events, 2, "both due rows fired one in/agent/<noun> each");
+        assert_eq!(
+            fired_events, 2,
+            "both due rows fired one in/agent/<noun> each"
+        );
         let unfired: i64 = conn
-            .query_row("SELECT COUNT(*) FROM scheduled_events WHERE fired = 0", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM scheduled_events WHERE fired = 0",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(unfired, 0, "every fired row flips fired = 1");
 
         // A second sweep is a no-op — idempotent (the fired flag + sched:<id>).
         crate::dispatcher::tick_schedules(&root, &conn).unwrap();
         let after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&own], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM events WHERE type = ?1", [&own], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(after, 2, "a re-sweep does not re-fire");
 
@@ -3514,10 +3591,10 @@ mod tests {
             .expect("a held lease yields a narrowed cage");
         assert!(narrowed.enforcing());
         // The narrowed write set really did narrow to root + the leased subtree.
-        assert!(narrowed.write_roots.iter().any(|r| r == &sub) || narrowed
-            .write_roots
-            .iter()
-            .any(|r| sub.starts_with(r)));
+        assert!(
+            narrowed.write_roots.iter().any(|r| r == &sub)
+                || narrowed.write_roots.iter().any(|r| sub.starts_with(r))
+        );
         // ...and the network posture rode through: still cannot reach loopback.
         let narrowed_conn = narrowed
             .shell_command(&format!("nc -w 2 127.0.0.1 {port}"))
@@ -3551,7 +3628,11 @@ pub fn handle_exec(root: &Root) -> Result<()> {
     // provider. Applied for this run only in run_turn.
     let with_packages: Vec<String> = payload["with_packages"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let launch_provider = payload["provider"].as_str().map(String::from);
     // The groundskeeper pipeline (docs/handoffs/kb-groundskeeper.md M3) threads

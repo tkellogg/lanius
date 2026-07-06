@@ -120,7 +120,8 @@ pub fn publish(
     retain: bool,
     correlation: Option<&str>,
 ) -> Result<()> {
-    publish_typed(root, topic_name, payload, qos, retain, correlation).map_err(|e| anyhow::anyhow!(e))
+    publish_typed(root, topic_name, payload, qos, retain, correlation)
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// The typed publish (docs/handoffs/bus-resilience.md M2): the same wire path as
@@ -425,7 +426,10 @@ mod tests {
         let denied = classify_conn_error(ConnectionError::ConnectionRefused(
             ConnectReturnCode::NotAuthorized,
         ));
-        assert!(denied.is_denied(), "a refused CONNACK is Denied, got {denied:?}");
+        assert!(
+            denied.is_denied(),
+            "a refused CONNACK is Denied, got {denied:?}"
+        );
         assert!(
             denied.to_string().contains("authorization"),
             "a Denied error names authorization, got {denied}"
@@ -445,8 +449,12 @@ mod tests {
 
         // A generic ConnectionRefused with a non-auth banned code is still the
         // broker actively refusing -> Denied (never soft-retried past).
-        let banned =
-            classify_conn_error(ConnectionError::ConnectionRefused(ConnectReturnCode::Banned));
-        assert!(banned.is_denied(), "any refused CONNACK is Denied, got {banned:?}");
+        let banned = classify_conn_error(ConnectionError::ConnectionRefused(
+            ConnectReturnCode::Banned,
+        ));
+        assert!(
+            banned.is_denied(),
+            "any refused CONNACK is Denied, got {banned:?}"
+        );
     }
 }
