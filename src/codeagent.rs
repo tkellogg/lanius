@@ -3948,6 +3948,15 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
                 "".to_string(),
                 "--plugin-dir".to_string(),
                 plugin_dir.display().to_string(),
+                // Headless has no human to answer permission prompts, so
+                // without this every Write/Edit is auto-denied and the worker
+                // silently produces nothing (it cost us two planner runs to
+                // learn that). Tim's ruling 2026-07-06: skip-permissions for
+                // parity with codex's danger-full-access posture; an elanus
+                // cage around headless claude (like codex-cage) is the
+                // fast-follow that re-fences it. TUI launches keep prompts —
+                // a human is present there.
+                "--dangerously-skip-permissions".to_string(),
             ];
             if let Some((path, _)) = &mcp_config {
                 tool_args.push("--mcp-config".to_string());
