@@ -1,7 +1,14 @@
 #!/bin/sh
 # Count recent failures in the event log; raise an algedonic signal if any.
 set -eu
-N=$(sqlite3 "${ELANUS_DB:-$HARNESS_DB}" "SELECT count(*) FROM events WHERE state='failed' AND finished_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-5 minutes');")
+ROOT="${LANIUS_ROOT:-${ELANUS_ROOT:-${HARNESS_ROOT:-.}}}"
+DB="${LANIUS_DB:-${ELANUS_DB:-${HARNESS_DB:-$ROOT/lanius.db}}}"
+if [ ! -f "$DB" ] && [ -f "$ROOT/elanus.db" ]; then
+  DB="$ROOT/elanus.db"
+elif [ ! -f "$DB" ] && [ -f "$ROOT/harness.db" ]; then
+  DB="$ROOT/harness.db"
+fi
+N=$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE state='failed' AND finished_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-5 minutes');")
 if [ "${N:-0}" -gt 0 ]; then
-  elanus emit signal/pain --payload "{\"reason\":\"$N event(s) failed in the last 5 minutes\",\"source\":\"watchdog\"}"
+  lanius emit signal/pain --payload "{\"reason\":\"$N event(s) failed in the last 5 minutes\",\"source\":\"watchdog\"}"
 fi

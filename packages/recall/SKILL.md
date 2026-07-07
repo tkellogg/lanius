@@ -46,10 +46,10 @@ channel-faithfully — **on the bus, which is what records it to the ledger**:
 ```sh
 # 1. record who the handle is (create the identity, then link the channel —
 #    or record the channel unresolved now and link it later)
-elanus bus pub in/package/phonebook/identity '{"id":"tim","kind":"human","canonical":"Tim"}' --qos 1
-elanus bus pub in/package/phonebook/channel  '{"channel_kind":"bluesky","address":"@tim.bsky","identity":"tim","confidence":1.0}' --qos 1
+lanius bus pub in/package/phonebook/identity '{"id":"tim","kind":"human","canonical":"Tim"}' --qos 1
+lanius bus pub in/package/phonebook/channel  '{"channel_kind":"bluesky","address":"@tim.bsky","identity":"tim","confidence":1.0}' --qos 1
 # 2. publish each inbound message on the channel-faithful topic, QoS 1
-elanus bus pub "in/dm/bluesky/@tim.bsky" '{"text":"hey"}' --qos 1
+lanius bus pub "in/dm/bluesky/@tim.bsky" '{"text":"hey"}' --qos 1
 ```
 
 - The message text goes in **`payload.text`** (recall reads `text`, then

@@ -1,5 +1,5 @@
-//! `elanus kb list` / `elanus kb write` (docs/handoffs/kb-core.md). The CLI is the
-//! API, the way `elanus config` and `elanus block` are: a harness shells out to it.
+//! `lanius kb list` / `lanius kb write` (docs/handoffs/kb-core.md). The CLI is the
+//! API, the way `lanius config` and `lanius block` are: a harness shells out to it.
 //! `list` names the enabled knowledge bases (packages carrying the `[kb]` marker);
 //! `write` is the convenience verb that writes a file into a KB's `kb/` tree and
 //! commits it atomically with the shared hardened-git discipline. The taught
@@ -14,7 +14,7 @@ use crate::paths::Root;
 use anyhow::Result;
 use serde_json::json;
 
-/// `elanus kb list [--json]`: the enabled KBs visible to `profile`, human table
+/// `lanius kb list [--json]`: the enabled KBs visible to `profile`, human table
 /// or one JSON line each (for a harness to consume).
 pub fn list(root: &Root, profile: &str, json_out: bool) -> Result<()> {
     let kbs = kb::enumerate(root, profile)?;
@@ -51,7 +51,7 @@ pub fn list(root: &Root, profile: &str, json_out: bool) -> Result<()> {
     Ok(())
 }
 
-/// `elanus kb search <query>`: ranked file+line hits from the kb-search FTS5
+/// `lanius kb search <query>`: ranked file+line hits from the kb-search FTS5
 /// index (the same index the `search_knowledge` tool reads, so identical hits).
 /// Human list or one JSON line per hit.
 pub fn search(root: &Root, query: &str, limit: usize, json_out: bool) -> Result<()> {
@@ -80,7 +80,7 @@ pub fn search(root: &Root, query: &str, limit: usize, json_out: bool) -> Result<
     Ok(())
 }
 
-/// `elanus kb write <pkg> <path>`: write stdin (or `--content`) into `kb/<path>`
+/// `lanius kb write <pkg> <path>`: write stdin (or `--content`) into `kb/<path>`
 /// and commit it. Write-then-commit is atomic with the KB's hardened git.
 pub fn write(root: &Root, pkg: &str, path: &str, content: &str) -> Result<()> {
     let out = kb::write(root, pkg, path, content)?;
@@ -97,7 +97,7 @@ pub fn write(root: &Root, pkg: &str, path: &str, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// `elanus kb check [--profile] [--json] [--mail]`: the M1 groundskeeper sweep
+/// `lanius kb check [--profile] [--json] [--mail]`: the M1 groundskeeper sweep
 /// (docs/handoffs/kb-groundskeeper.md) — validate pointer blocks, find orphans,
 /// flag staleness. ZERO LLM calls. With `--mail`, emit the report to the owner's
 /// mailbox (in/human/owner) when there are findings — the cron sweep's deliverable.
@@ -127,7 +127,7 @@ pub fn check(root: &Root, profile: &str, json_out: bool, mail: bool) -> Result<(
     Ok(())
 }
 
-/// `elanus kb apply-diff <pkg>`: apply a unified diff (from stdin, or `--content`)
+/// `lanius kb apply-diff <pkg>`: apply a unified diff (from stdin, or `--content`)
 /// into a KB's `kb/` tree and commit exactly what it touches — the ratifier's
 /// apply path (docs/handoffs/kb-groundskeeper.md M3). Path-disciplined: a diff that
 /// reaches outside `kb/` is refused before any file is touched.
@@ -146,7 +146,7 @@ pub fn apply_diff(root: &Root, pkg: &str, diff: &str) -> Result<()> {
     Ok(())
 }
 
-/// `elanus kb groundskeep [--profile]`: the pipeline dispatch (M3) the cron calls.
+/// `lanius kb groundskeep [--profile]`: the pipeline dispatch (M3) the cron calls.
 /// The absolute setup gate first: if the pipeline is not set up (config keys unset,
 /// the package unapproved, OR the pipeline exec handler `kb-pipeline` unapproved so
 /// the compactor mailbox is not daemon-drivable) it is INERT — it prints why and
@@ -167,7 +167,7 @@ pub fn groundskeep(root: &Root, profile: &str) -> Result<()> {
     };
     if !crate::packages::is_granted(&conn, groundskeeper::PKG)? {
         println!(
-            "inert: {} is not approved (run `elanus approve {}`)",
+            "inert: {} is not approved (run `lanius approve {}`)",
             groundskeeper::PKG,
             groundskeeper::PKG
         );

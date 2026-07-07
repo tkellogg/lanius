@@ -1,7 +1,7 @@
 ---
-status: planned
+status: done
 author: Opus (planner)
-last-updated: 2026-07-06
+last-updated: 2026-07-07
 ---
 
 # Rename: elanus → Lanius (binary/crate `lanius`)
@@ -396,3 +396,11 @@ in `scripts/` beside `new-worktree.sh`. Requirements, all mandatory:
   transition `elanus`→`lanius` symlink for one cycle; doc policy = rename living
   commands, preserve historical prose. Awaiting Fable review before dispatching
   implementation. Impl must run on a clean tree (siblings active now).
+- 2026-07-07 (Codex orchestrator): implemented with a `gpt-5.4-mini` worker and
+  verified with a separate `gpt-5.5` verifier. Shipped the full mechanical rename:
+  `lanius` crate/binary, `LANIUS_*` canonical env with legacy fallbacks, `lanius.db`
+  migration, `lanius.toml` manifests with legacy load fallback, `~/.lanius` root
+  preference with old-root compatibility, living docs/skills/UI copy sweep, `.claude`
+  permission variants for both names, and `scripts/upgrade-to-lanius.sh` with
+  explicit user-kit migration. Final verifier pass: cargo tests/build green, web
+  build and browser QA green, upgrade-script syntax/executable/dry-run checks green.

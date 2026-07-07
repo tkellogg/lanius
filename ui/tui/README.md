@@ -1,4 +1,4 @@
-# elanus TUI
+# lanius TUI
 
 An ink-based terminal UI that is a **pure MQTT 5 client** on the loopback
 listener. No sqlite, no trace.jsonl, no privileged access — if this UI ever
@@ -10,7 +10,7 @@ system through the bus alone.
 
 ```sh
 cd ui/tui && npm install
-node index.js --root /tmp/elanus-live     # or ELANUS_ROOT, or --url mqtt://127.0.0.1:18830
+node index.js --root /tmp/lanius-live     # or LANIUS_ROOT, or --url mqtt://127.0.0.1:18830
 ```
 
 The broker address comes from `<root>/bus.toml` (the one allowed filesystem

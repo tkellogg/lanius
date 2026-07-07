@@ -12,17 +12,20 @@ pub fn open(root: &Root) -> Result<Connection> {
 }
 
 /// One-time, no-brick rename of the ledger file from the legacy `harness.db` to
-/// `elanus.db` (the binary used to be `harness`). Runs at the single open
-/// chokepoint BEFORE the connection is made — otherwise sqlite would create a
-/// fresh empty elanus.db beside the old data. Moves the WAL/SHM siblings too so
-/// no committed-but-unflushed transactions are lost. Idempotent and best-effort:
-/// if the new name already exists, or there's nothing to move, it does nothing.
+/// `lanius.db` (the binary used to be `harness`, and we also honor a historical
+/// `elanus.db`). Runs at the single open chokepoint BEFORE the connection is
+/// made — otherwise sqlite would create a fresh empty lanius.db beside the old
+/// data. Moves the WAL/SHM siblings too so no committed-but-unflushed
+/// transactions are lost. Idempotent and best-effort: if the new name already
+/// exists, or there's nothing to move, it does nothing.
 fn migrate_db_filename(root: &Root) {
     let new = root.db();
-    let old = root.legacy_db();
-    if new.exists() || !old.exists() {
+    if new.exists() {
         return;
     }
+    let Some(old) = root.legacy_db_candidates().into_iter().find(|p| p.exists()) else {
+        return;
+    };
     for (from, to) in [
         (old.clone(), new.clone()),
         (sibling(&old, "-wal"), sibling(&new, "-wal")),
@@ -62,25 +65,44 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root { dir: dir.clone() };
-        // Seed an old-style harness.db with a row; no elanus.db present.
+        // Seed an old-style elanus.db with a row; no lanius.db present.
         {
-            let conn = Connection::open(root.legacy_db()).unwrap();
+            let conn = Connection::open(root.legacy_db_candidates()[0].clone()).unwrap();
             conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);")
                 .unwrap();
         }
-        assert!(root.legacy_db().exists() && !root.db().exists());
+        assert!(root.legacy_db_candidates()[0].exists() && !root.db().exists());
         // open() migrates the filename first, then opens the SAME data.
         let conn = open(&root).unwrap();
-        assert!(root.db().exists(), "elanus.db must exist after migration");
+        assert!(root.db().exists(), "lanius.db must exist after migration");
         assert!(
-            !root.legacy_db().exists(),
-            "harness.db must be gone after migration"
+            !root.legacy_db_candidates()[0].exists(),
+            "elanus.db must be gone after migration"
         );
         let x: i64 = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(x, 42, "data preserved across the rename");
         // Idempotent: a second open is a no-op (already migrated).
         drop(conn);
         let _ = open(&root).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_legacy_harness_db_filename() {
+        let dir = std::env::temp_dir().join(format!("el-dbmig-h-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        {
+            let conn = Connection::open(root.legacy_db()).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (7);")
+                .unwrap();
+        }
+        let conn = open(&root).unwrap();
+        let x: i64 = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(x, 7);
+        assert!(root.db().exists());
+        assert!(!root.legacy_db().exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -144,7 +166,7 @@ CREATE TABLE IF NOT EXISTS events (
   payload         TEXT,
   state           TEXT NOT NULL DEFAULT 'pending',
                   -- pending | running | done | failed | waiting_on_human | expired | denied
-  -- Which handler invocation emitted this event (from ELANUS_DISPATCH_ID).
+  -- Which handler invocation emitted this event (from LANIUS_DISPATCH_ID).
   -- Scopes suspend/resume: an ask is matched to the dispatch that asked it.
   emitted_by_dispatch INTEGER,
   priority        INTEGER NOT NULL DEFAULT 0,
@@ -349,19 +371,19 @@ CREATE INDEX IF NOT EXISTS idx_context_build_log_session ON context_build_log(se
 CREATE INDEX IF NOT EXISTS idx_context_build_log_run ON context_build_log(run_id, id);
 
 -- Durable coding-session records (docs/handoffs/coding-agents.md, M2-A). One row
--- per launched coding session, mapping the elanus session id to the tool's own
+-- per launched coding session, mapping the lanius session id to the tool's own
 -- NATIVE resumable session id (codex thread_id / Claude Code session_id), the
 -- tool, the agent noun it publishes under, and the workdir it ran in. This is the
 -- DURABLE half of the split session model: the record carries NO secret and
 -- survives process exit, so an idle resumable session has a record but no live
 -- credential. The ephemeral scoped TOKEN (src/codesession.rs) is minted per run
--- and per resume and retired at the end — the record is what `elanus code resume`
+-- and per resume and retired at the end — the record is what `lanius code resume`
 -- looks up to mint a fresh token and continue the native session in its workdir.
 -- Written once the native id is known (codex: thread.started; CC: SessionStart),
--- updated on each resume (last_active). Keyed by the elanus session.
+-- updated on each resume (last_active). Keyed by the lanius session.
 CREATE TABLE IF NOT EXISTS code_sessions (
   id             INTEGER PRIMARY KEY,
-  elanus_session TEXT NOT NULL UNIQUE,  -- code-<8hex>, the elanus session id
+  elanus_session TEXT NOT NULL UNIQUE,  -- code-<8hex>, the lanius session id
   native_session TEXT NOT NULL,         -- codex thread_id / CC session_id (resume key)
   tool           TEXT NOT NULL,         -- the binary: claude | codex
   agent_noun     TEXT NOT NULL,         -- the obs noun: claude-code | codex
@@ -431,7 +453,7 @@ CREATE TABLE IF NOT EXISTS code_notes (
 );
 
 -- Inbox read-tracking (M3): which of a session's own mailbox deliveries it has
--- already pulled via `elanus code inbox`. Keyed by (session, event_id) so the
+-- already pulled via `lanius code inbox`. Keyed by (session, event_id) so the
 -- read is idempotent — pulling twice does not re-surface the same message, and
 -- the per-turn injection counts only UNSEEN deliveries. A session only ever
 -- writes rows for ITS OWN deliveries (the inbox read is scoped to its own
@@ -525,7 +547,7 @@ CREATE TABLE IF NOT EXISTS code_mail_delivered (
 -- session's todo obs events (Claude `tool/TodoWrite/{call,result}`, codex
 -- `assistant/todo`), latest-wins per (session, item_id). This is the ambient
 -- "what is this sibling working on" surface the per-turn sibling note +
--- `elanus code whose`/`sessions` read. Advisory only, gates nothing; one row per
+-- `lanius code whose`/`sessions` read. Advisory only, gates nothing; one row per
 -- task item, status ∈ todo|in_progress|done. Written from the projection rather
 -- than db.rs, but the table lives here beside the other coding-session tables.
 CREATE TABLE IF NOT EXISTS code_session_tasks (
@@ -538,7 +560,7 @@ CREATE TABLE IF NOT EXISTS code_session_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_code_session_tasks_session ON code_session_tasks(elanus_session);
 
--- Detached-spawn edge (cross-harness-death M1/M2). `elanus code spawn <tool>` fires
+-- Detached-spawn edge (cross-harness-death M1/M2). `lanius code spawn <tool>` fires
 -- a DETACHED, unparented worker process (src/codeagent.rs `spawn`): nothing can
 -- `wait()` on it, so a worker whose WRAPPER is SIGKILL'd before it mails its
 -- completion would leave the spawner hung forever (the driven path's

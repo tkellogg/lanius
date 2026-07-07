@@ -269,7 +269,7 @@ fn tick(
 /// Announce kernel-minted ledger events on the bus under their own topic —
 /// the work-plane-on-bus delivery piece (docs/bus.md "[KNOWN GAP — as built,
 /// step 5/6]"). The daemon is the single announcement authority for every
-/// emit that did NOT arrive over the bus: CLI `elanus emit`, cron, the
+/// emit that did NOT arrive over the bus: CLI `lanius emit`, cron, the
 /// dispatcher's own emits, exec handlers' emits — and events emitted while
 /// the daemon was down, which this sweep picks up on the next start.
 ///
@@ -305,7 +305,7 @@ fn announce_ledger_events(root: &Root, conn: &Connection) -> Result<()> {
         // obs/config/# — a config acceptance is a live notification a dashboard
         // wants (docs/config.md D3), and it is kernel-emitted so it would
         // otherwise never reach a subscriber. Other obs/ types (e.g. obs/channel
-        // receipts via `elanus emit`) keep their obs/harness/ledger/emit echo
+        // receipts via `lanius emit`) keep their obs/harness/ledger/emit echo
         // only. A bus-origin event is already announced=1, so it never reaches
         // this sweep — no double-publish. Mark the row either way so we move on.
         if etype.starts_with("in/")
@@ -493,16 +493,16 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
             // by contract — only the fallback ever filled it, which broke when
             // the file was renamed; now it is set for real.
             .env_dual("DB", root.db())
-            .env("ELANUS_PACKAGE", &pkg.name)
-            .env("ELANUS_SCRATCH", &scratch)
-            .env("ELANUS_BUS_ADDR", &addr)
-            .env("ELANUS_BUS_TOKEN", &token)
+            .env_dual("PACKAGE", &pkg.name)
+            .env_dual("SCRATCH", &scratch)
+            .env_dual("BUS_ADDR", &addr)
+            .env_dual("BUS_TOKEN", &token)
             .env(
-                "ELANUS_SESSION_EXPIRY_S",
+                "LANIUS_SESSION_EXPIRY_S",
                 proc_.session_expiry_s.to_string(),
             )
             .env(
-                "ELANUS_HTTP_PORT",
+                "LANIUS_HTTP_PORT",
                 http_port.map(|p| p.to_string()).unwrap_or_default(),
             )
             .env(
@@ -792,7 +792,7 @@ fn finish_dispatch(root: &Root, conn: &Connection, r: &Running, code: i32) -> Re
     if dstate == "suspended" {
         // The suspend contract: before exiting 75 the handler emitted an ask
         // (in/human/<owner>). Match it by the emitting dispatch
-        // (ELANUS_DISPATCH_ID), so two handlers of the same event can each
+        // (LANIUS_DISPATCH_ID), so two handlers of the same event can each
         // park on their own ask without cross-wiring; fall back to cause for
         // emitters that lost env.
         //
@@ -1179,7 +1179,7 @@ fn route_completion(
 }
 
 /// Reap detached-spawn workers that died without reporting (cross-harness-death
-/// M2). `elanus code spawn` fires a DETACHED, unparented worker: nothing can
+/// M2). `lanius code spawn` fires a DETACHED, unparented worker: nothing can
 /// `wait()` on it, so if its wrapper is SIGKILL'd (or crashes) before its own
 /// `emit_completion_delivery`, the spawner would hang forever — the driven path's
 /// `reconcile_lost_routes` only covers `code_delivery_keys`. Each spawn records a
@@ -1842,7 +1842,7 @@ fn spawn_handler(
     let out_f = std::fs::File::create(&out_path)?;
     let err_f = std::fs::File::create(&err_path)?;
 
-    // Handlers call back into `elanus`; make sure this binary wins on PATH.
+    // Handlers call back into `lanius`; make sure this binary wins on PATH.
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -1964,7 +1964,7 @@ mod tests {
 
     fn tmp_root() -> Root {
         let dir = std::env::temp_dir().join(format!(
-            "elanus-dispatch-{}-{}",
+            "lanius-dispatch-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
@@ -2243,7 +2243,7 @@ mod tests {
     }
 
     /// M3/M5 (docs/handoffs/timers.md): a one-shot schedule → fire → wake on the
-    /// ledger. A due `scheduled_events` row (as `elanus schedule` / the tool
+    /// ledger. A due `scheduled_events` row (as `lanius schedule` / the tool
     /// insert) fires exactly one `in/agent/main` event carrying {prompt,session};
     /// that event is a plain pending delivery — drive_code_deliveries leaves it
     /// for the chat exec handler (wonky bit 4: `main` is not a coding session);

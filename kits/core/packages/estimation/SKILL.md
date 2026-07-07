@@ -1,6 +1,6 @@
 ---
 name: estimation
-description: Estimate your work right after you plan, then count actuals against it and retro on the miss. Use `elanus estimate set` once your plan is set (dollars/turns/tokens/wall-clock), `elanus estimate actual` to see the variance, and let the Stop hook (or this package's cron) record the miss into a durable learned block so the next estimate improves.
+description: Estimate your work right after you plan, then count actuals against it and retro on the miss. Use `lanius estimate set` once your plan is set (dollars/turns/tokens/wall-clock), `lanius estimate actual` to see the variance, and let the Stop hook (or this package's cron) record the miss into a durable learned block so the next estimate improves.
 ---
 
 # estimation — estimate, count, retro (the loop)
@@ -10,19 +10,19 @@ counts against it. Later the process retros on why it missed and adjusts a memor
 block so the next estimate is better. The loop, in three verbs:
 
 ```
-elanus estimate set    --session <s> --dollars 0.40 --turns 8 --tokens 120000 --wall-clock 600000
-elanus estimate actual --session <s>          # actual vs estimate, dollars headline
-elanus estimate retro  --session <s>           # append the miss to the learned block
+lanius estimate set    --session <s> --dollars 0.40 --turns 8 --tokens 120000 --wall-clock 600000
+lanius estimate actual --session <s>          # actual vs estimate, dollars headline
+lanius estimate retro  --session <s>           # append the miss to the learned block
 ```
 
 There is **no estimation data model**. The estimate is a memory `estimate` block;
 the boundary is an `obs/estimate/<session>` event; actuals come from the obs
-projection (`elanus code sessions`); the learned heuristic is a durable
+projection (`lanius code sessions`); the learned heuristic is a durable
 `estimation` block. The verbs are kernel CLI built entirely on those primitives.
 
 ## E1 — capture the estimate (the plan-time declaration)
 
-`elanus estimate set` records a multi-dimensional estimate and **marks the
+`lanius estimate set` records a multi-dimensional estimate and **marks the
 count-from boundary**. Estimates are multi-dimensional but **dollars-normalized** —
 dollars is the cross-model axis. Provide whatever dimensions you can; all are
 optional:
@@ -37,7 +37,7 @@ Calling it again **updates** (latest wins). The estimate shows up as the
 
 ## E2 — actuals + variance (dollars depend on pricing.toml)
 
-`elanus estimate actual` reads the obs projection from the estimate boundary
+`lanius estimate actual` reads the obs projection from the estimate boundary
 onward — **turns, tool-calls, and wall-clock are always available**. It writes an
 `estimate-vs-actual` block and prints the per-dimension variance (actual −
 estimate), dollars first.
@@ -63,24 +63,24 @@ miss to a durable `estimation` block (agent scope), e.g.:
 2026-06-23 — estimated $0.40 actual $0.62 (+0.22), estimated 8 actual 13 (+5) turns; underestimated
 ```
 
-A future `elanus estimate set` runs in a context carrying that `estimation`
+A future `lanius estimate set` runs in a context carrying that `estimation`
 block, so the prior misses inform the next estimate — the **default-that-evolves**
 loop from memory-blocks. The MVP records the miss + a terse directional note;
 the LLM "*why* it missed" reflection (an estimator agent rewriting the heuristic)
 is a documented follow-on.
 
-`elanus estimate retro` is **once per session** — it writes a marker block the
+`lanius estimate retro` is **once per session** — it writes a marker block the
 first time and is a no-op thereafter, so the Stop hook and the cron backstop
 never double-count.
 
 ## What this package ships vs. what the kernel owns
 
-- **Kernel** (no data model): the `elanus estimate set/actual/retro` verbs (block
+- **Kernel** (no data model): the `lanius estimate set/actual/retro` verbs (block
   + obs primitives) and the Stop/SessionEnd retro hook.
 - **This package**: [`pricing.toml`](pricing.toml) (the only source of dollars)
   and a **cron backstop** — every 10 minutes it sweeps finished sessions and runs
   the retro for any whose Stop hook never fired (a crash). Approving this package
-  (`elanus approve estimation`) activates only that cron; the CLI verbs work
+  (`lanius approve estimation`) activates only that cron; the CLI verbs work
   without it.
 
 ## Deferred

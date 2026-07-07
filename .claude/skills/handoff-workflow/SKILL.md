@@ -2,7 +2,7 @@
 name: handoff-workflow
 description: >-
   The journey → handoff → implement → verify pipeline for shipping substantial
-  work on elanus, with deliberate model-tiering across the phases. Use when Tim
+  work on lanius, with deliberate model-tiering across the phases. Use when Tim
   asks to plan a feature, write or "knock out" handoff docs, implement a spec,
   or orchestrate implementation + verification — anything bigger than a quick
   edit. Encodes who plans vs implements vs verifies, which model/effort fits
@@ -13,7 +13,7 @@ description: >-
 
 # Handoff workflow
 
-How we ship non-trivial work on elanus. Four phases, two context boundaries, and
+How we ship non-trivial work on lanius. Four phases, two context boundaries, and
 a deliberate choice of model at each phase. The whole point is that **the model
 that plans is not the model that implements, and the model that implements is not
 the model that verifies** — each phase plays to a different model's strength, and
@@ -112,9 +112,9 @@ non-Claude model.
   verify gives clean separate contexts, a structured-output schema for the
   verdict, and a natural place to code the fix loop. This is the default when the
   task fits Opus.
-- **Cross-model → `elanus code`.** Dispatch the underlying harness:
-  `elanus code codex "<task>"` (GPT-5.5), `elanus code opencode "<task>"`
-  (GLM-5.2, via the configured provider), `elanus code claude --worker "<task>"`
+- **Cross-model → `lanius code`.** Dispatch the underlying harness:
+  `lanius code codex "<task>"` (GPT-5.5), `lanius code opencode "<task>"`
+  (GLM-5.2, via the configured provider), `lanius code claude --worker "<task>"`
   (Opus). Use `spawn`/`deliver` for async. Each worker is its own clean context.
 
 The orchestrator (you, as Claude) acts as **planner + conductor**: do phases 1–2

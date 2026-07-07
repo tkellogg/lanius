@@ -1,4 +1,4 @@
-//! `elanus provider` — manage model providers (docs/handoffs/model-providers.md,
+//! `lanius provider` — manage model providers (docs/handoffs/model-providers.md,
 //! M1). A provider is a named, encrypted credential; this is the human-direct
 //! surface to define/list/test/remove one. The secret is NEVER printed — `list`
 //! and `get` show metadata and a redaction; `test` decrypts transiently to probe
@@ -29,7 +29,7 @@ pub struct AddArgs {
     pub headers: Vec<String>,
 }
 
-/// `elanus provider add` — store (and encrypt) a provider.
+/// `lanius provider add` — store (and encrypt) a provider.
 pub fn add(root: &Root, conn: &Connection, a: AddArgs) -> Result<()> {
     let cred = if a.native {
         let tool = a.tool.as_deref().map(HarnessId::parse).transpose()?;
@@ -95,7 +95,7 @@ fn kind_label(conn: &Connection, name: &str) -> Result<String> {
         .unwrap_or_default())
 }
 
-/// `elanus provider list` — one JSON line per provider, metadata only.
+/// `lanius provider list` — one JSON line per provider, metadata only.
 pub fn list(conn: &Connection, want_json: bool) -> Result<()> {
     let providers = provider::list(conn)?;
     for p in &providers {
@@ -134,7 +134,7 @@ pub fn list(conn: &Connection, want_json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `elanus provider get <name>` — one provider's metadata (secret redacted).
+/// `lanius provider get <name>` — one provider's metadata (secret redacted).
 pub fn get(conn: &Connection, name: &str, want_json: bool) -> Result<()> {
     let Some(p) = provider::get_meta(conn, name)? else {
         bail!("no provider {name:?}");
@@ -174,7 +174,7 @@ pub fn get(conn: &Connection, name: &str, want_json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `elanus provider test <name>` — reachability via the `/models` probe. For an
+/// `lanius provider test <name>` — reachability via the `/models` probe. For an
 /// ApiKey the key is decrypted transiently and used to probe; for a NativeLogin
 /// there is nothing to probe. With `--json` the result is machine-readable (a
 /// single JSON object) and a probe FAILURE is reported in-band (`reachable:false`
@@ -258,7 +258,7 @@ pub fn test(root: &Root, conn: &Connection, name: &str, want_json: bool) -> Resu
     }
 }
 
-/// `elanus provider rm <name>` — delete a provider.
+/// `lanius provider rm <name>` — delete a provider.
 pub fn rm(conn: &Connection, name: &str) -> Result<()> {
     if provider::rm(conn, name)? {
         println!("removed provider {name}");

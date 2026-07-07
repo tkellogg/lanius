@@ -1,6 +1,6 @@
 ---
 name: docs-disclosure-indexer
-description: Maintain elanus docs/ progressive-disclosure indexes and useful docs-to-code/code-to-doc references. Use when adding, reorganizing, or auditing docs/ README indexes, AGENTS.md docs guidance, or references between design docs and implementation files.
+description: Maintain lanius docs/ progressive-disclosure indexes and useful docs-to-code/code-to-doc references. Use when adding, reorganizing, or auditing docs/ README indexes, AGENTS.md docs guidance, or references between design docs and implementation files.
 ---
 
 # Docs Disclosure Indexer

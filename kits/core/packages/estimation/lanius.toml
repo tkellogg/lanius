@@ -4,7 +4,7 @@
 # estimation type. All state rides existing substrates — the running estimate is
 # an `estimate` memory BLOCK, the boundary is an `obs/estimate/<session>` event,
 # actuals are read from the obs projection, and the learned heuristic is a durable
-# `estimation` block. The verbs are the kernel CLI `elanus estimate set/actual/
+# `estimation` block. The verbs are the kernel CLI `lanius estimate set/actual/
 # retro` (each reuses the block + obs primitives, not a new model). This package
 # ships the two userland pieces the kernel deliberately does NOT own:
 #
@@ -15,12 +15,12 @@
 #   2. a cron BACKSTOP for the retro (E3). The primary retro runs on the coding
 #      Stop/SessionEnd hook (in the kernel). This cron is the safety net for
 #      sessions whose hook never fired (a crash): it sweeps finished sessions and
-#      runs `elanus estimate retro` for any that still carry an estimate. `retro`
+#      runs `lanius estimate retro` for any that still carry an estimate. `retro`
 #      is once-per-session (it sets a marker block), so the cron and the hook
 #      never double-record.
 #
 # Ships pending like every package — approve to activate the cron sweep
-# (`elanus approve estimation`). The CLI verbs work without approving anything;
+# (`lanius approve estimation`). The CLI verbs work without approving anything;
 # only the cron backstop is a granted capability.
 
 [request]

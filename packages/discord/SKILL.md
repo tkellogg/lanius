@@ -10,7 +10,7 @@ follows packages/linemux (the tested template) but the gateway handling has
 not seen a real connection. Treat the first live run as a debugging session.
 
 Setup: `DISCORD_TOKEN` in the daemon's environment, `pip install websockets`,
-copy this package onto the package path, `elanus approve discord`.
+copy this package onto the package path, `lanius approve discord`.
 
 Flow: gateway `MESSAGE_CREATE` → `in/package/discord/triage` (ledger,
 published once, addressed to a triage handler — see packages/triage-demo;

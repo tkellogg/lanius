@@ -1,7 +1,7 @@
 // Observability M4: the coding-session tree.
 //
 // A self-contained view over the M2 read API (/api/code/sessions and
-// /api/code/sessions/<id>, served by the relay proxying the elanus CLI over the
+// /api/code/sessions/<id>, served by the relay proxying the lanius CLI over the
 // M1 sqlite projection). It renders the nested spawner->worker tree with
 // per-session stats, and a detail panel with a paste-able resume command and the
 // event timeline. Kept in its own file (and styled with a scoped <style> block)
@@ -684,7 +684,7 @@ export default function CodeSessions({ focus }: { focus?: string } = {}) {
         <h3 className="cs-h">Coding runs</h3>
         {error && <div className="cs-err">projection unavailable: {error}</div>}
         {!error && sessions.length === 0 && (
-          <div className="cs-dim">No coding sessions yet. (Run `elanus code project` to refresh, or start a worker.)</div>
+          <div className="cs-dim">No coding sessions yet. (Run `lanius code project` to refresh, or start a worker.)</div>
         )}
         {roots.map((s) => (
           <SessionNode

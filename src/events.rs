@@ -24,7 +24,7 @@ pub struct EmitOpts {
     /// The broker sets it from the authenticated connection for bus-origin
     /// events, overwriting anything the message claimed — that is the
     /// verified, unforgeable case. Left None elsewhere, where emit() falls
-    /// back to the emitting process's declared actor (ELANUS_ACTOR) or, for
+    /// back to the emitting process's declared actor (LANIUS_ACTOR) or, for
     /// the kernel's own machinery, "kernel".
     pub sender: Option<String>,
 }
@@ -46,7 +46,7 @@ impl EmitOpts {
     }
 }
 
-/// The universal entry point. Threads cause_id from ELANUS_EVENT_ID when the
+/// The universal entry point. Threads cause_id from LANIUS_EVENT_ID when the
 /// caller doesn't pass one explicitly — causality propagation must be
 /// zero-effort or it won't happen.
 pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
@@ -61,7 +61,7 @@ pub fn emit(root: &Root, conn: &Connection, mut o: EmitOpts) -> Result<i64> {
     }
     let dispatch: Option<i64> = crate::envcompat::read("DISPATCH_ID").and_then(|v| v.parse().ok());
     // Provenance (docs/identity.md): a broker-verified sender wins; otherwise
-    // the emitting process's declared actor (ELANUS_ACTOR, set by exec for
+    // the emitting process's declared actor (LANIUS_ACTOR, set by exec for
     // the agent it is running); otherwise the kernel itself. The broker path
     // is the only one that is unforgeable — the others are self-reported until
     // the ledger becomes kernel-only-writable.

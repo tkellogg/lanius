@@ -21,7 +21,7 @@
 //! (so the JS surfaces need not parse TOML). `ensure` keeps the cache in sync
 //! and, when the owner is renamed, moves the existing secret to the new name
 //! so the auth identity, the `in/human/<owner>` mailbox, and the credential
-//! always agree and nothing is orphaned. `ELANUS_OWNER` is a runtime override.
+//! always agree and nothing is orphaned. `LANIUS_OWNER` is a runtime override.
 
 use crate::paths::Root;
 use std::io::Write;
@@ -57,11 +57,11 @@ pub fn valid_principal(name: &str) -> bool {
 }
 
 /// The configured owner identity name a surface should authenticate as:
-/// `ELANUS_OWNER` env override, else the persisted `.owner-name` cache, else
+/// `LANIUS_OWNER` env override, else the persisted `.owner-name` cache, else
 /// the default "owner". The cache is kept equal to the default profile's
 /// `owner` by `ensure`, so this also matches the `in/human/<owner>` mailbox.
 pub fn owner_name(root: &Root) -> String {
-    if let Ok(o) = std::env::var("ELANUS_OWNER") {
+    if let Ok(o) = std::env::var("LANIUS_OWNER") {
         let o = o.trim().to_string();
         if valid_principal(&o) {
             return o;
@@ -173,7 +173,7 @@ mod tests {
     fn tmp_root() -> Root {
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "elanus-sectest-{}-{}",
+            "lanius-sectest-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
@@ -199,7 +199,7 @@ mod tests {
         std::fs::write(root.secrets().join(OWNER_NAME_FILE), "owner").unwrap();
         // the cache file exists, but a path-unsafe / dot-prefixed name never reads it
         assert_eq!(read(&root, OWNER_NAME_FILE), None);
-        assert_eq!(read(&root, "../elanus.db"), None);
+        assert_eq!(read(&root, "../lanius.db"), None);
         assert_eq!(read(&root, ".."), None);
     }
 

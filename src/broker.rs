@@ -1,4 +1,4 @@
-//! The micro-broker: elanus's MQTT 5 boundary interface (docs/bus.md).
+//! The micro-broker: lanius's MQTT 5 boundary interface (docs/bus.md).
 //!
 //! Runs as an ntex System on its own std::thread inside the daemon — never
 //! start it from inside a tokio task (spike/ntex/REPORT.md: the two runtimes
@@ -311,7 +311,7 @@ fn drop_session(st: &Rc<Broker>, key: u64, clean: bool) {
 pub fn spawn(root: Root, cfg: BusConfig, rx: UnboundedReceiver<BusMsg>) -> Result<()> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
     std::thread::Builder::new()
-        .name("elanus-bus".into())
+        .name("lanius-bus".into())
         .spawn(move || run_system(root, cfg, rx, ready_tx))?;
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(r) => r,
@@ -329,7 +329,7 @@ fn run_system(
     // whichever worker takes it first (we run exactly one).
     let rx_cell: Arc<Mutex<Option<UnboundedReceiver<BusMsg>>>> = Arc::new(Mutex::new(Some(rx)));
     let bind = cfg.bind.clone();
-    let sys = ntex::rt::System::new("elanus-bus", ntex::rt::DefaultRuntime);
+    let sys = ntex::rt::System::new("lanius-bus", ntex::rt::DefaultRuntime);
     let run = sys.run(move || {
         let built = ntex::server::build().bind("mqtt", bind.as_str(), {
             let root = root.clone();
@@ -795,7 +795,7 @@ async fn inbound(
     let payload = publish.read_all().await.unwrap_or_default();
     // A failure reason in the PUBACK is the honest answer for QoS 1: "I did
     // not take ownership." The hand-rolled mirror is QoS 0 (no ack), so this
-    // only ever reaches a real client (rumqttc/`elanus bus pub`), which the
+    // only ever reaches a real client (rumqttc/`lanius bus pub`), which the
     // CLI now treats as an error — the at-least-once handoff cannot lie.
     use v5::codec::PublishAckReason as Nack;
     let nack = |r: Nack| Ok(PublishAck::new(r));
@@ -1391,7 +1391,7 @@ mod tests {
     fn tmp_root() -> Root {
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "elanus-brokertest-{}-{}",
+            "lanius-brokertest-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));

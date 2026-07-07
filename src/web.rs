@@ -1,4 +1,4 @@
-//! `elanus web` — the dashboard server, in-process (the Rust port of
+//! `lanius web` — the dashboard server, in-process (the Rust port of
 //! ui/web/server.mjs).
 //!
 //! Browsers cannot speak raw TCP MQTT, so this process is the ordinary anonymous
@@ -34,6 +34,7 @@
 //! mark that lineage).
 
 use crate::bus;
+use crate::envcompat::EnvDual;
 use crate::paths::Root;
 use crate::secrets;
 use anyhow::{Context, Result};
@@ -126,7 +127,7 @@ impl Hub {
     }
 }
 
-/// Entry point for `elanus web`. Mirrors the broker: spin an ntex System on this
+/// Entry point for `lanius web`. Mirrors the broker: spin an ntex System on this
 /// thread, spawn the bus relay, run the HTTP server (one worker — everything is
 /// single-threaded on the system). Blocks until the system stops (Ctrl-C, or
 /// SIGTERM from `serve`'s supervisor).
@@ -149,7 +150,7 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
 
     let root = root.clone();
     let agent = agent.to_string();
-    let sys = ntex::rt::System::new("elanus-web", ntex::rt::DefaultRuntime);
+    let sys = ntex::rt::System::new("lanius-web", ntex::rt::DefaultRuntime);
     let run = sys.run(move || {
         // The bus client: an anonymous loopback MQTT 5 client presenting the
         // owner identity (mirrors src/buscli.rs `client`). Absent credential →
@@ -187,7 +188,7 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
         // the cloneable client (sync `try_publish`).
         let relay_hub = hub.clone();
         if let Err(e) = std::thread::Builder::new()
-            .name("elanus-web-bus".into())
+            .name("lanius-web-bus".into())
             .spawn(move || {
                 match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -237,7 +238,7 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
         .map(|s| s.workers(1).run());
         match built {
             Ok(_server) => {
-                eprintln!("elanus web on http://127.0.0.1:{port}");
+                eprintln!("lanius web on http://127.0.0.1:{port}");
                 Ok(())
             }
             Err(e) => {
@@ -542,7 +543,7 @@ fn cage_status(root: &Root) -> Value {
 
 /// Render a `[sandbox]` config's cage posture as the product-word JSON block,
 /// through the one shared enum→word mapping (`CageStatus::*_word`). Both
-/// `/api/status` (default profile) and `elanus profile get` (per-agent) emit
+/// `/api/status` (default profile) and `lanius profile get` (per-agent) emit
 /// this exact shape.
 pub fn cage_status_json(cfg: &crate::profile::SandboxCfg) -> Value {
     let s = crate::sandbox::cage_status(cfg);
@@ -565,7 +566,7 @@ async fn conversations(hub: web::types::State<Arc<Hub>>, req: HttpRequest) -> Ht
     let Some(db) = db_path(&hub.root) else {
         return json_resp(
             503,
-            json!({ "ok": false, "error": "conversation history unavailable — no elanus.db for this root" }),
+            json!({ "ok": false, "error": "conversation history unavailable — no lanius.db for this root" }),
         );
     };
     let owner = secrets::owner_name(&hub.root);
@@ -596,7 +597,7 @@ async fn conversation(
     let Some(db) = db_path(&hub.root) else {
         return json_resp(
             503,
-            json!({ "ok": false, "error": "conversation history unavailable — no elanus.db for this root" }),
+            json!({ "ok": false, "error": "conversation history unavailable — no lanius.db for this root" }),
         );
     };
     let session_out = session.clone();
@@ -740,7 +741,7 @@ async fn cli_json_resp(root: Root, args: Vec<String>, empty_default: &str) -> Ht
     }
 }
 
-/// M1 — the agent-to-agent mail projection. Shells `elanus code mail --json`
+/// M1 — the agent-to-agent mail projection. Shells `lanius code mail --json`
 /// (a pure ledger read over `in/agent/%`, threaded by correlation), exactly the
 /// `code_sessions` shell-out shape. A root with no mail returns `[]`.
 async fn comms_mail(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
@@ -752,7 +753,7 @@ async fn comms_mail(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
     .await
 }
 
-/// M3 — the coordination-rooms projection. Shells `elanus code rooms --json`.
+/// M3 — the coordination-rooms projection. Shells `lanius code rooms --json`.
 async fn comms_rooms(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
     cli_json_resp(
         hub.root.clone(),
@@ -772,7 +773,7 @@ fn valid_session_id(session: &str) -> bool {
 }
 
 /// M4 — the memory-block inspector (read-only). `?session=<code-id>` shells
-/// `elanus code blocks --session <id> --json` (durable + recomputed ephemeral).
+/// `lanius code blocks --session <id> --json` (durable + recomputed ephemeral).
 async fn blocks(hub: web::types::State<Arc<Hub>>, req: HttpRequest) -> HttpResponse {
     let Some(session) = query_param(&req, "session") else {
         return json_resp(
@@ -798,7 +799,7 @@ async fn blocks(hub: web::types::State<Arc<Hub>>, req: HttpRequest) -> HttpRespo
 }
 
 /// The documented follow-on to M4: a GUARDED human write to a DURABLE memory block.
-/// Build the `elanus block set` argv from a validated edit request. Only DURABLE
+/// Build the `lanius block set` argv from a validated edit request. Only DURABLE
 /// blocks are writable (the ephemeral inbox/channel blocks are owner-less, computed
 /// each turn, and never persisted — decision 2/3); the route rejects them before
 /// reaching here. The block's KEY (scope/owner/name) is preserved; only the content
@@ -867,7 +868,7 @@ fn block_set_args(body: &Value) -> Result<Vec<String>, String> {
 
 /// `POST /api/blocks` — the guarded inline-editor write. Mirrors the `/api/admin`
 /// POST contract: a cross-origin POST is refused by `origin_ok` (CSRF/DNS-rebind),
-/// the body is shelled to `elanus block set ... --by ui`, and the persisted value is
+/// the body is shelled to `lanius block set ... --by ui`, and the persisted value is
 /// re-read so the editor reflects what was actually stored. Only DURABLE blocks are
 /// writable (ephemeral blocks have no owner and are rejected by `block_set_args`).
 async fn block_set(
@@ -921,7 +922,7 @@ async fn block_set(
 }
 
 /// M5 — the estimate-vs-actual report for one session. Shells
-/// `elanus estimate actual --session <id> --json`, which prints the `Report` JSON
+/// `lanius estimate actual --session <id> --json`, which prints the `Report` JSON
 /// or `null` when the session has no recorded estimate. `null` → 200 with body
 /// `null` so the runs view simply omits the estimate group (no crash, no 404).
 async fn estimate_report(
@@ -1061,7 +1062,7 @@ fn admin_dispatch(
             ));
         }
         // ---- model providers (docs/handoffs/model-providers.md M4) ----------
-        // The named, encrypted credential surface. Every gesture shells `elanus
+        // The named, encrypted credential surface. Every gesture shells `lanius
         // provider …` (the same current_exe shell-out the rest of admin uses);
         // the secret never rides argv — `add` pipes the key on the CLI's stdin
         // safe path, and `list`/`test` only ever return the redaction the CLI
@@ -1340,7 +1341,7 @@ fn admin_dispatch(
     Ok(action_result(&r))
 }
 
-/// Build the `elanus provider add …` argv from a validated request body and run
+/// Build the `lanius provider add …` argv from a validated request body and run
 /// it. The API KEY is NEVER placed on argv — it is piped on the CLI's stdin safe
 /// path (`resolve_key`'s stdin fallback) so it stays off the process table and
 /// out of any obs line. `kind=native` builds a no-secret native-login provider;
@@ -1515,7 +1516,7 @@ fn admin_profile(
 
 /// `{ ...kit, packages: [{name, dir, skill, manifest}] }` for the kit-preview
 /// modal. Resolves the kit's dir from `kit list --json`, then reads each package
-/// dir's SKILL.md (skill name/description) and elanus.toml (a typed manifest
+/// dir's SKILL.md (skill name/description) and lanius.toml (a typed manifest
 /// summary). Returns None when the kit isn't found.
 fn kit_packages(root: &Root, name: &str) -> Result<Option<Value>> {
     let listed = cli(root, &["kit", "list", "--json"])?;
@@ -1552,7 +1553,8 @@ fn kit_packages(root: &Root, name: &str) -> Result<Option<Value>> {
                     })
                 })
                 .unwrap_or(Value::Null);
-            let manifest = std::fs::read_to_string(pkg_dir.join("elanus.toml"))
+            let manifest = std::fs::read_to_string(pkg_dir.join("lanius.toml"))
+                .or_else(|_| std::fs::read_to_string(pkg_dir.join("elanus.toml")))
                 .ok()
                 .map(|raw| manifest_summary(&raw))
                 .unwrap_or(Value::Null);
@@ -1595,7 +1597,7 @@ fn frontmatter(raw: &str) -> HashMap<String, String> {
     meta
 }
 
-/// A typed summary of a package's elanus.toml: actor role, request capabilities,
+/// A typed summary of a package's lanius.toml: actor role, request capabilities,
 /// and a one-line description — the same shape server.mjs `manifestSummary` built
 /// (used by the kit-preview modal to label package actors).
 fn manifest_summary(raw: &str) -> Value {
@@ -1783,10 +1785,10 @@ struct CliOut {
     error: Option<String>,
 }
 
-/// Append a tagged observability line to `$ELANUS_WEB_LOG` when set (mjs parity).
+/// Append a tagged observability line to `$LANIUS_WEB_LOG` when set (mjs parity).
 /// Logging must never break a request, so all errors are swallowed.
 fn weblog(tag: &str, msg: &str) {
-    if let Ok(path) = std::env::var("ELANUS_WEB_LOG") {
+    if let Ok(path) = std::env::var("LANIUS_WEB_LOG") {
         if !path.is_empty() {
             use std::io::Write as _;
             let line = format!("{} [web:{tag}] {msg}\n", chrono::Utc::now().to_rfc3339());
@@ -1810,7 +1812,7 @@ fn cli_err(r: &CliOut) -> String {
     }
 }
 
-/// Run THIS binary (current_exe) as the elanus CLI with ELANUS_ROOT set, exactly
+/// Run THIS binary (current_exe) as the lanius CLI with LANIUS_ROOT set, exactly
 /// as mjs ran the sibling binary — but in-process there is no node and no PATH
 /// lookup. Provider credentials are inherited from the launching environment
 /// (the web server already presents the owner identity).
@@ -1821,15 +1823,15 @@ fn cli(root: &Root, args: &[&str]) -> Result<CliOut> {
 
 fn cli_owned(root: &Root, args: &[String]) -> Result<CliOut> {
     // Backend observability (mjs parity): one greppable line per gesture. Goes to
-    // $ELANUS_WEB_LOG when set, matching server.mjs's `[web:cli] elanus …` format
+    // $LANIUS_WEB_LOG when set, matching server.mjs's `[web:cli] lanius …` format
     // so the same QA tail / e2e assertions work against this server.
-    weblog("cli", &format!("elanus {}", args.join(" ")));
-    let exe = std::env::current_exe().context("locating the running elanus binary")?;
+    weblog("cli", &format!("lanius {}", args.join(" ")));
+    let exe = std::env::current_exe().context("locating the running lanius binary")?;
     let out = std::process::Command::new(exe)
         .args(args)
-        .env("ELANUS_ROOT", root.dir.display().to_string())
+        .env_dual("ROOT", root.dir.display().to_string())
         .output()
-        .context("spawning elanus")?;
+        .context("spawning lanius")?;
     Ok(CliOut {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1847,17 +1849,17 @@ fn cli_owned(root: &Root, args: &[String]) -> Result<CliOut> {
 /// the `[web:cli]` obs line. The logged command line is the argv only (no key).
 fn cli_stdin(root: &Root, args: &[String], stdin: Option<&str>) -> Result<CliOut> {
     use std::io::Write as _;
-    weblog("cli", &format!("elanus {}", args.join(" ")));
-    let exe = std::env::current_exe().context("locating the running elanus binary")?;
+    weblog("cli", &format!("lanius {}", args.join(" ")));
+    let exe = std::env::current_exe().context("locating the running lanius binary")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args)
-        .env("ELANUS_ROOT", root.dir.display().to_string())
+        .env_dual("ROOT", root.dir.display().to_string())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     if stdin.is_some() {
         cmd.stdin(std::process::Stdio::piped());
     }
-    let mut child = cmd.spawn().context("spawning elanus")?;
+    let mut child = cmd.spawn().context("spawning lanius")?;
     if let Some(secret) = stdin {
         if let Some(mut sink) = child.stdin.take() {
             sink.write_all(secret.as_bytes())
@@ -1865,7 +1867,7 @@ fn cli_stdin(root: &Root, args: &[String], stdin: Option<&str>) -> Result<CliOut
             // Drop closes the pipe so the child's stdin read sees EOF.
         }
     }
-    let out = child.wait_with_output().context("awaiting elanus")?;
+    let out = child.wait_with_output().context("awaiting lanius")?;
     Ok(CliOut {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -2014,7 +2016,7 @@ fn percent_decode(s: &str) -> String {
 /// Browser-borne threats a terminal doesn't have: a hostile page POSTing to
 /// localhost (CSRF) and DNS rebinding. Mutations require a genuinely-local Host
 /// and — when a browser supplies Origin — an Origin whose host is ALSO local
-/// (any loopback port). The `elanus dev` loop serves the UI from Vite on one
+/// (any loopback port). The `lanius dev` loop serves the UI from Vite on one
 /// loopback port and proxies to the relay on another, a legitimate same-machine
 /// cross-origin; requiring a byte-equal Origin==Host (incl. port) wrongly refused
 /// every dev mutation. A FOREIGN Origin (evil.com) is still refused here, and a
@@ -2517,7 +2519,7 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
         // The owner's mailbox is shared across every agent, so an ambient row
         // belongs to THIS agent's conversation only when THIS agent sent it. The
         // send_message/ask_human handlers emit with the agent as the kernel
-        // sender (ELANUS_ACTOR = the agent noun), so the sender is the honest,
+        // sender (LANIUS_ACTOR = the agent noun), so the sender is the honest,
         // ledger-recorded link back to the agent — without it, one agent's
         // unprompted message would surface under every agent.
         if row.sender.as_deref() != Some(agent) {
@@ -3451,7 +3453,7 @@ mod route_tests {
     }
 
     // agent-comms-ui follow-on: the guarded block-editor write. `block_set_args`
-    // builds the `elanus block set ... --by ui` argv a valid edit shells, preserving
+    // builds the `lanius block set ... --by ui` argv a valid edit shells, preserving
     // the (scope, owner, name) key and stamping the `--by ui` attribution trail.
     #[test]
     fn block_set_args_builds_attributed_write() {
@@ -3497,7 +3499,7 @@ mod route_tests {
     }
 
     // model-providers M4: the provider-name gate the admin routes apply before
-    // any `elanus provider …` shell-out — the same lowercase `[a-z0-9][a-z0-9-]*`
+    // any `lanius provider …` shell-out — the same lowercase `[a-z0-9][a-z0-9-]*`
     // (≤64) the vault enforces, so a bad name is a clean 400, never an injection.
     #[test]
     fn provider_name_guard() {
@@ -3513,7 +3515,7 @@ mod route_tests {
         assert!(!valid_provider_name(&"x".repeat(65)));
     }
 
-    // model-providers M4: `provider_add` builds the `elanus provider add …` argv
+    // model-providers M4: `provider_add` builds the `lanius provider add …` argv
     // and — crucially — keeps the api KEY off argv (it rides stdin). Exercise the
     // body→argv shaping and the fail-closed validation without spawning the CLI.
     #[test]

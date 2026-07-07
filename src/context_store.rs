@@ -8,7 +8,7 @@
 //! placed by `placement`. M1 seeds the `system`-placement rows visible to a
 //! `(scope, owner, session)` into the native Doc system seed; the follow-on user
 //! placement loads the same visible slice into `Doc.user` before the stage chain.
-//! M2 is the write surface (`elanus block …`) plus the seed-once "default that
+//! M2 is the write surface (`lanius block …`) plus the seed-once "default that
 //! evolves"; M3 records every mutation in `context_build_log`.
 //!
 //! M4 adds the coding-agent projection surface here: `load_session_blocks`
@@ -106,7 +106,7 @@ fn load_profile_blocks(
 ) -> Result<Vec<LoadedBlock>> {
     // Dedup-on-read guard (storage-hardening M2): collapse to one row per logical
     // key (max `id` wins) BEFORE ordering, so a DB restored from a pre-migration
-    // backup — or an attach of an old `elanus.db` with NULL-keyed duplicates —
+    // backup — or an attach of an old `lanius.db` with NULL-keyed duplicates —
     // never renders the same block 2–30 times into the prompt. The sentinel
     // migration already prevents new duplicates; this is the belt-and-suspenders.
     // The visibility predicate matches the `''` sentinel, this session, AND legacy
@@ -177,7 +177,7 @@ pub fn load_user_blocks(
 }
 
 /// The well-known name of the per-session memory note block (M2 decision 5). The
-/// memory note `elanus code note` writes/reads is just a session-scope block under
+/// memory note `lanius code note` writes/reads is just a session-scope block under
 /// this name — one substrate, no separate `code_notes` read path in the live
 /// injection.
 pub const NOTE_BLOCK: &str = "note";
@@ -247,7 +247,7 @@ fn note_block(owner: &str, content: &str) -> ContextBlock {
 
 /// M2 decision 5 — write the per-session memory note as the well-known `note`
 /// block (session scope, owner = agent noun). A blank note CLEARS it (removes the
-/// block), preserving today's `elanus code note <session> ""` behavior. This is the
+/// block), preserving today's `lanius code note <session> ""` behavior. This is the
 /// alias `set_note` re-points at: identical semantics, one substrate.
 pub fn set_session_note(
     conn: &Connection,
@@ -298,7 +298,7 @@ pub fn is_mid_cycle(b: &LoadedBlock) -> bool {
 /// (`code_block_delivered` keyed by `(session, block_name)`, carrying the delivered
 /// `content_sha256`): an unchanged block is returned ONCE and not again on the next
 /// tool call; editing the block changes its sha and re-arms a single redelivery.
-/// The `note` block is excluded — it rides the next-turn vector (`[elanus note]`),
+/// The `note` block is excluded — it rides the next-turn vector (`[lanius note]`),
 /// not the louder mid-cycle one, regardless of priority.
 ///
 /// Caller contract: this MUTATES the dedup table (records delivery) — call it only

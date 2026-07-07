@@ -5,36 +5,36 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-pub const ENV_ROOT: &str = "ELANUS_ROOT";
-pub const ENV_BUS_TOKEN: &str = "ELANUS_BUS_TOKEN";
-pub const ENV_WORKDIR: &str = "ELANUS_CODE_WORKDIR";
-pub const ENV_MODE: &str = "ELANUS_CODE_MODE";
-pub const ENV_TOOL: &str = "ELANUS_CODE_TOOL";
-pub const ENV_MODEL: &str = "ELANUS_CODE_MODEL";
-pub const ENV_PROVIDER: &str = "ELANUS_CODE_PROVIDER";
-pub const ENV_SUMMARY_FILE: &str = "ELANUS_CODE_SUMMARY_FILE";
-pub const ENV_PROMPT: &str = "ELANUS_CODE_PROMPT";
-/// The FULL post-elanus-flags argv the user passed (JSON array). Real harness
+pub const ENV_ROOT: &str = "LANIUS_ROOT";
+pub const ENV_BUS_TOKEN: &str = "LANIUS_BUS_TOKEN";
+pub const ENV_WORKDIR: &str = "LANIUS_CODE_WORKDIR";
+pub const ENV_MODE: &str = "LANIUS_CODE_MODE";
+pub const ENV_TOOL: &str = "LANIUS_CODE_TOOL";
+pub const ENV_MODEL: &str = "LANIUS_CODE_MODEL";
+pub const ENV_PROVIDER: &str = "LANIUS_CODE_PROVIDER";
+pub const ENV_SUMMARY_FILE: &str = "LANIUS_CODE_SUMMARY_FILE";
+pub const ENV_PROMPT: &str = "LANIUS_CODE_PROMPT";
+/// The FULL post-lanius-flags argv the user passed (JSON array). Real harness
 /// adapters pass this verbatim to their capture fn, which knows how to split the
 /// harness's own flags (e.g. codex `-c …`) from the prompt — joining it into a
 /// single `ENV_PROMPT` string loses that distinction.
-pub const ENV_ARGS: &str = "ELANUS_CODE_ARGS";
-pub const ENV_BRIEFING: &str = "ELANUS_CODE_BRIEFING";
-pub const ENV_SKILLS_DIR: &str = "ELANUS_CODE_SKILLS_DIR";
+pub const ENV_ARGS: &str = "LANIUS_CODE_ARGS";
+pub const ENV_BRIEFING: &str = "LANIUS_CODE_BRIEFING";
+pub const ENV_SKILLS_DIR: &str = "LANIUS_CODE_SKILLS_DIR";
 /// The human owner's noun (profile `owner`): where a codex app-server driver
 /// routes approval elicitations (`in/human/<owner>`, docs/handoffs/codex-app-server.md
 /// M3). Absent ⇒ the default owner.
-pub const ENV_OWNER: &str = "ELANUS_CODE_OWNER";
+pub const ENV_OWNER: &str = "LANIUS_CODE_OWNER";
 /// Per-launch gate for the codex app-server transport (docs/handoffs/codex-app-server.md
 /// M4). Set to `1` by the launcher ONLY for a headless codex worker whose profile
 /// (or a `--app-server` launch flag) opted in; absent ⇒ the `codex exec` fallback.
-pub const ENV_CODEX_APP_SERVER: &str = "ELANUS_CODE_CODEX_APP_SERVER";
+pub const ENV_CODEX_APP_SERVER: &str = "LANIUS_CODE_CODEX_APP_SERVER";
 /// The app-server approval elicitation deadline (seconds) + fail-closed default,
 /// threaded from the profile's `[codex]` table so the adapter need not re-read it.
-pub const ENV_CODEX_AS_TIMEOUT: &str = "ELANUS_CODE_CODEX_APP_SERVER_TIMEOUT";
-pub const ENV_CODEX_AS_DEFAULT: &str = "ELANUS_CODE_CODEX_APP_SERVER_DEFAULT";
+pub const ENV_CODEX_AS_TIMEOUT: &str = "LANIUS_CODE_CODEX_APP_SERVER_TIMEOUT";
+pub const ENV_CODEX_AS_DEFAULT: &str = "LANIUS_CODE_CODEX_APP_SERVER_DEFAULT";
 
-/// The session context elanus hands an adapter. Built from the launch-contract env.
+/// The session context lanius hands an adapter. Built from the launch-contract env.
 #[derive(Clone, Debug)]
 pub struct Ctx {
     root: Root,
@@ -133,7 +133,7 @@ impl Ctx {
         &self.tool
     }
 
-    /// The full post-elanus-flags argv (harness flags + prompt). Real adapters pass
+    /// The full post-lanius-flags argv (harness flags + prompt). Real adapters pass
     /// this to their capture fn, which splits the harness's flags from the prompt.
     pub fn args(&self) -> &[String] {
         &self.args
@@ -244,7 +244,7 @@ impl Ctx {
         codeagent::deliver(&self.root, to, message)
     }
 
-    /// Scrub elanus's provider creds from a child Command.
+    /// Scrub lanius's provider creds from a child Command.
     pub fn scrub_provider_creds<'a>(
         &self,
         cmd: &'a mut std::process::Command,
@@ -255,10 +255,10 @@ impl Ctx {
 
 fn env_required(name: &str) -> Result<String> {
     std::env::var(name)
-        .with_context(|| format!("missing required elanus harness env var {name}"))
+        .with_context(|| format!("missing required lanius harness env var {name}"))
         .and_then(|v| {
             if v.is_empty() {
-                bail!("missing required elanus harness env var {name}")
+                bail!("missing required lanius harness env var {name}")
             } else {
                 Ok(v)
             }
@@ -293,7 +293,7 @@ mod tests {
     fn tmp_root() -> Root {
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "elanus-harness-{}-{}",
+            "lanius-harness-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
@@ -324,7 +324,7 @@ mod tests {
             .map(|name| (*name, std::env::var(name).ok()))
             .collect();
 
-        std::env::set_var(ENV_ROOT, "/tmp/elanus-root");
+        std::env::set_var(ENV_ROOT, "/tmp/lanius-root");
         std::env::set_var(codeagent::ENV_SESSION, "code-test1234");
         std::env::set_var(codeagent::ENV_AGENT, "test-agent");
         std::env::set_var(ENV_BUS_TOKEN, "bus-secret");

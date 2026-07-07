@@ -704,7 +704,7 @@ pub fn cage_status(cfg: &SandboxCfg) -> CageStatus {
 impl CageStatus {
     // Product-word posture strings — the ONE place the enum→product-word mapping
     // lives (docs/handoffs/sandbox-config-ui.md M1). Both `/api/status` and
-    // `elanus profile get` render through these so the words never drift, and no
+    // `lanius profile get` render through these so the words never drift, and no
     // client re-implements them. Never "SBPL"/"Seatbelt"/"cage"; off macOS every
     // dimension reads "unavailable here" rather than implying a silent "on".
     pub fn write_word(&self) -> &'static str {
@@ -745,7 +745,7 @@ mod tests {
     use super::*;
 
     fn tmp_root() -> Root {
-        let dir = std::env::temp_dir().join(format!("elanus-sbx-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("lanius-sbx-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         Root {
             dir: dir.canonicalize().unwrap(),
@@ -755,7 +755,7 @@ mod tests {
     fn cage_for(root: &Root) -> Cage {
         Cage {
             write_roots: vec![root.dir.clone()],
-            exclude: vec!["run/".into(), "elanus.db".into()],
+            exclude: vec!["run/".into(), "lanius.db".into()],
             policy: CagePolicy::default(),
             sbpl: None,
         }
@@ -937,7 +937,7 @@ mod tests {
         let cage = cage_for(&root);
         let before = snapshot(&cage);
         std::fs::write(root.dir.join("run/d1.out"), "noise").unwrap();
-        std::fs::write(root.dir.join("elanus.db-wal"), "noise").unwrap();
+        std::fs::write(root.dir.join("lanius.db-wal"), "noise").unwrap();
         std::fs::write(root.dir.join("real.txt"), "signal").unwrap();
         let after = snapshot(&cage);
         let changes = diff(&before, &after);
@@ -948,8 +948,8 @@ mod tests {
     fn test_protect() -> Protect {
         Protect {
             deny_write_files: vec![
-                PathBuf::from("/r/elanus.db"),
-                PathBuf::from("/r/elanus.db-wal"),
+                PathBuf::from("/r/lanius.db"),
+                PathBuf::from("/r/lanius.db-wal"),
             ],
             deny_write_trees: vec![PathBuf::from("/r/profiles"), PathBuf::from("/r/config")],
             deny_all_trees: vec![PathBuf::from("/r/.secrets")],
@@ -968,9 +968,9 @@ mod tests {
         assert!(p.contains("(subpath \"/tmp/ws\")"));
         assert!(p.contains("(subpath \"/dev\")"));
         // The ledger and its log are fenced; the -shm index is not.
-        assert!(p.contains("(deny file-write* (literal \"/r/elanus.db\"))"));
-        assert!(p.contains("(deny file-write* (literal \"/r/elanus.db-wal\"))"));
-        assert!(!p.contains("elanus.db-shm"));
+        assert!(p.contains("(deny file-write* (literal \"/r/lanius.db\"))"));
+        assert!(p.contains("(deny file-write* (literal \"/r/lanius.db-wal\"))"));
+        assert!(!p.contains("lanius.db-shm"));
         // Profiles are write-fenced (a profile confers authority).
         assert!(p.contains("(deny file-write* (subpath \"/r/profiles\"))"));
         // The config repo is write-fenced (kernel-owned truth); still readable.
@@ -1283,10 +1283,10 @@ mod tests {
             "write inside roots must succeed: {ok:?}"
         );
         // Outside (home dir): denied. Process tree inheritance included.
-        let target = std::env::temp_dir().join(format!("elanus-escape-{}", uuid::Uuid::new_v4()));
+        let target = std::env::temp_dir().join(format!("lanius-escape-{}", uuid::Uuid::new_v4()));
         // NB: temp is an allowed hole; use a path that is definitely outside:
         let home_target = format!(
-            "{}/elanus-cage-escape-test.txt",
+            "{}/lanius-cage-escape-test.txt",
             std::env::var("HOME").unwrap()
         );
         let denied = cage

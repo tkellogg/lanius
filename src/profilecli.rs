@@ -1,4 +1,4 @@
-//! `elanus profile` — list / get / set / new. The CLI is the API: the web
+//! `lanius profile` — list / get / set / new. The CLI is the API: the web
 //! UI's agent management shells out to these, so profile.toml editing
 //! lives in ONE place (toml_edit, comments preserved) instead of being
 //! reimplemented in node.
@@ -120,7 +120,7 @@ fn get_value(root: &Root, name: &str) -> Result<serde_json::Value> {
     }))
 }
 
-/// Set dotted keys: `elanus profile set default agent=kestrel
+/// Set dotted keys: `lanius profile set default agent=kestrel
 /// model.max_turns=12 'skills.include=["#"]'`. The right-hand side is
 /// parsed as a TOML value when it parses (ints, bools, arrays, quoted
 /// strings) and treated as a bare string otherwise. Comments survive
@@ -132,7 +132,7 @@ pub fn set(root: &Root, name: &str, pairs: &[String]) -> Result<Option<String>> 
     let pdir = root.profile_dir(name);
     let f = pdir.join("profile.toml");
     if !f.exists() {
-        bail!("no profile {name:?} (create it with `elanus profile new {name}`)");
+        bail!("no profile {name:?} (create it with `lanius profile new {name}`)");
     }
     let raw = std::fs::read_to_string(&f)?;
     let mut doc: toml_edit::DocumentMut = raw
@@ -234,7 +234,7 @@ pub fn new(
     std::fs::write(
         pdir.join("profile.toml"),
         format!(
-            "# profile {name} — created by `elanus profile new`\n\
+            "# profile {name} — created by `lanius profile new`\n\
              agent = \"{agent}\"\nowner = \"owner\"\n\n[model]\n{model_line}"
         ),
     )?;
@@ -250,7 +250,7 @@ pub fn new(
     }
     println!("created profile {name} (agent {agent}, mailbox in/agent/{agent})");
     println!(
-        "dispatch to it: elanus emit in/agent/{agent} --payload '{{\"prompt\":\"...\",\"profile\":\"{name}\"}}'"
+        "dispatch to it: lanius emit in/agent/{agent} --payload '{{\"prompt\":\"...\",\"profile\":\"{name}\"}}'"
     );
     match config_repo::commit_agent(root, name, "config: create agent profile") {
         Ok((sha, changed)) => Ok(changed.then_some(sha)),

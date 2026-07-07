@@ -2,7 +2,7 @@
 """webhook — an egress exemplar (docs/actors.md), built as a daemon bridge.
 
 A bridge is a long-running actor with its own identity, so its sends attribute
-to IT. Spawned with its package token, `elanus bus pub` authenticates as
+to IT. Spawned with its package token, `lanius bus pub` authenticates as
 "webhook", and the broker stamps the receipt sender=webhook — the provenance
 the egress record exists to carry. (A per-event exec handler runs uncaged and
 tokenless, so it would authenticate as the OWNER and mislabel every send; that
@@ -27,8 +27,16 @@ import sys
 import time
 import urllib.request
 
-DB = os.environ.get("ELANUS_DB") or os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."), "elanus.db")
-PKG = os.environ.get("ELANUS_PACKAGE", "webhook")
+ROOT = os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", ".")
+DB = (
+    os.environ.get("LANIUS_DB")
+    or os.environ.get("ELANUS_DB")
+    or os.environ.get("HARNESS_DB")
+    or os.path.join(ROOT, "lanius.db")
+    or os.path.join(ROOT, "elanus.db")
+    or os.path.join(ROOT, "harness.db")
+)
+PKG = os.environ.get("LANIUS_PACKAGE") or os.environ.get("ELANUS_PACKAGE") or "webhook"
 REQ = "in/package/webhook/send"
 RESULT = "obs/channel/webhook/sent"
 
@@ -70,17 +78,17 @@ def main():
     waited = False
     while not subscribe_grant_approved():
         if not waited:
-            log("[webhook] grant not approved yet; parking until `elanus approve webhook` (this is not an error)")
+            log("[webhook] grant not approved yet; parking until `lanius approve webhook` (this is not an error)")
             waited = True
         time.sleep(2)
-    proc = subprocess.Popen(["elanus", "bus", "sub", REQ], stdout=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(["lanius", "bus", "sub", REQ], stdout=subprocess.PIPE, text=True)
     log(f"[webhook] serving {REQ} (egress bridge; direct send + obs record, attributed to this actor)")
     for line in proc.stdout:
         try:
             env = json.loads(line)
         except ValueError:
             continue
-        # `elanus bus sub` wraps each delivery as {"topic", "payload": <broker
+        # `lanius bus sub` wraps each delivery as {"topic", "payload": <broker
         # envelope>}; the broker envelope carries the request body and the
         # triggering correlation.
         inner = env.get("payload") if isinstance(env.get("payload"), dict) else {}
@@ -91,7 +99,7 @@ def main():
         # here — attributed to this bridge (the broker stamps sender=webhook)
         # and linked to the request's correlation.
         receipt = json.dumps({**result, "correlation": corr})
-        args = ["elanus", "bus", "pub", RESULT, receipt, "--qos", "1"]
+        args = ["lanius", "bus", "pub", RESULT, receipt, "--qos", "1"]
         if corr:
             args += ["--correlation", corr]
         try:

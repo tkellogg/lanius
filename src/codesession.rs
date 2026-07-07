@@ -1,6 +1,6 @@
 //! Per-session coding-agent identity: a **grant-scoped** session actor token.
 //!
-//! A coding session (`elanus code launch claude …`) must publish to the bus as
+//! A coding session (`lanius code launch claude …`) must publish to the bus as
 //! *itself* (`sender = code-<session>`, never the owner — docs/actors.md egress
 //! lesson / docs/security.md entry 16), but it must NOT carry owner-equivalent
 //! authority. The earlier slice minted a plain fenced secret named
@@ -50,11 +50,11 @@ use std::path::{Path, PathBuf};
 //
 // The split-session model (docs/handoffs/coding-agents.md) keeps the durable
 // *record* of a session apart from the ephemeral *token* above. The record lives
-// in `elanus.db` (`code_sessions`), carries **no secret**, and survives process
-// exit: it maps the elanus session id to the tool's own native resumable session
+// in `lanius.db` (`code_sessions`), carries **no secret**, and survives process
+// exit: it maps the lanius session id to the tool's own native resumable session
 // id (codex `thread_id` / CC `session_id`), the tool, the agent noun, and the
 // workdir. An idle resumable session is exactly this — a record with no live
-// token. `elanus code resume` reads the record to mint a FRESH scoped token and
+// token. `lanius code resume` reads the record to mint a FRESH scoped token and
 // continue the native session in its recorded workdir, then retires the token.
 // This preserves the verified "no idle live credential" property while enabling
 // resume: the credential is per-run, the record is durable.
@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 /// A durable coding-session record (the `code_sessions` row). Carries no secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
-    /// The elanus session id (`code-<8hex>`), the stable handle a human resumes.
+    /// The lanius session id (`code-<8hex>`), the stable handle a human resumes.
     pub elanus_session: String,
     /// The tool's own native resumable session id — codex `thread_id` / CC
     /// `session_id`. This is what the native resume command targets.
@@ -83,7 +83,7 @@ pub struct SessionRecord {
 
 /// Persist (or update) the durable record once the native session id is known
 /// (codex: on `thread.started`; CC: on the SessionStart hook). Idempotent per
-/// elanus session: a re-observed native id (e.g. a second SessionStart) refreshes
+/// lanius session: a re-observed native id (e.g. a second SessionStart) refreshes
 /// `native_session`/`workdir` and bumps `last_active` rather than duplicating.
 /// Best-effort callers may ignore the error — a missing record just means that
 /// session can't be resumed, never that the live session breaks.
@@ -342,7 +342,7 @@ pub fn current_task(root: &Root, session: &str) -> Option<(String, String)> {
     current_task_on(&conn, session)
 }
 
-/// Read a durable record by elanus session id. None if there is no such session
+/// Read a durable record by lanius session id. None if there is no such session
 /// (never launched, or launched but the native id was never observed).
 pub fn read_record(root: &Root, elanus_session: &str) -> Result<Option<SessionRecord>> {
     let conn = crate::db::open(root).context("opening the ledger for the session record")?;
@@ -431,12 +431,12 @@ pub fn delivery_key_seen(root: &Root, key: &str, session: &str) -> bool {
 // session reads ONLY its own inbox, and it does so as a SCOPED LEDGER QUERY by
 // its own identity, not over the bus: `inbox_for_session` selects the `events`
 // rows whose topic is the session's own mailbox `in/agent/<noun>/<session>`. The
-// caller (the `elanus code inbox` CLI) derives `<noun>`/`<session>` from the
-// process env the launcher set (ELANUS_CODE_AGENT / ELANUS_CODE_SESSION), never
+// caller (the `lanius code inbox` CLI) derives `<noun>`/`<session>` from the
+// process env the launcher set (LANIUS_CODE_AGENT / LANIUS_CODE_SESSION), never
 // from an argument — so a session can never name another session's inbox, and
 // the read is own-inbox-only BY CONSTRUCTION. The bus token's subscribe scope is
 // untouched (still empty): the read authority is the kernel-side query, gated by
-// the env-derived identity, exactly as `elanus code hook` publishes as itself.
+// the env-derived identity, exactly as `lanius code hook` publishes as itself.
 
 /// One delivery in a session's own inbox (a `code-*` mailbox `events` row).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -543,7 +543,7 @@ pub fn inbox_for_session(
 }
 
 /// Mark a set of the session's own inbox deliveries as seen (idempotent). Called
-/// after `elanus code inbox` lists them, so a second pull does not re-surface the
+/// after `lanius code inbox` lists them, so a second pull does not re-surface the
 /// same messages and the per-turn count reflects only genuinely new deliveries.
 /// Writes ONLY rows for the env-derived `session` — a session can never mark
 /// another session's deliveries seen. `INSERT … ON CONFLICT DO NOTHING` so a
@@ -638,7 +638,7 @@ fn note_owner(root: &Root, session: &str) -> String {
 ///
 /// M2 decision 5 (memory-blocks handoff): the note IS a well-known session-scope
 /// `note` block in the `context_blocks` substrate — this is a thin alias that
-/// writes that block. `elanus code note` keeps working; the next-turn injection
+/// writes that block. `lanius code note` keeps working; the next-turn injection
 /// reads the block, not a separate `code_notes` path. (`code_notes` remains in the
 /// schema as legacy; nothing live reads it anymore.)
 pub fn set_note(root: &Root, session: &str, note: &str) -> Result<()> {
@@ -839,13 +839,13 @@ pub fn peer_claims(root: &Root, room: &str, viewer: &str) -> Result<Vec<Claim>> 
 // coding session that last claimed it, freshest-claim-wins, off `code_claims` —
 // which carries claims from ALL THREE harnesses via each one's OWN write-tool
 // events (`auto_claim_write`: claude's Write/Edit hook, codex `file_change`,
-// opencode `edit`/`write`), plus a manual `elanus code claim`. Advisory, gates
+// opencode `edit`/`write`), plus a manual `lanius code claim`. Advisory, gates
 // nothing: it answers "which of these dirty files are mine, and who owns the
 // rest?" — the exact question the motivating incident got wrong by hand.
 
 /// Who owns a path: the session that holds the freshest `code_claims` claim on it,
 /// plus that session's agent noun, last-active recency, and current task — the
-/// answer `elanus code whose <path>` renders.
+/// answer `lanius code whose <path>` renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribution {
     /// The owning session id (`code-<id>`) — who is/was editing the path.
@@ -1113,7 +1113,7 @@ pub fn bump_last_active(root: &Root, session: &str) -> Result<()> {
 
 // ── Detached-spawn edges (cross-harness-death M1/M2) ──────────────────────────
 //
-// A durable record of an `elanus code spawn` detached worker: who it must report
+// A durable record of an `lanius code spawn` detached worker: who it must report
 // to, the correlation the completion threads on, and its wrapper pid. The worker's
 // own completion (`emit_completion_delivery`) and the daemon reaper
 // (`reap_dead_spawn_edges`) both CLAIM the edge before mailing — an atomic
@@ -1535,7 +1535,7 @@ pub struct SessionToken {
     pub principal: String,
     /// The agent noun this session publishes under (`claude-code`, `codex`).
     pub agent: String,
-    /// The secret the child presents as ELANUS_BUS_TOKEN.
+    /// The secret the child presents as LANIUS_BUS_TOKEN.
     pub secret: String,
     /// The launcher pid that owns this session — used by the reaper to tell a
     /// live session's token from an orphan a SIGKILL left behind.
@@ -1650,7 +1650,7 @@ impl Drop for BudgetLock {
 
 /// Mint a grant-scoped session token for `principal` publishing `agent`
 /// telemetry. Writes the 0600 token file inside the fenced store and returns
-/// the token (the launcher hands `.secret` to the child as ELANUS_BUS_TOKEN).
+/// the token (the launcher hands `.secret` to the child as LANIUS_BUS_TOKEN).
 /// The default scope is structural: publish only `obs/agent/<agent>/<session>/#`,
 /// subscribe nothing.
 ///
@@ -1988,7 +1988,7 @@ pub fn retire(root: &Root, principal: &str) {
 /// can no longer resolve it. Returns the principals reaped.
 ///
 /// Run at daemon boot and launcher boot. Crash-only, same as every other
-/// elanus liveness sweep (release_dead_leases, orphaned-dispatch cleanup).
+/// lanius liveness sweep (release_dead_leases, orphaned-dispatch cleanup).
 pub fn reap_orphans(root: &Root) -> Vec<String> {
     let mut reaped = Vec::new();
     let dir = store_dir(root);
@@ -2099,7 +2099,7 @@ mod tests {
     fn tmp_root() -> Root {
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "elanus-codesess-{}-{}",
+            "lanius-codesess-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
@@ -2260,7 +2260,7 @@ mod tests {
         };
         upsert_record(&root, &rec).unwrap();
         // A re-observed native id / workdir (e.g. a second SessionStart) updates in
-        // place rather than duplicating — the elanus session is the stable key.
+        // place rather than duplicating — the lanius session is the stable key.
         rec.native_session = "thread-2".to_string();
         rec.workdir = "/tmp/b".to_string();
         upsert_record(&root, &rec).unwrap();

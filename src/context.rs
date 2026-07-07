@@ -383,7 +383,7 @@ fn fold_user_blocks(doc: &mut Doc) -> Result<()> {
     let blocks = doc
         .user
         .iter()
-        .map(|b| format!("[elanus user block: {}]\n{}", b.name, b.text))
+        .map(|b| format!("[lanius user block: {}]\n{}", b.name, b.text))
         .collect::<Vec<_>>()
         .join("\n\n");
     let Some(msg) = doc
@@ -487,8 +487,8 @@ fn run_exec_stage(root: &Root, s: &StageRef, doc: &Doc) -> Result<Doc> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .env_dual("ROOT", &root.dir)
-        .env("ELANUS_PACKAGE", &s.package)
-        .env("ELANUS_STAGE", &s.name)
+        .env_dual("PACKAGE", &s.package)
+        .env_dual("STAGE", &s.name)
         .spawn()
         .with_context(|| format!("spawning {}", s.script.display()))?;
     // Writer thread: the doc can exceed the pipe buffer in BOTH directions.
@@ -787,8 +787,8 @@ mod tests {
             "only the trailing user message is folded"
         );
         let folded = doc1.messages[2]["text"].as_str().unwrap();
-        assert!(folded.starts_with("[elanus user block: scratch]\nhot notes"));
-        assert!(folded.contains("[elanus user block: focus]\nship M1"));
+        assert!(folded.starts_with("[lanius user block: scratch]\nhot notes"));
+        assert!(folded.contains("[lanius user block: focus]\nship M1"));
         assert!(folded.ends_with("\n\nactual ask"));
         assert_eq!(folded.matches("hot notes").count(), 1);
         assert_eq!(rows[2]["text"], "actual ask", "raw input rows stay raw");
@@ -805,7 +805,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("packages/alpha/scripts")).unwrap();
         std::fs::create_dir_all(dir.join("packages/beta/scripts")).unwrap();
         std::fs::write(
-            dir.join("packages/alpha/elanus.toml"),
+            dir.join("packages/alpha/lanius.toml"),
             r#"
 [[stage]]
 name = "keep"
@@ -820,7 +820,7 @@ order = 10
         )
         .unwrap();
         std::fs::write(
-            dir.join("packages/beta/elanus.toml"),
+            dir.join("packages/beta/lanius.toml"),
             r#"
 [[stage]]
 name = "move"
@@ -873,7 +873,7 @@ timeout_ms = 9000
         std::fs::create_dir_all(dir.join("packages/alpha/scripts")).unwrap();
         std::fs::create_dir_all(dir.join("config/packages")).unwrap();
         std::fs::write(
-            dir.join("packages/alpha/elanus.toml"),
+            dir.join("packages/alpha/lanius.toml"),
             r#"
 [[stage]]
 name = "window"

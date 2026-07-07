@@ -1,6 +1,6 @@
 ---
 name: launching-agents
-description: Launch elanus agents yourself — discover profiles and packages with `elanus agent catalog`, then run (blocking) or spawn (durable, async). Native agents use the launch_agent tool; coding workers use `elanus code`. Covers launch-time --with-package and --provider.
+description: Launch lanius agents yourself — discover profiles and packages with `lanius agent catalog`, then run (blocking) or spawn (durable, async). Native agents use the launch_agent tool; coding workers use `lanius code`. Covers launch-time --with-package and --provider.
 ---
 
 # launching-agents
@@ -14,8 +14,8 @@ gate.
 ## 1. See what you can launch
 
 ```sh
-elanus agent catalog          # human-readable
-elanus agent catalog --json   # machine-readable: pick a profile + its packages
+lanius agent catalog          # human-readable
+lanius agent catalog --json   # machine-readable: pick a profile + its packages
 ```
 
 The catalog lists **native profiles** (each with its agent noun, model,
@@ -30,14 +30,14 @@ foreground.
 - **`run`** — blocking, foreground, any profile. You get the turn's output
   inline. Use for a quick synchronous sub-task.
   ```sh
-  elanus agent run --profile helper "summarize docs/security.md"
+  lanius agent run --profile helper "summarize docs/security.md"
   ```
 - **`spawn`** — durable, async, daemon-driven. Returns immediately with
   `{event, correlation, session, mailbox}`; the result (or a failure) comes
   back later as mail on that correlation. Use for background work — and
   **do not block waiting**; end your turn.
   ```sh
-  elanus agent spawn --profile helper "watch the build and report"
+  lanius agent spawn --profile helper "watch the build and report"
   ```
 
 ### If you are a native agent: the `launch_agent` tool
@@ -58,11 +58,11 @@ launch_agent {
 It is async and returns `{correlation, session, mailbox}`. The launched
 run is attributed to you.
 
-### If you are a coding worker: `elanus code`
+### If you are a coding worker: `lanius code`
 
-A coding session shells out. `elanus code spawn <tool> "<task>"` launches an
-async worker; `elanus code <tool> --headless "<task>"` runs one blocking.
-See the `elanus` worker-dispatch skill (`elanus code help`).
+A coding session shells out. `lanius code spawn <tool> "<task>"` launches an
+async worker; `lanius code <tool> --headless "<task>"` runs one blocking.
+See the `lanius` worker-dispatch skill (`lanius code help`).
 
 ## 3. Launch-time overrides
 
@@ -73,14 +73,14 @@ Both `run`/`spawn` (and `launch_agent`) take two overrides that apply to
   widen the run's VISIBLE packages to include an already-**approved** package
   the profile's path doesn't carry. This adds visibility, never authority:
   the package's bus capabilities stay gated by the grants ledger. An
-  un-granted or uninstalled package is refused (`elanus approve <name>`
+  un-granted or uninstalled package is refused (`lanius approve <name>`
   first). Prefer this over editing a profile just to borrow one skill.
 - **`--provider <name>`** (`provider` on the tool) — pin the model provider
-  for the run (a name from `elanus provider list`), e.g. spawn a worker on a
+  for the run (a name from `lanius provider list`), e.g. spawn a worker on a
   cheaper endpoint. Overrides the profile's `[model].provider`.
 
 ```sh
-elanus agent spawn --profile helper \
+lanius agent spawn --profile helper \
   --with-package history --provider deepseek \
   "explain what session s-abc123 did to src/reactor.rs"
 ```
@@ -89,4 +89,4 @@ elanus agent spawn --profile helper \
 
 - **`explain-session`** — the ready-made recipe for dispatching a read-only
   reader at a dead session's history.
-- **`elanus agent <verb> --help`** — the authoritative flag reference.
+- **`lanius agent <verb> --help`** — the authoritative flag reference.

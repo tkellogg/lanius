@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-/// An elanus root: the directory holding elanus.db, trace.jsonl, packages/,
+/// A lanius root: the directory holding lanius.db, trace.jsonl, packages/,
 /// config/, run/. Identity is the path; there is no registry.
 #[derive(Clone, Debug)]
 pub struct Root {
@@ -10,12 +10,15 @@ pub struct Root {
 
 impl Root {
     pub fn db(&self) -> PathBuf {
-        self.dir.join("elanus.db")
+        self.dir.join("lanius.db")
     }
-    /// The legacy db filename (pre-rename). Only db::open's one-time migration
-    /// references it; everything else uses db().
+    /// The legacy db filenames (pre-rename). Only db::open's one-time migration
+    /// references them; everything else uses db().
     pub fn legacy_db(&self) -> PathBuf {
         self.dir.join("harness.db")
+    }
+    pub fn legacy_db_candidates(&self) -> [PathBuf; 2] {
+        [self.dir.join("elanus.db"), self.legacy_db()]
     }
     pub fn trace_file(&self) -> PathBuf {
         self.dir.join("trace.jsonl")
@@ -71,35 +74,64 @@ impl Root {
     }
 }
 
-/// The default harness root: ~/.elanus/root. One predictable place, no
+/// The default lanius root: ~/.lanius/root. One predictable place, no
 /// cwd-dependence — running a daemon from the repo must not quietly make the
 /// repo a root (it did, before this).
 pub fn default_root() -> Result<PathBuf> {
     let home = std::env::var("HOME")?;
-    Ok(PathBuf::from(home).join(".elanus/root"))
+    Ok(default_root_from(PathBuf::from(home)))
 }
 
-/// Resolution order: explicit flag > $ELANUS_ROOT (or legacy $HARNESS_ROOT) >
-/// ~/.elanus/root. The old "walk up from cwd looking for the db" rule is gone:
+fn default_root_from(home: PathBuf) -> PathBuf {
+    home.join(".lanius/root")
+}
+
+fn root_has_marker(dir: &std::path::Path) -> bool {
+    dir.join("lanius.db").exists()
+        || dir.join("elanus.db").exists()
+        || dir.join("harness.db").exists()
+}
+
+/// Resolution order: explicit flag > $LANIUS_ROOT (or legacy $HARNESS_ROOT) >
+/// ~/.lanius/root. The old "walk up from cwd looking for the db" rule is gone:
 /// it made the active root a function of where you happened to be standing.
 pub fn resolve(cli: Option<PathBuf>) -> Result<Root> {
+    let home = std::env::var("HOME")?;
+    resolve_impl(
+        cli,
+        crate::envcompat::read("ROOT"),
+        default_root_from(PathBuf::from(&home)),
+        PathBuf::from(home).join(".elanus/root"),
+    )
+}
+
+fn resolve_impl(
+    cli: Option<PathBuf>,
+    root_env: Option<String>,
+    default_root: PathBuf,
+    legacy_root: PathBuf,
+) -> Result<Root> {
     if let Some(dir) = cli {
         return Ok(Root { dir: canon(dir)? });
     }
-    if let Some(dir) = crate::envcompat::read("ROOT") {
+    if let Some(dir) = root_env {
         return Ok(Root {
             dir: canon(PathBuf::from(dir))?,
         });
     }
-    let def = default_root()?;
-    // Either the current db name or the legacy one marks an existing root (an
-    // old root is migrated to elanus.db on first open).
-    if def.join("elanus.db").exists() || def.join("harness.db").exists() {
-        return Ok(Root { dir: canon(def)? });
+    let new = default_root;
+    // Either the current db name or a legacy one marks an existing root.
+    if root_has_marker(&new) {
+        return Ok(Root { dir: canon(new)? });
+    }
+    if root_has_marker(&legacy_root) {
+        return Ok(Root {
+            dir: canon(legacy_root)?,
+        });
     }
     bail!(
-        "no elanus root at {} — run `elanus init` to create it, or override with $ELANUS_ROOT / -C <dir>",
-        def.display()
+        "no lanius root at {} — run `lanius init` to create it, or override with $LANIUS_ROOT / -C <dir>",
+        new.display()
     )
 }
 
@@ -108,5 +140,29 @@ fn canon(p: PathBuf) -> Result<PathBuf> {
         Ok(p.canonicalize()?)
     } else {
         Ok(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_prefers_lanius_root_then_legacy_root() {
+        let base = std::env::temp_dir().join(format!("el-paths-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let lanius = base.join(".lanius/root");
+        let elanus = base.join(".elanus/root");
+        std::fs::create_dir_all(&elanus).unwrap();
+        std::fs::write(elanus.join("elanus.db"), "").unwrap();
+        let resolved =
+            resolve_impl(None, None, default_root_from(base.clone()), elanus.clone()).unwrap();
+        assert_eq!(resolved.dir, elanus.canonicalize().unwrap());
+
+        std::fs::create_dir_all(&lanius).unwrap();
+        std::fs::write(lanius.join("lanius.db"), "").unwrap();
+        let resolved = resolve_impl(None, None, default_root_from(base.clone()), elanus).unwrap();
+        assert_eq!(resolved.dir, lanius.canonicalize().unwrap());
+        std::fs::remove_dir_all(&base).ok();
     }
 }

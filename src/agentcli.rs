@@ -1,4 +1,4 @@
-//! `elanus agent` - front door for native/profile agents plus launch discovery.
+//! `lanius agent` - front door for native/profile agents plus launch discovery.
 
 use crate::db;
 use crate::events::{self, EmitOpts};
@@ -35,7 +35,7 @@ pub struct SpawnOpts {
 }
 
 /// The shared spawn request (docs/handoffs/agent-launching.md M3): both
-/// `elanus agent spawn` and the native `launch_agent` tool build one of these
+/// `lanius agent spawn` and the native `launch_agent` tool build one of these
 /// and hand it to `spawn_core`, so the CLI door and the tool door cannot drift.
 pub struct SpawnRequest {
     pub profile: String,
@@ -58,7 +58,7 @@ pub struct SpawnRequest {
     pub budget: Option<i64>,
 }
 
-/// `elanus agent catalog` - one inventory surface for launchable things.
+/// `lanius agent catalog` - one inventory surface for launchable things.
 pub fn catalog(root: &Root, opts: CatalogOpts) -> Result<()> {
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
@@ -114,7 +114,7 @@ pub fn catalog(root: &Root, opts: CatalogOpts) -> Result<()> {
     Ok(())
 }
 
-/// `elanus agent run` - blocking native/profile-agent turn.
+/// `lanius agent run` - blocking native/profile-agent turn.
 pub fn run(root: &Root, opts: RunOpts) -> Result<()> {
     validate_profile_name(&opts.profile)?;
     let conn = db::open(root)?;
@@ -137,7 +137,7 @@ pub fn run(root: &Root, opts: RunOpts) -> Result<()> {
     )
 }
 
-/// `elanus agent spawn` - durable background native/profile-agent turn.
+/// `lanius agent spawn` - durable background native/profile-agent turn.
 ///
 /// This emits work to the profile's agent mailbox. It is intentionally gated on
 /// an approved exec handler matching that mailbox; otherwise the event would be
@@ -165,7 +165,7 @@ pub fn spawn(root: &Root, opts: SpawnOpts) -> Result<()> {
     Ok(())
 }
 
-/// Shared spawn core for the CLI (`elanus agent spawn`) and the native
+/// Shared spawn core for the CLI (`lanius agent spawn`) and the native
 /// `launch_agent` tool (docs/handoffs/agent-launching.md M3). Validates the
 /// profile + `--with-package` names, gates on an approved exec handler for the
 /// profile's mailbox (otherwise the daemon would mark the event done with no
@@ -356,13 +356,13 @@ fn validate_with_packages(
         if !universe.contains(pkg) {
             bail!(
                 "package {pkg:?} is not installed on this instance; \
-                 `elanus agent catalog` lists what is available"
+                 `lanius agent catalog` lists what is available"
             );
         }
         if !packages::is_granted(conn, pkg)? {
             bail!(
                 "package {pkg:?} is not granted (approved) — a launch may widen visibility \
-                 only to approved packages; run `elanus approve {pkg}` first"
+                 only to approved packages; run `lanius approve {pkg}` first"
             );
         }
     }
@@ -382,7 +382,7 @@ fn validate_profile_name(name: &str) -> Result<()> {
 }
 
 fn current_actor() -> Option<String> {
-    std::env::var("ELANUS_ACTOR")
+    std::env::var("LANIUS_ACTOR")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| {
@@ -391,7 +391,7 @@ fn current_actor() -> Option<String> {
                 .filter(|s| !s.is_empty())
         })
         .or_else(|| {
-            std::env::var("ELANUS_CODE_SESSION")
+            std::env::var("LANIUS_CODE_SESSION")
                 .ok()
                 .filter(|s| !s.is_empty())
         })
@@ -418,7 +418,7 @@ mod tests {
     fn write_pkg(root: &Root, name: &str, manifest: &str) {
         let d = root.dir.join("packages").join(name);
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("elanus.toml"), manifest).unwrap();
+        std::fs::write(d.join("lanius.toml"), manifest).unwrap();
     }
 
     #[test]
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn catalog_profile_rows_are_machine_pickable() {
-        // M1 acceptance: `elanus agent catalog --json` must be complete enough for
+        // M1 acceptance: `lanius agent catalog --json` must be complete enough for
         // an agent to pick a profile AND its packages. Assert the per-profile row
         // carries the fields that choice needs.
         let root = scratch("catalog-json");

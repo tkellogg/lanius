@@ -76,7 +76,7 @@ enum ToolOutcome {
     Suspend,
 }
 
-/// `elanus exec` — run an agent turn. Chat is exec with a session ID.
+/// `lanius exec` — run an agent turn. Chat is exec with a session ID.
 /// The tool loop is hand-rolled on purpose: termination policy, signal
 /// preemption, budget enforcement, and trace capture live here and are owned.
 pub fn run(root: &Root, opts: ExecOpts) -> Result<()> {
@@ -265,7 +265,7 @@ async fn run_async(root: &Root, opts: ExecOpts) -> Result<()> {
 /// docs/config.md increment 3 — set up the agent's config clone. A
 /// proposal-capable agent (profile `autonomy != "off"`) gets a disposable clone
 /// of the config repo in its run scratch (under `run/`, which is inside its cage
-/// and NOT the fenced `config/`), and `$ELANUS_CONFIG_DIR` points at it. Returns
+/// and NOT the fenced `config/`), and `$LANIUS_CONFIG_DIR` points at it. Returns
 /// the clone path to reap, or None when the agent can't propose. Best-effort: a
 /// clone failure disables proposals for the run, never breaks the run.
 fn config_clone_setup(root: &Root, profile_name: &str) -> Option<std::path::PathBuf> {
@@ -281,6 +281,7 @@ fn config_clone_setup(root: &Root, profile_name: &str) -> Option<std::path::Path
         eprintln!("[exec] config clone unavailable (proposals disabled this run): {e:#}");
         return None;
     }
+    std::env::set_var("LANIUS_CONFIG_DIR", &dest);
     std::env::set_var("ELANUS_CONFIG_DIR", &dest);
     Some(dest)
 }
@@ -437,14 +438,14 @@ async fn run_turn(root: &Root, opts: ExecOpts) -> Result<()> {
     }
     // Provenance (docs/identity.md): events this run emits — its reply mail,
     // failure mail, ask_human, any emit_event tool call, and anything the
-    // shell tool runs via `elanus emit` — attribute to the agent. This is
+    // shell tool runs via `lanius emit` — attribute to the agent. This is
     // self-reported (the run writes the ledger directly) until the ledger
     // becomes kernel-only-writable; the broker-verified path is the
     // unforgeable one.
     // Canonical name + legacy alias, so events::emit (and any child reading
     // either) attributes to this agent.
+    std::env::set_var("LANIUS_ACTOR", &prof.agent);
     std::env::set_var("ELANUS_ACTOR", &prof.agent);
-    std::env::set_var("HARNESS_ACTOR", &prof.agent);
     let session = opts
         .session
         .unwrap_or_else(|| format!("s-{}", &uuid::Uuid::new_v4().to_string()[..8]));
@@ -1304,7 +1305,7 @@ fn dispatcher_plan(
         let provider = crate::provider::get(root, conn, name)?.ok_or_else(|| {
             anyhow!(
                 "profile's [model].provider names {name:?}, but no such provider exists — \
-                 define it with `elanus provider add {name} …` (or remove [model].provider \
+                 define it with `lanius provider add {name} …` (or remove [model].provider \
                  to use the inline base_url/api_key_env)"
             )
         })?;
@@ -1346,7 +1347,7 @@ fn dispatcher_plan(
 ///   genai 0.6.5's Anthropic/OpenAI adapters merge `extra_headers` only from the
 ///   per-call `options` argument of `exec_chat` (client_impl.rs:110), never from
 ///   the client config — so client-level `with_extra_headers` would be silently
-///   dropped for exactly the adapters elanus uses. The caller threads the
+///   dropped for exactly the adapters lanius uses. The caller threads the
 ///   returned options into the `exec_chat(..., opts.as_ref())` call so the
 ///   headers actually reach the wire (additive — preserves the adapter's auth
 ///   header).
@@ -1725,9 +1726,9 @@ fn tool_defs() -> Vec<Tool> {
             })),
         Tool::new("launch_agent")
             .with_description(
-                "Launch a native elanus agent to run a durable background turn — the sanctioned \
+                "Launch a native lanius agent to run a durable background turn — the sanctioned \
                  way to put another agent's mailbox to work (a raw emit_event to in/agent/<other> \
-                 is refused). Pick a `profile` from `elanus agent catalog` (it must be spawn-ready: \
+                 is refused). Pick a `profile` from `lanius agent catalog` (it must be spawn-ready: \
                  an approved exec handler drives its mailbox). The launch is ASYNC and its own flow: \
                  it returns immediately with {correlation, session, mailbox}; the agent's result \
                  (or a failure) arrives later as mail on that correlation — do not block waiting. \
@@ -1738,7 +1739,7 @@ fn tool_defs() -> Vec<Tool> {
             .with_schema(json!({
                 "type": "object",
                 "properties": {
-                    "profile": { "type": "string", "description": "the native profile to run (see `elanus agent catalog`)" },
+                    "profile": { "type": "string", "description": "the native profile to run (see `lanius agent catalog`)" },
                     "prompt": { "type": "string", "description": "the self-contained task for the launched agent" },
                     "with_packages": {
                         "type": "array",
@@ -2104,7 +2105,7 @@ fn run_tool(
             // The in/ plane is reserved ingress: kernel and bridge code path
             // through events::emit() with a verified sender, but this tool
             // arm is agent-reachable, and emit() can't tell an agent apart
-            // from the kernel (ELANUS_ACTOR is self-reported, events.rs
+            // from the kernel (LANIUS_ACTOR is self-reported, events.rs
             // sender fallback). Without this refusal an agent could mint
             // in/dm/... or in/human/<owner> events and poison another
             // agent's recall or forge owner mail (security.md entry 15).
@@ -2800,14 +2801,14 @@ mod tests {
 
     #[test]
     fn missing_workdir_fails_loudly_not_silently() {
-        let p = std::env::temp_dir().join(format!("elanus-no-such-{}", uuid::Uuid::new_v4()));
+        let p = std::env::temp_dir().join(format!("lanius-no-such-{}", uuid::Uuid::new_v4()));
         let e = resolve_workdir(&cfg(Some(&p.display().to_string()))).unwrap_err();
         assert!(e.to_string().contains("does not exist"), "{e}");
     }
 
     #[test]
     fn existing_workdir_resolves() {
-        let p = std::env::temp_dir().join(format!("elanus-wd-{}", uuid::Uuid::new_v4()));
+        let p = std::env::temp_dir().join(format!("lanius-wd-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         let got = resolve_workdir(&cfg(Some(&p.display().to_string())))
             .unwrap()
@@ -3679,7 +3680,7 @@ mod tests {
     }
 }
 
-/// `elanus handle-exec` — the two-line-script backend for exec-as-handler.
+/// `lanius handle-exec` — the two-line-script backend for exec-as-handler.
 /// Reads the event envelope from stdin per the handler contract.
 pub fn handle_exec(root: &Root) -> Result<()> {
     let mut body = String::new();

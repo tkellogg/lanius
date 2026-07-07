@@ -8,7 +8,7 @@ so a query is physically unable to corrupt the index. A cold-start agent holding
 only this tool can recall a curated fact and get back the file + line to open.
 
 The query shape MIRRORS src/kb.rs (query_tokens + AND-then-OR + bm25) so this
-tool and `elanus kb search` return identical hits — the engine is swappable, the
+tool and `lanius kb search` return identical hits — the engine is swappable, the
 surface is stable.
 """
 import json
@@ -18,7 +18,7 @@ import sqlite3
 import sys
 
 SCRATCH = os.environ.get("ELANUS_SCRATCH") or os.path.join(
-    os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."),
+    os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."),
     "run",
     "pkg-kb-search",
 )

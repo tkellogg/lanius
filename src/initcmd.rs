@@ -17,8 +17,8 @@ struct PkgFile {
 /// is self-contained and the user can edit/fork them freely.
 const PKG_FILES: &[PkgFile] = &[
     PkgFile {
-        rel: "chat/elanus.toml",
-        content: include_str!("../packages/chat/elanus.toml"),
+        rel: "chat/lanius.toml",
+        content: include_str!("../packages/chat/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -27,8 +27,8 @@ const PKG_FILES: &[PkgFile] = &[
         exec: true,
     },
     PkgFile {
-        rel: "echo/elanus.toml",
-        content: include_str!("../packages/echo/elanus.toml"),
+        rel: "echo/lanius.toml",
+        content: include_str!("../packages/echo/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -37,8 +37,8 @@ const PKG_FILES: &[PkgFile] = &[
         exec: true,
     },
     PkgFile {
-        rel: "notify/elanus.toml",
-        content: include_str!("../packages/notify/elanus.toml"),
+        rel: "notify/lanius.toml",
+        content: include_str!("../packages/notify/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -47,8 +47,8 @@ const PKG_FILES: &[PkgFile] = &[
         exec: true,
     },
     PkgFile {
-        rel: "watchdog/elanus.toml",
-        content: include_str!("../packages/watchdog/elanus.toml"),
+        rel: "watchdog/lanius.toml",
+        content: include_str!("../packages/watchdog/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -62,10 +62,10 @@ const PKG_FILES: &[PkgFile] = &[
         exec: false,
     },
     // Ships pending, NOT auto-approved below: an approved stage shapes every
-    // prompt; activating it is the human's call (elanus approve recent-history).
+    // prompt; activating it is the human's call (lanius approve recent-history).
     PkgFile {
-        rel: "recent-history/elanus.toml",
-        content: include_str!("../packages/recent-history/elanus.toml"),
+        rel: "recent-history/lanius.toml",
+        content: include_str!("../packages/recent-history/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -74,8 +74,8 @@ const PKG_FILES: &[PkgFile] = &[
         exec: true,
     },
     PkgFile {
-        rel: "window/elanus.toml",
-        content: include_str!("../packages/window/elanus.toml"),
+        rel: "window/lanius.toml",
+        content: include_str!("../packages/window/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -85,10 +85,10 @@ const PKG_FILES: &[PkgFile] = &[
     },
     // Ships pending like the other stages: an approved stage shapes every
     // prompt, so activating the platform block is the human's call
-    // (elanus approve platform). docs/handoffs/platform-trust.md M3.
+    // (lanius approve platform). docs/handoffs/platform-trust.md M3.
     PkgFile {
-        rel: "platform/elanus.toml",
-        content: include_str!("../packages/platform/elanus.toml"),
+        rel: "platform/lanius.toml",
+        content: include_str!("../packages/platform/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -174,8 +174,8 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: false,
     },
     PkgFile {
-        rel: "core/packages/sibling-coordination/elanus.toml",
-        content: include_str!("../kits/core/packages/sibling-coordination/elanus.toml"),
+        rel: "core/packages/sibling-coordination/lanius.toml",
+        content: include_str!("../kits/core/packages/sibling-coordination/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -198,11 +198,11 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
     },
     // kb-groundskeeper — the KB's caretaker (docs/handoffs/kb-groundskeeper.md):
     // a no-LLM sweep cron (pointers/orphans/staleness → owner report) plus the
-    // setup-gated diff pipeline. Ships in core, pending; `elanus approve` turns on
+    // setup-gated diff pipeline. Ships in core, pending; `lanius approve` turns on
     // rung 1, the [config] keys + approve gate rung 2.
     PkgFile {
-        rel: "core/packages/kb-groundskeeper/elanus.toml",
-        content: include_str!("../kits/core/packages/kb-groundskeeper/elanus.toml"),
+        rel: "core/packages/kb-groundskeeper/lanius.toml",
+        content: include_str!("../kits/core/packages/kb-groundskeeper/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -218,11 +218,11 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
     // kb-pipeline — the exec handler that makes the compactor/ratifier agent
     // mailboxes daemon-drivable (docs/handoffs/kb-groundskeeper.md M3). Without an
     // approved exec package subscribing to in/agent/kb-compactor / in/agent/kb-ratifier,
-    // `spawn_core` refuses to launch and `elanus kb groundskeep` cannot spawn the
+    // `spawn_core` refuses to launch and `lanius kb groundskeep` cannot spawn the
     // compactor. Mirrors packages/chat; ships pending, approved as part of setup.
     PkgFile {
-        rel: "core/packages/kb-pipeline/elanus.toml",
-        content: include_str!("../kits/core/packages/kb-pipeline/elanus.toml"),
+        rel: "core/packages/kb-pipeline/lanius.toml",
+        content: include_str!("../kits/core/packages/kb-pipeline/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -247,8 +247,8 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: false,
     },
     PkgFile {
-        rel: "dev/packages/git-protect/elanus.toml",
-        content: include_str!("../kits/dev/packages/git-protect/elanus.toml"),
+        rel: "dev/packages/git-protect/lanius.toml",
+        content: include_str!("../kits/dev/packages/git-protect/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -267,8 +267,8 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: false,
     },
     PkgFile {
-        rel: "funnel/packages/funnel-intake/elanus.toml",
-        content: include_str!("../kits/funnel/packages/funnel-intake/elanus.toml"),
+        rel: "funnel/packages/funnel-intake/lanius.toml",
+        content: include_str!("../kits/funnel/packages/funnel-intake/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -277,8 +277,8 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: true,
     },
     PkgFile {
-        rel: "funnel/packages/funnel-sift/elanus.toml",
-        content: include_str!("../kits/funnel/packages/funnel-sift/elanus.toml"),
+        rel: "funnel/packages/funnel-sift/lanius.toml",
+        content: include_str!("../kits/funnel/packages/funnel-sift/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -292,8 +292,8 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: true,
     },
     PkgFile {
-        rel: "funnel/packages/funnel-scout/elanus.toml",
-        content: include_str!("../kits/funnel/packages/funnel-scout/elanus.toml"),
+        rel: "funnel/packages/funnel-scout/lanius.toml",
+        content: include_str!("../kits/funnel/packages/funnel-scout/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -312,8 +312,8 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: false,
     },
     PkgFile {
-        rel: "helper/packages/helper-chat/elanus.toml",
-        content: include_str!("../kits/helper/packages/helper-chat/elanus.toml"),
+        rel: "helper/packages/helper-chat/lanius.toml",
+        content: include_str!("../kits/helper/packages/helper-chat/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -322,43 +322,43 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: true,
     },
     PkgFile {
-        rel: "helper/packages/kb-elanus/elanus.toml",
-        content: include_str!("../kits/helper/packages/kb-elanus/elanus.toml"),
+        rel: "helper/packages/kb-lanius/lanius.toml",
+        content: include_str!("../kits/helper/packages/kb-lanius/lanius.toml"),
         exec: false,
     },
     PkgFile {
-        rel: "helper/packages/kb-elanus/kb/kits-and-packages.md",
-        content: include_str!("../kits/helper/packages/kb-elanus/kb/kits-and-packages.md"),
+        rel: "helper/packages/kb-lanius/kb/kits-and-packages.md",
+        content: include_str!("../kits/helper/packages/kb-lanius/kb/kits-and-packages.md"),
         exec: false,
     },
     PkgFile {
-        rel: "helper/packages/kb-elanus/kb/llm-access.md",
-        content: include_str!("../kits/helper/packages/kb-elanus/kb/llm-access.md"),
+        rel: "helper/packages/kb-lanius/kb/llm-access.md",
+        content: include_str!("../kits/helper/packages/kb-lanius/kb/llm-access.md"),
         exec: false,
     },
     PkgFile {
-        rel: "helper/packages/kb-elanus/kb/model-guidance.md",
-        content: include_str!("../kits/helper/packages/kb-elanus/kb/model-guidance.md"),
+        rel: "helper/packages/kb-lanius/kb/model-guidance.md",
+        content: include_str!("../kits/helper/packages/kb-lanius/kb/model-guidance.md"),
         exec: false,
     },
     PkgFile {
-        rel: "helper/packages/kb-elanus/kb/mutation-doctrine.md",
-        content: include_str!("../kits/helper/packages/kb-elanus/kb/mutation-doctrine.md"),
+        rel: "helper/packages/kb-lanius/kb/mutation-doctrine.md",
+        content: include_str!("../kits/helper/packages/kb-lanius/kb/mutation-doctrine.md"),
         exec: false,
     },
     PkgFile {
-        rel: "helper/packages/kb-elanus/kb/overview.md",
-        content: include_str!("../kits/helper/packages/kb-elanus/kb/overview.md"),
+        rel: "helper/packages/kb-lanius/kb/overview.md",
+        content: include_str!("../kits/helper/packages/kb-lanius/kb/overview.md"),
         exec: false,
     },
     PkgFile {
-        rel: "helper/packages/kb-elanus/kb/setup-checklist.md",
-        content: include_str!("../kits/helper/packages/kb-elanus/kb/setup-checklist.md"),
+        rel: "helper/packages/kb-lanius/kb/setup-checklist.md",
+        content: include_str!("../kits/helper/packages/kb-lanius/kb/setup-checklist.md"),
         exec: false,
     },
     PkgFile {
-        rel: "helper/packages/kb-user/elanus.toml",
-        content: include_str!("../kits/helper/packages/kb-user/elanus.toml"),
+        rel: "helper/packages/kb-user/lanius.toml",
+        content: include_str!("../kits/helper/packages/kb-user/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -382,8 +382,8 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: false,
     },
     PkgFile {
-        rel: "helper/profiles/helper/blocks/20-kb-elanus.md",
-        content: include_str!("../kits/helper/profiles/helper/blocks/20-kb-elanus.md"),
+        rel: "helper/profiles/helper/blocks/20-kb-lanius.md",
+        content: include_str!("../kits/helper/profiles/helper/blocks/20-kb-lanius.md"),
         exec: false,
     },
     // stdlib: the protected, always-on kit (docs/config.md). Installed and
@@ -400,8 +400,8 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: false,
     },
     PkgFile {
-        rel: "stdlib/packages/history/elanus.toml",
-        content: include_str!("../kits/stdlib/packages/history/elanus.toml"),
+        rel: "stdlib/packages/history/lanius.toml",
+        content: include_str!("../kits/stdlib/packages/history/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -428,10 +428,10 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
     // a read-only indexing daemon (scripts/index) + the `search_knowledge` model
     // tool via the [[tool]] seam (scripts/search). Ships in stdlib so a fresh root
     // gets the index daemon and the tool folds into agents automatically; without
-    // this, `elanus kb search` errors "no knowledge index yet".
+    // this, `lanius kb search` errors "no knowledge index yet".
     PkgFile {
-        rel: "stdlib/packages/kb-search/elanus.toml",
-        content: include_str!("../kits/stdlib/packages/kb-search/elanus.toml"),
+        rel: "stdlib/packages/kb-search/lanius.toml",
+        content: include_str!("../kits/stdlib/packages/kb-search/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -451,12 +451,12 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
     },
     // discovery — the privileged capability search (docs/handoffs/kb-discovery.md):
     // the `find_capability` model tool via the [[tool]] seam (scripts/find), a thin
-    // wrapper over `elanus discover --json`. Ships in stdlib so a fresh root can tell
+    // wrapper over `lanius discover --json`. Ships in stdlib so a fresh root can tell
     // an agent "you don't have the discord package enabled, but it exists and matches
     // your query." Its taught availability rides the seeded 20-discovery block.
     PkgFile {
-        rel: "stdlib/packages/discovery/elanus.toml",
-        content: include_str!("../kits/stdlib/packages/discovery/elanus.toml"),
+        rel: "stdlib/packages/discovery/lanius.toml",
+        content: include_str!("../kits/stdlib/packages/discovery/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -481,8 +481,8 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         exec: false,
     },
     PkgFile {
-        rel: "stdlib/packages/kb-llm-strengths/elanus.toml",
-        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/elanus.toml"),
+        rel: "stdlib/packages/kb-llm-strengths/lanius.toml",
+        content: include_str!("../kits/stdlib/packages/kb-llm-strengths/lanius.toml"),
         exec: false,
     },
     PkgFile {
@@ -660,7 +660,7 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     // protected packages the product itself depends on — history's transcript
     // view first, so the sessions tab is never a dead 503. Linked, not vendored
     // (it stays kernel-managed); its packages are revoke-guarded
-    // (kit::protected_packages + `elanus revoke`).
+    // (kit::protected_packages + `lanius revoke`).
     let stdlib_dir = kit::resolve(&root, "stdlib").context("resolving the stdlib kit")?;
     kit::install(&root, &conn, &stdlib_dir, kit::Mode::Link, true).context("installing stdlib")?;
     let mut readmes: Vec<(String, String)> = Vec::new();
@@ -672,16 +672,16 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     }
 
     println!();
-    println!("initialized harness root at {}", root.dir.display());
+    println!("initialized lanius root at {}", root.dir.display());
     println!();
     println!(
         "you are \"{}\" here (the default identity). to use your own name:",
         crate::secrets::owner_name(&root)
     );
-    println!("  elanus profile set default owner=<yourname>   # then restart the daemon");
+    println!("  lanius profile set default owner=<yourname>   # then restart the daemon");
     println!();
     println!("next steps:");
-    // The default root needs no env var; only point at $ELANUS_ROOT when
+    // The default root needs no env var; only point at $LANIUS_ROOT when
     // this root actually requires it.
     let is_default = crate::paths::default_root()
         .ok()
@@ -689,18 +689,18 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
         .map(|d| d == root.dir)
         .unwrap_or(false);
     if !is_default {
-        println!("  export ELANUS_ROOT={}", root.dir.display());
+        println!("  export LANIUS_ROOT={}", root.dir.display());
     }
-    println!("  elanus daemon &                     # the dispatcher");
-    println!("  elanus exec --session hi \"hello\"    # chat (needs ANTHROPIC_API_KEY)");
-    println!("  elanus emit in/agent/main --payload '{{\"prompt\":\"check in with me\"}}'");
-    println!("  elanus inbox / elanus answer <id> \"...\"");
-    println!("  elanus packages                     # what's installed, what's pending");
-    println!("  elanus approve history              # transcripts in the web UI (granted serving)");
+    println!("  lanius daemon &                     # the dispatcher");
+    println!("  lanius exec --session hi \"hello\"    # chat (needs ANTHROPIC_API_KEY)");
+    println!("  lanius emit in/agent/main --payload '{{\"prompt\":\"check in with me\"}}'");
+    println!("  lanius inbox / lanius answer <id> \"...\"");
+    println!("  lanius packages                     # what's installed, what's pending");
+    println!("  lanius approve history              # transcripts in the web UI (granted serving)");
     println!(
-        "  elanus approve recent-history       # cross-run memory of recent mail (a context stage)"
+        "  lanius approve recent-history       # cross-run memory of recent mail (a context stage)"
     );
-    println!("  elanus bus sub 'obs/#'              # watch the live stream");
+    println!("  lanius bus sub 'obs/#'              # watch the live stream");
     println!("  tail -f {}", root.trace_file().display());
     for (name, readme) in &readmes {
         println!();
@@ -721,16 +721,16 @@ fn write_if_missing(path: &Path, content: &str, exec: bool) -> Result<()> {
 }
 
 fn seed_stock_harness_packages(root: &Root) -> Result<()> {
-    let exe = std::env::current_exe().context("locating the running elanus binary")?;
+    let exe = std::env::current_exe().context("locating the running lanius binary")?;
     let exe_dir = exe
         .parent()
-        .context("running elanus binary has no parent directory")?;
+        .context("running lanius binary has no parent directory")?;
 
     for pkg in STOCK_HARNESS_PACKAGES {
         let pkg_dir = root.packages().join(pkg.dir);
         let bin_dir = pkg_dir.join("bin");
         std::fs::create_dir_all(&bin_dir)?;
-        write_if_missing(&pkg_dir.join("elanus.toml"), pkg.manifest, false)?;
+        write_if_missing(&pkg_dir.join("lanius.toml"), pkg.manifest, false)?;
 
         let adapter = bin_dir.join("adapter");
         let source = exe_dir.join(format!("{}{}", pkg.binary, std::env::consts::EXE_SUFFIX));

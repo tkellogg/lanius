@@ -105,11 +105,11 @@ fn matrix_codex() {
     // The key rides env (off the command line), named by env_key.
     assert!(h
         .env
-        .contains(&("ELANUS_PV_DS_KEY".to_string(), "sk-secret-123".to_string())));
+        .contains(&("LANIUS_PV_DS_KEY".to_string(), "sk-secret-123".to_string())));
     // The secret header value also rides env.
     assert!(h
         .env
-        .contains(&("ELANUS_PV_DS_H0".to_string(), "hdr-secret".to_string())));
+        .contains(&("LANIUS_PV_DS_H0".to_string(), "hdr-secret".to_string())));
     // The -c flags select a custom provider, never the literal key.
     let joined = h.args.join(" ");
     // The model_provider VALUE is quoted (TOML scalar; required for hyphenated ids,
@@ -119,9 +119,9 @@ fn matrix_codex() {
     assert!(joined.contains("model_providers.ds.name=\"ds\""));
     assert!(joined.contains("model_providers.ds.base_url=\"https://api.example.com\""));
     assert!(joined.contains("model_providers.ds.wire_api=\"responses\""));
-    assert!(joined.contains("model_providers.ds.env_key=\"ELANUS_PV_DS_KEY\""));
+    assert!(joined.contains("model_providers.ds.env_key=\"LANIUS_PV_DS_KEY\""));
     assert!(
-        joined.contains("model_providers.ds.env_http_headers.\"X-LiteLLM\"=\"ELANUS_PV_DS_H0\"")
+        joined.contains("model_providers.ds.env_http_headers.\"X-LiteLLM\"=\"LANIUS_PV_DS_H0\"")
     );
     assert!(
         !joined.contains("sk-secret-123"),

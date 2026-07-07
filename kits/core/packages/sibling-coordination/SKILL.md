@@ -1,44 +1,44 @@
 ---
 name: sibling-coordination
-description: What to do when you share a working tree with other coding sessions — how to see what each sibling is doing and when it was last active (sibling-status), figure out which uncommitted changes are yours vs theirs (whose-change), ask a live sibling a question and wait for the answer (ask-sibling), and the decision tree for resolving a tangle without clobbering another agent's work (resolve-sibling-conflict). Read this the moment `git status` shows changes you don't recognize, before committing/stashing in a shared tree, or when the [elanus siblings] note says another session is active.
+description: What to do when you share a working tree with other coding sessions — how to see what each sibling is doing and when it was last active (sibling-status), figure out which uncommitted changes are yours vs theirs (whose-change), ask a live sibling a question and wait for the answer (ask-sibling), and the decision tree for resolving a tangle without clobbering another agent's work (resolve-sibling-conflict). Read this the moment `git status` shows changes you don't recognize, before committing/stashing in a shared tree, or when the [lanius siblings] note says another session is active.
 ---
 
 # Coordinating with sibling coding sessions
 
 You may share one working tree (and one git index) with other coding sessions. The
-`[elanus siblings]` note each turn names who is live, their tool, when each was last
+`[lanius siblings]` note each turn names who is live, their tool, when each was last
 active, and what each is working on. When their work and yours tangle, do NOT
 reverse-engineer it from `git diff` or commit a dirty tree blind. Use these moves.
 
 ## sibling-status — what is each sibling doing?
-- The per-turn **`[elanus siblings]` note is the source of truth** for *what each
+- The per-turn **`[lanius siblings]` note is the source of truth** for *what each
   sibling is doing + when it was last active* — it renders, per live sibling, its
   last-active delta, current `in_progress` task, and last-edited file. Read it first.
-- `elanus code rooms` — your room's roster + who is claiming/editing which files.
-- `elanus code sessions` — the coding-session roster (tool, status, duration,
+- `lanius code rooms` — your room's roster + who is claiming/editing which files.
+- `lanius code sessions` — the coding-session roster (tool, status, duration,
   tokens) for cross-checking who exists; it does NOT show task/last-active — the
   note does.
 - "last active 30s ago" → actively working, treat its files as hot. "last active
   40m ago / off the roster" → likely stranded; its work may be safe to take over.
-- **Caveat:** auto-claims depend on elanus observing a harness's edits live (Claude &
+- **Caveat:** auto-claims depend on lanius observing a harness's edits live (Claude &
   codex via hooks, opencode via its event stream). If a sibling is clearly active but
   shows no task/claims, don't assume it's idle — absence of a claim is not proof it
   isn't touching a file. When unsure about a live sibling, prefer `ask-sibling` / `git`
   over trusting an empty claim set.
 
 ## whose-change — which changes are mine?
-- `elanus code whose --dirty` — annotates `git status` with the owning session,
+- `lanius code whose --dirty` — annotates `git status` with the owning session,
   tool, last-active, and current task for each changed file.
-- `elanus code whose <path>` — for one file.
+- `lanius code whose <path>` — for one file.
 - A file with no owner but in your diff is yours. A file owned by a live sibling is
   theirs — do not stage it as if it were your work.
 
 ## ask-sibling — just ask
-- `elanus code ask <session> "are you still editing src/foo.rs? safe for me to
+- `lanius code ask <session> "are you still editing src/foo.rs? safe for me to
   touch src/bar.rs?"` — sends the question and waits briefly for the reply.
 - Add `--priority 5` to interrupt a live sibling mid-turn for an urgent question.
 - No answer in time → treat the contended file as theirs and route around it.
-- You can also be asked: if a sibling messages you, answer it (`elanus code inbox`).
+- You can also be asked: if a sibling messages you, answer it (`lanius code inbox`).
 
 ## resolve-sibling-conflict — the decision tree
 1. `git status` shows changes you don't recognize? Run `whose-change`.
@@ -49,7 +49,7 @@ reverse-engineer it from `git diff` or commit a dirty tree blind. Use these move
      do and can collide with its in-flight edits.
    - Sibling **live** (last active recently)? `ask-sibling` whether it's safe, or
      retreat: do your own work in a `git worktree` (`git worktree add ../wt -b mine`)
-     and merge later. Claim your files (`elanus code claim <path>`) so it routes
+     and merge later. Claim your files (`lanius code claim <path>`) so it routes
      around you.
    - Sibling **stranded** (off the roster / long-idle, work left dangling)? It may be
      safe to commit its work to preserve it — but only with the human's explicit

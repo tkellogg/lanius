@@ -25,8 +25,16 @@ import subprocess
 import sys
 import time
 
-DB = os.environ.get("ELANUS_DB") or os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."), "elanus.db")
-PKG = os.environ.get("ELANUS_PACKAGE", "recent-history")
+ROOT = os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", ".")
+DB = (
+    os.environ.get("LANIUS_DB")
+    or os.environ.get("ELANUS_DB")
+    or os.environ.get("HARNESS_DB")
+    or os.path.join(ROOT, "lanius.db")
+    or os.path.join(ROOT, "elanus.db")
+    or os.path.join(ROOT, "harness.db")
+)
+PKG = os.environ.get("LANIUS_PACKAGE") or os.environ.get("ELANUS_PACKAGE") or "recent-history"
 REQ_TOPIC = f"obs/harness/stagereq/{PKG}/recent-history"
 LIMIT = 12
 CLIP = 300
@@ -93,7 +101,7 @@ def transform(doc):
 
 def respond(topic, body):
     subprocess.run(
-        ["elanus", "bus", "pub", topic, json.dumps(body), "--qos", "1"],
+        ["lanius", "bus", "pub", topic, json.dumps(body), "--qos", "1"],
         check=True, timeout=30,
     )
 
@@ -120,10 +128,10 @@ def main():
     while not stage_grant_approved():
         if not waited:
             log("[recent-history] stage grant not approved yet; parking until "
-                "`elanus approve recent-history` (this is not an error)")
+                "`lanius approve recent-history` (this is not an error)")
             waited = True
         time.sleep(2)
-    proc = subprocess.Popen(["elanus", "bus", "sub", REQ_TOPIC], stdout=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(["lanius", "bus", "sub", REQ_TOPIC], stdout=subprocess.PIPE, text=True)
     log(f"[recent-history] serving {REQ_TOPIC} (db {DB}, read-only, warm)")
     for line in proc.stdout:
         try:

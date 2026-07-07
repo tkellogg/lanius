@@ -5,19 +5,19 @@
 #   1. THE SCRIPT RUNG (M1) — no LLM, works with ZERO configuration. A daily sweep
 #      validates every pointer block's meta.{path,lines,sha} (kb-core M3), finds
 #      orphan kb/ files, and flags staleness (a file changed since its recorded
-#      sha), then mails the owner a report. `elanus kb check` is the verb; the
-#      `sweep` cron below fires it. This rung needs only `elanus approve`.
+#      sha), then mails the owner a report. `lanius kb check` is the verb; the
+#      `sweep` cron below fires it. This rung needs only `lanius approve`.
 #
-#   2. THE DIFF PIPELINE (M3) — elanus's FIRST auto-approve pipeline, and so
+#   2. THE DIFF PIPELINE (M3) — lanius's FIRST auto-approve pipeline, and so
 #      absolutely SETUP-GATED. A cheap "compactor" drafts unified diffs; an
 #      expensive "ratifier" applies-or-bounces them WITH feedback. NOTHING runs —
 #      no cron fire that spawns anything, no LLM call — until the human has set the
 #      two model choices (informed by reading the llm-strengths KB), a cadence, and
 #      a token budget (the [config] keys below) AND approved this package. The
-#      `pipeline` cron fires on a fixed schedule, but `elanus kb groundskeep` is
+#      `pipeline` cron fires on a fixed schedule, but `lanius kb groundskeep` is
 #      INERT (spawns nothing, prints why) until setup is complete.
 #
-# Ships pending like every package. `elanus approve kb-groundskeeper` turns on the
+# Ships pending like every package. `lanius approve kb-groundskeeper` turns on the
 # sweep cron (rung 1). The pipeline (rung 2) additionally needs the [config] keys.
 
 [request]
@@ -58,7 +58,7 @@ schedule = "0 * * * *"
 emit     = "in/package/kb-groundskeeper/pipeline"
 
 # The pipeline's setup surface (docs/handoffs/kb-groundskeeper.md M2, wonky bit 1):
-# the human sets each with `elanus config set kb-groundskeeper.<key> ...`. All four
+# the human sets each with `lanius config set kb-groundskeeper.<key> ...`. All four
 # are REQUIRED — the pipeline stays inert until every one carries a value. None is
 # agent_tunable: an agent may not turn its own auto-approve pipeline on or retune it.
 [config]
@@ -66,11 +66,11 @@ agent_tunable = []
 
 [[config.keys]]
 name = "compactor_model"
-description = "The CHEAP model that drafts consolidation diffs (a fast/cheap tier — consult the llm-strengths KB: `elanus kb search 'implementer model'`)."
+description = "The CHEAP model that drafts consolidation diffs (a fast/cheap tier — consult the llm-strengths KB: `lanius kb search 'implementer model'`)."
 
 [[config.keys]]
 name = "ratifier_model"
-description = "The EXPENSIVE model that ratifies diffs — the trust boundary (a strong/verifier tier — `elanus kb search 'who verifies'`)."
+description = "The EXPENSIVE model that ratifies diffs — the trust boundary (a strong/verifier tier — `lanius kb search 'who verifies'`)."
 
 [[config.keys]]
 name = "cadence"

@@ -38,7 +38,7 @@ for line in text[:FILE_CAP].splitlines():
     # a crash; the un-deleted file is the retry state.
     while IFS= read -r payload; do
       [ -n "$payload" ] || continue
-      elanus bus pub in/package/funnel/sift "$payload" --qos 1 || exit 1
+      lanius bus pub in/package/funnel/sift "$payload" --qos 1 || exit 1
     done < "$tmp"
     rm -f "$f" "$tmp"
   done

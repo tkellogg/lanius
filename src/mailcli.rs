@@ -1,10 +1,10 @@
-//! `elanus code mail --json` — the human-facing projection of agent-to-agent
+//! `lanius code mail --json` — the human-facing projection of agent-to-agent
 //! message traffic (docs/handoffs/agent-comms-ui.md M1). The CLI IS the API: the
-//! web server shells it exactly like `elanus code sessions --json`, so the comms
+//! web server shells it exactly like `lanius code sessions --json`, so the comms
 //! surface needs no new transport.
 //!
 //! This is a PURE LEDGER QUERY — no new bus capture. Agent-to-agent deliveries
-//! are already `in/agent/<noun>/<session>` events on `elanus.db` carrying
+//! are already `in/agent/<noun>/<session>` events on `lanius.db` carrying
 //! `sender`, `priority`, `state`, and a `correlation_id` (`record_delivery`,
 //! src/codeagent.rs). A worker's completion/failure reply rides the SAME
 //! correlation (failure-mail is `{failed:true}` on `in/human/<owner>`, see
@@ -372,7 +372,7 @@ fn room_claims(conn: &rusqlite::Connection, room: &str) -> Result<Vec<RoomClaim>
     Ok(rows)
 }
 
-/// `elanus code rooms [--json] [--recent N]`: print the coordination rooms.
+/// `lanius code rooms [--json] [--recent N]`: print the coordination rooms.
 pub fn rooms_cmd(root: &Root, rest: &[String]) -> Result<()> {
     let want_json = rest.iter().any(|a| a == "--json");
     let recent_n = parse_named(rest, "--recent").unwrap_or(5);
@@ -533,13 +533,13 @@ pub fn session_blocks(root: &Root, session: &str) -> Result<Vec<BlockRow>> {
     Ok(out)
 }
 
-/// `elanus code blocks --session <id> [--json]`: print a session's blocks
+/// `lanius code blocks --session <id> [--json]`: print a session's blocks
 /// (durable + recomputed-ephemeral). Backs the web /api/blocks route.
 pub fn blocks_cmd(root: &Root, rest: &[String]) -> Result<()> {
     let want_json = rest.iter().any(|a| a == "--json");
     let session = parse_str(rest, "--session").unwrap_or_default();
     if session.is_empty() {
-        anyhow::bail!("usage: elanus code blocks --session <code-id> [--json]");
+        anyhow::bail!("usage: lanius code blocks --session <code-id> [--json]");
     }
     let rows = session_blocks(root, &session)?;
     if want_json {
@@ -563,7 +563,7 @@ fn parse_str(rest: &[String], flag: &str) -> Option<String> {
     rest.get(i + 1).cloned().filter(|s| !s.is_empty())
 }
 
-/// `elanus code mail [--json] [--limit N]`: print the recent agent-to-agent mail.
+/// `lanius code mail [--json] [--limit N]`: print the recent agent-to-agent mail.
 pub fn mail_cmd(root: &Root, rest: &[String]) -> Result<()> {
     let want_json = rest.iter().any(|a| a == "--json");
     let limit = parse_limit(rest).unwrap_or(200);
@@ -620,7 +620,7 @@ mod tests {
 
     fn temp_root(tag: &str) -> Root {
         let dir = std::env::temp_dir().join(format!(
-            "elanus-mailcli-{tag}-{}-{:?}",
+            "lanius-mailcli-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

@@ -1,7 +1,7 @@
 # architect — the strong-model identity escalations target (core kit).
 # Copied only if profiles/architect/ didn't already exist; edit freely,
 # especially the model line. Dispatch to it:
-#   elanus emit in/agent/architect --payload '{"prompt":"...","profile":"architect"}'
+#   lanius emit in/agent/architect --payload '{"prompt":"...","profile":"architect"}'
 
 agent = "architect"
 owner = "owner"

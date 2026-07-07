@@ -1,7 +1,7 @@
 ---
 name: debug
 description: >-
-  Runbook for diagnosing common elanus RUNTIME / operational failures — broker &
+  Runbook for diagnosing common lanius RUNTIME / operational failures — broker &
   bus errors ("CONNECT refused", "bad credential"), stray/orphaned processes,
   ports stuck in use, the daemon not dispatching, the web UI not loading. Use when
   something is failing at runtime (not a compile error or a logic bug) and you want
@@ -10,21 +10,21 @@ description: >-
   symptom to an entry, follow it.
 ---
 
-# debug — elanus operational runbooks
+# debug — lanius operational runbooks
 
-When elanus misbehaves at runtime, match what you SEE to a runbook entry below and
+When lanius misbehaves at runtime, match what you SEE to a runbook entry below and
 follow it. Each entry is self-contained: **Symptom → What it means → Diagnose →
 Fix → Prevent.** These are for *operational* failures (processes, the bus, the
 daemon, credentials) — not compile errors or code logic.
 
 ## The one diagnostic you'll run first, almost every time
 Separate the **legit stack** from **strays**. The healthy stack is three nested
-processes under the *real* root (default `~/.elanus/root`):
+processes under the *real* root (default `~/.lanius/root`):
 
 ```
-elanus serve                                   # the supervisor
-└─ elanus -C ~/.elanus/root daemon …           # the broker + dispatcher
-└─ elanus -C ~/.elanus/root web --port 7180    # the web server (+ package handlers)
+lanius serve                                   # the supervisor
+└─ lanius -C ~/.lanius/root daemon …           # the broker + dispatcher
+└─ lanius -C ~/.lanius/root web --port 7180    # the web server (+ package handlers)
 ```
 
 List everything and split it by root:
@@ -39,10 +39,10 @@ real stack. Most runtime weirdness traces back to strays.
 - [broker-credential-refused.md](broker-credential-refused.md) — the broker log
   repeats `[bus] CONNECT refused: bad credential for identity "<name>"`. Usually a
   stray client authenticating against the wrong root — NOT a broken broker.
-- [stray-workflow-processes.md](stray-workflow-processes.md) — orphaned `elanus`
+- [stray-workflow-processes.md](stray-workflow-processes.md) — orphaned `lanius`
   web/daemon/handler processes from workflow runs piling up: bus noise, ports held,
   CPU. How to enumerate and reap them safely (and why `pkill` may be refused).
-- [daemon-stack-health.md](daemon-stack-health.md) — "is elanus even up?" Deliveries
+- [daemon-stack-health.md](daemon-stack-health.md) — "is lanius even up?" Deliveries
   stuck, agents not dispatching, the UI not loading. Confirm the serve→daemon→web
   stack and the broker port.
 

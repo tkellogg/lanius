@@ -1,4 +1,4 @@
-// Walkthrough: screenshots of every view into /tmp/elanus-ui-shots/.
+// Walkthrough: screenshots of every view into /tmp/lanius-ui-shots/.
 // Same stack pattern as smoke.mjs / ui.spec.mjs. Human reviews the shots;
 // taste problems are caught by looking, not asserting.
 import { execFileSync, spawn } from 'node:child_process';
@@ -9,13 +9,13 @@ import { chromium } from 'playwright';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const BIN = path.join(REPO, 'target/debug');
-const TMP = fs.mkdtempSync('/tmp/elanus-ui-walk.');
+const TMP = fs.mkdtempSync('/tmp/lanius-ui-walk.');
 // Offset by 5000 from smoke, 2000 from spec, to avoid collisions.
 const BUS_PORT = 23000 + (process.pid % 2000);
 const WEB_PORT = 9800 + (process.pid % 500);
 const BASE = `http://127.0.0.1:${WEB_PORT}`;
-const ENV = { ...process.env, ELANUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
-const SHOTS = '/tmp/elanus-ui-shots';
+const ENV = { ...process.env, LANIUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
+const SHOTS = '/tmp/lanius-ui-shots';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(fn, timeoutMs = 15000) {
@@ -26,7 +26,7 @@ async function waitFor(fn, timeoutMs = 15000) {
   }
   return false;
 }
-const elanus = (...a) => execFileSync(path.join(BIN, 'elanus'), a, { env: ENV, encoding: 'utf8' });
+const lanius = (...a) => execFileSync(path.join(BIN, 'lanius'), a, { env: ENV, encoding: 'utf8' });
 
 // Clear and recreate the shots directory.
 fs.rmSync(SHOTS, { recursive: true, force: true });
@@ -41,10 +41,10 @@ async function shot(page, name) {
 }
 
 // -- stack setup --
-elanus('init');
+lanius('init');
 fs.writeFileSync(path.join(TMP, 'bus.toml'), `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\n`);
-const daemon = spawn(path.join(BIN, 'elanus'), ['daemon', '--interval-ms', '200'], { env: ENV, stdio: 'ignore' });
-const server = spawn(path.join(BIN, 'elanus'), ['web', '--port', String(WEB_PORT)], {
+const daemon = spawn(path.join(BIN, 'lanius'), ['daemon', '--interval-ms', '200'], { env: ENV, stdio: 'ignore' });
+const server = spawn(path.join(BIN, 'lanius'), ['web', '--port', String(WEB_PORT)], {
   env: ENV, stdio: ['ignore', 'pipe', 'inherit'],
 });
 await waitFor(async () => { try { return (await fetch(`${BASE}/`)).ok; } catch { return false; } }, 20000);
@@ -166,7 +166,7 @@ const ctx = await browser.newContext({ baseURL: BASE, viewport: { width: 1280, h
   // A harness-emitted failure threads into the conversation as an explicit
   // error bubble — the realistic out-of-box state (agent can't reach a model).
   const corr = await page.$eval('#conv-holder .msg.you', (el) => (el.title || '').replace('correlation ', '')).catch(() => 'wt-fail');
-  elanus('emit', 'in/human/owner', '--correlation', corr || 'wt-fail', '--payload',
+  lanius('emit', 'in/human/owner', '--correlation', corr || 'wt-fail', '--payload',
     JSON.stringify({ failed: true, error: 'llm call failed (model claude-…): connection refused', agent: 'main' }));
   await sleep(1200);
   await shot(page, '10b-converse-failure');
@@ -192,8 +192,8 @@ const ctx = await browser.newContext({ baseURL: BASE, viewport: { width: 1280, h
   const page = await ctx.newPage();
   await page.goto('/');
   // Emit a few bus messages so the rail has something to show.
-  try { elanus('bus', 'pub', 'obs/agent/kestrel/s1/think', '{"step":"plan"}'); } catch {}
-  try { elanus('bus', 'pub', 'in/agent/kestrel', '{"prompt":"walk"}'); } catch {}
+  try { lanius('bus', 'pub', 'obs/agent/kestrel/s1/think', '{"step":"plan"}'); } catch {}
+  try { lanius('bus', 'pub', 'in/agent/kestrel', '{"prompt":"walk"}'); } catch {}
   await page.waitForSelector('#nav-agents .nav-item');
   const firstBtn = await page.$('#nav-agents .nav-item');
   if (firstBtn) await firstBtn.click();

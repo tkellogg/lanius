@@ -1,4 +1,4 @@
-//! `elanus config` — read/write PACKAGE configuration (docs/config.md). The CLI
+//! `lanius config` — read/write PACKAGE configuration (docs/config.md). The CLI
 //! is the API: a human-direct `config set` writes the file, commits it on the
 //! `live` branch of `<root>/config`, and records a ledger acceptance event whose
 //! sender is the current identity (the trustworthy "who accepted this").
@@ -18,7 +18,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-/// `elanus config set <pkg> <key> <value>`: write + commit on `live` + ledger event.
+/// `lanius config set <pkg> <key> <value>`: write + commit on `live` + ledger event.
 pub fn set(
     root: &Root,
     conn: &Connection,
@@ -61,7 +61,7 @@ pub fn set(
     Ok(())
 }
 
-/// `elanus config get <pkg> <key>`: print one value (a TOML fragment).
+/// `lanius config get <pkg> <key>`: print one value (a TOML fragment).
 pub fn get(root: &Root, pkg: &str, key: &str) -> Result<()> {
     match config_repo::get_key(root, pkg, key)? {
         Some(v) => println!("{v}"),
@@ -70,7 +70,7 @@ pub fn get(root: &Root, pkg: &str, key: &str) -> Result<()> {
     Ok(())
 }
 
-/// `elanus config list [pkg]`: the raw config TOML for one package, or one JSON
+/// `lanius config list [pkg]`: the raw config TOML for one package, or one JSON
 /// line per package that has config. JSON so the web UI can consume it directly.
 pub fn list(root: &Root, pkg: Option<&str>) -> Result<()> {
     match pkg {
@@ -87,7 +87,7 @@ pub fn list(root: &Root, pkg: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `elanus config proposals`: pending agent proposals, one JSON line each.
+/// `lanius config proposals`: pending agent proposals, one JSON line each.
 /// Git holds the pending refs (the diff); the ledger holds who/what (provenance,
 /// docs/config.md "two records, composed not duplicated") — joined here on the id.
 pub fn proposals(root: &Root, conn: &Connection) -> Result<()> {
@@ -108,13 +108,13 @@ pub fn proposals(root: &Root, conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// `elanus config show <id>`: a proposal's diff vs live.
+/// `lanius config show <id>`: a proposal's diff vs live.
 pub fn show(root: &Root, id: &str) -> Result<()> {
     print!("{}", config_repo::proposal_diff(root, id)?);
     Ok(())
 }
 
-/// `elanus config accept <id>`: a human accepts a proposal — merge it into live
+/// `lanius config accept <id>`: a human accepts a proposal — merge it into live
 /// and record the acceptance on the ledger (decided_by = the owner identity).
 pub fn accept(root: &Root, conn: &Connection, id: &str, by: &str) -> Result<()> {
     let pkgs = config_repo::proposal_packages(root, id)?; // path-discipline up front
@@ -138,7 +138,7 @@ pub fn accept(root: &Root, conn: &Connection, id: &str, by: &str) -> Result<()> 
     Ok(())
 }
 
-/// `elanus config decline <id>`: drop a proposal without applying it.
+/// `lanius config decline <id>`: drop a proposal without applying it.
 pub fn decline(root: &Root, conn: &Connection, id: &str, by: &str) -> Result<()> {
     config_repo::decline_proposal(root, id)?;
     let _ = events::emit(

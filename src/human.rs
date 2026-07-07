@@ -45,7 +45,7 @@ pub fn inbox(root: &Root, conn: &Connection) -> Result<()> {
             println!("      deadline: {d} -> default: {def}");
         }
         println!("      asked: {created_at}  root cause: {root_type}");
-        println!("      answer with: elanus answer {id} \"...\"");
+        println!("      answer with: lanius answer {id} \"...\"");
     }
     Ok(())
 }

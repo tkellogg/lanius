@@ -15,7 +15,7 @@
 //!
 //! This module is the pure core: the `Estimate` shape, the pricing map, the
 //! actuals/variance computation over a projection `Connection`, and the retro
-//! text. The CLI glue (`elanus estimate set/actual/retro`) lives in
+//! text. The CLI glue (`lanius estimate set/actual/retro`) lives in
 //! `src/estimatecli.rs`; the hook wiring lives in `src/codeagent.rs`. Nothing
 //! here touches a kernel table that estimation owns — it only reads the obs
 //! projection and writes blocks through `context_store`.

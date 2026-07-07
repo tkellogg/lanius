@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use elanus::{
+use lanius::{
     agentcli, blockcli, buscli, code_projection, codeagent, configcli, context, db, dev, discover,
     dispatcher, dotenv, envcompat, estimatecli, events, exec, human, initcmd, kbcli, kit, mailcli,
     manifest, models, packages, paths, profile, profilecli, providercli, render, secrets, trace,
@@ -41,19 +41,20 @@ fn leading_comment_summary(raw: &str) -> String {
 }
 
 fn package_manifest_description(dir: &std::path::Path) -> String {
-    std::fs::read_to_string(dir.join("elanus.toml"))
+    std::fs::read_to_string(dir.join("lanius.toml"))
+        .or_else(|_| std::fs::read_to_string(dir.join("elanus.toml")))
         .map(|raw| leading_comment_summary(&raw))
         .unwrap_or_default()
 }
 
 #[derive(Parser)]
 #[command(
-    name = "elanus",
+    name = "lanius",
     version,
-    about = "elanus: a minimal event-driven agent harness"
+    about = "lanius: a minimal event-driven agent harness"
 )]
 struct Cli {
-    /// Elanus root (default: $ELANUS_ROOT, else ~/.elanus/root)
+    /// Lanius root (default: $LANIUS_ROOT, else ~/.lanius/root)
     #[arg(short = 'C', long, global = true)]
     root: Option<PathBuf>,
     #[command(subcommand)]
@@ -62,13 +63,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Scaffold a harness root (db, trace log, default profile, stock skills)
+    /// Scaffold a lanius root (db, trace log, default profile, stock skills)
     Init {
         dir: Option<PathBuf>,
         /// Kit(s) to install: packages linked (or --copy vendored) + granted,
         /// profiles copied if missing, README printed. A value containing '/'
         /// is a path; a bare name resolves against <root>/kits (seeded with
-        /// the stock kits), ~/.elanus/kits, $ELANUS_KIT_PATH, then the repo
+        /// the stock kits), ~/.lanius/kits, $LANIUS_KIT_PATH, then the repo
         /// kits/ (dev builds). Repeatable.
         #[arg(long)]
         kit: Vec<String>,
@@ -184,9 +185,9 @@ enum Cmd {
         shift_ports: bool,
     },
     /// Run the packaged stack: the daemon (this binary) + the web server (also
-    /// this binary, `elanus web`), supervised. The prod counterpart of `dev` —
+    /// this binary, `lanius web`), supervised. The prod counterpart of `dev` —
     /// no cargo, no `--watch`, no Vite, no Node: the SPA is embedded in the binary
-    /// (src/web.rs `include_dir!`), so an installed `cargo install elanus` works
+    /// (src/web.rs `include_dir!`), so an installed `cargo install lanius` works
     /// off any host with no checkout.
     Serve {
         /// Dispatcher poll interval for the daemon child.
@@ -196,7 +197,7 @@ enum Cmd {
         #[arg(long, default_value_t = 7180)]
         web_port: u16,
         /// Ignored — the SPA is embedded in the binary (nothing to npm-build at
-        /// serve time). Kept for flag compatibility; use `elanus dev` for the
+        /// serve time). Kept for flag compatibility; use `lanius dev` for the
         /// Vite hot-reload loop.
         #[arg(long)]
         rebuild: bool,
@@ -331,13 +332,13 @@ enum Cmd {
     },
     /// Launch and observe an external coding agent.
     ///
-    /// `elanus code <tool> [args...]` launches the real coding agent in this
+    /// `lanius code <tool> [args...]` launches the real coding agent in this
     /// directory, observed on the bus (`tool` selects the adapter — `claude` or
     /// `codex`; everything after it is passed through unchanged). Reserved first
     /// words: `hook` is the internal hook bridge the generated hooks invoke
-    /// (`elanus code hook <Event>`). (To re-attach to a session interactively, just
+    /// (`lanius code hook <Event>`). (To re-attach to a session interactively, just
     /// relaunch its tool with the tool's own resume flag passed through, e.g.
-    /// `elanus code claude --resume <native_session>`; there is no `resume` verb.)
+    /// `lanius code claude --resume <native_session>`; there is no `resume` verb.)
     /// `deliver <worker-session> "<message>"` (run from inside a session) dispatches
     /// work to a worker and records the running session as the requester (M4-B);
     /// `spawn <tool> "<task>"` (run from inside a session) starts a worker
@@ -346,7 +347,7 @@ enum Cmd {
     /// construction); `note <session> "<text>"` leaves a per-session memory note (M3).
     #[command(disable_help_flag = true)]
     Code {
-        /// Arguments passed straight through to the tool, or an `elanus code` verb.
+        /// Arguments passed straight through to the tool, or an `lanius code` verb.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -359,7 +360,7 @@ enum ProfileCmd {
     /// One profile: parsed summary + raw TOML, as JSON
     Get { name: String },
     /// Set dotted keys, comments preserved, validated before writing:
-    /// elanus profile set default agent=kestrel model.max_turns=12
+    /// lanius profile set default agent=kestrel model.max_turns=12
     Set {
         name: String,
         /// key=value pairs; values parse as TOML when they can
@@ -391,7 +392,7 @@ enum ProfileCmd {
 
 #[derive(Subcommand)]
 enum ConfigCmd {
-    /// Set one key for a package: elanus config set watcher accounts '["a","b"]'
+    /// Set one key for a package: lanius config set watcher accounts '["a","b"]'
     /// (creates the package's config if absent; value parses as TOML when it can)
     Set {
         /// package name
@@ -426,7 +427,7 @@ enum ConfigCmd {
 /// `run` works for any profile. Both carry launch-time overrides: `--with-package`
 /// widens the run's visible packages (approved packages only — visibility, not
 /// authority) and `--provider` pins the model provider for the run. Native agents
-/// launch peers with the `launch_agent` tool; coding workers use `elanus code`.
+/// launch peers with the `launch_agent` tool; coding workers use `lanius code`.
 #[derive(Subcommand)]
 enum AgentCmd {
     /// Inventory launchable things: native profiles + their packages, coding tools, providers (--json for a machine-readable pick)
@@ -446,7 +447,7 @@ enum AgentCmd {
         /// Widen this run's visible packages: an approved package name (repeatable). Already-visible packages are a no-op; an un-granted package is refused. Visibility only — bus authority stays gated by grants.
         #[arg(long = "with-package")]
         with_packages: Vec<String>,
-        /// Override the profile's model provider for this run (a name from `elanus provider list`).
+        /// Override the profile's model provider for this run (a name from `lanius provider list`).
         #[arg(long)]
         provider: Option<String>,
         /// Prompt text, or '-' to read stdin through exec.
@@ -466,7 +467,7 @@ enum AgentCmd {
         /// Widen this run's visible packages: an approved package name (repeatable). Un-granted packages are refused. Visibility only, for this run — the profile.toml is untouched.
         #[arg(long = "with-package")]
         with_packages: Vec<String>,
-        /// Override the profile's model provider for this run (a name from `elanus provider list`).
+        /// Override the profile's model provider for this run (a name from `lanius provider list`).
         #[arg(long)]
         provider: Option<String>,
         /// Prompt text.
@@ -524,7 +525,7 @@ enum ProviderCmd {
     Rm { name: String },
 }
 
-/// Block-addressing flags shared by every `elanus block` verb (clap flattens
+/// Block-addressing flags shared by every `lanius block` verb (clap flattens
 /// them into each subcommand).
 #[derive(clap::Args)]
 struct BlockArgs {
@@ -583,7 +584,7 @@ impl BlockArgs {
 
 #[derive(Subcommand)]
 enum BlockCmd {
-    /// Set (upsert) a block: elanus block set identity "I am Lily."
+    /// Set (upsert) a block: lanius block set identity "I am Lily."
     Set {
         name: String,
         content: String,
@@ -627,7 +628,7 @@ enum KbCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Search the knowledge base index: elanus kb search <query>
+    /// Search the knowledge base index: lanius kb search <query>
     Search {
         /// The query — plain words, e.g. "who verifies".
         query: Vec<String>,
@@ -638,7 +639,7 @@ enum KbCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Write a file into a KB's kb/ tree and commit it: elanus kb write <pkg> <path>
+    /// Write a file into a KB's kb/ tree and commit it: lanius kb write <pkg> <path>
     Write {
         /// The package that owns the KB (must be on the path).
         pkg: String,
@@ -686,7 +687,7 @@ struct EstimateArgs {
     #[arg(long, default_value = "render-preview")]
     session: String,
     /// Override the owner identity (the agent noun). Defaults to the profile's
-    /// agent noun — a self-attested label, like `elanus block --owner`.
+    /// agent noun — a self-attested label, like `lanius block --owner`.
     #[arg(long)]
     owner: Option<String>,
     /// Override the pricing.toml path (model id -> $/token). Defaults to the
@@ -766,14 +767,14 @@ enum KitCmd {
     /// (or --copy vendored), profiles copied if missing, packages granted
     /// with provenance kit:<name>, README printed
     Add {
-        /// Kit name (resolved via <root>/kits, ~/.elanus/kits,
-        /// $ELANUS_KIT_PATH, <repo>/kits) or a path
+        /// Kit name (resolved via <root>/kits, ~/.lanius/kits,
+        /// $LANIUS_KIT_PATH, <repo>/kits) or a path
         kit: String,
         /// Vendor packages into the root's packages/ instead of linking
         #[arg(long)]
         copy: bool,
         /// STAGE only: files land and requests register, but every grant
-        /// stays pending — commit with `elanus approve <package>` (the
+        /// stays pending — commit with `lanius approve <package>` (the
         /// web UI / agent-staging path)
         #[arg(long)]
         pending: bool,
@@ -848,7 +849,7 @@ enum BusCmd {
 }
 
 fn main() {
-    // Die quietly on EPIPE like a normal Unix tool (`elanus inbox | grep -q`).
+    // Die quietly on EPIPE like a normal Unix tool (`lanius inbox | grep -q`).
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -870,7 +871,7 @@ fn run(cli: Cli) -> Result<()> {
             copy,
         } => {
             // Same resolution order as every other command: explicit arg >
-            // $ELANUS_ROOT (or legacy $HARNESS_ROOT) > ~/.elanus/root. Init once
+            // $LANIUS_ROOT (or legacy $HARNESS_ROOT) > ~/.lanius/root. Init once
             // targeted cwd while the env var pointed elsewhere, littering
             // template roots into repos and test directories.
             let dir = match dir
@@ -895,9 +896,9 @@ fn run(cli: Cli) -> Result<()> {
             vite_port,
             shift_ports,
         } => {
-            // dev resolves its OWN isolated, repo-local root (target/elanus-dev) —
+            // dev resolves its OWN isolated, repo-local root (target/lanius-dev) —
             // it deliberately ignores the global root so it can never run against
-            // ~/.elanus/root and collide with `serve`/coding sessions. See dev::run.
+            // ~/.lanius/root and collide with `serve`/coding sessions. See dev::run.
             dev::run(interval_ms, web_port, vite_port, shift_ports)?
         }
         Cmd::Serve {
@@ -906,12 +907,12 @@ fn run(cli: Cli) -> Result<()> {
             rebuild,
         } => dev::serve(&root, interval_ms, web_port, rebuild)?,
         Cmd::Web { port, agent } => {
-            // server.mjs parity: ELANUS_WEB_PORT overrides the default when no
+            // server.mjs parity: LANIUS_WEB_PORT overrides the default when no
             // explicit --port is on the command line. clap can't tell a default
             // from an explicit equal value, so honor the env var only when --port
             // is left at the default; supervisors (serve/dev) pass --port anyway.
             let port = if port == 7180 {
-                std::env::var("ELANUS_WEB_PORT")
+                std::env::var("LANIUS_WEB_PORT")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(port)
@@ -970,7 +971,7 @@ fn run(cli: Cli) -> Result<()> {
             // agent's mailbox, reusing M2's row shape. The wake carries no
             // conversation session — a CLI-initiated reminder isn't threaded to
             // a chat, so the send that closes the loop lands on the mailbox.
-            let emit_type = elanus::topic::agent_mailbox(&agent);
+            let emit_type = lanius::topic::agent_mailbox(&agent);
             let payload = serde_json::json!({ "prompt": message, "session": Value::Null });
             conn.execute(
                 "INSERT INTO scheduled_events(fire_at, emit_type, payload, created_by, fired)
@@ -979,7 +980,7 @@ fn run(cli: Cli) -> Result<()> {
             )?;
             println!(
                 "scheduled {} to wake at {fire_at}",
-                elanus::topic::agent_mailbox(&agent)
+                lanius::topic::agent_mailbox(&agent)
             );
         }
         Cmd::Trace { kind, payload } => {
@@ -1555,8 +1556,8 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Cmd::Code { args } => {
-            // M2 (model-providers): pull the elanus-level `--provider <name>` that
-            // sits BEFORE the tool token (`elanus code --provider deepseek claude …`)
+            // M2 (model-providers): pull the lanius-level `--provider <name>` that
+            // sits BEFORE the tool token (`lanius code --provider deepseek claude …`)
             // so it never collides with forwarded tool args. Absent ⇒ argv unchanged
             // (byte-identical to today). Consumed by launch/spawn; ignored by the
             // other code verbs.
@@ -1565,8 +1566,8 @@ fn run(cli: Cli) -> Result<()> {
             let tool = args.first().map(String::as_str).unwrap_or("");
             let rest = args.get(1..).unwrap_or(&[]);
             // Reserved first words: `hook` is the internal hook bridge
-            // (`elanus code hook <Event>`); `resume` continues a recorded session
-            // (`elanus code resume <elanus_session> "<message>"`). Any other first
+            // (`lanius code hook <Event>`); `resume` continues a recorded session
+            // (`lanius code resume <elanus_session> "<message>"`). Any other first
             // word is a coding-tool adapter to launch.
             match tool {
                 "" | "help" | "-h" | "--help" => {
@@ -1580,20 +1581,20 @@ fn run(cli: Cli) -> Result<()> {
                     codeagent::hook(&root, event)?;
                 }
                 "resume" => {
-                    // `resume` is NOT an elanus verb. Re-attaching interactively is
+                    // `resume` is NOT an lanius verb. Re-attaching interactively is
                     // a normal managed launch with the tool's own resume flag passed
                     // through; the daemon's async resume is the in-process
                     // `resume_capture` primitive, never a human command. Redirect a
-                    // muscle-memory `elanus code resume <id>` to the real form rather
+                    // muscle-memory `lanius code resume <id>` to the real form rather
                     // than silently treating "resume" as a tool name.
                     let session = rest.first().map(String::as_str).unwrap_or("");
                     let hint = codeagent::session_resume_hint(&root, session);
                     anyhow::bail!(
-                        "`elanus code resume` is not a command. To re-attach to a \
+                        "`lanius code resume` is not a command. To re-attach to a \
                          session, launch its tool with the tool's own resume flag, \
-                         e.g. `elanus code claude --resume <native_session>` (run in \
+                         e.g. `lanius code claude --resume <native_session>` (run in \
                          the session's workdir).{hint}\n\
-                         Find the exact command with `elanus code session <id>`."
+                         Find the exact command with `lanius code session <id>`."
                     );
                 }
                 "deliver" => {
@@ -1602,7 +1603,7 @@ fn run(cli: Cli) -> Result<()> {
                     // so the worker's completion routes back (M4-A).
                     let worker = rest.first().map(String::as_str).unwrap_or("");
                     if worker.is_empty() {
-                        anyhow::bail!("usage: elanus code deliver <worker-session> \"<message>\"");
+                        anyhow::bail!("usage: lanius code deliver <worker-session> \"<message>\"");
                     }
                     let message = rest.get(1..).unwrap_or(&[]).join(" ");
                     codeagent::deliver(&root, worker, &message)?;
@@ -1614,21 +1615,21 @@ fn run(cli: Cli) -> Result<()> {
                     // immediately so the planner can end its turn.
                     let worker_tool = rest.first().map(String::as_str).unwrap_or("");
                     if worker_tool.is_empty() {
-                        anyhow::bail!("usage: elanus code spawn <tool> \"<task>\"");
+                        anyhow::bail!("usage: lanius code spawn <tool> \"<task>\"");
                     }
                     let prompt = rest.get(1..).unwrap_or(&[]).join(" ");
                     codeagent::spawn(&root, worker_tool, &prompt, provider)?;
                 }
                 "inbox" => {
                     // A session pulls its OWN inbox (M3). Identity comes from the
-                    // env the launcher set (ELANUS_CODE_SESSION/AGENT) — never an
+                    // env the launcher set (LANIUS_CODE_SESSION/AGENT) — never an
                     // arg — so it can only ever read its own mailbox. Flags: --all
                     // (full inbox, non-destructive), --json (machine-readable).
                     codeagent::inbox_cmd(&root, rest)?;
                 }
                 "mail" => {
                     // The human-facing projection of agent-to-agent message
-                    // traffic (agent-comms-ui M1). `elanus code mail [--json]
+                    // traffic (agent-comms-ui M1). `lanius code mail [--json]
                     // [--limit N]`. A pure ledger read over `in/agent/%` events,
                     // threaded by correlation, failure-mail flagged. Backs the web
                     // /api/comms/mail route.
@@ -1636,7 +1637,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 "blocks" => {
                     // The human-facing memory-block inspector projection
-                    // (agent-comms-ui M4, read-only). `elanus code blocks
+                    // (agent-comms-ui M4, read-only). `lanius code blocks
                     // --session <code-id> [--json]`. Durable blocks (context_blocks,
                     // keyed by the session's agent noun) + recomputed ephemeral
                     // inbox/channel blocks (never stored). Backs /api/blocks.
@@ -1644,19 +1645,19 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 "rooms" => {
                     // The human-facing projection of coordination rooms
-                    // (agent-comms-ui M3). `elanus code rooms [--json] [--recent
+                    // (agent-comms-ui M3). `lanius code rooms [--json] [--recent
                     // N]`. Roster (liveness honest), claims, and recent channel
                     // traffic per room. Backs the web /api/comms/rooms route.
                     mailcli::rooms_cmd(&root, rest)?;
                 }
                 "note" => {
                     // Leave a per-session memory note (M3), surfaced by the per-turn
-                    // injection. `elanus code note <session> "<text>"`; empty text
+                    // injection. `lanius code note <session> "<text>"`; empty text
                     // clears it.
                     let session = rest.first().map(String::as_str).unwrap_or("");
                     if session.is_empty() {
                         anyhow::bail!(
-                            "usage: elanus code note <session> \"<text>\"  (empty text clears the note)"
+                            "usage: lanius code note <session> \"<text>\"  (empty text clears the note)"
                         );
                     }
                     let text = rest.get(1..).unwrap_or(&[]).join(" ");
@@ -1665,37 +1666,37 @@ fn run(cli: Cli) -> Result<()> {
                 "claim" => {
                     // Announce an advisory edit claim (M5). Run from inside a
                     // session; identity + room are env/record-derived, so it can
-                    // only claim as itself in its own room. `elanus code claim <path>`.
+                    // only claim as itself in its own room. `lanius code claim <path>`.
                     let path = rest.first().map(String::as_str).unwrap_or("");
                     if path.is_empty() {
-                        anyhow::bail!("usage: elanus code claim <path>");
+                        anyhow::bail!("usage: lanius code claim <path>");
                     }
                     codeagent::claim_cmd(&root, path)?;
                 }
                 "unclaim" => {
                     // Release this session's advisory claim on a path (M5).
-                    // `elanus code unclaim <path>`.
+                    // `lanius code unclaim <path>`.
                     let path = rest.first().map(String::as_str).unwrap_or("");
                     if path.is_empty() {
-                        anyhow::bail!("usage: elanus code unclaim <path>");
+                        anyhow::bail!("usage: lanius code unclaim <path>");
                     }
                     codeagent::unclaim_cmd(&root, path)?;
                 }
                 "claims" => {
                     // Show this session's room coordination view (own + peer
-                    // claims), M5. `elanus code claims [--json]`.
+                    // claims), M5. `lanius code claims [--json]`.
                     codeagent::claims_cmd(&root, rest)?;
                 }
                 "whose" => {
-                    // SI4 (sibling-intent): change attribution. `elanus code whose
-                    // <path>` or `elanus code whose --dirty [--json]` — map a path
+                    // SI4 (sibling-intent): change attribution. `lanius code whose
+                    // <path>` or `lanius code whose --dirty [--json]` — map a path
                     // (or the whole `git status` set) to its owning session, that
                     // session's tool, last-active, and current task. Backed by the
                     // `code_claims` projection (codesession::whose_path).
                     codeagent::whose_cmd(&root, rest)?;
                 }
                 "ask" => {
-                    // sibling-resolution: a blocking deliver-and-wait. `elanus code
+                    // sibling-resolution: a blocking deliver-and-wait. `lanius code
                     // ask <session> "<question>" [--timeout SECS] [--priority N]` —
                     // send a scoped question to a live sibling and block briefly for
                     // the correlated reply (or "no answer — treat as theirs"). Thin
@@ -1711,7 +1712,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 "sessions" => {
                     // Observability M2: list coding sessions from the projection.
-                    // `elanus code sessions [--json]`. Reads the derived sqlite
+                    // `lanius code sessions [--json]`. Reads the derived sqlite
                     // projection (code_projection); empty until the daemon (this
                     // build) has projected at least once.
                     let want_json = rest.iter().any(|a| a == "--json");
@@ -1752,8 +1753,8 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 "session" => {
                     // Observability M2: one session's detail (stats, timeline,
-                    // resume command, children). `elanus code session <id> [--json]`.
-                    // Thread-grouping (TG1): <id> may be any incarnation's elanus
+                    // resume command, children). `lanius code session <id> [--json]`.
+                    // Thread-grouping (TG1): <id> may be any incarnation's lanius
                     // id OR a native thread_key; the detail shows the UNIONED
                     // thread timeline across all incarnations by default. The
                     // richer per-incarnation web rendering (TG3 CodeSessions.tsx
@@ -1762,7 +1763,7 @@ fn run(cli: Cli) -> Result<()> {
                     // grouped threads unchanged.
                     let id = rest.first().map(String::as_str).unwrap_or("");
                     if id.is_empty() {
-                        anyhow::bail!("usage: elanus code session <id> [--json]");
+                        anyhow::bail!("usage: lanius code session <id> [--json]");
                     }
                     let want_json = rest.iter().any(|a| a == "--json");
                     match code_projection::session_detail(&root, id)? {

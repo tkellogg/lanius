@@ -1,6 +1,6 @@
 # webhook — send a message out (the egress template)
 
-`webhook` is the worked example of **egress** in elanus (docs/actors.md).
+`webhook` is the worked example of **egress** in lanius (docs/actors.md).
 Ingress — messages arriving — is event-shaped and comes *in* over the bus.
 Egress — sending one out — is command-shaped (a specific send, with a result),
 so it goes **direct**: the bridge calls the outside service itself. It is not
@@ -16,7 +16,7 @@ bus.
 
 webhook is a **daemon** (a long-running actor), not a per-event exec handler.
 That is what makes its receipt trustworthy: a daemon is spawned with its
-package token, so its `elanus bus pub` authenticates as `webhook` and the
+package token, so its `lanius bus pub` authenticates as `webhook` and the
 broker stamps the receipt `sender = webhook`. A per-event exec handler runs
 uncaged and tokenless, so it would authenticate as the *owner* and mislabel
 every send as owner-originated (docs/security.md entry 16). Any real egress
@@ -25,11 +25,11 @@ bridge should be a daemon for this reason.
 ## Use
 
 ```sh
-elanus emit in/package/webhook/send --correlation req-7 \
+lanius emit in/package/webhook/send --correlation req-7 \
   --payload '{"url":"https://example.com/hook","text":"hello"}'
 # -> POSTs {"text":"hello"} to the url directly, then publishes
 #    obs/channel/webhook/sent {ok, status, correlation:"req-7"}
-elanus bus sub obs/channel/webhook/sent --count 1   # watch the outcome
+lanius bus sub obs/channel/webhook/sent --count 1   # watch the outcome
 ```
 
 ## The shape to copy for a real channel
@@ -40,7 +40,7 @@ SMS, email):
 1. A **daemon** with its own identity (so its sends attribute to it).
 2. The request arrives addressed to the bridge's **inbox**
    (`in/package/<bridge>/send`) — there is no `out/` plane. Sending to another
-   elanus actor is just writing *its* inbox; sending to the outside is a direct
+   lanius actor is just writing *its* inbox; sending to the outside is a direct
    command that gets observed.
 3. **Delivery is direct** — replace the `urllib` POST with the service's API or
    SDK (and its credentials, which the bridge holds so no agent has to).

@@ -1,14 +1,14 @@
 //! End-to-end acceptance for the discovery arc (docs/handoffs/kb-discovery.md).
 //!
-//! Drives the built `elanus` binary against a real init'd root:
-//!   - M1: `elanus discover <query>` names an available-but-disabled package,
+//! Drives the built `lanius` binary against a real init'd root:
+//!   - M1: `lanius discover <query>` names an available-but-disabled package,
 //!     what enabling it would add, and the enable path; a capability already
 //!     visible to the caller is NOT re-surfaced; `--json` is machine-stable.
 //!   - M2: the stdlib `discovery` package's `find_capability` tool grant is
 //!     auto-approved into existence (the M0 "tool" grant gate), the tool script
-//!     is a thin wrapper over `elanus discover --json` that reshapes the report,
+//!     is a thin wrapper over `lanius discover --json` that reshapes the report,
 //!     and the seeded high-awareness block teaches the tool on the default
-//!     profile (`elanus render`).
+//!     profile (`lanius render`).
 //!   - M3: the enable guidance rides the existing config-proposal flow — no new
 //!     enable mechanism is invented (asserted on the guidance text; the proposal
 //!     machinery itself is exercised by the config-repo tests).
@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 struct Fixture {
-    elanus: PathBuf,
+    lanius: PathBuf,
     root: PathBuf,
     work: PathBuf,
 }
@@ -29,28 +29,28 @@ impl Fixture {
     fn setup() -> Result<Fixture> {
         let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let build = Command::new("cargo")
-            .args(["build", "--bin", "elanus"])
+            .args(["build", "--bin", "lanius"])
             .current_dir(&repo)
             .output()
-            .context("cargo build --bin elanus")?;
+            .context("cargo build --bin lanius")?;
         assert!(
             build.status.success(),
             "cargo build failed\n{}",
             String::from_utf8_lossy(&build.stderr)
         );
-        let elanus = target_debug_dir()?.join(format!("elanus{}", std::env::consts::EXE_SUFFIX));
+        let lanius = target_debug_dir()?.join(format!("lanius{}", std::env::consts::EXE_SUFFIX));
 
-        let root = unique_temp_dir("elanus-disc-root")?;
-        let work = unique_temp_dir("elanus-disc-work")?;
-        let init = Command::new(&elanus)
+        let root = unique_temp_dir("lanius-disc-root")?;
+        let work = unique_temp_dir("lanius-disc-work")?;
+        let init = Command::new(&lanius)
             .arg("init")
-            .env("ELANUS_ROOT", &root)
+            .env("LANIUS_ROOT", &root)
             .current_dir(&work)
             .output()
-            .context("elanus init")?;
+            .context("lanius init")?;
         assert!(
             init.status.success(),
-            "elanus init failed\n{}",
+            "lanius init failed\n{}",
             String::from_utf8_lossy(&init.stderr)
         );
 
@@ -60,7 +60,7 @@ impl Fixture {
         std::fs::create_dir_all(d.join("kb"))?;
         std::fs::create_dir_all(d.join("scripts"))?;
         std::fs::write(
-            d.join("elanus.toml"),
+            d.join("lanius.toml"),
             "[kb]\ntitle = \"Discord API notes\"\n\n\
              [[tool]]\nname = \"send_discord\"\ndescription = \"post to a channel\"\nrun = \"scripts/send\"\n",
         )?;
@@ -84,16 +84,16 @@ impl Fixture {
              [model]\nmodel = \"claude-sonnet-4-6\"\n\n[skills]\ninclude = [\"#\"]\n",
         )?;
 
-        Ok(Fixture { elanus, root, work })
+        Ok(Fixture { lanius, root, work })
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {
-        Command::new(&self.elanus)
+        Command::new(&self.lanius)
             .args(args)
-            .env("ELANUS_ROOT", &self.root)
+            .env("LANIUS_ROOT", &self.root)
             .current_dir(&self.work)
             .output()
-            .expect("running elanus")
+            .expect("running lanius")
     }
 }
 
@@ -196,9 +196,9 @@ fn m2_find_capability_tool_is_approved_taught_and_wraps_the_cli() -> Result<()> 
         "the default profile's rendered context teaches find_capability: {ctx}"
     );
 
-    // The tool script is a thin wrapper: stdin {query} → `elanus discover --json`
+    // The tool script is a thin wrapper: stdin {query} → `lanius discover --json`
     // (as the calling profile) → reshaped {query, found:[...]}. Drive it the way
-    // the [[tool]] seam dispatches (args JSON on stdin, ELANUS_PROFILE in env).
+    // the [[tool]] seam dispatches (args JSON on stdin, LANIUS_PROFILE in env).
     let find = fx.root.join("kits/stdlib/packages/discovery/scripts/find");
     assert!(
         find.exists(),
@@ -207,8 +207,8 @@ fn m2_find_capability_tool_is_approved_taught_and_wraps_the_cli() -> Result<()> 
     );
     let mut child = Command::new("python3")
         .arg(&find)
-        .env("ELANUS_ROOT", &fx.root)
-        .env("ELANUS_PROFILE", "worker")
+        .env("LANIUS_ROOT", &fx.root)
+        .env("LANIUS_PROFILE", "worker")
         .env(
             "PATH",
             format!(

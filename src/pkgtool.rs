@@ -32,11 +32,11 @@ pub struct PkgTool {
     pub description: String,
     pub schema: Value,
     pub script: PathBuf,
-    /// The package's state dir (`<root>/run/pkg-<name>`) — the same ELANUS_SCRATCH
+    /// The package's state dir (`<root>/run/pkg-<name>`) — the same LANIUS_SCRATCH
     /// the daemon side gets, so a tool script reads what its own daemon indexed.
     pub scratch: PathBuf,
     pub timeout_ms: u64,
-    /// The calling agent's profile name, exported as `ELANUS_PROFILE` on dispatch.
+    /// The calling agent's profile name, exported as `LANIUS_PROFILE` on dispatch.
     /// A per-agent tool (e.g. discovery's `find_capability`, which scans the
     /// package universe MINUS this profile's visible set) needs to know whose
     /// visibility set to subtract; without it, the tool would fall back to the
@@ -150,10 +150,10 @@ fn dispatch(root: &Root, t: &PkgTool, args: &Value) -> Result<String> {
         .stderr(Stdio::inherit())
         .env_dual("ROOT", &root.dir)
         .env_dual("DB", root.db())
-        .env("ELANUS_PACKAGE", &t.package)
-        .env("ELANUS_TOOL", &t.name)
-        .env("ELANUS_PROFILE", &t.profile)
-        .env("ELANUS_SCRATCH", &t.scratch)
+        .env_dual("PACKAGE", &t.package)
+        .env_dual("TOOL", &t.name)
+        .env_dual("PROFILE", &t.profile)
+        .env_dual("SCRATCH", &t.scratch)
         .spawn()
         .with_context(|| format!("spawning {}", t.script.display()))?;
     let mut stdin = child.stdin.take().unwrap();
@@ -225,6 +225,19 @@ mod tests {
     }
 
     #[test]
+    fn package_script_sees_canonical_and_legacy_envs() {
+        let root = scratch("legacy-env");
+        let t = tool(
+            &root,
+            "#!/bin/sh\nprintf '%s|%s|%s|%s' \"$LANIUS_PACKAGE\" \"$ELANUS_PACKAGE\" \"$LANIUS_PROFILE\" \"$ELANUS_PROFILE\"\n",
+            5_000,
+        );
+        let out = dispatch(&root, &t, &json!({})).unwrap();
+        assert_eq!(out, "eng|eng|default|default");
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
     fn dispatch_round_trips_args_to_stdin_and_stdout_to_result() {
         // The [[stage]] contract: args JSON on stdin, stdout JSON as the result.
         let root = scratch("roundtrip");
@@ -283,7 +296,7 @@ mod tests {
         let d = root.dir.join("packages/echoer");
         std::fs::create_dir_all(d.join("scripts")).unwrap();
         std::fs::write(
-            d.join("elanus.toml"),
+            d.join("lanius.toml"),
             "[[tool]]\nname = \"echo_args\"\ndescription = \"echo the args back\"\nrun = \"scripts/echo\"\n\n\
              [tool.schema]\ntype = \"object\"\n\n[tool.schema.properties.x]\ntype = \"string\"\n",
         )
@@ -333,7 +346,7 @@ mod tests {
         let d = root.dir.join("packages").join(name);
         std::fs::create_dir_all(d.join("scripts")).unwrap();
         std::fs::write(
-            d.join("elanus.toml"),
+            d.join("lanius.toml"),
             "[[tool]]\nname = \"search_knowledge\"\ndescription = \"search\"\n\
              run = \"scripts/search\"\n\n[tool.schema]\ntype = \"object\"\n\
              required = [\"query\"]\n\n[tool.schema.properties.query]\ntype = \"string\"\n",

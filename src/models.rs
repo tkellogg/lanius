@@ -1,4 +1,4 @@
-//! `elanus models` — ask the configured provider what models it serves
+//! `lanius models` — ask the configured provider what models it serves
 //! (Anthropic-compatible GET /v1/models). Resolution mirrors
 //! exec::build_client: profile base_url > ANTHROPIC_BASE_URL > the real
 //! Anthropic API; key from profile.api_key_env > ANTHROPIC_API_KEY. A
@@ -46,8 +46,8 @@ pub fn list(root: &Root, profile_name: &str, json: bool) -> Result<()> {
 }
 
 /// Probe an Anthropic-compatible provider for its model list (GET /v1/models),
-/// given a base URL and a literal API key. Reused by `elanus models` (profile
-/// coordinates) and `elanus provider test` (a vault provider's decrypted key).
+/// given a base URL and a literal API key. Reused by `lanius models` (profile
+/// coordinates) and `lanius provider test` (a vault provider's decrypted key).
 /// Returns the `data` array; an empty/absent endpoint is an honest error.
 pub fn probe(base: &str, key: &str) -> Result<Vec<Value>> {
     let base = base.trim_end_matches('/');

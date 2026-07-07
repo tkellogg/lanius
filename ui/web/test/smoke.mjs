@@ -12,10 +12,10 @@ import mqtt from 'mqtt';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const BIN = path.join(REPO, 'target/debug');
-const TMP = fs.mkdtempSync('/tmp/elanus-web-smoke.');
+const TMP = fs.mkdtempSync('/tmp/lanius-web-smoke.');
 const BUS_PORT = 18000 + (process.pid % 2000);
 const WEB_PORT = 7300 + (process.pid % 500);
-const ENV = { ...process.env, ELANUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
+const ENV = { ...process.env, LANIUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
 
 let failures = 0;
 const ok = (m) => console.log(`  ok: ${m}`);
@@ -30,22 +30,22 @@ async function waitFor(desc, fn, timeoutMs = 15000) {
   fail(`${desc} (timed out)`);
   return false;
 }
-const elanus = (...a) => execFileSync(path.join(BIN, 'elanus'), a, { env: ENV, encoding: 'utf8' });
+const lanius = (...a) => execFileSync(path.join(BIN, 'lanius'), a, { env: ENV, encoding: 'utf8' });
 // .timeout: the daemon holds the db in WAL; writers must wait, not fail
-const sql = (q) => execFileSync('sqlite3', ['-cmd', '.timeout 5000', path.join(TMP, 'elanus.db'), q], { encoding: 'utf8' }).trim();
+const sql = (q) => execFileSync('sqlite3', ['-cmd', '.timeout 5000', path.join(TMP, 'lanius.db'), q], { encoding: 'utf8' }).trim();
 
 // -- daemon on a throwaway root --
-elanus('init');
+lanius('init');
 fs.writeFileSync(path.join(TMP, 'bus.toml'), `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\n`);
-const daemon = spawn(path.join(BIN, 'elanus'), ['daemon', '--interval-ms', '200'], { env: ENV, stdio: 'ignore' });
+const daemon = spawn(path.join(BIN, 'lanius'), ['daemon', '--interval-ms', '200'], { env: ENV, stdio: 'ignore' });
 // The probe acts as the owner: present the owner credential (minted at init)
 // so it is accepted once unauthenticated connections are denied.
 const humanSecret = fs.readFileSync(path.join(TMP, '.secrets', 'owner'), 'utf8').trim();
 const probe = mqtt.connect(`mqtt://127.0.0.1:${BUS_PORT}`, { protocolVersion: 5, reconnectPeriod: 300, username: 'owner', password: humanSecret });
 await waitFor('daemon listener bound', () => new Promise((r) => { probe.connected ? r(true) : probe.once('connect', () => r(true)); setTimeout(() => r(probe.connected), 250); }));
 
-// -- the server under test: the Rust `elanus web` (server.mjs retired, M4) --
-const server = spawn(path.join(BIN, 'elanus'), ['web', '--port', String(WEB_PORT)], {
+// -- the server under test: the Rust `lanius web` (server.mjs retired, M4) --
+const server = spawn(path.join(BIN, 'lanius'), ['web', '--port', String(WEB_PORT)], {
   env: ENV, stdio: ['ignore', 'pipe', 'inherit'],
 });
 const BASE = `http://127.0.0.1:${WEB_PORT}`;
@@ -75,14 +75,14 @@ const reader = sse.body.getReader();
 await waitFor('SSE status: bus connected', () => events.some((m) => m.kind === 'status' && m.connected));
 
 // 1. bus → page. Publish via the authenticated owner `probe` client (the CLI
-// `elanus bus pub` presents no broker credential from a bare root — a separate
+// `lanius bus pub` presents no broker credential from a bare root — a separate
 // pre-existing auth gap, unrelated to the web server under test).
 probe.publish('obs/test/web', JSON.stringify({ msg: 'web-smoke' }));
 await waitFor('bus event relayed over SSE', () =>
   events.some((m) => m.kind === 'message' && m.topic === 'obs/test/web' && m.env?.payload?.msg === 'web-smoke'));
 
 // 2. an ask announces and relays (daemon sweep, not the publish echo)
-elanus('emit', 'in/human/owner', '--correlation', 'web-corr-1', '--payload', '{"question":"deploy?","options":["yes","no"]}');
+lanius('emit', 'in/human/owner', '--correlation', 'web-corr-1', '--payload', '{"question":"deploy?","options":["yes","no"]}');
 await waitFor('ask relayed with correlation', () =>
   events.some((m) => m.topic === 'in/human/owner' && m.env?.correlation_id === 'web-corr-1'));
 
@@ -132,7 +132,7 @@ badKind.status === 400 ? ok('unknown history kind rejected (400)') : fail(`bad k
 // 7. seed a transcript and query it through the already-serving view. history
 // is a stdlib package (present + approved at init), so there is no cp/approve
 // step — just seed the ledger and ask.
-/^history\s/m.test(elanus('packages')) ? ok('history package present (stdlib)') : fail('history package missing');
+/^history\s/m.test(lanius('packages')) ? ok('history package present (stdlib)') : fail('history package missing');
 sql(`INSERT INTO events(type, payload, state, correlation_id)
      VALUES ('in/agent/main','{"prompt":"hi"}','done','web-hist-conv');
      INSERT INTO messages(session_id, role, content, event_id) VALUES

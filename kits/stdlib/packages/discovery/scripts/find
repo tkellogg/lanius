@@ -5,8 +5,8 @@ exec-mode tool over the `[[tool]]` seam: the call args arrive as JSON on stdin
 ({"query": ...}) and the reshaped discovery report goes out as JSON on stdout.
 
 A THIN wrapper (wonky bit 2): the privileged universe scan lives ONCE in the
-kernel CLI (`elanus discover --json`); this script only shells it with the
-calling agent's profile (ELANUS_PROFILE) and reshapes the report into a tool
+kernel CLI (`lanius discover --json`); this script only shells it with the
+calling agent's profile (LANIUS_PROFILE) and reshapes the report into a tool
 result the model reads. It does NOT re-scan package dirs — that would duplicate
 manifest parsing in a package script and drift from the kernel.
 """
@@ -31,21 +31,21 @@ def main():
         emit({"error": "find_capability: 'query' is required"})
         return
 
-    # The kernel binary — `elanus` on PATH is how packages shell the CLI (the
+    # The kernel binary — `lanius` on PATH is how packages shell the CLI (the
     # index daemon and history package do the same).
-    profile = os.environ.get("ELANUS_PROFILE") or "default"
+    profile = os.environ.get("LANIUS_PROFILE") or os.environ.get("ELANUS_PROFILE") or "default"
     try:
         out = subprocess.run(
-            ["elanus", "discover", "--json", "--profile", profile, query],
+            ["lanius", "discover", "--json", "--profile", profile, query],
             capture_output=True,
             text=True,
             timeout=12,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
-        emit({"error": f"find_capability: could not run `elanus discover`: {e}"})
+        emit({"error": f"find_capability: could not run `lanius discover`: {e}"})
         return
     if out.returncode != 0:
-        emit({"error": f"find_capability: `elanus discover` failed: {out.stderr.strip()}"})
+        emit({"error": f"find_capability: `lanius discover` failed: {out.stderr.strip()}"})
         return
     try:
         report = json.loads(out.stdout)

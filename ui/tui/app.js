@@ -1,4 +1,4 @@
-// elanus TUI — a PURE MQTT 5 client on the loopback listener.
+// lanius TUI — a PURE MQTT 5 client on the loopback listener.
 // No sqlite, no trace.jsonl, no privilege: everything on screen arrived
 // over the bus, and everything we do is an ordinary QoS 1 publish.
 import React, { useEffect, useRef, useState } from 'react';
@@ -17,7 +17,7 @@ function validPrincipal(name) {
   return !!name && name.length <= 64 && !name.startsWith('.') && !name.includes('/') && !name.includes('\\');
 }
 function ownerName(root) {
-  const env = (process.env.ELANUS_OWNER || '').trim();
+  const env = (process.env.LANIUS_OWNER || '').trim();
   if (validPrincipal(env)) return env;
   try {
     const n = fs.readFileSync(path.join(root, '.secrets', '.owner-name'), 'utf8').trim();
@@ -189,7 +189,7 @@ export default function App({ url, agent = 'main', root = null }) {
   const pendingAsks = asks; // answered asks stay visible, greyed
 
   const publishAnswer = (ask, text) => {
-    // Mirror `elanus answer` (src/human.rs): mail to the agent's mailbox,
+    // Mirror `lanius answer` (src/human.rs): mail to the agent's mailbox,
     // payload {answer}. The envelope correlation rides the el-correlation
     // user property — the broker materializes it into the ledger event's
     // correlation_id, which is what resumes the suspended asker. (MQTT

@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>elanus - agent explorer</title>
+<title>lanius - agent explorer</title>
 <script>
   // Pre-paint theme so reloads don't flash dark before React's effect runs.
-  // Mirrors the resolution in App.tsx (localStorage 'elanus.theme' + matchMedia);
+  // Mirrors the resolution in App.tsx (localStorage 'lanius.theme' + matchMedia);
   // the React effect re-applies the same value and owns live system switching.
   (function () {
     try {
-      var t = localStorage.getItem('elanus.theme');
+      var t = localStorage.getItem('lanius.theme');
       if (t !== 'light' && t !== 'dark' && t !== 'system') t = 'system';
       var light = t === 'system' ? window.matchMedia('(prefers-color-scheme: light)').matches : t === 'light';
       document.documentElement.dataset.theme = light ? 'light' : 'dark';

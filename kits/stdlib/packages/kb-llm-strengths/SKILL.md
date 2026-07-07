@@ -6,7 +6,7 @@ description: The model-tiering knowledge base — which model to use for plannin
 # LLM strengths — the model-tiering knowledge base
 
 This package is a knowledge base (a `kb/` subfolder, declared by the `[kb]`
-marker in `elanus.toml`). It holds the model-tiering rules the harness uses when
+marker in `lanius.toml`). It holds the model-tiering rules the harness uses when
 it dispatches work: which model plans, which implements, which verifies, and the
 one rule that never flexes.
 
@@ -29,8 +29,8 @@ preference wins and the conflict is flagged, not silently resolved.
 
 - **Read** a `kb/role-*.md` before you pick a model for a task, or grep the
   tree: `grep -ri "who verifies" kb/`.
-- **List** every enabled KB with `elanus kb list`.
-- **Write** an update with `elanus kb write kb-llm-strengths kb/<file>.md` (it
+- **List** every enabled KB with `lanius kb list`.
+- **Write** an update with `lanius kb write kb-llm-strengths kb/<file>.md` (it
   writes the file and commits it — provenance is the git log). Update the paired
   copy too: the canonical model-tiering text is mirrored in
   `.claude/skills/handoff-workflow/SKILL.md`, which configures Claude Code (and

@@ -27,7 +27,7 @@
 #       tests rather than here.
 #
 # Containment: everything runs under a scratch ELANUS_ROOT; no daemon is left
-# running; the live root (~/.elanus) is never touched.
+# running; the live root (~/.lanius) is never touched.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,18 +35,18 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/bus-resilience-repro.XXXXXX")"
 cleanup() { rm -rf "$SCRATCH"; }
 trap cleanup EXIT
 
-BIN="$REPO/target/debug/elanus"
+BIN="$REPO/target/debug/lanius"
 ECHO="$REPO/target/debug/examples/harness_echo"
 if [[ ! -x "$BIN" || ! -x "$ECHO" ]]; then
-  echo "building elanus + harness_echo ..."
-  ( cd "$REPO" && cargo build --bin elanus --example harness_echo ) || exit 1
+  echo "building lanius + harness_echo ..."
+  ( cd "$REPO" && cargo build --bin lanius --example harness_echo ) || exit 1
 fi
 
 ROOT="$SCRATCH/root"; WORK="$SCRATCH/work"
 mkdir -p "$ROOT/packages/harness-echo/bin" "$WORK"
 cp "$ECHO" "$ROOT/packages/harness-echo/bin/adapter"
 chmod +x "$ROOT/packages/harness-echo/bin/adapter"
-cat > "$ROOT/packages/harness-echo/elanus.toml" <<'TOML'
+cat > "$ROOT/packages/harness-echo/lanius.toml" <<'TOML'
 [[harness]]
 name = "echo"
 aliases = ["ec"]
@@ -67,7 +67,7 @@ else
   echo "ok(a): session survived broker-down, exited by the tool's own status"
 fi
 if command -v sqlite3 >/dev/null 2>&1; then
-  claim="$(sqlite3 "$ROOT/elanus.db" \
+  claim="$(sqlite3 "$ROOT/lanius.db" \
     "SELECT c.path FROM code_claims c JOIN code_sessions s ON s.elanus_session=c.session LIMIT 1;" 2>/dev/null)"
   if [[ -n "$claim" ]]; then
     echo "ok(a): work captured to disk despite broker-down ($claim)"
@@ -89,6 +89,6 @@ fi
 
 echo
 echo "=== (b) is a ledger-seed reproduction; see the dispatcher regression test ==="
-echo "    cargo test -p elanus drive_holds_stale_delivery_and_drives_fresh"
+echo "    cargo test -p lanius drive_holds_stale_delivery_and_drives_fresh"
 
 exit $fail

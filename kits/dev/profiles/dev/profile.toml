@@ -1,5 +1,5 @@
 # dev kit profile — a skeleton for coding-agent work. Use it with
-# `elanus exec --profile dev`, or fold the [sandbox] block into your default
+# `lanius exec --profile dev`, or fold the [sandbox] block into your default
 # profile. Copied only if profiles/dev/ didn't already exist.
 
 agent = "main"

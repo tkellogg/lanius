@@ -15,7 +15,7 @@ work will sit inert and you'll wonder why.
 1. **Write or edit** a package under a directory on the package path
    (usually `packages/<name>/` in the harness root — check your cage
    covers it; if not, that's a grant to request, not a workaround to find).
-2. **Every capability is a request.** `elanus.toml` declares what the
+2. **Every capability is a request.** `lanius.toml` declares what the
    package needs — subscribe/publish filters, fs prefixes, hook points,
    context stages, MCP servers. Declaring grants you NOTHING.
 3. **Editing de-approves.** Grants pin to the manifest *and the code
@@ -23,8 +23,8 @@ work will sit inert and you'll wonder why.
    package silently reverts to pending — your edited package stops
    firing. This is not a bug; a grant authorizes code, not a name.
 4. **The human commits.** Tell your owner what you changed and why, then
-   point them at the review: `elanus packages` shows what's pending,
-   `elanus approve <name>` lands it. Mail them
+   point them at the review: `lanius packages` shows what's pending,
+   `lanius approve <name>` lands it. Mail them
    (`emit_event` → `in/human/<owner>`) with a one-paragraph summary and
    the approve command. Do not nag; one clear message.
 
@@ -35,7 +35,7 @@ work will sit inert and you'll wonder why.
 - A SKILL.md if other agents should use it (name + description
   frontmatter; the body is progressive disclosure — they read it on
   demand).
-- Say what you tested. `elanus exec` against your own session, or emit a
+- Say what you tested. `lanius exec` against your own session, or emit a
   test event and show the trace line.
 
 ## Know your limits

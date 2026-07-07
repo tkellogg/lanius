@@ -2,7 +2,7 @@
 """kb-search index daemon (docs/handoffs/kb-search.md M2/M3).
 
 Read-only over the CORPUS: it discovers every enabled package that carries a
-`[kb]` marker (via `elanus kb list --json` — the ledger + manifest are the
+`[kb]` marker (via `lanius kb list --json` — the ledger + manifest are the
 truth), reads each `kb/` file, chunks it per markdown heading, and (re)builds a
 package-local sqlite FTS5 index in its own state dir (ELANUS_SCRATCH). It NEVER
 writes a `kb/` file — it only writes its own index. Zero kernel schema.
@@ -15,7 +15,7 @@ temp db, fsync-rename over the live index) so the tool/CLI reader never sees a
 half-built index. Crash-only: any fault exits nonzero and the supervisor
 restarts us with backoff.
 
-The FTS5 index is the SAME shape src/kb.rs reads, so `elanus kb search` and the
+The FTS5 index is the SAME shape src/kb.rs reads, so `lanius kb search` and the
 `search_knowledge` tool return identical hits:
 
   CREATE VIRTUAL TABLE chunks USING fts5(
@@ -34,7 +34,7 @@ MAX_FILE_BYTES = 512 * 1024
 TEXT_EXT = {".md", ".markdown", ".mdx", ".txt", ".text", ""}
 
 SCRATCH = os.environ.get("ELANUS_SCRATCH") or os.path.join(
-    os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."),
+    os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."),
     "run",
     "pkg-kb-search",
 )
@@ -46,15 +46,15 @@ def log(msg):
 
 
 def enabled_kbs():
-    """The enabled knowledge bases: one dict per `elanus kb list --json` line."""
+    """The enabled knowledge bases: one dict per `lanius kb list --json` line."""
     out = subprocess.run(
-        ["elanus", "kb", "list", "--json", "--profile", "default"],
+        ["lanius", "kb", "list", "--json", "--profile", "default"],
         capture_output=True,
         text=True,
         timeout=30,
     )
     if out.returncode != 0:
-        raise RuntimeError(f"`elanus kb list` failed: {out.stderr.strip()}")
+        raise RuntimeError(f"`lanius kb list` failed: {out.stderr.strip()}")
     kbs = []
     for line in out.stdout.splitlines():
         line = line.strip()

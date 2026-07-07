@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Create an isolated elanus dev worktree on shifted ports, so a second agent can
+# Create an isolated lanius dev worktree on shifted ports, so a second agent can
 # run the full stack (daemon + web relay + Vite UI) without colliding with the
 # stack in the main checkout.
 #
-# Isolation boundary is the elanus *root* (its own elanus.db, bus.toml, secrets,
+# Isolation boundary is the lanius *root* (its own lanius.db, bus.toml, secrets,
 # config repo). Each slot N shifts three ports: web relay, Vite, and the MQTT
 # broker bind (the last lives in <root>/bus.toml, not a dev flag). Slot 0 is the
 # main stack (7180 / 5173 / 1883).
@@ -13,7 +13,7 @@
 #   [slot]   port-shift slot, default 1 (use 2, 3, ... for more worktrees)
 #
 # Tear down later:
-#   git worktree remove ../elanus-<name> && rm -rf ~/.elanus/wt-<name>
+#   git worktree remove ../lanius-<name> && rm -rf ~/.lanius/wt-<name>
 set -euo pipefail
 
 NAME="${1:?usage: new-worktree.sh <name> [slot]}"
@@ -21,10 +21,10 @@ N="${2:-1}"
 
 REPO="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
 PARENT="$(dirname "$REPO")"
-WT="$PARENT/elanus-$NAME"
+WT="$PARENT/lanius-$NAME"
 BRANCH="$NAME"
-ROOT="$HOME/.elanus/wt-$NAME"
-ELANUS_BIN="$REPO/target/debug/elanus"
+ROOT="$HOME/.lanius/wt-$NAME"
+LANIUS_BIN="$REPO/target/debug/lanius"
 
 WEB=$((7180 + N * 100))
 VITE=$((5173 + N * 100))
@@ -51,11 +51,11 @@ else
 fi
 
 # 4. an isolated root on a shifted broker port. NOTE: `init` takes the root as a
-# POSITIONAL arg (positional > $ELANUS_ROOT > ~/.elanus/root); the global --root
+# POSITIONAL arg (positional > $LANIUS_ROOT > ~/.lanius/root); the global --root
 # flag does NOT apply to init, so `--root X init` would scaffold the default root.
 mkdir -p "$ROOT"
-if [ -x "$ELANUS_BIN" ]; then
-  "$ELANUS_BIN" init "$ROOT"
+if [ -x "$LANIUS_BIN" ]; then
+  "$LANIUS_BIN" init "$ROOT"
 else
   (cd "$REPO" && cargo run --quiet -- init "$ROOT")
 fi

@@ -1,7 +1,7 @@
 # Broker: `CONNECT refused: bad credential for identity "<name>"`
 
 ## Symptom
-The broker log (e.g. `~/.elanus/root/elanus-serve.log`) repeats, often a few times
+The broker log (e.g. `~/.lanius/root/lanius-serve.log`) repeats, often a few times
 every few seconds:
 ```
 [bus] CONNECT refused: bad credential for identity "owner"
@@ -22,7 +22,7 @@ secret for that identity.**
 
 ## Most common cause: a stray client on the wrong root
 A process is connecting to *this* broker while holding a *different* root's owner
-secret. The classic source is an **orphaned `elanus web` (or daemon) left by a
+secret. The classic source is an **orphaned `lanius web` (or daemon) left by a
 test/probe/workflow run**: it was started with a `/tmp` `--root` but the **default
 broker address** `mqtt://127.0.0.1:1883`, so it knocks on your *real* broker
 presenting its *own* root's owner secret. The web server reads its owner secret
@@ -33,19 +33,19 @@ Less common: a rotated/restored `.secrets` out of sync with running clients, or 
 real client genuinely misconfigured with the wrong `--root`.
 
 ## Diagnose
-1. Watch the rate: `tail -f ~/.elanus/root/elanus-serve.log` (or your serve log).
+1. Watch the rate: `tail -f ~/.lanius/root/lanius-serve.log` (or your serve log).
 2. Enumerate and split legit vs stray (see SKILL.md):
    ```sh
    ps -eo pid,ppid,command | grep '[e]lanus'
    ```
    Legit stack is under your real root (`serve` → `daemon` → `web`). Suspects are
-   `elanus web`/`daemon` on a `/tmp` or `/private/tmp` root (often `ppid 1`).
+   `lanius web`/`daemon` on a `/tmp` or `/private/tmp` root (often `ppid 1`).
 3. Confirm a stray is the culprit (optional, very convincing): kill ONE stray and
-   watch the refusal rate in the log drop. Starting a foreign-root `elanus web` on
+   watch the refusal rate in the log drop. Starting a foreign-root `lanius web` on
    `:1883` makes the rate jump; killing it restores baseline.
 
 ## Fix
-Kill the strays — **never** the legit `serve`/`daemon`/`web`. Heads-up: `elanus
+Kill the strays — **never** the legit `serve`/`daemon`/`web`. Heads-up: `lanius
 web` **ignores SIGTERM**, so a plain `kill` does nothing — use `kill -9`:
 ```sh
 # verify each pid first, then:
@@ -55,7 +55,7 @@ The refusals stop immediately. **No daemon restart and no re-mint is needed** �
 broker's check was correct the whole time; you only removed the bad clients.
 
 If it's genuinely an operational secret mismatch (not a stray): make sure the
-clients and the broker share one root, or restart `elanus serve` so everything
+clients and the broker share one root, or restart `lanius serve` so everything
 re-reads the same `.secrets`.
 
 ## Prevent

@@ -42,8 +42,8 @@ const CONFIG_README: &str = "\
 
 This is a kernel-owned Git repository. Its `live` branch is the materialized
 truth: per-package settings live at `packages/<name>.toml`. Do not edit by hand
-while the daemon runs — use `elanus config set <package> <key> <value>` or
-`elanus profile set <agent> <key=value>`, which commit changes on `live` and
+while the daemon runs — use `lanius config set <package> <key> <value>` or
+`lanius profile set <agent> <key=value>`, which commit changes on `live` and
 record who accepted them in the ledger. Package settings live at
 `packages/<name>.toml`; agent profiles live at `agents/<name>/profile.toml`.
 Agents never write live config; they only propose (a `proposal/<id>` branch).
@@ -104,7 +104,7 @@ fn git_ok(root: &Root, args: &[&str]) -> bool {
 /// Create the config repo if absent: `<root>/config` with `packages/` and
 /// `agents/` dirs and
 /// an initial commit on the `live` branch. Idempotent — a root that already has
-/// the repo is left untouched. Called from `elanus init`.
+/// the repo is left untouched. Called from `lanius init`.
 pub fn init(root: &Root) -> Result<()> {
     let dir = root.config();
     // "Already initialized" means a real repo with a commit on `live`, not just

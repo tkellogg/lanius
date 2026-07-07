@@ -1,4 +1,4 @@
-//! `elanus code` — launch and observe an external coding agent.
+//! `lanius code` — launch and observe an external coding agent.
 //!
 //! A coding agent (Claude Code today; Codex next) is an external actor brought
 //! up from the command line (docs/actors.md): the launcher is NOT the actor, the
@@ -9,7 +9,7 @@
 //!
 //! What this increment delivers (M0 launcher scaffolding + M1 hook→bus bridge):
 //!
-//! - **Per-session identity (grant-scoped).** Each launch mints a fresh elanus
+//! - **Per-session identity (grant-scoped).** Each launch mints a fresh lanius
 //!   session id and a **grant-scoped** session token (src/codesession.rs), so
 //!   everything the session publishes is stamped `sender = code-<session>` by the
 //!   broker — never the owner (docs/actors.md / docs/security.md entry 16: a
@@ -23,7 +23,7 @@
 //!
 //! - **Scoped hook config, no home pollution.** A generated CC `--settings` file
 //!   in the session's run scratch routes the documented hook events through
-//!   `elanus code hook <event>` → the bus. We pass `--setting-sources ''` so the
+//!   `lanius code hook <event>` → the bus. We pass `--setting-sources ''` so the
 //!   user's `~/.claude` (user/project/local settings, their hooks, their
 //!   CLAUDE.md auto-discovery) is NOT loaded — only the generated hooks run.
 //!
@@ -39,7 +39,7 @@
 //!
 //! - **Claude Code — a hook bridge.** The launcher inherits the child's stdio and
 //!   the child's own *hooks* (a generated `--settings` config) call
-//!   `elanus code hook <Event>`, which publishes. The launcher parses nothing.
+//!   `lanius code hook <Event>`, which publishes. The launcher parses nothing.
 //! - **Codex — a stdout stream plus a claim hook.** Headless codex runs
 //!   `codex exec --json`, which prints a JSONL event stream to stdout. The launcher
 //!   **pipes the child's stdout, reads it line-by-line as JSONL, maps each event,
@@ -49,19 +49,20 @@
 //!   `PostToolUse` hook records live advisory apply_patch edit-claims.
 //!
 //! **Sandbox stance for this increment (recorded in the handoff Log).** We do NOT
-//! bypass Claude Code's own sandbox onto today's elanus cage. Today the cage is a
+//! bypass Claude Code's own sandbox onto today's lanius cage. Today the cage is a
 //! write-only fence (reads/network open) and is built for one-shot captured
 //! `sh -c` calls, not an interactive long-lived TUI with inherited stdio
 //! (src/sandbox.rs). Bypassing the tool's sandbox onto that would be a containment
 //! regression (M0's read/egress acceptance criteria need the complete cage that
 //! docs/sandbox.md promotes to the end state but which is not built yet). So for
 //! now the tool keeps its OWN sandbox active (reads/network stay contained) and
-//! elanus owns the workdir + observation + identity. The single complete cage
+//! lanius owns the workdir + observation + identity. The single complete cage
 //! (write + read + egress + the read camera) is a separate core prerequisite; the
 //! tool-sandbox bypass + posture reconstruction is a LATER milestone gated on it.
 
 use crate::buscli;
 use crate::codesession;
+use crate::envcompat::EnvDual;
 use crate::manifest::HarnessDecl;
 use crate::packages;
 use crate::paths::Root;
@@ -72,9 +73,9 @@ use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 /// Env vars the launcher sets for the child coding-agent process tree, read back
-/// by `elanus code hook` so each hook event publishes as the session principal.
-pub const ENV_SESSION: &str = "ELANUS_CODE_SESSION";
-pub const ENV_AGENT: &str = "ELANUS_CODE_AGENT";
+/// by `lanius code hook` so each hook event publishes as the session principal.
+pub const ENV_SESSION: &str = "LANIUS_CODE_SESSION";
+pub const ENV_AGENT: &str = "LANIUS_CODE_AGENT";
 
 /// Set on the child when the launcher's own launch-time bus publish already
 /// failed (docs/handoffs/bus-resilience.md M2). The launcher and the tool child
@@ -82,61 +83,61 @@ pub const ENV_AGENT: &str = "ELANUS_CODE_AGENT";
 /// once-per-session state; seeding the child "already warned + degraded" keeps a
 /// launch-time-down session to ONE warning across the pair instead of one per
 /// process, while a mid-session recovery still prints exactly one reconnect line.
-const ENV_BUS_DEGRADED: &str = "ELANUS_BUS_DEGRADED";
+const ENV_BUS_DEGRADED: &str = "LANIUS_BUS_DEGRADED";
 
-/// Internal launch-control env vars used by `elanus code spawn`.
+/// Internal launch-control env vars used by `lanius code spawn`.
 ///
-/// `ELANUS_CODE_FORCE_SESSION` lets a detached wrapper process use the worker
+/// `LANIUS_CODE_FORCE_SESSION` lets a detached wrapper process use the worker
 /// handle its spawner already printed, after validating that it is a safe
-/// `code-*` principal. `ELANUS_CODE_REPLY_TO` names the spawning session that
+/// `code-*` principal. `LANIUS_CODE_REPLY_TO` names the spawning session that
 /// should receive the worker's completion, and
-/// `ELANUS_CODE_REPLY_CORRELATION` threads that completion through the same
+/// `LANIUS_CODE_REPLY_CORRELATION` threads that completion through the same
 /// conversation id the spawn command reported. These vars are consumed by the
-/// elanus wrapper only; they must NOT leak onward into the real coding tool, or a
-/// nested `elanus code <tool>` launched by the worker could accidentally inherit
+/// lanius wrapper only; they must NOT leak onward into the real coding tool, or a
+/// nested `lanius code <tool>` launched by the worker could accidentally inherit
 /// the forced id / reply route.
-const ENV_FORCE_SESSION: &str = "ELANUS_CODE_FORCE_SESSION";
-const ENV_REPLY_TO: &str = "ELANUS_CODE_REPLY_TO";
-const ENV_REPLY_CORRELATION: &str = "ELANUS_CODE_REPLY_CORRELATION";
+const ENV_FORCE_SESSION: &str = "LANIUS_CODE_FORCE_SESSION";
+const ENV_REPLY_TO: &str = "LANIUS_CODE_REPLY_TO";
+const ENV_REPLY_CORRELATION: &str = "LANIUS_CODE_REPLY_CORRELATION";
 /// Spawn-depth guard carried through detached workers. Unlike the reply/force
 /// launch-control vars, this MUST propagate into the real tool child so nested
-/// `elanus code spawn` calls see and increment the current depth.
-const ENV_SPAWN_DEPTH: &str = "ELANUS_CODE_SPAWN_DEPTH";
+/// `lanius code spawn` calls see and increment the current depth.
+const ENV_SPAWN_DEPTH: &str = "LANIUS_CODE_SPAWN_DEPTH";
 /// Hard cap on recursively spawned detached workers. It is intentionally roomy
 /// for normal delegation trees but stops accidental fork-bomb prompts.
 const MAX_SPAWN_DEPTH: u32 = 8;
 
 /// One-turn teaching nudge surfaced only when the user's submitted prompt is
 /// plausibly asking for delegation, parallelism, or another coding agent.
-const DISPATCH_HINT: &str = "[elanus] Tip: you can dispatch coding workers yourself - run `elanus code help` for all verbs. Live/blocking headless workers: `elanus code codex --headless \"<task>\"` runs a Codex worker and returns its result inline; `elanus code opencode --headless \"<task>\"` runs an opencode worker; `elanus code claude --headless \"<task>\"` runs a headless Claude worker. (Bare `elanus code <tool>` opens that tool's interactive TUI. `--worker` is the deprecated alias for `--headless`.)";
+const DISPATCH_HINT: &str = "[lanius] Tip: you can dispatch coding workers yourself - run `lanius code help` for all verbs. Live/blocking headless workers: `lanius code codex --headless \"<task>\"` runs a Codex worker and returns its result inline; `lanius code opencode --headless \"<task>\"` runs an opencode worker; `lanius code claude --headless \"<task>\"` runs a headless Claude worker. (Bare `lanius code <tool>` opens that tool's interactive TUI. `--worker` is the deprecated alias for `--headless`.)";
 
 /// The session-local Claude Code skill body. Claude discovers it as a skill in the
 /// per-session plugin (`build_claude_skill_plugin`) loaded via `--plugin-dir`, the
 /// only channel that surfaces skills under `--setting-sources ''`. Available only
 /// for this session and vanishes with the run scratch.
-const ELANUS_SKILL: &str = r#"---
-name: elanus
-description: Shows how to dispatch coding workers from this elanus-launched Claude Code session.
+const LANIUS_SKILL: &str = r#"---
+name: lanius
+description: Shows how to dispatch coding workers from this lanius-launched Claude Code session.
 ---
 
-# elanus worker dispatch
+# lanius worker dispatch
 
 Use this cheatsheet when you need another coding worker:
 
-- Full help: `elanus code help`
-- Live/blocking Codex worker: `elanus code codex --headless "<task>"`
-- Live/blocking opencode worker: `elanus code opencode --headless "<task>"`
-- Live/blocking Claude worker: `elanus code claude --headless "<task>"`
-  (bare `elanus code <tool>` opens the interactive TUI; `--worker` = deprecated alias for `--headless`)
-- Async spawn: `elanus code spawn <tool> "<task>"`
-- Async deliver to an existing worker: `elanus code deliver <worker> "<msg>"`
-- Check your own mailbox: `elanus code inbox`
+- Full help: `lanius code help`
+- Live/blocking Codex worker: `lanius code codex --headless "<task>"`
+- Live/blocking opencode worker: `lanius code opencode --headless "<task>"`
+- Live/blocking Claude worker: `lanius code claude --headless "<task>"`
+  (bare `lanius code <tool>` opens the interactive TUI; `--worker` = deprecated alias for `--headless`)
+- Async spawn: `lanius code spawn <tool> "<task>"`
+- Async deliver to an existing worker: `lanius code deliver <worker> "<msg>"`
+- Check your own mailbox: `lanius code inbox`
 
 For async `spawn` or `deliver`, end your turn after dispatch. Do not poll, sleep,
-or wait; elanus wakes you later with the result.
+or wait; lanius wakes you later with the result.
 
-You can also launch NATIVE elanus agents (not just coding workers): run
-`elanus agent catalog` to see launchable profiles, then `elanus agent spawn
+You can also launch NATIVE lanius agents (not just coding workers): run
+`lanius agent catalog` to see launchable profiles, then `lanius agent spawn
 --profile <p> "<task>"` (durable, async) or `--with-package` /
 `--provider` for launch-time overrides. See the `launching-agents` skill.
 "#;
@@ -144,37 +145,37 @@ You can also launch NATIVE elanus agents (not just coding workers): run
 /// Provider-credential env vars scrubbed from EVERY launched/resumed coding-agent
 /// child (Task 2 / docs/handoffs/coding-agents.md cred-scrub Log).
 ///
-/// elanus loads its own `.env` into its process (`dotenv::load` in main.rs) so its
+/// lanius loads its own `.env` into its process (`dotenv::load` in main.rs) so its
 /// NATIVE agents can reach a provider through the genai anthropic-compat path — in
 /// the field that `.env` points `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` at a
 /// DeepSeek endpoint. A spawned coding tool (Claude Code / Codex) would otherwise
 /// INHERIT those vars and be misdirected away from its own login (`~/.claude` /
 /// `~/.codex`). The coding tool brings its OWN auth, so the launcher must NOT leak
-/// elanus's provider credentials into it: each spawn `env_remove`s these before
-/// exec. This scrubs ONLY provider credentials — the `ELANUS_*` session/bus/root
-/// vars the hook bridge and `elanus code …` children depend on are set explicitly
+/// lanius's provider credentials into it: each spawn `env_remove`s these before
+/// exec. This scrubs ONLY provider credentials — the `LANIUS_*` session/bus/root
+/// vars the hook bridge and `lanius code …` children depend on are set explicitly
 /// AFTER the scrub and are never in this list.
 ///
 /// (A future `--inherit-credentials` flag could opt back in to passing them, for a
-/// user who deliberately wants the tool to use elanus's provider; not built — the
+/// user who deliberately wants the tool to use lanius's provider; not built — the
 /// correct default is the tool's own auth.)
 const PROVIDER_CRED_VARS: &[&str] = &[
-    // Anthropic / Claude Code (and the genai anthropic-compat path elanus uses).
+    // Anthropic / Claude Code (and the genai anthropic-compat path lanius uses).
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
-    // OpenAI / Codex (and any OpenAI-compatible provider elanus is pointed at).
+    // OpenAI / Codex (and any OpenAI-compatible provider lanius is pointed at).
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_API_BASE",
     "OPENAI_MODEL",
 ];
 
-/// Scrub elanus's provider credentials from a child `Command` before it spawns the
-/// coding tool, so the tool uses its OWN login rather than inheriting elanus's
+/// Scrub lanius's provider credentials from a child `Command` before it spawns the
+/// coding tool, so the tool uses its OWN login rather than inheriting lanius's
 /// provider env (see `PROVIDER_CRED_VARS`). Returns the same `&mut Command` for
-/// chaining. The `ELANUS_*` session/bus/root vars the bridge needs are set by the
+/// chaining. The `LANIUS_*` session/bus/root vars the bridge needs are set by the
 /// caller AFTER this and are deliberately NOT scrubbed.
 pub fn scrub_provider_creds(cmd: &mut std::process::Command) -> &mut std::process::Command {
     for var in PROVIDER_CRED_VARS {
@@ -183,16 +184,16 @@ pub fn scrub_provider_creds(cmd: &mut std::process::Command) -> &mut std::proces
     cmd
 }
 
-/// Resolve the `elanus` binary used by generated hook commands.
+/// Resolve the `lanius` binary used by generated hook commands.
 ///
 /// When running from the main binary, this is just the current executable. When
-/// one of the thin adapter binaries runs beside it, prefer the sibling `elanus`
+/// one of the thin adapter binaries runs beside it, prefer the sibling `lanius`
 /// binary in the same directory. Packaged stock adapters live under
-/// `~/.elanus/root/packages/.../bin/adapter` without that sibling, so fall back
+/// `~/.lanius/root/packages/.../bin/adapter` without that sibling, so fall back
 /// to PATH before giving up. Generated hook configs must call the real
-/// `elanus code hook ...` entrypoint, never the adapter itself.
+/// `lanius code hook ...` entrypoint, never the adapter itself.
 fn elanus_command_path() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("locating the running elanus binary")?;
+    let exe = std::env::current_exe().context("locating the running lanius binary")?;
     Ok(resolve_elanus_command_path_from_exe(
         &exe,
         std::env::var_os("PATH").as_deref(),
@@ -200,18 +201,18 @@ fn elanus_command_path() -> Result<PathBuf> {
 }
 
 fn resolve_elanus_command_path_from_exe(exe: &Path, path: Option<&std::ffi::OsStr>) -> PathBuf {
-    if exe.file_stem().and_then(|s| s.to_str()) == Some("elanus") {
+    if exe.file_stem().and_then(|s| s.to_str()) == Some("lanius") {
         return exe.to_path_buf();
     }
     if let Some(dir) = exe.parent() {
-        let sibling = dir.join("elanus");
+        let sibling = dir.join("lanius");
         if sibling.exists() {
             return sibling;
         }
     }
     if let Some(path) = path {
         for dir in std::env::split_paths(path) {
-            let candidate = dir.join("elanus");
+            let candidate = dir.join("lanius");
             if candidate.exists() {
                 return candidate;
             }
@@ -221,9 +222,9 @@ fn resolve_elanus_command_path_from_exe(exe: &Path, path: Option<&std::ffi::OsSt
 }
 
 /// Remove internal launch-control variables from a real coding-tool child. They
-/// are instructions to this elanus wrapper, not part of the session identity the
-/// model should inherit. The wrapper sets fresh `ELANUS_CODE_SESSION` /
-/// `ELANUS_CODE_AGENT` for the tool after this scrub.
+/// are instructions to this lanius wrapper, not part of the session identity the
+/// model should inherit. The wrapper sets fresh `LANIUS_CODE_SESSION` /
+/// `LANIUS_CODE_AGENT` for the tool after this scrub.
 fn scrub_launch_control_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
     for var in [ENV_FORCE_SESSION, ENV_REPLY_TO, ENV_REPLY_CORRELATION] {
         cmd.env_remove(var);
@@ -267,14 +268,14 @@ fn apply_provider_injection_env(
     }
 }
 
-/// Strip a single elanus-level `--provider <name>` that appears BEFORE the tool
+/// Strip a single lanius-level `--provider <name>` that appears BEFORE the tool
 /// token, returning `(Option<name>, remaining argv)`. The grammar is
-/// `elanus code [--provider <name>] <tool> [tool args…]`: everything from the tool
+/// `lanius code [--provider <name>] <tool> [tool args…]`: everything from the tool
 /// token onward forwards to the tool verbatim, so scanning stops at the first
 /// non-flag token (the tool). A `--provider` appearing AFTER the tool token is a
 /// tool arg and is left untouched. Absent flag ⇒ argv returned unchanged (the
 /// no-`--provider` invariant — byte-identical to today). Sibling of
-/// `take_grants_flags`, but it runs over the WHOLE `elanus code` argv (before the
+/// `take_grants_flags`, but it runs over the WHOLE `lanius code` argv (before the
 /// tool is split out) precisely because the option sits before the tool token.
 pub fn take_provider_flag(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
     let mut provider: Option<String> = None;
@@ -310,14 +311,14 @@ pub fn take_provider_flag(args: &[String]) -> Result<(Option<String>, Vec<String
 pub fn print_help() {
     println!(
         "\
-Usage: elanus code <verb> [args...]
+Usage: lanius code <verb> [args...]
 
 Launch tools (bare invocation / a prompt opens the tool's interactive TUI;
 add --headless to run the captured headless worker cell instead):
-  elanus code claude [args...]              launch Claude Code (TUI)
-  elanus code codex [\"<task>\"]             launch Codex (TUI)
-  elanus code opencode [\"<task>\"]          launch opencode (TUI)
-  elanus code <tool> --headless \"<task>\"   run the tool headless and print its result
+  lanius code claude [args...]              launch Claude Code (TUI)
+  lanius code codex [\"<task>\"]             launch Codex (TUI)
+  lanius code opencode [\"<task>\"]          launch opencode (TUI)
+  lanius code <tool> --headless \"<task>\"   run the tool headless and print its result
                                            (--worker is the deprecated alias for --headless)
 
 Authority-narrowing flags (M4 — strip before tool, enforced at mint):
@@ -332,22 +333,22 @@ Authority-narrowing flags (M4 — strip before tool, enforced at mint):
   Mint enforces child ⊆ spawner for capabilities and Σ children ≤ parent for budget.
 
 Commands:
-  elanus code deliver <worker-session> \"<message>\"  dispatch work to a worker session
-  elanus code spawn <tool> \"<task>\"                  start a worker in the background
-  elanus code inbox [--all] [--json]                  show this session's inbox
-  elanus code resume <elanus-session> \"<message>\"    resume a recorded session
-  elanus code note <session> \"<text>\"                set or clear a session note
-  elanus code claim <path>                            announce an advisory edit claim
-  elanus code unclaim <path>                          release an advisory edit claim
-  elanus code claims [--json]                         show edit claims in this room
-  elanus code whose <path> | --dirty [--json]         attribute a path (or the git-dirty set) to its owning session
-  elanus code ask <session> \"<q>\" [--timeout N] [--priority N]  ask a live sibling and block for the reply
-  elanus code project                                  refresh the trace->sqlite session projection
-  elanus code sessions [--json]                        list coding sessions + stats
-  elanus code session <id> [--json]                   one session: stats, timeline, resume command
-  elanus code help                                    show this help
-  elanus code list                                    list supported launch tools
-  elanus code hook <event>                            internal hook bridge"
+  lanius code deliver <worker-session> \"<message>\"  dispatch work to a worker session
+  lanius code spawn <tool> \"<task>\"                  start a worker in the background
+  lanius code inbox [--all] [--json]                  show this session's inbox
+  lanius code resume <lanius-session> \"<message>\"    resume a recorded session
+  lanius code note <session> \"<text>\"                set or clear a session note
+  lanius code claim <path>                            announce an advisory edit claim
+  lanius code unclaim <path>                          release an advisory edit claim
+  lanius code claims [--json]                         show edit claims in this room
+  lanius code whose <path> | --dirty [--json]         attribute a path (or the git-dirty set) to its owning session
+  lanius code ask <session> \"<q>\" [--timeout N] [--priority N]  ask a live sibling and block for the reply
+  lanius code project                                  refresh the trace->sqlite session projection
+  lanius code sessions [--json]                        list coding sessions + stats
+  lanius code session <id> [--json]                   one session: stats, timeline, resume command
+  lanius code help                                    show this help
+  lanius code list                                    list supported launch tools
+  lanius code hook <event>                            internal hook bridge"
     );
 }
 
@@ -398,24 +399,24 @@ fn opencode_agent_noun() -> &'static str {
 }
 
 /// The human-facing interactive-resume SUGGESTION for a recorded session:
-/// `elanus code <tool> <passthrough…>` that re-attaches a MANAGED interactive TUI
+/// `lanius code <tool> <passthrough…>` that re-attaches a MANAGED interactive TUI
 /// to the native session, or None when the tool has no clean passthrough resume
-/// (so the webui simply shows no suggestion). Surfaced by `elanus code session` and
+/// (so the webui simply shows no suggestion). Surfaced by `lanius code session` and
 /// the runs UI as a copy-paste hint — suggestive and per-tool; nothing core depends
-/// on it. Resume itself is NOT an elanus verb: re-attaching is just a normal managed
-/// launch (`elanus code claude --resume <id>`), and the daemon's async one-shot is
+/// on it. Resume itself is NOT an lanius verb: re-attaching is just a normal managed
+/// launch (`lanius code claude --resume <id>`), and the daemon's async one-shot is
 /// the in-process `resume_capture` primitive (M2-B), not a human command.
 pub fn interactive_resume_hint(tool: &str, native_session: &str) -> Option<String> {
     if native_session.is_empty() {
         return None;
     }
     match harness_id_for_tool(tool)? {
-        "claude" => Some(format!("elanus code claude --resume {native_session}")),
+        "claude" => Some(format!("lanius code claude --resume {native_session}")),
         _ => None,
     }
 }
 
-/// A ready-to-print " → <hint>" suffix for the resume redirect: given an elanus
+/// A ready-to-print " → <hint>" suffix for the resume redirect: given an lanius
 /// session id, look up its record and return the per-tool interactive-resume
 /// suggestion, or "" when there's no record / no clean passthrough for the tool.
 /// Best-effort: any lookup error degrades to the generic redirect (empty suffix).
@@ -438,7 +439,7 @@ fn resolve_external_harness(
 ) -> Result<ExternalHarness> {
     find_external_harness(root, profile_name, tool)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no harness named {tool} — is it installed? (run `elanus init` to seed the stock claude/codex/opencode harness packages)"
+            "no harness named {tool} — is it installed? (run `lanius init` to seed the stock claude/codex/opencode harness packages)"
         )
     })
 }
@@ -732,7 +733,7 @@ pub fn delivery_message(payload: &Value) -> Option<String> {
 
 // ── The deliver tool: a planner dispatches work to a worker (M4-B) ────────────
 //
-// `elanus code deliver <worker-session> "<message>"` is how a *planner* coding
+// `lanius code deliver <worker-session> "<message>"` is how a *planner* coding
 // session hands work to a *worker* coding session without busy-waiting. It is the
 // origination half the M4-A loop left open: M4-A routes a worker's completion back
 // to whoever asked; this is how a coding-session planner *becomes* that asker.
@@ -750,10 +751,10 @@ pub fn delivery_message(payload: &Value) -> Option<String> {
 // resuming it. The safety here is the audit trail: who dispatched what to whom, on
 // the bus, with honest provenance — not a permission check.
 
-/// `elanus code deliver <worker-session> "<message>"` — dispatch work to a worker.
+/// `lanius code deliver <worker-session> "<message>"` — dispatch work to a worker.
 ///
-/// Run from inside a coding session (the launcher sets `ELANUS_CODE_SESSION` /
-/// `ELANUS_CODE_AGENT` in the child's env): that running session is recorded as the
+/// Run from inside a coding session (the launcher sets `LANIUS_CODE_SESSION` /
+/// `LANIUS_CODE_AGENT` in the child's env): that running session is recorded as the
 /// **requester**, so M4-A routes the worker's completion back to it. Fails cleanly
 /// if there is no running-session identity in the env, if the worker session has no
 /// durable record (never launched / wrong id), or if a session tries to deliver to
@@ -769,9 +770,9 @@ pub fn deliver(root: &Root, worker_session: &str, message: &str) -> Result<()> {
     let requester = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
     let Some(requester) = requester else {
         bail!(
-            "elanus code deliver must run inside a coding session \
+            "lanius code deliver must run inside a coding session \
              (no {ENV_SESSION} in the environment — are you running it from a \
-             session launched by `elanus code`?)"
+             session launched by `lanius code`?)"
         );
     };
     let id = record_delivery(root, &requester, worker_session, message)?;
@@ -800,10 +801,10 @@ pub fn record_delivery(
 
 /// Like `record_delivery` but takes an `events.priority` AND returns the
 /// `correlation` that threads the whole round trip — the env-free core both
-/// `record_delivery` (priority 0, id-only façade) and `elanus code ask` call.
+/// `record_delivery` (priority 0, id-only façade) and `lanius code ask` call.
 ///
 /// A non-zero priority rides the inbound delivery (`EmitOpts.priority`), so a
-/// HIGH-priority question (`elanus code ask … --priority 5`) reaches a live sibling
+/// HIGH-priority question (`lanius code ask … --priority 5`) reaches a live sibling
 /// **mid-turn** (the agent-comms HIGH-priority unseen-mail vector — Claude Code's
 /// `mid_cycle_mail_injection`) rather than only on its next turn. The returned
 /// correlation lets `ask` match the worker's completion reply on its OWN inbox: the
@@ -818,7 +819,7 @@ pub fn record_delivery_priority(
 ) -> Result<(i64, String)> {
     let worker_session = worker_session.trim();
     if worker_session.is_empty() {
-        bail!("usage: elanus code deliver <worker-session> \"<message>\"");
+        bail!("usage: lanius code deliver <worker-session> \"<message>\"");
     }
     let message = message.trim();
     if message.is_empty() {
@@ -899,23 +900,23 @@ pub fn record_delivery_priority(
 
 // ── The spawn tool: create a worker and route completion back (D3) ───────────
 //
-// `elanus code spawn <tool> "<task>"` is the async counterpart to the blocking
+// `lanius code spawn <tool> "<task>"` is the async counterpart to the blocking
 // foreground launch. It is deliberately just plumbing + record: the spawner and
 // worker are both the user's coding sessions, so there is no new bus authority
 // and no widened session token. The spawner names a tool and prompt; this command
-// starts a detached elanus wrapper with a pre-generated worker id and reply route,
+// starts a detached lanius wrapper with a pre-generated worker id and reply route,
 // then exits immediately. The wrapper mints its OWN scoped worker identity in
 // `launch()`, runs the tool, and on completion records a kernel-ledger delivery
 // to the spawner's mailbox via `mailbox_for_actor` (never a raw topic).
 
-/// Generate a fresh elanus coding-session id in the existing `code-<8hex>` shape.
+/// Generate a fresh lanius coding-session id in the existing `code-<8hex>` shape.
 /// Kept as a helper so `spawn` and `launch` cannot drift apart.
 fn new_code_session_id() -> String {
     format!("code-{}", &uuid::Uuid::new_v4().to_string()[..8])
 }
 
 /// Select the session id for a launch. A detached `spawn` pre-generates the
-/// worker handle and passes it as `ELANUS_CODE_FORCE_SESSION`; this function uses
+/// worker handle and passes it as `LANIUS_CODE_FORCE_SESSION`; this function uses
 /// it only after `codesession::is_session_principal` accepts the name AND no
 /// credential file already exists for that principal. Reusing an existing forced
 /// id could clobber a live worker's token; because the liveness probe is private
@@ -956,15 +957,15 @@ fn forced_session_token_exists(root: &Root, principal: &str) -> bool {
         .exists()
 }
 
-/// Remove the spawner's live identity from the detached elanus wrapper process
+/// Remove the spawner's live identity from the detached lanius wrapper process
 /// before setting the worker's launch-control env. The wrapper must mint a fresh
-/// worker token in `launch()`: inheriting the spawner's `ELANUS_PACKAGE`,
-/// `ELANUS_BUS_TOKEN`, `ELANUS_CODE_SESSION`, or `ELANUS_CODE_AGENT` would make
+/// worker token in `launch()`: inheriting the spawner's `LANIUS_PACKAGE`,
+/// `LANIUS_BUS_TOKEN`, `LANIUS_CODE_SESSION`, or `LANIUS_CODE_AGENT` would make
 /// provenance ambiguous and could route hooks as the wrong session.
 fn scrub_spawn_wrapper_identity_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
     for var in [
-        "ELANUS_PACKAGE",
-        "ELANUS_BUS_TOKEN",
+        "LANIUS_PACKAGE",
+        "LANIUS_BUS_TOKEN",
         ENV_SESSION,
         ENV_AGENT,
         ENV_FORCE_SESSION,
@@ -976,29 +977,29 @@ fn scrub_spawn_wrapper_identity_env(cmd: &mut std::process::Command) -> &mut std
     cmd
 }
 
-/// `elanus code spawn <tool> "<task>"` — start a worker in the background.
+/// `lanius code spawn <tool> "<task>"` — start a worker in the background.
 ///
-/// Must run from inside a coding session, identified by `ELANUS_CODE_SESSION`.
+/// Must run from inside a coding session, identified by `LANIUS_CODE_SESSION`.
 /// The worker's session id is generated before the child starts and passed to the
-/// detached wrapper as `ELANUS_CODE_FORCE_SESSION`; the wrapper validates that
-/// forced id before minting its scoped token. `ELANUS_CODE_REPLY_TO` and
-/// `ELANUS_CODE_REPLY_CORRELATION` tell the wrapper where to deliver the worker's
+/// detached wrapper as `LANIUS_CODE_FORCE_SESSION`; the wrapper validates that
+/// forced id before minting its scoped token. `LANIUS_CODE_REPLY_TO` and
+/// `LANIUS_CODE_REPLY_CORRELATION` tell the wrapper where to deliver the worker's
 /// completion when `launch()` finishes. The detached wrapper inherits
-/// `ELANUS_ROOT` so it resolves the same ledger/root, but it does NOT inherit the
+/// `LANIUS_ROOT` so it resolves the same ledger/root, but it does NOT inherit the
 /// spawner's session/bus identity.
 pub fn spawn(root: &Root, tool: &str, prompt: &str, provider: Option<&str>) -> Result<()> {
     let spawner = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
     let Some(spawner) = spawner else {
         bail!(
-            "elanus code spawn must run inside a coding session \
+            "lanius code spawn must run inside a coding session \
              (no {ENV_SESSION} in the environment — are you running it from a \
-             session launched by `elanus code`?)"
+             session launched by `lanius code`?)"
         );
     };
 
     let prompt = prompt.trim();
     if prompt.is_empty() {
-        bail!("usage: elanus code spawn <tool> \"<task>\"");
+        bail!("usage: lanius code spawn <tool> \"<task>\"");
     }
 
     let parsed = resolve_external_harness(root, "default", tool)?;
@@ -1012,14 +1013,14 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str, provider: Option<&str>) -> R
     let worker_session = new_code_session_id();
     let correlation = format!("code-spawn-{}", uuid::Uuid::new_v4().simple());
     let self_exe =
-        std::env::current_exe().context("locating the elanus binary for background spawn")?;
+        std::env::current_exe().context("locating the lanius binary for background spawn")?;
 
     let mut cmd = std::process::Command::new(self_exe);
     cmd.arg("code");
     // M2: forward `--provider <name>` BEFORE the tool token so the detached worker
     // wrapper re-enters `launch()` with the same provider selection (the worker
     // funnels through the same parse). Validated for existence/wire-fit in the
-    // child's launch, exactly like a direct `elanus code --provider … <tool>`.
+    // child's launch, exactly like a direct `lanius code --provider … <tool>`.
     if let Some(name) = provider {
         cmd.arg("--provider").arg(name);
     }
@@ -1040,7 +1041,7 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str, provider: Option<&str>) -> R
         .env(ENV_REPLY_TO, &spawner)
         .env(ENV_REPLY_CORRELATION, &correlation)
         .env(ENV_SPAWN_DEPTH, (spawn_depth + 1).to_string())
-        .env("ELANUS_ROOT", &root.dir);
+        .env_dual("ROOT", &root.dir);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -1256,9 +1257,9 @@ pub fn emit_reaper_failure_delivery(
 
 // ── The launch-envelope briefing (M4-B) ───────────────────────────────────────
 //
-// A coding agent does not, on its own, know it is running under elanus, that it may
+// A coding agent does not, on its own, know it is running under lanius, that it may
 // be resumed headlessly, or how hand-off works (docs/handoffs/coding-agents.md,
-// "elanus briefs the session on the envelope at launch"). The launcher injects a
+// "lanius briefs the session on the envelope at launch"). The launcher injects a
 // one-time operating-envelope briefing at launch — CC via `--append-system-prompt`
 // (the out-of-band system layer), Codex by prepending it to the prompt (Codex exec
 // has no system-prompt flag). The per-turn ongoing context (inbox status, claims)
@@ -1266,38 +1267,38 @@ pub fn emit_reaper_failure_delivery(
 
 /// The operating-envelope briefing text, parameterized with this session's own id
 /// so the agent knows its handle. Deliberately short — it tells the agent the
-/// things it can't infer: it runs under elanus; how to create or drive a worker;
+/// things it can't infer: it runs under lanius; how to create or drive a worker;
 /// the two dispatch modes (blocking foreground vs async wake-later); where to ask
 /// for the complete verb list; and that it should behave normally toward its
 /// human.
 fn briefing(session: &str) -> String {
     format!(
-        "You are coding session `{session}` under elanus supervision \
+        "You are coding session `{session}` under lanius supervision \
 (an orchestration layer around you).\n\
 \n\
 - Two independent axes. LAUNCH MODE = how a harness runs: bare \
-`elanus code <tool>` (claude/codex/opencode) opens its interactive TUI; \
-`elanus code <tool> --headless \"<task>\"` runs it non-interactively and captures it \
+`lanius code <tool>` (claude/codex/opencode) opens its interactive TUI; \
+`lanius code <tool> --headless \"<task>\"` runs it non-interactively and captures it \
 (`--worker` = deprecated alias). DRIVE PATTERN = how the result returns: live/blocking — \
 run a `--headless` worker in the foreground, read its result as the command's output; or \
-async — `elanus code spawn <tool> \"<task>\"` / `elanus code deliver <worker> \"<msg>\"`. \
-`elanus code help` lists every verb.\n\
+async — `lanius code spawn <tool> \"<task>\"` / `lanius code deliver <worker> \"<msg>\"`. \
+`lanius code help` lists every verb.\n\
 - For async dispatch (`spawn`/`deliver`), END YOUR TURN cleanly — do NOT poll, sleep, or \
-wait; elanus wakes you later with the result. Live/blocking workers return inline.\n\
+wait; lanius wakes you later with the result. Live/blocking workers return inline.\n\
 - Things addressed to you arrive as a resumed turn with the content in your prompt; \
-you can also pull your own inbox with `elanus code inbox` (only YOUR mailbox). Each \
-turn elanus injects an `[elanus]` note with your inbox status and any memory note. \
+you can also pull your own inbox with `lanius code inbox` (only YOUR mailbox). Each \
+turn lanius injects an `[lanius]` note with your inbox status and any memory note. \
 Prior session activity is on the bus under `obs/agent/<noun>/<session>/`.\n\
 - Otherwise behave exactly as you normally would toward your human, who may or may \
 not be watching this session live."
     )
 }
 
-/// Build the per-session Claude plugin carrying the bootstrap `/elanus` skill plus
+/// Build the per-session Claude plugin carrying the bootstrap `/lanius` skill plus
 /// the profile's visible skills, returning its path for `--plugin-dir`.
 ///
 /// Why a plugin and not `.claude/skills`: Claude only discovers `.claude/skills`
-/// through setting-sources that include project/user — which elanus disables with
+/// through setting-sources that include project/user — which lanius disables with
 /// `--setting-sources ''` to isolate from the user's `~/.claude`
 /// (hooks/CLAUDE.md/settings). Under that isolation, `--add-dir` does NOT register
 /// skills (verified empirically against claude 2.1.195). A plugin loaded via
@@ -1314,31 +1315,31 @@ fn build_claude_skill_plugin(scratch: &Path, skills: &[(String, PathBuf)]) -> Re
         .with_context(|| format!("creating plugin manifest dir {}", manifest_dir.display()))?;
     std::fs::write(
         manifest_dir.join("plugin.json"),
-        r#"{"name":"elanus","version":"1.0.0","description":"elanus session skills"}"#,
+        r#"{"name":"lanius","version":"1.0.0","description":"lanius session skills"}"#,
     )
-    .with_context(|| "writing the elanus plugin manifest".to_string())?;
+    .with_context(|| "writing the lanius plugin manifest".to_string())?;
     // The bootstrap dispatch skill — a real file, it has no source package.
     let skills_dir = plugin.join("skills");
-    let elanus_skill = skills_dir.join("elanus");
+    let elanus_skill = skills_dir.join("lanius");
     std::fs::create_dir_all(&elanus_skill)
-        .with_context(|| format!("creating elanus skill dir {}", elanus_skill.display()))?;
+        .with_context(|| format!("creating lanius skill dir {}", elanus_skill.display()))?;
     let skill_path = elanus_skill.join("SKILL.md");
-    std::fs::write(&skill_path, ELANUS_SKILL)
+    std::fs::write(&skill_path, LANIUS_SKILL)
         .with_context(|| format!("writing {}", skill_path.display()))?;
     // The profile's visible skills, symlinked alongside it (best-effort per skill).
     link_skill_packages(&skills_dir, skills)?;
     Ok(plugin)
 }
 
-/// Take the `--profile <name>` launch flag: the elanus profile whose VISIBLE
+/// Take the `--profile <name>` launch flag: the lanius profile whose VISIBLE
 /// skills this coding session adopts (the same `discover_for_profile ∩
 /// skill_visible` set the native renderer uses, `render.rs`). Default `"default"`
-/// — every `elanus code` session materializes the default profile's skills, the
+/// — every `lanius code` session materializes the default profile's skills, the
 /// same whole-system config home native agents read. The flag and its value are
 /// stripped before the args reach the tool. A bare trailing `--profile` (no value)
 /// is ignored (keeps the default). Returns `(profile_name, filtered_args)`.
 ///
-/// NB: elanus consumes the LONG `--profile`; Codex's own config-profile is still
+/// NB: lanius consumes the LONG `--profile`; Codex's own config-profile is still
 /// reachable via its short `-p` form, which passes through to codex untouched.
 fn take_profile_flag(args: &[String]) -> (String, Vec<String>) {
     let mut profile: Option<String> = None;
@@ -1367,7 +1368,7 @@ fn take_profile_flag(args: &[String]) -> (String, Vec<String>) {
 /// `discover_for_profile ∩ skill_visible ∩ has-SKILL.md` set the native renderer
 /// surfaces (`render.rs` §3), as `(name, dir)` pairs. Best-effort — a profile-load
 /// or discovery error logs and yields an empty set, so a coding launch is never
-/// fatal-blocked on its skills (it just gets the bootstrap `/elanus` skill alone).
+/// fatal-blocked on its skills (it just gets the bootstrap `/lanius` skill alone).
 fn visible_skill_packages(root: &Root, profile_name: &str) -> Vec<(String, PathBuf)> {
     let prof = match crate::profile::load(root, profile_name) {
         Ok((p, _)) => p,
@@ -1420,13 +1421,13 @@ fn link_skill_packages(skills_dir: &Path, skills: &[(String, PathBuf)]) -> Resul
     Ok(())
 }
 
-/// Build a per-session, ephemeral `CODEX_HOME` carrying elanus's managed codex
+/// Build a per-session, ephemeral `CODEX_HOME` carrying lanius's managed codex
 /// hooks and, when present, the profile's skills. codex 0.141.0 scans
 /// `$CODEX_HOME/skills` but has no per-invocation skills lever, and its hook config
 /// lives in `config.toml`; an isolated home is therefore the scoped way to add both
 /// without writing into the user's real `~/.codex` or the repo. The user's real
 /// auth/version stay symlinked (secret read in place, never copied), while
-/// `config.toml` is copied then appended with the elanus PostToolUse hook.
+/// `config.toml` is copied then appended with the lanius PostToolUse hook.
 fn build_codex_skills_home(
     root: &Root,
     session: &str,
@@ -1535,9 +1536,9 @@ fn dirs_next_home_codex() -> Option<PathBuf> {
 // (`--setting-sources ''` for claude, `--pure` for opencode, an ephemeral
 // CODEX_HOME for codex) so a session does not drag in the user's global hooks or
 // plugins. That isolation used to throw the user's MCP SERVER registrations out
-// with the bathwater. An MCP server is user-authority, not elanus-authority
+// with the bathwater. An MCP server is user-authority, not lanius-authority
 // (docs: safety = audit, not restriction; no trust boundary between the user's
-// own agents) — the user configured it for this tool, so an elanus launch
+// own agents) — the user configured it for this tool, so an lanius launch
 // selectively MERGES the MCP registrations back in while still excluding
 // everything else (hooks, plugins, misc settings). record-not-gate: the merged
 // server names are recorded on session/start, never approved or filtered. See
@@ -1729,7 +1730,7 @@ fn opencode_user_mcp_servers() -> (serde_json::Map<String, Value>, Option<String
 }
 
 /// The user's codex MCP server names, read from `$CODEX_HOME/config.toml`'s
-/// `[mcp_servers]` table (the user's real codex home, before elanus copies it into
+/// `[mcp_servers]` table (the user's real codex home, before lanius copies it into
 /// the per-session home). Codex already carries these by COPYING config.toml
 /// verbatim into the session home (`build_codex_skills_home`), so this reader is
 /// only for the session/start record — the merge itself is the copy. Fail-open:
@@ -1825,7 +1826,7 @@ fn take_room_flag(args: &[String]) -> (Option<String>, Vec<String>) {
 /// the result, and prints a marked result for a parent agent to read. `--worker`
 /// is the DEPRECATED ALIAS (the pre-HM3 spelling) and still works, with a one-line
 /// stderr deprecation notice. Either flag is stripped before the real tool sees
-/// argv, matching the other elanus-only launch flags.
+/// argv, matching the other lanius-only launch flags.
 fn take_headless_flag(args: &[String]) -> (bool, Vec<String>) {
     let mut headless = false;
     let mut saw_worker_alias = false;
@@ -1923,7 +1924,7 @@ fn extract_reasoning_effort_config(config: &str) -> Option<String> {
 /// the populated `RequestedGrants` plus the remaining args (which are forwarded
 /// to the tool untouched, just like the other take_*_flag helpers).
 ///
-/// Flags recognised (each is an elanus-only flag stripped before the tool sees
+/// Flags recognised (each is an lanius-only flag stripped before the tool sees
 /// argv):
 ///
 /// - `--budget <N>`           → `budget: Some(N)` (u64; rejects non-numeric)
@@ -2120,17 +2121,17 @@ fn validate_fs_grant_path(flag: &str, path: &str) -> anyhow::Result<()> {
 /// fragile against flag values like `-m <model>`). The user's prompt stays the
 /// positional; the briefing arrives as out-of-band context.
 fn codex_briefing_block(brief: &str) -> String {
-    format!("[elanus operating envelope — read before acting]\n{brief}\n")
+    format!("[lanius operating envelope — read before acting]\n{brief}\n")
 }
 
 /// Heuristically decide whether the `codex exec` argv already carries a prompt
 /// positional. Codex accepts many flags before the prompt; we do NOT attempt a
 /// full Codex CLI parse here. Instead, skip values for the common value-taking
-/// flags elanus may pass through, honor `--`, and treat the first remaining
+/// flags lanius may pass through, honor `--`, and treat the first remaining
 /// non-flag token as the prompt. This is intentionally conservative enough to
 /// distinguish "no non-flag prompt was supplied" from the normal
-/// `elanus code codex "<task>"` launch shape without baking Codex's full clap
-/// grammar into elanus.
+/// `lanius code codex "<task>"` launch shape without baking Codex's full clap
+/// grammar into lanius.
 fn codex_args_have_prompt(args: &[String]) -> bool {
     let value_flags = [
         "-c",
@@ -2175,9 +2176,9 @@ fn codex_args_have_prompt(args: &[String]) -> bool {
 
 /// If Codex was launched without a prompt positional, promote the launcher's own
 /// stdin to that positional prompt. This keeps Codex's stdin reserved for the
-/// elanus briefing block: the user prompt always reaches Codex as argv, and the
+/// lanius briefing block: the user prompt always reaches Codex as argv, and the
 /// briefing still arrives as piped context. A terminal stdin is treated as absent
-/// so `elanus code codex` fails promptly instead of waiting forever.
+/// so `lanius code codex` fails promptly instead of waiting forever.
 fn codex_args_with_prompt_from_stdin(args: &[String]) -> Result<Vec<String>> {
     if codex_args_have_prompt(args) {
         return Ok(args.to_vec());
@@ -2192,7 +2193,7 @@ fn codex_args_with_prompt_from_stdin(args: &[String]) -> Result<Vec<String>> {
     }
     if prompt.trim().is_empty() {
         bail!(
-            "no prompt provided: pass it as an argument (elanus code codex \"<task>\") \
+            "no prompt provided: pass it as an argument (lanius code codex \"<task>\") \
              or pipe it on stdin"
         );
     }
@@ -2215,16 +2216,16 @@ fn codex_args_with_prompt_from_stdin(args: &[String]) -> Result<Vec<String>> {
 // inbox read is `codesession::inbox_for_session`, a SQL query of the `events`
 // ledger filtered to the session's OWN mailbox `in/agent/<noun>/<session>`, where
 // `<noun>`/`<session>` come from the running session's own env (the launcher set
-// ELANUS_CODE_AGENT / ELANUS_CODE_SESSION) — NEVER from an argument. So a session
+// LANIUS_CODE_AGENT / LANIUS_CODE_SESSION) — NEVER from an argument. So a session
 // cannot name another session's inbox: the mailbox topic is built from its own
-// identity, exactly as `elanus code hook` publishes as itself. The emit-only bus
+// identity, exactly as `lanius code hook` publishes as itself. The emit-only bus
 // token's subscribe scope is UNTOUCHED (still empty — `codesession::SessionToken`
 // `subscribe: Vec::new()`); the session still cannot read the bus at all. The new
 // read authority is the kernel-side query gated by the env-derived identity, the
 // approach docs/handoffs/coding-agents.md M3 prefers.
 
-/// `elanus code inbox` — list THIS session's own inbox (run from inside a
-/// session). Reads ELANUS_CODE_SESSION / ELANUS_CODE_AGENT from the env the
+/// `lanius code inbox` — list THIS session's own inbox (run from inside a
+/// session). Reads LANIUS_CODE_SESSION / LANIUS_CODE_AGENT from the env the
 /// launcher set; the inbox is its OWN mailbox by construction (no session-id arg,
 /// so it can never name another session's inbox). Prints the pending/unseen
 /// deliveries (message + who-from + correlation) and marks them seen so a second
@@ -2241,9 +2242,9 @@ pub fn inbox_cmd(root: &Root, args: &[String]) -> Result<()> {
     let agent = std::env::var(ENV_AGENT).ok().filter(|s| !s.is_empty());
     let (Some(session), Some(agent)) = (session, agent) else {
         bail!(
-            "elanus code inbox must run inside a coding session \
+            "lanius code inbox must run inside a coding session \
              (no {ENV_SESSION}/{ENV_AGENT} in the environment — run it from a \
-             session launched by `elanus code`)"
+             session launched by `lanius code`)"
         );
     };
 
@@ -2354,7 +2355,7 @@ fn clip_task(text: &str) -> String {
     }
 }
 
-/// `elanus code ask <session> "<question>" [--timeout SECS] [--priority N] [--json]`
+/// `lanius code ask <session> "<question>" [--timeout SECS] [--priority N] [--json]`
 /// — a blocking deliver-and-wait (sibling-resolution skills "ask-sibling"). Sends
 /// the question to `<session>` threaded on a fresh correlation, then BLOCKS up to
 /// `--timeout` (default 20s) polling THIS session's OWN inbox (~1/s) for the
@@ -2369,9 +2370,9 @@ pub fn ask_cmd(root: &Root, args: &[String]) -> Result<()> {
     let own_noun = std::env::var(ENV_AGENT).ok().filter(|s| !s.is_empty());
     let (Some(own_session), Some(own_noun)) = (own_session, own_noun) else {
         bail!(
-            "elanus code ask must run inside a coding session \
+            "lanius code ask must run inside a coding session \
              (no {ENV_SESSION}/{ENV_AGENT} in the environment — run it from a \
-             session launched by `elanus code`)"
+             session launched by `lanius code`)"
         );
     };
 
@@ -2408,7 +2409,7 @@ pub fn ask_cmd(root: &Root, args: &[String]) -> Result<()> {
     let question = words.join(" ");
     if target.is_empty() || question.trim().is_empty() {
         bail!(
-            "usage: elanus code ask <session> \"<question>\" [--timeout SECS] [--priority N] [--json]"
+            "usage: lanius code ask <session> \"<question>\" [--timeout SECS] [--priority N] [--json]"
         );
     }
 
@@ -2471,11 +2472,11 @@ pub fn ask_cmd(root: &Root, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `elanus code whose <path>` / `elanus code whose --dirty [--json]` — change
+/// `lanius code whose <path>` / `lanius code whose --dirty [--json]` — change
 /// attribution (SI4). Maps a path (or the whole `git status --porcelain` set) to its
 /// owning coding session via `codesession::whose_path`, printing the owner, its
 /// tool, humanized last-active, and current task. A path no session claims reads as
-/// "unattributed" (likely the viewer's own work, or untracked-by-elanus).
+/// "unattributed" (likely the viewer's own work, or untracked-by-lanius).
 pub fn whose_cmd(root: &Root, args: &[String]) -> Result<()> {
     let want_json = args.iter().any(|a| a == "--json");
     let want_dirty = args.iter().any(|a| a == "--dirty");
@@ -2512,7 +2513,7 @@ pub fn whose_cmd(root: &Root, args: &[String]) -> Result<()> {
 
     // Single-path form: the first non-flag argument.
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
-        bail!("usage: elanus code whose <path>   |   elanus code whose --dirty [--json]");
+        bail!("usage: lanius code whose <path>   |   lanius code whose --dirty [--json]");
     };
     if want_json {
         println!(
@@ -2594,7 +2595,7 @@ fn whose_json(root: &Root, path: &str, viewer: Option<&str>) -> Value {
 
 // ── M5: advisory edit claims (run inside a session) ───────────────────────────
 //
-// `elanus code claim <path>` / `elanus code unclaim <path>` record/clear an
+// `lanius code claim <path>` / `lanius code unclaim <path>` record/clear an
 // advisory claim that THIS session is editing <path>, visible to its roommates in
 // their per-turn injection. Identity (session + agent) comes from the env the
 // launcher set — never an argument — and the room from the session's own durable
@@ -2624,7 +2625,7 @@ fn canonical_workdir(workdir: &Path) -> PathBuf {
 }
 
 /// Derive the stable default room id for a canonical workdir. The id only has to
-/// be stable for the SAME path within one elanus install (it scopes a ledger
+/// be stable for the SAME path within one lanius install (it scopes a ledger
 /// query, never a bus topic), and short + string-safe. We hash the canonical path
 /// with a deterministic FNV-1a (NOT DefaultHasher — its hashing is not guaranteed
 /// stable across toolchains, and two concurrently-running sessions must agree) and
@@ -2663,7 +2664,7 @@ fn session_room_identity(root: &Root) -> Result<(String, String)> {
         bail!(
             "this command must run inside a coding session \
              (no {ENV_SESSION} in the environment — run it from a session launched \
-             by `elanus code`)"
+             by `lanius code`)"
         );
     };
     let rec = codesession::read_record(root, &session)
@@ -2686,14 +2687,14 @@ fn session_room_identity(root: &Root) -> Result<(String, String)> {
     Ok((session, room))
 }
 
-/// `elanus code claim <path>` — announce that THIS session is editing <path>
+/// `lanius code claim <path>` — announce that THIS session is editing <path>
 /// (advisory; visible to roommates, locks nothing). Identity + room are derived
 /// from the running session, never an argument. Re-claiming the same path is
 /// idempotent.
 pub fn claim_cmd(root: &Root, path: &str) -> Result<()> {
     let path = path.trim();
     if path.is_empty() {
-        bail!("usage: elanus code claim <path>");
+        bail!("usage: lanius code claim <path>");
     }
     let (session, room) = session_room_identity(root)?;
     // Canonicalize to the SAME absolute form auto_claim_write uses (BUG B): a manual
@@ -2716,14 +2717,14 @@ editing it; nothing is locked)"
 // ── SA3 (write half): touching a file IS the claim ───────────────────────────
 //
 // docs/handoffs/sibling-awareness.md SA3 + coding-agent-tails.md SA3. The
-// acceptance: an agent that EDITS a file without ever running `elanus code claim`
+// acceptance: an agent that EDITS a file without ever running `lanius code claim`
 // must still appear, for that path, in a roommate's `claims` and per-turn
 // injection — so coordination stops depending on an agent remembering to claim.
 //
 // SOURCE DECISION (settled): we DO NOT drive auto-claims from an `obs/fs/#`
 // subscriber. The obs/fs WRITE camera (src/exec.rs emit_fs_delta) only brackets
 // CAGED actors (the kernel shell/exec + package actors via Cage::shell_command /
-// Cage::command). Coding agents (claude/codex/opencode) are NOT in elanus's cage
+// Cage::command). Coding agents (claude/codex/opencode) are NOT in lanius's cage
 // — each keeps its own tool sandbox; the cage bypass is a deferred milestone
 // (coding-agents.md) — so an obs/fs subscriber would NEVER witness a coding
 // agent's edits and would NOT satisfy SA3's acceptance. Instead we auto-claim
@@ -2837,13 +2838,13 @@ fn claude_write_tool_path<'a>(tool: &str, input: Option<&'a Value>) -> Option<&'
         .filter(|s| !s.is_empty())
 }
 
-/// `elanus code unclaim <path>` — release THIS session's advisory claim on <path>
+/// `lanius code unclaim <path>` — release THIS session's advisory claim on <path>
 /// (e.g. when it has finished). Only the session's OWN claim is cleared; it can
 /// never clear a peer's. Idempotent (unclaiming a path it doesn't hold is a no-op).
 pub fn unclaim_cmd(root: &Root, path: &str) -> Result<()> {
     let path = path.trim();
     if path.is_empty() {
-        bail!("usage: elanus code unclaim <path>");
+        bail!("usage: lanius code unclaim <path>");
     }
     let (session, room) = session_room_identity(root)?;
     let removed = codesession::remove_claim(root, &room, &session, path)?;
@@ -2855,7 +2856,7 @@ pub fn unclaim_cmd(root: &Root, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// `elanus code claims [--json]` — show what THIS session sees in its room: its
+/// `lanius code claims [--json]` — show what THIS session sees in its room: its
 /// own claims and its peers' (the advisory coordination view). Read-only.
 pub fn claims_cmd(root: &Root, args: &[String]) -> Result<()> {
     let want_json = args.iter().any(|a| a == "--json");
@@ -2895,7 +2896,7 @@ pub fn claims_cmd(root: &Root, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `elanus code note <session> "<text>"` — set (or replace) a session's memory
+/// `lanius code note <session> "<text>"` — set (or replace) a session's memory
 /// note, surfaced by the per-turn injection. An empty `<text>` clears the note.
 /// Run by a planner (or a human) to leave a worker a persistent reminder. Unlike
 /// `inbox`, this names the target session explicitly (a planner annotates a
@@ -2904,7 +2905,7 @@ pub fn claims_cmd(root: &Root, args: &[String]) -> Result<()> {
 pub fn note_cmd(root: &Root, session: &str, text: &str) -> Result<()> {
     let session = session.trim();
     if session.is_empty() {
-        bail!("usage: elanus code note <session> \"<text>\"  (empty text clears the note)");
+        bail!("usage: lanius code note <session> \"<text>\"  (empty text clears the note)");
     }
     // A note can only attach to a real recorded session — otherwise it would sit
     // unread (nothing surfaces it). Keep the failure honest.
@@ -2924,7 +2925,7 @@ pub fn note_cmd(root: &Root, session: &str, text: &str) -> Result<()> {
 }
 
 /// Build the per-turn injection text for a session — the OUT-OF-BAND system note
-/// (system-reminder layer for CC, the `[elanus]` resume block for codex) that
+/// (system-reminder layer for CC, the `[lanius]` resume block for codex) that
 /// reports the session's current inbox status and any memory note. Returns None
 /// when there is nothing to say (no unseen inbox, no note) so a quiet turn injects
 /// nothing. Deliberately short; it is per-turn context, kept OUT of the cached
@@ -2978,7 +2979,7 @@ pub fn achievable_vector(agent_noun: &str, desired: InjectionVector) -> Injectio
 /// Load the durable memory blocks to render in this coding session's per-turn
 /// injection: its agent-noun-owned agent-scope blocks + its session-scope blocks,
 /// ordered by priority — EXCLUDING the well-known `note` block (rendered separately
-/// as `[elanus note]`). Best-effort: a ledger error yields no blocks rather than
+/// as `[lanius note]`). Best-effort: a ledger error yields no blocks rather than
 /// breaking the (telemetry-tier) injection.
 fn session_memory_blocks(
     root: &Root,
@@ -3000,7 +3001,7 @@ fn session_memory_blocks(
 
 /// M4 — compose the mid-cycle injection text (Claude Code): the pending,
 /// not-yet-delivered mid-cycle blocks for this session, rendered in the same
-/// `[elanus block: …]` shape the next-turn vector uses, bracketed so the model
+/// `[lanius block: …]` shape the next-turn vector uses, bracketed so the model
 /// reads them as a system note. `None` when nothing is pending (the dedup'd common
 /// case), so a quiet tool call emits nothing. MUTATES the dedup table — call only
 /// from the emitting hook arm.
@@ -3013,11 +3014,11 @@ fn mid_cycle_injection(root: &Root, agent_noun: &str, session: &str) -> Option<S
         return None;
     }
     let mut out = String::from(
-        "[elanus] Urgent context delivered mid-task (priority block(s) — read before continuing):",
+        "[lanius] Urgent context delivered mid-task (priority block(s) — read before continuing):",
     );
     for b in &pending {
         out.push_str(&format!(
-            "\n[elanus block: {}] {}",
+            "\n[lanius block: {}] {}",
             b.name,
             clip(&b.content, 2000)
         ));
@@ -3040,7 +3041,7 @@ fn mid_cycle_mail_injection(root: &Root, agent_noun: &str, session: &str) -> Opt
         return None;
     }
     let mut out = String::from(
-        "[elanus] Urgent mail arrived mid-task (high-priority — run `elanus code inbox` to read):",
+        "[lanius] Urgent mail arrived mid-task (high-priority — run `lanius code inbox` to read):",
     );
     for m in &pending {
         let from = m.from.as_deref().unwrap_or("?");
@@ -3140,14 +3141,14 @@ fn channel_optin(root: &Root) -> (Vec<String>, usize) {
 /// from `inbox_for_session` (NOT written to `context_blocks` — the inbox changes
 /// every turn). Returns `None` when the inbox has no unseen mail, so a quiet turn
 /// produces no block. This is the ONE producer of the inbox surface — the old
-/// hardcoded `[elanus] You have N new message(s)` text in `turn_injection` is now
+/// hardcoded `[lanius] You have N new message(s)` text in `turn_injection` is now
 /// just this block's content.
 fn inbox_block(unseen: &[codesession::InboxItem]) -> Option<crate::context_store::LoadedBlock> {
     if unseen.is_empty() {
         return None;
     }
     let mut content = format!(
-        "You have {} new message(s) in your inbox. Run `elanus code inbox` to read them.",
+        "You have {} new message(s) in your inbox. Run `lanius code inbox` to read them.",
         unseen.len()
     );
     if let Some(latest) = unseen.last() {
@@ -3207,7 +3208,7 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
     // session: its agent-noun-owned agent-scope blocks + its session-scope blocks,
     // ordered by priority. The coding agent has no profile document, so blocks are
     // keyed by agent noun + session (`load_session_blocks`), not a Profile. The
-    // `note` block is rendered separately above (as `[elanus note]`) so it is
+    // `note` block is rendered separately above (as `[lanius note]`) so it is
     // excluded here to avoid showing it twice.
     let blocks = session_memory_blocks(root, agent_noun, session);
     // If any visible block wanted the louder mid-cycle vector but this harness can't
@@ -3252,7 +3253,7 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
     // claims) is DEFERRED: it is a new long-running runtime component whose read
     // half rides the not-yet-shipped read camera, out of scope for this read-only
     // injection change. Until it lands, "what each sibling is touching" is only as
-    // fresh as the claims an agent volunteered via `elanus code claim`.
+    // fresh as the claims an agent volunteered via `lanius code claim`.
     let live_siblings = if workdir.is_empty() {
         Vec::new()
     } else {
@@ -3260,7 +3261,7 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
     };
 
     // C2 (agent-comms) — the inbox is now a COMPUTED block, the one producer of the
-    // inbox surface (replacing the old hardcoded `[elanus] You have N message(s)`
+    // inbox surface (replacing the old hardcoded `[lanius] You have N message(s)`
     // text). Ephemeral: computed from the unseen mail each turn, never persisted.
     // None when there is no unseen mail, so a quiet inbox adds no block.
     let inbox_blk = inbox_block(&unseen);
@@ -3307,7 +3308,7 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
         const MAX_NAMED: usize = 2;
         let n = live_siblings.len();
         out.push_str(&format!(
-            "[elanus siblings] {n} other coding session(s) active here (advisory — \
+            "[lanius siblings] {n} other coding session(s) active here (advisory — \
 divide the work, nothing is locked): "
         ));
         let named: Vec<String> = live_siblings
@@ -3357,13 +3358,13 @@ collision (advisory).",
     }
 
     // C2 (agent-comms): the inbox is rendered as its computed block in the same
-    // `[elanus block: …]` shape the memory blocks use — one producer, one path. An
+    // `[lanius block: …]` shape the memory blocks use — one producer, one path. An
     // empty inbox produced no block above, so nothing is emitted here (the quiet
-    // turn is preserved). The old hardcoded "[elanus] You have N message(s)" text is
+    // turn is preserved). The old hardcoded "[lanius] You have N message(s)" text is
     // gone; its content moved into `inbox_block`.
     if let Some(b) = &inbox_blk {
         out.push_str(&format!(
-            "[elanus block: {}] {}",
+            "[lanius block: {}] {}",
             b.name,
             clip(&b.content, 2000)
         ));
@@ -3372,7 +3373,7 @@ collision (advisory).",
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&format!("[elanus note] {}", clip(&note, 2000)));
+        out.push_str(&format!("[lanius note] {}", clip(&note, 2000)));
     }
     // M4: render the session's memory blocks, in priority order, reusing the
     // built-in {name, text} block shape. One labeled line per block so the agent
@@ -3382,7 +3383,7 @@ collision (advisory).",
             out.push('\n');
         }
         out.push_str(&format!(
-            "[elanus block: {}] {}",
+            "[lanius block: {}] {}",
             b.name,
             clip(&b.content, 2000)
         ));
@@ -3393,7 +3394,7 @@ collision (advisory).",
             out.push('\n');
         }
         out.push_str(&format!(
-            "[elanus block: {}] {}",
+            "[lanius block: {}] {}",
             b.name,
             clip(&b.content, 2000)
         ));
@@ -3403,7 +3404,7 @@ collision (advisory).",
     // is locked. One line per claim (capped so a busy room can't flood the turn).
     if !peer_claims.is_empty() {
         out.push_str(&format!(
-            "\n[elanus peers] {} other session(s) in room {room} have active edit claims \
+            "\n[lanius peers] {} other session(s) in room {room} have active edit claims \
 (advisory — route around these files, nothing is locked):",
             peer_claims
                 .iter()
@@ -3451,7 +3452,7 @@ fn user_prompt_mentions_dispatch(payload: &serde_json::Value) -> bool {
     .any(|needle| prompt.contains(needle))
 }
 
-/// Compose the message a driven resume hands the model: the per-turn `[elanus]`
+/// Compose the message a driven resume hands the model: the per-turn `[lanius]`
 /// injection block (inbox status + memory note) prepended to the delivered
 /// message, OUT OF BAND. The injection is bracketed so the model reads it as a
 /// system note, not as the user's words; the delivered message follows under its
@@ -3460,7 +3461,7 @@ fn user_prompt_mentions_dispatch(payload: &serde_json::Value) -> bool {
 fn build_resume_message(root: &Root, agent_noun: &str, session: &str, message: &str) -> String {
     match turn_injection(root, agent_noun, session) {
         Some(ctx) => {
-            format!("{ctx}\n[elanus] The message you were resumed with follows.\n\n{message}")
+            format!("{ctx}\n[lanius] The message you were resumed with follows.\n\n{message}")
         }
         None => message.to_string(),
     }
@@ -3583,10 +3584,10 @@ fn launch_external_harness(
             start_record["approvals"] = json!(approvals);
             start_record["sandbox"] = json!(sandbox);
         }
-        // The vendor sandbox is off (above), but elanus's OWN cage is on for this
+        // The vendor sandbox is off (above), but lanius's OWN cage is on for this
         // cell (docs/handoffs/codex-cage.md M3): record its posture so a session's
         // authority stays fully reconstructable from its trace — showing BOTH that
-        // codex's gate is off AND that elanus's cage fences writes to the workdir
+        // codex's gate is off AND that lanius's cage fences writes to the workdir
         // and cuts external egress.
         if let Some(cage) = codex_headless_cage_posture(&external.decl.name, mode) {
             start_record["elanus_cage"] = cage;
@@ -3599,7 +3600,7 @@ fn launch_external_harness(
             start_record,
         );
         if !captured {
-            let note = "[elanus] NOTE: elanus can't reach its message bus, so this \
+            let note = "[lanius] NOTE: lanius can't reach its message bus, so this \
                 session is UNCAPTURED — nothing you do is being recorded, no sibling \
                 awareness, no mail can reach you, and any `spawn`/`deliver` you attempt \
                 will not be delivered. Do the work, but do NOT claim you filed mail or \
@@ -3619,10 +3620,10 @@ fn launch_external_harness(
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
-            .env("ELANUS_ROOT", &root.dir)
+            .env_dual("ROOT", &root.dir)
             .env(ENV_SESSION, &session)
             .env(ENV_AGENT, &agent)
-            .env("ELANUS_PACKAGE", &principal)
+            .env_dual("PACKAGE", &principal)
             .env(crate::harness::ENV_BUS_TOKEN, &bus_token)
             .env(crate::harness::ENV_WORKDIR, &workdir)
             .env(crate::harness::ENV_MODE, mode_str)
@@ -3749,7 +3750,7 @@ fn launch_external_harness(
     Ok(())
 }
 
-/// `elanus code <tool> [args...]` — launch the real coding agent, observed.
+/// `lanius code <tool> [args...]` — launch the real coding agent, observed.
 pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) -> Result<()> {
     // If this launcher is itself running inside a coding session, capture that
     // parent edge before this function sets ENV_SESSION for the child session.
@@ -3780,7 +3781,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
     // The launch-envelope briefing rides a launch flag (default on; `--no-brief`
     // suppresses it). The coordination room rides `--room <id>` (M5). Claude's
     // worker shape rides `--worker`. M4 grant-narrowing flags (`--budget`,
-    // `--grant-*`) are also elanus-only and stripped before the tool sees argv.
+    // `--grant-*`) are also lanius-only and stripped before the tool sees argv.
     // Order matters: pull M4 flags first (they may appear anywhere), then the
     // others; all return filtered args.
     let (requested_grants, args) = take_grants_flags(args)?;
@@ -3809,7 +3810,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
     // opencode `$OPENCODE_CONFIG_DIR`). Computed once here; `--profile` selects the
     // profile (default "default"). Empty (best-effort) when the profile has no
     // visible skills or discovery fails — then a session sees only the bootstrap
-    // `/elanus` skill, exactly as before.
+    // `/lanius` skill, exactly as before.
     let skills = visible_skill_packages(root, &profile_name);
     let external = resolve_external_harness(root, &profile_name, tool)?;
     return launch_external_harness(
@@ -3847,7 +3848,7 @@ struct ClaudeLaunch<'a> {
 }
 
 /// Reconstruct the launch argv that the thin adapter binaries pass to a capture
-/// function from `ELANUS_CODE_PROMPT`. The prompt is the user's TASK and must travel
+/// function from `LANIUS_CODE_PROMPT`. The prompt is the user's TASK and must travel
 /// as ONE positional arg — splitting on whitespace shreds a multi-word prompt (codex
 /// then keeps only the first token). So the whole prompt is a single argv element.
 fn adapter_prompt_args(prompt: Option<&str>) -> Vec<String> {
@@ -3858,7 +3859,7 @@ fn adapter_prompt_args(prompt: Option<&str>) -> Vec<String> {
 }
 
 /// The argv an adapter passes to its capture fn: the FULL raw argv (harness flags +
-/// prompt) from `ELANUS_CODE_ARGS` so codex `-c …`/etc. reach the tool and the prompt
+/// prompt) from `LANIUS_CODE_ARGS` so codex `-c …`/etc. reach the tool and the prompt
 /// is parsed correctly — falling back to the single joined prompt when no argv was set.
 fn adapter_args(ctx: &crate::harness::Ctx) -> Vec<String> {
     if ctx.args().is_empty() {
@@ -3868,7 +3869,7 @@ fn adapter_args(ctx: &crate::harness::Ctx) -> Vec<String> {
     }
 }
 
-/// Reconstruct the visible skill package list from `ELANUS_CODE_SKILLS_DIR`.
+/// Reconstruct the visible skill package list from `LANIUS_CODE_SKILLS_DIR`.
 fn skill_packages_from_dir(skills_dir: Option<&Path>) -> Vec<(String, PathBuf)> {
     let Some(skills_dir) = skills_dir else {
         return Vec::new();
@@ -3925,7 +3926,7 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
         let settings = claude_settings(&self_exe, root);
         std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
             .with_context(|| format!("writing {}", settings_path.display()))?;
-        // M1: the bootstrap `/elanus` skill + the profile's visible skills,
+        // M1: the bootstrap `/lanius` skill + the profile's visible skills,
         // delivered as a per-session plugin (the only channel that surfaces
         // skills under `--setting-sources ''` from an ephemeral path).
         let plugin_dir = build_claude_skill_plugin(&scratch, skills)?;
@@ -3952,7 +3953,7 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
                 // without this every Write/Edit is auto-denied and the worker
                 // silently produces nothing (it cost us two planner runs to
                 // learn that). Tim's ruling 2026-07-06: skip-permissions for
-                // parity with codex's danger-full-access posture; an elanus
+                // parity with codex's danger-full-access posture; an lanius
                 // cage around headless claude (like codex-cage) is the
                 // fast-follow that re-fences it. TUI launches keep prompts —
                 // a human is present there.
@@ -3978,9 +3979,9 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
             };
             let mut cmd = Command::new(&program);
             cmd.args(&tool_args);
-            // Scrub elanus's provider credentials FIRST so Claude Code uses
-            // its own login (`~/.claude`) rather than inheriting elanus's
-            // DeepSeek ANTHROPIC_BASE_URL/API_KEY (Task 2). The ELANUS_*
+            // Scrub lanius's provider credentials FIRST so Claude Code uses
+            // its own login (`~/.claude`) rather than inheriting lanius's
+            // DeepSeek ANTHROPIC_BASE_URL/API_KEY (Task 2). The LANIUS_*
             // vars set below are NOT scrubbed — the hook bridge depends on
             // them.
             scrub_provider_creds(&mut cmd);
@@ -3992,14 +3993,14 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
                 apply_provider_injection_env(&mut cmd, inj);
             }
             // The session's own identity, carried to the hook bridge children
-            // CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are what
-            // `elanus bus pub` authenticates with (src/buscli.rs); ELANUS_CODE_*
+            // CC spawns. LANIUS_PACKAGE + LANIUS_BUS_TOKEN are what
+            // `lanius bus pub` authenticates with (src/buscli.rs); LANIUS_CODE_*
             // tell the bridge which session/agent to file under.
-            cmd.env("ELANUS_PACKAGE", principal)
-                .env("ELANUS_BUS_TOKEN", bus_token)
+            cmd.env_dual("PACKAGE", principal)
+                .env_dual("BUS_TOKEN", bus_token)
                 .env(ENV_SESSION, session)
                 .env(ENV_AGENT, agent)
-                .env("ELANUS_ROOT", &root.dir);
+                .env_dual("ROOT", &root.dir);
             eprintln!(
                 "[code] launching {} as session {session}{timeout_suffix}",
                 binary
@@ -4038,9 +4039,9 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
             if let Some(brief) = &brief {
                 cmd.arg("--append-system-prompt").arg(brief);
             }
-            // Scrub elanus's provider credentials FIRST so Claude Code uses
-            // its own login (`~/.claude`) rather than inheriting elanus's
-            // DeepSeek ANTHROPIC_BASE_URL/API_KEY (Task 2). The ELANUS_*
+            // Scrub lanius's provider credentials FIRST so Claude Code uses
+            // its own login (`~/.claude`) rather than inheriting lanius's
+            // DeepSeek ANTHROPIC_BASE_URL/API_KEY (Task 2). The LANIUS_*
             // vars set below are NOT scrubbed — the hook bridge depends on
             // them.
             scrub_provider_creds(&mut cmd);
@@ -4050,14 +4051,14 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
                 apply_provider_injection_env(&mut cmd, inj);
             }
             // The session's own identity, carried to the hook bridge children
-            // CC spawns. ELANUS_PACKAGE + ELANUS_BUS_TOKEN are what
-            // `elanus bus pub` authenticates with (src/buscli.rs); ELANUS_CODE_*
+            // CC spawns. LANIUS_PACKAGE + LANIUS_BUS_TOKEN are what
+            // `lanius bus pub` authenticates with (src/buscli.rs); LANIUS_CODE_*
             // tell the bridge which session/agent to file under.
-            cmd.env("ELANUS_PACKAGE", principal)
-                .env("ELANUS_BUS_TOKEN", bus_token)
+            cmd.env_dual("PACKAGE", principal)
+                .env_dual("BUS_TOKEN", bus_token)
                 .env(ENV_SESSION, session)
                 .env(ENV_AGENT, agent)
-                .env("ELANUS_ROOT", &root.dir);
+                .env_dual("ROOT", &root.dir);
             eprintln!("[code] launching {} as session {session}", binary);
             cmd.args(args);
             let status = cmd
@@ -4082,8 +4083,8 @@ fn adapter_provider_injection(
         .with_context(|| "opening the ledger to resolve --provider".to_string())?;
     let prov = crate::provider::get(ctx.root(), &conn, name)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no provider named {name:?} — define one with `elanus provider add {name} …` \
-             (list with `elanus provider list`)"
+            "no provider named {name:?} — define one with `lanius provider add {name} …` \
+             (list with `lanius provider list`)"
         )
     })?;
     let hid = crate::provider::HarnessId::parse(ctx.tool())?;
@@ -4101,7 +4102,7 @@ fn adapter_provider_injection(
 }
 
 pub fn run_claude_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::ExitStatus> {
-    let bus_token = ctx.bus_token().context("missing ELANUS_BUS_TOKEN")?;
+    let bus_token = ctx.bus_token().context("missing LANIUS_BUS_TOKEN")?;
     let skills = skill_packages_from_dir(ctx.skills_dir());
     let args = adapter_args(ctx);
     let injection = adapter_provider_injection(ctx)?;
@@ -4124,7 +4125,7 @@ pub fn run_claude_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::Exi
 }
 
 pub fn run_codex_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::ExitStatus> {
-    let bus_token = ctx.bus_token().context("missing ELANUS_BUS_TOKEN")?;
+    let bus_token = ctx.bus_token().context("missing LANIUS_BUS_TOKEN")?;
     let skills = skill_packages_from_dir(ctx.skills_dir());
     let args = adapter_args(ctx);
     let injection = adapter_provider_injection(ctx)?;
@@ -4181,7 +4182,7 @@ pub fn run_codex_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::Exit
 }
 
 pub fn run_opencode_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::ExitStatus> {
-    let bus_token = ctx.bus_token().context("missing ELANUS_BUS_TOKEN")?;
+    let bus_token = ctx.bus_token().context("missing LANIUS_BUS_TOKEN")?;
     let skills = skill_packages_from_dir(ctx.skills_dir());
     let args = adapter_args(ctx);
     let injection = adapter_provider_injection(ctx)?;
@@ -4226,7 +4227,7 @@ pub fn run_opencode_adapter(ctx: &crate::harness::Ctx) -> Result<std::process::E
 /// `~/.codex`. The user prompt must be a positional arg by the time Codex is
 /// spawned; if the caller omitted one, we promote the launcher's stdin to that
 /// positional or fail loudly before spawning. Codex's stdin remains reserved for
-/// the elanus briefing block, and stderr is inherited so the human still sees
+/// the lanius briefing block, and stderr is inherited so the human still sees
 /// Codex's own progress/errors. Returns the native exit status plus the captured
 /// legible result so foreground launches can print it and spawned launches can
 /// route it back to the spawner.
@@ -4325,7 +4326,7 @@ fn codex_headless_approval_posture(
 /// tool/mode (the codex TUI is human-approved; claude/opencode keep their own
 /// vendor sandbox). Emitted for exactly the same cell as
 /// `codex_headless_approval_posture` so the audit trail records "vendor gate OFF
-/// but elanus's cage ON" together. `enforced` reflects the platform probe
+/// but lanius's cage ON" together. `enforced` reflects the platform probe
 /// (`enforcement_available`): off macOS it is `false`, never a silent "on".
 fn codex_headless_cage_posture(tool: &str, mode: Mode) -> Option<serde_json::Value> {
     if tool == "codex" && mode == Mode::Headless {
@@ -4343,7 +4344,7 @@ fn codex_headless_cage_posture(tool: &str, mode: Mode) -> Option<serde_json::Val
     }
 }
 
-/// elanus's own cage around the HEADLESS codex spawn (docs/handoffs/codex-cage.md).
+/// lanius's own cage around the HEADLESS codex spawn (docs/handoffs/codex-cage.md).
 /// Headless `codex exec` runs with its vendor sandbox deliberately OFF
 /// (`danger-full-access`, docs/security.md entry 24) so an MCP tool call can
 /// complete — leaving the one matrix cell with no sandbox at all. This fills that
@@ -4462,9 +4463,9 @@ fn run_codex_capture(
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::inherit());
-    // Scrub elanus's provider credentials so Codex uses its own login (`~/.codex`)
-    // rather than inheriting elanus's OPENAI_*/ANTHROPIC_* provider env (Task 2).
-    // The ELANUS_* vars set below are NOT scrubbed.
+    // Scrub lanius's provider credentials so Codex uses its own login (`~/.codex`)
+    // rather than inheriting lanius's OPENAI_*/ANTHROPIC_* provider env (Task 2).
+    // The LANIUS_* vars set below are NOT scrubbed.
     scrub_provider_creds(&mut cmd);
     scrub_launch_control_env(&mut cmd);
     // M2: apply the named-provider injection (if any) after the scrub. For codex
@@ -4473,18 +4474,18 @@ fn run_codex_capture(
     if let Some(inj) = injection {
         apply_provider_injection_env(&mut cmd, inj);
     }
-    cmd.env_remove("ELANUS_PACKAGE")
-        .env_remove("ELANUS_BUS_TOKEN");
+    cmd.env_remove("LANIUS_PACKAGE")
+        .env_remove("LANIUS_BUS_TOKEN");
     // The session's own identity, carried to anything the codex session spawns —
-    // crucially `elanus code deliver`, which reads ELANUS_CODE_SESSION/AGENT to
-    // record the running session as the requester, and ELANUS_ROOT to resolve the
-    // same root. ELANUS_BUS_TOKEN stays SCRUBBED (above): the codex child is the
-    // tool, not an elanus adapter — its hook claims via the ledger (no bus), so it
+    // crucially `lanius code deliver`, which reads LANIUS_CODE_SESSION/AGENT to
+    // record the running session as the requester, and LANIUS_ROOT to resolve the
+    // same root. LANIUS_BUS_TOKEN stays SCRUBBED (above): the codex child is the
+    // tool, not an lanius adapter — its hook claims via the ledger (no bus), so it
     // needs no bus credential. The bus token enters the launch contract only for an
     // actual adapter process (PH3), never the raw tool child.
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
-        .env("ELANUS_ROOT", &root.dir)
+        .env_dual("ROOT", &root.dir)
         .env(crate::harness::ENV_WORKDIR, workdir)
         .env(crate::harness::ENV_MODE, "headless")
         .env(crate::harness::ENV_TOOL, "codex");
@@ -4539,7 +4540,7 @@ fn run_codex_capture(
 //
 // The HEADLESS codex transport that speaks `codex app-server` JSON-RPC instead of
 // shelling out to `codex exec`, so a gated action runs APPROVAL-ELICITED — real
-// pause/ask/resume onto elanus's owner mailbox — with NO danger-full-access
+// pause/ask/resume onto lanius's owner mailbox — with NO danger-full-access
 // bypass (retiring security.md entry 24 where active). Flag/profile-gated;
 // `codex exec` stays the default fallback.
 //
@@ -4552,7 +4553,7 @@ fn run_codex_capture(
 //     wrong keyword fails CLOSED). An MCP tool call (the entry-24 case) is gated
 //     via `mcpServer/elicitation/request` with `_meta.codex_approval_kind =
 //     "mcp_tool_call"` → reply `{action: "accept"|"decline", …}`.
-//   - The request blocks UNBOUNDEDLY (held 70s, no server timeout) — elanus
+//   - The request blocks UNBOUNDEDLY (held 70s, no server timeout) — lanius
 //     imposes its own deadline + fail-closed default (wonky bit 3).
 //   - A thread CANNOT be reattached after a client reconnect on the co-located
 //     stdio path (killing the client kills the server + the in-flight turn;
@@ -4604,7 +4605,7 @@ fn codex_answer_is_allow(answer: &str) -> bool {
 
 /// Build the JSON-RPC reply body for an approval server-request given the
 /// allow/deny decision. `Ok(result)` is a normal `{result}`; `Err(error)` is a
-/// JSON-RPC `{error}` (used for approval families elanus cannot honestly grant —
+/// JSON-RPC `{error}` (used for approval families lanius cannot honestly grant —
 /// e.g. a permission-profile grant whose response shape it does not synthesize —
 /// so those fail CLOSED rather than reply with a guessed/malformed grant).
 fn codex_approval_reply(method: &str, allow: bool) -> std::result::Result<Value, Value> {
@@ -4615,13 +4616,13 @@ fn codex_approval_reply(method: &str, allow: bool) -> std::result::Result<Value,
     if method.ends_with("/requestApproval") {
         // commandExecution / fileChange approvals share the `{decision}` shape.
         // A permission-profile grant (`item/permissions/requestApproval`) has a
-        // different response (a granted profile, not a decision) that elanus
+        // different response (a granted profile, not a decision) that lanius
         // cannot honestly synthesize — deny it closed with a JSON-RPC error
         // regardless of the answer, and record that it could not be granted.
         if method == "item/permissions/requestApproval" {
             return Err(json!({
                 "code": -32000,
-                "message": "elanus does not grant permission profiles; denied (fail-closed)"
+                "message": "lanius does not grant permission profiles; denied (fail-closed)"
             }));
         }
         Ok(json!({ "decision": decision }))
@@ -4632,7 +4633,7 @@ fn codex_approval_reply(method: &str, allow: bool) -> std::result::Result<Value,
         // An unmodeled server request: fail closed with an error reply.
         Err(json!({
             "code": -32601,
-            "message": format!("elanus app-server driver does not handle {method}")
+            "message": format!("lanius app-server driver does not handle {method}")
         }))
     }
 }
@@ -4715,7 +4716,7 @@ fn appserver_send_frame<W: std::io::Write>(stdin: &mut W, frame: &Value) -> Resu
 /// mapping its notification stream into the SAME obs grammar the exec path uses
 /// (stamped `app-server-live`) and eliciting each approval onto the owner's
 /// mailbox. Mirrors `run_codex_capture`'s process wiring (per-session
-/// `CODEX_HOME`, the elanus cage, credential scrub, briefing) but composes it
+/// `CODEX_HOME`, the lanius cage, credential scrub, briefing) but composes it
 /// with codex's own in-force approval posture instead of the danger-full-access
 /// bypass. Returns the child's exit status + the harvested `CaptureSummary`.
 #[allow(clippy::too_many_arguments)]
@@ -4768,11 +4769,11 @@ fn run_codex_app_server_capture(
     if let Some(inj) = injection {
         apply_provider_injection_env(&mut cmd, inj);
     }
-    cmd.env_remove("ELANUS_PACKAGE")
-        .env_remove("ELANUS_BUS_TOKEN");
+    cmd.env_remove("LANIUS_PACKAGE")
+        .env_remove("LANIUS_BUS_TOKEN");
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
-        .env("ELANUS_ROOT", &root.dir)
+        .env_dual("ROOT", &root.dir)
         .env(crate::harness::ENV_WORKDIR, workdir)
         .env(crate::harness::ENV_MODE, "headless")
         .env(crate::harness::ENV_TOOL, "codex");
@@ -4893,7 +4894,7 @@ fn drive_codex_app_server<W: std::io::Write>(
         &mut next_id,
         "initialize",
         json!({
-            "clientInfo": { "name": "elanus", "title": null, "version": env!("CARGO_PKG_VERSION") },
+            "clientInfo": { "name": "lanius", "title": null, "version": env!("CARGO_PKG_VERSION") },
             "capabilities": { "experimentalApi": true, "requestAttestation": false },
         }),
     )?;
@@ -4933,7 +4934,7 @@ fn drive_codex_app_server<W: std::io::Write>(
                 } else {
                     Err(json!({
                         "code": -32601,
-                        "message": format!("elanus app-server driver does not handle {m}")
+                        "message": format!("lanius app-server driver does not handle {m}")
                     }))
                 };
                 let frame = match reply {
@@ -5107,7 +5108,7 @@ fn codex_appserver_handle_approval(
 
     // Emit the ask to the owner's mailbox (in/human/<owner>) with the correlation,
     // deadline and default_action — the SAME data model ask_human uses. Direct
-    // ledger emit (like `elanus code deliver`); the daemon announces it to the
+    // ledger emit (like `lanius code deliver`); the daemon announces it to the
     // owner's mailbox and a reply on `in/agent/<noun>` threads by correlation.
     let ask_payload = json!({
         "question": format!("codex worker {session} asks approval for a {kind}: {detail}"),
@@ -5612,13 +5613,13 @@ fn run_codex_tui_import(
     if let Some(inj) = injection {
         apply_provider_injection_env(&mut cmd, inj);
     }
-    cmd.env_remove("ELANUS_PACKAGE")
-        .env_remove("ELANUS_BUS_TOKEN");
-    // ELANUS_BUS_TOKEN stays scrubbed: the codex child is the tool, not an adapter;
+    cmd.env_remove("LANIUS_PACKAGE")
+        .env_remove("LANIUS_BUS_TOKEN");
+    // LANIUS_BUS_TOKEN stays scrubbed: the codex child is the tool, not an adapter;
     // its hook claims via the ledger (no bus). (See the exec path for the rationale.)
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
-        .env("ELANUS_ROOT", &root.dir)
+        .env_dual("ROOT", &root.dir)
         .env(crate::harness::ENV_WORKDIR, workdir)
         .env(crate::harness::ENV_MODE, "tui")
         .env(crate::harness::ENV_TOOL, "codex");
@@ -5854,7 +5855,7 @@ fn walk_rollouts(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Read a codex TUI rollout JSONL and project its turns into the obs grammar under
-/// the elanus session, publishing each as the session principal — the POST-HOC
+/// the lanius session, publishing each as the session principal — the POST-HOC
 /// counterpart to `capture_codex_stream`'s live parse. Every projected body is
 /// marked `fidelity=rollout-import` so a consumer never mistakes it for live
 /// granularity. When `record_workdir` is Some, the `session_meta`'s codex thread id
@@ -6214,12 +6215,12 @@ fn rollout_collect_summary(rec: &Value, summary: &mut CaptureSummary) {
 
 /// Compose the opencode run message: opencode's `run` has no out-of-band
 /// system-prompt flag, so the launch-envelope briefing rides the prompt positional
-/// as a leading `[elanus]` block ahead of the task (the same shape codex uses on
+/// as a leading `[lanius]` block ahead of the task (the same shape codex uses on
 /// stdin, but folded into the positional here since opencode reads its prompt as
 /// argv). Returned verbatim when there is no briefing.
 fn opencode_message_with_brief(brief: Option<&str>, task: &str) -> String {
     match brief {
-        Some(b) => format!("[elanus operating envelope — read before acting]\n{b}\n\n{task}"),
+        Some(b) => format!("[lanius operating envelope — read before acting]\n{b}\n\n{task}"),
         None => task.to_string(),
     }
 }
@@ -6228,7 +6229,7 @@ fn opencode_message_with_brief(brief: Option<&str>, task: &str) -> String {
 /// after flag-stripping). Joins multiple tokens with spaces (the normal launch
 /// shape is a single quoted task). If no task token was supplied, promote the
 /// launcher's stdin (non-terminal) to the task — symmetric with codex — so
-/// `elanus code opencode` from a pipe still works; a terminal/empty stdin fails
+/// `lanius code opencode` from a pipe still works; a terminal/empty stdin fails
 /// loudly rather than hanging.
 fn opencode_task_from_args(args: &[String]) -> Result<String> {
     let task = args
@@ -6249,7 +6250,7 @@ fn opencode_task_from_args(args: &[String]) -> Result<String> {
     }
     if prompt.trim().is_empty() {
         bail!(
-            "no prompt provided: pass it as an argument (elanus code opencode \"<task>\") \
+            "no prompt provided: pass it as an argument (lanius code opencode \"<task>\") \
              or pipe it on stdin"
         );
     }
@@ -6262,7 +6263,7 @@ fn opencode_task_from_args(args: &[String]) -> Result<String> {
 /// (the analog of Claude's `--setting-sources ''`); `--dangerously-skip-permissions`
 /// is opencode's headless auto-approve (a worker can't answer interactive prompts) —
 /// it is passed for worker/headless launches. opencode brings its OWN provider auth
-/// (`opencode auth`), so we scrub elanus's provider creds (PROVIDER_CRED_VARS) — none
+/// (`opencode auth`), so we scrub lanius's provider creds (PROVIDER_CRED_VARS) — none
 /// of which opencode reads — leaving its own login intact.
 #[allow(clippy::too_many_arguments)]
 fn run_opencode_capture(
@@ -6329,10 +6330,10 @@ fn run_opencode_capture(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    // Scrub elanus's provider credentials so opencode uses its OWN login rather than
-    // inheriting elanus's DeepSeek/ANTHROPIC_*/OPENAI_* env. opencode does not read
+    // Scrub lanius's provider credentials so opencode uses its OWN login rather than
+    // inheriting lanius's DeepSeek/ANTHROPIC_*/OPENAI_* env. opencode does not read
     // any PROVIDER_CRED_VARS as its own auth (it stores creds in its auth.json), so
-    // the scrub never removes opencode's login. The ELANUS_* vars set below are NOT
+    // the scrub never removes opencode's login. The LANIUS_* vars set below are NOT
     // scrubbed.
     scrub_provider_creds(&mut cmd);
     scrub_launch_control_env(&mut cmd);
@@ -6342,13 +6343,13 @@ fn run_opencode_capture(
     if let Some(inj) = injection {
         apply_provider_injection_env(&mut cmd, inj);
     }
-    cmd.env_remove("ELANUS_PACKAGE")
-        .env_remove("ELANUS_BUS_TOKEN");
+    cmd.env_remove("LANIUS_PACKAGE")
+        .env_remove("LANIUS_BUS_TOKEN");
     // The session's own identity, carried to anything the opencode session spawns
-    // (crucially `elanus code deliver`, which reads ELANUS_CODE_SESSION/AGENT).
+    // (crucially `lanius code deliver`, which reads LANIUS_CODE_SESSION/AGENT).
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
-        .env("ELANUS_ROOT", &root.dir);
+        .env_dual("ROOT", &root.dir);
     // M3: point opencode at the per-session skills config dir (Some only when the
     // profile had skills). Coexists with a `--provider` OPENCODE_CONFIG_CONTENT
     // injection (different config layer — dir = skills/agents, content = inline).
@@ -6489,12 +6490,12 @@ fn run_opencode_tui_server_events(
         apply_provider_injection_env(&mut serve, inj);
     }
     serve
-        .env_remove("ELANUS_PACKAGE")
-        .env_remove("ELANUS_BUS_TOKEN")
+        .env_remove("LANIUS_PACKAGE")
+        .env_remove("LANIUS_BUS_TOKEN")
         .env("OPENCODE_SERVER_PASSWORD", &password)
         .env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
-        .env("ELANUS_ROOT", &root.dir);
+        .env_dual("ROOT", &root.dir);
     // M3: point the served instance at the per-session skills config dir. None when
     // the profile has no skills.
     if let Some(dir) = &oc_config_dir {
@@ -6659,13 +6660,13 @@ fn run_opencode_attach_tui(
     if let Some(inj) = injection {
         apply_provider_injection_env(&mut cmd, inj);
     }
-    cmd.env_remove("ELANUS_PACKAGE")
-        .env_remove("ELANUS_BUS_TOKEN");
+    cmd.env_remove("LANIUS_PACKAGE")
+        .env_remove("LANIUS_BUS_TOKEN");
     // attach reads the same basic-auth password to reach the server.
     cmd.env("OPENCODE_SERVER_PASSWORD", password);
     cmd.env(ENV_SESSION, session)
         .env(ENV_AGENT, agent)
-        .env("ELANUS_ROOT", &root.dir);
+        .env_dual("ROOT", &root.dir);
     match url {
         Some(u) => eprintln!(
             "[code] launching opencode attach {u} as session {session} (live SSE capture)"
@@ -6730,7 +6731,7 @@ fn opencode_server_password() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("elanus-{}-{}", std::process::id(), nanos)
+    format!("lanius-{}-{}", std::process::id(), nanos)
 }
 
 /// Read `opencode serve`'s stdout until it announces its listen URL
@@ -7161,7 +7162,7 @@ fn capture_opencode_stream(
         opencode_collect_summary(&event, &mut summary);
         // SA3 (write half): a settled `edit`/`write` tool_use is a file write —
         // auto-claim its `path` for this session in its room, so a roommate sees it
-        // without this agent running `elanus code claim`. Reuses the SAME
+        // without this agent running `lanius code claim`. Reuses the SAME
         // edit|write + state.input.path detection opencode_collect_summary uses;
         // advisory + idempotent.
         if let Some(path) = opencode_file_write_path(&event) {
@@ -7489,7 +7490,7 @@ const FINAL_TEXT_CAP: usize = 8000;
 
 /// Read a codex child's `--json` stdout line-by-line, mapping each JSONL event to
 /// an obs record and publishing it as the session principal. Shared by launch and
-/// resume (the SAME obs grammar lands under the SAME elanus session both times).
+/// resume (the SAME obs grammar lands under the SAME lanius session both times).
 /// When `record_workdir` is `Some`, a `thread.started` event also persists/refreshes
 /// the durable `code_sessions` record (launch path, carrying the workdir to store);
 /// resume already has a record, so it passes `None`. A malformed line files
@@ -7540,7 +7541,7 @@ fn capture_codex_stream(
         codex_collect_summary(&event, &mut summary);
         // SA3 (write half): each settled `file_change` is a write — auto-claim the
         // path(s) for this session in its room, so a roommate sees them without
-        // this agent running `elanus code claim`. Reuses the SAME `file_change`
+        // this agent running `lanius code claim`. Reuses the SAME `file_change`
         // detection codex_collect_summary uses; advisory + idempotent.
         for path in codex_file_change_paths(&event) {
             auto_claim_write(
@@ -7915,11 +7916,11 @@ fn command_succeeded(item: &Value) -> bool {
 
 // ── The resume primitive (M2-A) ──────────────────────────────────────────────
 //
-// `elanus code resume <elanus_session> "<message>"` continues a recorded session.
+// `lanius code resume <elanus_session> "<message>"` continues a recorded session.
 // It is the foundation of inbound delivery (M2-B): a session has a DURABLE record
 // (no secret) but no idle token; resume mints a FRESH scoped token, runs the
 // tool's native resume in the recorded workdir capturing output into the SAME obs
-// tree under the SAME elanus session, publishes the result, retires the token, and
+// tree under the SAME lanius session, publishes the result, retires the token, and
 // bumps last_active. The token is emit-only on resume too (no read/subscribe grant
 // — that is M3's interactive-pull). M2-B (the daemon driving resume off a session
 // mailbox message) is deferred: the DAEMON has the authority to read the mailbox
@@ -8003,11 +8004,11 @@ fn resume_stream_capture_for(
 /// generous for the headless `-p`/`exec` shapes while still bounding a wedged
 /// run. The native call is wrapped in `timeout(1)` so a hung model never holds
 /// a session worker (or a CLI invocation) open forever. Override per run with
-/// `ELANUS_CODE_RESUME_TIMEOUT_S`.
+/// `LANIUS_CODE_RESUME_TIMEOUT_S`.
 const RESUME_TIMEOUT_SECS: u64 = 600;
 
 fn resume_timeout_secs() -> u64 {
-    std::env::var("ELANUS_CODE_RESUME_TIMEOUT_S")
+    std::env::var("LANIUS_CODE_RESUME_TIMEOUT_S")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&s: &u64| s > 0)
@@ -8017,11 +8018,11 @@ fn resume_timeout_secs() -> u64 {
 /// Wall-clock ceiling on a detached spawned worker. This is deliberately much
 /// larger than a driven resume timeout because a spawned delegation may do a real
 /// chunk of work, but it must still eventually release the spawner wake path if a
-/// native tool wedges. Override per run with `ELANUS_CODE_SPAWN_TIMEOUT_SECS`.
+/// native tool wedges. Override per run with `LANIUS_CODE_SPAWN_TIMEOUT_SECS`.
 const SPAWN_TIMEOUT_SECS: u64 = 1800;
 
 fn spawn_timeout_secs() -> u64 {
-    std::env::var("ELANUS_CODE_SPAWN_TIMEOUT_SECS")
+    std::env::var("LANIUS_CODE_SPAWN_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&s: &u64| s > 0)
@@ -8031,7 +8032,7 @@ fn spawn_timeout_secs() -> u64 {
 /// Wrap a resume command in `timeout(1) -s TERM <secs> <program> <args…>` so a
 /// hung native turn is killed rather than holding the caller open forever (the
 /// handoff guardrail: wrap any codex/claude call in `timeout`). `timeout` is in
-/// coreutils/BSD on every platform elanus targets; if it is somehow absent the
+/// coreutils/BSD on every platform lanius targets; if it is somehow absent the
 /// child simply fails to spawn and the resume errors cleanly (no hang). The
 /// `-s TERM` lets the tool flush; `timeout` exits 124 on expiry, which the
 /// caller reports as a failed (timed-out) resume.
@@ -8046,12 +8047,12 @@ fn timeout_wrap(program: &str, args: &[String], secs: u64) -> (String, Vec<Strin
     ("timeout".to_string(), wrapped)
 }
 
-// NOTE: there is deliberately NO human `elanus code resume` verb. "Resume" is not
-// an elanus primitive — re-attaching to a session interactively is just a normal
+// NOTE: there is deliberately NO human `lanius code resume` verb. "Resume" is not
+// an lanius primitive — re-attaching to a session interactively is just a normal
 // managed launch with the tool's own resume flag passed through, e.g.
-// `elanus code claude --resume <native_session>` (hooks/room/obs all intact). The
-// webui/`elanus code session` surface that per-tool suggestion via
-// `interactive_resume_hint`. The only resume that lives in elanus is the daemon's
+// `lanius code claude --resume <native_session>` (hooks/room/obs all intact). The
+// webui/`lanius code session` surface that per-tool suggestion via
+// `interactive_resume_hint`. The only resume that lives in lanius is the daemon's
 // async one-shot, `resume_capture` below (M2-B), driven IN-PROCESS off a mailbox
 // delivery — never a command a human types.
 
@@ -8073,7 +8074,7 @@ pub struct ResumeOutcome {
 }
 
 /// Continue a recorded coding session with a fresh, emit-only scoped token,
-/// capturing the result under the same elanus session, and RETURN the outcome
+/// capturing the result under the same lanius session, and RETURN the outcome
 /// (never `process::exit`). This is the in-process resume primitive the daemon
 /// drives off a mailbox delivery (M2-B). Returns an error only for a missing
 /// record or a credential/spawn failure; a non-zero tool exit is a successful
@@ -8129,7 +8130,7 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     // resume does NOT fire the launch-time UserPromptSubmit hook (a bare
     // `-p --resume` / `codex exec resume` doesn't reload the generated hooks), so
     // the per-turn context rides the RESUME PROMPT instead — prepended as an
-    // out-of-band `[elanus]` block ahead of the delivered message. It carries the
+    // out-of-band `[lanius]` block ahead of the delivered message. It carries the
     // session's inbox status + memory note (the same own-inbox-only scoped read,
     // built from this session's own noun/id), kept per-turn so it reflects the
     // current state every resume. The injection is prepended to the message the
@@ -8142,7 +8143,7 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     let secs = resume_timeout_secs();
     let (program, cmd_args) = timeout_wrap(&program, &cmd_args, secs);
 
-    // A resume marker under the SAME elanus session, so the bus shows the session
+    // A resume marker under the SAME lanius session, so the bus shows the session
     // continued and with what message.
     publish_obs(
         root,
@@ -8172,8 +8173,8 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Scrub elanus's provider credentials so the resumed tool uses its own
-        // login rather than inheriting elanus's provider env (Task 2). The native
+        // Scrub lanius's provider credentials so the resumed tool uses its own
+        // login rather than inheriting lanius's provider env (Task 2). The native
         // tool (claude/codex) is wrapped in `timeout`, but env_remove on the parent
         // Command is inherited through the `timeout` exec, so the tool still never
         // sees them.
@@ -8213,7 +8214,7 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
 }
 
 /// Read a Claude Code `-p --output-format stream-json` child's stdout line-by-line,
-/// mapping each JSONL message to an obs record under the resumed elanus session.
+/// mapping each JSONL message to an obs record under the resumed lanius session.
 /// Claude's print stream is a different grammar from codex's: top-level objects
 /// with a `type` of `system` (init), `assistant`/`user` (message turns carrying a
 /// nested `message` with `content` blocks: `text`, `tool_use`, `tool_result`), and
@@ -8409,7 +8410,7 @@ fn map_hook_event(noun: &str, event: &str, payload: &Value) -> (String, Value) {
     }
 }
 
-/// `elanus code hook <event>` — the bridge. Reads the Claude Code hook JSON
+/// `lanius code hook <event>` — the bridge. Reads the Claude Code hook JSON
 /// payload on stdin and publishes one ordered observation to the bus as the
 /// session principal. Always exits 0: a hook that fails must never break or alter
 /// the coding session. It prints to stdout only for the M3 per-turn injection —
@@ -8426,16 +8427,16 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
         // and we must not fail the coding session. Stay quiet.
         return Ok(());
     };
-    let principal = std::env::var("ELANUS_PACKAGE")
+    let principal = std::env::var("LANIUS_PACKAGE")
         .ok()
         .filter(|s| !s.is_empty());
-    let token = std::env::var("ELANUS_BUS_TOKEN")
+    let token = std::env::var("LANIUS_BUS_TOKEN")
         .ok()
         .filter(|s| !s.is_empty());
 
     // The DURABLE session record (M2-A): Claude Code carries its own native
     // resumable session id in every hook payload (`session_id`). On SessionStart —
-    // the first hook of a run — persist the record (elanus session ↔ CC session_id
+    // the first hook of a run — persist the record (lanius session ↔ CC session_id
     // ↔ workdir), so the session is resumable (`claude -p --resume <session_id>`)
     // even after the launcher exits. The record carries no secret. Best-effort: a
     // failure here must never break the hook or the coding session.
@@ -8509,7 +8510,7 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
     // SA3 (write half) — touching a file IS the claim. On a Claude-Code
     // file-write tool call (Write/Edit/MultiEdit/NotebookEdit), record an advisory
     // edit-claim for this session on that path in its room, so a roommate sees it
-    // WITHOUT this agent ever running `elanus code claim`. Same PreToolUse hook the
+    // WITHOUT this agent ever running `lanius code claim`. Same PreToolUse hook the
     // M1 read camera rides; advisory + idempotent (see auto_claim_write). The READ
     // half (auto-claim on Read/Grep/Glob) is DEFERRED: it rides the authoritative
     // read camera (read-provenance M2), not built — claiming every file an agent
@@ -8780,7 +8781,7 @@ fn read_camera_enabled(root: &Root) -> bool {
 /// platform-gated (macOS has no free authoritative read-open notification — needs
 /// the Endpoint-Security entitlement + a signed system extension; the unprivileged
 /// seccomp-unotify path is Linux-only) AND gated on coding-agents.md's tool-sandbox
-/// bypass (coding agents are not in elanus's cage today). See the read-provenance
+/// bypass (coding agents are not in lanius's cage today). See the read-provenance
 /// handoff. M1 is the only tier that delivers on macOS now.
 fn claude_read_fs_events(payload: &Value, session: &str) -> Vec<(String, Value)> {
     let tool = tool_name(payload);
@@ -8830,7 +8831,7 @@ fn claude_read_fs_events(payload: &Value, session: &str) -> Vec<(String, Value)>
         "tool": tool,
         // SESSION ATTRIBUTION — the milestone's acceptance ("the human pulls the
         // read stream FOR THE SESSION"). The spatial obs/fs/<path> topic carries no
-        // session level by design, so stamp the elanus `session` (and the native CC
+        // session level by design, so stamp the lanius `session` (and the native CC
         // `cc_session`) onto the body — matching what the write camera's envelope
         // carries on the shared obs/fs noun (emit_fs_delta stamps session_id via
         // trace::Ids), so a consumer of obs/fs/<subtree>/# can session-scope READ
@@ -8870,12 +8871,12 @@ fn generic_event(event: &str, _payload: &Value) -> (String, Value) {
 }
 
 /// Generate the Claude Code `--settings` object: only hooks, each routing to
-/// `elanus code hook <event>`. The matcher `*` matches every tool. We record the
+/// `lanius code hook <event>`. The matcher `*` matches every tool. We record the
 /// documented events for a coarse, ordered ledger (Appendix A hook event set).
 fn claude_settings(self_exe: &Path, root: &Root) -> Value {
     let exe = self_exe.display().to_string();
     let root_arg = root.dir.display().to_string();
-    // A single hook command shape: `<elanus> -C <root> code hook <Event>`.
+    // A single hook command shape: `<lanius> -C <root> code hook <Event>`.
     let cmd = |event: &str| {
         json!({
             "hooks": [{
@@ -8910,7 +8911,7 @@ fn claude_settings(self_exe: &Path, root: &Root) -> Value {
 // ── bus publish ──────────────────────────────────────────────────────────────
 
 /// Publish one observation to the bus as the session principal. We use the same
-/// `elanus bus pub` path the webhook bridge uses (real rumqttc client →
+/// `lanius bus pub` path the webhook bridge uses (real rumqttc client →
 /// broker-verified sender), authenticating with the principal/token in this
 /// process's environment so the broker stamps `sender = <principal>`. Best
 /// effort: a publish failure (broker down) never breaks the coding session —
@@ -8957,11 +8958,13 @@ pub fn publish_obs_captured(
             BUS_DEGRADED.store(true, Ordering::SeqCst);
         }
     });
-    // buscli::publish reads ELANUS_PACKAGE/ELANUS_BUS_TOKEN from the environment.
+    // buscli::publish reads LANIUS_PACKAGE/LANIUS_BUS_TOKEN from the environment.
     // In the launcher process those aren't set (only the child's were), so set
     // them for this publish; the hook process already has them. Setting them
     // unconditionally keeps both call sites correct.
+    std::env::set_var("LANIUS_PACKAGE", principal);
     std::env::set_var("ELANUS_PACKAGE", principal);
+    std::env::set_var("LANIUS_BUS_TOKEN", token);
     std::env::set_var("ELANUS_BUS_TOKEN", token);
     let payload = body.to_string();
     // buscli::publish builds its own current-thread runtime and `block_on`s it. If we
@@ -9014,7 +9017,7 @@ fn degrade_decision(
                 return (
                     true,
                     Some(
-                        "[elanus] message bus reachable again — capture resumed for this session."
+                        "[lanius] message bus reachable again — capture resumed for this session."
                             .to_string(),
                     ),
                 );
@@ -9024,9 +9027,9 @@ fn degrade_decision(
         Err(e) if e.is_denied() => (
             false,
             Some(format!(
-                "[elanus] message bus REFUSED this session's credential ({e}). \
+                "[lanius] message bus REFUSED this session's credential ({e}). \
                  This is an authorization failure, not a bus-down — it will keep \
-                 failing until the credential is fixed; elanus will not silently \
+                 failing until the credential is fixed; lanius will not silently \
                  retry past it."
             )),
         ),
@@ -9038,7 +9041,7 @@ fn degrade_decision(
                 (
                     false,
                     Some(
-                        "[elanus] can't reach the message bus — this session continues \
+                        "[lanius] can't reach the message bus — this session continues \
                          UNCAPTURED (no record, no sibling awareness, no mail) until it \
                          reconnects. Further bus errors are silenced until then."
                             .to_string(),
@@ -9362,7 +9365,7 @@ mod tests {
         // and confirm both the header reader and the thread-id resolver find it.
         let thread = "019ed361-4fd2-7793-9ea6-a1add8ca3d4f";
         let base = std::env::temp_dir().join(format!(
-            "elanus-rollout-{}-{}",
+            "lanius-rollout-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
@@ -9480,7 +9483,7 @@ mod tests {
         assert_eq!(body["omits"], json!(["B", "C"]));
         // SESSION ATTRIBUTION — the milestone's acceptance ("pull the read stream
         // FOR THE SESSION"). The spatial obs/fs/<path> topic has no session level,
-        // so the body must carry the elanus `session` (matching the write camera's
+        // so the body must carry the lanius `session` (matching the write camera's
         // envelope on the shared noun) and the native CC `cc_session`.
         assert_eq!(body["session"], "sess-42");
         assert_eq!(body["cc_session"], "cc-123");
@@ -9550,7 +9553,7 @@ mod tests {
         // so a Read tool call publishes NO obs/fs read event — a consumer can't
         // misread silence as "no reads happened" because the broker also fast-fails
         // the read-flavor subscribe (asserted in broker.rs).
-        let dir = std::env::temp_dir().join(format!("elanus-rcam-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("lanius-rcam-{}", uuid::Uuid::new_v4()));
         let root = Root { dir: dir.clone() };
         std::fs::create_dir_all(root.profile_dir("default")).unwrap();
 
@@ -9625,16 +9628,16 @@ mod tests {
         let root = Root {
             dir: PathBuf::from("/tmp/fake-root"),
         };
-        let s = claude_settings(Path::new("/usr/local/bin/elanus"), &root);
+        let s = claude_settings(Path::new("/usr/local/bin/lanius"), &root);
         // Exactly one top-level key: hooks (no user settings, no MCP, nothing
         // that would touch ~/.claude).
         let obj = s.as_object().unwrap();
         assert_eq!(obj.len(), 1);
         assert!(obj.contains_key("hooks"));
-        // Every command routes through `elanus code hook`.
+        // Every command routes through `lanius code hook`.
         let pre = &s["hooks"]["PreToolUse"][0]["hooks"][0]["command"];
         let cmd = pre.as_str().unwrap();
-        assert!(cmd.contains("/usr/local/bin/elanus"));
+        assert!(cmd.contains("/usr/local/bin/lanius"));
         assert!(cmd.contains("-C /tmp/fake-root"));
         assert!(cmd.ends_with("code hook PreToolUse"));
         // Tool hooks carry a matcher; session hooks do not.
@@ -9644,14 +9647,14 @@ mod tests {
 
     #[test]
     fn packaged_adapter_resolves_hook_command_to_path_elanus() {
-        let dir = std::env::temp_dir().join(format!("elanus-path-bin-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("lanius-path-bin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let elanus = dir.join("elanus");
-        std::fs::write(&elanus, "").unwrap();
+        let lanius = dir.join("lanius");
+        std::fs::write(&lanius, "").unwrap();
 
-        let adapter = Path::new("/home/me/.elanus/root/packages/harness-claude/bin/adapter");
+        let adapter = Path::new("/home/me/.lanius/root/packages/harness-claude/bin/adapter");
         let resolved = resolve_elanus_command_path_from_exe(adapter, Some(dir.as_os_str()));
-        assert_eq!(resolved, elanus);
+        assert_eq!(resolved, lanius);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9665,7 +9668,7 @@ mod tests {
         let root = Root {
             dir: PathBuf::from("/tmp/fake-root"),
         };
-        let s = claude_settings(Path::new("/usr/local/bin/elanus"), &root);
+        let s = claude_settings(Path::new("/usr/local/bin/lanius"), &root);
         let obj = s.as_object().unwrap();
         assert_eq!(obj.len(), 1);
         assert!(obj.contains_key("hooks"));
@@ -9690,7 +9693,7 @@ mod tests {
     fn write_claude_mcp_config_none_when_no_user_servers() {
         // No `~/.claude.json` mcpServers ⇒ None ⇒ NO `--mcp-config` flag ⇒ launch
         // is byte-identical to before. Point HOME at an empty scratch dir.
-        let dir = std::env::temp_dir().join(format!("elanus-mcp-none-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("lanius-mcp-none-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let servers = mcp_servers_from_json(&json!({}), "mcpServers");
         assert!(servers.is_empty());
@@ -9951,7 +9954,7 @@ mod tests {
         // resolve via secrets::read (the path that yields actor=None / owner-
         // equivalent authority in the broker), and its scope must be only its
         // own obs subtree. This is the regression guard for the entry-16 gap.
-        let dir = std::env::temp_dir().join(format!("elanus-codetest-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lanius-codetest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root { dir: dir.clone() };
         let principal = "code-deadbeef";
@@ -10054,7 +10057,7 @@ mod tests {
         // panic ("Cannot start a runtime from within a runtime"). It must now offload to
         // a fresh thread and fail-soft (no daemon here) rather than abort the process.
         let root = Root {
-            dir: PathBuf::from("/tmp/elanus-test-no-such-root"),
+            dir: PathBuf::from("/tmp/lanius-test-no-such-root"),
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -10580,7 +10583,7 @@ mod tests {
 
     fn delivery_tmp_root() -> Root {
         let dir = std::env::temp_dir().join(format!(
-            "elanus-delivery-{}-{}",
+            "lanius-delivery-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
@@ -10920,7 +10923,7 @@ mod tests {
         // clean error, not a panic and not a silent no-op (so the daemon sees the
         // missing record). There is no human `resume` verb; `resume_capture` is the
         // in-process primitive the daemon drives.
-        let dir = std::env::temp_dir().join(format!("elanus-resume-norec-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lanius-resume-norec-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root { dir: dir.clone() };
         let err = resume_capture(&root, "code-nope0000", "hi").unwrap_err();
@@ -10935,7 +10938,7 @@ mod tests {
         // suggestion. An unknown tool or empty native id also yields None.
         assert_eq!(
             interactive_resume_hint("claude", "38472ce9").as_deref(),
-            Some("elanus code claude --resume 38472ce9")
+            Some("lanius code claude --resume 38472ce9")
         );
         assert_eq!(interactive_resume_hint("codex", "abc"), None);
         assert_eq!(interactive_resume_hint("opencode", "abc"), None);
@@ -11512,7 +11515,7 @@ mod tests {
 
     /// M3: an answer maps to the v2 accept/decline keyword, fail-closed on anything
     /// ambiguous — and the LEGACY `"approved"` keyword the wire would silently
-    /// decline is treated by elanus as an ALLOW (so the human's plain "approved"
+    /// decline is treated by lanius as an ALLOW (so the human's plain "approved"
     /// still grants, and the reply uses the correct v2 `"accept"`).
     #[test]
     fn appserver_answer_maps_to_v2_decision_fail_closed() {
@@ -11540,7 +11543,7 @@ mod tests {
         let no = codex_approval_reply("mcpServer/elicitation/request", false).unwrap();
         assert_eq!(no["action"], json!("decline"));
         // A permission-profile grant is refused CLOSED with a JSON-RPC error even on
-        // an allow — elanus cannot synthesize a granted profile.
+        // an allow — lanius cannot synthesize a granted profile.
         assert!(codex_approval_reply("item/permissions/requestApproval", true).is_err());
         // An unmodeled server request fails closed too.
         assert!(codex_approval_reply("some/other/request", true).is_err());
@@ -11639,7 +11642,7 @@ mod tests {
 
     fn appserver_tmp_root() -> Root {
         let dir = std::env::temp_dir().join(format!(
-            "elanus-appsrv-{}-{}",
+            "lanius-appsrv-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
@@ -12152,7 +12155,7 @@ mod tests {
         // Write outside (home): denied — process-tree inheritance covers the
         // timeout+codex wrap the real spawn threads through this same cage.
         let home_target = format!(
-            "{}/elanus-codex-cage-escape-{}.txt",
+            "{}/lanius-codex-cage-escape-{}.txt",
             std::env::var("HOME").unwrap(),
             uuid::Uuid::new_v4().simple()
         );
@@ -12281,7 +12284,7 @@ mod tests {
         // It names the session, the deliver command, the end-your-turn rule, and
         // the behave-normally-toward-the-human note.
         assert!(b.contains("code-abcd1234"));
-        assert!(b.contains("elanus code deliver"));
+        assert!(b.contains("lanius code deliver"));
         assert!(b.to_lowercase().contains("end your turn"));
         assert!(b.to_lowercase().contains("do not")); // do not poll/sleep/wait
         assert!(b.to_lowercase().contains("human"));
@@ -12318,14 +12321,14 @@ mod tests {
         // than via arg injection, which would be fragile against flag values like
         // `-m <model>`. The block carries the full briefing body.
         let block = codex_briefing_block("BRIEF-BODY");
-        assert!(block.contains("elanus operating envelope"));
+        assert!(block.contains("lanius operating envelope"));
         assert!(block.contains("BRIEF-BODY"));
     }
 
     #[test]
     fn elanus_skill_plugin_is_session_scratch_scoped() {
         let dir = std::env::temp_dir().join(format!(
-            "elanus-skill-{}-{}",
+            "lanius-skill-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
@@ -12342,13 +12345,13 @@ mod tests {
 
         // The plugin manifest makes `--plugin-dir` recognize it.
         let manifest = std::fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap();
-        assert!(manifest.contains("\"name\":\"elanus\""));
+        assert!(manifest.contains("\"name\":\"lanius\""));
 
-        // The bootstrap `/elanus` skill is a real file under skills/elanus.
-        let boot = std::fs::read_to_string(plugin.join("skills/elanus/SKILL.md")).unwrap();
-        assert!(boot.contains("name: elanus"));
-        assert!(boot.contains("elanus code help"));
-        assert!(boot.contains("elanus code claude --headless"));
+        // The bootstrap `/lanius` skill is a real file under skills/lanius.
+        let boot = std::fs::read_to_string(plugin.join("skills/lanius/SKILL.md")).unwrap();
+        assert!(boot.contains("name: lanius"));
+        assert!(boot.contains("lanius code help"));
+        assert!(boot.contains("lanius code claude --headless"));
 
         // The profile skill is SYMLINKED alongside it (live, not copied) and its
         // SKILL.md is reachable through the link.
@@ -12370,7 +12373,7 @@ mod tests {
 
     fn m3_tmp_root() -> Root {
         let dir = std::env::temp_dir().join(format!(
-            "elanus-m3-{}-{}",
+            "lanius-m3-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
@@ -12425,9 +12428,9 @@ mod tests {
         m3_deliver(&root, "codex", "code-inj00001", "owner", "fix the parser");
         let one = turn_injection(&root, "codex", "code-inj00001").unwrap();
         // C2 (agent-comms): the inbox is now the computed `inbox` block.
-        assert!(one.starts_with("[elanus block: inbox]"));
+        assert!(one.starts_with("[lanius block: inbox]"));
         assert!(one.contains("1 new message"));
-        assert!(one.contains("elanus code inbox")); // tells the agent how to read
+        assert!(one.contains("lanius code inbox")); // tells the agent how to read
         assert!(one.contains("fix the parser")); // a brief preview
 
         // Deliver a second → the injection CHANGES (count reflects the new inbox).
@@ -12448,7 +12451,7 @@ mod tests {
         // A memory note also surfaces, and changes when edited.
         codesession::set_note(&root, "code-inj00001", "the lexer lives in src/lex.rs").unwrap();
         let with_note = turn_injection(&root, "codex", "code-inj00001").unwrap();
-        assert!(with_note.contains("[elanus note]"));
+        assert!(with_note.contains("[lanius note]"));
         assert!(with_note.contains("src/lex.rs"));
         codesession::set_note(&root, "code-inj00001", "actually src/lexer/mod.rs").unwrap();
         let edited = turn_injection(&root, "codex", "code-inj00001").unwrap();
@@ -12482,14 +12485,14 @@ mod tests {
         // No inbox / no note → the message is unchanged (a plain resume stays plain).
         let plain = build_resume_message(&root, "codex", "code-bld00001", "do the work");
         assert_eq!(plain, "do the work");
-        // With a note, the `[elanus]` block is prepended and the delivered message
+        // With a note, the `[lanius]` block is prepended and the delivered message
         // is kept under its own marker.
         codesession::set_note(&root, "code-bld00001", "remember X").unwrap();
         let injected = build_resume_message(&root, "codex", "code-bld00001", "do the work");
         // C2 (agent-comms): with only a note (empty inbox), the injection leads with
         // the note line; the inbox text is now a block that only appears when mail
         // is waiting. The point stands: the injection is prepended.
-        assert!(injected.starts_with("[elanus note]"));
+        assert!(injected.starts_with("[lanius note]"));
         assert!(injected.contains("remember X"));
         assert!(injected.contains("do the work"));
         assert!(injected.contains("message you were resumed with"));
@@ -12554,7 +12557,7 @@ mod tests {
 
     #[test]
     fn take_provider_flag_strips_before_tool_token() {
-        // `elanus code --provider deepseek claude --resume` → (deepseek, claude --resume).
+        // `lanius code --provider deepseek claude --resume` → (deepseek, claude --resume).
         let (p, rest) =
             take_provider_flag(&sv(&["--provider", "deepseek", "claude", "--resume"])).unwrap();
         assert_eq!(p.as_deref(), Some("deepseek"));
@@ -12659,7 +12662,7 @@ mod tests {
         // The env_key pair carries the secret to the child (this is where it lives).
         assert!(
             envs.iter()
-                .any(|(k, v)| k == "ELANUS_PV_DEEPSEEK_ANTHROPIC_KEY"
+                .any(|(k, v)| k == "LANIUS_PV_DEEPSEEK_ANTHROPIC_KEY"
                     && v.as_deref() == Some("sk-secret-xyz")),
             "env_key pair must be set: {envs:?}"
         );
@@ -13295,7 +13298,7 @@ mod tests {
         codesession::add_claim(&root, "room-x", "code-livea001", "ui/App.tsx").unwrap();
         let b = turn_injection(&root, "codex", "code-liveb002").unwrap();
         assert!(
-            b.contains("[elanus siblings]"),
+            b.contains("[lanius siblings]"),
             "the siblings roster line must appear: {b}"
         );
         assert!(b.contains("code-livea001"), "names the live sibling: {b}");
@@ -13326,11 +13329,11 @@ mod tests {
         let inj = turn_injection(&root, "codex", "code-alone001").unwrap();
         // C2 (agent-comms): the inbox now renders as the `inbox` block.
         assert!(
-            inj.starts_with("[elanus block: inbox]"),
+            inj.starts_with("[lanius block: inbox]"),
             "solo block is unchanged: {inj}"
         );
         assert!(
-            !inj.contains("[elanus siblings]"),
+            !inj.contains("[lanius siblings]"),
             "a solo session must have no siblings line: {inj}"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
@@ -13373,7 +13376,7 @@ mod tests {
     #[test]
     fn scrub_removes_provider_creds_but_keeps_elanus_vars() {
         // The denylist constant scrubs exactly the provider-credential vars and
-        // nothing else; the ELANUS_* session/bus/root vars are not in it.
+        // nothing else; the LANIUS_* session/bus/root vars are not in it.
         for v in [
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
@@ -13387,11 +13390,11 @@ mod tests {
             assert!(PROVIDER_CRED_VARS.contains(&v), "{v} must be scrubbed");
         }
         for keep in [
-            "ELANUS_PACKAGE",
-            "ELANUS_BUS_TOKEN",
-            "ELANUS_CODE_SESSION",
-            "ELANUS_CODE_AGENT",
-            "ELANUS_ROOT",
+            "LANIUS_PACKAGE",
+            "LANIUS_BUS_TOKEN",
+            "LANIUS_CODE_SESSION",
+            "LANIUS_CODE_AGENT",
+            "LANIUS_ROOT",
         ] {
             assert!(
                 !PROVIDER_CRED_VARS.contains(&keep),
@@ -13403,14 +13406,14 @@ mod tests {
     #[test]
     fn scrubbed_child_does_not_inherit_provider_creds_but_keeps_session_vars() {
         // The spawn-env construction the launcher uses: provider creds set on the
-        // parent Command are env_remove'd before exec, while the ELANUS_* vars set
+        // parent Command are env_remove'd before exec, while the LANIUS_* vars set
         // AFTER the scrub reach the child. We spawn a real child (`env`) through the
         // SAME `scrub_provider_creds` helper the three spawn paths use, so the test
         // exercises the actual construction, not a re-statement of it.
         use std::process::{Command, Stdio};
 
         let mut cmd = Command::new("/usr/bin/env");
-        // The denylisted provider creds (set as elanus's .env would), INCLUDING the
+        // The denylisted provider creds (set as lanius's .env would), INCLUDING the
         // exact DeepSeek-leak vars from the user's bug.
         cmd.env("ANTHROPIC_BASE_URL", "https://deepseek.example/x")
             .env("ANTHROPIC_API_KEY", "sk-deepseek-test")
@@ -13420,15 +13423,15 @@ mod tests {
             .env("OPENAI_BASE_URL", "https://openai.example")
             .env("OPENAI_API_BASE", "https://openai.example/v1")
             .env("OPENAI_MODEL", "gpt-test");
-        // Scrub them (the launcher's first env step), THEN set the ELANUS_* vars the
-        // hook bridge / `elanus code …` children depend on (the launcher's second
+        // Scrub them (the launcher's first env step), THEN set the LANIUS_* vars the
+        // hook bridge / `lanius code …` children depend on (the launcher's second
         // step) — exactly the order the real spawn paths use.
         scrub_provider_creds(&mut cmd);
-        cmd.env("ELANUS_PACKAGE", "code-deadbeef")
-            .env("ELANUS_BUS_TOKEN", "bus-secret")
+        cmd.env_dual("PACKAGE", "code-deadbeef")
+            .env_dual("BUS_TOKEN", "bus-secret")
             .env(ENV_SESSION, "code-deadbeef")
             .env(ENV_AGENT, "claude-code")
-            .env("ELANUS_ROOT", "/tmp/fake-root");
+            .env_dual("ROOT", "/tmp/fake-root");
         cmd.stdout(Stdio::piped()).stderr(Stdio::null());
 
         let out = cmd.output().expect("running `env`");
@@ -13447,11 +13450,11 @@ mod tests {
         }
         // The session/bus/root vars the bridge needs survive.
         for kept in [
-            "ELANUS_PACKAGE",
-            "ELANUS_BUS_TOKEN",
+            "LANIUS_PACKAGE",
+            "LANIUS_BUS_TOKEN",
             ENV_SESSION,
             ENV_AGENT,
-            "ELANUS_ROOT",
+            "LANIUS_ROOT",
         ] {
             assert!(
                 names.contains(kept),
@@ -13487,7 +13490,7 @@ mod tests {
         let workdir = "/tmp/sa3-proj";
         let room = sa3_record_session(&root, "code-aaaa1111", workdir);
 
-        // Agent A writes a file via a tool — NO `elanus code claim` is ever run.
+        // Agent A writes a file via a tool — NO `lanius code claim` is ever run.
         auto_claim_write(&root, "code-aaaa1111", "src/foo.rs", Some(workdir));
 
         // A roommate B in the SAME workdir-derived room sees A's claim as a peer,
@@ -13843,7 +13846,7 @@ mod tests {
     #[test]
     fn sa3_auto_claimed_path_surfaces_in_a_siblings_turn_injection() {
         // SA2's per-turn injection reads peer_claims; confirm an AUTO-claim (no
-        // `elanus code claim`) surfaces for a sibling in the same room.
+        // `lanius code claim`) surfaces for a sibling in the same room.
         let root = delivery_tmp_root();
         let workdir = "/tmp/sa3-inject";
         // Two sessions in the same checkout (same default workdir-room).
@@ -13929,17 +13932,17 @@ mod tests {
 
         let inj = turn_injection(&root, claude_agent_noun(), "code-blk00001")
             .expect("blocks should produce an injection");
-        assert!(inj.contains("[elanus block: identity]"), "got:\n{inj}");
+        assert!(inj.contains("[lanius block: identity]"), "got:\n{inj}");
         assert!(inj.contains("I am Lily, the worker."), "got:\n{inj}");
-        assert!(inj.contains("[elanus block: focus]"), "got:\n{inj}");
+        assert!(inj.contains("[lanius block: focus]"), "got:\n{inj}");
         assert!(inj.contains("Ship memory-blocks M4."), "got:\n{inj}");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
     #[test]
     fn note_alias_shows_in_turn_injection_and_not_as_a_block_line() {
-        // `elanus code note` writes the `note` block; turn_injection reads it as the
-        // [elanus note] line (old behavior), NOT as a generic [elanus block: note].
+        // `lanius code note` writes the `note` block; turn_injection reads it as the
+        // [lanius note] line (old behavior), NOT as a generic [lanius block: note].
         let root = delivery_tmp_root();
         m4_record(&root, "code-note0009");
         codesession::set_note(&root, "code-note0009", "remember the rename").unwrap();
@@ -13953,11 +13956,11 @@ mod tests {
         let inj = turn_injection(&root, claude_agent_noun(), "code-note0009")
             .expect("a note should produce an injection");
         assert!(
-            inj.contains("[elanus note] remember the rename"),
+            inj.contains("[lanius note] remember the rename"),
             "got:\n{inj}"
         );
         assert!(
-            !inj.contains("[elanus block: note]"),
+            !inj.contains("[lanius block: note]"),
             "the note must not also render as a generic block line; got:\n{inj}"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
@@ -13980,7 +13983,7 @@ mod tests {
         // First tool boundary: emitted.
         let first = mid_cycle_injection(&root, claude_agent_noun(), "code-mid00001")
             .expect("a fresh high-priority block emits mid-cycle");
-        assert!(first.contains("[elanus block: alert]"), "got:\n{first}");
+        assert!(first.contains("[lanius block: alert]"), "got:\n{first}");
         assert!(first.contains("STOP: schema migrated"), "got:\n{first}");
 
         // Second tool boundary (unchanged): nothing (dedup).
@@ -14135,7 +14138,7 @@ mod tests {
         let inj = turn_injection(&root, claude_agent_noun(), "code-inbx0001")
             .expect("unseen mail must produce an inbox block");
         // Rendered in the block shape (C2), with the count + a preview of the latest.
-        assert!(inj.contains("[elanus block: inbox]"), "got:\n{inj}");
+        assert!(inj.contains("[lanius block: inbox]"), "got:\n{inj}");
         assert!(inj.contains("1 new message(s)"), "got:\n{inj}");
         assert!(
             inj.contains("Latest from scout: please review PR 7"),
@@ -14220,7 +14223,7 @@ mod tests {
         );
         // But it still shows next-turn (the inbox block).
         let inj = turn_injection(&root, claude_agent_noun(), "code-lopr0001").unwrap();
-        assert!(inj.contains("[elanus block: inbox]"), "got:\n{inj}");
+        assert!(inj.contains("[lanius block: inbox]"), "got:\n{inj}");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -14253,7 +14256,7 @@ mod tests {
         let inj = turn_injection(&root, claude_agent_noun(), "code-room0001")
             .expect("an in-room session with channel traffic gets a channel block");
         assert!(
-            inj.contains("[elanus block: channel:team-1]"),
+            inj.contains("[lanius block: channel:team-1]"),
             "got:\n{inj}"
         );
         assert!(
@@ -14341,7 +14344,7 @@ mod tests {
     #[test]
     fn link_skill_packages_symlinks_each_and_is_noop_when_empty() {
         let base = std::env::temp_dir().join(format!(
-            "elanus-skilllink-{}-{}",
+            "lanius-skilllink-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -14390,7 +14393,7 @@ mod tests {
     #[test]
     fn codex_skills_home_mirrors_auth_and_links_skills() {
         let base = std::env::temp_dir().join(format!(
-            "elanus-codexhome-{}-{}",
+            "lanius-codexhome-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -14434,7 +14437,7 @@ mod tests {
             );
             assert_eq!(&std::fs::read_link(&link).unwrap(), &real_codex.join(entry));
         }
-        // Config is copied, not symlinked, because elanus appends its managed hook.
+        // Config is copied, not symlinked, because lanius appends its managed hook.
         let config = home.join("config.toml");
         assert!(
             !std::fs::symlink_metadata(&config)

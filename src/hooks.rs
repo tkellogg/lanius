@@ -242,7 +242,7 @@ mod tests {
     use crate::db;
 
     fn test_root() -> Root {
-        let dir = std::env::temp_dir().join(format!("elanus-hooks-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("lanius-hooks-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         Root { dir }
     }

@@ -5,7 +5,7 @@
 //! Three shapes of process, one publish() call:
 //! - the daemon publishes in-process over a channel to the broker thread —
 //!   no framing, no loopback hop;
-//! - every other process (exec, emit, handlers via `elanus trace`) mirrors
+//! - every other process (exec, emit, handlers via `lanius trace`) mirrors
 //!   over loopback MQTT with a deliberately tiny hand-rolled QoS 0 publisher.
 //!   No client library, no async runtime: trace::write is called from inside
 //!   genai's tokio context in exec, and the flight path must never grow a
@@ -243,8 +243,8 @@ pub fn register_actor(name: &str, token: Option<&str>) {
 /// is fine, its obs are still on disk via the WAL.
 fn mirror_creds(root: &Root) -> Option<(String, String)> {
     if let (Ok(pkg), Ok(token)) = (
-        std::env::var("ELANUS_PACKAGE"),
-        std::env::var("ELANUS_BUS_TOKEN"),
+        std::env::var("LANIUS_PACKAGE"),
+        std::env::var("LANIUS_BUS_TOKEN"),
     ) {
         return Some((pkg, token));
     }
@@ -525,7 +525,7 @@ mod tests {
     /// empty file defaults to full.
     #[test]
     fn trust_level_from_bus_toml() {
-        let dir = std::env::temp_dir().join(format!("elanus-trust-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("lanius-trust-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root {
             dir: dir.canonicalize().unwrap(),

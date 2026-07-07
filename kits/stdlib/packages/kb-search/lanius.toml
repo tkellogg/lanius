@@ -13,7 +13,7 @@
 # The tool NAME is bare (`search_knowledge`), so a different engine (an
 # embedding-based indexer, say) can declare the SAME [[tool]] and swap invisibly
 # to agents. The approve gate refuses two live holders — disable one, enable the
-# other. `elanus kb search <query>` reads the same index for the CLI.
+# other. `lanius kb search <query>` reads the same index for the CLI.
 
 # NOTE: kb-search carries NO [kb] marker — it is the search ENGINE, not a
 # knowledge corpus. It indexes OTHER packages' kb/ trees.

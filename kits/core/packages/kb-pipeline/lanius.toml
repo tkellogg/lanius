@@ -1,8 +1,8 @@
 # kb-pipeline — the exec handler that turns the KB diff-pipeline agent mailboxes
-# (in/agent/kb-compactor, in/agent/kb-ratifier) into `elanus exec` runs
+# (in/agent/kb-compactor, in/agent/kb-ratifier) into `lanius exec` runs
 # (docs/handoffs/kb-groundskeeper.md M3). Mirrors the `chat`/`funnel-scout`
 # pattern: `spawn_core` (src/agentcli.rs) refuses to launch a profile whose agent
-# mailbox has NO approved exec handler — so without this package `elanus kb
+# mailbox has NO approved exec handler — so without this package `lanius kb
 # groundskeep` cannot spawn the compactor at all. This is that handler.
 #
 # publish = ["#"] is deliberate and worth reading twice — the compactor and the
@@ -13,7 +13,7 @@
 # rung 1's no-LLM sweep keeps its narrow publish set, and turning the auto-approve
 # pipeline's agents loose is its own deliberate decision.
 #
-# Ships pending in core, like every package. `elanus approve kb-pipeline` (in
+# Ships pending in core, like every package. `lanius approve kb-pipeline` (in
 # addition to the kb-groundskeeper config + approve) is part of pipeline setup.
 
 [request]

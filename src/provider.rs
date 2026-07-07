@@ -16,7 +16,7 @@
 //! is NEVER written to logs, obs, the config git, or printed by the CLI.
 //!
 //! Scope of M1: the vault + the credential model + `materialize` + the
-//! `elanus provider` CLI. No consumer is wired yet (M2 harness launch, M3
+//! `lanius provider` CLI. No consumer is wired yet (M2 harness launch, M3
 //! dispatcher build_client) — but `materialize` returns the right SHAPES so they
 //! can be.
 
@@ -54,7 +54,7 @@ impl Wire {
     }
 }
 
-/// The coding harnesses elanus can point at a provider. Mirrors the CLI ids in
+/// The coding harnesses lanius can point at a provider. Mirrors the CLI ids in
 /// src/codeagent.rs (`claude` | `codex` | `opencode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HarnessId {
@@ -264,7 +264,7 @@ fn materialize_dispatcher(name: &str, cred: &Credential) -> Result<DispatcherInj
             headers: headers.clone(),
         }),
         Credential::NativeLogin { .. } => bail!(
-            "provider {name:?} is a native-login credential and can't drive the elanus dispatcher \
+            "provider {name:?} is a native-login credential and can't drive the lanius dispatcher \
              (there is no secret to feed a genai client) — point the dispatcher at an ApiKey provider"
         ),
     }
@@ -441,11 +441,11 @@ fn env_token(name: &str) -> String {
 }
 
 fn codex_key_var(name: &str) -> String {
-    format!("ELANUS_PV_{}_KEY", env_token(name))
+    format!("LANIUS_PV_{}_KEY", env_token(name))
 }
 
 fn codex_header_var(name: &str, i: usize) -> String {
-    format!("ELANUS_PV_{}_H{i}", env_token(name))
+    format!("LANIUS_PV_{}_H{i}", env_token(name))
 }
 
 /// Render a string as a double-quoted TOML scalar for a codex `-c key=value`
@@ -570,7 +570,7 @@ CREATE TABLE IF NOT EXISTS providers (
     Ok(())
 }
 
-/// Provider names flow into env-var tokens (`ELANUS_PV_<NAME>_KEY`), codex TOML
+/// Provider names flow into env-var tokens (`LANIUS_PV_<NAME>_KEY`), codex TOML
 /// keys (`model_providers.<name>`), opencode provider ids, and CLI args — so
 /// restrict them to a safe, collision-free shape: lowercase alphanumeric + hyphen,
 /// starting alphanumeric, ≤64 chars. Disallowing `_` keeps `env_token`'s `-`→`_`

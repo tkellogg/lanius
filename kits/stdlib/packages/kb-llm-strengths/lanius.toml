@@ -1,12 +1,12 @@
 # kb-llm-strengths — the first knowledge base (docs/handoffs/kb-core.md M2, D5).
 # The model-tiering knowledge (which model for which role) used to live only in
 # Claude's own config (.claude/skills/handoff-workflow/SKILL.md), invisible to
-# elanus agents. It lives here now as a first-class, elanus-visible KB so the
+# lanius agents. It lives here now as a first-class, lanius-visible KB so the
 # work-estimation and escalation packages — and any dispatching planner — read
 # the same tiering facts.
 #
 # The [kb] marker (its mere presence) enrolls this package's kb/ subfolder as a
-# knowledge base: `elanus kb list` names it, and the search union (kb-search)
+# knowledge base: `lanius kb list` names it, and the search union (kb-search)
 # indexes it. No kernel data model — just plain, greppable markdown.
 
 [kb]

@@ -7,7 +7,7 @@ miss to the durable `estimation` block. This cron-driven script is the safety
 net for sessions whose hook never fired — a crashed worker, a killed harness.
 
 It is intentionally dumb and idempotent: list the finished coding sessions from
-the obs projection, and for each one run `elanus estimate retro`. That verb is
+the obs projection, and for each one run `lanius estimate retro`. That verb is
 once-per-session (it writes a session-scope `estimation-retro-done` marker block
 the first time and returns "skipped" thereafter), so a session the hook already
 retro'd, or that this sweep already swept, records NOTHING the second time. The
@@ -21,11 +21,11 @@ import os
 import subprocess
 import sys
 
-ROOT = os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT")
+ROOT = os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT")
 
 
-def elanus(*args):
-    cmd = ["elanus"]
+def lanius(*args):
+    cmd = ["lanius"]
     if ROOT:
         cmd += ["--root", ROOT]
     cmd += list(args)
@@ -34,7 +34,7 @@ def elanus(*args):
 
 def main():
     # The materialized projection: one row per coding session/thread.
-    listed = elanus("code", "sessions", "--json")
+    listed = lanius("code", "sessions", "--json")
     if listed.returncode != 0:
         # No projection yet, or the CLI is unavailable — nothing to sweep.
         return 0
@@ -53,7 +53,7 @@ def main():
             continue
         # retro is once-per-session (marker block); a session with no estimate, or
         # one already retro'd by the Stop hook or a prior sweep, is a no-op.
-        r = elanus("estimate", "retro", "--session", session, "--owner", owner)
+        r = lanius("estimate", "retro", "--session", session, "--owner", owner)
         if r.returncode == 0 and "updated" in r.stdout:
             print(f"estimation: retro recorded for {session}", file=sys.stderr)
     return 0

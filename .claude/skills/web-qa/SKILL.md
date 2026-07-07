@@ -1,7 +1,7 @@
 ---
 name: web-qa
 description: >-
-  QA the elanus web dashboard (ui/web) by driving the real UI in a headless
+  QA the lanius web dashboard (ui/web) by driving the real UI in a headless
   browser against an isolated live stack, asserting DURABLE state and reading
   the backend log. Use when changing ui/web (server.mjs, src/App.tsx,
   src/api.ts, src/styles.css), when a UI gesture "does nothing"/flashes/feels
@@ -10,10 +10,10 @@ description: >-
   silent edit loss, feedback that flashes and vanishes, dead UI affordances.
 ---
 
-# elanus web-qa
+# lanius web-qa
 
 The web UI is a pure MQTT client relayed to the browser over SSE, with admin
-gestures that shell out to the `elanus` CLI. The bugs that matter here are the
+gestures that shell out to the `lanius` CLI. The bugs that matter here are the
 ones a unit test or an HTTP-200 check miss: a confirmation that flashes for one
 frame, an edit silently overwritten by a late async load, a badge that can never
 render. So this harness drives a **real headless browser** against a **real
@@ -36,7 +36,7 @@ with the *observable* a user (and an assertion) can trust.
 2. **Separate "it worked" from "the user could tell it worked."** A flow can be
    functionally `pass` while `user_observes_clearly` is false. That gap is the
    point — record both.
-3. **Read `ELANUS_WEB_LOG`.** It proves the actual CLI invocation and POST body
+3. **Read `LANIUS_WEB_LOG`.** It proves the actual CLI invocation and POST body
    (e.g. that `model.max_turns` / `sandbox.workdir` / `skills.*` arrived
    correctly). This is how the configure load-race clobber was caught: the log
    showed disk defaults where typed values should have been.
@@ -44,22 +44,22 @@ with the *observable* a user (and an assertion) can trust.
 ## Recipe — an isolated stack (mirror `ui/web/test/ui.spec.mjs`)
 
 ```js
-const TMP = fs.mkdtempSync('/tmp/elanus-qa-<suite>.');
+const TMP = fs.mkdtempSync('/tmp/lanius-qa-<suite>.');
 const BUS_PORT = 22000 + /* unique per suite */;   // never 1883 (user's live bus)
 const WEB_PORT = 9500 + /* unique per suite */;    // never 7180 (user's live web)
-const ENV = { ...process.env, ELANUS_ROOT: TMP,
+const ENV = { ...process.env, LANIUS_ROOT: TMP,
   PATH: `${REPO}/target/debug:${process.env.PATH}`,
-  ELANUS_WEB_LOG: `${TMP}/web.log` };              // <-- capture the backend trace
+  LANIUS_WEB_LOG: `${TMP}/web.log` };              // <-- capture the backend trace
 
-elanus('init');                                    // mints .secrets/owner etc.
+lanius('init');                                    // mints .secrets/owner etc.
 fs.writeFileSync(`${TMP}/bus.toml`, `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\n`);
-const daemon = spawn(BIN+'/elanus', ['daemon','--interval-ms','200'], { env: ENV, stdio: 'ignore' });
+const daemon = spawn(BIN+'/lanius', ['daemon','--interval-ms','200'], { env: ENV, stdio: 'ignore' });
 const server = spawn('node', [`${REPO}/ui/web/server.mjs`, '--root', TMP, '--port', String(WEB_PORT)],
   { env: ENV, stdio: ['ignore','pipe','inherit'] });
 // waitFor `${BASE}/` to answer, then chromium.launch({ headless: true }).
 ```
 
-The web server resolves root as `--root > $ELANUS_ROOT > ~/.elanus/root` and
+The web server resolves root as `--root > $LANIUS_ROOT > ~/.lanius/root` and
 presents the fenced owner credential, so it authenticates — no deny-by-default
 refusal. The boot line `[web:boot] ... credential=present` confirms it; if you
 ever see `credential=MISSING`, the root is wrong.
@@ -77,7 +77,7 @@ file under `ui/web/test/`. Chromium itself is already installed.
 `browser.close()`; `server.kill('SIGKILL')`; `daemon.kill('SIGKILL')`;
 `execFileSync('pkill', ['-9','-f',TMP])`; then it's safe to `rm -rf $TMP`.
 
-**⚠ Never broaden the cleanup to `pkill -f "elanus daemon"`.** That is global — it
+**⚠ Never broaden the cleanup to `pkill -f "lanius daemon"`.** That is global — it
 kills the user's live daemon and any other test running at the same time (it
 sabotaged a live daemon and an in-flight e2e once). Kill the daemon/server
 handles you spawned, and scope any `pkill` to this run's `$TMP`. When you ask a
@@ -104,7 +104,7 @@ subagent to run a suite, give it the scoped form too.
 `boot` (root/owner/credential/broker/port) · `bus` (connect+connack reason,
 reconnect/close/error/disconnect) · `http` (method path → status + ms) · `cli`
 (every shell-out + failures) · `pub` (publishes) · `sse` (client connect/
-disconnect). Set `ELANUS_WEB_LOG=<file>` to also append to a file; otherwise it's
+disconnect). Set `LANIUS_WEB_LOG=<file>` to also append to a file; otherwise it's
 on stderr.
 
 ## When you find something

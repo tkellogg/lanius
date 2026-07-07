@@ -6,7 +6,7 @@ description: Read, search, and write knowledge bases (kb/ folders). Use when you
 # knowledge — using knowledge bases
 
 A knowledge base is a `kb/` subfolder inside a package, declared by a `[kb]`
-marker in the package's `elanus.toml`. It is plain, greppable markdown: one topic
+marker in the package's `lanius.toml`. It is plain, greppable markdown: one topic
 per file, with file + line anchors when you cross-reference. Knowledge that is
 *ours* (a shared fact other agents should see) belongs here; your own private
 scratch stays in `notes/` or a memory block.
@@ -16,7 +16,7 @@ The ladder: **notes (mine)** → **kb/ (ours, sandbox-gated + git-logged)** →
 
 ## Find and read
 
-- `elanus kb list` — the enabled knowledge bases (name, title, file count, path).
+- `lanius kb list` — the enabled knowledge bases (name, title, file count, path).
 - Read a file directly, or grep the tree: `grep -rin "who verifies" <kb path>`.
 - A memory block may already point you at the exact file + lines (its `meta`
   carries `{kb, path, lines, sha}`) — follow the pointer for the deep copy.
@@ -27,8 +27,8 @@ You write a KB the same way you write any file, then it is committed for
 provenance. Two ways:
 
 - **Convenience verb (does write-then-commit atomically):**
-  `elanus kb write <package> <path-inside-kb> --content "..."`, or pipe the
-  content on stdin: `printf '%s' "$body" | elanus kb write kb-llm-strengths kb/gpt-5.5.md`.
+  `lanius kb write <package> <path-inside-kb> --content "..."`, or pipe the
+  content on stdin: `printf '%s' "$body" | lanius kb write kb-llm-strengths kb/gpt-5.5.md`.
 - **By hand:** write the file under the package's `kb/` tree with your normal
   tools; the change is captured by the KB's git repo.
 

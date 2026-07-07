@@ -121,7 +121,7 @@ fn connect(root: &Root) -> Option<Line> {
     let resub = client.clone();
     let resub_topic = resp_topic.clone();
     std::thread::Builder::new()
-        .name("elanus-hookline".into())
+        .name("lanius-hookline".into())
         .spawn(move || drive(connection, tx, resub, resub_topic))
         .ok()?;
     Some(Line {
@@ -177,7 +177,7 @@ fn drive(mut connection: Connection, tx: Sender<Msg>, client: Client, resp_topic
 // correlation ride IN THE BODY ({doc, response_topic, correlation}), not
 // MQTT §4.10 properties — the broker is not the coordinator here (it only
 // fans out and keeps these topics off disk), and the serving daemon is a
-// plain `elanus bus sub | transform | elanus bus pub` pipeline, which the
+// plain `lanius bus sub | transform | lanius bus pub` pipeline, which the
 // CLI supports today with no property plumbing. Topics:
 //   request:  obs/harness/stagereq/<package>/<stage>   (daemon subscribes)
 //   response: obs/harness/stageresp/req-<pid>-<uuid>   (consult subscribes)
@@ -229,7 +229,7 @@ fn stage_connect(root: &Root) -> Option<Line> {
     let resub = client.clone();
     let resub_topic = resp_topic.clone();
     std::thread::Builder::new()
-        .name("elanus-stageline".into())
+        .name("lanius-stageline".into())
         .spawn(move || drive(connection, tx, resub, resub_topic))
         .ok()?;
     Some(Line {

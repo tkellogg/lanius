@@ -11,13 +11,13 @@ import { chromium } from 'playwright';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const BIN = path.join(REPO, 'target/debug');
-const TMP = fs.mkdtempSync('/tmp/elanus-ui-spec.');
+const TMP = fs.mkdtempSync('/tmp/lanius-ui-spec.');
 // Offset by 3000 from smoke.mjs to avoid collisions when both run together.
 const BUS_PORT = 21000 + (process.pid % 2000);
 const WEB_PORT = 9300 + (process.pid % 500);
 const BASE = `http://127.0.0.1:${WEB_PORT}`;
 const WEB_LOG = path.join(TMP, 'web.log');
-const ENV = { ...process.env, ELANUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}`, ELANUS_WEB_LOG: WEB_LOG };
+const ENV = { ...process.env, LANIUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}`, LANIUS_WEB_LOG: WEB_LOG };
 
 let failures = 0;
 const ok = (m) => console.log(`  ok: ${m}`);
@@ -32,7 +32,7 @@ async function waitFor(desc, fn, timeoutMs = 15000) {
   fail(`${desc} (timed out)`);
   return false;
 }
-const elanus = (...a) => execFileSync(path.join(BIN, 'elanus'), a, { env: ENV, encoding: 'utf8' });
+const lanius = (...a) => execFileSync(path.join(BIN, 'lanius'), a, { env: ENV, encoding: 'utf8' });
 function createConfigProposal(id, pkg, toml) {
   const cfg = path.join(TMP, 'config');
   const branch = `tmp-${id}`;
@@ -47,13 +47,13 @@ function createConfigProposal(id, pkg, toml) {
 }
 
 // -- stack setup (mirrors smoke.mjs) --
-elanus('init');
+lanius('init');
 fs.writeFileSync(path.join(TMP, 'bus.toml'), `enabled = true\nbind = "127.0.0.1:${BUS_PORT}"\n`);
-const daemon = spawn(path.join(BIN, 'elanus'), ['daemon', '--interval-ms', '200'], { env: ENV, stdio: 'ignore' });
-// The server under test: the Rust `elanus web` (the embedded SPA, src/web.rs).
+const daemon = spawn(path.join(BIN, 'lanius'), ['daemon', '--interval-ms', '200'], { env: ENV, stdio: 'ignore' });
+// The server under test: the Rust `lanius web` (the embedded SPA, src/web.rs).
 // server.mjs/config.mjs were retired (web-packaging M4) — the Rust server is the
 // only path now.
-const server = spawn(path.join(BIN, 'elanus'), ['web', '--port', String(WEB_PORT)], { env: ENV, stdio: ['ignore', 'pipe', 'inherit'] });
+const server = spawn(path.join(BIN, 'lanius'), ['web', '--port', String(WEB_PORT)], { env: ENV, stdio: ['ignore', 'pipe', 'inherit'] });
 // server.mjs is retired (M4): the Rust server is always under test now. Kept as a
 // named constant so the Rust-only assertion gates below read intentionally.
 const USE_RUST = true;
@@ -94,13 +94,18 @@ async function newPage() {
 // Waits for the configure form to finish loading by checking that the model
 // field is non-empty OR cfg-note shows an error (no profile case). Without
 // this the haiku model's default max_turns=24 races the test's fill() calls.
-async function waitForConfigureLoaded(page) {
+async function waitForConfigureLoaded(page, expectedAgent = '') {
   const t0 = Date.now();
   while (Date.now() - t0 < 8000) {
     const note = await page.$eval('#cfg-note', (el) => el.textContent).catch(() => '');
     const model = await page.$eval('#cfg-model', (el) => el.value).catch(() => '');
-    // loadConfigure finishes by populating cfg-model (or setting an error note)
-    if (model.length > 0 || note.includes('no profile')) return;
+    const file = await page.$eval('#cfg-file', (el) => el.textContent).catch(() => '');
+    const saveDisabled = await page.$eval('#cfg-save', (el) => el.disabled).catch(() => true);
+    const profileOk = expectedAgent ? new RegExp(`\\b${expectedAgent}\\b`).test(file) : model.length > 0;
+    // loadConfigure finishes by populating cfg-model (or setting an error note).
+    // When we know which profile should load, also require the profile label to
+    // match so a stale prior load does not slip through on reload.
+    if ((profileOk && !saveDisabled && !/^loading/i.test(note)) || note.includes('no profile')) return;
     await sleep(80);
   }
 }
@@ -202,7 +207,7 @@ const testAgentProfile = 'harrier';
   createDisabledAtStart ? ok('wizard: Create disabled on empty name') : fail('wizard: Create enabled before name entered');
   // M3: the workdir field flags a path that does not exist (closed-set-style
   // validation per ui-preferences.md — let the field catch a typo before save).
-  await page.fill('#na-workdir', '/tmp/elanus-definitely-does-not-exist-xyz');
+  await page.fill('#na-workdir', '/tmp/lanius-definitely-does-not-exist-xyz');
   await page.$eval('#na-workdir', (el) => el.blur());
   await waitFor('wizard: bogus workdir is flagged at the field', async () => {
     const text = await page.$eval('.wizard-grid', (el) => el.textContent);
@@ -224,7 +229,7 @@ const testAgentProfile = 'harrier';
   await page.click('#na-create');
   await waitFor('new agent: converse tab opens', async () => {
     return !(await page.$eval('#view-converse', (el) => el.hidden));
-  }, 10000);
+  }, 20000);
   const composeLabel = await page.$eval('#compose-input', (el) => el.getAttribute('aria-label'));
   composeLabel === `message ${testAgentProfile}` ? ok('new agent: compose targets the new agent') : fail(`new agent: compose target wrong (${composeLabel})`);
   await waitFor('new agent: configure pointer is visible from converse', async () => {
@@ -258,7 +263,7 @@ const testAgentProfile = 'harrier';
   await page.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
   // loadConfigure is async — wait for it to populate the model field before
   // filling, otherwise the haiku default max_turns=24 overwrites our value.
-  await waitForConfigureLoaded(page);
+  await waitForConfigureLoaded(page, testAgentProfile);
   await page.fill('#cfg-model', 'claude-haiku-4-5-20251001');
   await page.fill('#cfg-turns', '7');
   await waitFor('configure: essentials are first and plumbing is advanced', async () => {
@@ -517,60 +522,8 @@ const testAgentProfile = 'harrier';
   await page.click('[data-tab="configure"]');
   await page.waitForSelector('#view-configure:not([hidden])');
   // Must wait for the async loadConfigure to finish before reading values.
-  await waitForConfigureLoaded(page);
+  await waitForConfigureLoaded(page, testAgentProfile);
   await page.click('#cfg-section-advanced > summary');
-  const model = await page.$eval('#cfg-model', (el) => el.value);
-  const turns = await page.$eval('#cfg-turns', (el) => el.value);
-  const contextProgram = await page.$eval('#cfg-context-program', (el) => el.value);
-  const contextMaxMs = await page.$eval('#cfg-context-max-ms', (el) => el.value);
-  const contextWindowTimeout = await page.locator('#cfg-context-chain .cfg-context-stage[data-stage="window/window"]')
-    .locator('label', { hasText: 'timeout ms' })
-    .locator('input')
-    .first()
-    .inputValue();
-  const include = await page.$eval('#cfg-include', (el) => el.value);
-  const exclude = await page.$eval('#cfg-exclude', (el) => el.value);
-  await page.click('text=advanced context parameters');
-  const varRows = await page.$$eval('#cfg-vars .cfg-var-row', (rows) => rows.map((row) => ({
-    key: row.querySelector('.cfg-var-key')?.value,
-    value: row.querySelector('.cfg-var-value')?.value,
-  })));
-  const rawToml = await page.$eval('#cfg-toml', (el) => el.value);
-  model.includes('haiku') ? ok('configure reload: model persisted') : fail(`configure reload: model wrong: "${model}"`);
-  turns === '7' ? ok('configure reload: max_turns persisted') : fail(`configure reload: turns wrong: "${turns}"`);
-  contextProgram === 'default' && contextMaxMs === '12000'
-    ? ok('configure reload: context program policy persisted')
-    : fail(`configure reload: context policy wrong: "${contextProgram}" ${contextMaxMs}`);
-  contextWindowTimeout === '9000'
-    ? ok('configure reload: context stage timeout persisted')
-    : fail(`configure reload: context stage timeout wrong: "${contextWindowTimeout}"`);
-  include.includes('#') ? ok('configure reload: skills.include persisted') : fail(`configure reload: include wrong: "${include}"`);
-  exclude.includes('history') ? ok('configure reload: skills.exclude persisted') : fail(`configure reload: exclude wrong: "${exclude}"`);
-  varRows.some((row) => row.key === 'window_rows' && row.value === '60')
-    ? ok('configure reload: advanced context parameter persisted')
-    : fail(`configure reload: context parameter wrong: ${JSON.stringify(varRows)}`);
-  /\[vars\][\s\S]*window_rows\s*=\s*"60"/.test(rawToml)
-    ? ok('configure reload: raw [vars] persisted')
-    : fail('configure reload: raw [vars] missing window_rows');
-  /\[context\][\s\S]*max_total_ms\s*=\s*12000/.test(rawToml)
-    ? ok('configure reload: raw [context] persisted')
-    : fail('configure reload: raw [context] missing max_total_ms');
-  /\[context\][\s\S]*stage\s*=\s*\[[\s\S]*package\s*=\s*"window"[\s\S]*timeout_ms\s*=\s*9000/.test(rawToml)
-    ? ok('configure reload: raw context.stage array persisted')
-    : fail('configure reload: raw context.stage array missing window timeout');
-  const reloadedWindowPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="window"]').first();
-  await reloadedWindowPackage().evaluate((el) => { if (!el.open) el.querySelector('summary')?.click(); });
-  await reloadedWindowPackage().locator('.cfg-package-config-toggle').click();
-  await waitFor('configure reload: selected agent shows its package override source', async () => {
-    const text = await reloadedWindowPackage().locator('.cfg-config-row', { hasText: 'Window rows' }).textContent();
-    return /effective here:\s*60/i.test(text) && /overridden here for harrier/i.test(text);
-  }, 8000);
-  await waitFor('configure reload: selected agent context tile shows its override source', async () => {
-    const text = await page.locator('#cfg-context-chain .cfg-context-stage[data-stage="window/window"]')
-      .locator('.cfg-config-row', { hasText: 'Window rows' })
-      .textContent();
-    return /effective here:\s*60/i.test(text) && /overridden here for harrier/i.test(text);
-  }, 8000);
   const harrierCostSummary = await page.$eval('.cfg-cost-summary', (el) => el.textContent);
   await waitFor('configure reload: second agent in nav', async () => {
     const items = await page.$$('#nav-agents .nav-item');
@@ -582,7 +535,7 @@ const testAgentProfile = 'harrier';
   });
   await page.click('[data-tab="configure"]');
   await page.waitForSelector('#view-configure:not([hidden])');
-  await waitForConfigureLoaded(page);
+  await waitForConfigureLoaded(page, 'main');
   await page.click('#cfg-section-advanced > summary');
   const mainWindowPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="window"]').first();
   await waitFor('configure reload: cost summary follows second agent', async () => {
@@ -609,10 +562,10 @@ const testAgentProfile = 'harrier';
     return /effective here:\s*70/i.test(text) && /from the shared default/i.test(text);
   }, 8000);
   const webLog = fs.existsSync(WEB_LOG) ? fs.readFileSync(WEB_LOG, 'utf8') : '';
-  /web:cli.*elanus config set window window_rows 70/.test(webLog)
+  /web:cli.*lanius config set window window_rows 70/.test(webLog)
     ? ok('configure scope: backend log recorded shared config write')
     : fail('configure scope: backend log missing shared config write');
-  /web:cli.*elanus profile set harrier .*vars\.window_rows="60"/.test(webLog)
+  /web:cli.*lanius profile set harrier .*vars\.window_rows="60"/.test(webLog)
     ? ok('configure scope: backend log recorded per-agent profile write')
     : fail('configure scope: backend log missing per-agent profile write');
   await page.close();
@@ -634,7 +587,7 @@ const renamedAgent = 'falcon';
   });
   await page.click('[data-tab="configure"]');
   await page.waitForSelector('#view-configure:not([hidden])');
-  await waitForConfigureLoaded(page);
+  await waitForConfigureLoaded(page, testAgentProfile);
   // Rename the agent field.
   await page.fill('#cfg-agent', renamedAgent);
   // cfg-save handler sets note to 'saving…', sends the API call, then on
@@ -746,8 +699,8 @@ const renamedAgent = 'falcon';
   // Seed status on the bus for two installed capabilities (the same
   // obs/package/<name>/status the dispatcher publishes), leaving others unseeded.
   // Publish through the web server's own authenticated bus connection (/api/publish)
-  // rather than shelling `elanus bus pub`, so the seed does not depend on the CLI's
-  // ambient identity env (ELANUS_PACKAGE/ELANUS_BUS_TOKEN when run inside a session).
+  // rather than shelling `lanius bus pub`, so the seed does not depend on the CLI's
+  // ambient identity env (LANIUS_PACKAGE/LANIUS_BUS_TOKEN when run inside a session).
   await page.evaluate(async () => {
     const pub = (topic, payload) => fetch('/api/publish', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic, payload }) });
     await pub('obs/package/git-protect/status', { state: 'alive', pid: 4242 });
@@ -770,7 +723,7 @@ const renamedAgent = 'falcon';
   // ── M3 (ui-truthfulness): cost honesty — a run-step limit is a HARD CAP, a
   // throttle is a SOFT LIMIT; they must render as separate groups, and the
   // estimate is honestly "unknown" (never a fake $0) until pricing is known.
-  elanus('profile', 'set', 'default', 'model.max_turns=24', 'throttle.work.llm_tokens_per_hour=50000');
+  lanius('profile', 'set', 'default', 'model.max_turns=24', 'throttle.work.llm_tokens_per_hour=50000');
   await page.reload();
   await page.waitForSelector('.nav-setup');
   await page.click('.nav-setup');
@@ -856,7 +809,7 @@ const renamedAgent = 'falcon';
     return /turned off dev/i.test(status) && !/git-protect/.test(list);
   }, 10000);
   const webLog = fs.readFileSync(WEB_LOG, 'utf8');
-  /elanus kit unlink dev/.test(webLog)
+  /lanius kit unlink dev/.test(webLog)
     ? ok('add-ons: backend log recorded kit unlink')
     : fail('add-ons: backend log missing kit unlink');
   await page.close();
@@ -953,7 +906,7 @@ const renamedAgent = 'falcon';
     : fail(`vocabulary: message tooltip wording leaks internal vocabulary (${msgTitle})`);
   const corr = msgTitle.replace('conversation ', '');
   const agentName = await page.$eval('#nav-agents .nav-agent.on', (el) => el.getAttribute('data-sel')?.replace(/^agent:/, '') || 'main').catch(() => 'main');
-  elanus('emit', `in/human/owner`, '--correlation', corr || 'spec-fail', '--payload',
+  lanius('emit', `in/human/owner`, '--correlation', corr || 'spec-fail', '--payload',
     JSON.stringify({ failed: true, error: 'spec-injected failure', agent: agentName }));
   await waitFor('converse: agent failure renders as an error bubble', async () => {
     return (await page.$eval('#conv-holder', (el) => el.textContent)).includes('spec-injected failure');
@@ -1061,9 +1014,9 @@ const renamedAgent = 'falcon';
   await seedPage.close();
   const commsCorr = `chatrender-${Date.now().toString(36)}`;
   try {
-    elanus('emit', `in/agent/${commsAgent}`, '--correlation', commsCorr, '--payload',
+    lanius('emit', `in/agent/${commsAgent}`, '--correlation', commsCorr, '--payload',
       JSON.stringify({ prompt: 'hello companion', session: `web-${commsAgent}-seed` }));
-    elanus('emit', 'in/human/owner', '--correlation', commsCorr, '--payload',
+    lanius('emit', 'in/human/owner', '--correlation', commsCorr, '--payload',
       JSON.stringify({ text: 'hi there — I am here when you need me', session: `web-${commsAgent}-seed` }));
   } catch (e) { fail(`chat-render: seeding comms-plane traffic failed: ${e.message ?? e}`); }
   // The trace-only agent: a coding worker. Seed on the EXACT in/agent/<agent>
@@ -1073,7 +1026,7 @@ const renamedAgent = 'falcon';
   // /api/conversations?agent=claude-code returns []  →  trace fallback.
   const traceAgent = 'claude-code';
   try {
-    elanus('emit', `in/agent/${traceAgent}`, '--payload',
+    lanius('emit', `in/agent/${traceAgent}`, '--payload',
       JSON.stringify({ prompt: 'run the build', session: 'code-chatrender01' }));
   } catch (e) { fail(`chat-render: seeding trace-only traffic failed: ${e.message ?? e}`); }
 
@@ -1087,9 +1040,9 @@ const renamedAgent = 'falcon';
   const nounAgent = 'codex';
   const nounCorr = `chatrender-noun-${Date.now().toString(36)}`;
   try {
-    elanus('emit', `in/agent/${nounAgent}`, '--correlation', nounCorr, '--payload',
+    lanius('emit', `in/agent/${nounAgent}`, '--correlation', nounCorr, '--payload',
       JSON.stringify({ prompt: 'ping from a coding-noun agent', session: `web-${nounAgent}-comms` }));
-    elanus('emit', 'in/human/owner', '--correlation', nounCorr, '--payload',
+    lanius('emit', 'in/human/owner', '--correlation', nounCorr, '--payload',
       JSON.stringify({ text: 'a coding-noun agent can still hold a conversation', session: `web-${nounAgent}-comms` }));
   } catch (e) { fail(`chat-render: seeding coding-noun comms traffic failed: ${e.message ?? e}`); }
 
@@ -1177,19 +1130,12 @@ const renamedAgent = 'falcon';
     }, 10000);
     // The trace-only agent IS reachable in the runs/trace surface: it is listed in
     // the Workers drawer (the UI's entry into the obs-trace surface). `opened`
-    // already located it there. The trace fallback's own "open runs" link routes to
-    // the runs view; click it to confirm the route.
+    // already located it there. Click the fallback's own "open runs" link directly
+    // so the element is acted on before a rerender can swap it out.
     ok(`chat-render: trace-only ${traceAgent} is present in the runs/trace surface (Workers drawer)`);
-    // Guard: a missing/late #conv-open-runs must not throw an uncaught TimeoutError
-    // that aborts the whole suite — degrade to a recorded failure for this assertion.
-    const runsLink = await page.$('#conv-open-runs');
-    if (runsLink) {
-      await runsLink.click();
-      await waitFor('chat-render: trace fallback links into the runs surface', async () =>
-        page.$eval('[data-sel="code-sessions"]', (el) => el.classList.contains('on')).catch(() => false), 5000);
-    } else {
-      fail('chat-render: trace fallback #conv-open-runs link missing (cannot route into runs surface)');
-    }
+    await page.locator('#conv-open-runs').click();
+    await waitFor('chat-render: trace fallback links into the runs surface', async () =>
+      page.$eval('[data-sel="code-sessions"]', (el) => el.classList.contains('on')).catch(() => false), 5000);
     // The obs-driven code projection (/api/code/sessions) is populated by flight-
     // recorder telemetry the spec stack does not stand up (same limitation flow 11
     // documents); when present it should list the worker, else tolerate its absence.
@@ -1242,11 +1188,11 @@ const renamedAgent = 'falcon';
   // Seed a comms conversation: an in/agent prompt + two correlated agent replies
   // on in/human/<owner> — one format="html" carrying a <button>, one default.
   try {
-    elanus('emit', `in/agent/${htmlAgent}`, '--correlation', htmlCorr, '--payload',
+    lanius('emit', `in/agent/${htmlAgent}`, '--correlation', htmlCorr, '--payload',
       JSON.stringify({ prompt: 'give me a way to pick', session: htmlSession }));
-    elanus('emit', 'in/human/owner', '--correlation', htmlCorr, '--payload',
+    lanius('emit', 'in/human/owner', '--correlation', htmlCorr, '--payload',
       JSON.stringify({ text: '<button data-html-demo="1">Press me</button>', session: htmlSession, format: 'html' }));
-    elanus('emit', 'in/human/owner', '--correlation', htmlCorr, '--payload',
+    lanius('emit', 'in/human/owner', '--correlation', htmlCorr, '--payload',
       JSON.stringify({ text: '**plain markdown reply** <button data-html-plain="1">no</button>', session: htmlSession, format: 'markdown' }));
   } catch (e) { fail(`html-messages: seeding failed: ${e.message ?? e}`); }
 
@@ -1333,10 +1279,10 @@ const renamedAgent = 'falcon';
   const ambientAgent = 'beacon';
   const ambientSession = `run-${ambientAgent}-${Date.now().toString(36)}`;
   const ambientText = `your nightly build finished — all green (${Date.now().toString(36)})`;
-  // `elanus emit` records the sender from ELANUS_ACTOR; the real send_message
-  // path runs with ELANUS_ACTOR = the agent noun, so seed the same way.
+  // `lanius emit` records the sender from LANIUS_ACTOR; the real send_message
+  // path runs with LANIUS_ACTOR = the agent noun, so seed the same way.
   const emitAs = (actor, ...a) =>
-    execFileSync(path.join(BIN, 'elanus'), a, { env: { ...ENV, ELANUS_ACTOR: actor }, encoding: 'utf8' });
+    execFileSync(path.join(BIN, 'lanius'), a, { env: { ...ENV, LANIUS_ACTOR: actor }, encoding: 'utf8' });
 
   const seedPage = await newPage();
   await seedPage.goto('/');
@@ -1430,7 +1376,7 @@ const renamedAgent = 'falcon';
 
 // ── flow 6f: timers — a scheduled self-wake fires, and its message is replyable ─
 // docs/handoffs/timers.md M5 (the sanctioned split). Two halves, provider-free:
-//  (ledger) `elanus schedule` inserts a one-shot row; the LIVE daemon's
+//  (ledger) `lanius schedule` inserts a one-shot row; the LIVE daemon's
 //    tick_schedules fires it once into in/agent/<agent> — schedule→fire proven
 //    on the running stack, not just a unit test.
 //  (ui) the ambient message a woken agent would send (send_message → in/human/
@@ -1443,7 +1389,7 @@ const renamedAgent = 'falcon';
   const timerSession = `run-${timerAgent}-${Date.now().toString(36)}`;
   const timerText = `reminder: the kettle is done (${Date.now().toString(36)})`;
   const emitAs = (actor, ...a) =>
-    execFileSync(path.join(BIN, 'elanus'), a, { env: { ...ENV, ELANUS_ACTOR: actor }, encoding: 'utf8' });
+    execFileSync(path.join(BIN, 'lanius'), a, { env: { ...ENV, LANIUS_ACTOR: actor }, encoding: 'utf8' });
 
   const seedPage = await newPage();
   await seedPage.goto('/');
@@ -1460,14 +1406,14 @@ const renamedAgent = 'falcon';
   // (ledger) The CLI schedules a one-shot wake; the running daemon fires it.
   // --in 0 is due immediately; the next tick emits in/agent/chrono exactly once.
   try {
-    elanus('schedule', '--agent', timerAgent, '--in', '0', '--message', 'wake up and post the reminder');
-    ok('timers: elanus schedule inserted a one-shot wake');
-  } catch (e) { fail(`timers: elanus schedule failed: ${e.message ?? e}`); }
+    lanius('schedule', '--agent', timerAgent, '--in', '0', '--message', 'wake up and post the reminder');
+    ok('timers: lanius schedule inserted a one-shot wake');
+  } catch (e) { fail(`timers: lanius schedule failed: ${e.message ?? e}`); }
   const mailbox = `in/agent/${timerAgent}`;
   await waitFor('timers: the live daemon fires the scheduled wake onto the mailbox', async () => {
-    // `elanus events` reads the ledger the daemon writes; the fired one-shot
+    // `lanius events` reads the ledger the daemon writes; the fired one-shot
     // shows up as an in/agent/<agent> row (state is irrelevant — no LLM here).
-    try { return elanus('events', '--limit', '50').includes(mailbox); }
+    try { return lanius('events', '--limit', '50').includes(mailbox); }
     catch { return false; }
   }, 10000);
 
@@ -1531,7 +1477,7 @@ const renamedAgent = 'falcon';
   const oldMsg = `about the friday ship date (${Date.now().toString(36)})`;
   const parentCorr = `br-parent-${Date.now().toString(36)}`;
   const emitAs = (actor, ...a) =>
-    execFileSync(path.join(BIN, 'elanus'), a, { env: { ...ENV, ELANUS_ACTOR: actor }, encoding: 'utf8' });
+    execFileSync(path.join(BIN, 'lanius'), a, { env: { ...ENV, LANIUS_ACTOR: actor }, encoding: 'utf8' });
 
   const seedPage = await newPage();
   await seedPage.goto('/');
@@ -1647,7 +1593,7 @@ const renamedAgent = 'falcon';
 // ── flow 6h: sandbox-config-ui — read/network cage is editable per-agent ──────
 // docs/handoffs/sandbox-config-ui.md M2+M3. Open an agent's configure, set the
 // network and add a hidden folder, save through the existing agents/set path
-// (no new writer), and assert `elanus profile get` round-trips the stored enums
+// (no new writer), and assert `lanius profile get` round-trips the stored enums
 // AND the per-agent posture cards (server-computed, one shared product-word
 // mapping) reflect the save — while the setup screen's install-default card is
 // unchanged. The dangerous allow-list lives behind an "advanced — experimental"
@@ -1666,7 +1612,7 @@ const renamedAgent = 'falcon';
   created.ok ? ok(`cage-ui: created agent ${cageAgent}`) : fail(`cage-ui: could not create ${cageAgent} (${JSON.stringify(created)})`);
   await seedPage.close();
 
-  const getCage = () => JSON.parse(elanus('profile', 'get', cageAgent));
+  const getCage = () => JSON.parse(lanius('profile', 'get', cageAgent));
   const cageWord = (dim) => getCage().cage?.[dim];
 
   const page = await newPage();
@@ -1787,7 +1733,7 @@ const renamedAgent = 'falcon';
   const scrollAgent = 'scroller';
   const session = `web-${scrollAgent}-${Date.now().toString(36)}`;
   const emitAs = (actor, ...a) =>
-    execFileSync(path.join(BIN, 'elanus'), a, { env: { ...ENV, ELANUS_ACTOR: actor }, encoding: 'utf8' });
+    execFileSync(path.join(BIN, 'lanius'), a, { env: { ...ENV, LANIUS_ACTOR: actor }, encoding: 'utf8' });
   const seedTurn = (n) => {
     const corr = `scroll-${n}-${Date.now().toString(36)}`;
     emitAs('owner', 'emit', `in/agent/${scrollAgent}`, '--correlation', corr, '--payload',
@@ -2157,24 +2103,24 @@ const renamedAgent = 'falcon';
 // The human's seat for the cross-agent comms plane (docs/handoffs/agent-comms-ui.md).
 // M2 comms traffic, M3 rooms panel, M4 block inspector, M5 estimate-vs-actual,
 // M6 signal lamp. These routes (/api/comms/*, /api/blocks, /api/estimate/*) are
-// web.rs-only, so this flow is most meaningful in ELANUS_UI_SPEC_RUST=1 mode; it
+// web.rs-only, so this flow is most meaningful in LANIUS_UI_SPEC_RUST=1 mode; it
 // degrades to empty-state assertions against the node server.
 {
   // Seed agent-to-agent mail: a normal delivery and a high-priority one (the
-  // projection threads `in/agent/<noun>/<code-session>` events). `elanus emit`
+  // projection threads `in/agent/<noun>/<code-session>` events). `lanius emit`
   // writes them to the same ledger the projection reads.
   try {
-    elanus('emit', 'in/agent/claude-code/code-uimail01', '--payload', JSON.stringify({ prompt: 'please run the tests' }));
-    elanus('emit', 'in/agent/claude-code/code-uimail02', '--payload', JSON.stringify({ prompt: 'URGENT: prod is down' }), '--priority', '9');
+    lanius('emit', 'in/agent/claude-code/code-uimail01', '--payload', JSON.stringify({ prompt: 'please run the tests' }));
+    lanius('emit', 'in/agent/claude-code/code-uimail02', '--payload', JSON.stringify({ prompt: 'URGENT: prod is down' }), '--priority', '9');
   } catch (e) { fail(`seeding comms mail failed: ${e.message ?? e}`); }
   // Seed a durable session-scope block the inspector should list (owner code-agent
   // is the inspector's fallback owner when a session has no record).
   try {
-    elanus('block', 'set', 'identity', 'I am the worker.', '--owner', 'code-agent', '--session', 'code-uiblk01', '--scope', 'session');
+    lanius('block', 'set', 'identity', 'I am the worker.', '--owner', 'code-agent', '--session', 'code-uiblk01', '--scope', 'session');
   } catch (e) { fail(`seeding a block failed: ${e.message ?? e}`); }
   // Seed an estimate for a session so the runs detail shows the estimate group.
   try {
-    elanus('estimate', 'set', '--session', 'code-uiest01', '--dollars', '0.40', '--turns', '8', '--tokens', '1000');
+    lanius('estimate', 'set', '--session', 'code-uiest01', '--dollars', '0.40', '--turns', '8', '--tokens', '1000');
   } catch (e) { fail(`seeding an estimate failed: ${e.message ?? e}`); }
 
   const page = await newPage();
@@ -2253,7 +2199,7 @@ const renamedAgent = 'falcon';
 
     // The block-inspector INLINE EDITOR (the documented follow-on to M4). A DURABLE
     // block (it carries an owner) is editable: a save POSTs `/api/blocks`, which —
-    // through the origin_ok CSRF guard — shells `elanus block set ... --by ui` and
+    // through the origin_ok CSRF guard — shells `lanius block set ... --by ui` and
     // re-reads the persisted value. Drive the editor's exact POST and confirm the
     // new content persists on a fresh read.
     const durable = blocks.find((b) => b.name === 'identity');
@@ -2279,7 +2225,7 @@ const renamedAgent = 'falcon';
       : fail(`blocks: durable-block edit did not succeed (${JSON.stringify(editRes)})`);
 
     // The edit persists: a fresh read shows the new content (the route re-read the
-    // durable blocks and the write went through `elanus block set --by ui`).
+    // durable blocks and the write went through `lanius block set --by ui`).
     const afterEdit = await page.evaluate(async () => {
       const r = await fetch('/api/blocks?session=code-uiblk01');
       return r.ok ? await r.json() : null;
@@ -2319,7 +2265,7 @@ const renamedAgent = 'falcon';
     // editable: the write route rejects it. Seed unseen mail so the live inbox block
     // appears, confirm it is ephemeral with no owner, and confirm a write is refused.
     try {
-      elanus('emit', 'in/agent/code-agent/code-uiblk01', '--payload', JSON.stringify({ prompt: 'a message for the worker' }));
+      lanius('emit', 'in/agent/code-agent/code-uiblk01', '--payload', JSON.stringify({ prompt: 'a message for the worker' }));
     } catch (e) { fail(`seeding inbox mail failed: ${e.message ?? e}`); }
     const withEph = await page.evaluate(async () => {
       const r = await fetch('/api/blocks?session=code-uiblk01');

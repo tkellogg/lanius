@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// elanus.toml — the manifest inside a package (docs/bus.md, Packages).
+/// lanius.toml — the manifest inside a package (docs/bus.md, Packages).
 /// SKILL.md stays pure per the agentskills.io spec; this sibling file carries
 /// everything the harness needs. Ecosystem-facing, hence the tool-named file
 /// (Cargo.toml convention) — the settled exception to generic role names.
@@ -34,7 +34,7 @@ pub struct Manifest {
     pub harness: Vec<HarnessDecl>,
     /// Presence declares "this package's `kb/` subfolder is a knowledge base"
     /// (docs/handoffs/kb-core.md M1, D6): first-class via an explicit manifest
-    /// marker, the same move `[[harness]]` made. `elanus kb list` and the search
+    /// marker, the same move `[[harness]]` made. `lanius kb list` and the search
     /// union key on the marker, not merely a `kb/` dir on disk, so a package may
     /// still carry a private `kb/` without opting it in as knowledge.
     #[serde(default)]
@@ -106,7 +106,7 @@ pub struct ConfigDecl {
     #[serde(default)]
     pub agent_tunable: Vec<String>,
     /// Config keys this package declares (docs/handoffs/kb-groundskeeper.md M2).
-    /// The human sets each with `elanus config set <pkg>.<key>`; a `required` key
+    /// The human sets each with `lanius config set <pkg>.<key>`; a `required` key
     /// gates a setup-dependent capability — the package stays inert until every
     /// required key carries a value (the kb-groundskeeper pipeline's absolute setup
     /// gate: no cron fire, no LLM call before setup). This is the gate's source of
@@ -175,7 +175,7 @@ pub struct ProcessDecl {
     #[serde(default = "default_session_expiry")]
     pub session_expiry_s: u64,
     /// daemon only: ask for a harness-negotiated loopback HTTP port. The
-    /// dispatcher assigns one per spawn (ELANUS_HTTP_PORT, plus
+    /// dispatcher assigns one per spawn (LANIUS_HTTP_PORT, plus
     /// run/pkg-<name>/http.json for consumers — discovery from harness
     /// state, never retained bus messages: docs/security.md entry 11).
     /// Declaring it registers a grant request (kind "http"): serving is a
@@ -305,7 +305,7 @@ fn default_mcp_transport() -> String {
 }
 
 /// A package-declared coding harness adapter. `name` is the CLI verb
-/// (`elanus code <name>`), aliases are alternate verbs, `agent_noun` is the obs
+/// (`lanius code <name>`), aliases are alternate verbs, `agent_noun` is the obs
 /// noun (defaulting to `name` after parse), and `run` is the package-relative
 /// adapter binary.
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -321,7 +321,7 @@ pub struct HarnessDecl {
 
 /// The `[kb]` marker (docs/handoffs/kb-core.md M1). Its mere presence enrolls the
 /// package's `kb/` subfolder as a knowledge base; the optional `title`/`description`
-/// are display metadata for `elanus kb list`. Mirrors the way `[[harness]]` names a
+/// are display metadata for `lanius kb list`. Mirrors the way `[[harness]]` names a
 /// capability without any kernel data model behind it (D6).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
@@ -416,10 +416,9 @@ pub struct LoadedManifest {
 }
 
 pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
-    let f = pkg_dir.join("elanus.toml");
-    if !f.exists() {
+    let Some(f) = manifest_file(pkg_dir) else {
         return Ok(None);
-    }
+    };
     let raw = std::fs::read(&f)?;
     let s = String::from_utf8_lossy(&raw);
     let mut m: Manifest = toml::from_str(&s).with_context(|| format!("parsing {}", f.display()))?;
@@ -550,7 +549,7 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
     // authorizing code changes. A grant-less harness package has no stored
     // grant row to protect, so hashing its adapter buys nothing — and costs
     // everything: the stock adapters are multi-megabyte kernel-seeded copies
-    // of the elanus binary, so reading + SHA-256'ing them on every
+    // of the lanius binary, so reading + SHA-256'ing them on every
     // `packages`/discover made each CLI shell-out (and the web relay that
     // fans several out) take seconds. A harness package that DOES declare
     // [[request]] keeps the swap-detaches-grants property in full. Either
@@ -600,6 +599,18 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
         hash,
         code_hash,
     }))
+}
+
+fn manifest_file(pkg_dir: &Path) -> Option<std::path::PathBuf> {
+    let new = pkg_dir.join("lanius.toml");
+    if new.exists() {
+        return Some(new);
+    }
+    let legacy = pkg_dir.join("elanus.toml");
+    if legacy.exists() {
+        return Some(legacy);
+    }
+    None
 }
 
 fn validate_stage_config(path: &Path, stage: &str, c: &StageConfigDecl) -> Result<()> {
@@ -708,7 +719,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("el-man-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             r#"
 [request]
 subscribe = ["in/package/demo/echo"]
@@ -727,20 +738,37 @@ run  = "scripts/echo"
         assert_eq!(lm.manifest.process.as_ref().unwrap().mode, "exec");
         assert_eq!(lm.hash.len(), 64);
         // Any manifest byte change detaches: hash must move.
-        std::fs::write(dir.join("elanus.toml"), "[request]\nsubscribe = [\"#\"]\n").unwrap();
+        std::fs::write(dir.join("lanius.toml"), "[request]\nsubscribe = [\"#\"]\n").unwrap();
         let lm2 = load(&dir).unwrap().unwrap();
         assert_ne!(lm.hash, lm2.hash);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
+    fn legacy_manifest_filename_falls_back() {
+        let dir = std::env::temp_dir().join(format!("el-man-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("elanus.toml"),
+            r#"
+[request]
+subscribe = ["in/package/demo/echo"]
+"#,
+        )
+        .unwrap();
+        let lm = load(&dir).unwrap().unwrap();
+        assert_eq!(lm.manifest.request.subscribe, vec!["in/package/demo/echo"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn editing_run_script_detaches_grants() {
         // The grant pins CODE, not just the declaration: swapping scripts/main
-        // while leaving elanus.toml untouched must move the hash so approvals
+        // while leaving lanius.toml untouched must move the hash so approvals
         // re-enter pending.
         let dir = std::env::temp_dir().join(format!("el-man-code-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
-        std::fs::write(dir.join("elanus.toml"), "[request]\nsubscribe=[\"in/package/demo/x\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
+        std::fs::write(dir.join("lanius.toml"), "[request]\nsubscribe=[\"in/package/demo/x\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
         std::fs::write(dir.join("scripts/main"), "#!/bin/sh\necho benign\n").unwrap();
         let before = load(&dir).unwrap().unwrap().hash;
         std::fs::write(
@@ -769,7 +797,7 @@ run  = "scripts/echo"
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             "[[harness]]\nname = \"claude\"\nrun = \"bin/adapter\"\n",
         )
         .unwrap();
@@ -788,7 +816,7 @@ run  = "scripts/echo"
         );
         // A manifest edit still detaches (the declaration rides `raw`).
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             "[[harness]]\nname = \"codex\"\nrun = \"bin/adapter\"\n",
         )
         .unwrap();
@@ -810,7 +838,7 @@ run  = "scripts/echo"
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             "[request]\npublish = [\"obs/agent/#\"]\n\n[[harness]]\nname = \"gemini\"\nrun = \"bin/adapter\"\n",
         )
         .unwrap();
@@ -830,7 +858,7 @@ run  = "scripts/echo"
         let dir = std::env::temp_dir().join(format!("el-man-stage-cfg-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             r#"
 [[stage]]
 name = "window"
@@ -863,7 +891,7 @@ agent_tunable = true
         let dir = std::env::temp_dir().join(format!("el-man-pkg-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             r#"
 [config]
 agent_tunable = ["cadence"]
@@ -895,7 +923,7 @@ required = false
         let dir = std::env::temp_dir().join(format!("el-man-stage-cfg-bad-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             r#"
 [[stage]]
 name = "window"
@@ -918,7 +946,7 @@ default = "many"
         let dir = std::env::temp_dir().join(format!("el-man-harness-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             r#"
 [[harness]]
 name = "echo"
@@ -943,7 +971,7 @@ run = "bin/adapter"
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("kb")).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             r#"
 [kb]
 title = "LLM strengths"
@@ -959,9 +987,9 @@ description = "which model for what"
 
         // A bare `[kb]` with no fields is still a valid marker (opt-in with
         // defaults), and a package with NO `[kb]` table has kb = None.
-        std::fs::write(dir.join("elanus.toml"), "[kb]\n").unwrap();
+        std::fs::write(dir.join("lanius.toml"), "[kb]\n").unwrap();
         assert!(load(&dir).unwrap().unwrap().manifest.kb.is_some());
-        std::fs::write(dir.join("elanus.toml"), "[request]\nsubscribe=[]\n").unwrap();
+        std::fs::write(dir.join("lanius.toml"), "[request]\nsubscribe=[]\n").unwrap();
         assert!(load(&dir).unwrap().unwrap().manifest.kb.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -972,7 +1000,7 @@ description = "which model for what"
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             r#"
 [[tool]]
 name = "search_knowledge"
@@ -1016,7 +1044,7 @@ type = "string"
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             "[[tool]]\nname = \"kb__search\"\nrun = \"s\"\n",
         )
         .unwrap();
@@ -1032,7 +1060,7 @@ type = "string"
         let dir = std::env::temp_dir().join(format!("el-man-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("elanus.toml"),
+            dir.join("lanius.toml"),
             "[process]\nmode = \"resident\"\nrun = \"x\"\n",
         )
         .unwrap();

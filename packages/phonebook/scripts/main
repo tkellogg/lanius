@@ -2,7 +2,7 @@
 """phonebook — the identity directory (docs/identity.md).
 
 An identity is identifiable but not singularly addressable: one stable
-entity reachable through many channels (the elanus interface, Bluesky,
+entity reachable through many channels (the lanius interface, Bluesky,
 Discord, SMS, email, a front door) and called by many names. This daemon
 holds the record of which channel belongs to which identity, and which
 names point at it. It is the data model that makes cross-system identity
@@ -25,7 +25,7 @@ Two halves, by the transport doctrine (docs/actors.md):
            in/package/phonebook/split     {id}
          An agent can therefore only ever propose AS ITSELF; it cannot
          write a link stamped "human". Every write is also a ledgered
-         in/ event, so elanus.db carries the audit trail of who claimed
+         in/ event, so lanius.db carries the audit trail of who claimed
          what. Results (and errors) fan out on obs/package/phonebook/result,
          echoing the request's correlation id so a caller can match them.
          Writes are AUTHENTICATED but not AUTHORIZED: any granted writer may
@@ -34,7 +34,7 @@ Two halves, by the transport doctrine (docs/actors.md):
          increment (HANDOFF increment 3).
 
 The store is the phonebook's OWN sqlite in its writable scratch — never
-the kernel-only-writable elanus.db (the approvals ledger must not be
+the kernel-only-writable lanius.db (the approvals ledger must not be
 agent-writable; the phonebook must be, hence a separate store).
 
 Merge is non-destructive so split can undo it: an identity carries an
@@ -57,11 +57,19 @@ import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-PKG = os.environ.get("ELANUS_PACKAGE", "phonebook")
-SCRATCH = os.environ.get("ELANUS_SCRATCH") or "."
+PKG = os.environ.get("LANIUS_PACKAGE") or os.environ.get("ELANUS_PACKAGE") or "phonebook"
+SCRATCH = os.environ.get("LANIUS_SCRATCH") or os.environ.get("ELANUS_SCRATCH") or "."
 DB = os.path.join(SCRATCH, "phonebook.db")
 # The kernel ledger, read-only, only to check our own grant state.
-LEDGER = os.environ.get("ELANUS_DB") or os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."), "elanus.db")
+ROOT = os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", ".")
+LEDGER = (
+    os.environ.get("LANIUS_DB")
+    or os.environ.get("ELANUS_DB")
+    or os.environ.get("HARNESS_DB")
+    or os.path.join(ROOT, "lanius.db")
+    or os.path.join(ROOT, "elanus.db")
+    or os.path.join(ROOT, "harness.db")
+)
 
 REQ_FILTER = "in/package/phonebook/#"
 RESULT_TOPIC = "obs/package/phonebook/result"
@@ -474,21 +482,21 @@ def serve_http(port):
 
 def respond(body):
     try:
-        subprocess.run(["elanus", "bus", "pub", RESULT_TOPIC, json.dumps(body), "--qos", "1"],
+        subprocess.run(["lanius", "bus", "pub", RESULT_TOPIC, json.dumps(body), "--qos", "1"],
                        check=False, timeout=10)
     except subprocess.SubprocessError:
         pass  # a result fan-out is best-effort; the write already committed
 
 
 def bus_loop(c):
-    proc = subprocess.Popen(["elanus", "bus", "sub", REQ_FILTER], stdout=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(["lanius", "bus", "sub", REQ_FILTER], stdout=subprocess.PIPE, text=True)
     log(f"[phonebook] subscribed {REQ_FILTER} (writes; provenance = broker-verified sender)")
     for line in proc.stdout:
         try:
             outer = json.loads(line)
         except ValueError:
             continue
-        # `elanus bus sub` wraps each delivery as {"topic":..., "payload": <env>},
+        # `lanius bus sub` wraps each delivery as {"topic":..., "payload": <env>},
         # where <env> is the broker's ledger envelope carrying the verified
         # sender, the request correlation id, and the body at env["payload"].
         env = outer.get("payload")
@@ -522,7 +530,7 @@ def bus_loop(c):
 
 def http_grant_approved():
     """Serving + accepting writes is a capability (grants kind 'http'); park
-    until approved — `elanus approve phonebook` flips this without a restart."""
+    until approved — `lanius approve phonebook` flips this without a restart."""
     try:
         c = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True, timeout=5)
         row = c.execute(
@@ -536,14 +544,14 @@ def http_grant_approved():
 
 
 def main():
-    port = os.environ.get("ELANUS_HTTP_PORT")
+    port = os.environ.get("LANIUS_HTTP_PORT") or os.environ.get("ELANUS_HTTP_PORT")
     if not port:
-        log("[phonebook] no ELANUS_HTTP_PORT (needs a daemon with process.http); exiting")
+        log("[phonebook] no LANIUS_HTTP_PORT (needs a daemon with process.http); exiting")
         sys.exit(1)
     waited = False
     while not http_grant_approved():
         if not waited:
-            log("[phonebook] grant not approved yet; parking until `elanus approve phonebook` (this is not an error)")
+            log("[phonebook] grant not approved yet; parking until `lanius approve phonebook` (this is not an error)")
             waited = True
         time.sleep(2)
     writer = db_rw()

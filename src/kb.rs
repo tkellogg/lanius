@@ -5,7 +5,7 @@
 //! (manifest.rs `KbDecl`); everything else composes from substrates that already
 //! ship (packages, the cage, git).
 //!
-//! This module owns two things: enumerating the enabled KBs (`elanus kb list`)
+//! This module owns two things: enumerating the enabled KBs (`lanius kb list`)
 //! and the write path (D2) — a plain file write into a package's `kb/` tree
 //! followed by one git commit using the shared hardened-git discipline
 //! (`git_hardened`), the same untrusted-content hardening `config_repo` uses.
@@ -25,13 +25,13 @@ pub const KB_DIR: &str = "kb";
 /// The package that ships the default (FTS5) knowledge-search engine, and the
 /// filename of the index its daemon builds inside its state dir. The CLI reads
 /// the index straight from that well-known location; the tool surface
-/// (`search_knowledge`) is an engine-swap seam, but `elanus kb search` is the
+/// (`search_knowledge`) is an engine-swap seam, but `lanius kb search` is the
 /// convenience verb for the default engine (docs/handoffs/kb-search.md M3).
 pub const KB_SEARCH_PKG: &str = "kb-search";
 pub const INDEX_DB: &str = "kb-index.sqlite";
 
 /// The FTS5 index path the kb-search daemon writes and the CLI reads:
-/// `<root>/run/pkg-kb-search/kb-index.sqlite` — the daemon's ELANUS_SCRATCH.
+/// `<root>/run/pkg-kb-search/kb-index.sqlite` — the daemon's LANIUS_SCRATCH.
 pub fn search_index_path(root: &Root) -> PathBuf {
     root.run_dir()
         .join(format!("pkg-{KB_SEARCH_PKG}"))
@@ -70,7 +70,7 @@ pub fn query_tokens(query: &str) -> Vec<String> {
 /// path is physically unable to corrupt the index it reads. AND semantics first
 /// (a hit contains every term), falling back to OR when AND finds nothing;
 /// ranked by bm25. This is the exact shape `scripts/search` runs, so
-/// `elanus kb search` returns the same hits as the `search_knowledge` tool.
+/// `lanius kb search` returns the same hits as the `search_knowledge` tool.
 pub fn search(index_db: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
     if !index_db.exists() {
         bail!(
@@ -117,7 +117,7 @@ fn run_match(conn: &rusqlite::Connection, match_expr: &str, limit: usize) -> Res
     Ok(rows)
 }
 
-/// One enabled knowledge base, for `elanus kb list`.
+/// One enabled knowledge base, for `lanius kb list`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct KbInfo {
     /// The package name (also the topic/grant/sql key).
@@ -247,7 +247,7 @@ pub fn write(root: &Root, pkg: &str, rel: &str, content: &str) -> Result<WriteOu
 /// commit under the fixed kernel identity, so every applied consolidation is an
 /// auditable, revertible commit (kb-core D2). Every path the diff touches MUST be
 /// under `kb/` with no traversal — an agent-authored diff is untrusted, so a diff
-/// that reaches for `elanus.toml`, a `..`, or an absolute path is refused before
+/// that reaches for `lanius.toml`, a `..`, or an absolute path is refused before
 /// any file is touched.
 pub fn apply_diff(root: &Root, pkg: &str, diff: &str) -> Result<WriteOutcome> {
     let package = packages::find(root, pkg)
@@ -472,7 +472,7 @@ mod tests {
         let pdir = root.packages().join(name);
         std::fs::create_dir_all(pdir.join("kb")).unwrap();
         std::fs::write(
-            pdir.join("elanus.toml"),
+            pdir.join("lanius.toml"),
             format!("[kb]\ntitle = \"{title}\"\n"),
         )
         .unwrap();
@@ -486,7 +486,7 @@ mod tests {
         // A package with a kb/ dir but NO [kb] marker must NOT be listed.
         let plain = root.packages().join("plain");
         std::fs::create_dir_all(plain.join("kb")).unwrap();
-        std::fs::write(plain.join("elanus.toml"), "[request]\nsubscribe=[]\n").unwrap();
+        std::fs::write(plain.join("lanius.toml"), "[request]\nsubscribe=[]\n").unwrap();
         std::fs::write(plain.join("kb/private.md"), "x").unwrap();
 
         let kbs = enumerate(&root, "default").unwrap();
@@ -514,7 +514,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            log.contains("elanus <elanus@localhost>"),
+            log.contains("lanius <lanius@localhost>"),
             "kernel committer: {log}"
         );
         assert!(
@@ -578,13 +578,13 @@ mod tests {
     #[test]
     fn seeded_kb_llm_strengths_installs_and_lists() {
         // M2 acceptance: the shipped kb-llm-strengths package installs on a scratch
-        // root and shows in `elanus kb list`; its role/model files exist and
+        // root and shows in `lanius kb list`; its role/model files exist and
         // cross-link; the verifier facts are grep-able with a file; the invariants
         // are encoded verbatim.
         let shipped =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("kits/stdlib/packages/kb-llm-strengths");
         assert!(
-            shipped.join("elanus.toml").exists(),
+            shipped.join("lanius.toml").exists(),
             "package ships in stdlib"
         );
 
@@ -768,7 +768,7 @@ mod tests {
     }
 
     /// Build a fixture FTS5 index with the SAME schema the daemon writes, so the
-    /// Rust query path (kb::search — the `elanus kb search` engine) is tested
+    /// Rust query path (kb::search — the `lanius kb search` engine) is tested
     /// deterministically without invoking python.
     fn build_fixture_index(path: &Path, rows: &[(&str, &str, i64, i64, &str)]) {
         let conn = rusqlite::Connection::open(path).unwrap();
@@ -885,15 +885,15 @@ mod tests {
 
         // A diff that reaches OUTSIDE kb/ is refused before any file is touched.
         let escape = "\
---- a/elanus.toml
-+++ b/elanus.toml
+--- a/lanius.toml
++++ b/lanius.toml
 @@ -1 +1 @@
 -x
 +y
 ";
         assert!(
             apply_diff(&root, "kb-demo", escape).is_err(),
-            "a diff touching elanus.toml must be refused"
+            "a diff touching lanius.toml must be refused"
         );
         // A traversal diff is refused too.
         let traverse = "\

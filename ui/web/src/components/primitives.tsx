@@ -125,7 +125,7 @@ export function ModelField({ id, value, onChange, models, disabled, hint, native
 const anyId = (m: any) => (typeof m === 'string' ? m : m.id);
 
 // Workdir/path input with a server-side exists/writable check on blur. A typo'd
-// workdir silently runs tools in the elanus root today; this flags it before
+// workdir silently runs tools in the lanius root today; this flags it before
 // save. Text stays as the input — the picker is the inline validation state.
 export function WorkdirInput({ id, value, onChange, disabled, placeholder }: {
   id?: string;

@@ -56,7 +56,7 @@ if verdict == "pass":
     # No --correlation: an uncorrelated agent run stays out of the human's
     # inbox; only the scout's explicit KEEP emit reaches in/human/owner.
     subprocess.run(
-        ["elanus", "emit", "in/agent/scout", "--payload", payload],
+        ["lanius", "emit", "in/agent/scout", "--payload", payload],
         check=True,
         stdout=subprocess.DEVNULL,
     )

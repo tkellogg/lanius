@@ -1,5 +1,5 @@
 fn main() -> anyhow::Result<()> {
-    let ctx = elanus::harness::Ctx::from_env()?;
+    let ctx = lanius::harness::Ctx::from_env()?;
     ctx.emit("session/start", serde_json::json!({ "adapter": "echo" }));
     let echoed = ctx.prompt().unwrap_or("").to_string();
     ctx.emit("assistant/message", serde_json::json!({ "text": echoed }));

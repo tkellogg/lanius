@@ -1,7 +1,7 @@
 {
-  "name": "elanus-tui",
+  "name": "lanius-tui",
   "version": "0.1.0",
-  "description": "elanus TUI — a pure MQTT 5 client on the loopback listener",
+  "description": "lanius TUI — a pure MQTT 5 client on the loopback listener",
   "type": "module",
   "private": true,
   "main": "index.js",

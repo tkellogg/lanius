@@ -1,6 +1,6 @@
 ---
 name: comms-etiquette
-description: How agents talk on Elanus - to the human (send_message vs ask_human), to coding workers (deliver/spawn/inbox), and to native/profile agents (agent catalog/run/spawn), when to speak unprompted vs stay quiet, when to set priority, shared-channel etiquette, and the failure-mail contract. Read before messaging the human, dispatching work to another agent, launching a native/profile agent, or coordinating in a shared room.
+description: How agents talk on Lanius - to the human (send_message vs ask_human), to coding workers (deliver/spawn/inbox), and to native/profile agents (agent catalog/run/spawn), when to speak unprompted vs stay quiet, when to set priority, shared-channel etiquette, and the failure-mail contract. Read before messaging the human, dispatching work to another agent, launching a native/profile agent, or coordinating in a shared room.
 ---
 
 # comms-etiquette
@@ -17,14 +17,14 @@ courtesy, not authorization.
 
 Start with discovery when you are unsure what can run:
 
-- **`elanus agent catalog`** - list coding tools, native/profile agents,
+- **`lanius agent catalog`** - list coding tools, native/profile agents,
   providers, and the packages visible to each profile. Add `--json` when you
   need machine-readable launch data. For native/profile agents, check
   `daemon_drivable`: if false, use blocking `agent run` or fix the package
   wiring before expecting `agent spawn` to run.
 
-Use the `elanus code ...` verbs for coding sessions and coding workers. Use
-the `elanus agent ...` verbs for native/profile agents backed by elanus
+Use the `lanius code ...` verbs for coding sessions and coding workers. Use
+the `lanius agent ...` verbs for native/profile agents backed by lanius
 profiles and the ordinary `exec` loop.
 
 ## Coding-session dispatch
@@ -33,43 +33,43 @@ All of these run **inside a coding session** (the launcher sets your
 identity in the environment; you never name yourself or another session's
 inbox as an argument — it is derived, so you can only ever act as yourself).
 
-- **`elanus code deliver <worker-session> "<message>"`** — hand work to an
+- **`lanius code deliver <worker-session> "<message>"`** — hand work to an
   *existing* worker session. The daemon resumes that worker with your
   message; its completion (or failure — see below) comes back to *your*
   mailbox on the correlation. After delivering, **end your turn — do not
   wait**. The reply arrives as inbox mail later.
 
-- **`elanus code spawn <tool> "<task>"`** — create a *new* worker in the
+- **`lanius code spawn <tool> "<task>"`** — create a *new* worker in the
   background (`<tool>` is e.g. `claude` or `codex`). You get the worker's
   session id and a reply route back to you, then the command returns
   immediately so you can finish your turn.
 
-- **`elanus code inbox`** — pull *your own* inbox: the messages other agents
+- **`lanius code inbox`** — pull *your own* inbox: the messages other agents
   delivered to you. `--all` shows the full inbox (non-destructive); `--json`
   is machine-readable. Pulling marks messages **seen**, so the per-turn
   inbox count only ever reflects genuinely new mail. The authoritative read
   is this command; the per-turn `inbox` block is only a hint that mail is
   waiting.
 
-- **`elanus code note <session> "<text>"`** — leave a durable note a planner
+- **`lanius code note <session> "<text>"`** — leave a durable note a planner
   wants a worker to keep in view (it becomes that session's `note` block).
   Empty text clears it.
 
 You see waiting mail *without* asking: each turn an `inbox` block reports the
 unseen count and a preview of the latest. Treat it as a notification — run
-`elanus code inbox` to actually read and act.
+`lanius code inbox` to actually read and act.
 
 ## Native/profile-agent launch
 
-Native/profile agents are ordinary elanus profiles: model, context program,
+Native/profile agents are ordinary lanius profiles: model, context program,
 visible packages, memory blocks, package stages, and tools come from the
 profile. Launch them through the `agent` namespace:
 
-- **`elanus agent run --profile <profile> "<task>"`** - run one blocking
+- **`lanius agent run --profile <profile> "<task>"`** - run one blocking
   native/profile-agent turn. This is the direct foreground path. Use it when
   you need the answer in this turn.
 
-- **`elanus agent spawn --profile <profile> "<task>"`** - queue one durable
+- **`lanius agent spawn --profile <profile> "<task>"`** - queue one durable
   native/profile-agent turn for the daemon. It prints JSON with the event id,
   correlation, session, profile, agent, and mailbox. It only works when
   `agent catalog --json` reports the profile as `daemon_drivable`; otherwise
@@ -82,7 +82,7 @@ profile. Launch them through the `agent` namespace:
   can silently widen a profile for one run.
 
 Native `spawn` is currently a background launch handle, not the same routed
-completion loop as `elanus code spawn`: correlated native-agent final replies
+completion loop as `lanius code spawn`: correlated native-agent final replies
 follow the existing native exec behavior. If you need a worker's answer in the
 same turn, use `agent run`.
 
@@ -170,9 +170,9 @@ If you share a **room** with siblings — by default the room is your git
 checkout, so every session in the same working tree is already a roommate —
 you have two courtesies:
 
-- **Advisory edit claims.** `elanus code claim <path>` announces "I'm
+- **Advisory edit claims.** `lanius code claim <path>` announces "I'm
   editing this"; your roommates see it in their per-turn `peers` line and
-  route around you. `elanus code unclaim <path>` when you're done. Nothing is
+  route around you. `lanius code unclaim <path>` when you're done. Nothing is
   locked — this only helps cooperating workers divide the work and avoid a
   shared-index collision. If you'll edit overlapping files heavily, consider
   a separate `git worktree`.

@@ -4,7 +4,7 @@
 //! keeps a last-pass timestamp under `<root>/run/` and interval-compares it.
 //!
 //! Drives `kits/core/packages/kb-groundskeeper/scripts/dispatch` directly with a
-//! scratch root and a stub `elanus` (the ELANUS_BIN seam), so the throttle is
+//! scratch root and a stub `lanius` (the LANIUS_BIN seam), so the throttle is
 //! tested at the level it lives: the script, not the kernel verb.
 
 use std::io::Write;
@@ -53,8 +53,8 @@ exit 0
 fn kick(root: &Path, stub: &Path, log: &Path, reply: &Path) -> (bool, String) {
     let mut child = Command::new("python3")
         .arg(dispatch_script())
-        .env("ELANUS_ROOT", root)
-        .env("ELANUS_BIN", stub)
+        .env("LANIUS_ROOT", root)
+        .env("LANIUS_BIN", stub)
         .env("STUB_LOG", log)
         .env("STUB_REPLY", reply)
         .stdin(Stdio::piped())

@@ -8,7 +8,7 @@ export type LiveStatus = {
 export type LiveMessage = {
   kind: 'message';
   // Server-side monotonic sequence number, stable across ring-buffer replay on
-  // reconnect (the Rust `elanus web` server sets it on every formed message).
+  // reconnect (the Rust `lanius web` server sets it on every formed message).
   // Lets consumers apply each delivery at most once even under at-least-once /
   // replayed SSE delivery.
   seq?: number;

@@ -1,7 +1,7 @@
 {
-  "name": "elanus-web",
+  "name": "lanius-web",
   "version": "0.1.0",
-  "description": "elanus web dashboard SPA source — served in production by the Rust `elanus web` (src/web.rs), embedded in the binary",
+  "description": "lanius web dashboard SPA source — served in production by the Rust `lanius web` (src/web.rs), embedded in the binary",
   "type": "module",
   "private": true,
   "scripts": {

@@ -4,8 +4,8 @@ The helper may read broadly and transparently. It may not silently mutate setup.
 
 Reads:
 
-- Use `elanus status`, `elanus packages`, `elanus config get`,
-  `elanus agent catalog`, `elanus kb list`, `elanus kb search`, and history
+- Use `lanius status`, `lanius packages`, `lanius config get`,
+  `lanius agent catalog`, `lanius kb list`, `lanius kb search`, and history
   commands before guessing.
 - Use direct file reads when the CLI does not expose the needed information.
 - Prefer JSON output when a command provides it.
@@ -13,7 +13,7 @@ Reads:
 Writes:
 
 - Configuration changes go through config proposals or explicit human commands.
-- Package authority changes go through `elanus approve` or `elanus revoke`.
+- Package authority changes go through `lanius approve` or `lanius revoke`.
 - Durable user context goes into `kb-user` when the human asks the helper to
   remember purpose, preferences, or rationale.
 - The helper can maintain its own setup checklist block because that is its

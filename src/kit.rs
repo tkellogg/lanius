@@ -58,22 +58,22 @@ pub fn resolve(root: &Root, kit: &str) -> Result<PathBuf> {
 }
 
 /// The directories kits resolve against, in order:
-/// 1. $ELANUS_KIT_PATH entries (an override, not the mechanism);
+/// 1. $LANIUS_KIT_PATH entries (an override, not the mechanism);
 /// 2. `<root>/kits` — THE configured home: init seeds the stock kits here,
 ///    and dropping a directory in is the whole install story;
-/// 3. `~/.elanus/kits` — user-level, shared across roots;
+/// 3. `~/.lanius/kits` — user-level, shared across roots;
 /// 4. every `kits/` dir walking up from the executable (dev convenience so
 ///    a repo build sees <repo>/kits).
 fn search_dirs(root: &Root) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    if let Ok(kp) = std::env::var("ELANUS_KIT_PATH") {
+    if let Ok(kp) = std::env::var("LANIUS_KIT_PATH") {
         for entry in kp.split(':').filter(|s| !s.is_empty()) {
             out.push(PathBuf::from(entry));
         }
     }
     out.push(root.dir.join("kits"));
     if let Some(home) = std::env::var_os("HOME") {
-        out.push(PathBuf::from(home).join(".elanus/kits"));
+        out.push(PathBuf::from(home).join(".lanius/kits"));
     }
     if let Ok(exe) = std::env::current_exe() {
         for anc in exe.ancestors().skip(1) {
@@ -90,7 +90,7 @@ fn search_dirs(root: &Root) -> Vec<PathBuf> {
 /// caller to print — the kit's direction) if it has one. `grant = false` is
 /// the STAGING path (HANDOFF phase 5): files land and requests register,
 /// but every grant stays pending review — the commit gesture is a separate
-/// `elanus approve`, which is what lets an un-trusted surface (the web UI,
+/// `lanius approve`, which is what lets an un-trusted surface (the web UI,
 /// an agent) compose installs without authority.
 pub fn install(
     root: &Root,
@@ -185,7 +185,7 @@ pub fn install(
                     continue;
                 }
             }
-            // Skill-only packages (no elanus.toml) carry no requests —
+            // Skill-only packages (no lanius.toml) carry no requests —
             // nothing to decide, nothing to stage; their SKILL.md is inert
             // content gated by profile visibility alone.
             if packages::find(root, pkg)?.manifest.is_none() {
@@ -194,7 +194,7 @@ pub fn install(
             if grant {
                 packages::decide(root, conn, pkg, true, &by)?;
             } else {
-                println!("staged {pkg} (grants pending — `elanus approve {pkg}` to commit)");
+                println!("staged {pkg} (grants pending — `lanius approve {pkg}` to commit)");
             }
         }
     }
@@ -363,7 +363,7 @@ pub fn protected_packages(root: &Root) -> std::collections::HashSet<String> {
 }
 
 /// Refuse to unlink a protected kit without `--force`: unlinking silently
-/// drops its packages off the path, the same off-switch `elanus revoke`
+/// drops its packages off the path, the same off-switch `lanius revoke`
 /// already guards at the package level (docs/config.md, "Stdlib").
 pub fn guard_unlink_protected(kit_dir: &Path, name: &str, force: bool) -> Result<()> {
     if !force && kit_is_protected(kit_dir) {
@@ -378,7 +378,7 @@ pub fn guard_unlink_protected(kit_dir: &Path, name: &str, force: bool) -> Result
 
 /// Remove a kit dir from the default profile's elanus_path.
 /// Grants are NOT revoked here — they're inert without discovery, and
-/// revocation is its own gesture (`elanus revoke <pkg>`); we say so.
+/// revocation is its own gesture (`lanius revoke <pkg>`); we say so.
 pub fn unlink(root: &Root, kit_dir: &Path) -> Result<()> {
     let kit_entry = kit_dir
         .canonicalize()
@@ -407,12 +407,12 @@ pub fn unlink(root: &Root, kit_dir: &Path) -> Result<()> {
         !entries.iter().any(|entry| entry == s)
     });
     if arr.len() == before {
-        bail!("{} is not on the elanus path", entries[0]);
+        bail!("{} is not on the lanius path", entries[0]);
     }
     std::fs::write(&f, doc.to_string())?;
     println!("unlinked {}", entries[0]);
     println!(
-        "grants for its packages remain in the ledger (inert without discovery); `elanus revoke <pkg>` to retire them"
+        "grants for its packages remain in the ledger (inert without discovery); `lanius revoke <pkg>` to retire them"
     );
     Ok(())
 }
@@ -474,7 +474,7 @@ mod tests {
         let kit = base.join("mykit");
         std::fs::create_dir_all(kit.join("packages/kpkg/scripts")).unwrap();
         std::fs::write(
-            kit.join("packages/kpkg/elanus.toml"),
+            kit.join("packages/kpkg/lanius.toml"),
             "[request]\nsubscribe=[\"in/package/kpkg/go\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/main\"\n",
         )
         .unwrap();
@@ -552,13 +552,13 @@ mod tests {
 
         let kit = base.join("helper");
         std::fs::create_dir_all(kit.join("packages/kb-user/kb")).unwrap();
-        std::fs::write(kit.join("packages/kb-user/elanus.toml"), "[kb]\n").unwrap();
+        std::fs::write(kit.join("packages/kb-user/lanius.toml"), "[kb]\n").unwrap();
         std::fs::write(kit.join("packages/kb-user/kb/README.md"), "# user\n").unwrap();
         std::fs::create_dir_all(kit.join("packages/kb-user/.git")).unwrap();
         std::fs::write(kit.join("packages/kb-user/.git/config"), "do not copy\n").unwrap();
         std::fs::create_dir_all(kit.join("packages/helper-chat/scripts")).unwrap();
         std::fs::write(
-            kit.join("packages/helper-chat/elanus.toml"),
+            kit.join("packages/helper-chat/lanius.toml"),
             "[request]\nsubscribe=[\"in/agent/helper\"]\n[process]\nmode=\"exec\"\nrun=\"scripts/run\"\n",
         )
         .unwrap();
@@ -572,9 +572,9 @@ mod tests {
         db::init_schema(&conn).unwrap();
         install(&root, &conn, &kit, Mode::Link, true).unwrap();
 
-        assert!(root.packages().join("kb-user/elanus.toml").exists());
+        assert!(root.packages().join("kb-user/lanius.toml").exists());
         assert!(!root.packages().join("kb-user/.git").exists());
-        assert!(!root.packages().join("helper-chat/elanus.toml").exists());
+        assert!(!root.packages().join("helper-chat/lanius.toml").exists());
         let found = packages::find(&root, "kb-user").unwrap();
         assert!(found.dir.starts_with(root.packages()));
         let found = packages::find(&root, "helper-chat").unwrap();
@@ -593,7 +593,7 @@ mod tests {
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();
         install(&root, &conn, &kit, Mode::Copy, true).unwrap();
-        assert!(root.packages().join("kpkg/elanus.toml").exists());
+        assert!(root.packages().join("kpkg/lanius.toml").exists());
         assert!(packages::is_approved(&conn, "kpkg", "subscribe", "in/package/kpkg/go").unwrap());
         let (prof, _) = crate::profile::load(&root, "default").unwrap();
         assert_eq!(prof.elanus_path, vec!["packages".to_string()]);
@@ -607,7 +607,7 @@ mod tests {
         let local = root.packages().join("kpkg");
         std::fs::create_dir_all(&local).unwrap();
         std::fs::write(
-            local.join("elanus.toml"),
+            local.join("lanius.toml"),
             "[request]\nsubscribe=[\"in/package/kpkg/local\"]\n",
         )
         .unwrap();

@@ -22,7 +22,7 @@ authority.
 You usually start from a symptom ("this file changed and I don't know
 why") or a session id you already have.
 
-- List recent sessions: `elanus code sessions` (coding workers) or query
+- List recent sessions: `lanius code sessions` (coding workers) or query
   the `history` package: `POST /query {"kind":"sessions","agent":"<name>"}`.
 - Find by content: `history` search DSL — e.g.
   `{"kind":"search","filter":{"text":"reactor.rs"}}` surfaces sessions that
@@ -48,11 +48,11 @@ Pick the cheapest capable path.
       explanation back to me."
   }
   ```
-  (From the CLI: `elanus agent spawn --profile helper "…"`.) The reply — or a
+  (From the CLI: `lanius agent spawn --profile helper "…"`.) The reply — or a
   failure — arrives as mail on the returned correlation.
 - **A coding reader** (when the explanation wants code-level reading of a
-  repo): `elanus code spawn <tool> "read-only: explain what session … did to
-  <files>, using elanus history queries; mail back the summary"` on a cheap
+  repo): `lanius code spawn <tool> "read-only: explain what session … did to
+  <files>, using lanius history queries; mail back the summary"` on a cheap
   tier.
 
 ## 3. Read the answer
@@ -64,4 +64,4 @@ call (or the human's) — the reader only told you what happened.
 
 Pointers: the `history` skill (query DSL and endpoint discovery), the
 `launching-agents` skill (how to choose a profile and spawn), and
-`elanus agent catalog` (which profiles are spawn-ready).
+`lanius agent catalog` (which profiles are spawn-ready).

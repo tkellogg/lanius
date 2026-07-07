@@ -53,9 +53,9 @@ it reads the instance's package universe rather than your visible set, that it i
 a privileged read the owner approved into being — are expando: read them here
 only when you need them.
 
-## `elanus discover <query>` — the CLI behind it
+## `lanius discover <query>` — the CLI behind it
 
-The tool wraps `elanus discover --json <query>`, the kernel command that owns the
-universe scan. A human or a harness at a shell can run `elanus discover "discord
+The tool wraps `lanius discover --json <query>`, the kernel command that owns the
+universe scan. A human or a harness at a shell can run `lanius discover "discord
 api"` directly (`--json` for the machine shape, `--profile <name>` to ask on
 another agent's behalf).

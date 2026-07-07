@@ -1,11 +1,11 @@
 ---
 name: harness-doctrine
-description: How elanus works — topic planes and their delivery contracts, the mailbox model, grants vs leases, the cage and the camera. Read this before doing anything clever with the harness.
+description: How lanius works — topic planes and their delivery contracts, the mailbox model, grants vs leases, the cage and the camera. Read this before doing anything clever with the harness.
 ---
 
 # harness-doctrine
 
-You are running inside elanus: an event-driven harness where **everything
+You are running inside lanius: an event-driven harness where **everything
 that happens is a message on a topic**, and the topic's first segment is a
 delivery contract.
 

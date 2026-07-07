@@ -16,7 +16,7 @@ judgement, with a confidence and a provenance, and to revise it later.
 Discover the port from harness state, then post a JSON body with a `kind`:
 
 ```sh
-PORT=$(python3 -c 'import json,os;print(json.load(open((os.environ.get("ELANUS_ROOT") or os.environ["HARNESS_ROOT"])+"/run/pkg-phonebook/http.json"))["port"])')
+PORT=$(python3 -c 'import json,os;print(json.load(open((os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ["HARNESS_ROOT"])+"/run/pkg-phonebook/http.json"))["port"])')
 curl -s "http://127.0.0.1:$PORT/healthz"
 curl -s "http://127.0.0.1:$PORT/query" -d '{"kind":"resolve","channel_kind":"bluesky","address":"@tim.bsky"}'
 ```
@@ -43,11 +43,11 @@ link's `provenance`. You cannot write a link that claims to come from
 someone else — if you are an agent, your proposals are stamped as you.
 
 ```sh
-elanus bus pub in/package/phonebook/identity '{"id":"tim","kind":"human","canonical":"Tim"}'      --qos 1
-elanus bus pub in/package/phonebook/channel  '{"channel_kind":"bluesky","address":"@tim.bsky","identity":"tim","confidence":1.0}' --qos 1
-elanus bus pub in/package/phonebook/channel  '{"channel_kind":"discord","address":"tim#1234"}'    --qos 1   # seen, unresolved
-elanus bus pub in/package/phonebook/link     '{"channel_kind":"discord","address":"tim#1234","identity":"tim","confidence":0.7}' --qos 1
-elanus bus pub in/package/phonebook/alias    '{"identity":"tim","name":"tk"}'                       --qos 1
+lanius bus pub in/package/phonebook/identity '{"id":"tim","kind":"human","canonical":"Tim"}'      --qos 1
+lanius bus pub in/package/phonebook/channel  '{"channel_kind":"bluesky","address":"@tim.bsky","identity":"tim","confidence":1.0}' --qos 1
+lanius bus pub in/package/phonebook/channel  '{"channel_kind":"discord","address":"tim#1234"}'    --qos 1   # seen, unresolved
+lanius bus pub in/package/phonebook/link     '{"channel_kind":"discord","address":"tim#1234","identity":"tim","confidence":0.7}' --qos 1
+lanius bus pub in/package/phonebook/alias    '{"identity":"tim","name":"tk"}'                       --qos 1
 ```
 
 Operations:
@@ -67,7 +67,7 @@ Operations:
 - `split {id}` — undo a merge: `id` becomes its own identity again and its
   original channels resolve back to it.
 
-`elanus bus pub` returns as soon as the broker accepts the event onto the
+`lanius bus pub` returns as soon as the broker accepts the event onto the
 ledger — that is *not* the op's outcome. The phonebook runs the op and fans
 its result out on `obs/package/phonebook/result` as `{ok, op, by, correlation,
 ...}` (errors too, with `{ok:false, error}`), echoing the request's
@@ -75,8 +75,8 @@ correlation id. To see whether a write actually succeeded, **subscribe before
 you publish**:
 
 ```sh
-elanus bus sub obs/package/phonebook/result --count 1 --timeout 5 &
-elanus bus pub in/package/phonebook/link '{"channel_kind":"discord","address":"tim#1234","identity":"tim","confidence":0.7}' --qos 1
+lanius bus sub obs/package/phonebook/result --count 1 --timeout 5 &
+lanius bus pub in/package/phonebook/link '{"channel_kind":"discord","address":"tim#1234","identity":"tim","confidence":0.7}' --qos 1
 wait   # prints {ok:true,...} or {ok:false,error:...}
 ```
 

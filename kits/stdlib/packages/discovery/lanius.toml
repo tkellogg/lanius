@@ -15,7 +15,7 @@
 # privileged surface into existence explicitly — the right place for "privileged"
 # to be visible and decided.
 #
-# The tool script is a THIN wrapper over `elanus discover --json` (the kernel CLI
+# The tool script is a THIN wrapper over `lanius discover --json` (the kernel CLI
 # owns the single universe-scan implementation — no manifest re-scanning here).
 
 # NOTE: no [kb] marker — discovery is a search FACILITY, not a knowledge corpus.

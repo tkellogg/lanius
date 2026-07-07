@@ -6,7 +6,7 @@
 # tree without clobbering another agent's work.
 #
 # Pure skill content. This package requests NO bus authority and provides NO
-# builtin tools — every "move" it teaches is an existing `elanus code` CLI verb
+# builtin tools — every "move" it teaches is an existing `lanius code` CLI verb
 # (sessions/rooms/whose/ask/claim/inbox), so there is nothing to grant or
 # approve. Hence no [request]/[process]/[[hook]] blocks; visibility is gated by
 # the profile's elanus_path alone.

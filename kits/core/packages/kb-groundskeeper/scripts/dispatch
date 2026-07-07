@@ -4,12 +4,12 @@
 One exec handler for both crons; it branches on the delivered event's `type`:
 
   in/package/kb-groundskeeper/sweep     — RUNG 1 (M1), no LLM. Runs
-      `elanus kb check --mail`: validate pointer blocks, find orphans, flag
+      `lanius kb check --mail`: validate pointer blocks, find orphans, flag
       staleness, and mail the owner a report when there are findings. Works with
       ZERO configuration — this is the rung that ships first.
 
   in/package/kb-groundskeeper/pipeline  — RUNG 2 (M3), the diff pipeline. Runs
-      `elanus kb groundskeep`, which is INERT (spawns nothing) until the setup
+      `lanius kb groundskeep`, which is INERT (spawns nothing) until the setup
       gate is satisfied: the [config] model keys are set AND the package is
       approved. The kernel verb is the gate — this script never spawns directly.
 
@@ -28,10 +28,10 @@ import subprocess
 import sys
 import time
 
-ROOT = os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT")
+ROOT = os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT")
 # The kernel CLI to shell to; overridable so the script can be driven directly
-# in tests (a scratch root + a stub `elanus`).
-BIN = os.environ.get("ELANUS_BIN", "elanus")
+# in tests (a scratch root + a stub `lanius`).
+BIN = os.environ.get("LANIUS_BIN") or os.environ.get("ELANUS_BIN") or "lanius"
 
 PKG = "kb-groundskeeper"
 HOUR, DAY, WEEK = 3600, 86400, 7 * 86400
@@ -40,7 +40,7 @@ HOUR, DAY, WEEK = 3600, 86400, 7 * 86400
 SLACK = 300
 
 
-def elanus(*args):
+def lanius(*args):
     cmd = [BIN]
     if ROOT:
         cmd += ["--root", ROOT]
@@ -92,7 +92,7 @@ def cadence_skip_reason():
     path = last_pass_file()
     if not path:
         return None  # no root, no state — let the verb decide
-    r = elanus("config", "get", PKG, "cadence")
+    r = lanius("config", "get", PKG, "cadence")
     if r.returncode != 0:
         return None  # cadence unset → the verb prints why it is inert
     cadence = r.stdout.strip().strip('"')
@@ -132,7 +132,7 @@ def main():
 
     if etype.endswith("/sweep"):
         # Rung 1: the no-LLM sweep, mailing the owner on findings.
-        r = elanus("kb", "check", "--mail")
+        r = lanius("kb", "check", "--mail")
         sys.stderr.write(r.stdout)
         sys.stderr.write(r.stderr)
         return 0 if r.returncode == 0 else 1
@@ -146,7 +146,7 @@ def main():
         if reason:
             sys.stderr.write(f"skipped: {reason}\n")
             return 0
-        r = elanus("kb", "groundskeep")
+        r = lanius("kb", "groundskeep")
         sys.stderr.write(r.stdout)
         sys.stderr.write(r.stderr)
         # Only a real pass consumes the cadence: an inert result (setup

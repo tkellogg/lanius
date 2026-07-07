@@ -17,8 +17,8 @@ use std::path::Path;
 use std::process::Command;
 
 /// The committer identity stamped on every kernel-owned commit (config + kb).
-pub const COMMITTER_NAME: &str = "elanus";
-pub const COMMITTER_EMAIL: &str = "elanus@localhost";
+pub const COMMITTER_NAME: &str = "lanius";
+pub const COMMITTER_EMAIL: &str = "lanius@localhost";
 
 /// Apply the untrusted-input hardening every kernel git invocation shares.
 pub fn harden(c: &mut Command) {

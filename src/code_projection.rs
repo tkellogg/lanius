@@ -21,7 +21,7 @@ use std::io::{Read, Seek, SeekFrom};
 ///
 /// The schema is owned here rather than in `db.rs` because the projection is a
 /// derived, lazily-maintained index over the recorder's `trace.jsonl`. The stats
-/// table has one row per elanus coding session for list/tree queries; the events
+/// table has one row per lanius coding session for list/tree queries; the events
 /// table stores only short timeline entries so UI details do not need to scan
 /// the full flight recorder; the cursor table stores the byte offset of the last
 /// fully-consumed JSONL line.
@@ -97,7 +97,7 @@ pub struct SessionStat {
     /// also `elanus_session` — the stable wire id the UI keys on.
     #[serde(default)]
     pub incarnations: Vec<String>,
-    /// Manual `--resume` relaunches that minted a fresh elanus id but continued
+    /// Manual `--resume` relaunches that minted a fresh lanius id but continued
     /// the same native thread: `incarnations - 1`. Reported SEPARATELY from
     /// `driven_resumes` (we do not conflate the two kinds of resume).
     #[serde(default)]
@@ -124,10 +124,10 @@ pub struct SessionEvent {
 pub struct SessionDetail {
     pub session: SessionStat,
     pub events: Vec<SessionEvent>,
-    /// The per-tool INTERACTIVE-resume suggestion (`elanus code <tool> --resume
+    /// The per-tool INTERACTIVE-resume suggestion (`lanius code <tool> --resume
     /// <native>`), or None when the tool has no clean managed passthrough (e.g.
     /// codex/opencode) — the UI then shows no resume hint. Suggestive only; resume
-    /// is not an elanus verb (see `codeagent::interactive_resume_hint`).
+    /// is not an lanius verb (see `codeagent::interactive_resume_hint`).
     pub resume_command: Option<String>,
     pub children: Vec<SessionStat>,
 }
@@ -722,7 +722,7 @@ fn sort_active_first(out: &mut [SessionStat]) {
 
 /// Every per-incarnation `code_session_stats` row, native_session filled from the
 /// durable `code_sessions` mapping when the obs-derived copy is null. This is the
-/// UNGROUPED view (`elanus code sessions --raw`): one row per launch, the old
+/// UNGROUPED view (`lanius code sessions --raw`): one row per launch, the old
 /// behaviour. Robust to the projection tables not existing yet (empty list).
 pub fn list_sessions_raw(root: &Root) -> Result<Vec<SessionStat>> {
     let conn = crate::db::open(root)?;
@@ -782,7 +782,7 @@ fn fill_native(s: &mut SessionStat, overrides: &std::collections::HashMap<String
     }
 }
 
-/// The grouping key for a stat: its native thread id, or its elanus id as a
+/// The grouping key for a stat: its native thread id, or its lanius id as a
 /// fallback when the native id is unknown (an incarnation with no native id stays
 /// 1:1, which is correct — we cannot claim it is the same thread). native_session
 /// is effectively globally unique, so it is a safe collapse key.
@@ -819,7 +819,7 @@ fn fold_threads(stats: Vec<SessionStat>) -> Vec<SessionStat> {
     }
 
     // Map every incarnation's elanus_session → its thread key, so we can remap
-    // parent edges (a parent edge points at an incarnation's elanus id) into the
+    // parent edges (a parent edge points at an incarnation's lanius id) into the
     // thread it belongs to (TG2).
     let mut elanus_to_thread: HashMap<String, String> = HashMap::new();
     for (key, incs) in &groups {
@@ -884,7 +884,7 @@ fn fold_threads(stats: Vec<SessionStat>) -> Vec<SessionStat> {
 }
 
 /// List coding sessions GROUPED into logical threads (default). Manual `--resume`
-/// relaunches that mint a fresh elanus id but continue the same native thread fold
+/// relaunches that mint a fresh lanius id but continue the same native thread fold
 /// into ONE row per `thread_key`; the spawn tree is remapped into thread-space so
 /// planner→worker stays nested while resume-incarnations collapse to one node.
 /// Robust to the projection tables not existing yet (returns an empty list).
@@ -987,7 +987,7 @@ mod tests {
 
     fn temp_root(tag: &str) -> Root {
         let dir = std::env::temp_dir().join(format!(
-            "elanus-code-projection-{tag}-{}",
+            "lanius-code-projection-{tag}-{}",
             std::process::id()
         ));
         std::fs::remove_dir_all(&dir).ok();
@@ -1151,12 +1151,12 @@ mod tests {
 
     // ── session-thread-grouping (TG1/TG2) ─────────────────────────────────────
 
-    /// Emit a CC incarnation: a `session/start` (fresh elanus id), a
+    /// Emit a CC incarnation: a `session/start` (fresh lanius id), a
     /// `session/started` carrying the shared `cc_session` (native thread id), one
     /// tool/idle event, and a stop. `parent` is optional (the spawn edge).
     fn cc_incarnation(
         root: &Root,
-        elanus: &str,
+        lanius: &str,
         cc_session: &str,
         parent: Option<&str>,
         t0: &str,
@@ -1169,27 +1169,27 @@ mod tests {
         }
         append_trace(
             root,
-            &format!("obs/agent/claude-code/{elanus}/session/start"),
+            &format!("obs/agent/claude-code/{lanius}/session/start"),
             start,
         );
         append_trace(
             root,
-            &format!("obs/agent/claude-code/{elanus}/session/started"),
+            &format!("obs/agent/claude-code/{lanius}/session/started"),
             json!({ "ts": format!("{t0}.100Z"), "cc_session": cc_session }),
         );
         append_trace(
             root,
-            &format!("obs/agent/claude-code/{elanus}/tool/edit/call"),
-            json!({ "ts": format!("{t0}.200Z"), "command": format!("edit by {elanus}") }),
+            &format!("obs/agent/claude-code/{lanius}/tool/edit/call"),
+            json!({ "ts": format!("{t0}.200Z"), "command": format!("edit by {lanius}") }),
         );
         append_trace(
             root,
-            &format!("obs/agent/claude-code/{elanus}/session/idle"),
+            &format!("obs/agent/claude-code/{lanius}/session/idle"),
             json!({ "ts": format!("{t0}.300Z"), "usage": { "input_tokens": in_tok, "output_tokens": out_tok } }),
         );
         append_trace(
             root,
-            &format!("obs/agent/claude-code/{elanus}/session/stop"),
+            &format!("obs/agent/claude-code/{lanius}/session/stop"),
             json!({ "ts": format!("{t0}.400Z"), "exit_code": 0 }),
         );
     }
@@ -1197,7 +1197,7 @@ mod tests {
     #[test]
     fn tg1_three_incarnations_fold_to_one_thread() {
         let root = temp_root("tg1-fold");
-        // Three manual --resume relaunches: fresh elanus id each, SAME cc_session.
+        // Three manual --resume relaunches: fresh lanius id each, SAME cc_session.
         cc_incarnation(
             &root,
             "code-aaa",
@@ -1333,11 +1333,11 @@ mod tests {
             assert_eq!(edits[0].elanus_session, "code-i1");
             assert_eq!(edits[1].elanus_session, "code-i2");
             // The resume hint is the per-tool managed relaunch targeting the
-            // (shared) native thread, not an elanus verb — `elanus code claude
+            // (shared) native thread, not an lanius verb — `lanius code claude
             // --resume <native>`.
             assert_eq!(
                 d.resume_command.as_deref(),
-                Some("elanus code claude --resume cc-union"),
+                Some("lanius code claude --resume cc-union"),
                 "per-tool interactive-resume hint for id {id}"
             );
         }

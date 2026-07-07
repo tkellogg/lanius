@@ -1,6 +1,6 @@
 # kb-ratifier — the EXPENSIVE half of the KB diff pipeline (docs/handoffs/kb-groundskeeper.md M3).
-# It is the TRUST BOUNDARY of elanus's first auto-approve pipeline: for each diff
-# the compactor proposes, it either APPLIES it (`elanus kb apply-diff <pkg>` — one
+# It is the TRUST BOUNDARY of lanius's first auto-approve pipeline: for each diff
+# the compactor proposes, it either APPLIES it (`lanius kb apply-diff <pkg>` — one
 # git commit via the kb write path) or BOUNCES it with concrete feedback that it
 # appends to the compactor's `ratifier-bounces` memory block. It stands in for the
 # human at a quality tier the human chose and turned on deliberately.

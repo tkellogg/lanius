@@ -1,9 +1,9 @@
 # Kits
 
 A kit is a starter pack: a composition of packages, profiles, and a
-direction, installed in one gesture — `elanus kit add <name-or-path>` on an
-existing root, or `elanus init [dir] --kit <name-or-path>` at creation (the
-flag repeats for several kits). It exists so "set up elanus for X" is one
+direction, installed in one gesture — `lanius kit add <name-or-path>` on an
+existing root, or `lanius init [dir] --kit <name-or-path>` at creation (the
+flag repeats for several kits). It exists so "set up lanius for X" is one
 command instead of a page of copy-paste.
 
 The format is a directory:
@@ -41,14 +41,14 @@ profile. There is no runtime kit entity — nothing consults "the kit" after
 install, there is no registry, no update channel; "what did kit X install"
 is a provenance query against the grants ledger (`decided_by = 'kit:X'`).
 
-CLI: `elanus kit add <ref> [--copy]`, `elanus kit list` (kits installable
-right now, in resolution order), `elanus kit show <ref>` (README without
+CLI: `lanius kit add <ref> [--copy]`, `lanius kit list` (kits installable
+right now, in resolution order), `lanius kit show <ref>` (README without
 installing).
 
 Resolution: a ref containing `/` is used as a path directly. A bare name
-resolves, in order, against `$ELANUS_KIT_PATH` (an override, not the
-mechanism), **`<root>/kits`** — the configured home: `elanus init` seeds it
+resolves, in order, against `$LANIUS_KIT_PATH` (an override, not the
+mechanism), **`<root>/kits`** — the configured home: `lanius init` seeds it
 with the stock `core` kit, and dropping a directory there is the whole
-install story — then `~/.elanus/kits` (user-level, shared across roots),
-then a `kits/` directory found walking up from the elanus executable (dev
+install story — then `~/.lanius/kits` (user-level, shared across roots),
+then a `kits/` directory found walking up from the lanius executable (dev
 convenience so a repo build finds `<repo>/kits`).

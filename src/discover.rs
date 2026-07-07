@@ -1,4 +1,4 @@
-//! `elanus discover <query>` — the privileged capability search
+//! `lanius discover <query>` — the privileged capability search
 //! (docs/handoffs/kb-discovery.md M1). It answers "you don't have the discord
 //! package enabled, but it exists and matches your query."
 //!
@@ -12,7 +12,7 @@
 //! (visibility, not authority — src/packages.rs:150-151). Getting the capability
 //! still rides the config-proposal flow.
 //!
-//! One implementation, three surfaces: this kernel scan is the CLI (`elanus
+//! One implementation, three surfaces: this kernel scan is the CLI (`lanius
 //! discover`), the `discovery` package's `find_capability` tool script shells it
 //! (`--json`), and the discovery skill teaches it.
 
@@ -45,7 +45,7 @@ pub struct Adds {
     pub stages: Vec<String>,
     /// `[[mcp]]` server names (third-party tool servers).
     pub mcp: Vec<String>,
-    /// `[[harness]]` names (`elanus code <name>` adapters).
+    /// `[[harness]]` names (`lanius code <name>` adapters).
     pub harnesses: Vec<String>,
     /// Built-in tools this package gates via `provides_builtin_tools`.
     pub builtin_tools: Vec<String>,
@@ -281,7 +281,7 @@ mod tests {
         std::fs::create_dir_all(d.join("kb")).unwrap();
         std::fs::create_dir_all(d.join("scripts")).unwrap();
         std::fs::write(
-            d.join("elanus.toml"),
+            d.join("lanius.toml"),
             "[kb]\ntitle = \"Discord API notes\"\n\n\
              [[tool]]\nname = \"send_discord\"\ndescription = \"post to a channel\"\nrun = \"scripts/send\"\n",
         )
@@ -369,7 +369,7 @@ mod tests {
         let d = root.packages().join("paging");
         std::fs::create_dir_all(d.join("scripts")).unwrap();
         std::fs::write(
-            d.join("elanus.toml"),
+            d.join("lanius.toml"),
             "[[tool]]\nname = \"page_oncall\"\ndescription = \"escalate to the pager\"\nrun = \"scripts/p\"\n",
         )
         .unwrap();

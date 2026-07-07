@@ -17,12 +17,12 @@ authority being requested.
 
 Useful commands:
 
-- `elanus kit list` shows installable kits.
-- `elanus kit add <kit>` installs a kit and grants its package requests.
-- `elanus kit add <kit> --pending` stages requests for later review.
-- `elanus packages` shows discovered packages and grant status.
-- `elanus approve <package>` approves pending requests for a package.
-- `elanus revoke <package>` revokes approved requests for a package.
+- `lanius kit list` shows installable kits.
+- `lanius kit add <kit>` installs a kit and grants its package requests.
+- `lanius kit add <kit> --pending` stages requests for later review.
+- `lanius packages` shows discovered packages and grant status.
+- `lanius approve <package>` approves pending requests for a package.
+- `lanius revoke <package>` revokes approved requests for a package.
 
 For setup, prefer small approvals that the human understands. Explain what the
 package asks to subscribe to, publish to, or expose before asking for approval.

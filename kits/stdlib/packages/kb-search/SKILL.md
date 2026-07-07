@@ -1,12 +1,12 @@
 ---
 name: kb-search
-description: Search the shared knowledge base before you guess. Call the search_knowledge tool (or `elanus kb search <query>`) to recall curated facts — model tiering, roles, conventions — and get back the file + line to open. The tool's existence is high-availability; the mechanics here are expando.
+description: Search the shared knowledge base before you guess. Call the search_knowledge tool (or `lanius kb search <query>`) to recall curated facts — model tiering, roles, conventions — and get back the file + line to open. The tool's existence is high-availability; the mechanics here are expando.
 ---
 
 # kb-search — recall from the knowledge base
 
 The knowledge base is the union of every enabled package's `kb/` corpus (see
-`elanus kb list`). It feels like one KB even though it is many packages. This
+`lanius kb list`). It feels like one KB even though it is many packages. This
 package makes it **searchable** two ways, both over the same FTS5 index:
 
 - **The `search_knowledge` tool** — your primary surface. It is an ordinary
@@ -25,7 +25,7 @@ package makes it **searchable** two ways, both over the same FTS5 index:
                   "snippet": "Who verifies … Opus on high … Fable for the hardest" } ] }
   ```
 
-- **`elanus kb search <query>`** — the same hits from the CLI, for a harness or a
+- **`lanius kb search <query>`** — the same hits from the CLI, for a harness or a
   human at a shell. `--json` for one JSON object per hit; `--limit N` to widen.
 
 ## Availability tiers (journey 14)

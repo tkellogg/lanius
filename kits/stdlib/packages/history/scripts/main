@@ -8,12 +8,12 @@ NO state of its own — every query is answered by a fresh read-only sqlite
 connection, so the answer is exactly as good as the ledger at that instant.
 
 Transport (2026-06-12, HANDOFF phase 3): HTTP on the harness-negotiated
-loopback port (ELANUS_HTTP_PORT; consumers discover it from
+loopback port (LANIUS_HTTP_PORT; consumers discover it from
 run/pkg-history/http.json — harness state, never retained bus messages).
 The old obs/ui/history q/r protocol is retired: result sets, pagination and
 projection want status codes and bodies, not pub/sub. Serving is a granted
 capability (kind "http" in the ledger): transcripts are the crown jewels
-(docs/security.md entry 10), so this parks until `elanus approve history`.
+(docs/security.md entry 10), so this parks until `lanius approve history`.
 
   POST /query   one JSON body, dispatched on "kind":
     agents                          -> {"agents":[{"agent","sessions":[...]}], "orphan_sessions":[...]}
@@ -43,7 +43,17 @@ import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-DB = os.environ.get("ELANUS_DB") or os.environ.get("HARNESS_DB") or os.path.join(os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", "."), "elanus.db")
+DB = (
+    os.environ.get("LANIUS_DB")
+    or os.environ.get("ELANUS_DB")
+    or os.environ.get("HARNESS_DB")
+    or os.path.join(
+        os.environ.get("LANIUS_ROOT")
+        or os.environ.get("ELANUS_ROOT")
+        or os.environ.get("HARNESS_ROOT", "."),
+        "lanius.db",
+    )
+)
 PAGE_DEFAULT = 80
 PAGE_MAX = 200
 CONTENT_CAP = 16 * 1024
@@ -317,13 +327,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def http_grant_approved():
     """Serving is a capability (grants kind 'http'); park until approved —
-    `elanus approve history` flips this without a restart dance."""
+    `lanius approve history` flips this without a restart dance."""
     try:
         with ro() as c:
             row = c.execute(
                 "SELECT state FROM grants WHERE package = ? AND kind = 'http'"
                 " ORDER BY id DESC LIMIT 1",
-                (os.environ.get("ELANUS_PACKAGE", "history"),),
+                (os.environ.get("LANIUS_PACKAGE") or os.environ.get("ELANUS_PACKAGE", "history"),),
             ).fetchone()
         return row is not None and row["state"] == "approved"
     except sqlite3.Error:
@@ -334,14 +344,14 @@ def main():
     if not os.path.exists(DB):
         log(f"[history] no ledger at {DB}; the path is supervisor-given, so a missing db is a real fault")
         sys.exit(1)
-    port = os.environ.get("ELANUS_HTTP_PORT")
+    port = os.environ.get("LANIUS_HTTP_PORT") or os.environ.get("ELANUS_HTTP_PORT")
     if not port:
-        log("[history] no ELANUS_HTTP_PORT (needs a daemon with process.http support); exiting")
+        log("[history] no LANIUS_HTTP_PORT (needs a daemon with process.http support); exiting")
         sys.exit(1)
     waited = False
     while not http_grant_approved():
         if not waited:
-            log("[history] http grant not approved yet; parking until `elanus approve history` (this is not an error)")
+            log("[history] http grant not approved yet; parking until `lanius approve history` (this is not an error)")
             waited = True
         time.sleep(2)
     srv = HTTPServer(("127.0.0.1", int(port)), Handler)

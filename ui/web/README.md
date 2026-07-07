@@ -1,4 +1,4 @@
-# elanus web — the agent explorer
+# lanius web — the agent explorer
 
 A local web UI over the bus. The **pure-MQTT-client constraint** from ui/tui
 carries over one hop: browsers can't speak raw TCP MQTT, so `server.mjs` is
@@ -10,7 +10,7 @@ this directory's built static files, `<root>/bus.toml` for broker discovery,
 profile files, and the run/ dir for the history endpoint.
 
 **Authority: the same as your terminal — because it shells out to it.**
-The admin seam (`/api/admin/*`) runs the `elanus` CLI, so this server adds
+The admin seam (`/api/admin/*`) runs the `lanius` CLI, so this server adds
 no authority of its own and there is one code path for every human
 gesture. Commits included (Tim's call, 2026-06-12): pretending the CLI was
 a safer channel claimed a boundary that doesn't exist yet
@@ -21,21 +21,21 @@ UI-driven decisions carry `decided_by=ui` in the ledger:
 
 - **Agents are profiles.** The nav lists every profile on disk (a silent
   root still shows its identities); *new agent* scaffolds one
-  (`elanus profile new` — instant, profiles are your files, no review);
+  (`lanius profile new` — instant, profiles are your files, no review);
   the per-agent **configure** tab edits identity as a form — model, turn
   budget, workdir, skill visibility, and the agent name itself (renaming
   moves the mailbox to `in/agent/<new>` going forward; ledger history
   under the old noun stays). Every form save goes through
-  `elanus profile set`: comments survive, and a set that wouldn't load is
+  `lanius profile set`: comments survive, and a set that wouldn't load is
   refused before it lands.
 - **Add-ons install in one human action.** *add-ons* lists resolvable kits
   (`<root>/kits` is seeded with `core` at init; drop more in, or
-  `~/.elanus/kits`) with detail previews and an `installed` badge from
-  provenance. Adding runs `elanus kit add`; installed add-ons then expose
-  package settings through `elanus config`. Agent-started settings proposals
+  `~/.lanius/kits`) with detail previews and an `installed` badge from
+  provenance. Adding runs `lanius kit add`; installed add-ons then expose
+  package settings through `lanius config`. Agent-started settings proposals
   appear separately as plain requests to accept or decline.
 - **The model picker asks the provider.** `/api/admin/models` proxies
-  `elanus models` (GET /v1/models with the configured base_url/key);
+  `lanius models` (GET /v1/models with the configured base_url/key);
   compat layers without the endpoint degrade to static suggestions.
 
 ## Run
@@ -45,7 +45,7 @@ cd ui/web && npm install
 cargo run --manifest-path ../../Cargo.toml -- dev
 # -> daemon + web relay + Vite dev server
 # -> http://127.0.0.1:5173, proxies /api to http://127.0.0.1:7180
-# -> log: ../../target/elanus-dev.log
+# -> log: ../../target/lanius-dev.log
 ```
 
 From the repo root, the same command is:
@@ -56,7 +56,7 @@ cargo run -- dev
 
 The dev supervisor restarts crashed children, restarts the daemon when Rust
 sources change, lets Node/Vite watch their own files, and shuts down the whole
-stack on `Ctrl-C`. It tees terminal output into `target/elanus-dev.log`,
+stack on `Ctrl-C`. It tees terminal output into `target/lanius-dev.log`,
 overwriting that gitignored file on each start.
 
 Run the backend relay separately only when you need to debug it outside the
@@ -64,7 +64,7 @@ supervisor:
 
 ```sh
 npm run dev:relay                              # watches server.mjs/config.mjs
-# or: node server.mjs --root /tmp/elanus-live  # $ELANUS_ROOT / --url mqtt://...
+# or: node server.mjs --root /tmp/lanius-live  # $LANIUS_ROOT / --url mqtt://...
 # -> http://127.0.0.1:7180   (--port to change)
 ```
 
@@ -73,7 +73,7 @@ For production-style static serving, build first. `server.mjs` serves the Vite
 
 ```sh
 npm run build
-node server.mjs --root /tmp/elanus-live
+node server.mjs --root /tmp/lanius-live
 ```
 
 Historical views work out of the box on initialized roots because history is a

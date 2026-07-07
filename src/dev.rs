@@ -22,14 +22,14 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     // SHARED-NOTHING with `serve`/prod. dev runs against a dedicated, repo-local
-    // root under target/ (gitignored, disposable) — NEVER ~/.elanus/root. It gets
+    // root under target/ (gitignored, disposable) — NEVER ~/.lanius/root. It gets
     // its own DB, config, secrets, and bus port, so a dev stack can't (a) collide
     // with `serve` on the bus, (b) contend on the prod DB, or (c) on teardown sweep
-    // up prod / `elanus code` processes by root path — `cleanup_root_processes`
+    // up prod / `lanius code` processes by root path — `cleanup_root_processes`
     // matches the command line, and a coding session runs as `claude --settings
     // <root>/run/.../settings.json`, so a SHARED root made dev's teardown kill it.
     // `serve` is the command for a real root; dev ignores the global -C on purpose.
-    let dev_dir = repo.join("target/elanus-dev");
+    let dev_dir = repo.join("target/lanius-dev");
     if !dev_dir.join("bus.toml").exists() {
         crate::initcmd::init(dev_dir.clone(), vec![], false)
             .context("initializing the dev root")?;
@@ -72,7 +72,7 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("cargo"));
     let target_debug = repo.join("target/debug");
-    let log_path = repo.join("target/elanus-dev.log");
+    let log_path = repo.join("target/lanius-dev.log");
     let log = Log::create(&log_path)?;
     let path = prepend_path(&target_debug)?;
     let root_s = root.dir.display().to_string();
@@ -87,7 +87,7 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
                 .arg("run")
                 .arg("--quiet")
                 .arg("--")
-                // Pass -C explicitly (not just ELANUS_ROOT env) so the daemon's
+                // Pass -C explicitly (not just LANIUS_ROOT env) so the daemon's
                 // command line carries the dev root — cleanup_root_processes matches
                 // on the command line, so this is what lets teardown sweep the dev
                 // broker (else it orphans on the dev bus port). The web relay below
@@ -97,15 +97,15 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
                 .arg("daemon")
                 .arg("--interval-ms")
                 .arg(interval_ms.to_string())
-                .env("ELANUS_ROOT", &root_s)
+                .env_dual("ROOT", &root_s)
                 .env("PATH", &path),
         )
         .with_watch(RustInputs::new(&repo)?),
-        // The web relay is the same Rust server `serve` ships (`elanus web`,
+        // The web relay is the same Rust server `serve` ships (`lanius web`,
         // src/web.rs), built via `cargo run` so a change to src/web.rs hot-restarts
         // it in the dev loop. ui/web/server.mjs was retired (web-packaging M4) —
         // the Rust server is the only relay. Vite still serves the SPA with HMR
-        // and proxies /api here (ELANUS_WEB_BACKEND).
+        // and proxies /api here (LANIUS_WEB_BACKEND).
         Service::new(
             "web",
             CommandSpec::new(cargo, &repo)
@@ -117,8 +117,8 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
                 .arg("web")
                 .arg("--port")
                 .arg(&web_port_s)
-                .env("ELANUS_ROOT", &root_s)
-                .env("ELANUS_WEB_PORT", &web_port_s)
+                .env_dual("ROOT", &root_s)
+                .env_dual("WEB_PORT", &web_port_s)
                 .env("PATH", &path),
         )
         .with_watch(RustInputs::new(&repo)?),
@@ -127,15 +127,15 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
             CommandSpec::new("npm", &web_dir)
                 .arg("run")
                 .arg("dev")
-                .env("ELANUS_ROOT", &root_s)
-                .env("ELANUS_WEB_BACKEND", &backend)
-                .env("ELANUS_VITE_PORT", &vite_port_s)
+                .env_dual("ROOT", &root_s)
+                .env_dual("WEB_BACKEND", &backend)
+                .env_dual("VITE_PORT", &vite_port_s)
                 .env("PATH", &path),
         ),
     ];
 
     log.line(format!(
-        "[dev] dev root: {}  (isolated — NOT ~/.elanus/root; `serve` uses your real root)",
+        "[dev] dev root: {}  (isolated — NOT ~/.lanius/root; `serve` uses your real root)",
         root.dir.display()
     ));
     log.line(format!("[dev] log={}", log_path.display()));
@@ -205,7 +205,7 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
     Ok(())
 }
 
-/// `elanus serve` — the PACKAGED counterpart of `elanus dev`. Where `dev`
+/// `lanius serve` — the PACKAGED counterpart of `lanius dev`. Where `dev`
 /// supervises three DEV services (a `cargo run` debug daemon, a `cargo run … web`
 /// relay, and the Vite dev server), `serve` supervises the PROD stack with no
 /// dev toolchain:
@@ -217,7 +217,7 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
 ///   <web-port>` (src/web.rs): an in-process ntex server serving the SPA that is
 ///   **embedded in the binary** (`include_dir!` over ui/web/dist). No Node, no npm,
 ///   no `ui/web` source tree at runtime — the whole point of the packaging work
-///   (docs/handoffs/web-packaging.md). `elanus dev` keeps Vite + npm for hot reload.
+///   (docs/handoffs/web-packaging.md). `lanius dev` keeps Vite + npm for hot reload.
 ///   (ui/web/server.mjs + config.mjs were retired in web-packaging M4 — gone.)
 ///
 /// Supervision (signals, restart-with-backoff, combined logging, group teardown,
@@ -231,18 +231,18 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
     // Everything is rooted at <root>: no build tree is consulted, so an installed
     // binary with no checkout serves fine. The web UI is embedded in the binary
     // (src/web.rs), so there is no dist/ to locate or build.
-    let log_path = root.dir.join("elanus-serve.log");
+    let log_path = root.dir.join("lanius-serve.log");
     let log = Log::create(&log_path)?;
     let root_s = root.dir.display().to_string();
     let web_port_s = web_port.to_string();
 
     // The packaged daemon is THIS binary re-invoked (not `cargo run`): serve is
-    // launched from a built binary, so current_exe IS the elanus binary. Run it as
+    // launched from a built binary, so current_exe IS the lanius binary. Run it as
     // `<self> -C <root> daemon` so the daemon targets the same root explicitly.
-    let self_exe = std::env::current_exe().context("locating the running elanus binary")?;
+    let self_exe = std::env::current_exe().context("locating the running lanius binary")?;
 
     if rebuild {
-        log.line("[serve] --rebuild ignored: the web UI is embedded in the binary (nothing to npm-build at serve time; use `elanus dev` for the Vite hot-reload loop)");
+        log.line("[serve] --rebuild ignored: the web UI is embedded in the binary (nothing to npm-build at serve time; use `lanius dev` for the Vite hot-reload loop)");
     }
 
     let mut services = vec![
@@ -254,9 +254,9 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
                 .arg("daemon")
                 .arg("--interval-ms")
                 .arg(interval_ms.to_string())
-                .env("ELANUS_ROOT", &root_s),
+                .env_dual("ROOT", &root_s),
         ),
-        // The web server is THIS binary again (`elanus web`, src/web.rs): the SPA
+        // The web server is THIS binary again (`lanius web`, src/web.rs): the SPA
         // is embedded via include_dir!, so no Node, no npm, no ui/web checkout is
         // needed at runtime. ui/web/server.mjs was retired (web-packaging M4).
         Service::new(
@@ -267,8 +267,8 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
                 .arg("web")
                 .arg("--port")
                 .arg(&web_port_s)
-                .env("ELANUS_ROOT", &root_s)
-                .env("ELANUS_WEB_PORT", &web_port_s),
+                .env_dual("ROOT", &root_s)
+                .env_dual("WEB_PORT", &web_port_s),
         ),
     ];
 
@@ -352,6 +352,13 @@ impl CommandSpec {
 
     fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    fn env_dual(mut self, suffix: &str, value: impl Into<String>) -> Self {
+        let v = value.into();
+        self.env.push((format!("LANIUS_{suffix}"), v.clone()));
+        self.env.push((format!("ELANUS_{suffix}"), v));
         self
     }
 
@@ -576,7 +583,7 @@ fn prepend_path(dir: &Path) -> Result<String> {
 }
 
 /// Probe upward from `start` for a TCP port that binds on 127.0.0.1, returning the
-/// first free one (for `elanus dev --shift-ports`). The probe listener is dropped
+/// first free one (for `lanius dev --shift-ports`). The probe listener is dropped
 /// immediately, so there is a tiny TOCTOU window before the service rebinds — fine
 /// for a dev convenience. Falls back to `start` if the whole window is busy, so the
 /// service surfaces the real "address in use" error rather than this masking it.

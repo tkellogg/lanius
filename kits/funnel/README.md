@@ -23,12 +23,12 @@ in/human/owner                  mail: "KEEP: <item> — <reason>"  your attentio
 
 ## Setup
 
-1. `elanus init <dir> --kit funnel`
+1. `lanius init <dir> --kit funnel`
 2. Configure the scout's model in `profiles/scout/profile.toml`. It ships
    pointing at `claude-3-5-haiku-latest`; the commented lines show the
    anthropic-compatible-provider convention (DeepSeek-style `base_url` +
    `api_key_env`) if you want this rung even cheaper.
-3. Start the daemon (`elanus daemon`), then drop files:
+3. Start the daemon (`lanius daemon`), then drop files:
 
    ```
    printf 'ALERT: disk almost full\n' > <root>/run/pkg-funnel-intake/inbox/x.line
@@ -45,7 +45,7 @@ regex, case-insensitive, `#` comments. **No match means drop** — the funnel
 is default-closed, so write `pass` rules for what you care about; noise is
 infinite, interest is enumerable. Put cheap `drop` rules for high-volume
 chatter above the `pass` rules so they short-circuit. Editing rules.txt
-changes the package's code hash and re-enters review: `elanus approve
+changes the package's code hash and re-enters review: `lanius approve
 funnel-sift` after each edit.
 
 Nothing is silent: dropped lines were ledgered on arrival

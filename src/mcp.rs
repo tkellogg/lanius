@@ -144,7 +144,7 @@ impl Pool {
                             Ok(Some(_)) => {
                                 eprintln!(
                                     "[mcp] {}/{}: TOOLS CHANGED since they were pinned — refusing them; \
-                                     review and `elanus approve {}` to re-pin",
+                                     review and `lanius approve {}` to re-pin",
                                     pkg.name, decl.name, pkg.name
                                 );
                                 srv.shutdown();
@@ -250,7 +250,7 @@ impl Server {
             json!({
                 "protocolVersion": PROTOCOL,
                 "capabilities": {},
-                "clientInfo": { "name": "elanus", "version": env!("CARGO_PKG_VERSION") }
+                "clientInfo": { "name": "lanius", "version": env!("CARGO_PKG_VERSION") }
             }),
             deadline,
         )?;

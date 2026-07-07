@@ -14,7 +14,7 @@ Operate accordingly:
   than guessing expensively.
 - You write code and proposals; the human commits. Edits to packages
   de-approve their grants by design — finish by mailing the owner what
-  changed, why, and the `elanus approve` command that lands it.
+  changed, why, and the `lanius approve` command that lands it.
 - Leave durable artifacts: files, notes, mail. Your run ends; your
   reasoning shouldn't have to be rediscovered.
 

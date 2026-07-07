@@ -1,6 +1,6 @@
-//! `elanus block set/get/list/append/rm <name>` — the universal write surface
+//! `lanius block set/get/list/append/rm <name>` — the universal write surface
 //! for memory blocks (docs/handoffs/memory-blocks.md M2). The CLI is the API:
-//! any harness shells out to it exactly like `elanus code note` does today; the
+//! any harness shells out to it exactly like `lanius code note` does today; the
 //! MCP wrapper (handoff decision 1) is a deferred ergonomic upgrade.
 //!
 //! owner = the caller identity. For an agent's own blocks (scope=agent) the
@@ -9,10 +9,10 @@
 //! writing "your" block writes a DIFFERENT owner row.
 //!
 //! IDENTITY MODEL — `--owner` is a *self-attested label*, not an authenticated
-//! identity. The `elanus block ...` CLI is a local-trusted surface (a harness
-//! shells out to it exactly like `elanus code note`), so there is no broker
+//! identity. The `lanius block ...` CLI is a local-trusted surface (a harness
+//! shells out to it exactly like `lanius code note`), so there is no broker
 //! session to verify against; the owner string is taken at face value. This is
-//! sound under elanus's homogeneous-authority doctrine (handoff decision 4 — "no
+//! sound under lanius's homogeneous-authority doctrine (handoff decision 4 — "no
 //! trust boundary between an owner's own agents"): a mismatched `--owner` only
 //! ever writes a DIFFERENT owner row, which is invisible to and cannot overwrite
 //! another owner's blocks (owner is part of the `context_blocks` key). It is an
@@ -103,7 +103,7 @@ fn warn_user_placement(block: &ContextBlock) {
     }
 }
 
-/// `elanus block set <name> <content>`: upsert a block (last-writer-wins).
+/// `lanius block set <name> <content>`: upsert a block (last-writer-wins).
 pub fn set(root: &Root, name: &str, content: &str, opts: &BlockOpts) -> Result<()> {
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
@@ -143,7 +143,7 @@ pub fn set(root: &Root, name: &str, content: &str, opts: &BlockOpts) -> Result<(
     Ok(())
 }
 
-/// `elanus block append <name> <content>`: append to a block, creating it if
+/// `lanius block append <name> <content>`: append to a block, creating it if
 /// absent (a newline joins prior content). Useful for accumulating notes.
 pub fn append(root: &Root, name: &str, content: &str, opts: &BlockOpts) -> Result<()> {
     let conn = db::open(root)?;
@@ -168,7 +168,7 @@ pub fn append(root: &Root, name: &str, content: &str, opts: &BlockOpts) -> Resul
     Ok(())
 }
 
-/// `elanus block get <name>`: print one block's content, or exit non-zero.
+/// `lanius block get <name>`: print one block's content, or exit non-zero.
 pub fn get(root: &Root, name: &str, opts: &BlockOpts) -> Result<()> {
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
@@ -180,7 +180,7 @@ pub fn get(root: &Root, name: &str, opts: &BlockOpts) -> Result<()> {
     Ok(())
 }
 
-/// `elanus block list`: the system-placement blocks visible to this profile,
+/// `lanius block list`: the system-placement blocks visible to this profile,
 /// one JSON line each (so the web UI can consume it) in render order.
 pub fn list(root: &Root, opts: &BlockOpts) -> Result<()> {
     let conn = db::open(root)?;
@@ -202,7 +202,7 @@ pub fn list(root: &Root, opts: &BlockOpts) -> Result<()> {
     Ok(())
 }
 
-/// `elanus block rm <name>`: remove a block (logs the removal).
+/// `lanius block rm <name>`: remove a block (logs the removal).
 pub fn rm(root: &Root, name: &str, opts: &BlockOpts) -> Result<()> {
     let conn = db::open(root)?;
     db::init_schema(&conn)?;
@@ -241,7 +241,7 @@ mod tests {
         Root { dir }
     }
 
-    // M3: `elanus block set --meta <json>` stores a machine-readable pointer.
+    // M3: `lanius block set --meta <json>` stores a machine-readable pointer.
     #[test]
     fn set_accepts_meta_json_and_round_trips() {
         let root = scratch("meta");

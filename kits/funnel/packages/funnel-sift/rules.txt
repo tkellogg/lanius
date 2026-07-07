@@ -9,7 +9,7 @@
 # noise is infinite, interest is enumerable.
 #
 # Editing this file changes the package's code hash and re-enters review:
-# `elanus approve funnel-sift` after each edit.
+# `lanius approve funnel-sift` after each edit.
 
 # Absorb obvious heartbeat chatter before the pass rules even run.
 drop \b(heartbeat|keepalive|ping|pong)\b

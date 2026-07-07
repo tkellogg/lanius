@@ -14,10 +14,10 @@ import App from '../app.js';
 const h = React.createElement;
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const BIN = path.join(REPO, 'target/debug');
-const TMP = fs.mkdtempSync('/tmp/elanus-tui-smoke.');
+const TMP = fs.mkdtempSync('/tmp/lanius-tui-smoke.');
 const PORT = 18000 + (process.pid % 2000);
 const URL = `mqtt://127.0.0.1:${PORT}`;
-const ENV = { ...process.env, ELANUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
+const ENV = { ...process.env, LANIUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}` };
 
 let failures = 0;
 const ok = (msg) => console.log(`  ok: ${msg}`);
@@ -40,8 +40,8 @@ async function waitFor(desc, fn, timeoutMs = 15000) {
   return false;
 }
 
-function elanus(...args) {
-  return execFileSync(path.join(BIN, 'elanus'), args, { env: ENV, encoding: 'utf8' });
+function lanius(...args) {
+  return execFileSync(path.join(BIN, 'lanius'), args, { env: ENV, encoding: 'utf8' });
 }
 
 /** Type text one character at a time, verifying each lands in a rendered
@@ -86,16 +86,16 @@ async function pressUntil(desc, key, pred, attempts = 3) {
 }
 
 // -- build the binary if missing (cargo build, e2e-style PATH) --
-if (!fs.existsSync(path.join(BIN, 'elanus'))) {
-  console.log('building elanus...');
+if (!fs.existsSync(path.join(BIN, 'lanius'))) {
+  console.log('building lanius...');
   execFileSync('cargo', ['build'], { cwd: REPO, stdio: 'inherit' });
 }
 
 // -- throwaway root + daemon (the e2e.sh recipe) --
-elanus('init', TMP);
+lanius('init', TMP);
 fs.writeFileSync(path.join(TMP, 'bus.toml'), `enabled = true\nbind = "127.0.0.1:${PORT}"\n`);
 const daemonLog = fs.openSync(path.join(TMP, 'daemon.log'), 'w');
-const daemon = spawn(path.join(BIN, 'elanus'), ['daemon'], {
+const daemon = spawn(path.join(BIN, 'lanius'), ['daemon'], {
   env: ENV,
   stdio: ['ignore', daemonLog, daemonLog],
 });
@@ -139,11 +139,11 @@ const frame = () => tui.lastFrame() ?? '';
 await waitFor('tui connected', () => frame().includes('● connected'));
 
 // 1. receive path: a published event appears in the stream pane
-elanus('bus', 'pub', 'obs/test/tui', '{"msg":"tui-smoke"}');
+lanius('bus', 'pub', 'obs/test/tui', '{"msg":"tui-smoke"}');
 await waitFor('stream shows obs/test/tui', () => frame().includes('obs/test/tui') && frame().includes('tui-smoke'));
 
-// 2. ask path: an ask (with correlation, like `elanus ask`) lands in the asks pane
-elanus('emit', 'in/human/owner', '--correlation', 'tui-corr-1', '--payload', '{"question":"ship it?","options":["yes","no"]}');
+// 2. ask path: an ask (with correlation, like `lanius ask`) lands in the asks pane
+lanius('emit', 'in/human/owner', '--correlation', 'tui-corr-1', '--payload', '{"question":"ship it?","options":["yes","no"]}');
 // The ask reaches the TUI via the daemon's announce sweep, a tick AFTER the
 // instant obs/harness/ledger/emit echo hits the stream pane — so the guard
 // must check the asks-pane header, not just grep the frame for the question
@@ -177,14 +177,14 @@ await waitFor('ask marked answered in pane', () => frame().includes('answered: y
 
 // 4. CLI-answer reflection: an in/agent/# event with a pending ask's
 //    correlation (published by anyone) marks it answered in the pane.
-elanus('emit', 'in/human/owner', '--correlation', 'tui-corr-2', '--payload', '{"question":"second ask?"}');
+lanius('emit', 'in/human/owner', '--correlation', 'tui-corr-2', '--payload', '{"question":"second ask?"}');
 await waitFor('second ask pending', () => frame().includes('second ask?'));
-elanus('emit', 'in/agent/main', '--correlation', 'tui-corr-2', '--payload', '{"answer":"from-cli"}');
+lanius('emit', 'in/agent/main', '--correlation', 'tui-corr-2', '--payload', '{"answer":"from-cli"}');
 await waitFor('CLI answer reflected', () => frame().includes('answered: from-cli'));
 
 // 4b. agent REPLIES are human mail too ({text}, not {question}) — they render
 // in the pane as un-answerable items and never open the editor.
-elanus('emit', 'in/human/owner', '--correlation', 'tui-conv-9', '--payload', '{"text":"here is your answer"}');
+lanius('emit', 'in/human/owner', '--correlation', 'tui-conv-9', '--payload', '{"text":"here is your answer"}');
 await waitFor('agent reply rendered as mail', () => frame().includes('here is your answer'));
 
 // 5. compose path: publish new work, PUBACK = accepted indicator
@@ -199,7 +199,7 @@ await waitFor('observer saw composed work on in/agent/main', () =>
 );
 
 // 6. signal loudness sanity: a signal/# event reaches the stream
-elanus('bus', 'pub', 'signal/pain', '{"why":"smoke"}');
+lanius('bus', 'pub', 'signal/pain', '{"why":"smoke"}');
 await waitFor('signal in stream', () => frame().includes('signal/pain'));
 
 if (failures === 0) {

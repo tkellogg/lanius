@@ -1,6 +1,6 @@
-//! `elanus estimate set/actual/retro` — the CLI glue for work estimation
+//! `lanius estimate set/actual/retro` — the CLI glue for work estimation
 //! (docs/handoffs/work-estimation.md, E1–E3). The CLI IS the API: a harness or a
-//! package script shells out to it exactly like `elanus block` / `elanus code
+//! package script shells out to it exactly like `lanius block` / `lanius code
 //! note`. Every verb reuses an existing primitive — a memory block
 //! (`context_store`), an obs event (`trace::write`), the obs projection
 //! (`code_projection`/`estimate::compute_actuals`) — so estimation adds NO kernel
@@ -34,7 +34,7 @@ pub struct EstimateOpts {
     pub profile: String,
     pub session: String,
     /// The owner identity (agent noun) the blocks belong to. Defaults to the
-    /// profile's agent noun — the same self-attested label `elanus block` uses.
+    /// profile's agent noun — the same self-attested label `lanius block` uses.
     pub owner: Option<String>,
     /// Override the pricing.toml path. Defaults to the estimation package's
     /// `pricing.toml` under the root's package path, then the kit copy.
@@ -107,7 +107,7 @@ fn pricing_path(root: &Root, opts: &EstimateOpts) -> PathBuf {
         .unwrap_or_else(|| candidates[0].clone())
 }
 
-/// E1 — `elanus estimate set`: record the multi-dimensional estimate. Writes the
+/// E1 — `lanius estimate set`: record the multi-dimensional estimate. Writes the
 /// `estimate` block (latest wins) AND emits `obs/estimate/<session>` carrying the
 /// same dims + a timestamp (the count-from boundary).
 #[allow(clippy::too_many_arguments)]
@@ -193,7 +193,7 @@ pub fn report(root: &Root, opts: &EstimateOpts) -> Result<Option<Report>> {
     Ok(Some(report))
 }
 
-/// `elanus estimate actual`: E2 as a command — print the report (or a skip note).
+/// `lanius estimate actual`: E2 as a command — print the report (or a skip note).
 pub fn actual(root: &Root, opts: &EstimateOpts) -> Result<()> {
     match report(root, opts)? {
         Some(r) => {
@@ -210,7 +210,7 @@ pub fn actual(root: &Root, opts: &EstimateOpts) -> Result<()> {
     Ok(())
 }
 
-/// `elanus estimate actual --json`: E2 as a machine-readable command — print the
+/// `lanius estimate actual --json`: E2 as a machine-readable command — print the
 /// `Report` as JSON, or `null` when the session has no recorded estimate (so the
 /// web /api/estimate/{session} route can distinguish "no estimate" from an error
 /// and simply omit the estimate group). Never crashes on a missing estimate.
@@ -261,7 +261,7 @@ pub fn retro(root: &Root, opts: &EstimateOpts) -> Result<Option<String>> {
     Ok(Some(note))
 }
 
-/// `elanus estimate retro`: E3 as a command — print the appended note (or a skip).
+/// `lanius estimate retro`: E3 as a command — print the appended note (or a skip).
 pub fn retro_cmd(root: &Root, opts: &EstimateOpts) -> Result<()> {
     match retro(root, opts)? {
         Some(note) => println!("estimation block updated: {note}"),
@@ -278,7 +278,7 @@ mod tests {
 
     fn temp_root(tag: &str) -> Root {
         let dir = std::env::temp_dir().join(format!(
-            "elanus-estimate-{tag}-{}-{:?}",
+            "lanius-estimate-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

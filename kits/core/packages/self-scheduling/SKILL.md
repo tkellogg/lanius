@@ -45,7 +45,7 @@ Three things worth knowing:
   is impossible unless *you* keep re-arming it deliberately.
 - **The target is always you.** You cannot wake another agent with this —
   `schedule_event` addresses your own mailbox and nothing else. (An
-  operator can schedule any agent from the `elanus schedule` CLI; an agent
+  operator can schedule any agent from the `lanius schedule` CLI; an agent
   cannot.)
 - **It survives restarts.** The schedule is on the ledger, not in memory —
   it fires on the first tick after its time even if the daemon bounced in
@@ -67,9 +67,9 @@ the void — nothing would wake you. Use the machine instead, through the shell:
   sleep 30 && ./check-the-build
   ```
 
-These run **outside** elanus's record — the harness didn't schedule them and
+These run **outside** lanius's record — the harness didn't schedule them and
 won't see them fire. So keep your trace honest: emit an obs line noting what
-you scheduled and why, e.g. `elanus trace obs/self/scheduled --payload
+you scheduled and why, e.g. `lanius trace obs/self/scheduled --payload
 '{"what":"check build","when":"+1h","via":"at"}'`, so the timeline still
 reads truthfully even though the wake happened off-bus.
 

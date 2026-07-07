@@ -91,7 +91,7 @@ Two problems this dissolves:
   silently clobber the other. (That clobber is a real bug we have already hit
   in the configure form; making it structurally impossible is worth a lot.)
 
-It also sits on the project's grain — elanus is already a "git hooks and
+It also sits on the project's grain — lanius is already a "git hooks and
 sqlite" kind of system — and a Git history is a content-addressed hash chain,
 which is exactly the tamper-evident provenance trail we have wanted for
 configuration anyway.

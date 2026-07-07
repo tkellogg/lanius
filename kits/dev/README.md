@@ -1,6 +1,6 @@
 # dev kit — work on a codebase, with seatbelts
 
-This kit sets elanus up to act as a coding agent on a repo of yours. The
+This kit sets lanius up to act as a coding agent on a repo of yours. The
 flow:
 
 1. **Point the agent at your repo.** In your profile's `[sandbox]` section
@@ -28,5 +28,5 @@ flow:
 Try it:
 
 ```
-elanus exec "summarize the repo layout" --session dev1
+lanius exec "summarize the repo layout" --session dev1
 ```

@@ -75,7 +75,7 @@ const conversationLabel = (s: any) => s?.title || s?.preview || 'conversation';
 const agentOf = (topic: string) => topic.match(/^(?:in|obs)\/agent\/([^/]+)/)?.[1] ?? null;
 const uid = () => Math.random().toString(36).slice(2);
 const newWebConversationId = (agent: string) => `web-${agent}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-const conversationStorageKey = (agent: string) => `elanus.currentConversation.${agent}`;
+const conversationStorageKey = (agent: string) => `lanius.currentConversation.${agent}`;
 type ThemeChoice = 'system' | 'light' | 'dark';
 const THEME_CHOICES: ThemeChoice[] = ['system', 'light', 'dark'];
 // Coding-tool agent NOUNS are `claude-code` and `codex` (src/codeagent.rs); bare
@@ -433,23 +433,23 @@ export function App() {
   const [sel, setSel] = useState<any>({ kind: 'welcome' });
   const [navOpen, setNavOpen] = useState(false);
   const [cockpit, setCockpit] = useState<boolean>(() => {
-    try { return localStorage.getItem('elanus.cockpit') === '1'; } catch { return false; }
+    try { return localStorage.getItem('lanius.cockpit') === '1'; } catch { return false; }
   });
   const [themeChoice, setThemeChoice] = useState<ThemeChoice>(() => {
     try {
-      const stored = localStorage.getItem('elanus.theme');
+      const stored = localStorage.getItem('lanius.theme');
       return stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system';
     } catch {
       return 'system';
     }
   });
-  useEffect(() => { try { localStorage.setItem('elanus.cockpit', cockpit ? '1' : '0'); } catch {} }, [cockpit]);
+  useEffect(() => { try { localStorage.setItem('lanius.cockpit', cockpit ? '1' : '0'); } catch {} }, [cockpit]);
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: light)');
     const apply = () => {
       document.documentElement.dataset.theme = themeChoice === 'system' ? (media.matches ? 'light' : 'dark') : themeChoice;
     };
-    try { localStorage.setItem('elanus.theme', themeChoice); } catch {}
+    try { localStorage.setItem('lanius.theme', themeChoice); } catch {}
     apply();
     if (themeChoice !== 'system') return;
     media.addEventListener('change', apply);
@@ -979,7 +979,7 @@ export function App() {
     set['sandbox.capture_exclude'] = arr(cfgForm.captureExclude);
     // Read/network cage (sandbox-config-ui M2) — product words map to the stored
     // enums per the handoff: open/loopback/none. All three flow through the same
-    // agents/set → `elanus profile set` writer; no new write path.
+    // agents/set → `lanius profile set` writer; no new write path.
     set['sandbox.network'] = cfgForm.network;
     set['sandbox.fs_read_deny'] = arr(cfgForm.fsReadDeny);
     set['sandbox.fs_read_allow'] = arr(cfgForm.fsReadAllow);
@@ -1314,7 +1314,7 @@ export function App() {
       <header className="mast">
         <button className={`mast-left${sel.kind === 'welcome' ? ' on' : ''}`} id="mast-home" title="home" onClick={selectWelcome}>
           <span className="kite" aria-hidden="true">⟁</span>
-          <h1><em>elanus</em></h1>
+          <h1><em>lanius</em></h1>
           <span className="mast-sub">agent explorer // live</span>
         </button>
         <div className="mast-right">
@@ -1686,7 +1686,7 @@ function SetupView({ hidden, setup, systemStatus, liveness, provenance, profiles
           <h3>capability catalog</h3>
           <p className="dim-note">Ready-made outcomes for your agents. Expand a card before adding unfamiliar capabilities.</p>
           <div id="setup-kits">
-            {setup.loading || !kits ? 'resolving…' : kits.ok === false ? <div className="dim-note">capabilities could not load: {kits.error ?? 'unknown - is the elanus binary on the server PATH current?'}</div>
+            {setup.loading || !kits ? 'resolving…' : kits.ok === false ? <div className="dim-note">capabilities could not load: {kits.error ?? 'unknown - is the lanius binary on the server PATH current?'}</div>
               : <><CodingAgentCatalogCard />{!(kits.kits ?? []).length ? <div className="dim-note">no other capabilities found</div>
                 : kits.kits.map((k: any) => <SetupKit key={k.name} kit={k} installed={provenance.has(k.name)} loadSetup={loadSetup} />)}</>}
           </div>
@@ -2005,7 +2005,7 @@ function ConfigureView(props: any) {
               <label id="cfg-section-model">model <ModelField id="cfg-model" disabled={disabled} value={form.model} onChange={(v) => setForm({ model: v })} models={modelFieldModels} native={providerIsNative} onSetupProvider={selectProviders} hint={modelCostHint(form.model)} /></label>
               <label>max run steps <input id="cfg-turns" disabled={disabled} type="number" min="1" max="200" value={form.turns} onChange={(e) => setForm({ turns: e.target.value })} /><span className="cfg-field-hint">hard ceiling for one activation's model/tool loop</span></label>
               <label>autonomy <select id="cfg-autonomy" disabled={disabled} value={form.autonomy} onChange={(e) => setForm({ autonomy: e.target.value })}>{['off', 'manual', 'assisted', 'autonomous'].map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
-              <label>working directory <WorkdirInput id="cfg-workdir" disabled={disabled} placeholder="(elanus root)" value={form.workdir} onChange={(v) => setForm({ workdir: v })} /></label>
+              <label>working directory <WorkdirInput id="cfg-workdir" disabled={disabled} placeholder="(lanius root)" value={form.workdir} onChange={(v) => setForm({ workdir: v })} /></label>
             </div>
             <div className="setup-row"><button id="cfg-save" disabled={disabled} onClick={saveConfigure}>save</button><span id="cfg-note" className="dim-note">{cfgNote}</span></div>
             <p className="dim-note">renaming changes where future messages go; old messages and history stay under the old name.</p>
@@ -2050,7 +2050,7 @@ function ConfigureView(props: any) {
               <div className="cfg-grid">
                 <label>owner <input id="cfg-owner" disabled={disabled} spellCheck={false} value={form.owner} onChange={(e) => setForm({ owner: e.target.value })} /></label>
                 <label>parent <input id="cfg-parent" disabled={disabled} spellCheck={false} placeholder="default" value={form.parent} onChange={(e) => setForm({ parent: e.target.value })} /></label>
-                <label>prepend path <input id="cfg-package-path" disabled={disabled} spellCheck={false} placeholder="kits/dev, /opt/elanus/packages" value={form.packagePath} onChange={(e) => setForm({ packagePath: e.target.value })} /></label>
+                <label>prepend path <input id="cfg-package-path" disabled={disabled} spellCheck={false} placeholder="kits/dev, /opt/lanius/packages" value={form.packagePath} onChange={(e) => setForm({ packagePath: e.target.value })} /></label>
                 <label className="cfg-check"><input id="cfg-path-inherit" disabled={disabled} type="checkbox" checked={form.pathInherit} onChange={(e) => setForm({ pathInherit: e.target.checked })} /> include inherited path</label>
                 <label>effective path <input id="cfg-effective-path" disabled={disabled} spellCheck={false} readOnly value={form.effectivePath} /></label>
               </div>

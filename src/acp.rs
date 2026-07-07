@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const ACP_FIDELITY: &str = "acp-live";
-const ENV_ACP_ARGV: &str = "ELANUS_ACP_ARGV";
+const ENV_ACP_ARGV: &str = "LANIUS_ACP_ARGV";
 const APPROVAL_DEADLINE_SECS: u64 = 300;
 
 #[derive(Default)]
@@ -92,7 +92,7 @@ impl ApprovalRelayer for LedgerApprovalRelayer<'_> {
 }
 
 /// Run the generic ACP adapter. A4 will make this argv manifest-driven; until then
-/// tests and hand-wired launches may provide `ELANUS_ACP_ARGV` as a JSON string array.
+/// tests and hand-wired launches may provide `LANIUS_ACP_ARGV` as a JSON string array.
 pub fn run_acp_adapter(ctx: &Ctx) -> Result<ExitStatus> {
     if ctx.mode() == crate::codeagent::Mode::Tui {
         bail!("the acp harness is headless-only; use --headless or run the agent CLI directly");
@@ -190,7 +190,7 @@ fn drive_acp_session<W: Write>(
         "initialize",
         json!({
             "protocolVersion": 1,
-            "clientInfo": { "name": "elanus", "version": env!("CARGO_PKG_VERSION") },
+            "clientInfo": { "name": "lanius", "version": env!("CARGO_PKG_VERSION") },
             "clientCapabilities": {
                 "fs": { "readTextFile": false, "writeTextFile": false },
                 "terminal": false
@@ -263,7 +263,7 @@ fn drive_acp_session<W: Write>(
                     &json!({
                         "jsonrpc": "2.0",
                         "id": id,
-                        "error": { "code": -32601, "message": format!("elanus ACP driver does not handle {m}") }
+                        "error": { "code": -32601, "message": format!("lanius ACP driver does not handle {m}") }
                     }),
                 )?;
             }

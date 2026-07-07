@@ -5,7 +5,7 @@
 //!     block's `meta.{path,lines,sha}` (kb-core M3), finds orphan `kb/` files, and
 //!     flags staleness (a file changed since the recorded sha), then mails the
 //!     owner a report. This ships first and works with ZERO LLM configuration.
-//!   - **The setup gate (M2).** The diff pipeline is elanus's first auto-approve
+//!   - **The setup gate (M2).** The diff pipeline is lanius's first auto-approve
 //!     pipeline, so it is absolutely setup-gated: nothing runs — no cron fire, no
 //!     LLM call — until the human has set the two model choices (informed by the
 //!     llm-strengths KB), a cadence, and a token budget, AND approved the package.
@@ -15,7 +15,7 @@
 //!     dispatch shape (model + budget threaded); the agents' own reasoning (what to
 //!     consolidate, whether to bounce) is their live work. Per-pass cost is carried
 //!     by the general `llm_usage` substrate (each spawned run records its tokens),
-//!     and bounces are recorded by the ratifier via `elanus block append` — neither
+//!     and bounces are recorded by the ratifier via `lanius block append` — neither
 //!     needs a bespoke kernel helper here.
 //!
 //! There is no groundskeeper data model: the report reads pointer blocks
@@ -429,7 +429,7 @@ pub fn load_config(root: &Root) -> Result<std::result::Result<PipelineConfig, St
         if crate::config_repo::get_key(root, PKG, &key)?.is_none() {
             return Ok(Err(format!(
                 "kb-groundskeeper is not set up: {PKG}.{key} is unset \
-                 (run `elanus config set {PKG}.{key} ...`)"
+                 (run `lanius config set {PKG}.{key} ...`)"
             )));
         }
     }
@@ -468,7 +468,7 @@ pub fn is_setup_complete(root: &Root, conn: &Connection) -> bool {
 /// The exec-handler package that makes the pipeline's agent mailboxes
 /// daemon-drivable (docs/handoffs/kb-groundskeeper.md M3): it subscribes to
 /// in/agent/kb-compactor + in/agent/kb-ratifier and turns each into an
-/// `elanus handle-exec` run. Ships in core, approved as part of setup.
+/// `lanius handle-exec` run. Ships in core, approved as part of setup.
 pub const HANDLER_PKG: &str = "kb-pipeline";
 
 /// Is there an approved exec handler for the compactor and ratifier mailboxes?
@@ -483,7 +483,7 @@ pub fn handler_gap(root: &Root, conn: &Connection) -> Result<Option<String>> {
         if packages::matching_exec_handlers(root, conn, &mailbox)?.is_empty() {
             return Ok(Some(format!(
                 "the pipeline exec handler {HANDLER_PKG} is not approved — no approved \
-                 exec package subscribes to {mailbox} (run `elanus approve {HANDLER_PKG}`)"
+                 exec package subscribes to {mailbox} (run `lanius approve {HANDLER_PKG}`)"
             )));
         }
     }
@@ -518,13 +518,13 @@ pub fn compactor_request(cfg: &PipelineConfig, corpus: &str) -> SpawnRequest {
 
 /// Build the ratifier's spawn request (docs/handoffs/kb-groundskeeper.md M3): the
 /// configured EXPENSIVE model + budget threaded, a prompt carrying the one diff to
-/// judge. The ratifier either applies the diff (`elanus kb apply-diff`, one commit)
+/// judge. The ratifier either applies the diff (`lanius kb apply-diff`, one commit)
 /// or bounces it WITH feedback that lands in the compactor's memory block.
 pub fn ratifier_request(cfg: &PipelineConfig, diff: &str) -> SpawnRequest {
     let prompt = format!(
         "You are the KB ratifier — the trust boundary of an auto-approve pipeline. \
          Judge this ONE unified diff. If it is a correct, safe consolidation, apply \
-         it with `elanus kb apply-diff <pkg>` (one commit). If not, BOUNCE it: append \
+         it with `lanius kb apply-diff <pkg>` (one commit). If not, BOUNCE it: append \
          concrete feedback to the compactor's `{BOUNCE_BLOCK}` memory block so the \
          next pass learns. Diff:\n{diff}"
     );
@@ -541,7 +541,7 @@ pub fn ratifier_request(cfg: &PipelineConfig, diff: &str) -> SpawnRequest {
     }
 }
 
-// A ratifier bounce is recorded by the ratifier agent itself via `elanus block
+// A ratifier bounce is recorded by the ratifier agent itself via `lanius block
 // append` (its prompt names the `ratifier-bounces` block), not a kernel helper —
 // the CLI already covers this, so no `record_bounce` primitive lives here.
 //
@@ -569,7 +569,7 @@ mod tests {
     fn install_kb(root: &Root, name: &str, files: &[(&str, &str)]) {
         let pdir = root.packages().join(name);
         std::fs::create_dir_all(pdir.join("kb")).unwrap();
-        std::fs::write(pdir.join("elanus.toml"), "[kb]\ntitle = \"t\"\n").unwrap();
+        std::fs::write(pdir.join("lanius.toml"), "[kb]\ntitle = \"t\"\n").unwrap();
         for (rel, body) in files {
             let p = pdir.join("kb").join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn pipeline_is_daemon_drivable_after_setup_and_both_approvals() {
         // Regression (docs/handoffs/kb-groundskeeper.md M3): the reported bug was
-        // that after a complete, correct setup `elanus kb groundskeep` still could
+        // that after a complete, correct setup `lanius kb groundskeep` still could
         // not spawn the compactor — spawn_core bailed "not daemon-drivable" because
         // NO approved exec package subscribed to in/agent/kb-compactor. The fix ships
         // the `kb-pipeline` exec handler. This drives the REAL shipped packages +

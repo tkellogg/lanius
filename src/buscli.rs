@@ -1,4 +1,4 @@
-//! `elanus bus pub|sub` — mosquitto_pub/sub for the elanus listener.
+//! `lanius bus pub|sub` — mosquitto_pub/sub for the lanius listener.
 //!
 //! Deliberately built on rumqttc (the client we recommend to skills,
 //! docs/bus.md) rather than the kernel's hand-rolled mirror: every CLI use is
@@ -35,8 +35,8 @@ fn client(root: &Root, addr: SocketAddr, tag: &str) -> (AsyncClient, rumqttc::v5
     //    cannot read that store, so it presents no credential — and is refused
     //    (deny-by-default), which is the point.
     if let (Ok(pkg), Ok(token)) = (
-        std::env::var("ELANUS_PACKAGE"),
-        std::env::var("ELANUS_BUS_TOKEN"),
+        std::env::var("LANIUS_PACKAGE"),
+        std::env::var("LANIUS_BUS_TOKEN"),
     ) {
         opts.set_credentials(pkg, token);
     } else {
@@ -229,7 +229,7 @@ fn classify_conn_error(e: rumqttc::v5::ConnectionError) -> BusError {
 /// (docs/bus.md hook plane). These become SUBSCRIBE user properties
 /// (§3.8.2.1); the broker honors them only for a token-authed session whose
 /// package holds the blocking grant — inside a supervised actor that's the
-/// injected ELANUS_PACKAGE/ELANUS_BUS_TOKEN environment.
+/// injected LANIUS_PACKAGE/LANIUS_BUS_TOKEN environment.
 pub struct BlockingOpts {
     pub order: u32,
     pub timeout_ms: u64,

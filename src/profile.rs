@@ -238,7 +238,7 @@ impl Default for SandboxCfg {
 /// docs/security.md entry 24 where active. Per-profile so a not-yet-soaked
 /// transport only ever breaks the one agent whose profile asked for it (mirrors
 /// single-cage's rollout gate; docs/handoffs/single-cage-macos.md wonky bit 1).
-/// The elanus cage stays on either way; this only changes codex's own gate.
+/// The lanius cage stays on either way; this only changes codex's own gate.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CodexCfg {
@@ -247,7 +247,7 @@ pub struct CodexCfg {
     pub app_server: bool,
     /// The in-process elicitation deadline (seconds) for an app-server approval:
     /// codex blocks the turn unboundedly (M1 spike — no server timeout), so
-    /// elanus imposes its own. On no answer by the deadline the driver replies
+    /// lanius imposes its own. On no answer by the deadline the driver replies
     /// with `app_server_default`.
     #[serde(default = "default_app_server_timeout")]
     pub app_server_timeout_secs: u64,
@@ -361,10 +361,10 @@ impl Default for SubagentCfg {
 }
 
 fn default_capture_exclude() -> Vec<String> {
-    // Kernel churn (db/wal/trace/run) would self-noise every diff. "elanus.db"
+    // Kernel churn (db/wal/trace/run) would self-noise every diff. "lanius.db"
     // prefix-excludes its -wal/-shm siblings too.
     [
-        "elanus.db",
+        "lanius.db",
         "trace.jsonl",
         "run/",
         ".env",

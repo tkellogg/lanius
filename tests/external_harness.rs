@@ -7,10 +7,10 @@ use std::process::Command;
 fn code_echo_dispatches_to_external_sdk_adapter() -> Result<()> {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let build = Command::new("cargo")
-        .args(["build", "--bin", "elanus", "--example", "harness_echo"])
+        .args(["build", "--bin", "lanius", "--example", "harness_echo"])
         .current_dir(&repo)
         .output()
-        .context("running cargo build for elanus and harness_echo")?;
+        .context("running cargo build for lanius and harness_echo")?;
     assert!(
         build.status.success(),
         "cargo build failed\nstdout:\n{}\nstderr:\n{}",
@@ -19,18 +19,18 @@ fn code_echo_dispatches_to_external_sdk_adapter() -> Result<()> {
     );
 
     let target_debug = target_debug_dir()?;
-    let elanus_bin = target_debug.join(format!("elanus{}", std::env::consts::EXE_SUFFIX));
+    let elanus_bin = target_debug.join(format!("lanius{}", std::env::consts::EXE_SUFFIX));
     let example_bin = target_debug
         .join("examples")
         .join(format!("harness_echo{}", std::env::consts::EXE_SUFFIX));
 
-    let root_dir = unique_temp_dir("elanus-ext-root")?;
-    let workdir = unique_temp_dir("elanus-ext-work")?;
+    let root_dir = unique_temp_dir("lanius-ext-root")?;
+    let workdir = unique_temp_dir("lanius-ext-work")?;
     let pkg = root_dir.join("packages").join("harness-echo");
     let bin_dir = pkg.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
     std::fs::write(
-        pkg.join("elanus.toml"),
+        pkg.join("lanius.toml"),
         r#"
 [[harness]]
 name = "echo"
@@ -50,22 +50,22 @@ run = "bin/adapter"
 
     let output = Command::new(&elanus_bin)
         .args(["code", "echo", "--headless", "hello world"])
-        .env("ELANUS_ROOT", &root_dir)
+        .env("LANIUS_ROOT", &root_dir)
         .current_dir(&workdir)
         .output()
         .with_context(|| format!("running {}", elanus_bin.display()))?;
     assert!(
         output.status.success(),
-        "elanus code echo failed\nstdout:\n{}\nstderr:\n{}",
+        "lanius code echo failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let root = elanus::paths::Root {
+    let root = lanius::paths::Root {
         dir: root_dir.clone(),
     };
-    let conn = elanus::db::open(&root)?;
-    elanus::db::init_schema(&conn)?;
+    let conn = lanius::db::open(&root)?;
+    lanius::db::init_schema(&conn)?;
     let claim: Option<(String, String)> = conn
         .query_row(
             "SELECT c.session, c.path
@@ -83,7 +83,7 @@ run = "bin/adapter"
     let (session, path) = claim.context("external harness did not record the SDK claim proof")?;
     assert!(
         session.starts_with("code-"),
-        "claim should belong to an elanus code session, got {session}"
+        "claim should belong to an lanius code session, got {session}"
     );
     assert!(
         path.ends_with("ECHO_ADAPTER_RAN"),
@@ -95,7 +95,7 @@ run = "bin/adapter"
     Ok(())
 }
 
-/// Build elanus + the echo adapter, install a `harness-echo` package into a fresh
+/// Build lanius + the echo adapter, install a `harness-echo` package into a fresh
 /// root, and return `(elanus_bin, root_dir, workdir)`. Shared by the detached-spawn
 /// e2e tests below (cross-harness-death M2 — the stock echo proxy stands in for the
 /// real claude/codex/opencode adapters, which need credentials this sandbox lacks;
@@ -104,10 +104,10 @@ run = "bin/adapter"
 fn build_echo_root() -> Result<(PathBuf, PathBuf, PathBuf)> {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let build = Command::new("cargo")
-        .args(["build", "--bin", "elanus", "--example", "harness_echo"])
+        .args(["build", "--bin", "lanius", "--example", "harness_echo"])
         .current_dir(&repo)
         .output()
-        .context("running cargo build for elanus and harness_echo")?;
+        .context("running cargo build for lanius and harness_echo")?;
     assert!(
         build.status.success(),
         "cargo build failed\nstdout:\n{}\nstderr:\n{}",
@@ -115,18 +115,18 @@ fn build_echo_root() -> Result<(PathBuf, PathBuf, PathBuf)> {
         String::from_utf8_lossy(&build.stderr)
     );
     let target_debug = target_debug_dir()?;
-    let elanus_bin = target_debug.join(format!("elanus{}", std::env::consts::EXE_SUFFIX));
+    let elanus_bin = target_debug.join(format!("lanius{}", std::env::consts::EXE_SUFFIX));
     let example_bin = target_debug
         .join("examples")
         .join(format!("harness_echo{}", std::env::consts::EXE_SUFFIX));
 
-    let root_dir = unique_temp_dir("elanus-spawn-root")?;
-    let workdir = unique_temp_dir("elanus-spawn-work")?;
+    let root_dir = unique_temp_dir("lanius-spawn-root")?;
+    let workdir = unique_temp_dir("lanius-spawn-work")?;
     let pkg = root_dir.join("packages").join("harness-echo");
     let bin_dir = pkg.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
     std::fs::write(
-        pkg.join("elanus.toml"),
+        pkg.join("lanius.toml"),
         "\n[[harness]]\nname = \"echo\"\naliases = [\"ec\"]\nrun = \"bin/adapter\"\n",
     )?;
     let adapter = bin_dir.join("adapter");
@@ -135,21 +135,21 @@ fn build_echo_root() -> Result<(PathBuf, PathBuf, PathBuf)> {
     Ok((elanus_bin, root_dir, workdir))
 }
 
-/// cross-harness-death M1/M2 e2e — a DETACHED `elanus code spawn` worker records a
+/// cross-harness-death M1/M2 e2e — a DETACHED `lanius code spawn` worker records a
 /// durable spawn edge, and on a clean exit its own completion mail carries the
 /// structured `failed:false` contract and settles the edge. Real end-to-end through
 /// the detached wrapper (the echo adapter stands in for a real harness).
 #[test]
 fn spawn_worker_delivers_structured_completion_and_settles_edge() -> Result<()> {
     let (elanus_bin, root_dir, workdir) = build_echo_root()?;
-    let root = elanus::paths::Root {
+    let root = lanius::paths::Root {
         dir: root_dir.clone(),
     };
     // The spawner must be a recorded coding session so its completion mailbox
     // resolves (mailbox_for_actor reads the durable record for its noun).
-    elanus::codesession::upsert_record(
+    lanius::codesession::upsert_record(
         &root,
-        &elanus::codesession::SessionRecord {
+        &lanius::codesession::SessionRecord {
             elanus_session: "code-spawner1".into(),
             native_session: "n".into(),
             tool: "claude".into(),
@@ -161,21 +161,21 @@ fn spawn_worker_delivers_structured_completion_and_settles_edge() -> Result<()> 
 
     let out = Command::new(&elanus_bin)
         .args(["code", "spawn", "echo", "hello from spawn"])
-        .env("ELANUS_ROOT", &root_dir)
-        .env("ELANUS_CODE_SESSION", "code-spawner1")
+        .env("LANIUS_ROOT", &root_dir)
+        .env("LANIUS_CODE_SESSION", "code-spawner1")
         .current_dir(&workdir)
         .output()
-        .context("running elanus code spawn echo")?;
+        .context("running lanius code spawn echo")?;
     assert!(
         out.status.success(),
-        "elanus code spawn failed\nstdout:\n{}\nstderr:\n{}",
+        "lanius code spawn failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
 
     // The detached worker runs asynchronously; poll for its completion mail.
-    let conn = elanus::db::open(&root)?;
-    elanus::db::init_schema(&conn)?;
+    let conn = lanius::db::open(&root)?;
+    lanius::db::init_schema(&conn)?;
     let payload = poll_completion(&conn, "in/agent/claude-code/code-spawner1")
         .context("detached worker never delivered its completion")?;
     let pv: serde_json::Value = serde_json::from_str(&payload)?;
@@ -213,12 +213,12 @@ fn spawn_worker_delivers_structured_completion_and_settles_edge() -> Result<()> 
 #[test]
 fn spawn_worker_that_exits_nonzero_mails_structured_failure() -> Result<()> {
     let (elanus_bin, root_dir, workdir) = build_echo_root()?;
-    let root = elanus::paths::Root {
+    let root = lanius::paths::Root {
         dir: root_dir.clone(),
     };
-    elanus::codesession::upsert_record(
+    lanius::codesession::upsert_record(
         &root,
-        &elanus::codesession::SessionRecord {
+        &lanius::codesession::SessionRecord {
             elanus_session: "code-spawner2".into(),
             native_session: "n".into(),
             tool: "claude".into(),
@@ -230,20 +230,20 @@ fn spawn_worker_that_exits_nonzero_mails_structured_failure() -> Result<()> {
 
     let out = Command::new(&elanus_bin)
         .args(["code", "spawn", "echo", "this will fail"])
-        .env("ELANUS_ROOT", &root_dir)
-        .env("ELANUS_CODE_SESSION", "code-spawner2")
+        .env("LANIUS_ROOT", &root_dir)
+        .env("LANIUS_CODE_SESSION", "code-spawner2")
         // The echo adapter honors this and exits nonzero (test hook).
         .env("ELANUS_HARNESS_ECHO_EXIT", "5")
         .current_dir(&workdir)
         .output()
-        .context("running elanus code spawn echo (failure)")?;
+        .context("running lanius code spawn echo (failure)")?;
     assert!(
         out.status.success(),
         "the SPAWN command itself still returns 0"
     );
 
-    let conn = elanus::db::open(&root)?;
-    elanus::db::init_schema(&conn)?;
+    let conn = lanius::db::open(&root)?;
+    lanius::db::init_schema(&conn)?;
     let payload = poll_completion(&conn, "in/agent/claude-code/code-spawner2")
         .context("failing worker never delivered its completion")?;
     let pv: serde_json::Value = serde_json::from_str(&payload)?;

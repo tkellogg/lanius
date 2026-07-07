@@ -191,7 +191,7 @@ export default function CommsView({ onSelectSession }: { onSelectSession?: (id: 
         <h3 className="cm-h">Agent-to-agent mail</h3>
         {error && <div className="cm-err">comms projection unavailable: {error}</div>}
         {!error && merged.length === 0 && (
-          <div className="cm-dim cm-empty">No agent-to-agent mail yet. When one coding agent delivers work to another (`elanus code deliver`), it shows here — with priority, state, and the deliver→complete/fail thread.</div>
+          <div className="cm-dim cm-empty">No agent-to-agent mail yet. When one coding agent delivers work to another (`lanius code deliver`), it shows here — with priority, state, and the deliver→complete/fail thread.</div>
         )}
         <div className="cm-list">
           {merged.map((m) => (

@@ -14,9 +14,9 @@ ships a single package, `clock-block`, with two context-pipeline stages:
 Install and approve:
 
 ```
-elanus kit add memory-blocks-demo
-elanus approve clock-block
-elanus context render --profile default --session demo
+lanius kit add memory-blocks-demo
+lanius approve clock-block
+lanius context render --profile default --session demo
 ```
 
 The render shows both `clock` and `clock-echo` in the system text, and

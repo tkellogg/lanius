@@ -7,12 +7,12 @@ description: The knowledge base's caretaker — a no-LLM script sweep (pointers,
 
 The KB accretes: pointer blocks go stale when their target file is edited, files
 become orphaned, two entries drift into contradiction. This package is its
-caretaker. It has two rungs, and the second is elanus's **first auto-approve
+caretaker. It has two rungs, and the second is lanius's **first auto-approve
 pipeline** — so it is deliberately **setup-gated**.
 
 ## Rung 1 — the script sweep (no LLM, works today)
 
-`elanus approve kb-groundskeeper` turns on a daily sweep that:
+`lanius approve kb-groundskeeper` turns on a daily sweep that:
 
 - validates every **pointer block**'s `meta.{path,lines,sha}` — the file exists,
   the line range is in range, the sha still matches;
@@ -23,8 +23,8 @@ pipeline** — so it is deliberately **setup-gated**.
 and **mails the owner** a report when there are findings. Run it by hand anytime:
 
 ```
-elanus kb check          # human summary
-elanus kb check --json   # machine-readable
+lanius kb check          # human summary
+lanius kb check --json   # machine-readable
 ```
 
 This rung needs **no configuration**. It is the safe, cheap floor.
@@ -47,18 +47,18 @@ is a *cheap/fast* tier, the ratifier a *strong/verifier* tier, and **planning
 never flexes into this**. Consult the KB before you choose:
 
 ```
-elanus kb search 'implementer model'    # cheap tier candidates (the compactor)
-elanus kb search 'who verifies'         # the verifier tier (the ratifier)
+lanius kb search 'implementer model'    # cheap tier candidates (the compactor)
+lanius kb search 'who verifies'         # the verifier tier (the ratifier)
 ```
 
 Then persist your decision as config (the KB is the *recommendation*; config is
 the *committed choice*):
 
 ```
-elanus config set kb-groundskeeper compactor_model <cheap-model>
-elanus config set kb-groundskeeper ratifier_model  <strong-model>
-elanus config set kb-groundskeeper cadence         '0 3 * * *'
-elanus config set kb-groundskeeper token_budget    20000
+lanius config set kb-groundskeeper compactor_model <cheap-model>
+lanius config set kb-groundskeeper ratifier_model  <strong-model>
+lanius config set kb-groundskeeper cadence         '0 3 * * *'
+lanius config set kb-groundskeeper token_budget    20000
 ```
 
 All four keys are **required**. Until each carries a value, the pipeline is inert.
@@ -66,12 +66,12 @@ All four keys are **required**. Until each carries a value, the pipeline is iner
 ### 2. Approve the package — and the pipeline's agent handler
 
 ```
-elanus approve kb-groundskeeper   # turns on the sweep + the pipeline gate
-elanus approve kb-pipeline        # lets the compactor/ratifier agents actually spawn
+lanius approve kb-groundskeeper   # turns on the sweep + the pipeline gate
+lanius approve kb-pipeline        # lets the compactor/ratifier agents actually spawn
 ```
 
 `kb-pipeline` is the exec handler that makes the `kb-compactor` and `kb-ratifier`
-mailboxes **daemon-drivable** — without it approved, `elanus kb groundskeep` stays
+mailboxes **daemon-drivable** — without it approved, `lanius kb groundskeep` stays
 inert (it cannot launch an agent whose mailbox has no approved handler). It is a
 **separate** grant on purpose: rung 1's no-LLM sweep keeps its narrow authority,
 while turning the auto-approve pipeline's agents loose (they publish `#` — they can
@@ -88,5 +88,5 @@ land in the `llm_usage` trail, where you read what the pipeline spends.
 Check readiness anytime — it prints exactly what is missing:
 
 ```
-elanus kb groundskeep    # "inert: ..." until setup is complete
+lanius kb groundskeep    # "inert: ..." until setup is complete
 ```
