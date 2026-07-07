@@ -7451,7 +7451,7 @@ impl CaptureSummary {
     }
 }
 
-fn write_capture_summary_file(path: Option<&Path>, summary: &CaptureSummary) {
+pub(crate) fn write_capture_summary_file(path: Option<&Path>, summary: &CaptureSummary) {
     let Some(path) = path else {
         return;
     };
@@ -8095,6 +8095,113 @@ pub struct ResumeOutcome {
     pub file_changes: Vec<String>,
 }
 
+/// Resolve the ACP `[[harness]]` block for a recorded session, or None when the
+/// session's tool is NOT an ACP harness (so the CLI resume table handles it). An
+/// ACP harness is identified structurally: it is a package-declared harness whose
+/// manifest block carries a spawn `command` (the generic exec-shaped adapter marker
+/// — claude/codex/opencode bake their command into their bin and leave it None).
+/// This is the identity check that keeps an ACP resume off the claude CLI table
+/// (`harness_id_for_tool` has no ACP entry, so `resume_command_for` would otherwise
+/// misfire it as `claude -p --resume <acp-id>`). Best-effort over the default
+/// profile (the record doesn't store which profile launched it).
+fn acp_harness_for_resume(root: &Root, rec: &codesession::SessionRecord) -> Option<ExternalHarness> {
+    find_external_harness(root, "default", &rec.tool)
+        .ok()
+        .flatten()
+        .filter(|h| h.decl.command.is_some())
+}
+
+/// Drive an ACP resume: spawn the harness-acp adapter in "load" mode
+/// (`LANIUS_ACP_LOAD_SESSION=<native id>`) exactly the way a launch spawns it,
+/// stamping the agent's manifest spawn argv (`LANIUS_ACP_ARGV`) + MCP list, and
+/// harvest the summary the driver writes (A6.1). Returns `(success, exit_code,
+/// summary)`; the caller retires the token and builds the `ResumeOutcome`. Obs are
+/// published by the adapter itself under the SAME lanius session (via the fresh
+/// emit-only `bus_token`), so nothing here parses a stream.
+#[allow(clippy::too_many_arguments)]
+fn resume_acp_capture(
+    root: &Root,
+    external: &ExternalHarness,
+    rec: &codesession::SessionRecord,
+    principal: &str,
+    agent: &str,
+    session: &str,
+    bus_token: &str,
+    workdir: &Path,
+    owner: &str,
+    injected: &str,
+) -> Result<(bool, Option<i32>, CaptureSummary)> {
+    let adapter = external.package_dir.join(&external.decl.run);
+    if !adapter.exists() {
+        bail!(
+            "ACP harness {:?} from package {:?} points at missing adapter {}",
+            external.decl.name,
+            external.package,
+            adapter.display()
+        );
+    }
+
+    let scratch = root.run_dir().join(format!("{session}-resume"));
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("creating resume scratch {}", scratch.display()))?;
+    let summary_path = scratch.join("adapter-summary.json");
+
+    // The per-agent spawn argv (command + args) — the ONLY per-agent difference,
+    // carried as DATA on the manifest block (A4), stamped exactly as launch does.
+    let mut argv = Vec::with_capacity(1 + external.decl.args.len());
+    if let Some(command) = &external.decl.command {
+        argv.push(command.clone());
+    }
+    argv.extend(external.decl.args.iter().cloned());
+
+    let mut cmd = std::process::Command::new(&adapter);
+    scrub_launch_control_env(&mut cmd);
+    cmd.current_dir(workdir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .env_dual("ROOT", &root.dir)
+        .env(ENV_SESSION, session)
+        .env(ENV_AGENT, agent)
+        .env_dual("PACKAGE", principal)
+        .env(crate::harness::ENV_BUS_TOKEN, bus_token)
+        .env(crate::harness::ENV_WORKDIR, workdir)
+        .env(crate::harness::ENV_MODE, "headless")
+        .env(crate::harness::ENV_TOOL, &rec.tool)
+        .env(crate::harness::ENV_OWNER, owner)
+        .env(crate::harness::ENV_SUMMARY_FILE, &summary_path)
+        .env(crate::harness::ENV_PROMPT, injected)
+        .env_dual(
+            "ACP_ARGV",
+            serde_json::to_string(&argv).unwrap_or_else(|_| "[]".into()),
+        )
+        .env_dual(
+            "ACP_MCP",
+            serde_json::to_string(&external.decl.mcp).unwrap_or_else(|_| "[]".into()),
+        )
+        // The load-mode switch: present → the driver `session/load`s this recorded
+        // native id and continues it instead of `session/new` (A6.2).
+        .env_dual("ACP_LOAD_SESSION", &rec.native_session);
+
+    eprintln!(
+        "[code] resuming ACP session {session} ({}) via {} load-mode",
+        rec.native_session, external.decl.name
+    );
+    let status = (|| -> Result<std::process::ExitStatus> {
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("launching ACP resume adapter {}", adapter.display()))?;
+        child
+            .wait()
+            .with_context(|| format!("waiting for ACP resume adapter {}", adapter.display()))
+    })();
+
+    let summary = read_capture_summary_file(Some(&summary_path)).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&scratch);
+    let status = status?;
+    Ok((status.success(), status.code(), summary))
+}
+
 /// Continue a recorded coding session with a fresh, emit-only scoped token,
 /// capturing the result under the same lanius session, and RETURN the outcome
 /// (never `process::exit`). This is the in-process resume primitive the daemon
@@ -8160,13 +8267,9 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     // any prompt cache. None when there's nothing to inject (a quiet turn).
     let injected = build_resume_message(root, &agent, &session, message);
 
-    let (program, cmd_args) = resume_command_for(&rec, &injected);
-    // Bound the native turn (handoff guardrail): timeout(1) kills a hung model.
-    let secs = resume_timeout_secs();
-    let (program, cmd_args) = timeout_wrap(&program, &cmd_args, secs);
-
     // A resume marker under the SAME lanius session, so the bus shows the session
-    // continued and with what message.
+    // continued and with what message. Transport-agnostic — laid for BOTH the CLI
+    // and the ACP paths before the fork.
     publish_obs(
         root,
         &principal,
@@ -8180,6 +8283,79 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
             "message": clip(message, 4000),
         }),
     );
+
+    // ACP fork (A6.2): an ACP-harness session has NO CLI resume — its resume is a
+    // driver "load" mode (spawn the harness-acp adapter with LANIUS_ACP_LOAD_SESSION
+    // set, which `session/load`s the recorded id then `session/prompt`s the new
+    // message). It does NOT fit the `resume_command_for` CLI table; routing it there
+    // is the latent bug this fixes — `harness_id_for_tool` returns None for an ACP
+    // tool, so `resume_command_for`'s `.unwrap_or("claude")` would silently misfire
+    // an ACP resume as `claude -p --resume <acp-id>`. We branch here so an ACP tool
+    // NEVER reaches the claude CLI table.
+    //
+    // A6.3 (real-agent goose-style loadSession validation) is DEFERRED: it needs a
+    // live ACP agent that advertises `loadSession`, driven launch→resume end-to-end.
+    // A6.1/A6.2 (this fork + the driver load mode) are validated against the scripted
+    // fake in src/acp.rs; A6.3 remains for a follow-up with a real agent installed.
+    if let Some(external) = acp_harness_for_resume(root, &rec) {
+        // The owner mailbox an ACP resume's approvals route to. Best-effort from the
+        // default profile (the record doesn't store which profile launched it);
+        // falls back to "owner" so a resume is never blocked on config.
+        let owner = crate::profile::load(root, "default")
+            .map(|(p, _)| p.owner)
+            .unwrap_or_else(|_| "owner".to_string());
+        let summary = resume_acp_capture(
+            root, &external, &rec, &principal, &agent, &session, &bus_token, &workdir, &owner,
+            &injected,
+        );
+        codesession::retire(root, &principal);
+        let _ = codesession::touch_record(root, &session);
+        let (success, exit_code, summary) = summary?;
+        // Surface a reason on failure: a fail-closed capability gate (the agent
+        // doesn't advertise `loadSession`) exits non-zero with the explanation on
+        // the adapter's stderr, but the harvested summary has no final_text — so a
+        // daemon relaying this outcome would see an empty failure. Fill one in.
+        let final_text = summary.final_text.or_else(|| {
+            (!success).then(|| {
+                format!(
+                    "ACP resume of session {session} failed (exit {exit_code:?}) — the agent \
+                     may not support session/load (loadSession); see the adapter's stderr"
+                )
+            })
+        });
+        return Ok(ResumeOutcome {
+            success,
+            exit_code,
+            final_text,
+            file_changes: summary.file_changes,
+        });
+    }
+
+    // Fail closed: this is not an ACP session (handled above) AND not a recognized
+    // CLI harness. Without this guard, `resume_command_for`'s `.unwrap_or("claude")`
+    // would misfire an unresolved ACP tool (e.g. a customized profile path that hides
+    // `harness-acp`, so `acp_harness_for_resume` returned None) — or any unknown tool
+    // — as `claude -p --resume <id>`. This closes the latent-bug CLASS the ACP fork
+    // only routes around for the standard config.
+    if harness_id_for_tool(&rec.tool).is_none() {
+        codesession::retire(root, &principal);
+        return Ok(ResumeOutcome {
+            success: false,
+            exit_code: None,
+            final_text: Some(format!(
+                "cannot resume session {session}: tool {:?} is not a known CLI harness \
+                 (claude/codex/opencode) and its ACP harness block could not be resolved \
+                 under the default profile — aborted rather than misfiring as claude",
+                rec.tool
+            )),
+            file_changes: vec![],
+        });
+    }
+
+    let (program, cmd_args) = resume_command_for(&rec, &injected);
+    // Bound the native turn (handoff guardrail): timeout(1) kills a hung model.
+    let secs = resume_timeout_secs();
+    let (program, cmd_args) = timeout_wrap(&program, &cmd_args, secs);
 
     // The capture summary (the worker's verbatim final text + the files it wrote),
     // harvested in the closure below and carried out to the ResumeOutcome.
