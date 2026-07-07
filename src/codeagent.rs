@@ -3654,6 +3654,23 @@ fn launch_external_harness(
         if launched_degraded {
             cmd.env(ENV_BUS_DEGRADED, "1");
         }
+        // A generic exec-shaped adapter (the ACP adapter) carries its spawn argv
+        // and per-agent MCP list as DATA on the manifest block — the launcher
+        // stamps them so a new ACP agent is a manifest-only edit (A4). Skipped for
+        // the native adapters, whose command is baked into their bin (no `command`).
+        if let Some(acp_command) = &external.decl.command {
+            let mut argv = Vec::with_capacity(1 + external.decl.args.len());
+            argv.push(acp_command.clone());
+            argv.extend(external.decl.args.iter().cloned());
+            cmd.env_dual(
+                "ACP_ARGV",
+                serde_json::to_string(&argv).unwrap_or_else(|_| "[]".into()),
+            );
+            cmd.env_dual(
+                "ACP_MCP",
+                serde_json::to_string(&external.decl.mcp).unwrap_or_else(|_| "[]".into()),
+            );
+        }
         cmd.env(crate::harness::ENV_SUMMARY_FILE, &summary_path);
         // The FULL raw argv (harness flags + prompt) — real adapters split it via
         // their capture fn. The joined ENV_PROMPT is kept for simple adapters.
@@ -4067,7 +4084,12 @@ fn run_claude_capture(ctx: ClaudeLaunch<'_>) -> Result<(std::process::ExitStatus
             Ok((status, CaptureSummary::default()))
         }
     })();
-    let _ = std::fs::remove_dir_all(&scratch);
+    // Do NOT remove `scratch` here: the parent launcher created it
+    // (`launch_external_harness`, src/codeagent.rs:3518-3520) and owns its
+    // teardown at :3686, AFTER it reads `adapter-summary.json` from this same
+    // directory. `run_claude_adapter` writes that summary file into `scratch`
+    // right after this function returns (:4123) — removing it here raced that
+    // write and made it fail with ENOENT (docs/handoffs/small-fix-adapter-summary-race.md).
     result
 }
 
@@ -10556,6 +10578,97 @@ mod tests {
         );
         assert!(claude_is_file_writer("MultiEdit") && claude_is_file_writer("NotebookEdit"));
         assert!(!claude_is_file_writer("Read") && !claude_is_file_writer("Grep"));
+    }
+
+    /// Regression guard for docs/handoffs/small-fix-adapter-summary-race.md: the
+    /// run scratch dir (`root.run_dir().join(session)`) is created and owned by
+    /// the PARENT launcher (`launch_external_harness`, :3518/:3686 reads the
+    /// summary then removes it) and is shared with the child adapter, which
+    /// writes `adapter-summary.json` into it right after `run_claude_capture`
+    /// returns (`run_claude_adapter`, :4123). `run_claude_capture` itself must
+    /// leave that directory alone — if it resurrects the premature
+    /// `remove_dir_all(&scratch)` this fix deleted, that later summary write
+    /// fails with ENOENT and the parent gets an empty summary.
+    #[cfg(unix)]
+    #[test]
+    fn run_claude_capture_leaves_scratch_for_the_parent_to_reap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = delivery_tmp_root();
+        let session = "code-racetest1";
+        let scratch = root.run_dir().join(session);
+
+        // A fake `claude` binary that exits immediately — this test must never
+        // talk to a real Claude Code install or the network. It's placed FIRST
+        // on PATH so `Command::new("claude")` resolves to it, while the rest of
+        // PATH is preserved so other concurrently-running tests that shell out
+        // (git, /usr/bin/env, ...) are unaffected.
+        let fake_bin_dir = std::env::temp_dir().join(format!(
+            "lanius-fake-claude-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&fake_bin_dir).unwrap();
+        let fake_claude = fake_bin_dir.join("claude");
+        std::fs::write(&fake_claude, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let old_path = std::env::var_os("PATH");
+        let mut new_path = fake_bin_dir.clone().into_os_string();
+        if let Some(p) = &old_path {
+            new_path.push(":");
+            new_path.push(p);
+        }
+        std::env::set_var("PATH", &new_path);
+
+        let args = vec!["hello".to_string()];
+        let result = run_claude_capture(ClaudeLaunch {
+            root: &root,
+            principal: session,
+            bus_token: "tok",
+            agent: "claude-code",
+            session,
+            workdir: root.dir.as_path(),
+            args: &args,
+            brief: None,
+            worker: true,
+            worker_timeout: None,
+            injection: None,
+            skills: &[],
+        });
+
+        // Restore PATH immediately, before any assertion can panic partway.
+        match old_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert!(
+            result.is_ok(),
+            "fake claude launch should succeed: {result:?}"
+        );
+        // The invariant this guards: the shared scratch dir must survive
+        // `run_claude_capture` returning, because `run_claude_adapter` writes
+        // `adapter-summary.json` into it next, and the PARENT (not this
+        // function) removes it later, after reading that summary.
+        assert!(
+            scratch.is_dir(),
+            "run_claude_capture must not remove its own scratch dir — the parent \
+             launcher owns that cleanup, after reading the adapter summary \
+             written into it"
+        );
+        let summary = CaptureSummary {
+            final_text: Some("ok".into()),
+            file_changes: Vec::new(),
+        };
+        write_capture_summary_file(Some(&scratch.join("adapter-summary.json")), &summary);
+        assert!(
+            scratch.join("adapter-summary.json").exists(),
+            "the summary write that follows run_claude_capture must succeed"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_bin_dir);
+        let _ = std::fs::remove_dir_all(&root.dir);
     }
 
     #[test]

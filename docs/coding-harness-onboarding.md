@@ -267,10 +267,80 @@ Cline, OpenHands and others speak it natively; Claude Code and codex have
 maintained adapters. So before writing a bespoke adapter for a new tool,
 check for ACP support: **one generic `acp` harness package —
 `session/update` → `ctx.emit`, `session/request_permission` → the
-ask/mailbox relay, MCP endpoints passed at `session/new` — would onboard
-every ACP agent at once, with elicitation included.** That generic adapter
-does not exist yet; it is the highest-leverage harness anyone could
-contribute (journey 13's "remaining dozen" collapses into it).
+ask/mailbox relay, MCP endpoints passed at `session/new` — onboards
+every ACP agent at once, with elicitation included.**
+
+### That generic adapter now exists — adding an ACP agent is a manifest-only edit
+
+The `acp` harness package is real and stock-seeded: `packages/harness-acp/`
+with a single `bin/adapter` (the `harness-acp` binary; driver in `src/acp.rs`,
+`run_acp_adapter` / `drive_acp_session`). It is seeded by
+`STOCK_HARNESS_PACKAGES` (`src/initcmd.rs`). **Onboarding a new ACP agent is
+appending a `[[harness]]` block to `packages/harness-acp/lanius.toml` — no new
+binary, no rebuild.** Each block carries the agent's spawn argv (and optional
+per-agent MCP list) as DATA:
+
+```toml
+[[harness]]
+name = "goose"
+agent_noun = "goose"
+run = "bin/adapter"       # the SAME generic adapter for every agent
+command = "goose"         # the ACP invocation (verify it — see caveat)
+args = ["acp"]
+# optional: mcp = [{ name = "fs", transport = "stdio", command = "mcp-fs", args = [...] }]
+```
+
+The launcher stamps `command`/`args` into the adapter's env as
+`LANIUS_ACP_ARGV` and the `mcp` list as `LANIUS_ACP_MCP`; the adapter execs
+that argv and speaks ACP: `initialize` (advertising **`fs:false`,
+`terminal:false`** — lanius is observer + permission gate, NOT the executor;
+the agent uses its own sandbox for file/exec) → `session/new` (the merged MCP
+servers are passed *here*, cleaner than editing the tool's config file;
+http/sse servers are gated on the capability the agent advertised at
+`initialize`, stdio always passed) → `session/prompt`. Capture:
+`agent_message_chunk`/`agent_thought_chunk` buffer and flush to
+`assistant/message` / `assistant/reasoning`; `tool_call` /
+`tool_call_update` → `tool/<kind>/call` + `/result`; `tool_call.locations` →
+`ctx.claim`; the native session id is recorded via `ctx.record` and mirrored
+on `session/thread`; `stopReason` → `session/idle`. Everything is stamped
+`fidelity: "acp-live"`. Unmodeled server requests (e.g. `fs/read_text_file`)
+are refused fail-closed with JSON-RPC `-32601`.
+
+**The approval relay (the security-critical part).** When the agent issues
+`session/request_permission`, the adapter relays it to `in/human/<owner>` with
+a fresh correlation, a deadline, and a fail-closed `default_action: deny`, then
+blocks on the mailbox (it holds the live socket; it cannot exit-and-resume). A
+human answers with `lanius answer <ask-id> allow|deny` (or the web UI); the
+answer maps to the first `allow_*`-kind (grant) or `reject_*`-kind (deny)
+`optionId` the agent offered and is sent back over the wire. On timeout or a
+malformed/empty answer the default (deny) applies.
+
+**Validated end-to-end (A5) against goose 1.41.0** (`goose acp`): a real turn
+drove `initialize → session/new → session/prompt`, streamed `session/update`,
+captured `session/thread` + `assistant/message` (the model reply) +
+`session/idle` (`stopReason: end_turn`) all at `fidelity: acp-live`; and a
+tool-permission turn round-tripped `session/request_permission` →
+`in/human/owner` (ask #N, `default: deny`) → `lanius answer N allow` →
+`optionId` selected → the agent executed the shell command. Honest caveats
+from that run:
+- **Verify the invocation, don't assume it.** ACP support is version-gated:
+  goose only gained `goose acp` mid-2025. An older installed goose (e.g.
+  1.0.4) has **no `acp` subcommand at all** — `goose acp --help` is the
+  30-second check. `gemini --experimental-acp` and `codex-acp` (the codex ACP
+  wrapper) are likewise separate installs, not implied by `gemini`/`codex`.
+- **"Approval-elicited" depends on the AGENT's own policy, not lanius.** lanius
+  can only relay the requests the agent chooses to raise (residual: no forced
+  gate). goose auto-approves any tool in its `permission.yaml` `always_allow`
+  and never calls `session/request_permission` for it; move the tool to
+  `ask_before` (or run a non-`auto` `GOOSE_MODE`) and the relay fires. Other
+  agents have their own equivalent.
+- **"allow" grants whatever the first `allow_*` option is.** goose lists
+  `allow_always` before `allow_once`, so a plain `allow` answer selects
+  `allow_always` — a *persistent* grant, not one-shot. The adapter does not yet
+  distinguish once-vs-always; treat every `allow` as allow-always until it does.
+
+This is the highest-leverage harness in the tree (journey 13's "remaining
+dozen" collapses into it): the next ACP agent is six lines of TOML.
 
 Requirements mapping for an RPC driver: capture = the notification stream
 (requirement #1, best-in-class); death = the RPC session dropping or a

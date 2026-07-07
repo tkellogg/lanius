@@ -317,6 +317,54 @@ pub struct HarnessDecl {
     #[serde(default)]
     pub agent_noun: String,
     pub run: String,
+    /// The argv this (generic, exec-shaped) adapter execs. For the ACP adapter
+    /// this is the per-agent spawn command — the ONLY thing that differs between
+    /// `gemini --experimental-acp`, `goose acp`, `codex-acp`, … The launcher
+    /// stamps `command` + `args` into `LANIUS_ACP_ARGV` (JSON) so adding an ACP
+    /// agent is a manifest-only edit — a new `[[harness]]` block, no new binary.
+    /// Absent for the native adapters (claude/codex/opencode), whose command is
+    /// baked into their bin.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The MCP servers this ACP agent gets, passed into `session/new`'s
+    /// `mcpServers[]` (A4 decision, option 1: the list rides on the agent's OWN
+    /// manifest block — there is no lanius-wide MCP registry). stdio servers are
+    /// always passed; `http`/`sse` only if the agent advertised the capability at
+    /// `initialize`. Empty for a plain agent.
+    #[serde(default)]
+    pub mcp: Vec<AcpMcpServerDecl>,
+}
+
+/// One MCP server on an ACP agent's `[[harness]]` block (`mcp` array). The
+/// launcher serializes the list into `LANIUS_ACP_MCP` (JSON); the adapter builds
+/// each `session/new` `mcpServers[]` entry from it, gating http/sse on the
+/// agent's advertised capability.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AcpMcpServerDecl {
+    /// The server name (namespaces its tools).
+    pub name: String,
+    /// "stdio" (default), "http", or "sse".
+    #[serde(default = "default_acp_mcp_transport")]
+    pub transport: String,
+    /// stdio: the server command + argv + env.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// http/sse: the endpoint URL + headers.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+fn default_acp_mcp_transport() -> String {
+    "stdio".into()
 }
 
 /// The `[kb]` marker (docs/handoffs/kb-core.md M1). Its mere presence enrolls the
