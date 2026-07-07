@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 const ACP_FIDELITY: &str = "acp-live";
 const ENV_ACP_ARGV: &str = "LANIUS_ACP_ARGV";
 const ENV_ACP_MCP: &str = "LANIUS_ACP_MCP";
+/// Set by the resume launcher (A6.2) to the native ACP session id to continue.
+/// Present → the driver runs in "load" mode (`session/load` the recorded session,
+/// suppress its replayed history, then `session/prompt` the new message); absent →
+/// the normal `session/new` launch path.
+const ENV_ACP_LOAD_SESSION: &str = "LANIUS_ACP_LOAD_SESSION";
 const APPROVAL_DEADLINE_SECS: u64 = 300;
 
 #[derive(Default)]
@@ -20,6 +25,10 @@ struct ChunkBuffers {
     message_text: String,
     reasoning_id: Option<String>,
     reasoning_text: String,
+    /// The text of the most recently flushed `assistant/message`. The driver uses
+    /// it as the capture summary's `final_text` so BOTH a launch and a resume
+    /// return the agent's real final answer, not an empty result (A6 wonky bit 4).
+    last_flushed_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -159,8 +168,13 @@ pub fn run_acp_adapter(ctx: &Ctx) -> Result<ExitStatus> {
         .prompt()
         .map(str::to_string)
         .unwrap_or_else(|| ctx.args().join(" "));
+    // A6.2: when the resume launcher stamped a native session id, run in "load"
+    // mode (`session/load` that id, continue it) rather than `session/new`.
+    let load_session = std::env::var(ENV_ACP_LOAD_SESSION)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let relayer = LedgerApprovalRelayer::new(ctx.root());
-    drive_acp_session(
+    let summary = drive_acp_session(
         ctx,
         &relayer,
         ctx.session(),
@@ -168,11 +182,16 @@ pub fn run_acp_adapter(ctx: &Ctx) -> Result<ExitStatus> {
         ctx.workdir(),
         &prompt,
         &mcp_servers,
+        load_session.as_deref(),
         &rx,
         &mut stdin,
         Instant::now() + Duration::from_secs(60 * 60),
     )?;
     drop(stdin);
+    // Write the capture summary (the agent's final message + reported file changes)
+    // so BOTH a launch and a resume return a real result, not an empty one — the
+    // parent reads it via `read_capture_summary_file` (A6 wonky bit 4).
+    crate::codeagent::write_capture_summary_file(ctx.summary_file(), &summary);
 
     let wait_deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -187,6 +206,7 @@ pub fn run_acp_adapter(ctx: &Ctx) -> Result<ExitStatus> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive_acp_session<W: Write>(
     sink: &dyn AcpSink,
     relayer: &dyn ApprovalRelayer,
@@ -195,10 +215,14 @@ fn drive_acp_session<W: Write>(
     workdir: &Path,
     prompt: &str,
     mcp_servers: &[Value],
+    // When Some, run in "load" mode: `session/load` this native session id and
+    // continue it (A6.2 resume) instead of `session/new` (launch). The agent must
+    // advertise `agentCapabilities.loadSession` or the driver fails closed.
+    load_session: Option<&str>,
     rx: &mpsc::Receiver<Value>,
     stdin: &mut W,
     overall_deadline: Instant,
-) -> Result<()> {
+) -> Result<crate::codeagent::CaptureSummary> {
     let mut next_id = 1i64;
     let initialize_id = send_req(
         stdin,
@@ -221,6 +245,9 @@ fn drive_acp_session<W: Write>(
     let mut acp_session_id: Option<String> = None;
     let mut chunks = ChunkBuffers::default();
     let mut tools: HashMap<String, ToolState> = HashMap::new();
+    // The files the agent reported touching this turn (from `tool_call` locations),
+    // deduped in first-seen order — carried into the capture summary.
+    let mut file_changes: Vec<String> = Vec::new();
     // The MCP server names actually merged into `session/new` after capability
     // gating — recorded on the `session/thread` obs (mirrors
     // `merged_mcp_server_names`, src/codeagent.rs) so a session's MCP capability is
@@ -250,8 +277,17 @@ fn drive_acp_session<W: Write>(
 
         match (method.as_deref(), has_id) {
             (Some("session/update"), false) => {
+                // Load mode replays the whole session history as `session/update`
+                // notifications between `session/load` and its response. Absorb that
+                // burst (do NOT re-project it as new obs, which would duplicate the
+                // conversation onto the bus — A6 wonky bit 3); only the updates from
+                // the genuinely-new resumed turn (after the load response, in
+                // Prompting) are projected.
+                if matches!(phase, Phase::LoadingSession { .. }) {
+                    continue;
+                }
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                handle_session_update(sink, &params, &mut chunks, &mut tools)?;
+                handle_session_update(sink, &params, &mut chunks, &mut tools, &mut file_changes)?;
             }
             (Some("session/request_permission"), true) => {
                 flush_message(sink, &mut chunks);
@@ -303,19 +339,86 @@ fn drive_acp_session<W: Write>(
                         *initialize_result = Some(result.clone());
                         let (mcp_wire, merged) = build_mcp_servers(mcp_servers, &result);
                         mcp_merged = merged;
-                        let new_id = send_req(
+                        if let Some(load_id) = load_session {
+                            // Resume (A6.2): gate on the OPTIONAL `loadSession`
+                            // capability and FAIL CLOSED if absent — a fresh
+                            // `session/new` would silently drop the whole thread the
+                            // human expects continued (A6 wonky bit 2). Never fall
+                            // back to `session/new`.
+                            if !agent_supports_load_session(&result) {
+                                bail!(
+                                    "this ACP agent does not support resume: it did not \
+                                     advertise the `loadSession` capability at initialize, so \
+                                     the recorded session {load_id} cannot be continued over ACP"
+                                );
+                            }
+                            let load_req_id = send_req(
+                                stdin,
+                                &mut next_id,
+                                "session/load",
+                                json!({
+                                    "sessionId": load_id,
+                                    "cwd": workdir.display().to_string(),
+                                    "mcpServers": mcp_wire,
+                                }),
+                            )?;
+                            phase = Phase::LoadingSession {
+                                load_id: load_req_id,
+                                session_id: load_id.to_string(),
+                                initialize_result: result,
+                            };
+                        } else {
+                            let new_id = send_req(
+                                stdin,
+                                &mut next_id,
+                                "session/new",
+                                json!({
+                                    "cwd": workdir.display().to_string(),
+                                    "mcpServers": mcp_wire,
+                                }),
+                            )?;
+                            phase = Phase::CreatingSession {
+                                new_id,
+                                initialize_result: result,
+                            };
+                        }
+                    }
+                    Phase::LoadingSession {
+                        load_id,
+                        session_id,
+                        initialize_result,
+                    } if id == json!(*load_id) => {
+                        // The replayed history burst is done (its `session/update`s
+                        // were absorbed above); this is the `session/load` response.
+                        // Record + thread-mark the resumed session, then prompt the
+                        // new turn exactly like the new-session path.
+                        let session_id = session_id.clone();
+                        sink.record(&session_id);
+                        sink.emit(
+                            "session/thread",
+                            json!({
+                                "ts": now_iso(),
+                                "native_session": session_id,
+                                "sessionId": session_id,
+                                "initialize": initialize_result,
+                                "loadSession": result,
+                                "resumed": true,
+                                "mcp_merged": mcp_merged,
+                                "fidelity": ACP_FIDELITY
+                            }),
+                        );
+                        sink.bump_active();
+                        acp_session_id = Some(session_id.clone());
+                        let prompt_id = send_req(
                             stdin,
                             &mut next_id,
-                            "session/new",
+                            "session/prompt",
                             json!({
-                                "cwd": workdir.display().to_string(),
-                                "mcpServers": mcp_wire,
+                                "sessionId": session_id,
+                                "prompt": [{ "type": "text", "text": prompt }],
                             }),
                         )?;
-                        phase = Phase::CreatingSession {
-                            new_id,
-                            initialize_result: result,
-                        };
+                        phase = Phase::Prompting { prompt_id };
                     }
                     Phase::CreatingSession {
                         new_id,
@@ -374,7 +477,20 @@ fn drive_acp_session<W: Write>(
             (None, false) => {}
         }
     }
-    Ok(())
+    Ok(crate::codeagent::CaptureSummary {
+        final_text: chunks.last_flushed_message.clone(),
+        file_changes,
+    })
+}
+
+/// True iff the agent advertised the optional `agentCapabilities.loadSession`
+/// capability in its `initialize` result (A6 wonky bit 2 — the resume gate).
+fn agent_supports_load_session(initialize_result: &Value) -> bool {
+    initialize_result
+        .get("agentCapabilities")
+        .and_then(|c| c.get("loadSession"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug)]
@@ -385,6 +501,11 @@ enum Phase {
     },
     CreatingSession {
         new_id: i64,
+        initialize_result: Value,
+    },
+    LoadingSession {
+        load_id: i64,
+        session_id: String,
         initialize_result: Value,
     },
     Prompting {
@@ -420,6 +541,7 @@ fn handle_session_update(
     params: &Value,
     chunks: &mut ChunkBuffers,
     tools: &mut HashMap<String, ToolState>,
+    file_changes: &mut Vec<String>,
 ) -> Result<()> {
     let update = params.get("update").unwrap_or(params);
     match update.get("sessionUpdate").and_then(Value::as_str) {
@@ -434,6 +556,9 @@ fn handle_session_update(
             flush_reasoning(sink, chunks);
             for path in location_paths(update) {
                 sink.claim(&path);
+                if !file_changes.contains(&path) {
+                    file_changes.push(path);
+                }
             }
             let id = update
                 .get("toolCallId")
@@ -582,6 +707,9 @@ fn flush_message(sink: &dyn AcpSink, chunks: &mut ChunkBuffers) {
         chunks.message_id = None;
         return;
     }
+    // Remember this message as the running "final answer" for the capture summary
+    // (the last one flushed at turn end is what the resume outcome relays back).
+    chunks.last_flushed_message = Some(chunks.message_text.clone());
     let body = stamped(json!({
         "messageId": chunks.message_id,
         "text": chunks.message_text,
@@ -1026,6 +1154,34 @@ mod tests {
         relayer: &dyn ApprovalRelayer,
         mcp_servers: &[Value],
     ) -> (Arc<TestSink>, Vec<Value>) {
+        let (sink, sent, _summary) = drive_script_full(frames, relayer, mcp_servers, None);
+        (sink, sent)
+    }
+
+    /// Drive the session and also return the driver's `Result` (for the load-mode
+    /// fail-closed test) and the harvested capture summary.
+    #[allow(clippy::type_complexity)]
+    fn drive_script_full(
+        frames: Vec<Value>,
+        relayer: &dyn ApprovalRelayer,
+        mcp_servers: &[Value],
+        load_session: Option<&str>,
+    ) -> (Arc<TestSink>, Vec<Value>, crate::codeagent::CaptureSummary) {
+        let (res, sink, sent) = drive_script_try(frames, relayer, mcp_servers, load_session);
+        (sink, sent, res.unwrap())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn drive_script_try(
+        frames: Vec<Value>,
+        relayer: &dyn ApprovalRelayer,
+        mcp_servers: &[Value],
+        load_session: Option<&str>,
+    ) -> (
+        Result<crate::codeagent::CaptureSummary>,
+        Arc<TestSink>,
+        Vec<Value>,
+    ) {
         let (tx, rx) = mpsc::channel();
         for frame in frames {
             tx.send(frame).unwrap();
@@ -1033,7 +1189,7 @@ mod tests {
         drop(tx);
         let sink = Arc::new(TestSink::default());
         let mut out = Vec::<u8>::new();
-        drive_acp_session(
+        let res = drive_acp_session(
             sink.as_ref(),
             relayer,
             "code-test",
@@ -1041,17 +1197,17 @@ mod tests {
             Path::new("/tmp/project"),
             "do work",
             mcp_servers,
+            load_session,
             &rx,
             &mut out,
             Instant::now() + Duration::from_secs(5),
-        )
-        .unwrap();
+        );
         let sent = String::from_utf8(out).unwrap();
         let frames = sent
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect();
-        (sink, frames)
+        (res, sink, frames)
     }
 
     fn base_initialize() -> Value {
@@ -1270,5 +1426,148 @@ mod tests {
             .find(|f| f.get("id") == Some(&json!(99)))
             .unwrap();
         assert_eq!(reply["error"]["code"], -32601);
+    }
+
+    // ── A6.1 — load-mode (resume) ────────────────────────────────────────────
+
+    fn initialize_without_load_session() -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": false,
+                    "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
+                    "mcpCapabilities": { "http": false, "sse": false, "acp": false }
+                },
+                "authMethods": [],
+                "agentInfo": { "name": "fake-acp-noload", "version": "0.0.0" }
+            }
+        })
+    }
+
+    /// A load re-projects NO replayed `session/update`s as new obs, DOES project the
+    /// new resumed turn, records the loaded session, and produces a capture summary.
+    #[test]
+    fn load_mode_absorbs_replay_and_projects_only_the_new_turn() {
+        let frames = vec![
+            base_initialize(), // advertises loadSession: true
+            // The replayed history burst — arrives BEFORE the session/load response.
+            json!({ "jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "acp-session-old",
+                "update": { "sessionUpdate": "agent_message_chunk", "messageId": "h1",
+                    "content": { "type": "text", "text": "OLD HISTORY TURN ONE" } }
+            }}),
+            json!({ "jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "acp-session-old",
+                "update": { "sessionUpdate": "agent_message_chunk", "messageId": "h2",
+                    "content": { "type": "text", "text": "OLD HISTORY TURN TWO" } }
+            }}),
+            // The session/load response (id=2) closes the replay burst.
+            json!({ "jsonrpc": "2.0", "id": 2, "result": { "loaded": true } }),
+            // The genuinely-new resumed turn.
+            json!({ "jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "acp-session-old",
+                "update": { "sessionUpdate": "agent_message_chunk", "messageId": "n1",
+                    "content": { "type": "text", "text": "fresh answer" } }
+            }}),
+            json!({ "jsonrpc": "2.0", "id": 3, "result": { "stopReason": "end_turn" } }),
+        ];
+        let (sink, sent, summary) = drive_script_full(
+            frames,
+            &TestRelayer { allow: true },
+            &[],
+            Some("acp-session-old"),
+        );
+
+        // The driver LOADED (not new'd) the recorded session.
+        assert_eq!(sent[1]["method"], "session/load");
+        assert_eq!(sent[1]["params"]["sessionId"], "acp-session-old");
+        assert!(
+            !sent.iter().any(|f| f["method"] == "session/new"),
+            "load mode must NOT fall back to session/new"
+        );
+        assert_eq!(sent[2]["method"], "session/prompt");
+
+        let events = sink.events.lock().unwrap();
+        // The new turn IS projected...
+        assert!(events.iter().any(|(leaf, body)| {
+            leaf == "assistant/message" && body.get("text") == Some(&json!("fresh answer"))
+        }));
+        // ...but NONE of the replayed history is re-projected as obs.
+        assert!(
+            !events.iter().any(|(_leaf, body)| {
+                body.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.contains("OLD HISTORY"))
+            }),
+            "replayed history must be absorbed, not re-projected as new obs"
+        );
+        // The resumed session is recorded and thread-marked as resumed.
+        assert_eq!(
+            sink.records.lock().unwrap().as_slice(),
+            &["acp-session-old".to_string()]
+        );
+        assert!(events.iter().any(|(leaf, body)| {
+            leaf == "session/thread" && body.get("resumed") == Some(&json!(true))
+        }));
+        // A real capture summary is produced (the new turn's final text), not empty.
+        assert_eq!(summary.final_text.as_deref(), Some("fresh answer"));
+    }
+
+    /// An agent that does NOT advertise `loadSession` fails the resume CLOSED with
+    /// the documented message and does not fall back to `session/new`.
+    #[test]
+    fn load_mode_fails_closed_without_load_session_capability() {
+        let frames = vec![
+            initialize_without_load_session(),
+            // A well-behaved agent would send nothing more; include a stray frame to
+            // prove the driver bails rather than proceeding to prompt.
+            json!({ "jsonrpc": "2.0", "id": 2, "result": { "sessionId": "acp-session-x" } }),
+        ];
+        let (res, _sink, sent) =
+            drive_script_try(frames, &TestRelayer { allow: true }, &[], Some("acp-session-old"));
+        let err = res.expect_err("resume must fail closed when loadSession is absent");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not support resume") && msg.contains("loadSession"),
+            "unexpected error: {msg}"
+        );
+        // Fail-closed means NO session/load AND NO session/new fallback was sent.
+        assert!(
+            !sent.iter().any(|f| f["method"] == "session/load"),
+            "must not send session/load without the capability"
+        );
+        assert!(
+            !sent.iter().any(|f| f["method"] == "session/new"),
+            "must not cold-start a fresh session as a fallback"
+        );
+    }
+
+    /// A launched (new-session) turn also produces a real capture summary now
+    /// (A6 wonky bit 4 — symmetric with resume).
+    #[test]
+    fn launch_turn_produces_capture_summary() {
+        let frames = vec![
+            base_initialize(),
+            json!({ "jsonrpc": "2.0", "id": 2, "result": { "sessionId": "acp-session-1" } }),
+            json!({ "jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "acp-session-1",
+                "update": { "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+                    "content": { "type": "text", "text": "all done" } }
+            }}),
+            json!({ "jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "acp-session-1",
+                "update": { "sessionUpdate": "tool_call", "toolCallId": "tc1",
+                    "title": "edit src/lib.rs", "kind": "edit", "status": "completed",
+                    "locations": [{ "path": "/tmp/project/src/lib.rs" }], "content": [] }
+            }}),
+            json!({ "jsonrpc": "2.0", "id": 3, "result": { "stopReason": "end_turn" } }),
+        ];
+        let (_sink, _sent, summary) =
+            drive_script_full(frames, &TestRelayer { allow: true }, &[], None);
+        assert_eq!(summary.final_text.as_deref(), Some("all done"));
+        assert_eq!(summary.file_changes, vec!["/tmp/project/src/lib.rs".to_string()]);
     }
 }

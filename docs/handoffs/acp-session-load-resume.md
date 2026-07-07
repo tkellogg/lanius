@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done (A6.1 + A6.2 shipped; A6.3 real-agent validation deferred)
 author: Claude Opus 4.8 (planner)
 last-updated: 2026-07-07
 ---
@@ -208,3 +208,22 @@ independently reviewable.
   `session/resume` fork for the implementer to settle against the live spec /
   the real agent. Depends on A5 having found a `loadSession`-capable agent for
   A6.3; A6.1/A6.2 are testable against the scripted fake without one.
+- 2026-07-07 (Opus impl + xhigh verify + orchestrator fix): **A6.1 + A6.2 shipped.**
+  `src/acp.rs`: `drive_acp_session` gained a `load_session` path — on
+  `LANIUS_ACP_LOAD_SESSION`, gates on `agentCapabilities.loadSession` and
+  **fails closed (no `session/new` fallback)** if absent; `session/load`s, absorbs
+  the replayed `session/update` burst (not re-projected as obs), then prompts; and
+  it now **returns a `CaptureSummary`** written via `write_capture_summary_file` so
+  resume (and launch) carry real final text. `src/codeagent.rs`: `resume_capture`
+  forks ACP sessions to `resume_acp_capture` (spawns `harness-acp` with
+  `LANIUS_ACP_LOAD_SESSION`) **before** the CLI table — killing the latent
+  `resume_command_for → .unwrap_or("claude")` misfire. Verified: 12 resume + 9 ACP
+  tests green (3 new), full suite green modulo the known `dev.rs` port flake. Two
+  verifier-flagged minors then fixed by the orchestrator: (1) a **fail-closed guard**
+  in `resume_capture` so an ACP tool unresolvable under a non-default profile errors
+  clearly instead of falling through to `claude` (closes the bug *class*, not just
+  the standard config); (2) the ACP fork now fills `ResumeOutcome.final_text` with a
+  reason on failure so a relayed capability-gate rejection isn't an empty error.
+  **A6.3 (real-agent `loadSession` validation) DEFERRED** — needs a real agent
+  installed (the goose 1.41.0 rig was ephemeral and removed); noted in-code at
+  `src/codeagent.rs`.
