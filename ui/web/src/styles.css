@@ -210,9 +210,17 @@ body {
 .conn-up { color: var(--work); } .conn-up .conn-dot { background: var(--work); box-shadow: 0 0 8px color-mix(in srgb, var(--work) 60%, transparent); }
 .conn-down { color: var(--dim); } .conn-down .conn-dot { background: var(--faint); }
 
+/* ---------------- body row: deck | ai-panel ----------------
+   Row between the masthead and footer. `.deck` and (when open) `.ai-panel`
+   are its only children, side by side — see the AI panel comment below. */
+.body-row {
+  flex: 1; min-height: 0;
+  display: flex;
+}
+
 /* ---------------- deck: nav | stage ---------------- */
 .deck {
-  flex: 1; min-height: 0;
+  flex: 1; min-height: 0; min-width: 0;
   display: grid; grid-template-columns: 220px minmax(420px, 1fr);
   gap: 14px; padding: 14px 22px;
 }
@@ -605,12 +613,18 @@ details.setup-fold > summary .dim-note { padding: 0; flex: 1; min-width: 0; over
 .setup-home,
 .setup-wizard,
 .setup-cost,
-.setup-trust {
+.setup-trust,
+.setup-chat-offer {
   border: 1px solid var(--subtle-border);
   border-radius: 6px;
   padding: 12px;
   background: var(--card-bg-soft);
 }
+/* M2 (agentic-configuration): prominent — an accent edge sets it apart from
+   the other setup cards, same visual language as the highlight rows use
+   elsewhere (var(--work) is the "live/active" accent, not an alert color). */
+.setup-chat-offer { border-color: color-mix(in srgb, var(--work) 45%, var(--subtle-border)); }
+.setup-chat-offer button { border-color: var(--work); }
 .setup-health-grid,
 .cost-grid,
 .trust-grid {
@@ -1170,6 +1184,30 @@ details[open] > summary .cfg-disclosure { transform: rotate(90deg); color: var(-
   min-width: 0; background: var(--field-bg); color: var(--ink); font: inherit; font-size: 13px;
   border: 1px solid var(--field-border); border-radius: var(--r-sharp); padding: 8px 10px;
 }
+/* ---------------- AI panel (agentic-configuration M2) ----------------
+   A non-modal, always-available right-side surface mounting the helper
+   profile's AgentAssistant. A real flex column next to `.deck` (inside
+   `.body-row`), not a fixed overlay — opening it shrinks the deck instead of
+   covering it, so it never blocks interaction with the masthead or the page
+   behind it, which a fixed overlay could not guarantee in general (it used
+   to sit on top of #ai-panel-toggle itself and other page content). */
+.ai-panel {
+  flex: 0 0 auto; width: min(400px, 94vw);
+  display: flex; flex-direction: column; padding: 16px;
+  background: linear-gradient(180deg, var(--panel), var(--panel-grad-stop));
+  border-left: 1px solid var(--panel-edge);
+  box-shadow: -14px 0 32px var(--shadow-strong);
+  overflow: auto;
+}
+.ai-panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.ai-panel .agent-assistant { flex: 1; min-height: 0; }
+.ai-panel .agent-assistant-feed { flex: 1; max-height: none; }
+.ai-panel-empty { display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
+@media (max-width: 900px) {
+  .body-row { flex-direction: column; }
+  .ai-panel { width: 100%; max-height: 60vh; border-left: none; border-top: 1px solid var(--panel-edge); }
+}
+
 /* An action, not an agent — set it off from the agent list above. */
 .nav-new { color: var(--dim); border-top: 1px dashed var(--panel-edge); margin-top: 5px; padding-top: 7px; }
 .setup-row input { background: var(--field-bg); color: inherit; font: inherit; font-size: 13px; border: 1px solid var(--field-border); border-radius: var(--r-sharp); padding: 7px 9px; }

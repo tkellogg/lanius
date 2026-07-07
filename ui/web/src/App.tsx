@@ -432,6 +432,15 @@ export function App() {
   const [historyOk, setHistoryOk] = useState<boolean | null>(null);
   const [sel, setSel] = useState<any>({ kind: 'welcome' });
   const [navOpen, setNavOpen] = useState(false);
+  // M2 (agentic-configuration): the AI panel — a non-modal, always-available
+  // right-side chat mounting the helper profile. Open/closed persists across
+  // reloads like the other chrome toggles (cockpit/theme); the panel itself is
+  // rendered once, outside the `sel`-gated view tree, so it is reachable from
+  // every view without per-view wiring.
+  const [aiPanelOpen, setAiPanelOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem('lanius.aiPanel') === '1'; } catch { return false; }
+  });
+  useEffect(() => { try { localStorage.setItem('lanius.aiPanel', aiPanelOpen ? '1' : '0'); } catch {} }, [aiPanelOpen]);
   const [cockpit, setCockpit] = useState<boolean>(() => {
     try { return localStorage.getItem('lanius.cockpit') === '1'; } catch { return false; }
   });
@@ -625,6 +634,120 @@ export function App() {
   const selectAgent = (agent: string, tab?: string) => {
     setSel((prev: any) => ({ kind: 'agent', agent, tab: tab ?? (prev.kind === 'agent' && prev.agent === agent ? prev.tab : 'converse') }));
   };
+
+  // M2 (agentic-configuration): the helper's client tools — "access to
+  // everything the UI has access to", starting with reads + navigation.
+  // Follows the `contextAuthorTools` pattern (App.tsx configure view): every
+  // handler reuses an existing admin/API route (adminGet or the same
+  // /api/conversations fetch `loadConversation` already uses) — no new server
+  // route, and no write authority added. `navigate` drives the same `sel`
+  // state a nav click would, so the helper can take the person to the thing
+  // it is describing.
+  const helperTools: ClientTool[] = useMemo(() => [
+    {
+      name: 'get_status',
+      description: 'Read overall platform status: root/credential/broker health, history availability, read-camera and cage (sandbox) posture, and LLM-path detection (native provider / harness CLIs on PATH / which world: a, b, or c).',
+      parameters: { type: 'object', properties: {} },
+      handler: async () => {
+        const j = await fetchStatus<any>();
+        if (!j?.ok) throw new Error(j?.error ?? 'status unavailable');
+        return j;
+      },
+    },
+    {
+      name: 'list_agents',
+      description: 'List the agents configured on this installation: name, backing agent noun, which profile it mirrors, and whether it is ready to run.',
+      parameters: { type: 'object', properties: {} },
+      handler: async () => {
+        const j = await adminGet('agents');
+        if (!j.ok) throw new Error(j.error ?? 'agent list unavailable');
+        return { agents: j.profiles ?? [] };
+      },
+    },
+    {
+      name: 'list_packages',
+      description: "List an agent's packages (add-ons): name, source (kit/copied/linked), and trust/approval state.",
+      parameters: {
+        type: 'object',
+        properties: { agent: { type: 'string', description: 'agent name; defaults to "default"' } },
+      },
+      handler: async (args: any) => {
+        const agent = String(args?.agent ?? '').trim() || 'default';
+        const j = await adminGet(`packages?profile=${encodeURIComponent(agent)}`);
+        if (!j.ok) throw new Error(j.error ?? 'package list unavailable');
+        return { agent, packages: j.packages ?? [] };
+      },
+    },
+    {
+      name: 'list_providers',
+      description: 'List named model-provider credentials (metadata only — kind, wire, base URL, tool pin; secrets are never returned).',
+      parameters: { type: 'object', properties: {} },
+      handler: async () => {
+        const j = await adminGet('providers');
+        if (!j.ok) throw new Error(j.error ?? 'provider list unavailable');
+        return { providers: j.providers ?? [] };
+      },
+    },
+    {
+      name: 'read_conversation',
+      description: 'Read a chat conversation with an agent. Omit session to list that agent\'s recent conversations; pass session to read its messages.',
+      parameters: {
+        type: 'object',
+        properties: {
+          agent: { type: 'string', description: 'the agent whose conversation(s) to read' },
+          session: { type: 'string', description: 'a specific conversation/session id (optional — omit to list)' },
+        },
+        required: ['agent'],
+      },
+      handler: async (args: any) => {
+        const agent = String(args?.agent ?? '').trim();
+        if (!agent) throw new Error('read_conversation needs {agent}');
+        const session = args?.session ? String(args.session).trim() : '';
+        if (!session) {
+          const r = await fetch(`/api/conversations?agent=${encodeURIComponent(agent)}`);
+          const j = await r.json().catch(() => ({}));
+          if (!j.ok) throw new Error(j.error ?? 'conversation list unavailable');
+          return { agent, conversations: j.conversations ?? [] };
+        }
+        const r = await fetch(`/api/conversations/${encodeURIComponent(session)}`);
+        const j = await r.json().catch(() => ({}));
+        if (!j.ok) throw new Error(j.error ?? 'conversation unavailable');
+        return { agent, session, messages: j.conversation?.messages ?? [], branched_from: j.conversation?.branched_from ?? null };
+      },
+    },
+    {
+      name: 'navigate',
+      description: 'Switch what the interface is showing — the same selection a nav click would make. kind is one of welcome, agent, setup, signals, code-sessions, comms, providers; pass agent (and optionally tab: converse/sessions/telemetry/configure) when kind is "agent".',
+      parameters: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: ['welcome', 'agent', 'setup', 'signals', 'code-sessions', 'comms', 'providers'] },
+          agent: { type: 'string' },
+          tab: { type: 'string', enum: ['converse', 'sessions', 'telemetry', 'configure'] },
+        },
+        required: ['kind'],
+      },
+      handler: async (args: any) => {
+        const kind = String(args?.kind ?? '');
+        switch (kind) {
+          case 'welcome': selectWelcome(); break;
+          case 'setup': selectSetup(); break;
+          case 'signals': selectSignals(); break;
+          case 'code-sessions': selectCodeSessions(); break;
+          case 'comms': selectComms(); break;
+          case 'providers': selectProviders(); break;
+          case 'agent': {
+            const agent = String(args?.agent ?? '').trim();
+            if (!agent) throw new Error('navigate to an agent needs {agent}');
+            selectAgent(agent, args?.tab);
+            break;
+          }
+          default: throw new Error(`unknown navigate kind ${kind}`);
+        }
+        return { navigated: kind };
+      },
+    },
+  ], []);
 
   // Conversation persist/fork/resume (M2). M5 (the agent-driven conversation
   // selector) is DEFERRED: it is not built here, but the controls below are
@@ -1327,6 +1450,12 @@ export function App() {
           <button id="vocabulary-toggle" type="button" className="lamp" title={cockpit ? 'cockpit vocabulary on — click for plain language' : 'plain language on — click for cockpit vocabulary'} aria-pressed={cockpit} onClick={() => setCockpit(!cockpit)}>
             <span aria-hidden="true">{cockpit ? '⌬' : '∝'}</span><span className="lamp-label">{cockpit ? 'cockpit' : 'plain'}</span>
           </button>
+          {/* M2 (agentic-configuration): the AI panel toggle — available from
+              every view (the panel it opens is mounted once, outside the
+              sel-gated tree, below). */}
+          <button id="ai-panel-toggle" type="button" className={`lamp${aiPanelOpen ? ' lit' : ''}`} aria-pressed={aiPanelOpen} title={aiPanelOpen ? 'close the helper' : 'ask the helper — status, navigation, and setup help'} onClick={() => setAiPanelOpen((v) => !v)}>
+            <span aria-hidden="true">✦</span><span className="lamp-label">helper</span>
+          </button>
           <button id="signal-lamp" className={`lamp${signal.lit ? ' lit' : ''}`} title="urgent alerts — click to acknowledge" onClick={() => setSignal({ lit: false, label: 'signal' })}>
             <span className="lamp-dot" /><span id="signal-label">{signal.label}</span>
           </button>
@@ -1334,6 +1463,7 @@ export function App() {
         </div>
       </header>
 
+      <div className="body-row">
       <main className="deck">
         <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} selectComms={selectComms} selectProviders={selectProviders} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel={L.explore} />
 
@@ -1428,6 +1558,7 @@ export function App() {
             loadSetup={loadSetup}
             selectAgent={selectAgent}
             selectProviders={selectProviders}
+            openHelperChat={() => setAiPanelOpen(true)}
           />
           <RailView hidden={!(sel.kind === 'signals' || (sel.kind === 'agent' && sel.tab === 'telemetry'))} filter={filter} setFilter={setFilter} paused={paused} setPaused={setPaused} rows={filteredRail} />
 
@@ -1444,6 +1575,41 @@ export function App() {
           />
         </section>
       </main>
+
+      {/* M2 (agentic-configuration): the AI panel — a non-modal, right-side
+          surface mounting the helper profile. Rendered here (a sibling of
+          `.deck` inside `.body-row`, not inside any `sel`-gated view) so it
+          toggles from every view. A real flex column (not a fixed overlay),
+          so opening it shrinks `.deck` instead of covering the masthead or
+          other page content. Mounted only while open (mirrors the
+          context-assistant modal's own comment): an always-mounted
+          AgentAssistant would fire its opening publish on every page load. */}
+      {aiPanelOpen && (
+        <aside id="ai-panel" className="ai-panel" aria-label="helper assistant">
+          <div className="ai-panel-head">
+            <strong>helper</strong>
+            <IconButton label="close the helper panel" className="cfg-icon-btn" onClick={() => setAiPanelOpen(false)}>×</IconButton>
+          </div>
+          {/* M3 (agentic-configuration): no dead ends. World c (no provider, no
+              logged-in coding CLI) means a helper turn would only fail — say so
+              plainly and point at setup instead of sending a doomed prompt. */}
+          {systemStatus?.llm?.world === 'c' ? (
+            <div id="ai-panel-no-llm" className="ai-panel-empty">
+              <p className="dim-note">No LLM path is set up yet, so the helper can't run turns. Add a model provider (or sign in to a coding CLI) first — this is one more step, not a dead end.</p>
+              <button onClick={() => { selectSetup(); setAiPanelOpen(false); }}>go to setup →</button>
+            </div>
+          ) : (
+            <AgentAssistant
+              profile="helper"
+              title="helper"
+              intro="Help me get set up, or answer questions about this installation and the agents on it. Use get_status/list_agents/list_packages/list_providers/read_conversation to look things up, and navigate to take me to what you're describing."
+              tools={helperTools}
+              onDone={() => setAiPanelOpen(false)}
+            />
+          )}
+        </aside>
+      )}
+      </div>
 
       <footer className="strip">
         <span id="stat-count">{count} event{count === 1 ? '' : 's'}</span>
@@ -1564,7 +1730,12 @@ function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, se
   );
 }
 
-function SetupView({ hidden, setup, systemStatus, liveness, provenance, profiles, newAgent, setNewAgent, newAgentNote, createAgent, modelsHint, modelOptions, loadSetup, selectAgent, selectProviders }: any) {
+function SetupView({ hidden, setup, systemStatus, liveness, provenance, profiles, newAgent, setNewAgent, newAgentNote, createAgent, modelsHint, modelOptions, loadSetup, selectAgent, selectProviders, openHelperChat }: any) {
+  // M3 (agentic-configuration): "runnable" means detection found either a
+  // native provider (world a) or a logged-in coding CLI on PATH (world b) — the
+  // helper can produce a real turn. World c (or not-yet-known) hides the chat
+  // offer; the form wizard below is always available regardless.
+  const helperRunnable = systemStatus?.llm?.world === 'a' || systemStatus?.llm?.world === 'b';
   const kits = setup.kits;
   const pkgs = setup.packages;
   const proposals = setup.proposals;
@@ -1631,6 +1802,14 @@ function SetupView({ hidden, setup, systemStatus, liveness, provenance, profiles
                 : <span>Use the cockpit when you need transcript, telemetry, or advanced config.</span>}
           </div>
         </section>
+
+        {helperRunnable && (
+          <section id="setup-chat-offer" className="setup-block setup-chat-offer">
+            <h3>set up by chatting</h3>
+            <p className="dim-note">Tell the helper what you're trying to do — reads are transparent, and any change still asks before it lands. The form below still works if you'd rather drive it directly.</p>
+            <button id="setup-open-helper-chat" onClick={openHelperChat}>chat with the helper →</button>
+          </section>
+        )}
 
         <section className="setup-block setup-wizard">
           <h3>guided new agent</h3>

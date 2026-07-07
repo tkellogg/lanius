@@ -110,6 +110,17 @@ async function waitForConfigureLoaded(page, expectedAgent = '') {
   }
 }
 
+// The AI panel's open/closed state persists in localStorage (shared across
+// pages in this one browser context) — a flow that opens it and forgets to
+// close it before `page.close()` would otherwise leak an already-open panel
+// into the next flow's fresh page. Force a known-closed start.
+async function ensureAiPanelClosed(page) {
+  if (await page.$('#ai-panel')) {
+    await page.click('#ai-panel-toggle');
+    await page.waitForSelector('#ai-panel', { state: 'detached', timeout: 5000 }).catch(() => {});
+  }
+}
+
 // ── flow 1: boot ─────────────────────────────────────────────────────────────
 // Welcome view is the front door on load, routing to the primary agent; the
 // default agent appears in nav from disk.
@@ -2513,6 +2524,129 @@ const renamedAgent = 'falcon';
   await page.close();
 }
 
+// ── flow: agentic-configuration M3 — the underpowered-model advisory ──────────
+// Deterministic (no LLM needed): a soft, non-blocking heuristic in ModelField.
+// Same heuristic the helper's model-guidance KB page states, so the agent and
+// the UI tell one story (kits/helper/packages/kb-lanius/kb/model-guidance.md).
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.click('.nav-setup');
+  await page.waitForSelector('#view-setup:not([hidden])');
+  await page.fill('#na-model', 'some-7b-model');
+  await waitFor('model advisory: fires on a small-parameter-tier name', async () => {
+    const text = await page.$eval('#na-model', (el) => el.parentElement.textContent);
+    return /may struggle with agent work/i.test(text);
+  });
+  await page.fill('#na-model', 'claude-opus-4-8');
+  await waitFor('model advisory: does not fire on a full-size model name', async () => {
+    const text = await page.$eval('#na-model', (el) => el.parentElement.textContent);
+    return !/may struggle with agent work/i.test(text);
+  });
+  await page.close();
+}
+
+// ── flow: agentic-configuration M3 — LLM-path detection + the setup chat offer ─
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.click('.nav-setup');
+  await page.waitForSelector('#view-setup:not([hidden])');
+  await ensureAiPanelClosed(page);
+  const status = await page.evaluate(async () => (await fetch('/api/status')).json());
+  const world = status?.llm?.world;
+  (world === 'a' || world === 'b' || world === 'c')
+    ? ok(`llm detection: /api/status reports a well-formed world (${world}; native=${status?.llm?.native ?? 'none'}, harness=${(status?.llm?.harness ?? []).join(',') || 'none'})`)
+    : fail(`llm detection: /api/status world is not a/b/c (${JSON.stringify(status?.llm)})`);
+  Array.isArray(status?.llm?.harness)
+    ? ok('llm detection: harness is reported as a list')
+    : fail('llm detection: harness is not a list');
+
+  // systemStatus loads asynchronously (a mount fetch, not the direct fetch
+  // above), so poll rather than snapshot — the offer's presence should settle
+  // to match `world` within a few seconds, not race it.
+  const runnable = world === 'a' || world === 'b';
+  const settled = await waitFor(
+    runnable
+      ? 'setup: "set up by chatting" offer shown when the helper is runnable'
+      : 'setup: chat offer hidden in world c — no dead-end chat invite before an LLM path exists',
+    async () => ((await page.$('#setup-chat-offer')) !== null) === runnable,
+    8000,
+  );
+  if (runnable && settled) {
+    await page.click('#setup-open-helper-chat');
+    await waitFor('setup: the chat offer opens the AI panel', async () => (await page.$('#ai-panel')) !== null);
+  }
+  await page.close();
+}
+
+// ── flow: agentic-configuration M2 — the AI panel: everywhere, tools, navigate ─
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  await ensureAiPanelClosed(page);
+
+  // Acceptance: the panel toggles from every sel.kind.
+  const views = [
+    { label: 'welcome', go: () => page.click('#mast-home'), settle: '#view-welcome:not([hidden])' },
+    { label: 'agent', go: () => page.click('#nav-agents .nav-item'), settle: '#agent-tabs' },
+    { label: 'setup', go: () => page.click('.nav-setup'), settle: '#view-setup:not([hidden])' },
+    { label: 'signals', go: () => page.click('.nav-signals'), settle: '#view-rail:not([hidden])' },
+    { label: 'code-sessions', go: () => page.click('.nav-workers'), settle: '.cs-wrap' },
+    { label: 'comms', go: () => page.click('.nav-comms'), settle: '#view-comms' },
+    { label: 'providers', go: () => page.click('.nav-providers'), settle: '#view-providers' },
+  ];
+  for (const v of views) {
+    await v.go();
+    await page.waitForSelector(v.settle, { timeout: 5000 }).catch(() => {});
+    await page.click('#ai-panel-toggle');
+    await waitFor(`ai panel: opens over ${v.label}`, async () => (await page.$('#ai-panel')) !== null);
+    await page.click('#ai-panel-toggle');
+    await waitFor(`ai panel: closes over ${v.label}`, async () => (await page.$('#ai-panel')) === null);
+  }
+
+  // Leave it open over "setup" for the rest of this flow.
+  await page.click('.nav-setup');
+  await page.waitForSelector('#view-setup:not([hidden])');
+  await page.click('#ai-panel-toggle');
+  await page.waitForSelector('#ai-panel', { timeout: 5000 });
+
+  // Never neither, never both: wait for whichever branch the current world
+  // renders (systemStatus loads async, so poll rather than snapshot).
+  await waitFor('ai panel: shows either the assistant or the no-LLM advisory', async () =>
+    (await page.$('#ai-panel-no-llm')) !== null || (await page.$('#ai-panel .agent-assistant')) !== null, 8000);
+  const noLlmVisible = (await page.$('#ai-panel-no-llm')) !== null;
+  if (noLlmVisible) {
+    const noLlm = await page.$eval('#ai-panel-no-llm', (el) => el.textContent).catch(() => '');
+    /No LLM path/i.test(noLlm)
+      ? ok('ai panel: world c explains what is missing instead of dying')
+      : fail(`ai panel: world c did not show the no-LLM advisory (${JSON.stringify(noLlm)})`);
+  } else {
+    await page.waitForSelector('#ai-panel .agent-assistant', { timeout: 5000 });
+    const sessionText = await page.$eval('#ai-panel .agent-assistant-head p', (el) => el.textContent.trim());
+    ok(`ai panel: mounted the assistant (session ${sessionText})`);
+
+    // Client-tool round trip: simulate the agent calling `navigate` — as a real
+    // dispatcher reply would once a turn resolves — and confirm the call is
+    // both EXECUTED (the view switches) and its result publishes back over
+    // obs/agent/helper/<session>/tool/navigate/result (the same bus round trip
+    // the panel's own tool-call handling uses for every client tool).
+    const callId = `spec-${Date.now().toString(36)}`;
+    lanius('emit', `obs/agent/helper/${sessionText}/tool/navigate/call`, '--payload',
+      JSON.stringify({ call_id: callId, name: 'navigate', args: { kind: 'providers' } }));
+    await waitFor('ai panel: a helper navigate call switches the view', async () =>
+      (await page.$('#view-providers')) !== null, 8000);
+    await page.click('.nav-signals');
+    await page.waitForSelector('#view-rail:not([hidden])');
+    await page.click('button[data-f="tools"]');
+    await waitFor('ai panel: the tool call/result round-trips over obs/agent/helper/<session>/tool/*', async () => {
+      const text = await page.$eval('#tele-feed', (el) => el.textContent).catch(() => '');
+      return text.includes(`tool/navigate/call`) && text.includes(`tool/navigate/result`) && text.includes(sessionText);
+    }, 8000);
+  }
+  await page.close();
+}
 
 if (pageErrors.length) {
   fail(`${pageErrors.length} JS page error(s) across all views:\n${pageErrors.join('\n')}`);
