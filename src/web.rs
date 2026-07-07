@@ -494,6 +494,7 @@ async fn status(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
             "history": { "available": history.is_some(), "endpoint": history },
             "read_camera": read_camera_status(root),
             "cage": cage_status(root),
+            "llm": llm_detection(root),
             "paths": {
                 "bus": { "path": bus.display().to_string(), "exists": bus.exists() },
                 "database": { "path": db.display().to_string(), "exists": db.exists() },
@@ -553,6 +554,68 @@ pub fn cage_status_json(cfg: &crate::profile::SandboxCfg) -> Value {
         "write": s.write_word(),
         "read": s.read_word(),
         "network": s.network_word(),
+    })
+}
+
+/// LLM-path detection (docs/handoffs/agentic-configuration.md M3) — a
+/// deterministic, no-LLM-required read that decides which of the three
+/// bootstrap worlds this root is in, so the helper (and the SetupView) never
+/// hits a dead end:
+///   (a) `native` is set — a dispatcher-usable `ApiKey` provider exists
+///       (mirrors `provider::materialize_dispatcher`'s ApiKey-only rule; no
+///       decrypt needed, the clear `kind` column already decides it);
+///   (b) no such provider, but at least one coding CLI the helper could ride
+///       (M4) resolves on PATH — `harness` lists which;
+///   (c) neither — the static SetupView path is the only way forward.
+/// This does NOT probe whether a harness CLI is actually logged in (that is
+/// the M4 spike's concern) — "on PATH" is the deliberately cheap, deterministic
+/// operationalization the handoff names.
+fn llm_detection(root: &Root) -> Value {
+    let native = crate::db::open(root)
+        .ok()
+        .and_then(|conn| crate::provider::list(&conn).ok())
+        .and_then(|providers| providers.into_iter().find(|p| p.kind == "api_key"))
+        .map(|p| p.name);
+    let harness: Vec<&str> = ["claude", "codex", "opencode"]
+        .into_iter()
+        .filter(|bin| binary_on_path(bin))
+        .collect();
+    let world = llm_world(native.is_some(), !harness.is_empty());
+    json!({ "native": native, "harness": harness, "world": world })
+}
+
+/// The pure a/b/c decision (split out from `llm_detection` so the branching is
+/// unit-testable without touching the filesystem, PATH, or the ledger).
+fn llm_world(has_native: bool, has_harness: bool) -> &'static str {
+    if has_native {
+        "a"
+    } else if has_harness {
+        "b"
+    } else {
+        "c"
+    }
+}
+
+/// Is `bin` a runnable command on `PATH`? A minimal, dependency-free resolver
+/// (mirrors the spirit of `codeagent.rs`'s `elanus_command_path` sibling/PATH
+/// search) — existence only, no execution, no login probe.
+fn binary_on_path(bin: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    binary_in_path_string(bin, &path)
+}
+
+/// The pure PATH-search half of `binary_on_path`, taking the PATH value as an
+/// argument so tests can probe it with a synthetic directory instead of
+/// mutating the process's real (global, test-thread-shared) `PATH` env var.
+fn binary_in_path_string(bin: &str, path: &std::ffi::OsStr) -> bool {
+    std::env::split_paths(path).any(|dir| {
+        let candidate = dir.join(bin);
+        if candidate.is_file() {
+            return true;
+        }
+        cfg!(windows) && dir.join(format!("{bin}.exe")).is_file()
     })
 }
 
@@ -3622,5 +3685,71 @@ mod route_tests {
         assert!(!human_proof_ok(&root, &foreign));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- M3 (docs/handoffs/agentic-configuration.md): LLM-path detection ----
+
+    #[test]
+    fn llm_world_picks_native_over_harness_over_neither() {
+        assert_eq!(llm_world(true, true), "a", "a native provider wins outright");
+        assert_eq!(
+            llm_world(true, false),
+            "a",
+            "a native provider is sufficient alone"
+        );
+        assert_eq!(
+            llm_world(false, true),
+            "b",
+            "no provider but a harness on PATH is world b"
+        );
+        assert_eq!(
+            llm_world(false, false),
+            "c",
+            "neither is the dead-end-avoidance world c"
+        );
+    }
+
+    #[test]
+    fn binary_in_path_string_finds_only_what_is_actually_there() {
+        let dir = std::env::temp_dir().join(format!("el-path-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("claude"), "#!/bin/sh\n").unwrap();
+        let path = std::ffi::OsString::from(dir.display().to_string());
+
+        assert!(
+            binary_in_path_string("claude", &path),
+            "a file literally named claude in a PATH dir is found"
+        );
+        assert!(
+            !binary_in_path_string("codex", &path),
+            "a name that isn't in any PATH dir is not found"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn llm_detection_reports_world_c_on_a_fresh_root_with_no_providers() {
+        let dir = std::env::temp_dir().join(format!("el-llm-detect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+
+        // No providers table populated, and this test doesn't stub PATH (the
+        // real dev/CI PATH may or may not carry claude/codex/opencode) — assert
+        // only the shape and the native half, which IS fully deterministic here.
+        let out = llm_detection(&root);
+        assert_eq!(
+            out["native"],
+            Value::Null,
+            "a fresh root has no provider, so native is null"
+        );
+        assert!(out["harness"].is_array());
+        let world = out["world"].as_str().unwrap();
+        assert!(
+            world == "b" || world == "c",
+            "with no native provider the world is b or c depending on the test machine's PATH, never a"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -96,6 +96,7 @@ export function ModelField({ id, value, onChange, models, disabled, hint, native
           </span>
         )}
         {hint && <span className="cfg-field-hint">{hint}</span>}
+        <UnderpoweredHint value={value} />
       </>
     );
   }
@@ -108,6 +109,7 @@ export function ModelField({ id, value, onChange, models, disabled, hint, native
         </select>
         <input disabled={disabled} spellCheck={false} value={value} onChange={(e) => onChange(e.target.value)} placeholder="model id" />
         {hint && <span className="cfg-field-hint">{hint}</span>}
+        <UnderpoweredHint value={value} />
       </>
     );
   }
@@ -119,10 +121,33 @@ export function ModelField({ id, value, onChange, models, disabled, hint, native
         <option value="__custom__">custom…</option>
       </select>
       {hint && <span className="cfg-field-hint">{hint}</span>}
+      <UnderpoweredHint value={value} />
     </>
   );
 }
 const anyId = (m: any) => (typeof m === 'string' ? m : m.id);
+
+// Underpowered-model advisory (docs/handoffs/agentic-configuration.md M3): a
+// soft, non-blocking heuristic — small parameter tiers (`4b`..`14b`) or a
+// reduced product tier (mini/nano/lite/tiny/flash-lite) may struggle with
+// multi-step agent work. Mirrors the SAME heuristic the helper's model-guidance
+// KB page states (kits/helper/packages/kb-lanius/kb/model-guidance.md), so the
+// agent and the UI tell one story. Never blocks — advisory only.
+const UNDERPOWERED_TIER_RE = /(mini|nano|lite|tiny|flash-lite)/i;
+const UNDERPOWERED_SIZE_RE = /\b(\d{1,3})b\b/i;
+export function isUnderpoweredModel(model: string): boolean {
+  const s = String(model ?? '').trim();
+  if (!s) return false;
+  if (UNDERPOWERED_TIER_RE.test(s)) return true;
+  const m = s.match(UNDERPOWERED_SIZE_RE);
+  if (!m) return false;
+  const n = parseInt(m[1], 10);
+  return !Number.isNaN(n) && n <= 14;
+}
+function UnderpoweredHint({ value }: { value: string }) {
+  if (!isUnderpoweredModel(value)) return null;
+  return <span className="cfg-field-hint cfg-field-warn">may struggle with agent work (advisory only) — consider a stronger model if setup feels erratic</span>;
+}
 
 // Workdir/path input with a server-side exists/writable check on blur. A typo'd
 // workdir silently runs tools in the lanius root today; this flags it before
