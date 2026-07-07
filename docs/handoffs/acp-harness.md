@@ -368,3 +368,24 @@ driver-mode addition, not a table row. **Defer**; A2 records the id so nothing i
     `initialize` → `session/load` → `session/prompt`), NOT a row in the CLI
     `resume_command_for` table (`src/codeagent.rs:7931`). A2 already records the
     `sessionId` so nothing is lost; leave A6 for a dedicated handoff.
+- 2026-07-07 — **A5 validated end-to-end against a real ACP agent (goose).** The
+  full lanius stack (`--root wt-acp-fixes`) drove goose through
+  `initialize → session/new → session/prompt` (real model reply "hello", all obs
+  tagged `fidelity: acp-live`) AND a complete permission round-trip:
+  `session/request_permission` → ask on `in/human/owner` (correlation, options,
+  `default: deny`) → `lanius answer <id> allow` → `approval/decision(allow)` →
+  goose executed a file-write → tool result `completed`. `docs/coding-harness-onboarding.md`
+  flipped from "does not exist yet" to the validated recipe. **Honest residuals:**
+  (1) the box's stock `goose` is v1.0.4 — too old for `goose acp`; validation used
+  a downloaded **goose 1.41.0 in `/tmp/goose-acp-test/` (EPHEMERAL)**, and that
+  dir's wrapper/xdg config hold a **plaintext API key that must be cleaned up** —
+  durable A5 needs a real ACP agent at a stable path. (2) elicitation is the
+  agent's choice (goose only asks for tools not in its `always_allow`). (3) the
+  adapter maps "allow" to goose's first `allow_*` option = `allow_always` (grants
+  persistently, not once) — no once/always distinction. (4) MCP pass-through was
+  only exercised empty (`mcp_merged=[]`); A4's http/sse gating is unit-tested, not
+  goose-reality-checked. (5) `lanius code list` doesn't enumerate ACP-package
+  harness blocks (a real block still launches fine). (6) two early runs hung
+  ~100s at `session/start` then later runs completed in ~8s — transient, unexplained.
+  A5 acceptance (a real captured turn + approval round-trip + doc) is MET; A6
+  (resume) remains the last ACP milestone.
