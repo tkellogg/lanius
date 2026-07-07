@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 const ACP_FIDELITY: &str = "acp-live";
 const ENV_ACP_ARGV: &str = "LANIUS_ACP_ARGV";
+const ENV_ACP_MCP: &str = "LANIUS_ACP_MCP";
 const APPROVAL_DEADLINE_SECS: u64 = 300;
 
 #[derive(Default)]
@@ -107,6 +108,19 @@ pub fn run_acp_adapter(ctx: &Ctx) -> Result<ExitStatus> {
         bail!("{ENV_ACP_ARGV} must contain at least the ACP agent command");
     }
 
+    // The agent's per-manifest-block MCP servers (A4 decision, option 1). The
+    // launcher stamps the `[[harness]].mcp` list as JSON here; an absent/blank var
+    // means "no MCP servers", so a plain agent needs no config.
+    let mcp_servers: Vec<Value> = std::env::var(ENV_ACP_MCP)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            serde_json::from_str::<Vec<Value>>(&s)
+                .with_context(|| format!("parsing {ENV_ACP_MCP} as a JSON array of MCP servers"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .current_dir(ctx.workdir())
@@ -153,6 +167,7 @@ pub fn run_acp_adapter(ctx: &Ctx) -> Result<ExitStatus> {
         ctx.owner(),
         ctx.workdir(),
         &prompt,
+        &mcp_servers,
         &rx,
         &mut stdin,
         Instant::now() + Duration::from_secs(60 * 60),
@@ -179,6 +194,7 @@ fn drive_acp_session<W: Write>(
     owner: &str,
     workdir: &Path,
     prompt: &str,
+    mcp_servers: &[Value],
     rx: &mpsc::Receiver<Value>,
     stdin: &mut W,
     overall_deadline: Instant,
@@ -205,6 +221,11 @@ fn drive_acp_session<W: Write>(
     let mut acp_session_id: Option<String> = None;
     let mut chunks = ChunkBuffers::default();
     let mut tools: HashMap<String, ToolState> = HashMap::new();
+    // The MCP server names actually merged into `session/new` after capability
+    // gating — recorded on the `session/thread` obs (mirrors
+    // `merged_mcp_server_names`, src/codeagent.rs) so a session's MCP capability is
+    // reconstructable from its trace.
+    let mut mcp_merged: Vec<String> = Vec::new();
 
     loop {
         if matches!(phase, Phase::Done) {
@@ -280,13 +301,15 @@ fn drive_acp_session<W: Write>(
                         initialize_result,
                     } if id == json!(*initialize_id) => {
                         *initialize_result = Some(result.clone());
+                        let (mcp_wire, merged) = build_mcp_servers(mcp_servers, &result);
+                        mcp_merged = merged;
                         let new_id = send_req(
                             stdin,
                             &mut next_id,
                             "session/new",
                             json!({
                                 "cwd": workdir.display().to_string(),
-                                "mcpServers": [],
+                                "mcpServers": mcp_wire,
                             }),
                         )?;
                         phase = Phase::CreatingSession {
@@ -312,6 +335,7 @@ fn drive_acp_session<W: Write>(
                                 "sessionId": session_id,
                                 "initialize": initialize_result,
                                 "newSession": result,
+                                "mcp_merged": mcp_merged,
                                 "fidelity": ACP_FIDELITY
                             }),
                         );
@@ -606,6 +630,93 @@ fn location_paths(update: &Value) -> Vec<String> {
         .flatten()
         .filter_map(|loc| loc.get("path").and_then(Value::as_str).map(str::to_string))
         .collect()
+}
+
+/// Build `session/new`'s `mcpServers[]` from the agent's manifest MCP list,
+/// gating http/sse on the capability the agent advertised at `initialize`
+/// (`agentCapabilities.mcpCapabilities.{http,sse}`). stdio is always passed.
+/// Returns (wire entries, merged server names) — the names go on the
+/// `session/thread` obs.
+fn build_mcp_servers(decls: &[Value], initialize_result: &Value) -> (Vec<Value>, Vec<String>) {
+    let caps = initialize_result
+        .get("agentCapabilities")
+        .and_then(|c| c.get("mcpCapabilities"));
+    let http_ok = caps
+        .and_then(|c| c.get("http"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let sse_ok = caps
+        .and_then(|c| c.get("sse"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut wire = Vec::new();
+    let mut names = Vec::new();
+    for decl in decls {
+        let name = decl.get("name").and_then(Value::as_str).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let transport = decl
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or("stdio");
+        let entry = match transport {
+            "http" | "sse" => {
+                let allowed = if transport == "http" { http_ok } else { sse_ok };
+                if !allowed {
+                    eprintln!(
+                        "[acp] skipping MCP server {name}: agent did not advertise {transport} MCP"
+                    );
+                    continue;
+                }
+                let Some(url) = decl.get("url").and_then(Value::as_str) else {
+                    eprintln!("[acp] skipping MCP server {name}: {transport} transport needs a url");
+                    continue;
+                };
+                json!({
+                    "type": transport,
+                    "name": name,
+                    "url": url,
+                    "headers": name_value_pairs(decl.get("headers")),
+                })
+            }
+            _ => {
+                let Some(command) = decl.get("command").and_then(Value::as_str) else {
+                    eprintln!("[acp] skipping MCP server {name}: stdio transport needs a command");
+                    continue;
+                };
+                // stdio is the `#[serde(untagged)]` McpServer variant in ACP
+                // schema-v1.19.0 — canonical wire is {name,command,args,env}
+                // with NO `type` tag (only http/sse/acp carry one).
+                json!({
+                    "name": name,
+                    "command": command,
+                    "args": decl.get("args").cloned().unwrap_or_else(|| json!([])),
+                    "env": name_value_pairs(decl.get("env")),
+                })
+            }
+        };
+        wire.push(entry);
+        names.push(name.to_string());
+    }
+    names.sort();
+    names.dedup();
+    (wire, names)
+}
+
+/// Map a JSON object (`{k:v}`) to the ACP `[{name,value}]` env/header shape.
+fn name_value_pairs(obj: Option<&Value>) -> Value {
+    let mut out = Vec::new();
+    if let Some(map) = obj.and_then(Value::as_object) {
+        for (k, v) in map {
+            out.push(json!({
+                "name": k,
+                "value": v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()),
+            }));
+        }
+    }
+    Value::Array(out)
 }
 
 fn permission_result(params: &Value, allow: bool) -> Value {
@@ -907,6 +1018,14 @@ mod tests {
         frames: Vec<Value>,
         relayer: &dyn ApprovalRelayer,
     ) -> (Arc<TestSink>, Vec<Value>) {
+        drive_script_mcp(frames, relayer, &[])
+    }
+
+    fn drive_script_mcp(
+        frames: Vec<Value>,
+        relayer: &dyn ApprovalRelayer,
+        mcp_servers: &[Value],
+    ) -> (Arc<TestSink>, Vec<Value>) {
         let (tx, rx) = mpsc::channel();
         for frame in frames {
             tx.send(frame).unwrap();
@@ -921,6 +1040,7 @@ mod tests {
             "owner",
             Path::new("/tmp/project"),
             "do work",
+            mcp_servers,
             &rx,
             &mut out,
             Instant::now() + Duration::from_secs(5),
@@ -1014,6 +1134,43 @@ mod tests {
             sink.claims.lock().unwrap().as_slice(),
             &["/tmp/project/src/lib.rs".to_string()]
         );
+    }
+
+    #[test]
+    fn mcp_servers_flow_into_session_new_and_thread_obs() {
+        let frames = vec![
+            base_initialize(), // advertises mcpCapabilities.http=true, sse=false
+            json!({ "jsonrpc": "2.0", "id": 2, "result": { "sessionId": "acp-session-1" } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "result": { "stopReason": "end_turn" } }),
+        ];
+        let mcp = vec![
+            json!({ "name": "fs", "transport": "stdio", "command": "mcp-fs",
+                "args": ["--root", "/tmp"], "env": { "TOKEN": "x" } }),
+            json!({ "name": "remote", "transport": "http", "url": "https://mcp.example/api" }),
+            json!({ "name": "streamed", "transport": "sse", "url": "https://mcp.example/sse" }),
+        ];
+        let (sink, sent) = drive_script_mcp(frames, &TestRelayer { allow: true }, &mcp);
+
+        let new = sent.iter().find(|f| f["method"] == "session/new").unwrap();
+        let servers = new["params"]["mcpServers"].as_array().unwrap();
+        // stdio always; http admitted (advertised); sse dropped (not advertised).
+        assert_eq!(servers.len(), 2);
+        // stdio is the untagged McpServer variant — no `type` tag (schema-v1.19.0).
+        assert!(servers[0].get("type").is_none());
+        assert_eq!(servers[0]["name"], "fs");
+        assert_eq!(servers[0]["command"], "mcp-fs");
+        assert_eq!(servers[0]["args"], json!(["--root", "/tmp"]));
+        assert_eq!(servers[0]["env"], json!([{ "name": "TOKEN", "value": "x" }]));
+        assert_eq!(servers[1]["type"], "http");
+        assert_eq!(servers[1]["name"], "remote");
+        assert_eq!(servers[1]["url"], "https://mcp.example/api");
+
+        let events = sink.events.lock().unwrap();
+        let thread = events
+            .iter()
+            .find(|(leaf, _)| leaf == "session/thread")
+            .unwrap();
+        assert_eq!(thread.1["mcp_merged"], json!(["fs", "remote"]));
     }
 
     #[test]

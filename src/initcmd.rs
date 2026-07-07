@@ -136,6 +136,38 @@ const STOCK_HARNESS_PACKAGES: &[StockHarnessPackage] = &[
             "run = \"bin/adapter\"\n",
         ),
     },
+    // The generic ACP package (docs/handoffs/acp-harness.md A4). ONE adapter bin,
+    // one block per known ACP agent — the only per-agent difference is `command`
+    // + `args`, stamped into LANIUS_ACP_ARGV by the launcher. Adding the next ACP
+    // agent is appending a block here (a manifest-only edit — no new binary). Give
+    // an agent MCP servers with an `mcp` array on its block, e.g.:
+    //   [[harness.mcp]]  (or inline)  name="fs" command="mcp-fs" args=["--root","."]
+    StockHarnessPackage {
+        dir: "harness-acp",
+        binary: "harness-acp",
+        manifest: concat!(
+            "[[harness]]\n",
+            "name = \"goose\"\n",
+            "agent_noun = \"goose\"\n",
+            "run = \"bin/adapter\"\n",
+            "command = \"goose\"\n",
+            "args = [\"acp\"]\n",
+            "\n",
+            "[[harness]]\n",
+            "name = \"gemini\"\n",
+            "agent_noun = \"gemini\"\n",
+            "run = \"bin/adapter\"\n",
+            "command = \"gemini\"\n",
+            "args = [\"--experimental-acp\"]\n",
+            "\n",
+            "[[harness]]\n",
+            "name = \"codex-acp\"\n",
+            "agent_noun = \"codex-acp\"\n",
+            "run = \"bin/adapter\"\n",
+            "command = \"codex-acp\"\n",
+            "args = []\n",
+        ),
+    },
 ];
 
 /// ALL stock kits, seeded into <root>/kits so every root has the
@@ -735,11 +767,7 @@ fn seed_stock_harness_packages(root: &Root) -> Result<()> {
         let adapter = bin_dir.join("adapter");
         let source = exe_dir.join(format!("{}{}", pkg.binary, std::env::consts::EXE_SUFFIX));
         if source.is_file() {
-            if !adapter.exists() {
-                std::fs::copy(&source, &adapter).with_context(|| {
-                    format!("copying {} -> {}", source.display(), adapter.display())
-                })?;
-            }
+            refresh_adapter_if_stale(&source, &adapter)?;
             set_executable(&adapter)?;
         } else if !adapter.exists() {
             eprintln!(
@@ -748,6 +776,39 @@ fn seed_stock_harness_packages(root: &Root) -> Result<()> {
                 pkg_dir.display()
             );
         }
+    }
+    Ok(())
+}
+
+/// An adapter is stale if it's missing, or the source binary's mtime is newer
+/// than the installed adapter's. Any metadata error is treated as stale too —
+/// fail toward re-copying a correct binary rather than leaving a possibly-old
+/// one in place.
+fn is_adapter_stale(source: &Path, adapter: &Path) -> bool {
+    if !adapter.exists() {
+        return true;
+    }
+    let source_mtime = match std::fs::metadata(source).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return true,
+    };
+    let adapter_mtime = match std::fs::metadata(adapter).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return true,
+    };
+    source_mtime > adapter_mtime
+}
+
+/// Re-copy `source` over `adapter` if stale (missing or older than source).
+/// macOS-safe: never copies over a running/signed Mach-O in place (that
+/// SIGKILLs the next launch of the process using the old inode) — removes
+/// the old file first so the copy lands on a fresh inode. A no-op (existing
+/// inode left untouched) when the adapter is already up to date.
+fn refresh_adapter_if_stale(source: &Path, adapter: &Path) -> Result<()> {
+    if is_adapter_stale(source, adapter) {
+        let _ = std::fs::remove_file(adapter);
+        std::fs::copy(source, adapter)
+            .with_context(|| format!("copying {} -> {}", source.display(), adapter.display()))?;
     }
     Ok(())
 }
@@ -761,4 +822,113 @@ fn set_executable(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, perms)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod adapter_refresh_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, SystemTime};
+
+    /// A fresh, unique scratch dir under the system temp dir (no tempfile
+    /// crate dependency — this project has none).
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lanius-adapter-refresh-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn set_mtime(path: &Path, t: SystemTime) {
+        let f = fs::File::open(path).unwrap();
+        f.set_modified(t).unwrap();
+    }
+
+    fn inode(path: &Path) -> u64 {
+        fs::metadata(path).unwrap().ino()
+    }
+
+    #[test]
+    fn refreshes_when_source_is_newer_and_lands_on_a_fresh_inode() {
+        let dir = scratch_dir("newer");
+        let source = dir.join("harness-claude");
+        let adapter = dir.join("adapter");
+
+        fs::write(&source, b"old bytes").unwrap();
+        fs::write(&adapter, b"already installed").unwrap();
+
+        let base = SystemTime::now() - Duration::from_secs(60);
+        set_mtime(&source, base);
+        set_mtime(&adapter, base);
+
+        let adapter_ino_before = inode(&adapter);
+
+        // Source gets rebuilt/reinstalled: bump its mtime strictly newer.
+        fs::write(&source, b"new bytes").unwrap();
+        set_mtime(&source, base + Duration::from_secs(10));
+
+        refresh_adapter_if_stale(&source, &adapter).unwrap();
+
+        assert_ne!(
+            inode(&adapter),
+            adapter_ino_before,
+            "a stale adapter must be refreshed onto a fresh inode, never overwritten in place"
+        );
+        assert_eq!(fs::read(&adapter).unwrap(), b"new bytes");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leaves_up_to_date_adapter_untouched() {
+        let dir = scratch_dir("uptodate");
+        let source = dir.join("harness-claude");
+        let adapter = dir.join("adapter");
+
+        fs::write(&source, b"same bytes").unwrap();
+        fs::write(&adapter, b"same bytes").unwrap();
+
+        let base = SystemTime::now() - Duration::from_secs(60);
+        set_mtime(&source, base);
+        // Adapter mtime equal to source mtime => not stale (source must be
+        // strictly newer to trigger a refresh).
+        set_mtime(&adapter, base);
+
+        let adapter_ino_before = inode(&adapter);
+
+        refresh_adapter_if_stale(&source, &adapter).unwrap();
+
+        assert_eq!(
+            inode(&adapter),
+            adapter_ino_before,
+            "an up-to-date adapter must not be re-copied"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refreshes_when_adapter_is_missing() {
+        let dir = scratch_dir("missing");
+        let source = dir.join("harness-claude");
+        let adapter = dir.join("adapter");
+
+        fs::write(&source, b"fresh install").unwrap();
+        assert!(!adapter.exists());
+
+        refresh_adapter_if_stale(&source, &adapter).unwrap();
+
+        assert!(adapter.exists());
+        assert_eq!(fs::read(&adapter).unwrap(), b"fresh install");
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -321,3 +321,50 @@ driver-mode addition, not a table row. **Defer**; A2 records the id so nothing i
   fail-closed `-32601` for unmodeled server requests, and ACP permission
   elicitations relayed to `in/human/<owner>` with optionId mapping. A4-A6 remain
   deferred.
+- 2026-07-07 — **A4 decision: the MCP server list comes from the agent's own
+  manifest block (option 1), NOT a shared lanius-wide registry.** A4 left this one
+  fork open ("decide the source: a per-agent `[acp].mcp` list vs a shared elanus
+  registry"). Chosen: a per-agent list (an `[acp]` sub-table / `mcp` field) that
+  rides in the same `[[harness]]` block as the agent's `command`/`args`.
+  - **Why (grounded).** (1) A4's own Acceptance is "adding an ACP agent is a
+    manifest-only edit" — keeping the agent's MCP servers in the same block as its
+    spawn argv means onboarding stays one TOML edit; a separate registry would make
+    it two edits in two places. (2) There is no lanius-wide MCP registry to reuse.
+    `merged_mcp_server_names` (`src/codeagent.rs:1763`) is strictly *per-tool* and
+    reads each tool's OWN native config file — `claude_user_mcp_servers` /
+    `opencode_user_mcp_servers` / `codex_user_mcp_server_names`
+    (`src/codeagent.rs:1765-1767`). ACP agents are generic and share no such native
+    config convention, so option 2 would mean inventing new global state — more
+    machinery, less local, against "simplest thing that works." (3) Local +
+    inspectable: everything about an ACP agent (verb, spawn argv, MCP servers) sits
+    in one readable block.
+  - **Impl touch-points.** `HarnessDecl` (`src/manifest.rs:313`) — where A4 already
+    adds `command`/`args`; add the optional per-agent MCP list to the SAME struct
+    (nested `[acp]` sub-table or a flat `mcp` field), keeping
+    `#[serde(deny_unknown_fields)]`. Launcher env-stamping
+    (`src/codeagent.rs:~3616-3672`, the block that stamps the child env next to
+    `ENV_SUMMARY_FILE`/`ENV_ARGS`) — stamp the resolved MCP list as a JSON env
+    alongside the ACP argv. Adapter (`src/acp.rs`) — `run_acp_adapter` reads that env
+    and `drive_acp_session` builds `session/new`'s `mcpServers[]` from it,
+    **replacing the hardcoded `"mcpServers": []` at `src/acp.rs:289`**; record the
+    merged names on the `session/thread` obs (mirror `merged_mcp_server_names`,
+    `src/codeagent.rs:1762`). Stock package seeding — `STOCK_HARNESS_PACKAGES`
+    (`src/initcmd.rs:107`) + `seed_stock_harness_packages` (`src/initcmd.rs:648`); the
+    `acp` stock package's manifest TOML carries each agent block (`command`/`args` +
+    optional `mcp`).
+  - **Naming note (code vs this doc).** The env the driver already reads is
+    `LANIUS_ACP_ARGV` (`src/acp.rs:13`, `ENV_ACP_ARGV`), NOT `ELANUS_ACP_ARGV` — the
+    lanius rename made `LANIUS_` the canonical prefix (`ELANUS_` kept only as
+    back-compat). Stamp/read `LANIUS_ACP_ARGV` (and a `LANIUS_ACP_MCP` sibling) so
+    the implementer doesn't chase a stale name.
+  - **A5 is viable on this machine — validate against `goose`.** Probed the host:
+    `goose` (native ACP, `/Users/tim/.local/bin/goose`) and `codex`
+    (`/opt/homebrew/bin/codex`) are installed; `codex-acp` and `gemini` are NOT.
+    `codex` is the native (non-ACP) engine and its ACP wrapper `codex-acp` is absent,
+    so the real ACP target here is `goose acp` (the `acp` package's `goose` block:
+    `command="goose"`, `args=["acp"]`). Run A5 end-to-end against goose.
+  - **A6 stays DEFERRED — do not spec it in this pass.** It has no Acceptance clause
+    and needs its own design pass: ACP resume is a driver "load" mode (spawn →
+    `initialize` → `session/load` → `session/prompt`), NOT a row in the CLI
+    `resume_command_for` table (`src/codeagent.rs:7931`). A2 already records the
+    `sessionId` so nothing is lost; leave A6 for a dedicated handoff.
