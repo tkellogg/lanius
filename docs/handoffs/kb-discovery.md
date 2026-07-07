@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -142,6 +142,8 @@ findable.
   ("tell the agent").
 
 ## Log
+- 2026-07-07 — Confirmed shipped+merged on main (sprint-4 KB arc, merged
+  `80a23c7`); status flipped to `done` (was stale at `planned`). 559 tests green.
 - 2026-07-02 — Decomposed from knowledge-base.md B7 by Opus (planner) under
   Fable. Grounded against the sprint-4 worktree: `packages::discover`
   (`src/packages.rs:67`) is the whole-universe read (no visibility filter) vs

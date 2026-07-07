@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable; Tim's design review folded in 2026-07-02
 last-updated: 2026-07-02
 ---
@@ -270,6 +270,9 @@ before the checker that validates them, script rung before the LLM pipeline
   (the model-tiering rules), Tim's second-level model notes.
 
 ## Log
+- 2026-07-07 — Confirmed shipped+merged on main (all four build handoffs — kb-core,
+  kb-search, kb-groundskeeper, kb-discovery — merged at `80a23c7`); status flipped
+  to `done` (was stale at `planned`). 559 tests green.
 - 2026-07-02 — Created from Tim's `_questions.md` sprint-3 pull + journey
   14, as a design-review document (implementation = sprint 4). Grounded
   against the worktree: `meta` on `ContextBlock` is unused free JSON (the

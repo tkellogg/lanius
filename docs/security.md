@@ -951,14 +951,30 @@ honest about it (`"egress": "https-only"`). **Live-verified** against
 `sandbox-exec` on macOS 26.5 (`seatbelt_https_egress_allows_tls_blocks_other`,
 `src/sandbox.rs`): a caged `curl https://chatgpt.com/` reaches the API (HTTP 403,
 i.e. connected) while a caged `:80` connect is refused.
-The ONE remaining leg is a **full live driver turn**: running
-`run_codex_app_server_capture` against a live codex end-to-end (real turn →
-elicited approval → answer) — no longer blocked by the cage (the egress hole is
-proven), just not yet executed through the whole daemon/bus stack. So M2/M3/M4 are
-**verified end-to-end at the driver/protocol level (uncaged probe + in-process
-mock, incl. the MCP-elicitation gate driven through `drive_codex_app_server`) with
-the cage's model-egress now live-proven**, leaving only the one full live-driver
-turn as an execution (not a design or network) gap.
+**The full live driver turn WAS executed (2026-07-02/03).** A headless codex
+worker was driven end-to-end through `run_codex_app_server_capture` — real turn →
+elicited approval → answer — via a real daemon/bus/ledger stack (`elanus code
+codex --headless --app-server`, installed `codex-cli 0.142.5`), documented in
+`docs/appserver-spike/README.md`. Both branches ran: **ALLOW**
+(`docs/appserver-spike/e2e-allow-obs-trail.jsonl`, session `code-ec0491b6` — the
+MCP tool call paused, `elanus answer <id> allow` mapped to `{action:"accept"}`,
+the tool ran, the turn completed) and **DENY**
+(`docs/appserver-spike/e2e-deny-obs-trail.jsonl`, session `code-ca63eb85` —
+`elanus answer <id> deny` mapped to `{action:"decline"}`, codex reported the
+rejection, the turn still completed, the tool never ran). Both runs'
+`session/start` stamped the elicited posture (`"approvals":"elicited","sandbox":
+"workspace-write"`, cage `egress:https-only`, `enforced:true`), never
+`danger-full-access`. So M2/M3/M4 are now verified end-to-end at BOTH the
+driver/protocol level (uncaged probe + in-process mock, incl. the
+MCP-elicitation gate driven through `drive_codex_app_server`) AND the live
+composed level (real daemon/bus stack, both ALLOW and DENY) — no execution gap
+remains.
+
+**Known residuals (recorded, not blocking; see docs/handoffs/codex-app-server.md
+Log 2026-07-07):** the DENY branch's obs decision record logs `granted:true` (a
+cosmetic label bug — the wire behavior is correct, the tool call still
+declines); session-scoped coding packages lack the `obs/harness/ledger/emit`
+publish grant, producing benign denied-obs noise in the trail.
 
 ## 25. [FIXED 2026-07-02] The loopback network cage leaked all egress
 

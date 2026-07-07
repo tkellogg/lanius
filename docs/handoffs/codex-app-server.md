@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -190,6 +190,16 @@ byte-identical to today. `cargo test` green.
   bit 1 (per-profile opt-in, no flag day).
 
 ## Log
+- 2026-07-07 — Confirmed shipped+merged on main (M1–M4 all landed, the full live
+  e2e composed run also executed — see `docs/appserver-spike/README.md` +
+  `e2e-allow-obs-trail.jsonl`/`e2e-deny-obs-trail.jsonl`, merged in `039d640`
+  "s4-codex"; `docs/security.md` entry 24 updated to match); status flipped to
+  `done` (was stale at `planned`). Tracked residuals (minor, non-blocking, not
+  previously recorded outside the merge commit message): the DENY branch's obs
+  decision record logs `granted:true` (cosmetic label bug — the wire behavior is
+  correct, the tool call still declines); session-scoped coding packages lack the
+  `obs/harness/ledger/emit` publish grant, producing benign denied-obs noise in
+  the trail.
 - 2026-07-02 — **TWO VERIFIER HIGHs CLOSED (fixer).**
   - **(HIGH 1) The cage no longer blocks codex's model API.** The loopback cage
     (`codex_headless_cage`) previously cut ALL egress including codex's own model

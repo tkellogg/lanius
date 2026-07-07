@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -182,6 +182,8 @@ property, D2). `cargo test` green.
   `.claude/skills/handoff-workflow/SKILL.md:81-96`.
 
 ## Log
+- 2026-07-07 — Confirmed shipped+merged on main (sprint-4 KB arc, merged
+  `80a23c7`); status flipped to `done` (was stale at `planned`). 559 tests green.
 - 2026-07-02 — Decomposed from knowledge-base.md B1/B3/B4 by Opus (planner) under
   Fable. Grounded against the sprint-4 worktree: `[[harness]]` at
   `src/manifest.rs:34` is the marker precedent; `ContextBlock.meta`

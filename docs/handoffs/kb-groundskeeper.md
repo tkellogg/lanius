@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -139,6 +139,8 @@ logged; the whole exchange is reconstructable from the obs trail.
   `src/manifest.rs:87-92` (`[config]` `agent_tunable`).
 
 ## Log
+- 2026-07-07 — Confirmed shipped+merged on main (sprint-4 KB arc, merged
+  `80a23c7`); status flipped to `done` (was stale at `planned`). 559 tests green.
 - 2026-07-02 — Decomposed from knowledge-base.md B5/B6 by Opus (planner) under
   Fable. Grounded against the sprint-4 worktree: work-estimation's opt-in is
   lighter than this pipeline needs (no profile toggle, no setup verb; only its

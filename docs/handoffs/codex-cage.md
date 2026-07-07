@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus (planner) under Fable
 last-updated: 2026-07-02
 ---
@@ -136,6 +136,8 @@ false` (never a silent "on"). `cargo test` green.
   [codex-app-server.md](codex-app-server.md).
 
 ## Log
+- 2026-07-07 — Confirmed shipped+merged on main (M1–M3 all landed, merged in
+  `039d640` "s4-codex"); status flipped to `done` (was stale at `planned`).
 - 2026-07-03 — Codex 0.142 startup write regression found in the caged headless
   paths: the generated session `CODEX_HOME` is not just read material; codex
   writes startup/client state there and exits under a read-only home. Adjusted

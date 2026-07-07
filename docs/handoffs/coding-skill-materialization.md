@@ -1,5 +1,5 @@
 ---
-status: implemented
+status: done
 author: Claude Opus 4.8 in Claude Code on Elanus
 last-updated: 2026-06-27
 ---
@@ -116,3 +116,18 @@ scratch (and the symlinks, not the secrets) vanishes at launch exit.
 - Per-skill in-harness permission scoping — homogeneous authority; profile
   visibility is the gate.
 - A union/overlay FS — explicitly rejected.
+
+## Log
+- 2026-07-07 — Confirmed shipped+merged on main; the core helpers
+  (`take_profile_flag`, `visible_skill_packages`, `link_skill_packages`,
+  `build_codex_skills_home`, `build_claude_skill_plugin`) are present in
+  `src/codeagent.rs` and survived the PH4 pluggable-coding-harness refactor
+  (`3720df3` deleted the `trait Harness`/`HARNESSES` registry and moved dispatch
+  to packages; this handoff's materialization logic was untouched by that
+  migration). Status flipped to `done` (was stale at `implemented`). The two
+  residuals below are still open and worth tracking (previously recorded only
+  under "Known residuals" here, not elsewhere): the `--provider` + skills
+  interaction is unverified in combination, and the CODEX_HOME-mirror comment
+  in `src/codeagent.rs` still cites codex-cli 0.141.0 while the repo's pinned
+  version is now 0.142.5 (confirmed via `docs/appserver-spike/README.md`), which
+  may support a lighter `AGENTS_HOME`/`skills.config` lever — worth a review.

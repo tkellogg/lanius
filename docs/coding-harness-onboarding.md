@@ -16,12 +16,14 @@ actor). You write a small adapter binary, drop it in your elanus root's `package
 with an `elanus.toml`, grant it, and `elanus code <tool>` runs it. No fork of elanus,
 no PR.
 
-> **Status:** the `[[harness]]` manifest + dispatch + the `elanus-harness` adapter SDK
-> are speced in [handoffs/pluggable-coding-harness.md](handoffs/pluggable-coding-harness.md)
-> (why: [journeys/13-adding-a-harness-without-forking.md](journeys/13-adding-a-harness-without-forking.md))
-> and not yet implemented. This is the canonical recipe for that one way. (The three
-> built-ins are currently in-tree trait impls; they are migrating to packages — you do
-> not write a trait.)
+> **Status:** SHIPPED. The `[[harness]]` manifest + package dispatch + the
+> `lanius-harness` adapter SDK landed as PH1–PH4 of
+> [handoffs/pluggable-coding-harness.md](handoffs/pluggable-coding-harness.md)
+> (why: [journeys/13-adding-a-harness-without-forking.md](journeys/13-adding-a-harness-without-forking.md));
+> the old `Harness` trait + `HARNESSES` registry were **deleted** — dispatch is
+> package-based. This is the canonical recipe. The three built-ins
+> (claude/codex/opencode) are themselves stock harness packages seeded by
+> `lanius init` — you do not write a trait.
 
 ## What you build
 
