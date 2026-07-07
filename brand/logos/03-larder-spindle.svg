@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>lanius — larder spindle (events impaled on the thorn)</title>
+  <!-- impaled events; set to currentColor for a one-color mark -->
+  <g fill="var(--accent, #E5484D)">
+    <circle cx="32" cy="18" r="5.5"/>
+    <circle cx="32" cy="33" r="5.5"/>
+    <circle cx="32" cy="48" r="5.5"/>
+  </g>
+  <!-- the thorn skewer, drawn over the events -->
+  <path fill="currentColor" d="M32 4 L36.5 55 L27.5 55 Z"/>
+  <!-- base: the ledger it stands on -->
+  <rect fill="currentColor" x="20" y="55" width="24" height="5" rx="2.5"/>
+</svg>

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 231 76">
+  <title>lanius — wordmark</title>
+  <g fill="none" stroke="currentColor" stroke-width="11" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M16 11 L16 62.5"/>
+    <circle cx="50" cy="48" r="14.5"/>
+    <path d="M64.5 33.5 V62.5"/>
+    <path d="M84 62.5 V33.5 M84 46 C84 39 89.5 33.5 98 33.5 C106.5 33.5 112 39 112 46 V62.5"/>
+    <path d="M127.5 33.5 V62.5"/>
+    <path d="M143 33.5 V50 C143 57.5 149 62.5 157 62.5 C165 62.5 171 57.5 171 50 V33.5"/>
+    <path stroke-width="10.5" d="M213.5 38.5 C211 35 206.5 33.5 201.5 33.5 C194.5 33.5 190 36.5 190 41 C190 45.5 194.5 47 201.5 48 C208.5 49 213 50.5 213 55 C213 59.5 208 62.5 201.5 62.5 C196.5 62.5 192 61 189.5 57.5"/>
+  </g>
+  <!-- the tittle of the i is the 01 thorn, verbatim, scaled down -->
+  <path fill="#E5484D" style="fill:var(--accent, #E5484D)" transform="translate(117.3 5) scale(0.375)" d="M16 56 C16 34 30 16 54 8 C40 24 34 38 34 56 Z"/>
+</svg>

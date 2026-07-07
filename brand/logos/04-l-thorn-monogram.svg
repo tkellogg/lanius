@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="currentColor">
+  <title>lanius — l monogram with thorn</title>
+  <!-- the stem: lowercase l -->
+  <path d="M26 58 V14 C26 8 29 4.5 32 4 C35 4.5 38 8 38 14 V58 A6 6 0 0 1 26 58 Z"/>
+  <!-- the thorn, sprouting from the stem -->
+  <path d="M38 24 C46 25.5 52 30 55.5 37 C50 35.5 44 36 38 39 Z"/>
+</svg>

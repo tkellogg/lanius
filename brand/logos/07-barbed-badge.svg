@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240">
+  <title>lanius — barbed wire badge sticker</title>
+  <!-- die-cut disc with keyline -->
+  <circle cx="120" cy="120" r="112" fill="#FFFFFF" stroke="#D9DDE1" stroke-width="2"/>
+  <!-- barbed wire ring -->
+  <circle cx="120" cy="120" r="90" fill="none" stroke="#16181D" stroke-width="7"/>
+  <g stroke="#16181D" stroke-width="5.5" stroke-linecap="round">
+    <g transform="rotate(30 120 120)"><path d="M112 22 L128 38 M128 22 L112 38"/></g>
+    <g transform="rotate(90 120 120)"><path d="M112 22 L128 38 M128 22 L112 38"/></g>
+    <g transform="rotate(150 120 120)"><path d="M112 22 L128 38 M128 22 L112 38"/></g>
+    <g transform="rotate(210 120 120)"><path d="M112 22 L128 38 M128 22 L112 38"/></g>
+    <g transform="rotate(270 120 120)"><path d="M112 22 L128 38 M128 22 L112 38"/></g>
+    <g transform="rotate(330 120 120)"><path d="M112 22 L128 38 M128 22 L112 38"/></g>
+  </g>
+  <!-- the shrike head -->
+  <circle cx="112" cy="120" r="44" fill="#C9CFD6" stroke="#16181D" stroke-width="4"/>
+  <path fill="#16181D" d="M74 100 C94 85 134 85 152 100 L152 123 C134 108 94 108 74 123 Z"/>
+  <circle cx="127" cy="101" r="9" fill="#FFFFFF"/>
+  <circle cx="128.5" cy="101" r="4.5" fill="#16181D"/>
+  <circle cx="126" cy="98.5" r="1.8" fill="#FFFFFF"/>
+  <path fill="#16181D" d="M142.8 100.9 C164.8 97.3 182.4 105.3 189 118.5 C191.2 125.1 187.5 131.7 179.5 133.9 C181.7 126.6 178.7 120.7 172.1 117.1 C164.8 122.6 155.3 124.7 146.5 123.8 Z"/>
+</svg>

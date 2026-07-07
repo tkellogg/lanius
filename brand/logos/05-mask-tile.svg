@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="currentColor">
+  <title>lanius — mask tile app icon</title>
+  <!-- tile above the mask cut -->
+  <path d="M14 0 H50 A14 14 0 0 1 64 14 V18 L0 24 V14 A14 14 0 0 1 14 0 Z"/>
+  <!-- eye in the cut, riding high in the band -->
+  <circle cx="41" cy="27.2" r="5.4"/>
+  <!-- tile below the mask cut -->
+  <path d="M0 38 L64 32 V50 A14 14 0 0 1 50 64 H14 A14 14 0 0 1 0 50 Z"/>
+</svg>

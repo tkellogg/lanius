@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="currentColor">
+  <title>lanius — masked shrike head</title>
+  <!-- crown: head circle above the mask band -->
+  <path d="M10.9 26 A20 20 0 0 1 49.1 26 Z"/>
+  <!-- eye, floating in the negative-space mask -->
+  <circle cx="37" cy="31" r="3.4"/>
+  <!-- cheek + hooked beak below the band -->
+  <path d="M10.4 36 L46 36 C53 35.6 59.5 37 62.5 40.5 C63.5 44 61 47.5 56.5 48.5 C57.5 45.5 56 43 53 41.5 C50.5 44.5 47.5 46.5 44.3 46 A20 20 0 0 1 10.4 36 Z"/>
+</svg>
