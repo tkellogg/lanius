@@ -18,6 +18,11 @@ Grounded in the current UI (recon 2026-07-07): `ui/web/src/App.tsx` (2690 lines)
 **load-bearing e2e selector contract** (`ui/web/test/ui.spec.mjs`, ~65+ stable
 ids) that this redesign must preserve or co-migrate.
 
+> **Voice & copy is a companion:** [web-ui-copy.md](web-ui-copy.md). The app also
+> reads too wordy and in a private vocabulary — do the plain-language overhaul in
+> the same pass (delete the cockpit/plain toggle; name things as they are). These
+> are text-only changes and don't touch the e2e *id* contract.
+
 ---
 
 ## The one big idea: the thorn IS the algedonic channel
