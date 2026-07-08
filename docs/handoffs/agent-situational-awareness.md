@@ -1,5 +1,5 @@
 ---
-status: M1-M3 done (intent-in-note · baseline intent · tri-state broker liveness); M4 (sitrep ledger) + M5 (watch/ask) are follow-up
+status: M1-M5 done (intent-in-note · baseline intent · tri-state broker liveness · sitrep ledger · watch/ask)
 author: Claude Opus 4.8 (planner) — written as a debrief + proposal
 last-updated: 2026-07-07
 ---
@@ -236,3 +236,17 @@ Requirements:
   `conn_updated_at` column is written but unused (no time-grace escalation, since
   the pid probe subsumes it). M4 (`lanius code sitrep` ledger) + M5 (`watch`/`ask`)
   deferred, noted in-code.
+- 2026-07-08 (Opus impl + xhigh verify + orchestrator fix): **M4 + M5 shipped.**
+  M4: a `branch` column links a session to its worktree/branch; `classify_outcome`
+  (active/merged/abandoned/wip-stranded, safety-biased — unshipped work always beats
+  "merged/safe"); `lanius code sitrep` lists every session + loose worktree with
+  intent, tri-state liveness, branch, and outcome (the "account for all work" view
+  that replaces git archaeology). M5: `lanius code watch <session>` (readable obs
+  digest, not raw frames); `lanius code ask` gains a liveness pre-check (fail fast
+  on a dead/unknown target, still ask a possible split brain). Orchestrator caught +
+  fixed a real classification bug driving sitrep against the live root:
+  `classify_liveness(None, None)` (no pid + no broker view — a legacy/beacon-less or
+  long-idle session) defaulted to **Connected**; corrected to **Disconnected(Unknown)**
+  — absence of evidence is not evidence of life (still never Dead, so reap-safety is
+  unchanged). Verified live: 1 connected (the running session), 170 stale sessions
+  now honestly "disconnected (unknown)". 567 tests.

@@ -346,6 +346,8 @@ Commands:
   lanius code project                                  refresh the trace->sqlite session projection
   lanius code sessions [--json]                        list coding sessions + stats
   lanius code session <id> [--json]                   one session: stats, timeline, resume command
+  lanius code sitrep [--json]                          account for ALL work: every session + loose worktree, with outcome
+  lanius code watch <session> [--count N] [--timeout SECS]  tail a readable digest of a session's live activity
   lanius code help                                    show this help
   lanius code list                                    list supported launch tools
   lanius code hook <event>                            internal hook bridge"
@@ -2413,6 +2415,61 @@ pub fn ask_cmd(root: &Root, args: &[String]) -> Result<()> {
         );
     }
 
+    // M5 liveness pre-check (situational-awareness): `ask` BLOCKS for a live reply,
+    // so asking a DEAD target just hangs to the timeout for no reason. Classify the
+    // target's tri-state liveness first (reusing the M3 classifier) and fail fast on
+    // a confirmed-dead session (or one with no record) — but NOT on a disconnected
+    // split brain, which may still be running and able to answer. Point the caller at
+    // async `deliver` instead of a doomed block.
+    match codesession::session_liveness(root, &target) {
+        Some(codesession::Liveness::Dead) => {
+            let msg = format!(
+                "session {target} is not live (confirmed dead — its process is gone). \
+                 It cannot answer a blocking `ask`; use `lanius code deliver {target} \"…\"` \
+                 to leave async mail it will see if it ever resumes."
+            );
+            if want_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "answered": false,
+                        "session": target,
+                        "reason": "dead",
+                        "message": msg,
+                    }))?
+                );
+            } else {
+                println!("{msg}");
+            }
+            return Ok(());
+        }
+        None => {
+            let msg = format!(
+                "session {target} is not live — there is no record of it (unknown or never \
+                 launched here; it may be a split brain on another host). A blocking `ask` \
+                 would hang; use `lanius code deliver {target} \"…\"` to leave async mail."
+            );
+            if want_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "answered": false,
+                        "session": target,
+                        "reason": "unknown",
+                        "message": msg,
+                    }))?
+                );
+            } else {
+                println!("{msg}");
+            }
+            return Ok(());
+        }
+        // Connected → ask normally. Disconnected(SplitBrain/Unknown) → it MAY still be
+        // running (M3 safety rule: never treat a disconnect as death), so we still
+        // send and block for the timeout rather than refusing to ask.
+        Some(_) => {}
+    }
+
     // Send the question threaded on a FRESH correlation, captured so we can match
     // the worker's completion reply on our own inbox (route_completion echoes it).
     let (_id, correlation) =
@@ -3567,6 +3624,14 @@ fn launch_external_harness(
         // it dies (reap_dead_members keys on code_room_members) — parity with built-ins.
         let _ = codesession::set_room(root, &session, &room);
         let _ = codesession::join_room(root, &room, &session, &agent, std::process::id() as i32);
+
+        // M4 (situational-awareness): record the git BRANCH this session is on, so
+        // the session ↔ worktree/branch link is durable for `lanius code sitrep` to
+        // derive a terminal outcome later. Detected once at launch from the workdir;
+        // best-effort (a launch outside a git repo just records no branch).
+        if let Some(branch) = git_current_branch(&workdir) {
+            let _ = codesession::set_branch(root, &session, &branch);
+        }
 
         // M2 (situational-awareness): record the launch TASK as this session's
         // baseline intent — what it was asked to do, known even for a harness that
@@ -9374,16 +9439,471 @@ fn beacon_addr(root: &Root) -> Result<std::net::SocketAddr> {
     crate::bus::connect_addr(&cfg).context("unparseable bus bind address")
 }
 
-// ── M4/M5 are a deliberate FOLLOW-UP (agent-situational-awareness handoff) ─────
+// ── M4: `lanius code sitrep` — account for all the work in one view ───────────
 //
-// This change lands M1 (intent in the ambient note), M2 (never-blank baseline
-// intent), and M3 (tri-state, broker-driven liveness — the correctness-critical
-// reap-only-on-confirmed-dead rule). DEFERRED to a follow-up, per scope:
-//   • M4 — the durable session ↔ worktree/branch ↔ outcome ledger and
-//     `lanius code sitrep` (turns Incident B's git archaeology into a query).
-//   • M5 — `lanius code watch <session>` (readable live-activity digest) and the
-//     `ask` liveness pre-check (fail fast on a dead target instead of blocking).
-// Both are additive on top of the intent + tri-state-liveness substrate here.
+// M1 (intent in the ambient note), M2 (never-blank baseline intent), and M3
+// (tri-state, broker-driven liveness) shipped earlier on this branch. M4 adds the
+// durable session ↔ worktree/branch ↔ outcome ledger and the `sitrep` view that
+// renders it; M5 adds `watch` + the `ask` liveness pre-check. All additive on top
+// of the intent + tri-state-liveness substrate.
+
+/// Run `git` in a workdir and return trimmed stdout on success, None otherwise. No
+/// shell (std::process::Command), so a workdir path is never interpolated. Used by
+/// the sitrep git enrichment; every call is best-effort (a non-repo/absent-git dir
+/// just yields None, degrading the outcome to "unknown" rather than erroring).
+fn git_in(workdir: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The branch currently checked out in `workdir` (M4), or None outside a git repo /
+/// in detached HEAD (`git rev-parse` prints "HEAD"). Recorded on the session at
+/// launch as the branch it works on.
+fn git_current_branch(workdir: &Path) -> Option<String> {
+    let b = git_in(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if b.is_empty() || b == "HEAD" {
+        None // no branch / detached HEAD — nothing durable to record
+    } else {
+        Some(b)
+    }
+}
+
+/// The repo's default branch as seen from `workdir` (M4): `origin/HEAD`'s target,
+/// else whichever of `main`/`master` exists. None when neither can be determined
+/// (the outcome then degrades to "unknown" rather than guessing wrong).
+fn git_default_branch(workdir: &Path) -> Option<String> {
+    if let Some(sym) = git_in(workdir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+        // "origin/main" → "main"
+        if let Some((_, b)) = sym.split_once('/') {
+            if !b.is_empty() {
+                return Some(b.to_string());
+            }
+        }
+    }
+    for cand in ["main", "master"] {
+        if git_in(workdir, &["rev-parse", "--verify", "--quiet", cand]).is_some() {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
+
+/// Does `workdir` have uncommitted changes (M4)? `git status --porcelain` non-empty.
+/// True is the conservative answer only on a real dirty tree; a git error reads as
+/// clean (the caller's other signals still classify it).
+fn git_dirty(workdir: &Path) -> bool {
+    git_in(workdir, &["status", "--porcelain"])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Count of commits on `branch` not yet in `default` (M4): `git rev-list --count
+/// default..branch`. `Some(0)` ⇒ fully merged (nothing unique); `Some(n>0)` ⇒ has
+/// unmerged commits; `None` ⇒ couldn't tell (missing branch/ref). Drives both the
+/// `branch_merged` and `has_unmerged_commits` inputs to `classify_outcome`.
+fn git_unmerged_count(workdir: &Path, branch: &str, default: &str) -> Option<u64> {
+    let range = format!("{default}..{branch}");
+    git_in(workdir, &["rev-list", "--count", &range])
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Loose worktrees of the repo containing `workdir` (M4): every `git worktree list`
+/// entry as `(path, branch)`. `branch` is None for a detached/bare worktree. Empty
+/// on any error. Used to surface worktrees no live session accounts for (Incident B).
+fn git_worktrees(workdir: &Path) -> Vec<(String, Option<String>)> {
+    let Some(text) = git_in(workdir, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cur_path: Option<String> = None;
+    let mut cur_branch: Option<String> = None;
+    let flush = |p: &mut Option<String>, b: &mut Option<String>, out: &mut Vec<_>| {
+        if let Some(path) = p.take() {
+            out.push((path, b.take()));
+        } else {
+            *b = None;
+        }
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            // A new record begins; flush the previous.
+            flush(&mut cur_path, &mut cur_branch, &mut out);
+            cur_path = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            // "refs/heads/foo" → "foo"
+            let b = rest.trim().strip_prefix("refs/heads/").unwrap_or(rest.trim());
+            cur_branch = Some(b.to_string());
+        }
+    }
+    flush(&mut cur_path, &mut cur_branch, &mut out);
+    out
+}
+
+/// Compute a session's/worktree's terminal outcome (M4) by running git in `workdir`
+/// and folding the result with its `liveness` through `codesession::classify_outcome`.
+/// Best-effort: when the default branch can't be resolved the git signals default to
+/// "not merged, nothing unshipped", so a live session still reads `active` and a dead
+/// one reads `abandoned` rather than erroring.
+fn compute_outcome(
+    workdir: &str,
+    branch: Option<&str>,
+    liveness: codesession::Liveness,
+) -> codesession::Outcome {
+    let wd = Path::new(workdir);
+    let dirty = git_dirty(wd);
+    let (branch_merged, has_unmerged) = match (branch, git_default_branch(wd)) {
+        (Some(b), Some(def)) => match git_unmerged_count(wd, b, &def) {
+            // On the default branch itself (b == def), count is 0 → merged.
+            Some(0) => (true, false),
+            Some(_) => (false, true),
+            None => (false, false), // couldn't compare — treat as nothing to merge
+        },
+        _ => (false, false),
+    };
+    codesession::classify_outcome(liveness, branch_merged, has_unmerged, dirty)
+}
+
+/// One human-readable liveness phrase for the sitrep view.
+fn liveness_phrase(l: codesession::Liveness) -> &'static str {
+    use codesession::{DisconnectKind, Liveness};
+    match l {
+        Liveness::Connected => "connected",
+        Liveness::Disconnected(DisconnectKind::SplitBrain) => {
+            "disconnected (possible split brain — may still be running)"
+        }
+        Liveness::Disconnected(DisconnectKind::Unknown) => "disconnected (unknown — unconfirmable)",
+        Liveness::Dead => "dead",
+    }
+}
+
+/// `lanius code sitrep [--json]` (M4): ONE view accounting for every coding session
+/// AND every loose worktree/branch — intent, liveness, workdir/branch, and derived
+/// outcome. Replaces the git archaeology (Incident B): a dead session whose branch
+/// merged reads "merged — safe to remove"; a live one reads "active". Runs git in
+/// each workdir to derive the outcome; a non-repo workdir just shows "unknown".
+pub fn sitrep_cmd(root: &Root, args: &[String]) -> Result<()> {
+    let want_json = args.iter().any(|a| a == "--json");
+    let sessions = codesession::sitrep_sessions(root);
+
+    // Gather loose worktrees from any repo a recorded session lives in, so a worktree
+    // NO session accounts for still shows up. Dedup by canonical path; remember which
+    // paths a session already covers so we only list the genuinely loose ones.
+    let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in &sessions {
+        covered.insert(canonical_workdir(Path::new(&s.workdir)).to_string_lossy().into_owned());
+    }
+    let mut loose: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen_wt: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in &sessions {
+        for (path, branch) in git_worktrees(Path::new(&s.workdir)) {
+            let canon = canonical_workdir(Path::new(&path)).to_string_lossy().into_owned();
+            if covered.contains(&canon) || !seen_wt.insert(canon) {
+                continue; // a session already accounts for it, or already listed
+            }
+            loose.push((path, branch));
+        }
+    }
+
+    // Sessions first, then loose worktrees (as ownerless, dead-equivalent). The git
+    // outcome fold runs once per session/worktree, in whichever render path is taken.
+    if want_json {
+        let session_rows: Vec<Value> = sessions
+            .iter()
+            .map(|s| {
+                let outcome = compute_outcome(&s.workdir, s.branch.as_deref(), s.liveness);
+                json!({
+                    "kind": "session",
+                    "session": s.session,
+                    "tool": s.agent_noun,
+                    "workdir": s.workdir,
+                    "branch": s.branch,
+                    "intent": s.intent,
+                    "last_active": s.last_active,
+                    "last_active_human": humanize_since(&s.last_active),
+                    "liveness": liveness_phrase(s.liveness),
+                    "outcome": outcome.label(),
+                })
+            })
+            .collect();
+        let loose_rows: Vec<Value> = loose
+            .iter()
+            .map(|(path, branch)| {
+                // No session owns it → treat as dead for outcome purposes.
+                let outcome =
+                    compute_outcome(path, branch.as_deref(), codesession::Liveness::Dead);
+                json!({
+                    "kind": "worktree",
+                    "session": Value::Null,
+                    "workdir": path,
+                    "branch": branch,
+                    "liveness": "no session (unaccounted worktree)",
+                    "outcome": outcome.label(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "sessions": session_rows,
+                "loose_worktrees": loose_rows,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if sessions.is_empty() && loose.is_empty() {
+        println!("(no coding sessions or worktrees to account for)");
+        return Ok(());
+    }
+    println!("SITUATION REPORT — every coding session and loose worktree\n");
+    if !sessions.is_empty() {
+        println!("SESSIONS:");
+        for s in &sessions {
+            let outcome = compute_outcome(&s.workdir, s.branch.as_deref(), s.liveness);
+            let branch = s.branch.as_deref().unwrap_or("(no branch)");
+            let intent = s
+                .intent
+                .as_deref()
+                .map(clip_task)
+                .unwrap_or_else(|| "(no stated intent)".to_string());
+            println!(
+                "  {}  [{}]  {}",
+                s.session,
+                liveness_phrase(s.liveness),
+                outcome.label(),
+            );
+            println!(
+                "      branch {branch} in {}  ·  last active {}",
+                s.workdir,
+                humanize_since(&s.last_active),
+            );
+            println!("      intent: {intent}");
+        }
+    }
+    if !loose.is_empty() {
+        println!("\nLOOSE WORKTREES (no session accounts for these):");
+        for (path, branch) in &loose {
+            let outcome = compute_outcome(path, branch.as_deref(), codesession::Liveness::Dead);
+            let branch = branch.as_deref().unwrap_or("(detached)");
+            println!("  {path}  branch {branch}  →  {}", outcome.label());
+        }
+    }
+    Ok(())
+}
+
+// ── M5: `lanius code watch <session>` — a readable live-activity digest ───────
+//
+// "Spy on what it's doing" in one command. Subscribe the target's obs subtree
+// `obs/agent/<noun>/<session>/#` and render ONE legible activity line per event —
+// assistant messages and tool calls summarized, not raw frames. Authenticates as
+// the human on the command line (owner credential), the same identity `lanius bus
+// sub` presents; homogeneous authority means watching a sibling is fine (the point
+// is legibility, not permission).
+
+/// Render ONE obs frame as a legible activity line, or None to skip it (noise like
+/// reasoning deltas). Pure over `(leaf_suffix, payload)` so it is unit-testable
+/// without a broker. `leaf` is the topic tail after `.../<session>/` (e.g.
+/// `assistant/message`, `tool/Bash/call`, `session/idle`).
+fn watch_digest_line(leaf: &str, payload: &Value) -> Option<String> {
+    let text_of = |key: &str| -> Option<String> {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|s| clip(s.trim(), 200))
+            .filter(|s| !s.is_empty())
+    };
+    // tool/<name>/{call,result}
+    if let Some(rest) = leaf.strip_prefix("tool/") {
+        let (name, phase) = match rest.rsplit_once('/') {
+            Some((n, p)) => (n, p),
+            None => (rest, ""),
+        };
+        // Prefer a concrete summary: the command, the primary arg, or the file.
+        let detail = text_of("command")
+            .or_else(|| text_of("query"))
+            .or_else(|| {
+                payload
+                    .get("arguments")
+                    .or_else(|| payload.get("args"))
+                    .or_else(|| payload.get("input"))
+                    .map(|v| clip(&compact_value(v), 200))
+                    .filter(|s| !s.is_empty() && s != "null")
+            })
+            .unwrap_or_default();
+        let arrow = if phase == "result" { "tool <-" } else { "tool ->" };
+        let name = name.trim_matches('/');
+        return Some(if detail.is_empty() {
+            format!("{arrow} {name}")
+        } else {
+            format!("{arrow} {name}  {detail}")
+        });
+    }
+    match leaf {
+        "assistant/message" => text_of("text").map(|t| format!("says: {t}")),
+        // Reasoning is inner monologue — noisy; skip it in the digest.
+        "assistant/reasoning" => None,
+        "intent" => text_of("intent").map(|t| format!("intent: {t}")),
+        "file/write" => Some("wrote files".to_string()),
+        "session/start" => Some("session started".to_string()),
+        "session/resume" => Some("session resumed".to_string()),
+        "session/idle" => Some("idle (turn complete)".to_string()),
+        "session/stop" => Some("session stopped".to_string()),
+        "status" => match payload.get("connected").and_then(Value::as_bool) {
+            Some(true) => Some("(bus: connected)".to_string()),
+            Some(false) => Some("(bus: disconnected)".to_string()),
+            None => None,
+        },
+        "turn/completed" => Some("turn completed".to_string()),
+        "turn/failed" => Some("turn failed".to_string()),
+        // Unmodeled leaves: show the leaf itself so nothing is silently dropped.
+        other => Some(format!("· {other}")),
+    }
+}
+
+/// Compact one JSON value to a short single-line string for the watch digest.
+fn compact_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// `lanius code watch <session> [--count N] [--timeout SECS]` (M5): tail a READABLE
+/// digest of a session's live obs. Resolves the target's obs noun from its record,
+/// subscribes `obs/agent/<noun>/<session>/#`, and prints one legible activity line
+/// per event via `watch_digest_line`. `--count`/`--timeout` bound the watch (so a
+/// script/test can observe a fixed window); without them it streams until Ctrl-C.
+pub fn watch_cmd(root: &Root, args: &[String]) -> Result<()> {
+    let mut target = String::new();
+    let mut count: Option<u64> = None;
+    let mut timeout_secs: Option<u64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--count" => {
+                i += 1;
+                count = args.get(i).and_then(|s| s.parse().ok());
+            }
+            "--timeout" => {
+                i += 1;
+                timeout_secs = args.get(i).and_then(|s| s.parse().ok());
+            }
+            other if target.is_empty() => target = other.to_string(),
+            _ => {}
+        }
+        i += 1;
+    }
+    if target.is_empty() {
+        bail!("usage: lanius code watch <session> [--count N] [--timeout SECS]");
+    }
+    // Resolve the target's obs noun from its durable record; default to a wildcard
+    // via the record's agent_noun. If there is no record we still watch under the
+    // last-known noun set — fall back to `+` for the noun segment so any noun matches.
+    let noun = codesession::read_record(root, &target)
+        .ok()
+        .flatten()
+        .map(|r| r.agent_noun)
+        .filter(|n| !n.is_empty());
+    // A quick liveness note so the watcher knows if it is tailing a dead session.
+    if let Some(l) = codesession::session_liveness(root, &target) {
+        eprintln!("[code] watching {target} — currently {}", liveness_phrase(l));
+    } else {
+        eprintln!("[code] watching {target} — no session record (nothing may arrive)");
+    }
+    let filter = match &noun {
+        Some(n) => format!(
+            "obs/agent/{}/{}/#",
+            crate::topic::encode_segment(n),
+            crate::topic::encode_segment(&target)
+        ),
+        None => format!("obs/agent/+/{}/#", crate::topic::encode_segment(&target)),
+    };
+    watch_subscribe(root, &target, &filter, count, timeout_secs)
+}
+
+/// The watch subscribe loop (M5): connect as the owner, subscribe the filter, and
+/// print a digest line per obs frame. Bounded by `count`/`timeout_secs`. Separated
+/// from `watch_cmd` so the parsing/resolution is testable without a broker.
+fn watch_subscribe(
+    root: &Root,
+    target: &str,
+    filter: &str,
+    count: Option<u64>,
+    timeout_secs: Option<u64>,
+) -> Result<()> {
+    use rumqttc::v5::mqttbytes::v5::Packet;
+    use rumqttc::v5::mqttbytes::QoS;
+    use rumqttc::v5::{AsyncClient, Event, MqttOptions};
+
+    let addr = beacon_addr(root).context("the bus is not addressable — cannot watch")?;
+    let prefix = filter.trim_end_matches('#'); // "obs/agent/<noun>/<session>/"
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let root = root.clone();
+    let filter = filter.to_string();
+    let prefix = prefix.to_string();
+    rt.block_on(async move {
+        let mut opts = MqttOptions::new(
+            format!("el-watch-{}-{}", target, std::process::id()),
+            addr.ip().to_string(),
+            addr.port(),
+        );
+        opts.set_keep_alive(std::time::Duration::from_secs(10));
+        opts.set_max_packet_size(Some(crate::resident::MAX_PACKET));
+        // The human's own command line: present the owner identity (same as bus sub).
+        let owner = crate::secrets::owner_name(&root);
+        if let Some(secret) = crate::secrets::read(&root, &owner) {
+            opts.set_credentials(owner, secret);
+        }
+        let (client, mut eventloop) = AsyncClient::new(opts, 64);
+        client.subscribe(&filter, QoS::AtLeastOnce).await?;
+        let deadline =
+            timeout_secs.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
+        let mut got = 0u64;
+        loop {
+            if count.is_some_and(|c| got >= c) {
+                return Ok(());
+            }
+            let polled = match deadline {
+                Some(d) => match tokio::time::timeout_at(d, eventloop.poll()).await {
+                    Ok(ev) => ev,
+                    Err(_) => return Ok(()), // window elapsed — a clean end
+                },
+                None => eventloop.poll().await,
+            };
+            let ev = polled.context("connection failed (daemon running?)")?;
+            if let Event::Incoming(Packet::Publish(p)) = ev {
+                let topic_name = String::from_utf8_lossy(&p.topic).into_owned();
+                let leaf = topic_name.strip_prefix(&prefix).unwrap_or(&topic_name);
+                let payload: Value = serde_json::from_slice(&p.payload).unwrap_or(Value::Null);
+                if let Some(line) = watch_digest_line(leaf, &payload) {
+                    let ts = payload
+                        .get("ts")
+                        .and_then(Value::as_str)
+                        .map(humanize_since)
+                        .unwrap_or_default();
+                    if ts.is_empty() {
+                        println!("{target}  {line}");
+                    } else {
+                        println!("{target}  {ts}  {line}");
+                    }
+                    use std::io::Write as _;
+                    std::io::stdout().flush().ok();
+                    got += 1;
+                }
+            }
+        }
+    })
+}
 
 /// Per-process soft-degrade state (docs/handoffs/bus-resilience.md wonky bit 5).
 /// `DEGRADED` is set the moment a publish fails unreachable and cleared when one
@@ -15128,5 +15648,104 @@ mod tests {
         assert!(!hook_only_home.join("skills").exists());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── M5: watch digest + ask liveness pre-check ─────────────────────────────
+
+    #[test]
+    fn watch_digest_renders_readable_lines_not_raw_frames() {
+        // Assistant messages and tool calls become legible one-liners; reasoning is
+        // suppressed as noise; a status frame reports the bus state.
+        let say = watch_digest_line(
+            "assistant/message",
+            &json!({ "text": "I'll edit the parser now" }),
+        )
+        .unwrap();
+        assert_eq!(say, "says: I'll edit the parser now");
+
+        let call = watch_digest_line(
+            "tool/Bash/call",
+            &json!({ "command": "cargo test --lib" }),
+        )
+        .unwrap();
+        assert!(call.contains("tool ->") && call.contains("Bash") && call.contains("cargo test"));
+
+        let result = watch_digest_line("tool/Bash/result", &json!({ "output": "ok" })).unwrap();
+        assert!(result.contains("tool <-") && result.contains("Bash"));
+
+        // Claude-style tool with structured input still summarizes.
+        let edit = watch_digest_line(
+            "tool/Edit/call",
+            &json!({ "input": { "file_path": "/x/foo.rs" } }),
+        )
+        .unwrap();
+        assert!(edit.contains("Edit") && edit.contains("foo.rs"));
+
+        // Reasoning is inner monologue — skipped.
+        assert!(watch_digest_line("assistant/reasoning", &json!({ "text": "hmm" })).is_none());
+
+        // Lifecycle + status are legible.
+        assert_eq!(
+            watch_digest_line("session/idle", &Value::Null).unwrap(),
+            "idle (turn complete)"
+        );
+        assert_eq!(
+            watch_digest_line("status", &json!({ "connected": false })).unwrap(),
+            "(bus: disconnected)"
+        );
+        assert_eq!(
+            watch_digest_line("intent", &json!({ "intent": "harden the cage" })).unwrap(),
+            "intent: harden the cage"
+        );
+    }
+
+    #[test]
+    fn ask_dead_target_returns_immediately_not_a_block() {
+        // The M5 pre-check: asking a CONFIRMED-DEAD session must fail fast with a
+        // clear message pointing at async `deliver`, NOT block to the timeout.
+        let root = delivery_tmp_root();
+        let dead_pid = 0x7fff_fffe; // gone on any sane host
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-deadtgt01".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp".into(),
+                room: Some("r".into()),
+            },
+        )
+        .unwrap();
+        codesession::join_room(&root, "r", "code-deadtgt01", "codex", dead_pid).unwrap();
+        codesession::set_connected(&root, "code-deadtgt01", false).unwrap();
+        assert_eq!(
+            codesession::session_liveness(&root, "code-deadtgt01"),
+            Some(codesession::Liveness::Dead)
+        );
+
+        std::env::set_var(ENV_SESSION, "code-asker00001");
+        std::env::set_var(ENV_AGENT, "claude-code");
+        // A generous --timeout: if the pre-check FAILED to fire, ask_cmd would block
+        // ~30s polling the inbox. We assert it returns near-instantly instead.
+        let started = std::time::Instant::now();
+        let res = ask_cmd(
+            &root,
+            &[
+                "code-deadtgt01".to_string(),
+                "are you there?".to_string(),
+                "--timeout".to_string(),
+                "30".to_string(),
+            ],
+        );
+        let elapsed = started.elapsed();
+        std::env::remove_var(ENV_SESSION);
+        std::env::remove_var(ENV_AGENT);
+        assert!(res.is_ok(), "ask on a dead target should return Ok, got {res:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "ask on a dead target must return immediately, not block ({elapsed:?})"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
     }
 }
