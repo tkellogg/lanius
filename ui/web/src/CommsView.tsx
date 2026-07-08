@@ -257,49 +257,53 @@ function parseAgentMailbox(topic: string): { noun: string; session: string } | n
   return { noun: decodeURIComponent(segs[2]), session };
 }
 
+/* Messages (agent-to-agent) — on the shrike tokens (themes with the app). Data
+   reads mono; the one reserved red (--pain) is spent only on state that demands
+   action: a high-priority message and a failed delivery. Elevated priority is a
+   step up (--agent), not an alarm; live/normal stay quiet grey and --work. */
 const CM_STYLE = `
-.cm-wrap { display: flex; gap: 16px; align-items: flex-start; }
+.cm-wrap { display: flex; gap: 16px; align-items: flex-start; font-variant-numeric: tabular-nums; }
 .cm-main { flex: 1 1 60%; min-width: 0; }
-.cm-rooms { flex: 1 1 40%; min-width: 0; border-left: 1px solid #2a2a2a; padding-left: 16px; }
-.cm-h { margin: 0 0 8px; font-size: 14px; }
-.cm-dim { color: #8a8a8a; }
-.cm-id { font-family: ui-monospace, monospace; cursor: pointer; }
+.cm-rooms { flex: 1 1 40%; min-width: 0; border-left: 1px solid var(--panel-edge); padding-left: 16px; }
+.cm-h { margin: 0 0 8px; font-size: 14px; color: var(--ink); }
+.cm-dim { color: var(--dim); }
+.cm-id { font-family: var(--mono); color: var(--work); cursor: pointer; }
 .cm-id:hover { text-decoration: underline; }
-.cm-err { color: #ff8a8a; font-size: 12px; }
-.cm-empty { font-size: 12px; max-width: 60ch; }
+.cm-err { color: var(--pain); font-family: var(--mono); font-size: 12px; }
+.cm-empty { font-size: 12px; max-width: 60ch; color: var(--dim); }
 .cm-list { display: flex; flex-direction: column; gap: 2px; }
-.cm-row { border-radius: 4px; font-size: 12px; }
-.cm-line { display: flex; gap: 8px; align-items: center; padding: 5px 6px; border-radius: 4px; cursor: pointer; flex-wrap: wrap; }
-.cm-line:hover { background: rgba(255,255,255,0.05); }
-.cm-row-failed .cm-line { background: rgba(255,90,90,0.08); }
-.cm-arrow { color: #8a8a8a; }
-.cm-preview { color: #c8c8c8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 28ch; }
-.cm-time { margin-left: auto; }
-.cm-chip { font-size: 10px; padding: 1px 6px; border-radius: 8px; }
-.cm-normal { background: #2a2a2a; color: #9a9a9a; }
-.cm-elevated { background: #4a431f; color: #ffe9a8; }
-.cm-high { background: #7a3a12; color: #ffd2a8; font-weight: 600; }
-.cm-badge { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: #333; color: #ddd; }
-.cm-live { background: #1f6f3f; color: #d8ffe8; }
-.cm-done { background: #3a3a3a; color: #bbb; }
-.cm-failed { background: #7a1f1f; color: #ffd8d8; font-weight: 600; }
-.cm-tell { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: #3a2f5a; color: #d8c8ff; cursor: help; }
-.cm-thread { margin: 0 0 4px 18px; padding: 4px 8px; border-left: 1px solid #333; font-size: 11px; display: flex; flex-direction: column; gap: 3px; }
-.cm-thread code { font-family: ui-monospace, monospace; }
-.cm-thread-fail { color: #ff9a9a; }
-.cm-room { border: 1px solid #2a2a2a; border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; font-size: 12px; }
+.cm-row { border-radius: var(--r-sharp); font-size: 12px; }
+.cm-line { display: flex; gap: 8px; align-items: center; padding: 5px 6px; border-radius: var(--r-sharp); cursor: pointer; flex-wrap: wrap; border-left: 2px solid transparent; }
+.cm-line:hover { background: var(--hover); }
+.cm-row-failed .cm-line { background: color-mix(in srgb, var(--pain) 7%, transparent); border-left-color: var(--pain); }
+.cm-arrow { color: var(--meta); }
+.cm-preview { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 28ch; }
+.cm-time { margin-left: auto; font-family: var(--mono); color: var(--meta); }
+.cm-chip { font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; padding: 0 6px; border-radius: 2px; border: 1px solid currentColor; }
+.cm-normal { color: var(--meta); }
+.cm-elevated { color: var(--agent); }
+.cm-high { color: var(--pain); font-weight: 600; }
+.cm-badge { font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; padding: 0 6px; border-radius: 2px; border: 1px solid var(--panel-edge); color: var(--dim); }
+.cm-live { border-color: color-mix(in srgb, var(--work) 55%, transparent); color: var(--work); background: color-mix(in srgb, var(--work) 8%, transparent); }
+.cm-done { border-color: var(--panel-edge); color: var(--meta); }
+.cm-failed { border-color: color-mix(in srgb, var(--pain) 55%, transparent); color: var(--pain); background: color-mix(in srgb, var(--pain) 8%, transparent); font-weight: 600; }
+.cm-tell { font-family: var(--mono); font-size: 10px; padding: 0 6px; border-radius: 2px; border: 1px solid var(--ask-border); color: var(--ask); cursor: help; }
+.cm-thread { margin: 0 0 4px 18px; padding: 4px 8px; border-left: 1px solid var(--subtle-border-strong); font-size: 11px; display: flex; flex-direction: column; gap: 3px; }
+.cm-thread code { font-family: var(--mono); }
+.cm-thread-fail { color: var(--pain); }
+.cm-room { border: 1px solid var(--panel-edge); border-radius: var(--r-card); padding: 8px 10px; margin-bottom: 8px; font-size: 12px; background: var(--card-bg-soft); }
 .cm-room-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 4px; }
-.cm-room-name { font-family: ui-monospace, monospace; font-weight: 600; }
-.cm-room-id { font-family: ui-monospace, monospace; color: #6a6a6a; font-size: 11px; }
-.cm-room-count { color: #8a8a8a; font-size: 11px; }
+.cm-room-name { font-family: var(--mono); font-weight: 600; color: var(--ink); }
+.cm-room-id { font-family: var(--mono); color: var(--meta); font-size: 11px; }
+.cm-room-count { color: var(--dim); font-size: 11px; }
 .cm-room-members { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
-.cm-member { display: inline-flex; gap: 5px; align-items: baseline; padding: 1px 6px; border-radius: 8px; }
-.cm-member-live { background: rgba(31,111,63,0.25); }
-.cm-member-stale { background: #2a2a2a; opacity: 0.7; }
+.cm-member { display: inline-flex; gap: 5px; align-items: baseline; padding: 1px 6px; border-radius: 2px; font-family: var(--mono); font-size: 11px; }
+.cm-member-live { background: color-mix(in srgb, var(--work) 14%, transparent); color: var(--work); }
+.cm-member-stale { background: var(--hover-soft); color: var(--meta); opacity: 0.8; }
 .cm-claims { display: flex; flex-direction: column; gap: 1px; margin: 4px 0; }
 .cm-claim { display: flex; gap: 6px; align-items: baseline; }
-.cm-claim-path { font-family: ui-monospace, monospace; color: #c8c8c8; }
+.cm-claim-path { font-family: var(--mono); color: var(--dim); }
 .cm-channel { margin-top: 4px; }
 .cm-chan-msg { display: flex; gap: 6px; padding: 1px 0; }
-.cm-chan-text { color: #c8c8c8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cm-chan-text { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 `;

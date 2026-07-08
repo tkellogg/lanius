@@ -193,43 +193,48 @@ export default function ProvidersView() {
   );
 }
 
+/* Providers vault — on the shrike tokens (themes with the app). Data reads mono;
+   the one reserved red (--pain) appears only when a reachability test fails or on
+   the destructive remove action — never on resting state. */
 const PV_STYLE = `
 .pv-wrap { display: flex; gap: 16px; align-items: flex-start; }
 .pv-list-pane { flex: 1 1 55%; min-width: 0; }
-.pv-add-pane { flex: 1 1 45%; min-width: 0; border-left: 1px solid #2a2a2a; padding-left: 16px; }
-.pv-h { margin: 0 0 8px; font-size: 14px; }
-.pv-dim { color: #8a8a8a; font-size: 12px; max-width: 60ch; }
-.pv-err { color: #ff8a8a; font-size: 12px; margin: 6px 0; }
-.pv-empty { font-size: 12px; margin-top: 8px; }
+.pv-add-pane { flex: 1 1 45%; min-width: 0; border-left: 1px solid var(--panel-edge); padding-left: 16px; }
+.pv-h { margin: 0 0 8px; font-size: 14px; color: var(--ink); }
+.pv-dim { color: var(--dim); font-size: 12px; max-width: 60ch; }
+.pv-err { color: var(--pain); font-family: var(--mono); font-size: 12px; margin: 6px 0; }
+.pv-empty { font-size: 12px; margin-top: 8px; color: var(--dim); }
 .pv-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
-.pv-row { border: 1px solid #2a2a2a; border-radius: 6px; padding: 8px 10px; font-size: 12px; }
+.pv-row { border: 1px solid var(--panel-edge); border-radius: var(--r-card); padding: 8px 10px; font-size: 12px; background: var(--card-bg-soft); }
 .pv-row-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.pv-name { font-family: ui-monospace, monospace; font-weight: 600; }
-.pv-kind { font-size: 10px; padding: 1px 6px; border-radius: 8px; }
-.pv-kind-api_key { background: #1f4a6f; color: #cfe6ff; }
-.pv-kind-native_login { background: #4a3a1f; color: #ffe9a8; }
-.pv-wire { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: #2a2a2a; color: #bbb; }
+.pv-name { font-family: var(--mono); font-weight: 600; color: var(--ink); }
+.pv-kind { font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; padding: 0 6px; border-radius: 2px; border: 1px solid var(--panel-edge); color: var(--dim); }
+.pv-kind-api_key { color: var(--agent); border-color: color-mix(in srgb, var(--agent) 45%, transparent); }
+.pv-kind-native_login { color: var(--work); border-color: color-mix(in srgb, var(--work) 45%, transparent); }
+.pv-wire { font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; padding: 0 6px; border-radius: 2px; border: 1px solid var(--panel-edge); color: var(--meta); }
 .pv-actions { margin-left: auto; display: flex; gap: 6px; }
-.pv-btn { font-size: 11px; padding: 2px 8px; border-radius: 4px; border: 1px solid #3a3a3a; background: #222; color: #ddd; cursor: pointer; }
-.pv-btn:hover { background: #2c2c2c; }
-.pv-btn-danger { color: #ffb4b4; border-color: #5a2a2a; }
+.pv-btn { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: var(--r-sharp); border: 1px solid var(--panel-edge); background: transparent; color: var(--dim); cursor: pointer; }
+.pv-btn:hover { background: var(--hover); color: var(--ink); }
+.pv-btn-danger { color: var(--pain); border-color: color-mix(in srgb, var(--pain) 40%, transparent); }
 .pv-meta { display: flex; gap: 8px; margin-top: 3px; align-items: baseline; }
-.pv-meta-k { color: #7a7a7a; min-width: 64px; }
-.pv-meta code { font-family: ui-monospace, monospace; color: #c8c8c8; word-break: break-all; }
-.pv-redacted { color: #8a8a8a; }
-.pv-test { margin-top: 6px; padding: 4px 6px; border-radius: 4px; background: rgba(31,111,63,0.18); color: #cfe; font-size: 11px; }
-.pv-test-bad { background: rgba(122,31,31,0.22); color: #ffd2d2; }
+.pv-meta-k { color: var(--meta); min-width: 64px; font-family: var(--mono); font-size: 11px; }
+.pv-meta code { font-family: var(--mono); color: var(--dim); word-break: break-all; }
+.pv-redacted { color: var(--meta); }
+.pv-test { margin-top: 6px; padding: 4px 6px; border-radius: var(--r-sharp); border: 1px solid color-mix(in srgb, var(--work) 45%, transparent); background: color-mix(in srgb, var(--work) 8%, transparent); color: var(--work); font-family: var(--mono); font-size: 11px; }
+.pv-test-bad { border-color: color-mix(in srgb, var(--pain) 50%, transparent); background: color-mix(in srgb, var(--pain) 8%, transparent); color: var(--pain); }
 .pv-form { display: flex; flex-direction: column; gap: 10px; }
-.pv-form label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: #9a9a9a; letter-spacing: 0.04em; }
-.pv-form input, .pv-form select { font-size: 12px; padding: 4px 6px; background: #1a1a1a; border: 1px solid #333; border-radius: 4px; color: #e8e8e8; }
-.pv-hint { color: #6a6a6a; font-size: 10.5px; letter-spacing: 0; }
+.pv-form label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--dim); letter-spacing: 0.04em; }
+.pv-form input, .pv-form select { font-size: 12px; padding: 4px 6px; background: var(--field-bg); border: 1px solid var(--field-border); border-radius: var(--r-sharp); color: var(--ink); }
+.pv-form input:focus, .pv-form select:focus { border-color: var(--field-border-focus); }
+.pv-hint { color: var(--meta); font-size: 10.5px; letter-spacing: 0; }
 .pv-headers { display: flex; flex-direction: column; gap: 4px; }
-.pv-headers-head { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: #9a9a9a; }
+.pv-headers-head { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--dim); }
 .pv-header-row { display: flex; gap: 6px; }
 .pv-header-name { flex: 0 0 35%; }
 .pv-header-value { flex: 1 1 auto; }
 .pv-form-foot { display: flex; gap: 10px; align-items: center; }
-.pv-form-foot button { font-size: 12px; padding: 5px 12px; border-radius: 4px; border: 1px solid #3a5a3a; background: #1f3a24; color: #d8ffe8; cursor: pointer; }
+.pv-form-foot button { font-family: var(--mono); font-size: 12px; padding: 5px 12px; border-radius: var(--r-sharp); border: 1px solid var(--ink); background: var(--ink); color: var(--bg); cursor: pointer; }
+.pv-form-foot button:hover { filter: brightness(1.08); }
 .pv-form-foot button:disabled { opacity: 0.5; cursor: default; }
-.pv-note { color: #9a9a9a; font-size: 11px; }
+.pv-note { color: var(--dim); font-size: 11px; }
 `;

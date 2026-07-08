@@ -163,7 +163,7 @@ body {
   display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
   padding: 14px 22px 10px;
   border-bottom: 1px solid var(--panel-edge);
-  animation: settle 0.7s cubic-bezier(.2,.9,.3,1) both;
+  animation: settle 0.5s cubic-bezier(.2,.9,.3,1) both;
 }
 .mast-left { display: flex; align-items: center; gap: 12px; }
 .kite { color: var(--dim); font-size: 18px; transform: translateY(1px); }
@@ -204,9 +204,14 @@ body {
 .agent-chip {
   display: inline-flex; align-items: center; justify-content: center;
   font: 600 10px/1 var(--mono); letter-spacing: 0.04em;
-  border: 1px solid currentColor; border-radius: 2px;
+  /* disciplined neutral: a whisper of per-agent hue (--chip-h), low saturation,
+     theme-driven lightness so the monogram always clears its ground. Never
+     louder than the thorn. */
+  color: hsl(var(--chip-h, 215) 12% 64%);
+  border: 1px solid hsl(var(--chip-h, 215) 12% 64%); border-radius: 2px;
   padding: 2px 4px; flex: 0 0 auto; min-height: 18px;
 }
+:root[data-theme="light"] .agent-chip { color: hsl(var(--chip-h, 215) 14% 42%); border-color: hsl(var(--chip-h, 215) 14% 42%); }
 .agent-chip-md { font-size: 12px; padding: 4px 7px; min-height: 24px; }
 .agent-chip-lg { font-size: 22px; padding: 10px 14px; min-height: 44px; letter-spacing: 0.06em; }
 .nav-agent-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -234,9 +239,9 @@ body {
   background: linear-gradient(180deg, var(--panel), var(--panel-grad-stop));
   border: 1px solid var(--panel-edge); border-radius: 4px;
   display: flex; flex-direction: column; min-height: 0;
-  animation: settle 0.7s 0.08s cubic-bezier(.2,.9,.3,1) both;
+  animation: settle 0.5s 0.06s cubic-bezier(.2,.9,.3,1) both;
 }
-.stage { animation-delay: 0.16s; }
+.stage { animation-delay: 0.12s; }
 
 /* ---------------- explorer nav ---------------- */
 .nav-list { flex: 1; overflow-y: auto; padding: 8px 6px; display: flex; flex-direction: column; gap: 1px; }
@@ -250,10 +255,13 @@ body {
   border: 1px solid transparent; border-radius: 3px; padding: 4px 8px; cursor: pointer;
 }
 .nav-item:hover { background: var(--hover); color: var(--ink); }
-.nav-item.on { color: var(--ink); border-color: var(--panel-edge); background: var(--hover); }
+/* Active nav item: not a filled block — a hairline thorn rule down the left
+   edge and the sigil lit as the thorn "you are here" marker. Quiet, precise. */
+.nav-item.on { color: var(--ink); border-color: transparent; background: transparent; box-shadow: inset 2px 0 0 var(--thorn); border-radius: 0 3px 3px 0; }
+.nav-item.on:hover { background: var(--hover-soft); }
 .nav-item:focus-visible { outline: 1px solid var(--dim); outline-offset: -1px; }
 .nav-sigil { color: var(--meta); }
-.nav-item.on .nav-sigil { color: var(--work); }
+.nav-item.on .nav-sigil { color: var(--thorn); }
 .nav-live { margin-left: auto; font-size: 9.5px; color: var(--work); letter-spacing: 0.08em; }
 .nav-session,
 .nav-conversation {
@@ -305,7 +313,10 @@ body {
   color: var(--dim); background: none; border: 1px solid transparent;
   border-radius: 2px; padding: 2px 10px; cursor: pointer;
 }
-.tabs button.on { color: var(--ink); border-color: var(--panel-edge); background: var(--hover); }
+/* Active tab: underlined in thorn, not boxed — the tab bar reads as a rule the
+   thorn sits under, echoing the wordmark's tittle. Box-shadow underline avoids
+   the 1px→2px border reflow. */
+.tabs button.on { color: var(--ink); border-color: transparent; background: transparent; box-shadow: inset 0 -2px 0 var(--thorn); border-radius: 2px 2px 0 0; }
 .view { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; }
 .view[hidden] { display: none; }
 .conv-feed-holder { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; }
@@ -441,7 +452,18 @@ body {
 
 .msg { max-width: 86%; animation: arrive 0.25s ease-out both; }
 @keyframes arrive { from { opacity: 0; transform: translateY(5px); } }
-.msg-meta { font-size: 10px; color: var(--meta); margin-bottom: 3px; display: flex; gap: 8px; align-items: baseline; }
+/* The impaled-berry pin: when a worker result lands or an event is captured, a
+   tiny thorn-red tick pins it onto the rail for ~120ms, then fades — the larder
+   filling, one item at a time. The one delightful moment, not scattered effects.
+   Reduced-motion drops it with the other entrance animations (see the a11y block). */
+@keyframes pin {
+  0%   { box-shadow: inset 3px 0 0 var(--thorn); }
+  24%  { box-shadow: inset 3px 0 0 var(--thorn); }
+  100% { box-shadow: inset 3px 0 0 transparent; }
+}
+/* an agent/worker reply landing in the feed gets the pin as it arrives */
+.msg.agent { animation: arrive 0.25s ease-out both, pin 0.5s ease-out both; }
+.msg-meta { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 10px; color: var(--meta); margin-bottom: 3px; display: flex; gap: 8px; align-items: baseline; }
 .msg-who { font-family: var(--mono); letter-spacing: 0.16em; text-transform: uppercase; }
 .msg-corr { border: 1px solid var(--panel-edge); border-radius: 2px; padding: 0 5px; }
 .msg-body {
@@ -515,10 +537,13 @@ body {
 
 .row {
   display: grid; grid-template-columns: 64px 1fr; gap: 10px;
-  padding: 3px 14px; font-size: 11.5px; border-left: 2px solid transparent;
+  padding: 3px 14px; font-family: var(--mono); font-variant-numeric: tabular-nums;
+  font-size: 11.5px; border-left: 2px solid transparent;
   animation: arrive 0.2s ease-out both;
 }
 .row:hover { background: var(--hover-strong); }
+/* an incoming event captured onto the rail gets the impaled-berry pin */
+.row.v-in { animation: arrive 0.2s ease-out both, pin 0.5s ease-out both; }
 .row .t { color: var(--meta); }
 .row .topic { color: var(--dim); }
 .row .pay { color: var(--meta); word-break: break-all; }
@@ -527,7 +552,7 @@ body {
 .row.v-signal .topic, .row.v-signal .pay, .row.v-signal .t { color: var(--pain); }
 .row.v-tool .topic { color: var(--tool); }
 .row .badge {
-  display: inline-block; font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase;
+  display: inline-block; font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase;
   border: 1px solid currentColor; border-radius: 2px; padding: 0 4px; margin-right: 6px; opacity: 0.8;
 }
 
@@ -702,7 +727,8 @@ details.setup-fold > summary .dim-note { padding: 0; flex: 1; min-width: 0; over
 .risk-badges .badge,
 .cfg-package-meta .badge,
 .setup-kit-head .badge {
-  display: inline-block;
+  display: inline-flex; align-items: center; gap: 4px;
+  font-family: var(--mono);
   font-size: 9.5px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -711,11 +737,18 @@ details.setup-fold > summary .dim-note { padding: 0; flex: 1; min-width: 0; over
   padding: 0 4px;
   opacity: 0.85;
 }
-.badge-wait { color: var(--agent); }
+/* "Needs attention" tell — a single thorn dot before the label (pending
+   approval, a failed run). The one reserved red, applied sparingly. */
+.badge-wait::before,
+.badge.live-bad::before {
+  content: ''; width: 5px; height: 5px; border-radius: 50%;
+  background: var(--pain); flex: 0 0 auto;
+}
+.badge-wait { color: var(--dim); opacity: 1; }
 /* UI-truthfulness M1: liveness chip — running/stopped/failed/not-started must be
    distinguishable at a glance, not just by word. */
 .badge.live-ok { color: var(--work); }
-.badge.live-bad { color: var(--danger); opacity: 1; }
+.badge.live-bad { color: var(--pain); opacity: 1; }
 .badge.live-warn { color: var(--agent); }
 .badge.live-idle { color: var(--meta); }
 /* Cost honesty (M3): hard cap / soft limit / estimate as visually separate
@@ -953,17 +986,18 @@ details[open] > summary .cfg-disclosure { transform: rotate(90deg); color: var(-
   width: 28px; height: 26px; display: inline-grid; place-items: center;
   padding: 0; line-height: 1; font-size: 14px;
 }
-/* Scope-residual (M6): shared ("every agent") writes need a different visual
-   weight than per-agent writes — the blast radius is wider. Give the shared
-   button an amber border + auto-width so the ⚑ "affects all agents" tag is
-   unmistakable next to a same-shaped per-agent button. */
+/* Blast radius reads in color (the redesign's honesty win). A shared ("every
+   agent") write is an algedonic "this affects everyone" signal, so it carries
+   the reserved red (--pain) — border, ink, and a soft red field — while the
+   per-agent save stays neutral. The wider blast radius is now unmistakable
+   before you click, not just decodable from the label. */
 .cfg-shared-save {
   width: auto; min-height: 26px; padding: 0 10px;
   font-size: 11px; letter-spacing: 0.06em;
-  border: 1px solid color-mix(in srgb, var(--agent) 55%, transparent); border-radius: 3px;
-  color: var(--agent); background: color-mix(in srgb, var(--agent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--pain) 55%, transparent); border-radius: 3px;
+  color: var(--pain); background: color-mix(in srgb, var(--pain) 8%, transparent);
 }
-.cfg-shared-save:hover { background: color-mix(in srgb, var(--agent) 16%, transparent); }
+.cfg-shared-save:hover { background: color-mix(in srgb, var(--pain) 16%, transparent); }
 .cfg-agent-save {
   width: auto; min-height: 26px; padding: 0 10px;
   font-size: 11px; letter-spacing: 0.06em;
@@ -1178,7 +1212,7 @@ details[open] > summary .cfg-disclosure { transform: rotate(90deg); color: var(-
 }
 .agent-assistant-tool summary {
   cursor: pointer; padding: 7px 9px; display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  color: var(--work); font-size: 12px;
+  color: var(--work); font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.02em;
 }
 .agent-assistant-tool pre {
   margin: 0; padding: 8px 9px; border-top: 1px solid var(--subtle-border);
@@ -1242,8 +1276,9 @@ button.mast-left { background: none; border: none; cursor: pointer; text-align: 
 button.mast-left.on h1 { color: var(--ink); }
 
 /* ---------- converse failure bubble ---------- */
-.msg.failed .msg-who { color: var(--danger-strong); }
-.msg.failed .msg-body { border-left: 2px solid var(--danger-strong); padding-left: 10px; }
+/* A failed run is the one red thing in the feed — the thorn drawing blood. */
+.msg.failed .msg-who { color: var(--pain); }
+.msg.failed .msg-body { border-left: 2px solid var(--pain); padding-left: 10px; }
 .fail-reason { font-family: var(--mono, monospace); font-size: 12px; color: var(--danger-soft); white-space: pre-wrap; }
 .fail-hint { font-size: 11px; color: var(--dim); margin-top: 4px; }
 

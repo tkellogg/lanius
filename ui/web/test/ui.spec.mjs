@@ -2616,8 +2616,14 @@ const renamedAgent = 'falcon';
     // obs/agent/helper/<session>/tool/navigate/result (the same bus round trip
     // the panel's own tool-call handling uses for every client tool).
     const callId = `spec-${Date.now().toString(36)}`;
-    lanius('emit', `obs/agent/helper/${sessionText}/tool/navigate/call`, '--payload',
-      JSON.stringify({ call_id: callId, name: 'navigate', args: { kind: 'providers' } }));
+    // Inject the tool `call` via a LIVE bus publish (/api/publish → hub client
+    // try_publish → the server's obs/# subscription → SSE), the same real path a
+    // resolved dispatcher turn uses. A `lanius emit` only ledgers the frame
+    // (announced=0) and is NOT in announce_ledger_events' re-announce allow-list,
+    // so it would never reach the browser's live stream.
+    await page.evaluate(async ({ topic, payload }) => {
+      await fetch('/api/publish', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic, payload }) });
+    }, { topic: `obs/agent/helper/${sessionText}/tool/navigate/call`, payload: { call_id: callId, name: 'navigate', args: { kind: 'providers' } } });
     await waitFor('ai panel: a helper navigate call switches the view', async () =>
       (await page.$('#view-providers')) !== null, 8000);
     await page.click('.nav-signals');
