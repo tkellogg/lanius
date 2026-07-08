@@ -75,10 +75,13 @@ So I *could* have messaged the live sibling (`ask`) or watched its raw obs
    shows *nothing*, even though **its launch task is known** (`lanius code spawn
    <tool> "<task>"` carries it). Baseline intent is thrown away.
 
-3. **Stale claims/liveness lag.** Claims are reaped only "at the next
-   launcher/daemon boot," not gated on the liveness probe **at display time**. So a
-   dead session's claim shows as active indefinitely (Incident A). The note should
-   never show a claim from a session that fails the liveness probe *now*.
+3. **Stale claims + binary liveness.** Two problems. (a) Claims are reaped only "at
+   the next launcher/daemon boot," not at display time — so a dead session's claim
+   shows as active indefinitely (Incident A). (b) Worse, liveness is **binary**
+   (alive/dead) and **ignores the broker's own view** of connection. It should be
+   **tri-state and broker-driven** — connected / disconnected / dead — so that a
+   *disconnected* agent (which may be a live **split brain** still editing files)
+   is never silently treated as dead and its claims never wrongly reaped. See M3.
 
 4. **No durable session ↔ artifact ↔ outcome ledger.** SI/SA are about *live*
    siblings in a shared tree. A *past* session's git artifacts (a branch, a
@@ -118,12 +121,39 @@ attention path.** Call it *session accounting*.
 - **Acceptance:** a codex/opencode session that never emits a todo still shows its
   launch task as intent in `lanius code sessions` and the ambient note.
 
-### M3 — Liveness-gate the display + eager claim reaping
-- Filter claims/siblings by the liveness probe **at read time** (don't show a
-  claim whose session fails signal-0 / is stale), and reap dead sessions' claims on
-  a daemon tick, not only at boot.
-- **Acceptance:** a SIGKILL'd session's edit claim disappears from peers' notes
-  within one liveness window, not at the next launch.
+### M3 — Tri-state liveness (connected / disconnected / dead), broker-driven
+**Liveness is NOT binary.** The dangerous bug is treating a partitioned agent as
+dead. Model three states:
+- **connected** — the broker holds a live MQTT session for it AND (same host) its
+  `owner_pid` passes signal-0 AND `last_active` is fresh.
+- **disconnected** — the broker lost it (keepalive timeout / Last-Will fired), so
+  it's off the bus — **but it may still be running.** A network partition is a
+  **split brain**: the agent is alive, still editing files, just can't see or be
+  seen by peers. **Disconnected is not dead.**
+- **dead** — *confirmed* gone: a same-host `owner_pid` signal-0 probe fails, or a
+  session sits disconnected past a grace window with its pid gone.
+
+Requirements:
+- **The broker is the shared source of truth for connection** (Tim: "if the broker
+  recognizes the agent as disconnected, the other agents see it that way too").
+  Give each session's MQTT client a **Last-Will-and-Testament** that publishes a
+  *retained* `obs/agent/<noun>/<session>/status = {connected:false, ts}` on
+  ungraceful disconnect; the session sets `{connected:true}` on connect and clears
+  it on clean exit. Every peer subscribed to that topic then sees the exact state
+  the broker sees, near-instantly — which also fixes the stale-claim lag (a
+  disconnect is a keepalive away, not "next daemon boot").
+- **Reap claims ONLY on confirmed *dead*.** A **disconnected** agent's edit claims
+  **stay** — it might be a split brain still writing. The ambient note flags them:
+  *"code-XXXX — disconnected (may still be running — possible split brain; treat
+  its claims as live)."* Only a confirmed-dead session's claims reap.
+- **Bias toward "might still be running."** Same-host death is confirmable (pid
+  probe); a cross-host / partitioned session is **not** — it stays
+  `disconnected (unknown)` indefinitely rather than being auto-reaped.
+- **Acceptance:** a SIGKILL'd same-host session → **dead** (pid gone), claims
+  reaped within a liveness window. A session whose broker connection drops while
+  its process keeps running → shows **disconnected (possible split brain)**, its
+  claims are **NOT** reaped, and the note warns peers. A clean exit → `connected:
+  false` via LWT, seen by peers within one keepalive.
 
 ### M4 — Session ↔ worktree/branch ↔ outcome ledger + `lanius code sitrep`
 - Record, per session: the git worktree/branch it created (hook the
@@ -157,7 +187,14 @@ attention path.** Call it *session accounting*.
 3. **Scope of "spy" (M5) vs privacy** — homogeneous authority (Tim's model: no
    trust boundary between his own agents, see [[tim-safety-audit-not-restriction]]),
    so watching a sibling is fine; the point is legibility, not permission.
-4. **Don't reinvent the liveness definition** — reuse `codesession.rs:124-140`.
+4. **Extend the liveness definition, don't fight it** — reuse `codesession.rs:124-140`
+   as the "dead" (pid) half, and add the broker-connection half on top (M3).
+5. **Disconnected ≠ dead is a safety rule, not a nicety.** The one thing that must
+   never happen: treat a split-brained agent (alive, partitioned, still writing) as
+   gone and reap its claims / assume its files are free. The broker's LWT gives a
+   fast, uniform *disconnect* signal; only a same-host pid probe gives *death*.
+   When in doubt, "still running." Cross-host death is unconfirmable — leave such a
+   session `disconnected (unknown)` rather than reaping it.
 
 ## Read these first
 - `src/codesession.rs:124-140` (liveness), `:667-808` (rooms + claims),
@@ -177,3 +214,9 @@ attention path.** Call it *session accounting*.
   there's no session↔artifact↔outcome ledger so past work needs archaeology (M4),
   and spy/message ergonomics are thin (M5). M1+M2 are the cheap high-leverage fix;
   M4 is the structural one Tim is really asking for.
+- 2026-07-07 (Tim review): approved, with a correctness addition — **liveness must
+  be tri-state, not binary.** Propagate the broker's own disconnect view to all
+  peers (MQTT Last-Will → a retained `.../status` topic), and **separate
+  "disconnected" from "dead": a disconnected agent may be a live split brain still
+  editing files, so its claims must NOT be reaped until death is confirmed (same-
+  host pid probe).** M3 rewritten accordingly; gap 3 and wonky-bit 5 added.
