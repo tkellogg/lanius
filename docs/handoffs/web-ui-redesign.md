@@ -1,5 +1,5 @@
 ---
-status: planned
+status: M1 done (tokens · unified red · fonts · logo) + phrasing done; M2-M5 (per-view, motion) follow-up
 author: Claude Opus 4.8 (planner) — design direction
 last-updated: 2026-07-07
 ---

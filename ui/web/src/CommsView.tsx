@@ -66,7 +66,7 @@ function PriorityChip({ priority }: { priority: number }) {
 
 // The state badge: reuses the CodeSessions StatusBadge look (cm-* mirrors cs-*).
 function StateBadge({ state, failed }: { state: string; failed: boolean }) {
-  if (failed) return <span className="cm-badge cm-failed" title="the worker run failed (failure-mail on this correlation)">failed</span>;
+  if (failed) return <span className="cm-badge cm-failed" title="This run failed.">failed</span>;
   const cls = state === 'done' ? 'cm-badge cm-done' : state === 'pending' || state === 'running' ? 'cm-badge cm-live' : 'cm-badge';
   return <span className={cls}>{state}</span>;
 }
@@ -82,14 +82,14 @@ function MailRow({ m, onSelectSession }: { m: Mail; onSelectSession?: (id: strin
         <span className="cm-to cm-id" title="to" onClick={(e) => { e.stopPropagation(); if (m.to && onSelectSession) onSelectSession(m.to); }}>{m.to ?? '?'}</span>
         <PriorityChip priority={m.priority} />
         <StateBadge state={m.state} failed={m.failed} />
-        {m.mid_cycle && <span className="cm-tell" title="this urgent copy was injected mid-task (between the agent's tool calls); it is still unread until the agent pulls its inbox">delivered mid-task</span>}
+        {m.mid_cycle && <span className="cm-tell" title="Delivered while the agent was working — unread until it checks its inbox.">delivered mid-task</span>}
         <span className="cm-preview">{m.preview}</span>
         <span className="cm-dim cm-time">{relTime(m.ts)}</span>
       </div>
       {open && (
         <div className="cm-thread">
-          <div className="cm-dim">correlation: <code>{m.correlation ?? '(none)'}</code></div>
-          {m.failed && <div className="cm-thread-fail">↳ failure-mail on this correlation — the worker run failed.</div>}
+          <div className="cm-dim">Thread: <code>{m.correlation ?? '(none)'}</code></div>
+          {m.failed && <div className="cm-thread-fail">↳ This run failed.</div>}
           {m.mid_cycle && <div className="cm-dim">urgent copy delivered early (mid-task); the same message still counts as unread in the next-turn inbox until the agent pulls it — by design, not a duplicate.</div>}
         </div>
       )}
@@ -191,7 +191,7 @@ export default function CommsView({ onSelectSession }: { onSelectSession?: (id: 
         <h3 className="cm-h">Agent-to-agent mail</h3>
         {error && <div className="cm-err">comms projection unavailable: {error}</div>}
         {!error && merged.length === 0 && (
-          <div className="cm-dim cm-empty">No agent-to-agent mail yet. When one coding agent delivers work to another (`lanius code deliver`), it shows here — with priority, state, and the deliver→complete/fail thread.</div>
+          <div className="cm-dim cm-empty">No messages yet. When one agent hands work to another, it shows up here.</div>
         )}
         <div className="cm-list">
           {merged.map((m) => (
@@ -202,7 +202,7 @@ export default function CommsView({ onSelectSession }: { onSelectSession?: (id: 
 
       <div className="cm-rooms">
         <h3 className="cm-h">Rooms &amp; shared channels</h3>
-        {rooms.length === 0 && <div className="cm-dim">No coordination rooms with members. Sessions sharing a workdir (or launched with `--room`) appear here with their roster, edit-claims, and channel traffic.</div>}
+        {rooms.length === 0 && <div className="cm-dim">No shared rooms yet. Agents working in the same folder share a room here.</div>}
         {rooms.map((r) => (
           <div key={r.room} className="comms-room cm-room">
             <div className="cm-room-head">

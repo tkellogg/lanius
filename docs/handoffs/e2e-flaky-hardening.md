@@ -4,6 +4,27 @@ author: Claude Opus 4.8 (planner)
 last-updated: 2026-07-07
 ---
 
+> **Known-failing (pre-existing, environmental — not a refresh regression).** Two
+> assertions in the AI-panel flow time out reproducibly on this local harness:
+> - `ui.spec.mjs:2621` — "ai panel: a helper navigate call switches the view"
+> - `ui.spec.mjs:2626` — "ai panel: the tool call/result round-trips over
+>   `obs/agent/helper/<session>/tool/*`"
+>
+> Both wait for an **externally-emitted** bus event
+> (`lanius emit obs/agent/helper/<session>/tool/navigate/call`) to travel the
+> daemon → SSE stream → browser and drive the SPA. Confirmed pre-existing by
+> running the **pre-refresh base** (`/Users/tim/code/elanus`, `elanus` binary
+> built 2026-07-06, before any refresh edit): it fails these **two identically**
+> (base result: 294 ok / 3 FAIL — these two plus the sanctioned `:1948` flake).
+> The SSE wiring is untouched by the refresh: `ui/web/src/live.ts` is
+> byte-identical to base, and `AgentAssistant.tsx`'s tool-call subscription is
+> intact (its only diff is a `<label>` word `profile`→`agent`). The same
+> `#view-providers` selector these check reaches PASSES via a nav click in the
+> same run — the gap is only the daemon's delivery of an external `emit` into the
+> live SSE stream. These are **outside the sanctioned modulo below** and should
+> be treated as known-failing until the obs-bus SSE-delivery limitation of the
+> local harness is fixed; no SPA/refresh code change addresses them.
+
 # E2E flaky-test hardening — and the two real app bugs hiding behind them
 
 The Playwright suite `ui/web/test/ui.spec.mjs` (~138 assertions,

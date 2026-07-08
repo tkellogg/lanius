@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done (delivered with redesign M1)
 author: Claude Opus 4.8 (planner) — copy / voice
 last-updated: 2026-07-07
 ---

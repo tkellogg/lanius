@@ -112,7 +112,7 @@ export default function ProvidersView() {
       <style>{PV_STYLE}</style>
       <div className="pv-list-pane">
         <h3 className="pv-h">Model providers</h3>
-        <p className="pv-dim">A provider is a named, encrypted credential the dispatcher or a coding tool can point at. The key is stored encrypted at rest; only its redaction is shown here.</p>
+        <p className="pv-dim">A saved model key your agents can use. It’s encrypted; only a masked version shows here.</p>
         {note && <div className="pv-err">{note}</div>}
         {loaded && !note && list.length === 0 && (
           <div className="pv-dim pv-empty">No providers yet. Add one on the right — an api-key provider (KEY + base URL, e.g. DeepSeek or a LiteLLM gateway) or a native-login provider ("use the coding tool's own login; inject nothing").</div>
@@ -138,7 +138,7 @@ export default function ProvidersView() {
                 {t && (
                   <div className={`pv-test${t.reachable === false ? ' pv-test-bad' : ''}`} data-test-result={p.name}>
                     {t.pending ? 'testing…'
-                      : t.native ? 'native login — nothing to probe (the tool uses its own login)'
+                      : t.native ? 'Uses the tool’s own login — nothing to test.'
                       : t.reachable ? `reachable — ${t.count ?? 0} model${t.count === 1 ? '' : 's'}`
                       : `unreachable — ${t.error ?? 'no /models endpoint answered'}`}
                   </div>
@@ -168,7 +168,7 @@ export default function ProvidersView() {
                 </select>
               </label>
               <label>base URL <input id="pv-base-url" spellCheck={false} placeholder="https://api.deepseek.com/anthropic" value={form.base_url} onChange={(e) => setF({ base_url: e.target.value })} /></label>
-              <label>API key <input id="pv-key" type="password" autoComplete="off" spellCheck={false} placeholder="sk-…" value={form.key} onChange={(e) => setF({ key: e.target.value })} /><span className="pv-hint">stored encrypted; sent once over loopback, never placed on the command line</span></label>
+              <label>API key <input id="pv-key" type="password" autoComplete="off" spellCheck={false} placeholder="sk-…" value={form.key} onChange={(e) => setF({ key: e.target.value })} /><span className="pv-hint">Stored encrypted. Never shown in full or put on the command line.</span></label>
               <div className="pv-headers">
                 <div className="pv-headers-head"><span>extra headers (optional)</span><button type="button" className="pv-btn" onClick={addHeader}>add header</button></div>
                 {form.headers.map((h) => (
