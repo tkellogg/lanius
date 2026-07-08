@@ -587,6 +587,21 @@ CREATE TABLE IF NOT EXISTS code_spawn_edges (
     // claim/resume can derive it from the session's own identity. Nullable —
     // pre-M5 records (and a session launched with no `--room`) have no room.
     let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN room TEXT", []);
+    // Situational-awareness M2 (agent-situational-awareness handoff): the session's
+    // BASELINE intent — the launch task string (`lanius code spawn/deliver <tool>
+    // "<task>"`) or the first user prompt for an interactive session. Recorded on
+    // the record so a session that never emits a todo still has a stated intent to
+    // surface in the ambient sibling note (SI2 todos REFINE it, no longer gate it).
+    let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN intent TEXT", []);
+    // Situational-awareness M3: the broker's OWN view of this session's bus
+    // connection — the tri-state liveness signal. `connected` is 1 while the
+    // session's liveness beacon holds a live MQTT session, 0 once the broker loses
+    // it (keepalive timeout / Last-Will fired / a clean stop), NULL when unknown
+    // (no beacon yet). A DISCONNECTED (0) session may still be a live split brain —
+    // its claims are NEVER reaped on this signal alone; only a confirmed-dead pid
+    // reaps. `conn_updated_at` timestamps the last transition.
+    let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN connected INTEGER", []);
+    let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN conn_updated_at TEXT", []);
     // Migrations for databases created before a column existed; the error on
     // a duplicate column is expected and ignored.
     let _ = conn.execute(

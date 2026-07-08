@@ -140,6 +140,76 @@ pub fn upsert_record(root: &Root, rec: &SessionRecord) -> Result<()> {
 /// owner pid is somehow still reported (belt-and-suspenders with the pid probe).
 const LIVE_WINDOW_SECS: i64 = 15 * 60;
 
+// ── M3: tri-state liveness (agent-situational-awareness handoff) ──────────────
+//
+// Liveness is NOT binary. The dangerous bug is treating a network-PARTITIONED
+// agent (alive, still editing files, just off the bus) as dead and reaping its
+// claims. Three states, biased toward "might still be running":
+//   • connected    — the broker holds a live session AND (same host) the owner
+//                     pid passes a signal-0 probe AND `last_active` is fresh.
+//   • disconnected — the broker lost it (Last-Will fired / a clean stop / an
+//                     eventloop error), so it's off the bus — but it MAY still be
+//                     a live split brain. Its claims MUST NOT be reaped.
+//   • dead         — CONFIRMED gone: a same-host owner-pid signal-0 probe fails.
+// A disconnected session whose pid is still alive is a SPLIT BRAIN (same host,
+// confirmed still running). A disconnected session we cannot probe (cross host,
+// no local pid) is `disconnected (unknown)` — never auto-reaped, because
+// cross-host death is unconfirmable. Only `Dead` ever reaps claims.
+
+/// Why a session is disconnected — drives the ambient-note warning and whether we
+/// can ever escalate it to `Dead`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectKind {
+    /// Same host, the owner pid is STILL ALIVE: a confirmed live split brain that
+    /// merely lost the bus. It may still be editing files — treat its claims as
+    /// live. Never reaped (the pid is alive).
+    SplitBrain,
+    /// Cross host / unprobeable: we cannot confirm death, so it stays disconnected
+    /// indefinitely rather than being auto-reaped.
+    Unknown,
+}
+
+/// Tri-state liveness of a coding session (M3). `Dead` is the ONLY state that
+/// authorizes reaping a session's advisory claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    Connected,
+    Disconnected(DisconnectKind),
+    Dead,
+}
+
+/// Classify a session's liveness from the broker's connection view and a same-host
+/// pid probe (M3). Pure over its inputs so it is unit-testable without a broker.
+///
+/// - `broker_connected`: the broker's OWN view (`code_sessions.connected`): `Some(true)`
+///   holding a live MQTT session, `Some(false)` lost it (LWT fired / clean stop /
+///   partition), `None` unknown (no beacon yet).
+/// - `pid_probe`: `Some(true/false)` when the session has a same-host owner pid we
+///   can signal-0 (true = alive, false = the process is gone → CONFIRMED dead);
+///   `None` when there is no local pid to probe (cross host / no membership) — death
+///   is then UNCONFIRMABLE.
+///
+/// Safety invariant: `Dead` is returned ONLY on a confirmed same-host pid death.
+/// A disconnected session with a live pid is `Disconnected(SplitBrain)`; a
+/// disconnected session we cannot probe is `Disconnected(Unknown)`. Neither reaps.
+pub fn classify_liveness(broker_connected: Option<bool>, pid_probe: Option<bool>) -> Liveness {
+    match pid_probe {
+        // Same host, the process is GONE — the one signal that confirms death.
+        Some(false) => Liveness::Dead,
+        // Same host, the process is ALIVE — never dead. Off the bus → split brain.
+        Some(true) => match broker_connected {
+            Some(false) => Liveness::Disconnected(DisconnectKind::SplitBrain),
+            _ => Liveness::Connected,
+        },
+        // No local pid to probe: death is unconfirmable (cross host). Only the
+        // broker's view distinguishes connected from disconnected(unknown).
+        None => match broker_connected {
+            Some(false) => Liveness::Disconnected(DisconnectKind::Unknown),
+            _ => Liveness::Connected,
+        },
+    }
+}
+
 /// One live sibling sharing this session's workdir (SA2 roster entry).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSibling {
@@ -159,6 +229,17 @@ pub struct LiveSibling {
     /// emits no todo event — honestly absent, not a fake empty list). `status` is
     /// one of `todo|in_progress|done`.
     pub current_task: Option<(String, String)>,
+    /// M2 (situational-awareness): the session's BASELINE intent — the launch task
+    /// string (`lanius code spawn/deliver`) or the first user prompt of an
+    /// interactive session, from `code_sessions.intent`. Surfaced in the ambient
+    /// note when the session has no refined todo (`current_task`), so a harness that
+    /// emits no todo (codex/opencode) still shows what it was asked to do. `None`
+    /// when no intent was ever recorded → the note reads "(no stated intent)".
+    pub intent: Option<String>,
+    /// M3 (situational-awareness): tri-state liveness. A `Disconnected` sibling is
+    /// kept in the roster (flagged in the note) precisely because it may be a live
+    /// split brain — its claims must be treated as live, never silently dropped.
+    pub liveness: Liveness,
 }
 
 /// List the LIVE sibling sessions sharing `viewer`'s canonical workdir (SA2). A
@@ -179,7 +260,8 @@ pub fn live_siblings(root: &Root, viewer: &str, viewer_workdir: &str) -> Vec<Liv
     // canonical workdir + liveness in Rust (canonicalization and the pid probe
     // are not SQL). Pull owner_pid from the room membership (may be absent).
     let mut stmt = match conn.prepare(
-        "SELECT s.elanus_session, s.agent_noun, s.workdir, s.last_active, m.owner_pid
+        "SELECT s.elanus_session, s.agent_noun, s.workdir, s.last_active, m.owner_pid,
+                s.intent, s.connected
            FROM code_sessions s
            LEFT JOIN code_room_members m ON m.session = s.elanus_session
           WHERE s.elanus_session <> ?1",
@@ -194,6 +276,8 @@ pub fn live_siblings(root: &Root, viewer: &str, viewer_workdir: &str) -> Vec<Liv
             r.get::<_, String>(2)?,
             r.get::<_, String>(3)?,
             r.get::<_, Option<i32>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
         ))
     }) {
         Ok(rows) => rows,
@@ -202,7 +286,7 @@ pub fn live_siblings(root: &Root, viewer: &str, viewer_workdir: &str) -> Vec<Liv
     let now = chrono_now_secs();
     let mut out: Vec<(i64, LiveSibling)> = Vec::new();
     for row in rows.flatten() {
-        let (session, agent_noun, workdir, last_active, owner_pid) = row;
+        let (session, agent_noun, workdir, last_active, owner_pid, intent, connected) = row;
         if canon_str(&workdir) != want {
             continue; // a different checkout — not a sibling here
         }
@@ -218,15 +302,25 @@ pub fn live_siblings(root: &Root, viewer: &str, viewer_workdir: &str) -> Vec<Liv
             Some(t) => now.saturating_sub(t) <= LIVE_WINDOW_SECS,
             None => false, // an unparseable timestamp is not trusted as live
         };
-        if !fresh {
-            continue; // stale → aged out, never haunts the injection
+        // M3: tri-state liveness. A same-host owner pid gives a real probe; no
+        // membership row → no local pid to probe (`None`, unconfirmable). The
+        // broker's own connection view (`connected`) rides the retained status
+        // topic the beacon publishes / the Last-Will fires.
+        let broker_connected = connected.map(|c| c != 0);
+        let pid_probe = owner_pid.map(pid_alive);
+        let liveness = classify_liveness(broker_connected, pid_probe);
+        // A confirmed-dead session never haunts the injection.
+        if liveness == Liveness::Dead {
+            continue;
         }
-        // If a membership row exists, its owner pid must still be alive; absent a
-        // membership row, the freshness window alone governs (older records).
-        if let Some(pid) = owner_pid {
-            if !pid_alive(pid) {
-                continue; // a SIGKILL'd ghost — drop it
-            }
+        let disconnected = matches!(liveness, Liveness::Disconnected(_));
+        // Age-out rule (unchanged for the common case): a session past the freshness
+        // window drops from the roster — EXCEPT a broker-disconnected one, which we
+        // KEEP and flag, because a partitioned split brain that has been off the bus
+        // a while is exactly the claim-collision hazard peers must be warned about
+        // (M3: disconnected ≠ aged-out; never silently drop a possible split brain).
+        if !fresh && !disconnected {
+            continue; // stale but still on the bus → aged out, as before
         }
         // SI2: enrich with the sibling's current task (one cheap extra SELECT on
         // the open connection). Reuses the standalone selection logic so the note
@@ -239,6 +333,8 @@ pub fn live_siblings(root: &Root, viewer: &str, viewer_workdir: &str) -> Vec<Liv
                 agent_noun,
                 last_active,
                 current_task,
+                intent: intent.filter(|s| !s.trim().is_empty()),
+                liveness,
             },
         ));
     }
@@ -365,6 +461,95 @@ pub fn read_record(root: &Root, elanus_session: &str) -> Result<Option<SessionRe
         )
         .ok();
     Ok(rec)
+}
+
+// ── M2: baseline session intent (agent-situational-awareness handoff) ─────────
+//
+// The launch task string (`lanius code spawn/deliver <tool> "<task>"`) or the
+// first user prompt of an interactive session is the session's BASELINE intent —
+// what it was ASKED to do, known even when the harness emits no todo. SI2 todos
+// REFINE it; they no longer GATE it. Stored on the durable record so a codex or
+// opencode session that never produces a todo still shows a stated intent in the
+// ambient sibling note and `lanius code sessions`.
+
+/// Record a session's baseline intent, unconditionally (the launch path calls this
+/// once at launch with the launch task). A stub record is created if none exists
+/// yet — the native-id upsert later fills the rest (COALESCE preserves intent).
+/// Blank intent is ignored (never clobbers a real one with emptiness). Best-effort.
+pub fn set_intent(root: &Root, session: &str, intent: &str) -> Result<()> {
+    let intent = intent.trim();
+    if intent.is_empty() {
+        return Ok(());
+    }
+    let conn = crate::db::open(root).context("opening the ledger to set the intent")?;
+    crate::db::init_schema(&conn)?;
+    let n = conn.execute(
+        "UPDATE code_sessions SET intent = ?2 WHERE elanus_session = ?1",
+        rusqlite::params![session, intent],
+    )?;
+    if n == 0 {
+        conn.execute(
+            "INSERT INTO code_sessions
+               (elanus_session, native_session, tool, agent_noun, workdir, intent)
+             VALUES (?1, '', '', '', '', ?2)
+             ON CONFLICT(elanus_session) DO UPDATE SET intent = excluded.intent",
+            rusqlite::params![session, intent],
+        )?;
+    }
+    Ok(())
+}
+
+/// Record a session's intent ONLY if it has none yet (the interactive first-user-
+/// prompt path: the launch carried no task, so the first prompt becomes the
+/// baseline — but a later prompt must not overwrite it). Best-effort.
+pub fn set_intent_if_absent(root: &Root, session: &str, intent: &str) -> Result<()> {
+    let conn = crate::db::open(root).context("opening the ledger to seed the intent")?;
+    crate::db::init_schema(&conn)?;
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT intent FROM code_sessions WHERE elanus_session = ?1",
+            [session],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    if existing.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+        return Ok(()); // already has a baseline intent — the launch task wins
+    }
+    set_intent(root, session, intent)
+}
+
+/// Read a session's baseline intent (M2). None when none was recorded.
+pub fn get_intent(root: &Root, session: &str) -> Option<String> {
+    let conn = crate::db::open(root).ok()?;
+    let _ = crate::db::init_schema(&conn);
+    conn.query_row(
+        "SELECT intent FROM code_sessions WHERE elanus_session = ?1",
+        [session],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .filter(|s| !s.trim().is_empty())
+}
+
+/// Record the broker's connection view for a session (M3). The liveness beacon
+/// calls this: `true` when it holds a live MQTT session, `false` when the bus
+/// connection is lost (a clean stop, or the eventloop errored — a partition that
+/// makes this a possible split brain). This is the `connected` half of tri-state
+/// liveness; the pid probe supplies the `dead` half. Best-effort — a ledger hiccup
+/// never breaks the session (it just falls back to the pid/freshness signals).
+pub fn set_connected(root: &Root, session: &str, connected: bool) -> Result<()> {
+    let conn = crate::db::open(root).context("opening the ledger to set the connection view")?;
+    crate::db::init_schema(&conn)?;
+    conn.execute(
+        "UPDATE code_sessions
+            SET connected = ?2,
+                conn_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE elanus_session = ?1",
+        rusqlite::params![session, connected as i32],
+    )?;
+    Ok(())
 }
 
 // ── Delivery idempotency (M4-A) ───────────────────────────────────────────────
@@ -1058,9 +1243,16 @@ pub fn reap_dead_members(root: &Root) -> Vec<(String, String)> {
     if crate::db::init_schema(&conn).is_err() {
         return reaped;
     }
-    let members: Vec<(String, String, i32)> = {
-        let Ok(mut stmt) = conn.prepare("SELECT room, session, owner_pid FROM code_room_members")
-        else {
+    // Join the broker's connection view so the reap decision is tri-state: a
+    // DISCONNECTED session (broker lost it) whose pid is still alive is a possible
+    // SPLIT BRAIN — classify_liveness returns Disconnected(SplitBrain), NOT Dead,
+    // so we leave its claims alone. Only a confirmed same-host pid death reaps.
+    let members: Vec<(String, String, i32, Option<i64>)> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT m.room, m.session, m.owner_pid, s.connected
+               FROM code_room_members m
+               LEFT JOIN code_sessions s ON s.elanus_session = m.session",
+        ) else {
             return reaped;
         };
         let Ok(rows) = stmt.query_map([], |r| {
@@ -1068,14 +1260,20 @@ pub fn reap_dead_members(root: &Root) -> Vec<(String, String)> {
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i32>(2)?,
+                r.get::<_, Option<i64>>(3)?,
             ))
         }) else {
             return reaped;
         };
         rows.filter_map(|r| r.ok()).collect()
     };
-    for (room, session, owner_pid) in members {
-        if !pid_alive(owner_pid) {
+    for (room, session, owner_pid, connected) in members {
+        // A membership row always carries a same-host owner pid, so the probe is
+        // authoritative. REAP ONLY ON CONFIRMED DEAD (pid gone). A disconnected
+        // split brain (pid alive) keeps its claims — this is the M3 safety rule.
+        let broker_connected = connected.map(|c| c != 0);
+        let liveness = classify_liveness(broker_connected, Some(pid_alive(owner_pid)));
+        if liveness == Liveness::Dead {
             let _ = conn.execute(
                 "DELETE FROM code_claims WHERE room = ?1 AND session = ?2",
                 rusqlite::params![room, session],
@@ -4108,6 +4306,145 @@ mod tests {
         assert!(
             !sibs.iter().any(|s| s.session == "code-dead00002"),
             "a dead-pid sibling must be excluded: {sibs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M3: tri-state liveness (agent-situational-awareness handoff) ──────────
+
+    #[test]
+    fn classify_liveness_is_tri_state() {
+        use DisconnectKind::*;
+        use Liveness::*;
+        // CONNECTED: broker holds it (or unknown) AND the same-host pid is alive.
+        assert_eq!(classify_liveness(Some(true), Some(true)), Connected);
+        assert_eq!(classify_liveness(None, Some(true)), Connected);
+        // DISCONNECTED (split brain): the broker lost it but the pid is STILL ALIVE
+        // — it may be a partitioned agent still editing files. NOT dead.
+        assert_eq!(
+            classify_liveness(Some(false), Some(true)),
+            Disconnected(SplitBrain)
+        );
+        // DISCONNECTED (unknown): no local pid to probe (cross host) and the broker
+        // lost it — death is unconfirmable, so it is never escalated to dead.
+        assert_eq!(
+            classify_liveness(Some(false), None),
+            Disconnected(Unknown)
+        );
+        // DEAD: a same-host pid probe FAILS — the one signal that confirms death.
+        // This holds regardless of the broker's (possibly stale) connection view.
+        assert_eq!(classify_liveness(Some(true), Some(false)), Dead);
+        assert_eq!(classify_liveness(Some(false), Some(false)), Dead);
+        assert_eq!(classify_liveness(None, Some(false)), Dead);
+        // No pid, broker view connected/unknown → treated as connected (alive-ish),
+        // never dead: cross-host death is never inferred without a probe.
+        assert_eq!(classify_liveness(Some(true), None), Connected);
+        assert_eq!(classify_liveness(None, None), Connected);
+    }
+
+    #[test]
+    fn reap_reaps_only_confirmed_dead_never_a_disconnected_split_brain() {
+        // THE M3 SAFETY INVARIANT. A DISCONNECTED session whose process is still
+        // alive is a possible split brain still editing files — its claims MUST
+        // survive the sweep. Only a CONFIRMED-DEAD (pid gone) session is reaped.
+        let root = tmp_root();
+        let dead_pid = 0x7fff_fffe; // not a live pid on any sane system
+        let live_pid = std::process::id() as i32;
+
+        // A DISCONNECTED (broker lost it) session whose pid is ALIVE — a split brain.
+        member(&root, "room-sb", "code-splitbrn", live_pid);
+        set_connected(&root, "code-splitbrn", false).unwrap();
+        add_claim(&root, "room-sb", "code-splitbrn", "still-editing.rs").unwrap();
+
+        // A CONFIRMED-DEAD session (pid gone), also marked disconnected.
+        member(&root, "room-sb", "code-deadgone1", dead_pid);
+        set_connected(&root, "code-deadgone1", false).unwrap();
+        add_claim(&root, "room-sb", "code-deadgone1", "gone.rs").unwrap();
+
+        let reaped = reap_dead_members(&root);
+
+        // The split brain is NOT reaped — its claim stays live for peers to route around.
+        assert!(
+            !reaped.iter().any(|(_, s)| s == "code-splitbrn"),
+            "a disconnected-but-alive split brain must NOT be reaped: {reaped:?}"
+        );
+        assert_eq!(
+            own_claims(&root, "room-sb", "code-splitbrn").unwrap().len(),
+            1,
+            "the split brain's claim must survive the sweep"
+        );
+        // The confirmed-dead session IS reaped.
+        assert!(
+            reaped.contains(&("room-sb".to_string(), "code-deadgone1".to_string())),
+            "a confirmed-dead session's claims must be reaped: {reaped:?}"
+        );
+        assert!(own_claims(&root, "room-sb", "code-deadgone1")
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn live_siblings_keeps_and_flags_a_disconnected_split_brain() {
+        // A broker-disconnected sibling with a live pid stays in the roster FLAGGED
+        // as a possible split brain — the warning peers need to treat its claims as
+        // live (never silently dropped like a merely-aged-out session).
+        let root = tmp_root();
+        let wd = root.dir.join("co").display().to_string();
+        std::fs::create_dir_all(&wd).unwrap();
+        let me = std::process::id() as i32;
+        sa2_record(&root, "code-view00001", &wd, "r", me);
+        sa2_record(&root, "code-splt0002", &wd, "r", me);
+        set_connected(&root, "code-splt0002", false).unwrap();
+        let sibs = live_siblings(&root, "code-view00001", &wd);
+        let sb = sibs.iter().find(|s| s.session == "code-splt0002");
+        assert!(sb.is_some(), "a disconnected split brain must stay in the roster");
+        assert_eq!(
+            sb.unwrap().liveness,
+            Liveness::Disconnected(DisconnectKind::SplitBrain)
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M1/M2: baseline intent surfaced on the sibling roster ─────────────────
+
+    #[test]
+    fn live_siblings_carry_baseline_intent_when_no_todo() {
+        // M2: a session that never emitted a todo still exposes its launch-task
+        // intent (never blank). M1 renders this in the ambient note.
+        let root = tmp_root();
+        let wd = root.dir.join("co").display().to_string();
+        std::fs::create_dir_all(&wd).unwrap();
+        let me = std::process::id() as i32;
+        sa2_record(&root, "code-view00001", &wd, "r", me);
+        sa2_record(&root, "code-base0002", &wd, "r", me);
+        set_intent(&root, "code-base0002", "harden the codex cage sandbox").unwrap();
+        let sibs = live_siblings(&root, "code-view00001", &wd);
+        let s = sibs.iter().find(|s| s.session == "code-base0002").unwrap();
+        assert!(s.current_task.is_none(), "no todo was projected");
+        assert_eq!(s.intent.as_deref(), Some("harden the codex cage sandbox"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn intent_launch_wins_and_first_prompt_seeds_only_when_absent() {
+        // set_intent records the launch task; set_intent_if_absent (the interactive
+        // first-prompt path) must NOT clobber it, but DOES seed when none exists.
+        let root = tmp_root();
+        sa2_record(&root, "code-int00001", "/tmp", "r", std::process::id() as i32);
+        set_intent(&root, "code-int00001", "the launch task").unwrap();
+        set_intent_if_absent(&root, "code-int00001", "a later prompt").unwrap();
+        assert_eq!(
+            get_intent(&root, "code-int00001").as_deref(),
+            Some("the launch task"),
+            "the launch task must win over a later prompt"
+        );
+        // With no prior intent, the first prompt seeds it.
+        sa2_record(&root, "code-int00002", "/tmp", "r", std::process::id() as i32);
+        set_intent_if_absent(&root, "code-int00002", "first prompt").unwrap();
+        assert_eq!(
+            get_intent(&root, "code-int00002").as_deref(),
+            Some("first prompt")
         );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
