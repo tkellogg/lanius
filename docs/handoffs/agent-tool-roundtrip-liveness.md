@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done — M2A (test injects via live /api/publish; the 2 AI-panel round-trip assertions pass). M2B kernel-broaden not needed.
 author: Claude Opus 4.8 (planner)
 last-updated: 2026-07-07
 ---

@@ -25,25 +25,19 @@ const timeOf = (env: any) => {
   const d = new Date(env?.ts ?? Date.now());
   return isNaN(d.getTime()) ? '--:--:--' : d.toTimeString().slice(0, 8);
 };
-// Deterministic per-agent identity chip: a small monogram in a bordered box,
-// colored from a small on-brand palette. Same name → same chip every render.
-const AGENT_PALETTE = [
-  '#e3b769', // amber (matches agent voice)
-  '#6db8a6', // teal (matches work/in)
-  '#e3a08c', // coral
-  '#9aa7c0', // sage
-  '#b89cd1', // violet
-  '#d4b25a', // gold
-];
-function agentColor(name: string) {
+// Deterministic per-agent identity chip: a small monogram in a bordered box.
+// The brand is disciplined about color — the thorn (red) must always be the
+// loudest thing on screen — so chips are NOT a rainbow. Each agent gets only a
+// whisper of per-name hue within a narrow cool grey-blue band; the lightness
+// (and thus contrast) comes from the theme via CSS, not a hardcoded hex.
+function agentHue(name: string) {
   let h = 0;
   for (const c of String(name).toLowerCase()) h = (h * 31 + c.charCodeAt(0)) | 0;
-  return AGENT_PALETTE[Math.abs(h) % AGENT_PALETTE.length];
+  return 198 + (Math.abs(h) % 42); // 198–239: cool blue-grey, never warm
 }
 function AgentChip({ name, size = 'sm' as 'sm' | 'md' | 'lg', className = '' }: { name: string; size?: 'sm' | 'md' | 'lg'; className?: string }) {
-  const color = agentColor(name);
   const mono = String(name).trim().slice(0, 2).toUpperCase() || '??';
-  return <span className={`agent-chip agent-chip-${size}${className ? ` ${className}` : ''}`} style={{ borderColor: color, color }} aria-hidden="true">{mono}</span>;
+  return <span className={`agent-chip agent-chip-${size}${className ? ` ${className}` : ''}`} style={{ ['--chip-h' as any]: agentHue(name) }} aria-hidden="true">{mono}</span>;
 }
 const relativeTime = (t: unknown) => {
   const d = new Date(String(t ?? ''));
