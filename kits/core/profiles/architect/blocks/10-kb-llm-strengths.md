@@ -1,5 +1,5 @@
 ---
-{ "kb": "kb-llm-strengths", "path": "kb/role-verifier.md", "lines": "1-26", "sha": "4ab50cf36ce96ebe14b99e054de8895a4ef5437cd78ff023b8c889bc6cc685c6" }
+{ "kb": "kb-llm-strengths", "path": "kb/role-verifier.md", "lines": "1-31", "sha": "1aa5627c79706ca55970b3be67ea5ea56bb0037fdbf0e4b61c256bfedd0856ff" }
 ---
 When you dispatch work, choose the model by ROLE, and remember the one rule that
 never flexes: **planning stays with Claude or Fable — never GPT-5.5 or GLM-5.2.**

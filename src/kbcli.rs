@@ -80,6 +80,55 @@ pub fn search(root: &Root, query: &str, limit: usize, json_out: bool) -> Result<
     Ok(())
 }
 
+/// `lanius kb parse <pkg> <path> [--json]`: the deterministic, no-LLM extraction
+/// surface (docs/handoffs/kb-formalization.md M2). Parses the KB entry at
+/// `kb/<path>` inside `pkg` and prints its frontmatter + classified links — the
+/// canonical format reader scripts call instead of re-deriving a regex per language.
+pub fn parse(root: &Root, pkg: &str, path: &str, json_out: bool) -> Result<()> {
+    let entry = kb::parse_file(root, pkg, path)?;
+    if json_out {
+        println!("{}", serde_json::to_string(&entry)?);
+        return Ok(());
+    }
+    match &entry.frontmatter {
+        None => println!("frontmatter: (none)"),
+        Some(fm) => {
+            println!("title: {}", fm.title.as_deref().unwrap_or("(missing)"));
+            println!(
+                "description: {}",
+                fm.description.as_deref().unwrap_or("(missing)")
+            );
+            if !fm.tags.is_empty() {
+                println!("tags: {}", fm.tags.join(", "));
+            }
+            if !fm.unknown_keys.is_empty() {
+                println!("unknown keys (ignored): {}", fm.unknown_keys.join(", "));
+            }
+        }
+    }
+    println!("body starts at line {}", entry.body_start_line);
+    if entry.links.is_empty() {
+        println!("links: (none)");
+    } else {
+        println!("links:");
+        for l in &entry.links {
+            let cls = match &l.class {
+                kb::LinkClass::External => "external".to_string(),
+                kb::LinkClass::Anchor => "anchor".to_string(),
+                kb::LinkClass::Absolute => "absolute".to_string(),
+                kb::LinkClass::Relative { .. } => "relative".to_string(),
+            };
+            let refnote = if l.reference_style {
+                " [reference-style]"
+            } else {
+                ""
+            };
+            println!("  L{} {} -> {}{}", l.line, cls, l.target, refnote);
+        }
+    }
+    Ok(())
+}
+
 /// `lanius kb write <pkg> <path>`: write stdin (or `--content`) into `kb/<path>`
 /// and commit it. Write-then-commit is atomic with the KB's hardened git.
 pub fn write(root: &Root, pkg: &str, path: &str, content: &str) -> Result<()> {

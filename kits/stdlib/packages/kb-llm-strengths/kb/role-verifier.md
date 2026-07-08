@@ -1,3 +1,8 @@
+---
+title: Role: verifier (phase 4)
+description: Who verifies — a stronger tier than implementation; Opus, GPT-5.5, Fable.
+tags: [roles, verification]
+---
 # Role: verifier (phase 4)
 
 Verification is a **stronger** tier than implementation: pedantry is an asset

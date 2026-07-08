@@ -1,3 +1,8 @@
+---
+title: GLM-5.2
+description: An implementation-tier model; placement still firming up, never a planner.
+tags: [models, implementation]
+---
 # GLM-5.2
 
 > Placement still firming up. Fits somewhere in implementation.

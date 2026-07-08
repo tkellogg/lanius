@@ -1,3 +1,8 @@
+---
+title: Opus
+description: A workhorse for both building and checking; effort dials the tier.
+tags: [models, implementation, verification]
+---
 # Opus
 
 > A workhorse for both building and checking; effort dials the tier.

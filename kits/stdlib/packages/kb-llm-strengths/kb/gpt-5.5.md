@@ -1,3 +1,8 @@
+---
+title: GPT-5.5
+description: Smart and pedantic — that pedantry is an asset for checking and verification.
+tags: [models, verification]
+---
 # GPT-5.5
 
 > Extremely smart and pedantic. That pedantry is an asset for checking.

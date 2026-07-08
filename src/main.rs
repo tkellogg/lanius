@@ -647,6 +647,16 @@ enum KbCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Parse a KB entry's frontmatter + links (deterministic, no LLM): lanius kb parse <pkg> <path>
+    Parse {
+        /// The package that owns the KB (must be on the path).
+        pkg: String,
+        /// The path INSIDE the package's kb/ tree (e.g. role-verifier.md).
+        path: String,
+        /// Emit the parsed entry as one JSON object instead of the human view.
+        #[arg(long)]
+        json: bool,
+    },
     /// Write a file into a KB's kb/ tree and commit it: lanius kb write <pkg> <path>
     Write {
         /// The package that owns the KB (must be on the path).
@@ -1426,6 +1436,7 @@ fn run(cli: Cli) -> Result<()> {
             KbCmd::Search { query, limit, json } => {
                 kbcli::search(&root, &query.join(" "), limit, json)?
             }
+            KbCmd::Parse { pkg, path, json } => kbcli::parse(&root, &pkg, &path, json)?,
             KbCmd::Write { pkg, path, content } => {
                 let content = match content {
                     Some(c) => c,

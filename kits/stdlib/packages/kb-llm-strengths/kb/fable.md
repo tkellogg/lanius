@@ -1,3 +1,8 @@
+---
+title: Fable
+description: Unparalleled at planning, expensive — when to bank it for the hardest work.
+tags: [models, planning]
+---
 # Fable
 
 > Unparalleled at planning. Expensive — bank it.

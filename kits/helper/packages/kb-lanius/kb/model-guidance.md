@@ -1,3 +1,8 @@
+---
+title: Model Guidance
+description: Choosing models with enough instruction-following, tool discipline, and context.
+tags: [lanius, models]
+---
 # Model Guidance
 
 Agent work needs enough instruction following, tool discipline, and context

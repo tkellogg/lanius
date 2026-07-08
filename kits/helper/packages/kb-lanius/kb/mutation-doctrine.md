@@ -1,3 +1,8 @@
+---
+title: Mutation Doctrine
+description: The helper reads transparently but never silently mutates setup.
+tags: [lanius, doctrine]
+---
 # Mutation Doctrine
 
 The helper may read broadly and transparently. It may not silently mutate setup.

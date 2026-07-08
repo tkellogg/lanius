@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Opus 4.8 in Claude Code (planner)
 last-updated: 2026-07-08
 ---

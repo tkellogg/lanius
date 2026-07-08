@@ -455,6 +455,320 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+// ───────────────── The KB entry format: the deterministic parser ─────────────────
+//
+// docs/handoffs/kb-formalization.md. A KB entry is markdown with an optional
+// `---`-delimited YAML-ish frontmatter block (single-line scalars only) plus
+// inline relative links. This is a plain, no-LLM parser a script can rely on. The
+// frontmatter reader deliberately mirrors `manifest::skill_md` — the same minimal
+// `---` single-line-scalar discipline, no YAML dependency (wonky bit 1).
+
+/// The parsed frontmatter block of a KB entry. `title`/`description` are
+/// single-line scalars; `tags` is one inline `[a, b, c]` list. Unknown keys are
+/// ignored (forward-compatible), surfaced only so a caller could report them.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Frontmatter {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    pub unknown_keys: Vec<String>,
+}
+
+/// How a link target classifies. `classify_link` computes it from the raw target.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LinkClass {
+    /// A real external link — the target carries a `scheme:` (http:, https:, mailto:).
+    External,
+    /// An in-page anchor — a `#fragment`-only target.
+    Anchor,
+    /// An absolute path (`/…`) — disallowed for an internal reference.
+    Absolute,
+    /// A relative internal reference: the path (fragment stripped) plus any fragment.
+    Relative {
+        path: String,
+        fragment: Option<String>,
+    },
+}
+
+/// One link extracted from an entry's body. `reference_style` marks the disallowed
+/// `[text][id]` form (inline `[text](target)` is false) so a consumer can flag it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Link {
+    pub text: String,
+    pub target: String,
+    pub line: usize,
+    pub class: LinkClass,
+    pub reference_style: bool,
+}
+
+/// A fully parsed KB entry: its frontmatter (if any), its links, and the 1-based
+/// line at which the body begins (past the frontmatter) so a consumer can index
+/// the body without the frontmatter.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParsedEntry {
+    pub frontmatter: Option<Frontmatter>,
+    pub links: Vec<Link>,
+    pub body_start_line: usize,
+}
+
+/// Parse a KB entry: read the optional `---` frontmatter block, then extract every
+/// inline `[text](target)` link (and flag the disallowed reference-style form) from
+/// the body. Pure over its input, fully unit-testable. No LLM, no new dependency.
+pub fn parse_kb_entry(text: &str) -> ParsedEntry {
+    let (frontmatter, body_start_line) = parse_frontmatter(text);
+    let links = extract_links(text, body_start_line);
+    ParsedEntry {
+        frontmatter,
+        links,
+        body_start_line,
+    }
+}
+
+/// Read the leading `---`-delimited frontmatter block, mirroring
+/// `manifest::skill_md`. Returns the parsed block (or `None` when the file does not
+/// open with `---`) and the 1-based line where the body begins.
+fn parse_frontmatter(text: &str) -> (Option<Frontmatter>, usize) {
+    let mut lines = text.lines();
+    // The very first line must be exactly `---` (single-line-scalar discipline).
+    match lines.next() {
+        Some(l) if l.trim() == "---" => {}
+        _ => return (None, 1),
+    }
+    let mut fm = Frontmatter::default();
+    // Line 1 was the opening `---`; count from there to find the body start.
+    let mut consumed = 1usize;
+    let mut closed = false;
+    for line in lines {
+        consumed += 1;
+        let t = line.trim();
+        if t == "---" {
+            closed = true;
+            break;
+        }
+        let Some((key, value)) = t.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "title" => fm.title = Some(value.to_string()),
+            "description" => fm.description = Some(value.to_string()),
+            "tags" => fm.tags = parse_tags(value),
+            other if !other.is_empty() => fm.unknown_keys.push(other.to_string()),
+            _ => {}
+        }
+    }
+    if !closed {
+        // An unterminated block is not a valid frontmatter block.
+        return (None, 1);
+    }
+    // The body begins on the line after the closing `---` (1-based).
+    (Some(fm), consumed + 1)
+}
+
+/// Parse an inline `[a, b, c]` tag list into trimmed, non-empty tags. A bare
+/// `a, b` (no brackets) is accepted too; empties are dropped.
+fn parse_tags(value: &str) -> Vec<String> {
+    let inner = value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    inner
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Classify a raw link target: `External` (has a `scheme:`), `Anchor` (`#…`),
+/// `Absolute` (`/…`), or `Relative { path, fragment }` (everything else, with the
+/// `#fragment`/`?query` stripped from the resolved path).
+pub fn classify_link(target: &str) -> LinkClass {
+    let t = target.trim();
+    if t.is_empty() {
+        return LinkClass::Relative {
+            path: String::new(),
+            fragment: None,
+        };
+    }
+    if has_scheme(t) {
+        return LinkClass::External;
+    }
+    if t.starts_with('#') {
+        return LinkClass::Anchor;
+    }
+    if t.starts_with('/') {
+        return LinkClass::Absolute;
+    }
+    let (path, fragment) = split_fragment(t);
+    LinkClass::Relative { path, fragment }
+}
+
+/// Whether a target begins with a URL scheme — `letters(+.-)*` then `:` (e.g.
+/// `https:`, `mailto:`). A relative path like `role-verifier.md` has no such colon.
+fn has_scheme(t: &str) -> bool {
+    let mut seen_alpha = false;
+    for (i, ch) in t.char_indices() {
+        if i == 0 {
+            if !ch.is_ascii_alphabetic() {
+                return false;
+            }
+            seen_alpha = true;
+            continue;
+        }
+        if ch == ':' {
+            return seen_alpha;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '+' || ch == '.' || ch == '-' {
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+/// Split a relative target into its on-disk path and any trailing `#fragment`. A
+/// `?query` (rare for a file link) is also stripped from the path.
+fn split_fragment(t: &str) -> (String, Option<String>) {
+    let (path, fragment) = match t.split_once('#') {
+        Some((p, f)) => (p, Some(f.to_string())),
+        None => (t, None),
+    };
+    let path = path.split('?').next().unwrap_or(path);
+    (path.to_string(), fragment)
+}
+
+/// The outcome of resolving a relative internal link against the file's directory.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LinkResolution {
+    /// The lexically-normalized path the target resolves to (for diagnostics).
+    pub path: PathBuf,
+    /// True ONLY when the target exists on disk AND lies inside `package_root` — the
+    /// portable unit. A target that escapes the package tree resolves to `false`,
+    /// the same as a missing file (the one `dead_link` contract, wonky bit 4).
+    pub resolves: bool,
+}
+
+/// Resolve a relative link target against `kb_file_dir` (the directory of the KB
+/// file that carries the link — standard markdown/POSIX). `resolves` is true only
+/// when the resolved path is a file that EXISTS and lies INSIDE `package_root`: an
+/// escaping `../../../../docs/x.md` resolves to `false` exactly like a missing file,
+/// because a package installs without the repo's `docs/` so the target does not
+/// travel with the package.
+pub fn resolve_relative(kb_file_dir: &Path, package_root: &Path, target: &str) -> LinkResolution {
+    let (rel, _frag) = split_fragment(target.trim());
+    let normalized = normalize_lexical(&kb_file_dir.join(&rel));
+    let root = normalize_lexical(package_root);
+    let inside = normalized.starts_with(&root);
+    // symlink_metadata: never follow a link out of the tree; a real target is a file.
+    let exists = std::fs::symlink_metadata(&normalized)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false);
+    LinkResolution {
+        path: normalized,
+        resolves: inside && exists,
+    }
+}
+
+/// Collapse `.` and `..` components lexically (no disk access), so an escaping
+/// `../../../../docs/x.md` normalizes to a path OUTSIDE the package root — which is
+/// exactly what the `starts_with` package-containment check keys on.
+fn normalize_lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Extract inline `[text](target)` links (and flag reference-style `[text][id]`)
+/// from the body (lines at or after `body_start_line`). One left-to-right pass per
+/// line; targets do not span lines in the corpus, so per-line scanning is exact.
+fn extract_links(text: &str, body_start_line: usize) -> Vec<Link> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for (i, line) in text.lines().enumerate() {
+        let lineno = i + 1;
+        // A ``` or ~~~ fence line toggles a fenced code block; links inside are code
+        // samples (the format spec's own ✅/❌ examples), never real references.
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || lineno < body_start_line {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut j = 0;
+        while j < chars.len() {
+            if chars[j] != '[' {
+                j += 1;
+                continue;
+            }
+            let Some(close) = find_char(&chars, j + 1, ']') else {
+                break; // no closing ] on this line
+            };
+            let link_text: String = chars[j + 1..close].iter().collect();
+            let next = chars.get(close + 1).copied();
+            if next == Some('(') {
+                if let Some(pclose) = find_char(&chars, close + 2, ')') {
+                    let target: String = chars[close + 2..pclose].iter().collect();
+                    out.push(Link {
+                        class: classify_link(&target),
+                        text: link_text,
+                        target,
+                        line: lineno,
+                        reference_style: false,
+                    });
+                    j = pclose + 1;
+                    continue;
+                }
+            } else if next == Some('[') {
+                if let Some(rclose) = find_char(&chars, close + 2, ']') {
+                    let id: String = chars[close + 2..rclose].iter().collect();
+                    out.push(Link {
+                        class: classify_link(&id),
+                        text: link_text,
+                        target: id,
+                        line: lineno,
+                        reference_style: true,
+                    });
+                    j = rclose + 1;
+                    continue;
+                }
+            }
+            j = close + 1;
+        }
+    }
+    out
+}
+
+/// Index of the first `needle` in `chars` at or after `from`, if any.
+fn find_char(chars: &[char], from: usize, needle: char) -> Option<usize> {
+    chars.iter().skip(from).position(|&c| c == needle).map(|p| p + from)
+}
+
+/// Parse the KB entry at `kb/<rel>` inside `pkg` (path-disciplined, no traversal) —
+/// the sharp edge behind `lanius kb parse`. The package's own tree is the resolution
+/// root for its links.
+pub fn parse_file(root: &Root, pkg: &str, rel: &str) -> Result<ParsedEntry> {
+    let package = packages::find(root, pkg)
+        .with_context(|| format!("resolving package {pkg:?} for a kb parse"))?;
+    let safe = safe_kb_rel(rel)?;
+    let file = kb_dir(&package).join(&safe);
+    let text = std::fs::read_to_string(&file)
+        .with_context(|| format!("reading kb file {}", file.display()))?;
+    Ok(parse_kb_entry(&text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,6 +1220,179 @@ mod tests {
         assert!(
             apply_diff(&root, "kb-demo", traverse).is_err(),
             "traversal refused"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    /// Every `.md` file under a shipped package's `kb/` tree (recursive), as
+    /// (repo-relative-to-kb path, absolute file path) pairs.
+    fn shipped_kb_files(pkg_dir: &Path) -> Vec<(String, PathBuf)> {
+        fn walk(base: &Path, rel: &Path, out: &mut Vec<(String, PathBuf)>) {
+            let here = base.join(rel);
+            for e in std::fs::read_dir(&here).unwrap().filter_map(|e| e.ok()) {
+                let child = rel.join(e.file_name());
+                if e.file_type().unwrap().is_dir() {
+                    walk(base, &child, out);
+                } else if child.extension().and_then(|x| x.to_str()) == Some("md") {
+                    out.push((child.to_string_lossy().to_string(), base.join(&child)));
+                }
+            }
+        }
+        let kb = pkg_dir.join("kb");
+        let mut out = Vec::new();
+        walk(&kb, Path::new(""), &mut out);
+        out
+    }
+
+    #[test]
+    fn shipped_kb_files_conform_to_the_format() {
+        // M4 acceptance: every shipped KB file (both packages) parses with valid
+        // frontmatter (title + description) and carries only legitimate, resolving
+        // relative-inline links — no absolute, no reference-style, no escaping link.
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for pkg_dir in [
+            manifest.join("kits/stdlib/packages/kb-llm-strengths"),
+            manifest.join("kits/helper/packages/kb-lanius"),
+        ] {
+            let package_root = &pkg_dir;
+            let files = shipped_kb_files(&pkg_dir);
+            assert!(!files.is_empty(), "package ships kb files: {pkg_dir:?}");
+            for (rel, file) in files {
+                let text = std::fs::read_to_string(&file).unwrap();
+                let parsed = parse_kb_entry(&text);
+                let fm = parsed
+                    .frontmatter
+                    .unwrap_or_else(|| panic!("{rel} has frontmatter"));
+                assert!(
+                    fm.title.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false),
+                    "{rel} has a non-empty title"
+                );
+                assert!(
+                    fm.description
+                        .as_deref()
+                        .map(|d| !d.trim().is_empty())
+                        .unwrap_or(false),
+                    "{rel} has a non-empty description"
+                );
+                let kb_file_dir = file.parent().unwrap();
+                for link in &parsed.links {
+                    assert!(!link.reference_style, "{rel}: reference-style link {:?}", link.target);
+                    match &link.class {
+                        LinkClass::Absolute => {
+                            panic!("{rel}: absolute link {:?}", link.target)
+                        }
+                        LinkClass::Relative { .. } => {
+                            let r = resolve_relative(kb_file_dir, package_root, &link.target);
+                            assert!(
+                                r.resolves,
+                                "{rel}: relative link {:?} must resolve inside the package tree",
+                                link.target
+                            );
+                        }
+                        LinkClass::External | LinkClass::Anchor => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // ───────────── M1: the deterministic KB-entry parser ─────────────
+
+    #[test]
+    fn parse_frontmatter_present_absent_and_fields() {
+        // Frontmatter present: title/description/tags parsed, unknown key ignored
+        // (surfaced), body starts after the closing `---`.
+        let with = "---\ntitle: Role: planner\ndescription: who plans\ntags: [roles, planning]\nowner: someone\n---\n# Role: planner\nbody line\n";
+        let p = parse_kb_entry(with);
+        let fm = p.frontmatter.expect("frontmatter present");
+        assert_eq!(fm.title.as_deref(), Some("Role: planner"));
+        assert_eq!(fm.description.as_deref(), Some("who plans"));
+        assert_eq!(fm.tags, vec!["roles", "planning"]);
+        assert_eq!(fm.unknown_keys, vec!["owner"], "unknown key surfaced, not fatal");
+        assert_eq!(p.body_start_line, 7, "body begins after the closing ---");
+
+        // Frontmatter absent: None, body starts at line 1.
+        let without = "# Just a heading\nno frontmatter here\n";
+        let p2 = parse_kb_entry(without);
+        assert!(p2.frontmatter.is_none());
+        assert_eq!(p2.body_start_line, 1);
+
+        // Missing required field: title present, description absent → tags empty.
+        let partial = "---\ntitle: Only a title\n---\n# body\n";
+        let fm3 = parse_kb_entry(partial).frontmatter.unwrap();
+        assert_eq!(fm3.title.as_deref(), Some("Only a title"));
+        assert!(fm3.description.is_none(), "missing description is None, not an error");
+        assert!(fm3.tags.is_empty(), "absent tags = no tags");
+
+        // An unterminated block is not valid frontmatter.
+        let unterminated = "---\ntitle: x\nno closing fence\n";
+        assert!(parse_kb_entry(unterminated).frontmatter.is_none());
+    }
+
+    #[test]
+    fn classify_each_link_class() {
+        assert!(matches!(
+            classify_link("role-verifier.md"),
+            LinkClass::Relative { .. }
+        ));
+        assert!(matches!(classify_link("../x/y.md"), LinkClass::Relative { .. }));
+        assert_eq!(classify_link("/abs/path.md"), LinkClass::Absolute);
+        assert_eq!(classify_link("https://example.com"), LinkClass::External);
+        assert_eq!(classify_link("mailto:a@b.c"), LinkClass::External);
+        assert_eq!(classify_link("#section"), LinkClass::Anchor);
+        // A relative target's #fragment is split off the resolved path.
+        match classify_link("opus.md#who") {
+            LinkClass::Relative { path, fragment } => {
+                assert_eq!(path, "opus.md");
+                assert_eq!(fragment.as_deref(), Some("who"));
+            }
+            other => panic!("expected Relative, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_inline_and_flags_reference_style() {
+        let body = "see [role-verifier.md](role-verifier.md) and [the doc][ref] plus [abs](/x.md)\n";
+        let links = parse_kb_entry(body).links;
+        let inline = links.iter().find(|l| l.target == "role-verifier.md").unwrap();
+        assert!(!inline.reference_style);
+        assert!(matches!(inline.class, LinkClass::Relative { .. }));
+        let refstyle = links.iter().find(|l| l.reference_style).unwrap();
+        assert_eq!(refstyle.text, "the doc");
+        assert_eq!(refstyle.target, "ref");
+        let abs = links.iter().find(|l| l.target == "/x.md").unwrap();
+        assert_eq!(abs.class, LinkClass::Absolute);
+        // Every link carries a 1-based line number.
+        assert!(links.iter().all(|l| l.line == 1));
+    }
+
+    #[test]
+    fn resolve_relative_in_package_missing_and_escaping() {
+        // A scratch package tree: <pkg>/kb/a.md and <pkg>/kb/sub/b.md exist.
+        let root = scratch("resolve");
+        let pkg = root.dir.join("pkg");
+        let kb = pkg.join("kb");
+        std::fs::create_dir_all(kb.join("sub")).unwrap();
+        std::fs::write(kb.join("a.md"), "x").unwrap();
+        std::fs::write(kb.join("sub/b.md"), "y").unwrap();
+
+        // In-package target that exists → resolves true.
+        let r = resolve_relative(&kb, &pkg, "a.md");
+        assert!(r.resolves, "existing in-package file resolves: {r:?}");
+        // Cross-dir but still in-package → resolves true.
+        let r2 = resolve_relative(&kb.join("sub"), &pkg, "../a.md");
+        assert!(r2.resolves, "../a.md from sub/ is still in-package");
+        // Missing file → false.
+        assert!(!resolve_relative(&kb, &pkg, "gone.md").resolves);
+        // Escaping target (the ../../../../docs/x.md shape) → false, same as missing,
+        // EVEN if that path happens to exist on disk (it escapes the package tree).
+        let outside = root.dir.join("docs");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("x.md"), "z").unwrap();
+        let escape = resolve_relative(&kb, &pkg, "../docs/x.md");
+        assert!(
+            !escape.resolves,
+            "an existing-but-escaping target must NOT resolve: {escape:?}"
         );
         std::fs::remove_dir_all(&root.dir).ok();
     }

@@ -80,6 +80,36 @@ pub struct OrphanFile {
     pub path: String,
 }
 
+/// One KB-format finding over a `kb/` file (docs/handoffs/kb-formalization.md M2).
+/// All WARN-level — a finding in the sweep, never a hard error or a write block.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "finding")]
+pub enum FormatKind {
+    /// The file has no `---` frontmatter block at all.
+    MissingFrontmatter,
+    /// The frontmatter is present but a required field (`title`/`description`) is
+    /// missing or empty.
+    MissingField { field: String },
+    /// A disallowed internal-reference link: an absolute path or a reference-style
+    /// `[text][id]` link.
+    BadLink {
+        target: String,
+        reason: String,
+        line: usize,
+    },
+    /// A relative internal link that does not resolve inside the package's own tree
+    /// — either missing on disk OR escaping the package (one class, wonky bit 4).
+    DeadLink { target: String, line: usize },
+}
+
+/// One reported KB-format finding: the KB, the repo-relative `kb/` path, the kind.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FormatFinding {
+    pub kb: String,
+    pub path: String,
+    pub kind: FormatKind,
+}
+
 /// The owner-facing sweep report (M1). Zero LLM calls produce it.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Report {
@@ -89,6 +119,8 @@ pub struct Report {
     pub stale: Vec<PointerIssue>,
     /// `kb/` files no pointer references, within a pointed-at KB (informational).
     pub orphans: Vec<OrphanFile>,
+    /// KB-entry format findings (frontmatter/link contract, formalization M2).
+    pub format: Vec<FormatFinding>,
     /// How many pointer blocks were checked.
     pub checked_pointers: usize,
     /// How many `kb/` files were enumerated across the pointed-at KBs.
@@ -98,8 +130,64 @@ pub struct Report {
 impl Report {
     /// Whether the sweep found anything worth mailing the owner about.
     pub fn has_findings(&self) -> bool {
-        !self.broken.is_empty() || !self.stale.is_empty() || !self.orphans.is_empty()
+        !self.broken.is_empty()
+            || !self.stale.is_empty()
+            || !self.orphans.is_empty()
+            || !self.format.is_empty()
     }
+}
+
+/// Check one KB file's text against the format contract (frontmatter present, both
+/// required fields, and every internal link legitimate + resolving inside the
+/// package). Pure over its inputs — the text, the file's own directory, and the
+/// package root the links must resolve within — so it is directly unit-testable and
+/// makes ZERO LLM calls. `package_root` is the portable-unit boundary (wonky bit 4).
+pub fn check_kb_format(text: &str, kb_file_dir: &Path, package_root: &Path) -> Vec<FormatKind> {
+    let parsed = kb::parse_kb_entry(text);
+    let mut out = Vec::new();
+    match &parsed.frontmatter {
+        None => out.push(FormatKind::MissingFrontmatter),
+        Some(fm) => {
+            if fm.title.as_deref().unwrap_or("").trim().is_empty() {
+                out.push(FormatKind::MissingField {
+                    field: "title".into(),
+                });
+            }
+            if fm.description.as_deref().unwrap_or("").trim().is_empty() {
+                out.push(FormatKind::MissingField {
+                    field: "description".into(),
+                });
+            }
+        }
+    }
+    for link in &parsed.links {
+        if link.reference_style {
+            out.push(FormatKind::BadLink {
+                target: link.target.clone(),
+                reason: "reference-style link".into(),
+                line: link.line,
+            });
+            continue;
+        }
+        match &link.class {
+            kb::LinkClass::Absolute => out.push(FormatKind::BadLink {
+                target: link.target.clone(),
+                reason: "absolute path".into(),
+                line: link.line,
+            }),
+            kb::LinkClass::Relative { .. } => {
+                if !kb::resolve_relative(kb_file_dir, package_root, &link.target).resolves {
+                    out.push(FormatKind::DeadLink {
+                        target: link.target.clone(),
+                        line: link.line,
+                    });
+                }
+            }
+            // A real external URL and an in-page anchor are both fine.
+            kb::LinkClass::External | kb::LinkClass::Anchor => {}
+        }
+    }
+    out
 }
 
 /// A raw pointer block read from the store: its owner, name, and parsed meta.
@@ -277,6 +365,28 @@ pub fn sweep(root: &Root, conn: &Connection, profile: &str) -> Result<Report> {
             }
         }
     }
+
+    // Format sweep (docs/handoffs/kb-formalization.md M2): validate the frontmatter
+    // + link contract over EVERY file in EVERY enabled [kb] package (not only the
+    // pointed-at ones — the format applies to the whole corpus). Read-only; no LLM.
+    for kbi in kb::enumerate(root, profile)? {
+        // The package root is the parent of the `kb/` dir — the portable-unit tree a
+        // relative link must resolve inside (wonky bit 4).
+        let package_root = kbi.path.parent().unwrap_or(&kbi.path).to_path_buf();
+        for rel in list_kb_files(&kbi.path) {
+            let file = kbi.path.join(&rel);
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let kb_file_dir = file.parent().unwrap_or(&kbi.path).to_path_buf();
+            let repo_rel = format!("{}/{}", kb::KB_DIR, rel);
+            for kind in check_kb_format(&text, &kb_file_dir, &package_root) {
+                report.format.push(FormatFinding {
+                    kb: kbi.package.clone(),
+                    path: repo_rel.clone(),
+                    kind,
+                });
+            }
+        }
+    }
     Ok(report)
 }
 
@@ -319,12 +429,13 @@ pub fn report_summary(report: &Report) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "kb groundskeeper: {} pointer(s), {} file(s) checked — \
-         {} broken, {} stale, {} orphan\n",
+         {} broken, {} stale, {} orphan, {} format\n",
         report.checked_pointers,
         report.checked_files,
         report.broken.len(),
         report.stale.len(),
         report.orphans.len(),
+        report.format.len(),
     ));
     for i in &report.broken {
         out.push_str(&format!(
@@ -348,7 +459,26 @@ pub fn report_summary(report: &Report) -> String {
             o.kb, o.path
         ));
     }
+    for f in &report.format {
+        out.push_str(&format!("  FORMAT  {}/{}: {}\n", f.kb, f.path, format_word(&f.kind)));
+    }
     out
+}
+
+/// A one-line human reason for a KB-format finding.
+fn format_word(k: &FormatKind) -> String {
+    match k {
+        FormatKind::MissingFrontmatter => "no frontmatter block (--- title/description)".into(),
+        FormatKind::MissingField { field } => format!("frontmatter is missing '{field}'"),
+        FormatKind::BadLink {
+            target,
+            reason,
+            line,
+        } => format!("bad link ({reason}) at line {line}: {target}"),
+        FormatKind::DeadLink { target, line } => {
+            format!("dead link (does not resolve inside the package) at line {line}: {target}")
+        }
+    }
 }
 
 fn status_word(s: &PointerStatus) -> &'static str {
@@ -893,9 +1023,96 @@ mod tests {
     }
 
     #[test]
+    fn check_kb_format_classes_are_pure() {
+        // M2 acceptance (pure finding logic): frontmatter-less, absolute-link,
+        // escaping-relative, and a clean in-package cross-link.
+        let root = scratch("fmtpure");
+        let pkg = root.dir.join("pkg");
+        let kb = pkg.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::write(kb.join("target.md"), "# target\n").unwrap();
+
+        // 1) No frontmatter → MissingFrontmatter.
+        let none = check_kb_format("# heading\nno frontmatter\n", &kb, &pkg);
+        assert!(matches!(none.as_slice(), [FormatKind::MissingFrontmatter]));
+
+        // 2) Absolute link → BadLink (frontmatter is fine here).
+        let abs = check_kb_format(
+            "---\ntitle: T\ndescription: d\n---\nsee [x](/abs/path.md)\n",
+            &kb,
+            &pkg,
+        );
+        assert!(abs
+            .iter()
+            .any(|k| matches!(k, FormatKind::BadLink { reason, .. } if reason == "absolute path")));
+
+        // 3) Escaping relative link (../../../../docs/x.md shape) → DeadLink.
+        let escape = check_kb_format(
+            "---\ntitle: T\ndescription: d\n---\nsee [d](../../../../docs/x.md)\n",
+            &kb,
+            &pkg,
+        );
+        assert!(escape
+            .iter()
+            .any(|k| matches!(k, FormatKind::DeadLink { .. })));
+
+        // 4) Clean: frontmatter complete, an in-package resolving cross-file link.
+        let clean = check_kb_format(
+            "---\ntitle: T\ndescription: d\ntags: [a]\n---\nsee [t](target.md)\n",
+            &kb,
+            &pkg,
+        );
+        assert!(clean.is_empty(), "a conforming entry has no findings: {clean:?}");
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn sweep_reports_format_findings_over_the_corpus() {
+        // M2 acceptance: a seeded corpus with one frontmatter-less file, one with an
+        // absolute link, one with an escaping relative link, and one clean file →
+        // exactly the first three are format findings; the fourth is clean.
+        let root = scratch("fmtsweep");
+        install_kb(
+            &root,
+            "kb-demo",
+            &[
+                ("bare.md", "# bare\nno frontmatter\n"),
+                (
+                    "abs.md",
+                    "---\ntitle: Abs\ndescription: d\n---\nsee [x](/abs.md)\n",
+                ),
+                (
+                    "escape.md",
+                    "---\ntitle: Esc\ndescription: d\n---\nsee [d](../../../../docs/x.md)\n",
+                ),
+                (
+                    "good.md",
+                    "---\ntitle: Good\ndescription: d\n---\nsee [b](bare.md)\n",
+                ),
+            ],
+        );
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        let report = sweep(&root, &conn, "default").unwrap();
+
+        let path_has =
+            |p: &str| report.format.iter().filter(|f| f.path == format!("kb/{p}")).count();
+        assert_eq!(path_has("bare.md"), 1, "frontmatter-less file flagged once");
+        assert!(report.format.iter().any(|f| f.path == "kb/bare.md"
+            && matches!(f.kind, FormatKind::MissingFrontmatter)));
+        assert!(report.format.iter().any(|f| f.path == "kb/abs.md"
+            && matches!(f.kind, FormatKind::BadLink { .. })));
+        assert!(report.format.iter().any(|f| f.path == "kb/escape.md"
+            && matches!(f.kind, FormatKind::DeadLink { .. })));
+        assert_eq!(path_has("good.md"), 0, "the conforming file is clean");
+        assert!(report.has_findings());
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
     fn sweep_is_clean_on_a_healthy_corpus() {
         let root = scratch("clean");
-        let body = "# ok\nx\n";
+        let body = "---\ntitle: ok\ndescription: a healthy entry\n---\n# ok\nx\n";
         install_kb(&root, "kb-demo", &[("a.md", body)]);
         let conn = db::open(&root).unwrap();
         db::init_schema(&conn).unwrap();

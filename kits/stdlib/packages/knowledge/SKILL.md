@@ -38,6 +38,13 @@ Rules of the road:
   `fs_write` on that package's directory. If you lack it, the cage refuses the
   write — ask the human to grant it (or work in a *copied* package, whose `kb/`
   is inside your own writable world).
+- **Follow the entry format.** An entry opens with a `---` frontmatter block
+  (`title` + `description`, optional `tags`), and every internal reference is a
+  relative-inline markdown link that resolves inside the package. The canonical
+  spec — including what belongs in a KB versus a note or a memory block — is the
+  `writing-kb-entries.md` entry in the `kb-lanius` KB; read it with
+  `lanius kb parse kb-lanius writing-kb-entries.md` (or `lanius kb list` to find
+  the KB). `lanius kb check` flags any entry that breaks the format.
 - **One topic per file; cross-link by relative path + line.** Keep files small
   and greppable.
 - **Provenance is the git log**, not a footer you add — do not stamp

@@ -1,3 +1,8 @@
+---
+title: Claude
+description: The intent-and-spec model — a planner with taste; when to reach for it.
+tags: [models, planning]
+---
 # Claude
 
 > The intent-and-spec model. "Gets Tim" better than the others.

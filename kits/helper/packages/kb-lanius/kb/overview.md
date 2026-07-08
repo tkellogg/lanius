@@ -1,3 +1,8 @@
+---
+title: Lanius Overview
+description: What lanius is — the orchestration layer, topic planes, agents, packages, KBs.
+tags: [lanius, overview]
+---
 # Lanius Overview
 
 Lanius is an orchestration layer around agents, packages, tools, and humans. The
@@ -22,7 +27,9 @@ agent's path while its requested capability remains pending until approved.
 Knowledge bases are plain `kb/` folders inside packages that declare a `[kb]`
 marker. Use `lanius kb list` to find them, `lanius kb search` or the
 `search_knowledge` tool to query them, and `lanius kb write` to add durable
-knowledge where the package and grants allow it.
+knowledge where the package and grants allow it. Before you write one, read
+[writing-kb-entries.md](writing-kb-entries.md) — the KB entry format (frontmatter
++ relative-inline links) and what belongs in a KB versus a memory block or `docs/`.
 
 The helper follows a simple rule: reads are transparent through shell and the
 lanius CLI; writes are gated through proposals, approvals, or explicit human

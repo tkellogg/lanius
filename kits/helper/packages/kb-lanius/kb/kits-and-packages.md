@@ -1,3 +1,8 @@
+---
+title: Kits And Packages
+description: What a kit is versus a package, and how installing composes capability.
+tags: [lanius, packages]
+---
 # Kits And Packages
 
 A kit is a starter pack. It can contain packages and profiles. Installing a kit

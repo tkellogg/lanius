@@ -1,10 +1,15 @@
+---
+title: Channels and reaching a person
+description: How a person is reached across web/Signal/Telegram/email — channels as packages.
+tags: [lanius, channels]
+---
 # Channels and reaching a person
 
 A person is one identity reachable many ways — the web UI, Signal, Telegram,
 email. Lanius treats each way as a **channel**, and a bridge to an outside
 messaging app is **just a package that follows the ordinary topic protocol.**
-There is no separate "transport" layer to learn. Full design:
-[docs/channels.md](../../../../docs/channels.md).
+There is no separate "transport" layer to learn. The full design is the channels
+design doc (`docs/channels.md`) in the lanius repo.
 
 ## The one mental model
 

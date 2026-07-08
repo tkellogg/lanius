@@ -1,3 +1,8 @@
+---
+title: LLM Access
+description: Determining which of three LLM-access worlds a root is in before configuring.
+tags: [lanius, models, setup]
+---
 # LLM Access
 
 The helper should determine which of three worlds this root is in before giving

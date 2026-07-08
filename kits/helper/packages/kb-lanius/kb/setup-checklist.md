@@ -1,3 +1,8 @@
+---
+title: Setup Checklist
+description: The longer setup checklist behind the helper's setup-progress block.
+tags: [lanius, setup]
+---
 # Setup Checklist
 
 Use this longer checklist behind the helper's `setup-progress` block.

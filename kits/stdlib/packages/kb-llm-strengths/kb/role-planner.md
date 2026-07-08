@@ -1,3 +1,8 @@
+---
+title: Role: planner (phases 1–2)
+description: Who plans, and the rule that never flexes — Claude or Fable only.
+tags: [roles, planning]
+---
 # Role: planner (phases 1–2)
 
 Planning is the highest-leverage phase — intent capture and spec work — and the

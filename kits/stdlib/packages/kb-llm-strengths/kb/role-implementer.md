@@ -1,3 +1,8 @@
+---
+title: Role: implementer (phase 3)
+description: Who implements — the weaker/cheaper tier that builds the plan faithfully.
+tags: [roles, implementation]
+---
 # Role: implementer (phase 3)
 
 Implementation is a weaker/cheaper tier than planning: the plan is already
