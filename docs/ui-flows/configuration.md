@@ -780,3 +780,58 @@ window.innerWidth` on boot, on configure, and the compose input's
 - **Glyph distinction.** The app kite (`⟁` in the masthead) is no longer
   overloaded onto agent rows — agents use `AgentChip`, the kite belongs to
   the brand only. Nav glyphs gained explanatory `title=` tooltips.
+
+## routing (client-side, browser history)
+
+docs/handoffs/web-ui-routing.md. Every primary surface has a stable,
+product-facing URL; nav clicks push a history entry; browser Back/Forward and
+reload/deep-link restore the right view. Implemented as a hand-rolled History-API
+router in `ui/web/src/App.tsx` (`selToPath` / `pathToSel` / `navigate` + a
+`popstate` listener) — no router library — plus a Rust SPA fallback in
+`src/web.rs::static_file` (`spa_resolve`) so a reloaded deep link serves the
+embedded `index.html` instead of 404ing.
+
+### URL contract
+
+- `/` — welcome
+- `/setup` — setup / new-agent wizard
+- `/activity` — the signals (live activity) rail
+- `/runs` — coding sessions/runs; `/runs/:session` focuses one run
+- `/comms` — cross-agent messages
+- `/providers` — provider credentials
+- `/agents/:agent` — agent conversation (converse tab)
+- `/agents/:agent/config` — configure tab
+- `/agents/:agent/history` — sessions/history tab
+- `/agents/:agent/activity` — telemetry/activity tab
+
+Names and ids are `encodeURIComponent`-encoded and decoded defensively; an
+unknown or malformed path `replaceState`s to `/` and shows welcome. (The
+redesigned UI has no dedicated coding-agent config page, so the handoff's
+`/coding-agents/config` route is not wired to a view — but the Rust fallback
+still serves the SPA for it, so it is safe to add later without a server change.)
+
+### routing-1 — nav click pushes a URL; Back/Forward restore the view
+
+1. Click `.nav-providers`; observe `window.location.pathname === '/providers'`
+   and `#view-providers` visible, with no full page reload.
+2. Click `.nav-setup`; observe `/setup` and `#view-setup`.
+3. `page.goBack()` → `/providers` view restored; `page.goForward()` → `/setup`.
+
+### routing-2 — deep-link / reload restores the view (not welcome)
+
+1. `goto('/providers')` renders providers with `#view-welcome[hidden]`.
+2. `goto('/agents/:agent/config')` stays on that agent's configure tab
+   (`#agent-tabs [data-tab="configure"][aria-pressed=true]`).
+3. An agent tab button updates the path (`/agents/:agent/history`), and Back
+   returns to the prior tab URL (`/agents/:agent/config`).
+4. `goto('/runs/:session')` restores the runs surface
+   (`[data-sel="code-sessions"].on`); row focus depends on the fixture.
+5. `goto('/agents/:agent/bogus')` normalizes to `/` and shows welcome.
+
+### routing-3 — Rust SPA fallback (M3)
+
+- `GET /agents/main/config` and `GET /coding-agents/config` return the same
+  embedded `index.html` (`text/html`) as `GET /`.
+- `GET /does-not-exist.js` (an asset-looking path) still returns `404`, so a
+  broken bundle URL fails loudly. Covered by `spa_resolve` unit tests in
+  `src/web.rs` and the HTTP assertions in `ui/web/test/ui.spec.mjs`.
