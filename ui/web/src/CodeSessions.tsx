@@ -684,7 +684,7 @@ export default function CodeSessions({ focus }: { focus?: string } = {}) {
         <h3 className="cs-h">Coding runs</h3>
         {error && <div className="cs-err">projection unavailable: {error}</div>}
         {!error && sessions.length === 0 && (
-          <div className="cs-dim">No coding sessions yet. (Run `lanius code project` to refresh, or start a worker.)</div>
+          <div className="cs-dim">No coding runs yet. Start a worker to see them here.</div>
         )}
         {roots.map((s) => (
           <SessionNode

@@ -25,15 +25,6 @@ const timeOf = (env: any) => {
   const d = new Date(env?.ts ?? Date.now());
   return isNaN(d.getTime()) ? '--:--:--' : d.toTimeString().slice(0, 8);
 };
-// Product language (M5): the warm copy is the default; cockpit nouns live
-// behind the power toggle so Tim keeps his vocabulary and Lily/Daniel stop
-// paying the vocabulary tax. docs/journeys/07-chatting.md + docs/layering.md.
-const LABELS = {
-  warm:     { explore: 'explore', history: 'history', telemetry: 'activity', sessions: 'history', workers: 'runs', send: 'Send' },
-  cockpit:  { explore: 'instruments', history: 'sessions', telemetry: 'telemetry', sessions: 'sessions', workers: 'runs', send: 'transmit' },
-};
-const labelKey = (cockpit: boolean) => cockpit ? LABELS.cockpit : LABELS.warm;
-
 // Deterministic per-agent identity chip: a small monogram in a bordered box,
 // colored from a small on-brand palette. Same name → same chip every render.
 const AGENT_PALETTE = [
@@ -191,13 +182,13 @@ function packageBadges(pkg: any) {
   const badges = [];
   const manifest = pkg.manifest ?? {};
   if (pkg.skill) badges.push({ cls: 'badge', text: 'skill' });
-  if (manifest.process?.mode) badges.push({ cls: 'badge badge-wait', text: manifest.process.mode === 'daemon' ? 'actor' : manifest.process.mode });
+  if (manifest.process?.mode) badges.push({ cls: 'badge badge-wait', text: manifest.process.mode === 'daemon' ? 'Service' : manifest.process.mode });
   if (manifest.process?.http) badges.push({ cls: 'badge badge-wait', text: 'http' });
-  if (manifest.hooks) badges.push({ cls: 'badge badge-wait', text: 'hook' });
+  if (manifest.hooks) badges.push({ cls: 'badge badge-wait', text: 'Event handler' });
   if (manifest.cron) badges.push({ cls: 'badge badge-wait', text: 'cron' });
   if (manifest.providers) badges.push({ cls: 'badge badge-wait', text: 'provider' });
-  if ((manifest.stages ?? []).length) badges.push({ cls: 'badge badge-wait', text: 'stage' });
-  if ((manifest.mcp ?? []).length) badges.push({ cls: 'badge badge-wait', text: 'mcp' });
+  if ((manifest.stages ?? []).length) badges.push({ cls: 'badge badge-wait', text: 'Prompt step' });
+  if ((manifest.mcp ?? []).length) badges.push({ cls: 'badge badge-wait', text: 'Tool' });
   return badges;
 }
 
@@ -233,13 +224,13 @@ function riskBadges(pkg: any) {
   if (manifest.process?.http) badges.push('local http');
   if (manifest.hooks) badges.push('hook');
   if ((manifest.mcp ?? []).length) badges.push('mcp');
-  if ((manifest.stages ?? []).length) badges.push('prompt context');
-  if ((manifest.config?.agent_tunable ?? []).length) badges.push('agent-tunable');
-  if ((request.publish ?? []).some((v: string) => v === '#' || v.endsWith('/#'))) badges.push('broad publish');
+  if ((manifest.stages ?? []).length) badges.push('Adds to prompts');
+  if ((manifest.config?.agent_tunable ?? []).length) badges.push('Agent can change this');
+  if ((request.publish ?? []).some((v: string) => v === '#' || v.endsWith('/#'))) badges.push('Posts widely');
   const state = grantState(pkg);
   if (state === 'needs review') badges.unshift('needs review');
   else if (state === 'allowed') badges.unshift('allowed');
-  return badges.length ? badges : ['low surface'];
+  return badges.length ? badges : ['Low risk'];
 }
 
 function capabilityOutcome(kit: any) {
@@ -434,16 +425,13 @@ export function App() {
   const [navOpen, setNavOpen] = useState(false);
   // M2 (agentic-configuration): the AI panel — a non-modal, always-available
   // right-side chat mounting the helper profile. Open/closed persists across
-  // reloads like the other chrome toggles (cockpit/theme); the panel itself is
+  // reloads like the theme control; the panel itself is
   // rendered once, outside the `sel`-gated view tree, so it is reachable from
   // every view without per-view wiring.
   const [aiPanelOpen, setAiPanelOpen] = useState<boolean>(() => {
     try { return localStorage.getItem('lanius.aiPanel') === '1'; } catch { return false; }
   });
   useEffect(() => { try { localStorage.setItem('lanius.aiPanel', aiPanelOpen ? '1' : '0'); } catch {} }, [aiPanelOpen]);
-  const [cockpit, setCockpit] = useState<boolean>(() => {
-    try { return localStorage.getItem('lanius.cockpit') === '1'; } catch { return false; }
-  });
   const [themeChoice, setThemeChoice] = useState<ThemeChoice>(() => {
     try {
       const stored = localStorage.getItem('lanius.theme');
@@ -452,7 +440,6 @@ export function App() {
       return 'system';
     }
   });
-  useEffect(() => { try { localStorage.setItem('lanius.cockpit', cockpit ? '1' : '0'); } catch {} }, [cockpit]);
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: light)');
     const apply = () => {
@@ -464,7 +451,6 @@ export function App() {
     media.addEventListener('change', apply);
     return () => media.removeEventListener('change', apply);
   }, [themeChoice]);
-  const L = labelKey(cockpit);
   const [agents, setAgents] = useState(new Map());
   const [diskProfiles, setDiskProfiles] = useState<any[]>([]);
   const [buffer, setBuffer] = useState<any[]>([]);
@@ -860,22 +846,22 @@ export function App() {
   useEffect(() => { setNavOpen(false); }, [sel]);
 
   const stageTitle = sel.kind === 'welcome' ? 'welcome'
-    : sel.kind === 'signals' ? 'signals'
+    : sel.kind === 'signals' ? 'activity'
       : sel.kind === 'setup' ? 'setup'
-        : sel.kind === 'code-sessions' ? 'workers'
-          : sel.kind === 'comms' ? 'comms'
+        : sel.kind === 'code-sessions' ? 'runs'
+          : sel.kind === 'comms' ? 'messages'
             : sel.kind === 'providers' ? 'providers'
             : sel.agent;
   const stageNote = sel.kind === 'welcome' ? 'orient, then dive in'
-    : sel.kind === 'signals' ? 'a live view of everything happening — orange means something needs your attention'
-      : sel.kind === 'code-sessions' ? 'coding runs and the workers they spawned — tool, model, effort, duration, and a resume command'
-      : sel.kind === 'comms' ? 'the cross-agent comms plane — agent-to-agent mail (priority, state, failures) and the coordination rooms'
-      : sel.kind === 'providers' ? 'named, encrypted model-provider credentials — add, test reachability, and select one per agent'
+    : sel.kind === 'signals' ? 'What’s happening now. Red means something needs you.'
+      : sel.kind === 'code-sessions' ? 'Coding runs and the workers they started.'
+      : sel.kind === 'comms' ? 'Messages agents send each other, and the rooms they share.'
+      : sel.kind === 'providers' ? 'The model keys your agents use. Add one, test it, pick one per agent.'
       : sel.kind === 'setup' ? 'first-run health, agent setup, capabilities, and trust'
         : sel.tab === 'converse' ? `messages with ${sel.agent}`
           : sel.tab === 'sessions' ? 'your agent’s past conversations'
             : sel.tab === 'configure' ? 'who this agent is — model, cost, and add-ons'
-              : `obs/agent/${sel.agent}/# — this agent's telemetry`;
+              : `${sel.agent}’s activity`;
 
   const loadSetup = async (opts: any = {}) => {
     setSetup((s: any) => ({ ...s, loading: true, status: opts.status ?? s.status, statusKind: opts.statusKind ?? s.statusKind }));
@@ -1436,9 +1422,22 @@ export function App() {
       <div className="vignette" aria-hidden="true" />
       <header className="mast">
         <button className={`mast-left${sel.kind === 'welcome' ? ' on' : ''}`} id="mast-home" title="home" onClick={selectWelcome}>
-          <span className="kite" aria-hidden="true">⟁</span>
-          <h1><em>lanius</em></h1>
-          <span className="mast-sub">agent explorer // live</span>
+          <h1 className="mast-wordmark" aria-label="lanius">
+            <svg className="mast-wordmark-svg" viewBox="0 0 231 76" role="img" aria-hidden="true">
+              <g fill="none" stroke="currentColor" strokeWidth="11" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M16 11 L16 62.5" />
+                <circle cx="50" cy="48" r="14.5" />
+                <path d="M64.5 33.5 V62.5" />
+                <path d="M84 62.5 V33.5 M84 46 C84 39 89.5 33.5 98 33.5 C106.5 33.5 112 39 112 46 V62.5" />
+                <path d="M127.5 33.5 V62.5" />
+                <path d="M143 33.5 V50 C143 57.5 149 62.5 157 62.5 C165 62.5 171 57.5 171 50 V33.5" />
+                <path strokeWidth="10.5" d="M213.5 38.5 C211 35 206.5 33.5 201.5 33.5 C194.5 33.5 190 36.5 190 41 C190 45.5 194.5 47 201.5 48 C208.5 49 213 50.5 213 55 C213 59.5 208 62.5 201.5 62.5 C196.5 62.5 192 61 189.5 57.5" />
+              </g>
+              {/* the tittle of the i is the 01 thorn, in the reserved brand red */}
+              <path style={{ fill: 'var(--accent, #E5484D)' }} transform="translate(117.3 5) scale(0.375)" d="M16 56 C16 34 30 16 54 8 C40 24 34 38 34 56 Z" />
+            </svg>
+          </h1>
+          <span className="mast-sub">your agents</span>
         </button>
         <div className="mast-right">
           <label className="theme-control" htmlFor="theme-mode" title="theme">
@@ -1447,9 +1446,6 @@ export function App() {
               {THEME_CHOICES.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
             </select>
           </label>
-          <button id="vocabulary-toggle" type="button" className="lamp" title={cockpit ? 'cockpit vocabulary on — click for plain language' : 'plain language on — click for cockpit vocabulary'} aria-pressed={cockpit} onClick={() => setCockpit(!cockpit)}>
-            <span aria-hidden="true">{cockpit ? '⌬' : '∝'}</span><span className="lamp-label">{cockpit ? 'cockpit' : 'plain'}</span>
-          </button>
           {/* M2 (agentic-configuration): the AI panel toggle — available from
               every view (the panel it opens is mounted once, outside the
               sel-gated tree, below). */}
@@ -1465,7 +1461,7 @@ export function App() {
 
       <div className="body-row">
       <main className="deck">
-        <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} selectComms={selectComms} selectProviders={selectProviders} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel={L.explore} />
+        <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} selectComms={selectComms} selectProviders={selectProviders} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel="explore" />
 
         <section className="stage panel" aria-label="view">
           <div className="panel-head">
@@ -1473,7 +1469,7 @@ export function App() {
             <div id="agent-tabs" className="tabs" aria-label={`${sel.agent} views`} hidden={sel.kind !== 'agent'}>
               {(['converse', 'sessions', 'telemetry', 'configure'] as const).map((tab) => {
                 const on = sel.kind === 'agent' && sel.tab === tab;
-                const display = tab === 'sessions' ? L.history : tab === 'telemetry' ? L.telemetry : tab;
+                const display = tab === 'sessions' ? 'History' : tab === 'telemetry' ? 'Activity' : tab;
                 return tab === 'configure'
                   ? <IconButton key={tab} data-tab={tab} label={`configure ${sel.agent}`} className={on ? 'on tab-icon-btn' : 'tab-icon-btn'} aria-pressed={on} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>⚙</IconButton>
                   : <button key={tab} data-tab={tab} className={on ? 'on' : ''} aria-pressed={on} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>{display}</button>;
@@ -1498,7 +1494,7 @@ export function App() {
             branchOrigin={sel.kind === 'agent' ? branchOrigins.get(currentConversation(sel.agent)) : undefined}
             selectCodeSessions={selectCodeSessions}
             isTraceAgent={sel.kind === 'agent' && (isWorkerAgentName(sel.agent) || [...(agents.get(sel.agent)?.sessions ?? [])].some((s) => isWorkerSessionId(s)))}
-            sendLabel={L.send}
+            sendLabel="Send"
             allowHtml={systemStatus?.trust === 'full'}
           />
           <SessionsView hidden={!(sel.kind === 'agent' && sel.tab === 'sessions')} state={sessionsState} agent={sel.agent} openTranscript={openTranscript} loadSessions={loadSessions} />
@@ -1602,7 +1598,7 @@ export function App() {
             <AgentAssistant
               profile="helper"
               title="helper"
-              intro="Help me get set up, or answer questions about this installation and the agents on it. Use get_status/list_agents/list_packages/list_providers/read_conversation to look things up, and navigate to take me to what you're describing."
+              intro="Ask me to help you get set up, or about anything here — your agents, models, and settings. I can look things up and take you where you need to go."
               tools={helperTools}
               onDone={() => setAiPanelOpen(false)}
             />
@@ -1615,7 +1611,6 @@ export function App() {
         <span id="stat-count">{count} event{count === 1 ? '' : 's'}</span>
         <span id="stat-broker" />
         <span className="strip-note">same authority as your terminal — because it is your terminal</span>
-        <span className="strip-right">setup first, cockpit when needed</span>
       </footer>
     </div>
   );
@@ -1640,9 +1635,9 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
   };
   const stageLabel = sel.kind === 'welcome' ? 'welcome'
     : sel.kind === 'agent' ? sel.agent
-      : sel.kind === 'signals' ? 'signals'
-        : sel.kind === 'code-sessions' ? 'workers'
-          : sel.kind === 'comms' ? 'comms'
+      : sel.kind === 'signals' ? 'activity'
+        : sel.kind === 'code-sessions' ? 'runs'
+          : sel.kind === 'comms' ? 'messages'
             : sel.kind === 'providers' ? 'providers'
             : 'setup';
   return (
@@ -1652,11 +1647,11 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
         <IconButton id="nav-toggle" label={navOpen ? 'collapse navigation' : `expand navigation: ${stageLabel}`} className="ghost cfg-icon-btn nav-toggle-btn" aria-expanded={navOpen} onClick={() => setNavOpen(!navOpen)}>{navOpen ? '✕' : '≡'}</IconButton>
       </div>
       <div id="nav-list" className="nav-list" onKeyDown={onKey}>
-        <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" title="live activity across every agent" onClick={selectSignals}><span className="nav-sigil">◮</span> signals</button>
-        <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" title="health check, agent setup, capabilities, and trust footprint" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
-        <button className={`nav-item nav-workers${sel.kind === 'code-sessions' ? ' on' : ''}`} data-sel="code-sessions" title="coding runs and the workers they spawned" onClick={() => selectCodeSessions && selectCodeSessions()}><span className="nav-sigil">⚙</span> runs</button>
-        <button className={`nav-item nav-comms${sel.kind === 'comms' ? ' on' : ''}`} data-sel="comms" title="the cross-agent comms plane — what the agents are saying to each other" onClick={() => selectComms && selectComms()}><span className="nav-sigil">⇄</span> comms</button>
-        <button className={`nav-item nav-providers${sel.kind === 'providers' ? ' on' : ''}`} data-sel="providers" title="named, encrypted model-provider credentials — add, test, and select one per agent" onClick={() => selectProviders && selectProviders()}><span className="nav-sigil">⛁</span> providers</button>
+        <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" title="what's happening now across every agent" onClick={selectSignals}><span className="nav-sigil">◮</span> activity</button>
+        <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" title="health check, agent setup, capabilities, and trust" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
+        <button className={`nav-item nav-workers${sel.kind === 'code-sessions' ? ' on' : ''}`} data-sel="code-sessions" title="coding runs and the workers they started" onClick={() => selectCodeSessions && selectCodeSessions()}><span className="nav-sigil">⚙</span> runs</button>
+        <button className={`nav-item nav-comms${sel.kind === 'comms' ? ' on' : ''}`} data-sel="comms" title="messages agents send each other" onClick={() => selectComms && selectComms()}><span className="nav-sigil">⇄</span> messages</button>
+        <button className={`nav-item nav-providers${sel.kind === 'providers' ? ' on' : ''}`} data-sel="providers" title="the model keys your agents use — add, test, pick one per agent" onClick={() => selectProviders && selectProviders()}><span className="nav-sigil">⛁</span> providers</button>
         <div className="nav-label">agents</div>
         <div id="nav-agents">
           {chatItems.map((name) => {
@@ -1702,7 +1697,7 @@ function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, se
   return (
     <div id="view-welcome" className="view" hidden={hidden}>
       <div className="welcome-pane">
-        <p className="welcome-lead">set up a useful agent, see whether the local stack is healthy, then open the cockpit when you need the real machinery.</p>
+        <p className="welcome-lead">Set up an agent, check everything’s running, and open one when you need the details.</p>
         <div className={`welcome-health ${healthy ? 'ok' : 'warn'}`}>
           <span>{healthy ? 'local stack looks ready' : 'setup needs attention'}</span>
           <span>{systemStatus?.root ?? 'checking root...'}</span>
@@ -1722,7 +1717,7 @@ function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, se
         </div>
         <div className="welcome-actions">
           <button id="welcome-new" className="ghost" onClick={() => selectSetup()}>＋ guided setup</button>
-          <button id="welcome-signals" className="ghost" onClick={selectSignals}>◮ live signals</button>
+          <button id="welcome-signals" className="ghost" onClick={selectSignals}>◮ activity</button>
         </div>
         {historyOk === false && <p id="welcome-hint" className="dim-note">transcripts are unavailable until the history view is on.</p>}
       </div>
@@ -1744,21 +1739,21 @@ function SetupView({ hidden, setup, systemStatus, liveness, provenance, profiles
   const cost = costSummary(primaryProfile, newAgent.model);
   const capabilityOptions = (kits?.kits ?? []).filter((k: any) => !provenance.has(k.name));
   const health = [
-    { label: 'root', value: systemStatus?.root ?? 'checking...', state: systemStatus?.root_exists === false ? 'bad' : 'ok' },
-    { label: 'owner credential', value: systemStatus?.credential ?? 'checking...', state: systemStatus?.credential === 'present' ? 'ok' : 'bad' },
-    { label: 'broker', value: systemStatus?.broker_connected ? 'connected' : 'not connected', state: systemStatus?.broker_connected ? 'ok' : 'bad' },
+    { label: 'Data folder', value: systemStatus?.root ?? 'checking...', state: systemStatus?.root_exists === false ? 'bad' : 'ok' },
+    { label: 'Model key', value: systemStatus?.credential ?? 'checking...', state: systemStatus?.credential === 'present' ? 'ok' : 'bad' },
+    { label: 'Message bus', value: systemStatus?.broker_connected ? 'connected' : 'not connected', state: systemStatus?.broker_connected ? 'ok' : 'bad' },
     { label: 'history', value: systemStatus?.history?.available ? 'available' : 'live-only', state: systemStatus?.history?.available ? 'ok' : 'warn' },
     // Read camera (read-provenance M3) — make all three states legible:
     // available & on (ok), available & off (warn — a real "off" state, not an
     // error), and the authoritative tier "unavailable here" (warn/neutral — an
     // ACCEPTED platform gap on non-Linux, reported honestly, NOT alarmed as bad).
     {
-      label: 'read camera (advisory)',
+      label: 'Activity is readable (advisory)',
       value: systemStatus?.read_camera?.advisory?.enabled ? 'on' : 'off',
       state: systemStatus?.read_camera?.advisory?.enabled ? 'ok' : 'warn',
     },
     {
-      label: 'read camera (authoritative)',
+      label: 'Activity is readable (confirmed)',
       value: systemStatus?.read_camera?.authoritative?.available ? 'available' : 'unavailable here',
       state: systemStatus?.read_camera?.authoritative?.available ? 'ok' : 'warn',
     },
@@ -1767,17 +1762,17 @@ function SetupView({ hidden, setup, systemStatus, liveness, provenance, profiles
     // an honest platform gap), never a silent "on". "writes open" / "reads
     // open" / "network open" are the default, unrestricted posture (neutral).
     {
-      label: 'cage (writes)',
+      label: 'Sandbox — file writes',
       value: systemStatus?.cage?.write ?? 'checking...',
       state: systemStatus?.cage?.available === false ? 'warn' : 'ok',
     },
     {
-      label: 'cage (reads)',
+      label: 'Sandbox — file reads',
       value: systemStatus?.cage?.read ?? 'checking...',
       state: systemStatus?.cage?.available === false ? 'warn' : 'ok',
     },
     {
-      label: 'cage (network)',
+      label: 'Sandbox — network',
       value: systemStatus?.cage?.network ?? 'checking...',
       state: systemStatus?.cage?.available === false ? 'warn' : 'ok',
     },
@@ -1799,7 +1794,7 @@ function SetupView({ hidden, setup, systemStatus, liveness, provenance, profiles
             <strong>recommended next step</strong>
             {!profiles?.length ? <span>Create your first agent, then send it one message.</span>
               : !packages.length ? <span>Add a capability so the agent can do useful work.</span>
-                : <span>Use the cockpit when you need transcript, telemetry, or advanced config.</span>}
+                : <span>Open an agent for its history, activity, and settings.</span>}
           </div>
         </section>
 
@@ -1881,10 +1876,10 @@ function SetupView({ hidden, setup, systemStatus, liveness, provenance, profiles
         </details>
         <details className="setup-block setup-trust setup-fold">
           <summary><h3>trust and footprint</h3><span className="dim-note">where data lives, what is local, what creates risk</span></summary>
-          <p className="dim-note">A cheap security summary for Ganesh: what is local, where data lives, and which capabilities create risk.</p>
+          <p className="dim-note">A quick security summary: what runs locally, where your data is, and what could be risky.</p>
           <div className="trust-grid">
-            <div><span>active principal</span><strong>{systemStatus?.owner ?? 'owner'}</strong></div>
-            <div><span>web relay</span><strong>127.0.0.1:{systemStatus?.web?.port ?? '7180'}</strong></div>
+            <div><span>Owner</span><strong>{systemStatus?.owner ?? 'owner'}</strong></div>
+            <div><span>This web app</span><strong>127.0.0.1:{systemStatus?.web?.port ?? '7180'}</strong></div>
             <div><span>database</span><strong>{systemStatus?.paths?.database?.path ?? 'unknown'}</strong></div>
             <div><span>config repo</span><strong>{systemStatus?.paths?.config?.path ?? 'unknown'}</strong></div>
           </div>
@@ -2278,8 +2273,8 @@ function ConfigureView(props: any) {
                   rendered-and-[hidden], so an always-mounted assistant would fire
                   its opening publish on every page load. */}
               {contextAssistantOpen && <AgentAssistant
-                title="Context author"
-                intro={`Help add one useful context step for ${agentName}. Start by calling list_context_blocks. When the choice is clear, call save_context_block with the selected block.`}
+                title="Add a prompt step"
+                intro={`Help add one useful prompt step for ${agentName}. Look up the available steps, then save the one that fits.`}
                 tools={contextAuthorTools}
                 onDone={() => setContextAssistantOpen(false)}
               />}

@@ -5,7 +5,7 @@ const backend = process.env.LANIUS_WEB_BACKEND ?? process.env.ELANUS_WEB_BACKEND
 
 export default defineConfig({
   plugins: [react()],
-  publicDir: false,
+  publicDir: 'public',
   server: {
     host: '127.0.0.1',
     port: Number(process.env.LANIUS_VITE_PORT ?? process.env.ELANUS_VITE_PORT ?? 5173),

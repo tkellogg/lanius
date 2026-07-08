@@ -136,7 +136,7 @@ async function ensureAiPanelClosed(page) {
     const root = document.documentElement;
     const prior = root.getAttribute('data-theme');
     const lin = (ch) => { const c = ch / 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
-    const lum = (h) => { const r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16); return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b); };
+    const lum = (h0) => { const h = h0.length === 4 ? `#${h0[1]}${h0[1]}${h0[2]}${h0[2]}${h0[3]}${h0[3]}` : h0; const r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16); return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b); };
     const ratio = (a, b) => { const l1 = lum(a), l2 = lum(b); const hi = Math.max(l1, l2), lo = Math.min(l1, l2); return (hi + 0.05) / (lo + 0.05); };
     const measure = (theme) => {
       root.dataset.theme = theme;
@@ -187,21 +187,24 @@ const testAgentProfile = 'harrier';
   await page.waitForSelector('.nav-setup');
   await page.click('.nav-setup');
   await page.waitForSelector('#na-name', { state: 'visible' });
-  await waitFor('setup: health home shows root, credential, broker and history', async () => {
+  await waitFor('setup: health home shows data folder, model key, message bus and history', async () => {
     const text = await page.$eval('.setup-home', (el) => el.textContent);
-    return /root/i.test(text) && /owner credential/i.test(text) && /broker/i.test(text) && /history/i.test(text);
+    // Copy overhaul (web-ui-copy): the health cards now read in plain words —
+    // "Data folder"/"Model key"/"Message bus" replace root/owner credential/broker.
+    return /data folder/i.test(text) && /model key/i.test(text) && /message bus/i.test(text) && /history/i.test(text);
   }, 8000);
   await waitFor('setup: guided agent wizard exposes purpose, workdir, cost cap and autonomy', async () => {
     const text = await page.$eval('.setup-wizard', (el) => el.textContent);
     return /purpose/i.test(text) && /home \/ workdir/i.test(text) && /run-step cap/i.test(text) && /autonomy/i.test(text);
   }, 8000);
-  await waitFor('setup: cage posture is legible (writes/reads/network in product words)', async () => {
+  await waitFor('setup: sandbox posture is legible (writes/reads/network in product words)', async () => {
     const text = await page.$eval('.setup-home', (el) => el.textContent);
-    // M4 (single-cage): the three cage dimensions surface, in product words —
-    // never "SBPL"/"Seatbelt"/"cage-jargon". A default install reads "open" on
+    // M4 (single-cage): the three sandbox dimensions surface, in product words —
+    // never "SBPL"/"Seatbelt"/jargon. A default install reads "open" on
     // every dimension where enforcement is available, or "unavailable here" off
     // macOS. Either way the labels and one legible value must render.
-    const hasLabels = /cage \(writes\)/i.test(text) && /cage \(reads\)/i.test(text) && /cage \(network\)/i.test(text);
+    // Copy overhaul: the label reads "Sandbox — file writes/reads/network".
+    const hasLabels = /sandbox — file writes/i.test(text) && /sandbox — file reads/i.test(text) && /sandbox — network/i.test(text);
     const hasValue = /writes (fenced|open)|unavailable here/i.test(text) && /(reads open|some folders hidden|allow-list|unavailable here)/i.test(text) && /(network open|this machine only|network off|unavailable here)/i.test(text);
     return hasLabels && hasValue;
   }, 8000);
@@ -211,7 +214,8 @@ const testAgentProfile = 'harrier';
   }, 8000);
   await waitFor('setup: trust footprint exposes local root/data surface', async () => {
     const text = await page.$eval('.setup-trust', (el) => el.textContent);
-    return /active principal/i.test(text) && /web relay/i.test(text) && /database/i.test(text) && /config repo/i.test(text);
+    // Copy overhaul: "active principal"→"Owner", "web relay"→"This web app".
+    return /owner/i.test(text) && /this web app/i.test(text) && /database/i.test(text) && /config repo/i.test(text);
   }, 8000);
   // M3: Create is disabled until a name is entered.
   const createDisabledAtStart = await page.$eval('#na-create', (el) => el.disabled);
@@ -691,7 +695,8 @@ const renamedAgent = 'falcon';
   await waitFor('risk: installed capabilities show approval/risk badges', async () => {
     const text = await page.$eval('#setup-configs', (el) => el.textContent);
     // M2: trust wording is "allowed"/"needs review", never the internal "approved".
-    return /allowed|needs review|hook|daemon|local http|broad publish|low surface/i.test(text);
+    // Copy overhaul: "broad publish"→"Posts widely", "low surface"→"Low risk".
+    return /allowed|needs review|hook|daemon|local http|posts widely|low risk/i.test(text);
   }, 10000);
   // ── M2 (ui-truthfulness): the internal word "approved" must not appear as a
   // capability status badge — trust reads as "allowed"/"on"/"needs review".
@@ -2045,8 +2050,8 @@ const renamedAgent = 'falcon';
 
 // ── flow 10: product language + companion identity (M5) ─────────────────────
 // Kernel words (session, raw ids) stay off default surfaces; the agent has a
-// stable colored monogram in nav and converse; the cockpit toggle restores
-// Tim's vocabulary without re-theming the whole surface.
+// stable colored monogram in nav and converse. The cockpit/plain vocabulary
+// toggle was removed in the copy overhaul — one plain vocabulary ships now.
 {
   const page = await newPage();
   await page.goto('/');
@@ -2056,19 +2061,7 @@ const renamedAgent = 'falcon';
     const chips = await page.$$('#nav-agents .nav-agent .agent-chip');
     return chips.length >= 1;
   });
-  // Toggle into cockpit mode: the panel-head noun changes warm → cockpit.
-  const warmHead = await page.$eval('.nav .panel-head h2', (el) => el.textContent.trim()).catch(() => '');
-  await page.click('#vocabulary-toggle');
-  await waitFor('identity: cockpit toggle changes panel-head noun', async () => {
-    const h = await page.$eval('.nav .panel-head h2', (el) => el.textContent.trim()).catch(() => '');
-    return h && h !== warmHead;
-  });
-  await page.click('#vocabulary-toggle');
-  await waitFor('identity: warm mode restores the warm noun', async () => {
-    const h = await page.$eval('.nav .panel-head h2', (el) => el.textContent.trim()).catch(() => '');
-    return h === warmHead;
-  });
-  // Pick the first agent; the warm tab is labeled "history" not "sessions".
+  // Pick the first agent; the tab is labeled "History" not "sessions".
   await page.click('#nav-agents .nav-item');
   await page.waitForSelector('#agent-tabs', { state: 'visible' });
   const tabText = await page.$$eval('#agent-tabs button', (els) => els.map((e) => e.textContent.trim()));
@@ -2077,20 +2070,10 @@ const renamedAgent = 'falcon';
   // Converse header shows the identity chip alongside the agent name.
   const chipInHeader = await page.$eval('#conv-configure-hint', (el) => el.querySelector('.agent-chip') != null).catch(() => false);
   chipInHeader ? ok('identity: chip rendered in converse header') : fail('identity: converse header missing chip');
-  // The compose button is an icon (➤); its accessible name carries the
-  // vocabulary word ("Send" warm / "transmit" cockpit) via aria-label.
+  // The compose button is an icon (➤); its accessible name is the plain
+  // vocabulary word "Send" via aria-label (the cockpit "transmit" is retired).
   const sendLabel = await page.$eval('#compose-send', (el) => (el.getAttribute('aria-label') || '').trim()).catch(() => '');
   /^send$/i.test(sendLabel) ? ok('language: compose button labelled "Send"') : fail(`language: compose button labelled "${sendLabel}"`);
-  await page.click('#vocabulary-toggle');
-  await waitFor('language: cockpit mode changes compose button to "transmit"', async () => {
-    const label = await page.$eval('#compose-send', (el) => (el.getAttribute('aria-label') || '').trim()).catch(() => '');
-    return /^transmit$/i.test(label);
-  });
-  await page.click('#vocabulary-toggle');
-  await waitFor('language: warm mode restores compose button to "Send"', async () => {
-    const label = await page.$eval('#compose-send', (el) => (el.getAttribute('aria-label') || '').trim()).catch(() => '');
-    return /^send$/i.test(label);
-  });
   await page.click('[data-tab="sessions"]');
   await page.waitForSelector('#view-sessions:not([hidden])', { timeout: 5000 });
   await waitFor('language: history view resolved', async () => {
@@ -2395,7 +2378,7 @@ const renamedAgent = 'falcon';
   await waitFor('providers: the page test button surfaces a result', async () =>
     page.evaluate(() => {
       const el = document.querySelector('[data-test-result="ui-claude-oauth"]');
-      return el && /native login/i.test(el.textContent);
+      return el && /own login/i.test(el.textContent);
     }), 8000);
 
   // -- the ModelField "set up a provider →" link (the literal #4 ask) --

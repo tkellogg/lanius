@@ -153,7 +153,7 @@ export default function AgentAssistant({ profile = 'helper', tools, title = 'Ass
           <h3>{title}</h3>
           <p className="dim-note">{sessionRef.current}</p>
         </div>
-        <label>profile
+        <label>agent
           <select value={selectedProfile} onChange={(e) => setSelectedProfile(e.target.value)}>
             {profiles.map((p) => <option key={p.profile} value={p.profile}>{p.profile}{p.mirrors ? ` (mirrors ${p.mirrors})` : ''}</option>)}
             {!profiles.some((p) => p.profile === selectedProfile) && <option value={selectedProfile}>{selectedProfile}</option>}
