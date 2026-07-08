@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="-14 12 656 232">
+  <title>lanius — shrike + wordmark sticker (die-cut lockup)</title>
+  <defs>
+    <!-- silhouette for the die-cut border layers (bird + branch + berry) -->
+    <g id="cut">
+      <path d="M26 194 C90 188 160 176 228 164 C282 156 380 151 470 148.5 C520 147.1 566 146.3 600 146 L601 152 C566 152.4 520 153.3 470 154.8 C380 157.4 284 162.5 230 170.7 L229 171 C162 182 92 194 28 205 Z"/>
+      <path d="M557 151.5 C559 131.5 563 112.5 569 93.5 C569.8 113.5 570.4 133.5 571 151.5 Z"/>
+      <circle cx="566" cy="117.5" r="11"/>
+      <path d="M68 191 C71 182 74 176 79 172 C79.5 179 81.5 185 85 189 Z"/>
+      <path d="M143 181 C146 173 149 167 154 163 C154.5 170 156.5 175 160 178 Z"/>
+      <path d="M104 152 L60 184 C54 188 46 187 45 181 C44.5 177 47 173 51 170 L96 140 Z"/>
+      <path d="M150 102 C160 116 162 136 152 152 C144 166 128 174 112 170 C96 166 88 152 90 136 C92 120 102 108 114 100 C126 96 142 96 150 102 Z"/>
+      <circle cx="132" cy="84" r="30"/>
+      <path d="M153 71 C168 68.5 180 74 184.5 83 C186 87.5 183.5 92 178 93.5 C179.5 88.5 177.5 84.5 173 82 C168 85.8 161.5 87.2 155.5 86.6 Z"/>
+    </g>
+    <!-- the wordmark letters (08, verbatim), reused at three weights -->
+    <g id="letters">
+      <path d="M16 11 L16 62.5"/>
+      <circle cx="50" cy="48" r="14.5"/>
+      <path d="M64.5 33.5 V62.5"/>
+      <path d="M84 62.5 V33.5 M84 46 C84 39 89.5 33.5 98 33.5 C106.5 33.5 112 39 112 46 V62.5"/>
+      <path d="M127.5 33.5 V62.5"/>
+      <path d="M143 33.5 V50 C143 57.5 149 62.5 157 62.5 C165 62.5 171 57.5 171 50 V33.5"/>
+      <path d="M213.5 38.5 C211 35 206.5 33.5 201.5 33.5 C194.5 33.5 190 36.5 190 41 C190 45.5 194.5 47 201.5 48 C208.5 49 213 50.5 213 55 C213 59.5 208 62.5 201.5 62.5 C196.5 62.5 192 61 189.5 57.5"/>
+    </g>
+    <!-- the thorn-tittle of the i (the 01 thorn, verbatim, scaled down) -->
+    <path id="tittle" transform="translate(117.3 5) scale(0.375)" d="M16 56 C16 34 30 16 54 8 C40 24 34 38 34 56 Z"/>
+    <clipPath id="bodyClip">
+      <path d="M150 102 C160 116 162 136 152 152 C144 166 128 174 112 170 C96 166 88 152 90 136 C92 120 102 108 114 100 C126 96 142 96 150 102 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- die-cut: grey keyline first (bird+branch, then the word at matched width) -->
+  <use href="#cut" xlink:href="#cut" fill="#D9DDE1" stroke="#D9DDE1" stroke-width="26" stroke-linejoin="round" stroke-linecap="round"/>
+  <g transform="translate(224 75.2) rotate(-2.5) scale(1.3)">
+    <use href="#letters" xlink:href="#letters" fill="#D9DDE1" stroke="#D9DDE1" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>
+    <use href="#tittle" xlink:href="#tittle" fill="#D9DDE1" stroke="#D9DDE1" stroke-width="20" stroke-linejoin="round"/>
+  </g>
+
+  <!-- die-cut: white border -->
+  <use href="#cut" xlink:href="#cut" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="14" stroke-linejoin="round" stroke-linecap="round"/>
+  <g transform="translate(224 75.2) rotate(-2.5) scale(1.3)">
+    <use href="#letters" xlink:href="#letters" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="23" stroke-linecap="round" stroke-linejoin="round"/>
+    <use href="#tittle" xlink:href="#tittle" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="10.8" stroke-linejoin="round"/>
+    <!-- plug the n counter: its arch subpath fills on a diagonal chord, leaving a keyline leak -->
+    <path fill="#FFFFFF" stroke="none" d="M84 44 H112 V64 H84 Z"/>
+  </g>
+
+  <!-- the branch, its thorns, and the larder at the tip -->
+  <path fill="#16181D" d="M26 194 C90 188 160 176 228 164 C282 156 380 151 470 148.5 C520 147.1 566 146.3 600 146 L601 152 C566 152.4 520 153.3 470 154.8 C380 157.4 284 162.5 230 170.7 L229 171 C162 182 92 194 28 205 Z"/>
+  <path fill="#16181D" d="M68 191 C71 182 74 176 79 172 C79.5 179 81.5 185 85 189 Z"/>
+  <path fill="#16181D" d="M143 181 C146 173 149 167 154 163 C154.5 170 156.5 175 160 178 Z"/>
+  <circle cx="566" cy="117.5" r="11" fill="#E5484D" style="fill:var(--accent, #E5484D)" stroke="#16181D" stroke-width="3"/>
+  <path fill="#16181D" d="M557 151.5 C559 131.5 563 112.5 569 93.5 C569.8 113.5 570.4 133.5 571 151.5 Z"/>
+  <circle cx="558.5" cy="112" r="2.2" fill="#FFFFFF"/>
+
+  <!-- the shrike -->
+  <path fill="#16181D" d="M104 152 L60 184 C54 188 46 187 45 181 C44.5 177 47 173 51 170 L96 140 Z"/>
+  <path fill="#C9CFD6" stroke="#16181D" stroke-width="3" stroke-linejoin="round" d="M150 102 C160 116 162 136 152 152 C144 166 128 174 112 170 C96 166 88 152 90 136 C92 120 102 108 114 100 C126 96 142 96 150 102 Z"/>
+  <g clip-path="url(#bodyClip)">
+    <ellipse cx="134" cy="142" rx="26" ry="30" fill="#FFFFFF"/>
+  </g>
+  <path fill="#16181D" d="M116 104 C102 112 92 130 94 152 C95 160 100 164 106 162 C102 142 108 122 122 108 Z"/>
+  <path fill="#FFFFFF" d="M96 131 L105 127 L107 134 L98 138 Z"/>
+  <circle cx="132" cy="84" r="30" fill="#C9CFD6" stroke="#16181D" stroke-width="3"/>
+  <path fill="#16181D" d="M106 70 C120 60 146 60 158 70 L158 86 C146 78 120 78 106 86 Z"/>
+  <circle cx="142" cy="71" r="6" fill="#FFFFFF"/>
+  <circle cx="143" cy="71" r="3" fill="#16181D"/>
+  <circle cx="141.5" cy="69.3" r="1.1" fill="#FFFFFF"/>
+  <path fill="#16181D" d="M153 71 C168 68.5 180 74 184.5 83 C186 87.5 183.5 92 178 93.5 C179.5 88.5 177.5 84.5 173 82 C168 85.8 161.5 87.2 155.5 86.6 Z"/>
+  <g stroke="#16181D" stroke-width="5" stroke-linecap="round">
+    <path d="M116 164 L114 184"/>
+    <path d="M130 162 L129 182"/>
+  </g>
+
+  <!-- the wordmark, perched on the branch (ink, fixed palette) -->
+  <g transform="translate(224 75.2) rotate(-2.5) scale(1.3)">
+    <use href="#letters" xlink:href="#letters" fill="none" stroke="#16181D" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    <use href="#tittle" xlink:href="#tittle" fill="#E5484D" style="fill:var(--accent, #E5484D)" stroke="#16181D" stroke-width="2.3" stroke-linejoin="round"/>
+  </g>
+</svg>

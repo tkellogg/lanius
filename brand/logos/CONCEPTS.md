@@ -81,6 +81,18 @@ The 01 thorn at ascender height in red, seated on the text baseline, with the
 wordmark beside it — the tittle-thorn rhymes with the big thorn so the lockup
 reads as one system. This is the README-header / website-masthead asset.
 
+### 10-shrike-wordmark.svg — the shrike, signing its work
+06 and 08 fused into one die-cut sticker: the branch keeps going past the bird,
+*lanius* perches on it letter-by-letter (baselines kissing the bark, the way the
+bird's feet do), and the impaled berry moves out to the branch tip so the whole
+thing reads left to right — bird, name, catch. Both red hooks survive: the
+thorn-tittle on the *i* (now ink-outlined like the berry, so it lives in the
+sticker's world) and the berry itself, still on `var(--accent)`. Fixed palette
+like 06 — the wordmark strokes are ink here, not `currentColor`. The cut
+silhouette is a single connected piece (letters, bird, and larder all merge
+into the branch), with one white keyline + grey rim around everything. This is
+the laptop-lid hero: 06's charm, but it says the name.
+
 ## Honest ranking
 
 1. **03-larder-spindle** — the deepest concept-to-form match: nothing else in
