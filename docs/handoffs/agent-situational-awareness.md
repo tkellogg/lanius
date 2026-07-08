@@ -1,5 +1,5 @@
 ---
-status: planned
+status: M1-M3 done (intent-in-note · baseline intent · tri-state broker liveness); M4 (sitrep ledger) + M5 (watch/ask) are follow-up
 author: Claude Opus 4.8 (planner) — written as a debrief + proposal
 last-updated: 2026-07-07
 ---
@@ -220,3 +220,19 @@ Requirements:
   "disconnected" from "dead": a disconnected agent may be a live split brain still
   editing files, so its claims must NOT be reaped until death is confirmed (same-
   host pid probe).** M3 rewritten accordingly; gap 3 and wonky-bit 5 added.
+- 2026-07-07 (Opus impl + xhigh verify): **M1-M3 shipped.** Ambient note now shows
+  intent (refined-todo → baseline launch task → honest "(no stated intent)");
+  launch task recorded on the SessionRecord (`intent` column) + published retained
+  on `.../intent`; a per-session MQTT **liveness beacon** with a retained
+  Last-Will publishes `.../status={connected}`, mirrored into
+  `code_sessions.connected`. Liveness is tri-state via `classify_liveness`; **claims
+  reap ONLY on confirmed `Dead` (same-host pid gone)** — a `Disconnected(SplitBrain)`
+  or `Disconnected(Unknown)` session keeps its claims and the note flags it. 571
+  tests green incl. the safety test `reap_reaps_only_confirmed_dead_never_a_
+  disconnected_split_brain`. Verifier confirmed no path treats a disconnect as
+  death. Known residuals (minor, honest): cross-host peers don't yet subscribe the
+  retained `.../status` and mirror it (same-host peers see it via the shared
+  ledger; cross-host stays `Disconnected(Unknown)`, never reaped — safe); the
+  `conn_updated_at` column is written but unused (no time-grace escalation, since
+  the pid probe subsumes it). M4 (`lanius code sitrep` ledger) + M5 (`watch`/`ask`)
+  deferred, noted in-code.

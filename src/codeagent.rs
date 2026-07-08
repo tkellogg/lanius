@@ -3318,21 +3318,38 @@ divide the work, nothing is locked): "
                 // SI1: humanized recency so a viewer can judge alive-vs-stranded
                 // before touching a sibling's WIP.
                 let since = humanize_since(&s.last_active);
-                // SI2: the sibling's CURRENT task, when it has a projected task list.
-                // None → render nothing (opencode emits no todo event → honestly
-                // absent, never a faked empty list). Quoted + clipped (~80 chars).
-                let task = s
-                    .current_task
-                    .as_ref()
-                    .map(|(text, status)| format!(": {status} {:?}", clip_task(text)))
-                    .unwrap_or_default();
+                // M1 (situational-awareness): the sibling's INTENT, surfaced right
+                // where attention lands. Precedence: the refined SI2 todo (its
+                // CURRENT task) when it has a projected task list; else the M2
+                // baseline launch task / first prompt (`intent`); else an HONEST
+                // "(no stated intent)" — never a faked empty. This is the fix for
+                // the motivating incident: the note carried the claim but never the
+                // intent, so a sibling's *purpose* was invisible.
+                let intent = match (&s.current_task, &s.intent) {
+                    (Some((text, status)), _) => format!(": {status} {:?}", clip_task(text)),
+                    (None, Some(baseline)) => format!(" — {:?}", clip_task(baseline)),
+                    (None, None) => " — (no stated intent)".to_string(),
+                };
                 // SA2/SA3: the file it last claimed (auto/manual), when known.
                 let touching = last_path
                     .get(s.session.as_str())
                     .map(|p| format!(", last editing {}", clip(p, 200)))
                     .unwrap_or_default();
+                // M3: flag a DISCONNECTED sibling. The broker lost its bus session,
+                // but it may be a live split brain still editing files — so its
+                // claims must be treated as LIVE, never assumed free. This warning is
+                // the whole point of keeping a disconnected sibling in the roster.
+                let liveness = match s.liveness {
+                    codesession::Liveness::Disconnected(codesession::DisconnectKind::SplitBrain) => {
+                        " [disconnected (may still be running — possible split brain; treat its claims as live)]"
+                    }
+                    codesession::Liveness::Disconnected(codesession::DisconnectKind::Unknown) => {
+                        " [disconnected (unknown — cannot confirm whether it is still running; treat its claims as live)]"
+                    }
+                    _ => "",
+                };
                 format!(
-                    "{} ({}, last active {since}){task}{touching}",
+                    "{} ({}, last active {since}){intent}{touching}{liveness}",
                     s.session, s.agent_noun
                 )
             })
@@ -3551,6 +3568,24 @@ fn launch_external_harness(
         let _ = codesession::set_room(root, &session, &room);
         let _ = codesession::join_room(root, &room, &session, &agent, std::process::id() as i32);
 
+        // M2 (situational-awareness): record the launch TASK as this session's
+        // baseline intent — what it was asked to do, known even for a harness that
+        // never emits a todo (codex/opencode). SI2 todos later REFINE it. Publish it
+        // RETAINED on the session's intent topic so a late-subscribing peer still
+        // learns the intent, and store it on the record for the ambient note +
+        // `lanius code sessions`. An interactive launch carries no prompt arg → the
+        // first user prompt seeds the intent later (the hook path). Best-effort.
+        if let Some(task) = prompt.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            let _ = codesession::set_intent(root, &session, task);
+            publish_obs_retained(
+                root,
+                &principal,
+                &bus_token,
+                &obs_topic(&agent, &session, "intent"),
+                json!({ "ts": now_iso(), "intent": task, "source": "launch" }),
+            );
+        }
+
         // Emit the same launch envelope the direct path used to own. If the
         // launch-time publish already fails (the bus is down at launch), the
         // session is uncaptured from turn one — tell the AGENT so via a briefing
@@ -3691,6 +3726,11 @@ fn launch_external_harness(
             "[code] launching external harness {} from package {} as session {session}",
             external.decl.name, external.package
         );
+        // M3: hold a persistent liveness beacon for the child's whole lifetime. Its
+        // Last-Will makes the broker announce a retained {connected:false} on an
+        // ungraceful launcher death; its Drop (when this closure returns after the
+        // child exits) runs the clean-stop path. Best-effort — never blocks launch.
+        let _beacon = spawn_liveness_beacon(root, &principal, &bus_token, &agent, &session);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("launching external adapter {}", adapter.display()))?;
@@ -8659,6 +8699,20 @@ pub fn hook(root: &Root, event: &str) -> Result<()> {
         }
     }
 
+    // M2 (situational-awareness): an INTERACTIVE session carries no launch task
+    // arg, so its baseline intent is the FIRST user prompt. Seed it here on the
+    // first UserPromptSubmit — `set_intent_if_absent` makes a later prompt a no-op,
+    // and a headless launch that already recorded the launch task keeps that. So a
+    // session's stated intent never blanks. Best-effort; must not break the hook.
+    if event == "UserPromptSubmit" {
+        if let Some(prompt) = payload.get("prompt").and_then(Value::as_str) {
+            let prompt = prompt.trim();
+            if !prompt.is_empty() {
+                let _ = codesession::set_intent_if_absent(root, &session, prompt);
+            }
+        }
+    }
+
     // Route event-mapping through the adapter the launcher recorded as the
     // session's agent noun. Codex hooks are claim-only today: even though the child
     // has the SDK launch contract, this hook path deliberately avoids publishing
@@ -9117,6 +9171,219 @@ fn claude_settings(self_exe: &Path, root: &Root) -> Value {
 pub fn publish_obs(root: &Root, principal: &str, token: &str, topic_name: &str, body: Value) {
     let _ = publish_obs_captured(root, principal, token, topic_name, body);
 }
+
+/// Publish one observation RETAINED (M2/M3): the broker keeps the last value so a
+/// peer that subscribes AFTER the publish still receives it. Used for the session's
+/// baseline `intent` (a late-joining sibling still learns what a session is doing)
+/// and by the liveness beacon for the retained `status` topic. Same broker-verified
+/// sender + soft-degrade contract as `publish_obs`; best-effort (a down bus never
+/// breaks the session). An empty body on a retained topic CLEARS the retained value.
+pub fn publish_obs_retained(
+    root: &Root,
+    principal: &str,
+    token: &str,
+    topic_name: &str,
+    body: Value,
+) {
+    std::env::set_var("LANIUS_PACKAGE", principal);
+    std::env::set_var("ELANUS_PACKAGE", principal);
+    std::env::set_var("LANIUS_BUS_TOKEN", token);
+    std::env::set_var("ELANUS_BUS_TOKEN", token);
+    let payload = body.to_string();
+    let root = root.clone();
+    let topic = topic_name.to_string();
+    // Offload to a fresh OS thread so a surrounding tokio runtime (the opencode SSE
+    // subscriber) never triggers rumqttc's "runtime within a runtime" panic — the
+    // same guard `publish_obs_captured` uses.
+    let _ = std::thread::spawn(move || {
+        buscli::publish_typed(&root, &topic, Some(&payload), 0, true, None)
+    })
+    .join();
+}
+
+// ── M3: the liveness beacon (broker-driven tri-state connection) ──────────────
+//
+// The broker is the shared source of truth for connection (Tim: "if the broker
+// recognizes the agent as disconnected, the other agents see it that way too").
+// The launcher — a long-lived process for the whole session — holds a PERSISTENT
+// MQTT session with a Last-Will-and-Testament: a retained
+// `obs/agent/<noun>/<session>/status = {connected:false}` the broker publishes on
+// the launcher's UNGRACEFUL disconnect (a keepalive away, not "next daemon boot").
+// On connect it publishes retained {connected:true}; on a clean stop it publishes
+// retained {connected:false} then disconnects (which discards the will). It also
+// mirrors the connection view into `code_sessions.connected` so the ledger-side
+// liveness classifier (`classify_liveness`) reads the same broker verdict:
+//   • partition (launcher alive, bus lost) → the eventloop errors → connected=0 +
+//     pid alive → Disconnected(SplitBrain): its claims are NOT reaped.
+//   • SIGKILL (launcher gone) → the broker fires the retained will for peers AND
+//     the pid probe fails → Dead: only then are claims reaped.
+// Best-effort throughout: a down bus never blocks or breaks the launch.
+
+/// A running liveness beacon. Dropping it signals a CLEAN stop: it publishes
+/// retained `{connected:false}` and disconnects gracefully (discarding the will),
+/// so peers see the disconnect within a keepalive on a normal exit too.
+pub struct LivenessBeacon {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for LivenessBeacon {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Start the per-session liveness beacon (M3). Returns a guard whose `Drop` runs
+/// the clean-stop path. The persistent connection authenticates as the session
+/// principal (so the broker stamps `sender = code-<session>` and its publish ACL
+/// admits the will on the session's own obs subtree). Never fails the launch: if
+/// the bus is unaddressable the beacon just marks the ledger disconnected and idles.
+pub fn spawn_liveness_beacon(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+) -> LivenessBeacon {
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let status_topic = obs_topic(agent, session, "status");
+    let root = root.clone();
+    let principal = principal.to_string();
+    let bus_token = bus_token.to_string();
+    let session = session.to_string();
+    let shutdown_thread = shutdown.clone();
+    let handle = std::thread::Builder::new()
+        .name(format!("lanius-beacon-{session}"))
+        .spawn(move || {
+            liveness_beacon_loop(
+                &root,
+                &principal,
+                &bus_token,
+                &status_topic,
+                &session,
+                &shutdown_thread,
+            );
+        })
+        .ok();
+    LivenessBeacon { shutdown, handle }
+}
+
+/// The beacon's event loop: connect with a Last-Will, publish retained
+/// {connected:true} on CONNACK and mirror it to the ledger, mark disconnected on
+/// any eventloop error (a possible split brain), and run the clean-stop path when
+/// the shutdown flag is set. Auto-reconnects (rumqttc re-dials on the next poll).
+fn liveness_beacon_loop(
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    status_topic: &str,
+    session: &str,
+    shutdown: &std::sync::atomic::AtomicBool,
+) {
+    use rumqttc::v5::mqttbytes::v5::LastWill;
+    use rumqttc::v5::mqttbytes::QoS;
+    use rumqttc::v5::{AsyncClient, Event, MqttOptions};
+    use std::sync::atomic::Ordering;
+
+    let Ok(addr) = beacon_addr(root) else {
+        // No radio: we cannot assert connection. Leave the ledger view unknown; the
+        // pid probe still supplies the `dead` half of liveness.
+        return;
+    };
+    let will_payload = json!({ "connected": false, "ts": now_iso() }).to_string();
+    let mut opts = MqttOptions::new(
+        format!("el-beacon-{}-{}", session, std::process::id()),
+        addr.ip().to_string(),
+        addr.port(),
+    );
+    opts.set_keep_alive(std::time::Duration::from_secs(10));
+    opts.set_credentials(principal, bus_token);
+    opts.set_last_will(LastWill::new(
+        status_topic,
+        will_payload.into_bytes(),
+        QoS::AtLeastOnce,
+        true, // RETAINED: a peer subscribing after the crash still sees {connected:false}
+        None,
+    ));
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return,
+    };
+    rt.block_on(async move {
+        let (client, mut eventloop) = AsyncClient::new(opts, 16);
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                // Clean stop: assert {connected:false} retained (so peers see the
+                // disconnect on a normal exit too), mirror it, then disconnect
+                // gracefully — a graceful DISCONNECT discards the will.
+                let payload = json!({ "connected": false, "ts": now_iso() }).to_string();
+                let _ = client
+                    .publish(status_topic, QoS::AtLeastOnce, true, payload.into_bytes())
+                    .await;
+                let _ = codesession::set_connected(root, session, false);
+                let _ = client.disconnect().await;
+                // Drain briefly so the DISCONNECT/PUBLISH actually flush.
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                    loop {
+                        if eventloop.poll().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                return;
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(1), eventloop.poll()).await {
+                Ok(Ok(Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::ConnAck(_)))) => {
+                    // Connected: assert {connected:true} retained + mirror to ledger.
+                    let payload = json!({ "connected": true, "ts": now_iso() }).to_string();
+                    let _ = client
+                        .publish(status_topic, QoS::AtLeastOnce, true, payload.into_bytes())
+                        .await;
+                    let _ = codesession::set_connected(root, session, true);
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => {
+                    // The bus connection dropped: from the broker's view this session
+                    // is now DISCONNECTED. It may still be a live split brain, so we
+                    // record connected=0 (never dead) and let rumqttc re-dial.
+                    let _ = codesession::set_connected(root, session, false);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(_elapsed) => {} // idle keepalive tick — just re-check shutdown
+            }
+        }
+    });
+}
+
+/// Resolve the broker socket address for the beacon (mirrors `buscli::addr`). Errs
+/// when the bus is disabled/unaddressable — the beacon then idles (no radio).
+fn beacon_addr(root: &Root) -> Result<std::net::SocketAddr> {
+    let cfg = crate::bus::config(root);
+    if !cfg.enabled {
+        bail!("bus disabled");
+    }
+    crate::bus::connect_addr(&cfg).context("unparseable bus bind address")
+}
+
+// ── M4/M5 are a deliberate FOLLOW-UP (agent-situational-awareness handoff) ─────
+//
+// This change lands M1 (intent in the ambient note), M2 (never-blank baseline
+// intent), and M3 (tri-state, broker-driven liveness — the correctness-critical
+// reap-only-on-confirmed-dead rule). DEFERRED to a follow-up, per scope:
+//   • M4 — the durable session ↔ worktree/branch ↔ outcome ledger and
+//     `lanius code sitrep` (turns Incident B's git archaeology into a query).
+//   • M5 — `lanius code watch <session>` (readable live-activity digest) and the
+//     `ask` liveness pre-check (fail fast on a dead target instead of blocking).
+// Both are additive on top of the intent + tri-state-liveness substrate here.
 
 /// Per-process soft-degrade state (docs/handoffs/bus-resilience.md wonky bit 5).
 /// `DEGRADED` is set the moment a publish fails unreachable and cleared when one
@@ -13624,6 +13891,115 @@ mod tests {
         assert!(
             !inj.contains("[lanius siblings]"),
             "a solo session must have no siblings line: {inj}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// Insert a projected todo item for a session (what the SI2 projection would
+    /// fold from a `TodoWrite`/`assistant/todo` event) so the note-rendering tests
+    /// can exercise the intent precedence without a live projection.
+    fn seed_task(root: &Root, sess: &str, text: &str, status: &str) {
+        let conn = crate::db::open(root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO code_session_tasks (elanus_session, item_id, text, status)
+             VALUES (?1, '000', ?2, ?3)",
+            rusqlite::params![sess, text, status],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn m1_note_shows_refined_todo_intent_when_present() {
+        // M1: a sibling WITH a projected todo shows the refined todo as its intent.
+        let root = m3_tmp_root();
+        let shared = root.dir.join("repo");
+        std::fs::create_dir_all(&shared).unwrap();
+        let wd = shared.display().to_string();
+        m5_member_wd(&root, "room-i", "code-todoa001", &wd);
+        m5_member_wd(&root, "room-i", "code-viewb002", &wd);
+        // Give the sibling BOTH a launch-task baseline and an in-progress todo; the
+        // refined todo must win the note line.
+        codesession::set_intent(&root, "code-todoa001", "the launch task").unwrap();
+        seed_task(&root, "code-todoa001", "wire the SSE reconnect", "in_progress");
+        let b = turn_injection(&root, "codex", "code-viewb002").unwrap();
+        assert!(
+            b.contains("wire the SSE reconnect"),
+            "the refined todo is the intent shown: {b}"
+        );
+        assert!(
+            !b.contains("the launch task"),
+            "the todo refines over the baseline launch task: {b}"
+        );
+        assert!(
+            !b.contains("(no stated intent)"),
+            "an intent is present: {b}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn m1_note_falls_back_to_launch_task_intent_when_no_todo() {
+        // M1/M2: a sibling with NO todo (codex/opencode) still shows its baseline
+        // launch-task intent — never blank.
+        let root = m3_tmp_root();
+        let shared = root.dir.join("repo");
+        std::fs::create_dir_all(&shared).unwrap();
+        let wd = shared.display().to_string();
+        m5_member_wd(&root, "room-i", "code-basea001", &wd);
+        m5_member_wd(&root, "room-i", "code-viewb002", &wd);
+        codesession::set_intent(&root, "code-basea001", "harden the codex cage").unwrap();
+        let b = turn_injection(&root, "codex", "code-viewb002").unwrap();
+        assert!(
+            b.contains("harden the codex cage"),
+            "the baseline launch task is shown as intent: {b}"
+        );
+        assert!(
+            !b.contains("(no stated intent)"),
+            "a baseline intent is present: {b}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn m1_note_says_no_stated_intent_when_neither() {
+        // M1: with neither a todo nor a launch task, the note is HONEST about the
+        // absence rather than faking an empty task.
+        let root = m3_tmp_root();
+        let shared = root.dir.join("repo");
+        std::fs::create_dir_all(&shared).unwrap();
+        let wd = shared.display().to_string();
+        m5_member_wd(&root, "room-i", "code-mutea001", &wd);
+        m5_member_wd(&root, "room-i", "code-viewb002", &wd);
+        let b = turn_injection(&root, "codex", "code-viewb002").unwrap();
+        assert!(
+            b.contains("(no stated intent)"),
+            "no intent → honest '(no stated intent)': {b}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn m3_note_flags_a_disconnected_split_brain_sibling() {
+        // M3: a broker-disconnected sibling whose pid is still alive is flagged as a
+        // possible split brain so peers treat its claims as live (never assume free).
+        let root = m3_tmp_root();
+        let shared = root.dir.join("repo");
+        std::fs::create_dir_all(&shared).unwrap();
+        let wd = shared.display().to_string();
+        m5_member_wd(&root, "room-i", "code-splta001", &wd);
+        m5_member_wd(&root, "room-i", "code-viewb002", &wd);
+        codesession::set_connected(&root, "code-splta001", false).unwrap();
+        codesession::add_claim(&root, "room-i", "code-splta001", "src/live.rs").unwrap();
+        let b = turn_injection(&root, "codex", "code-viewb002").unwrap();
+        assert!(
+            b.contains("split brain") && b.contains("disconnected"),
+            "a disconnected split brain is flagged in the note: {b}"
+        );
+        // Its claim is still surfaced for the peer to route around (never reaped).
+        assert!(
+            b.contains("src/live.rs"),
+            "the split brain's claim stays visible: {b}"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
