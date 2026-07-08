@@ -162,13 +162,34 @@ Leans, to be confirmed during migration; **[OPEN]** items called out below.
 ## Formerly-open questions — all eight leans adopted by Tim, 2026-06-11
 
 1. **[DECIDED]** Category set: `agent, human, group, package, fs, harness,
-   channel` — small and closed-ish; adding a category is a design event, not
-   a convention. `human` stays a distinct category — ACL and escalation treat
-   humans differently by type, the grammar should too.
+   channel, dm` — small and closed-ish; adding a category is a design event,
+   not a convention. `human` stays a distinct category — ACL and escalation
+   treat humans differently by type, the grammar should too.
+   **`dm` added 2026-07-08 (Handoff B) — that addition IS the design event.**
+   `dm` is external-channel conversation *ingress*: a message that arrived from
+   a platform, addressed by the platform's own conversation id (see #2 and
+   [channels.md](channels.md)). It is distinct from `channel`, which stays the
+   *receipt* noun (`obs/channel/<kind>/{sent,acked}` — an `obs` noun, not an
+   `in` verb); `channels.md` weighed reusing `in/channel/...` for ingress and
+   rejected it, because the `dm` address now names *a conversation*, which is
+   what recall keys on. Addressing under `dm` is uniform — a conversation is an
+   id, and its participant set is a resolved phonebook fact, never a structural
+   property of the topic; enforcing who is in a conversation is a layered
+   security measure (the reserved `in/dm/` prefix of #M2 + grants + recall's
+   trust rule), **not** an authority boundary drawn by the category.
 2. **[DECIDED]** Locator conventions: actor categories (agent, human, group,
    package) have single-segment nouns; for `in/` the first locator is the
    conversation ID; for `obs/` the first locator is the session. `fs` nouns
    are the entire remainder.
+   **`dm` is the one two-segment-noun category (Handoff B):**
+   `in/dm/<kind>/<chat-addr>` — the platform `<kind>` (e.g. `telegram`,
+   `discord`) *and* the platform's conversation id `<chat-addr>` together are
+   the address, because recall must see `(kind, addr)` on the broker-verified
+   topic. `<chat-addr>` is `encode_segment`-ed (`src/topic.rs`) so a platform
+   id containing `/` cannot add levels. The conversation IS the address: a 1:1
+   DM and a group chat are the *same* shape — `in/dm/telegram/<chat.id>` either
+   way — the difference (one resolved participant vs. several) is a phonebook
+   fact, not a different topic.
 3. **[DECIDED]** Ingress: the twin-publish dies — an arrival is published
    once, addressed to its handler (`in/package/...` per-manifest routing);
    observation of arrivals comes from the delivery echo, not a second

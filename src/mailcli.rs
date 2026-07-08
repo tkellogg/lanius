@@ -125,10 +125,13 @@ pub fn recent_mail(root: &Root, limit: usize) -> Result<Vec<MailRow>> {
         let Some((noun, session)) = parse_mailbox(&topic) else {
             continue; // a bare agent mailbox or odd shape — not session mail
         };
-        // Only thread deliveries addressed to a coding session (`code-*`), the
-        // agents this view is about. An ordinary agent's mailbox is the chat
-        // seat's territory (/api/conversations), not the comms plane.
-        if !session.starts_with("code-") {
+        // Only thread deliveries addressed to a coding session, the agents this
+        // view is about. An ordinary agent's mailbox is the chat seat's territory
+        // (/api/conversations), not the comms plane. The worker test reads the
+        // durable `kind` recorded in `code_sessions` (principal-kind handoff M3)
+        // via the SHARED classifier, falling back to the `code-*` name prefix for
+        // rows that predate it — the same one definition the web comms list uses.
+        if !crate::codesession::is_worker_session(&conn, &session) {
             continue;
         }
         let pv: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);

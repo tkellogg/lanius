@@ -125,6 +125,24 @@ struct BlockingReg {
     seq: u64,
 }
 
+/// The outcome of resolving a CONNECT credential (`Broker::resolve_connect`).
+/// Keeps the trust-anchor decision — authority AND the `kind` label — in one
+/// pure, testable place while the handshake owns the network response.
+enum ConnectId {
+    /// Credential verified. `actor` is Some only for a grant-scoped principal
+    /// (session or package); None for a full-authority identity. `kind` is the
+    /// descriptive class set FROM the store that matched — it agrees with the
+    /// authority in `actor` and never decides it.
+    Verified {
+        actor: Option<String>,
+        sender: String,
+        kind: crate::codesession::PrincipalKind,
+    },
+    /// Credential absent, wrong, or unknown — refuse (NotAuthorized). Carries a
+    /// static reason for the operational log.
+    Refused(&'static str),
+}
+
 struct SessionRec {
     sink: v5::MqttSink,
     subs: Vec<SubRec>,
@@ -141,6 +159,19 @@ struct SessionRec {
     /// package name, or "kernel". Derived from the authenticated connection,
     /// never from the message.
     sender: String,
+    /// The CLASS of this principal, set FROM the store branch that resolved the
+    /// credential at CONNECT (docs/handoffs/principal-kind.md): session-store →
+    /// `Session`, fenced secret → `Human`/`Kernel`, actors map → `Package`. A
+    /// descriptive label carried alongside `(actor, sender)`; it AGREES with the
+    /// authority already decided by `actor` (grant-scoped iff `actor.is_some()`
+    /// or `Session`) and is never itself consulted to decide authority.
+    ///
+    /// Parked for downstream readers (handoffs B/C build on the concept): the
+    /// broker records the class here at CONNECT so a later consumer can read it
+    /// off the live session without re-deriving from the name. No live reader in
+    /// this handoff — this is the "carry alongside (actor, sender)" mandate.
+    #[allow(dead_code)]
+    kind: crate::codesession::PrincipalKind,
     /// CONNECT last will, fired on abnormal close (crash-only liveness).
     will: Option<Will>,
     /// Resident blocking-hook registrations held by this session.
@@ -200,6 +231,79 @@ impl Broker {
         b
     }
 
+    /// Resolve a CONNECT credential against the identity stores — THE trust
+    /// anchor (docs/identity.md, docs/security.md entry 20). Pure over the stores
+    /// (no network state), so the decision — both the authority (`actor`) and the
+    /// descriptive `kind` label — is unit-testable without a live MQTT handshake.
+    ///
+    /// The store resolution ORDER is exactly as entry 20 left it and MUST stay so:
+    ///   1. session-store (`code-*` token) → grant-scoped worker, `kind = Session`,
+    ///      `actor = Some` so every bus ACL gate runs. Checked FIRST so a `code-*`
+    ///      name can never resolve as the owner-equivalent fenced-secret identity.
+    ///   2. fenced secret (`.secrets/<name>`) → full authority, `actor = None`.
+    ///      `kind = Kernel` for the kernel's own machinery (`secrets::KERNEL`),
+    ///      else `Human` (the owner or another human). The authority is identical
+    ///      either way; the split is a UI/attribution label only.
+    ///   3. actors map (supervisor-minted token) → grant-scoped package,
+    ///      `kind = Package`, `actor = Some`.
+    /// Anything else — wrong secret, unknown name, or no credential at all — is
+    /// refused (deny-by-default).
+    ///
+    /// `kind` is set FROM the branch that matched; it is NEVER consulted to decide
+    /// authority (that is `actor`). Inverting that — reading `kind` to pick a
+    /// store — is the bug this design avoids.
+    fn resolve_connect(&self, username: Option<&str>, password: Option<&[u8]>) -> ConnectId {
+        use crate::codesession::PrincipalKind;
+        // Deny by default: no credential, no authority.
+        let (Some(name), Some(pw)) = (username, password) else {
+            return ConnectId::Refused("no credential presented (deny-by-default)");
+        };
+        let name = name.to_string();
+        if crate::codesession::is_session_principal(&name) {
+            // Session-store first (entry 20): a code-* name is ALWAYS grant-scoped.
+            match crate::codesession::read(&self.root, &name) {
+                Some(tok) if tok.secret.as_bytes() == pw => ConnectId::Verified {
+                    actor: Some(name.clone()),
+                    sender: name,
+                    kind: PrincipalKind::Session,
+                },
+                _ => ConnectId::Refused("bad/unknown session token"),
+            }
+        } else if let Some(secret) = crate::secrets::read(&self.root, &name) {
+            // Fenced secret → full authority. `secrets::read` rejects path-unsafe
+            // and dot-prefixed names, so a crafted username cannot traverse the
+            // store; the store is cage-fenced, so only the human/kernel can place
+            // such a secret.
+            if secret.as_bytes() != pw {
+                return ConnectId::Refused("bad credential for identity");
+            }
+            let kind = if name == crate::secrets::KERNEL {
+                PrincipalKind::Kernel
+            } else {
+                PrincipalKind::Human
+            };
+            ConnectId::Verified {
+                actor: None,
+                sender: name,
+                kind,
+            }
+        } else if self
+            .actors
+            .borrow()
+            .get(&name)
+            .is_some_and(|t| t.as_bytes() == pw)
+        {
+            // A supervisor-minted package actor, grant-scoped to its grants.
+            ConnectId::Verified {
+                actor: Some(name.clone()),
+                sender: name,
+                kind: PrincipalKind::Package,
+            }
+        } else {
+            ConnectId::Refused("bad token / unknown identity")
+        }
+    }
+
     /// Recompute the kv row exec/dispatcher read for the zero-overhead gate:
     /// the comma-joined set of hook points with at least one live resident
     /// registration. Updated on register/deregister/disconnect; cleared on
@@ -235,6 +339,20 @@ impl Broker {
     /// or replayed session token can publish ONLY its own telemetry — never the
     /// owner mailbox, work plane, or another agent's topics.
     fn actor_may_publish(&self, pkg: &str, topic_name: &str) -> bool {
+        // Reserved ingress prefix (docs/security.md entry 15, Handoff B/M2).
+        // External-channel ingress `in/dm/<kind>/<addr>` is a conversation's
+        // INPUT: whoever may publish it can widen what a resident recall stage
+        // loads. So it is reserved to an ingress BRIDGE — a package whose
+        // approved manifest declares an explicitly dm-scoped publish grant
+        // (e.g. `in/dm/#` or `in/dm/discord/#`). A grant-scoped actor holding a
+        // merely BROAD grant (`#`, `in/#`) that happens to cover `in/dm/…`, and
+        // a coding session's structural scope, are BOTH refused here — that is
+        // what stops a prompt-injected agent forging `in/dm/telegram/<victim>`.
+        // Full-authority principals (owner/kernel, actor=None) never reach this
+        // method, so they are unaffected.
+        if topic::matches("in/dm/#", topic_name) {
+            return self.actor_is_ingress_bridge_for(pkg, topic_name);
+        }
         if crate::codesession::is_session_principal(pkg) {
             return crate::codesession::read(&self.root, pkg)
                 .map(|t| t.may_publish(topic_name))
@@ -268,6 +386,38 @@ impl Broker {
             .map(|fs| fs.iter().any(|f| f == filter))
             .unwrap_or(false)
     }
+
+    /// May this grant-scoped actor act as an ingress bridge for `topic_name`
+    /// under the reserved `in/dm/` prefix? Yes iff it is a package whose
+    /// approved publish grants include an explicitly dm-scoped filter that
+    /// matches the topic. Coding sessions (structural scope, no manifest
+    /// grants) are never bridges. A broad grant such as `#` or `in/#` does NOT
+    /// confer the capability — the bridge declaration must be dm-scoped, so the
+    /// capability is decided from a STORED, owner-approved manifest fact, not a
+    /// name and not an incidentally-covering wildcard (docs/security.md 15).
+    fn actor_is_ingress_bridge_for(&self, pkg: &str, topic_name: &str) -> bool {
+        if crate::codesession::is_session_principal(pkg) {
+            return false;
+        }
+        let Some(conn) = self.conn.as_ref() else {
+            return false;
+        };
+        crate::packages::approved(conn, pkg, "publish")
+            .map(|fs| {
+                fs.iter()
+                    .any(|f| is_dm_scoped_filter(f) && topic::matches(f, topic_name))
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// Is `filter` an explicit `in/dm/`-scoped publish grant — the ingress-bridge
+/// capability marker? True only for a filter whose first two levels are exactly
+/// `in`/`dm` (e.g. `in/dm/#`, `in/dm/discord/#`). A broad `#` or `in/#` is
+/// deliberately excluded: covering `in/dm/…` by accident of breadth must not
+/// grant bridge authority.
+fn is_dm_scoped_filter(filter: &str) -> bool {
+    filter == "in/dm" || filter == "in/dm/#" || filter.starts_with("in/dm/")
 }
 
 /// Remove a session; fire its will unless the close was clean. The denied/
@@ -425,59 +575,29 @@ async fn handshake(
     // enforced below): a connection with no verified identity gets none.
     // `actor` is Some only for a grant-scoped package; `sender` is the
     // verified stamp for the ledger.
-    let (actor, sender) = match (&pkt.username, &pkt.password) {
-        (Some(u), Some(p)) => {
-            let name = u.to_string();
-            // A coding-session principal (code-<session>) is a GRANT-SCOPED
-            // actor, never full authority (docs/security.md entry 16). Its token
-            // lives in the fenced code-sessions store (only the uncaged launcher
-            // can place it, so a caged agent cannot forge a session identity),
-            // but it resolves as `actor = Some(code-<session>)` so every bus ACL
-            // gate runs — scoped structurally to its own obs subtree
-            // (src/codesession.rs). Checked BEFORE the fenced-secret path so a
-            // code-* name can never resolve as the owner-equivalent identity that
-            // skips the ACL.
-            if crate::codesession::is_session_principal(&name) {
-                match crate::codesession::read(&st.root, &name) {
-                    Some(tok) if tok.secret.as_bytes() == p.as_ref() => (Some(name.clone()), name),
-                    _ => {
-                        eprintln!("[bus] CONNECT refused: bad/unknown session token {name:?}");
-                        return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
-                    }
-                }
-            } else if let Some(secret) = crate::secrets::read(&st.root, &name) {
-                // A fenced secret named for this principal is full authority — the
-                // owner, the kernel, or another human. `secrets::read` rejects
-                // path-unsafe and dot-prefixed names, so a crafted username cannot
-                // traverse the store or read the config file. The store is
-                // cage-fenced, so only the human/kernel can place such a secret;
-                // an agent cannot mint itself a full-authority identity.
-                if secret.as_bytes() != p.as_ref() {
-                    eprintln!("[bus] CONNECT refused: bad credential for identity {name:?}");
-                    return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
-                }
-                (None, name)
-            } else if st
-                .actors
-                .borrow()
-                .get(&name)
-                .is_some_and(|t| t.as_bytes() == p.as_ref())
-            {
-                (Some(name.clone()), name) // a package actor, grant-scoped to its grants
-            } else {
-                eprintln!("[bus] CONNECT refused: bad token / unknown identity {name:?}");
+    //
+    // `kind` (docs/handoffs/principal-kind.md) is a *label* on the authority
+    // resolved by `resolve_connect` — set FROM the store branch that matched,
+    // never a second source of authority. The branch taken is identical to
+    // before this handoff (security.md entry 20 order preserved: session-store
+    // first, then fenced secret, then actors map); `kind` is only a description
+    // carried alongside `(actor, sender)` so later code and the ledger
+    // attribution can see the class without re-deriving it from the name.
+    let (actor, sender, kind) =
+        match st.resolve_connect(pkt.username.as_deref(), pkt.password.as_deref()) {
+            ConnectId::Verified {
+                actor,
+                sender,
+                kind,
+            } => (actor, sender, kind),
+            ConnectId::Refused(why) => {
+                eprintln!(
+                    "[bus] CONNECT refused: {why} (user {:?})",
+                    pkt.username.as_deref()
+                );
                 return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
             }
-        }
-        // Deny by default (docs/identity.md): no credential, no authority. A
-        // connection without credentials is a stray or a caged agent that
-        // could not read the fenced store — refuse it rather than hand it the
-        // owner's standing.
-        (None, _) | (_, None) => {
-            eprintln!("[bus] CONNECT refused: no credential presented (deny-by-default)");
-            return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
-        }
-    };
+        };
     let will = pkt.last_will.as_ref().map(|w| Will {
         topic: w.topic.to_string(),
         payload: String::from_utf8_lossy(&w.message).into_owned(),
@@ -506,6 +626,7 @@ async fn handshake(
             subs: Vec::new(),
             actor,
             sender,
+            kind,
             will,
             blocking: Vec::new(),
         },
@@ -1453,6 +1574,185 @@ mod tests {
         assert!(!b.actor_may_publish(ghost, "obs/agent/claude-code/code-00000000/session/start"));
         assert!(!b.actor_may_publish(ghost, "in/human/owner"));
         assert!(!b.actor_may_subscribe(ghost, "obs/#"));
+    }
+
+    /// The pure predicate at the heart of the reservation: only an explicitly
+    /// dm-scoped filter marks the ingress-bridge capability; a broad wildcard
+    /// that merely covers `in/dm/…` does not.
+    #[test]
+    fn dm_scoped_filter_excludes_broad_wildcards() {
+        use super::is_dm_scoped_filter;
+        assert!(is_dm_scoped_filter("in/dm/#"));
+        assert!(is_dm_scoped_filter("in/dm/discord/#"));
+        assert!(is_dm_scoped_filter("in/dm/telegram/12345"));
+        assert!(is_dm_scoped_filter("in/dm"));
+        // Broad grants that incidentally cover in/dm/… are NOT the capability.
+        assert!(!is_dm_scoped_filter("#"));
+        assert!(!is_dm_scoped_filter("in/#"));
+        assert!(!is_dm_scoped_filter("in/+/#"));
+        // A near-miss category must not slip through the prefix test.
+        assert!(!is_dm_scoped_filter("in/dmx/#"));
+    }
+
+    /// Handoff B / M2 — the reserved `in/dm/` ingress prefix.
+    /// A grant-scoped package actor may publish `in/dm/<kind>/<addr>` ONLY when
+    /// its approved manifest declares an explicitly dm-scoped publish grant (the
+    /// bridge capability). A package holding only a NON-dm grant is refused even
+    /// when it targets `in/dm/…`; a coding session is refused unconditionally.
+    /// This is the entry-15 bus-path residual: recall's single-correspondent
+    /// trust rule now rests on an enforced invariant.
+    #[test]
+    fn in_dm_prefix_is_reserved_to_bridge_packages() {
+        use crate::db;
+        let root = tmp_root();
+        // A bridge package: its manifest declares an in/dm-scoped publish grant.
+        let bridge = root.dir.join("packages/telebridge");
+        std::fs::create_dir_all(&bridge).unwrap();
+        std::fs::write(
+            bridge.join("lanius.toml"),
+            "[request]\npublish = [\"in/dm/telegram/#\", \"obs/channel/telegram/#\"]\n",
+        )
+        .unwrap();
+        // A non-bridge package: a broad-ish publish grant that does NOT scope to
+        // in/dm. It must not be able to forge conversation ingress.
+        let plain = root.dir.join("packages/scratch");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(
+            plain.join("lanius.toml"),
+            "[request]\npublish = [\"in/package/scratch/#\"]\n",
+        )
+        .unwrap();
+
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::packages::sync(&root, &conn).unwrap();
+        crate::packages::decide(&root, &conn, "telebridge", true, "test").unwrap();
+        crate::packages::decide(&root, &conn, "scratch", true, "test").unwrap();
+        drop(conn);
+
+        let b = Broker::new(root);
+
+        // The bridge publishes canonical ingress it declared.
+        assert!(b.actor_may_publish("telebridge", "in/dm/telegram/12345"));
+        // …but not a platform outside its declared scope.
+        assert!(!b.actor_may_publish("telebridge", "in/dm/discord/98765"));
+        // Its non-ingress grant still works (regression: guard is prefix-scoped).
+        assert!(b.actor_may_publish("telebridge", "obs/channel/telegram/sent"));
+
+        // The non-bridge package CANNOT forge conversation ingress …
+        assert!(!b.actor_may_publish("scratch", "in/dm/telegram/12345"));
+        assert!(!b.actor_may_publish("scratch", "in/dm/discord/98765"));
+        // … but retains its own declared grant.
+        assert!(b.actor_may_publish("scratch", "in/package/scratch/x"));
+
+        // A coding session is never a bridge, whatever it targets.
+        crate::codesession::mint(
+            &b.root,
+            "code-cafef00d",
+            "claude-code",
+            111_222,
+            None,
+            crate::codesession::RequestedGrants::default(),
+        )
+        .unwrap();
+        assert!(!b.actor_may_publish("code-cafef00d", "in/dm/telegram/12345"));
+    }
+
+    /// principal-kind handoff M2: `resolve_connect` (the CONNECT trust anchor)
+    /// sets `kind` FROM the store branch that matched, with the SAME authority
+    /// (`actor`) as before — the branch taken is unchanged, only the label is new.
+    ///  - a `code-*` session token → grant-scoped (actor=Some), kind=Session;
+    ///  - a fenced-secret owner       → full authority (actor=None),  kind=Human;
+    ///  - the fenced-secret `kernel`   → full authority (actor=None),  kind=Kernel;
+    ///  - a supervisor-minted actor    → grant-scoped (actor=Some), kind=Package;
+    ///  - wrong secret / unknown / no credential → Refused (deny-by-default).
+    #[test]
+    fn resolve_connect_labels_kind_from_the_store() {
+        use super::ConnectId;
+        use crate::codesession::PrincipalKind;
+        let root = tmp_root();
+
+        // A real scoped session token in the session store.
+        let tok = crate::codesession::mint(
+            &root,
+            "code-deadbeef",
+            "claude-code",
+            999_999,
+            None,
+            crate::codesession::RequestedGrants::default(),
+        )
+        .unwrap();
+
+        // Fenced secrets for a human (owner) and the kernel.
+        std::fs::create_dir_all(root.secrets()).unwrap();
+        std::fs::write(root.secrets().join("owner"), "owner-secret").unwrap();
+        std::fs::write(
+            root.secrets().join(crate::secrets::KERNEL),
+            "kernel-secret",
+        )
+        .unwrap();
+
+        let b = Broker::new(root);
+        // A supervisor-minted package actor in the in-memory map.
+        b.actors
+            .borrow_mut()
+            .insert("discord".into(), "pkg-token".into());
+
+        let verify = |u: &str, p: &[u8]| -> (Option<String>, String, PrincipalKind) {
+            match b.resolve_connect(Some(u), Some(p)) {
+                ConnectId::Verified {
+                    actor,
+                    sender,
+                    kind,
+                } => (actor, sender, kind),
+                ConnectId::Refused(why) => panic!("expected Verified for {u}, got Refused: {why}"),
+            }
+        };
+
+        // Session store → grant-scoped worker, kind = Session.
+        let (actor, sender, kind) = verify("code-deadbeef", tok.secret.as_bytes());
+        assert_eq!(actor.as_deref(), Some("code-deadbeef"));
+        assert_eq!(sender, "code-deadbeef");
+        assert_eq!(kind, PrincipalKind::Session);
+
+        // Fenced secret (owner) → full authority (actor None), kind = Human.
+        let (actor, sender, kind) = verify("owner", b"owner-secret");
+        assert_eq!(actor, None);
+        assert_eq!(sender, "owner");
+        assert_eq!(kind, PrincipalKind::Human);
+
+        // Fenced secret (kernel) → full authority (actor None), kind = Kernel.
+        let (actor, _sender, kind) = verify(crate::secrets::KERNEL, b"kernel-secret");
+        assert_eq!(actor, None);
+        assert_eq!(kind, PrincipalKind::Kernel);
+
+        // Actors map → grant-scoped package, kind = Package.
+        let (actor, sender, kind) = verify("discord", b"pkg-token");
+        assert_eq!(actor.as_deref(), Some("discord"));
+        assert_eq!(sender, "discord");
+        assert_eq!(kind, PrincipalKind::Package);
+
+        // Refusals: wrong secret, unknown name, and no credential at all.
+        assert!(matches!(
+            b.resolve_connect(Some("code-deadbeef"), Some(b"wrong")),
+            ConnectId::Refused(_)
+        ));
+        assert!(matches!(
+            b.resolve_connect(Some("owner"), Some(b"nope")),
+            ConnectId::Refused(_)
+        ));
+        assert!(matches!(
+            b.resolve_connect(Some("ghost"), Some(b"whatever")),
+            ConnectId::Refused(_)
+        ));
+        assert!(matches!(
+            b.resolve_connect(None, Some(b"x")),
+            ConnectId::Refused(_)
+        ));
+        assert!(matches!(
+            b.resolve_connect(Some("owner"), None),
+            ConnectId::Refused(_)
+        ));
     }
 
     #[test]

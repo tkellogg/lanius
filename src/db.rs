@@ -610,6 +610,19 @@ CREATE TABLE IF NOT EXISTS code_spawn_edges (
     // + tri-state liveness — turning Incident B's git archaeology into a query.
     // Nullable: a session launched outside a git repo (or before M4) has no branch.
     let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN branch TEXT", []);
+    // principal-kind handoff M1: the durable CLASS of this principal. Every
+    // code_sessions row is a grant-scoped coding worker by construction, so
+    // pre-existing rows back-fill as 'session' (NOT NULL DEFAULT). The two UI
+    // worker classifiers (web comms-list eviction, mailcli session-mail filter)
+    // read this recorded field via codesession::is_worker_session instead of
+    // guessing from the `code-` name prefix; the prefix stays only as the
+    // fallback for a row that predates this column. This is a descriptive label
+    // on the authority the broker already resolves by store placement — it gates
+    // nothing (docs/handoffs/principal-kind.md).
+    let _ = conn.execute(
+        "ALTER TABLE code_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'session'",
+        [],
+    );
     // Migrations for databases created before a column existed; the error on
     // a duplicate column is expected and ignored.
     let _ = conn.execute(

@@ -2369,19 +2369,6 @@ fn session_for_event(row: &EventRow) -> String {
     }
 }
 
-// A conversation is dropped from the comms list only when it is a *worker
-// session* — a coding run, identified by its bus-derived `code-*` session id —
-// NOT by the agent's noun (docs/handoffs/chat-rendering.md M2). Gating on noun
-// (codex/claude-code) wrongly drops a coding-noun agent's genuine comms-plane
-// conversation (an `in/agent/<agent>` prompt on a non-`code-*` session with a
-// correlated `in/human/<owner>` reply); the decision must be derivable from the
-// ledger shape alone so a third-party UI reproduces it. All real coding runs
-// carry `code-*` sessions, so they stay evicted; a curated conversation under
-// any agent (coding-noun or not) on a non-`code-*` session is preserved.
-fn is_worker_session(session: &str) -> bool {
-    session.starts_with("code-") && session.len() > 5
-}
-
 fn source_for(session: &str, sender: &Option<String>, payload: &Value, owner: &str) -> String {
     if let Some(claimed) = payload.get("source").and_then(Value::as_str) {
         let claimed = claimed.trim().to_lowercase();
@@ -2394,6 +2381,13 @@ fn source_for(session: &str, sender: &Option<String>, payload: &Value, owner: &s
     if s.starts_with("web-") {
         return "web".into();
     }
+    // TODO(docs/channels.md, closing section): these legacy spelling-based
+    // guesses are a SHRINKING safety net. The right seam is the `payload.source`
+    // branch above: a channel/package stamps its own source at the source (as
+    // the Telegram bridge does — docs/handoffs/agent-dm-relay.md M3, and the
+    // send/ask reply path via exec::reply_source), and these fallbacks wither.
+    // Adding a new channel must NOT add a branch here. github/jira/linear/cron
+    // stay only until they become packages that declare their own source.
     if from.contains("github") || from.contains("jira") || from.contains("linear") {
         return "github".into();
     }
@@ -2541,7 +2535,16 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
     for row in &inbound {
         let payload = parse_payload(&row.payload);
         let session = session_for_event(row);
-        if is_worker_session(&session) {
+        // A conversation is dropped from the comms list only when it is a *worker
+        // session* — a coding run — NOT by the agent's noun
+        // (docs/handoffs/chat-rendering.md M2). The decision now reads the durable
+        // `kind` recorded in `code_sessions` (principal-kind handoff M3), falling
+        // back to the `code-*` name prefix for rows that predate it — one shared
+        // definition (codesession::is_worker_session), not a copy. Gating on noun
+        // (codex/claude-code) would wrongly drop a coding-noun agent's genuine
+        // comms-plane conversation; a curated conversation on a non-worker session
+        // is preserved.
+        if crate::codesession::is_worker_session(&conn, &session) {
             continue;
         }
         if let Some(c) = &row.correlation_id {
@@ -2601,7 +2604,8 @@ fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
         let Some(session) = payload.get("session").and_then(Value::as_str) else {
             continue;
         };
-        if is_worker_session(session) {
+        // Same worker eviction as above, via the shared kind-aware classifier.
+        if crate::codesession::is_worker_session(&conn, session) {
             continue;
         }
         let source = source_for(session, &row.sender, &payload, owner);
@@ -3214,6 +3218,67 @@ mod ambient_tests {
                     && m["cls"].as_str() == Some("agent")
             ),
             "the ambient send renders as an agent turn in the feed ({feed:?})"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // docs/handoffs/agent-dm-relay.md M3/M6 — a Telegram-originated conversation
+    // renders in the web comms list with `source = "telegram"`, derived purely
+    // from the `payload.source` the reply path stamped (exec::reply_source), via
+    // source_for's EXISTING payload.source branch — with NO `telegram` branch in
+    // source_for. This is the "same publish, different renderer" payoff: the web
+    // dashboard is just another renderer of the owner's mailbox plane, and it
+    // learns a new channel with zero kernel taxonomy edits.
+    #[test]
+    fn telegram_conversation_renders_source_from_stamp() {
+        let dir = std::env::temp_dir().join(format!("el-tgconv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let agent = "main";
+        let owner = "owner";
+        let mailbox = crate::topic::human_mailbox(owner);
+
+        // The agent's reply to a Telegram inbound: an ambient in/human/<owner>
+        // send carrying the run's session AND the channel source the reply path
+        // propagated from the `in/dm/telegram/<chat>` trigger. No in/agent seed
+        // (the ingress was a dm, not a web prompt) — the ambient path renders it.
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
+            json!({ "text": "got it, Tim — the bridge shipped", "session": "tg-424242", "source": "telegram" }),
+            Some(agent),
+            "2026-07-01T10:00:00.000Z",
+        );
+
+        let out = conversation_rows(agent, &root.db(), owner).unwrap();
+        let convs = out.as_array().unwrap();
+        let tg = convs
+            .iter()
+            .find(|c| c["session"] == "tg-424242")
+            .expect("the Telegram conversation materialized");
+        assert_eq!(
+            tg["source"].as_str().unwrap(),
+            "telegram",
+            "source is the stamped payload.source, not a source_for spelling guess"
+        );
+
+        // Proof of the "no kernel edit" claim: source_for itself contains no
+        // telegram branch — it resolves telegram ONLY through payload.source.
+        let via_stamp = source_for(
+            "tg-424242",
+            &Some(agent.to_string()),
+            &json!({ "source": "telegram" }),
+            owner,
+        );
+        assert_eq!(via_stamp, "telegram");
+        let no_stamp = source_for("tg-424242", &Some(agent.to_string()), &json!({}), owner);
+        assert_ne!(
+            no_stamp, "telegram",
+            "without the stamp there is NO telegram branch — the kernel never learned the name"
         );
 
         std::fs::remove_dir_all(&dir).ok();

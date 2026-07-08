@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Discord ingress bridge — UNTESTED SCAFFOLD (written without a live token).
 
-Inbound: gateway MESSAGE_CREATE -> `in/package/discord/triage` (ledger-backed,
-published once, addressed to the triage handler; observation of the arrival
-comes from the delivery echo).
+Inbound: gateway MESSAGE_CREATE -> `in/dm/discord/<channel-id>` (ledger-backed,
+published once — the canonical, recall-keyable conversation address; the
+channel id IS the address, 1:1 and group alike. Handoff B).
 Outbound: subscribes `in/package/discord/send` {channel_id, content} -> REST
 post, then an `obs/channel/discord/sent` receipt.
 
@@ -35,6 +35,18 @@ def park(reason):
     log(f"[discord] not configured: {reason}; parking (this is not an error)")
     while True:
         time.sleep(3600)
+
+
+def encode_segment(s):
+    """One topic level, matching src/topic.rs encode_segment: percent-encode the
+    wildcard chars, `%`, and `/` so a platform id can't add or match levels."""
+    return (
+        str(s)
+        .replace("%", "%25")
+        .replace("+", "%2B")
+        .replace("#", "%23")
+        .replace("/", "%2F")
+    )
 
 
 def bus_pub(topic, payload, qos=1):
@@ -130,7 +142,12 @@ def main():
                 "text": d.get("content", ""),
                 "message_id": d.get("id"),
             }
-            bus_pub("in/package/discord/triage", inbound, qos=1)
+            # Address the CONVERSATION, not the person: the wire address is the
+            # Discord channel id (1:1 and group are the same shape — the
+            # phonebook says who/how-many). Recall keys the correspondent on the
+            # broker-verified (kind, addr) from THIS topic, never a body field.
+            addr = encode_segment(d.get("channel_id"))
+            bus_pub(f"in/dm/discord/{addr}", inbound, qos=1)
     sys.exit(1)  # gateway closed -> crash-only restart
 
 

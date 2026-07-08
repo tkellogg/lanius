@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Telegram bridge — a two-way external-channel daemon (docs/channels.md).
+
+The union of the two shipped daemon templates for ONE real platform:
+  * egress  (packages/webhook): an agent publishes a command to this actor's
+    inbox `in/package/telegram/send {recipient, text}`; the daemon calls the
+    Bot API `sendMessage` DIRECTLY (off the bus), then emits an
+    `obs/channel/telegram/sent` receipt. Spawned with its package token, the
+    daemon's `lanius bus pub` authenticates as "telegram", so the broker stamps
+    the receipt `sender = telegram` — the provenance the egress record carries
+    (docs/security.md entry 16; a per-event exec handler would authenticate as
+    the OWNER and mislabel the send, which is why a bridge must be a daemon).
+  * ingress (packages/discord): the daemon long-polls `getUpdates` holding the
+    bot token, and on each message publishes ONCE to
+    `in/dm/telegram/<chat.id>` — the canonical, recall-keyable conversation
+    address (Handoff B). 1:1 and group chats are the SAME shape (Telegram's own
+    `chat.id`); the phonebook says who/how-many. The `in/dm/telegram/#` publish
+    grant is ALSO the ingress-bridge capability the broker ACL enforces, so a
+    prompt-injected agent cannot forge `in/dm/telegram/<victim>`.
+
+On each inbound the daemon also records the correspondent's channel SIGHTING in
+the phonebook (`in/package/phonebook/channel {channel_kind:"telegram",
+address:<chat.id>}`, M4) — an UNRESOLVED sighting (identity_id stays NULL until
+an owner/EA links it). Provenance is this bridge's broker-verified sender, never
+a chosen field: the bridge is the party that actually saw the wire address.
+
+Bus access rides the `lanius bus` CLI as subprocesses — the CLI authenticates
+from the supervisor-injected env (LANIUS_PACKAGE / LANIUS_BUS_TOKEN), so this
+script holds no bus credentials of its own; the only secret it holds is the bot
+token, which no agent ever sees.
+
+The Bot API base is overridable (TELEGRAM_API_BASE) so CI acceptance can point
+the daemon at a recorded/stub transport — no live Telegram token required (the
+same posture packages/discord documents for itself).
+
+Crash-only for INFRASTRUCTURE faults: bus death exits nonzero and the
+supervisor restarts us. A failed send is a recorded outcome (ok:false), never a
+crash; a single malformed inbound is skipped, not fatal. Unconfigured (no
+TELEGRAM_TOKEN), it PARKS forever instead of crash-looping.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+ROOT = os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", ".")
+PKG = os.environ.get("LANIUS_PACKAGE") or os.environ.get("ELANUS_PACKAGE") or "telegram"
+
+
+def _config(key):
+    """A value from this package's live config (docs/config.md):
+    config/packages/<pkg>.toml. The supervisor RESTARTS a daemon whose config
+    changed, so a fresh process re-reads it (section 21). Env vars are canonical
+    (a real operator holds the bot token in the daemon's environment); the
+    config file is the fallback — and the seam CI uses to point the daemon at a
+    stub Bot API without a live token."""
+    path = os.path.join(ROOT, "config", "packages", f"{PKG}.toml")
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(rf'^\s*{re.escape(key)}\s*=\s*"([^"]*)"\s*$', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+TOKEN = os.environ.get("TELEGRAM_TOKEN") or _config("token") or ""
+# The Bot API base — real by default, overridable for a stub/recorded transport.
+API_BASE = (os.environ.get("TELEGRAM_API_BASE") or _config("api_base") or "https://api.telegram.org").rstrip("/")
+# Long-poll timeout (seconds) the daemon asks getUpdates to hold the connection.
+POLL_TIMEOUT = int(os.environ.get("TELEGRAM_POLL_TIMEOUT") or _config("poll_timeout") or "25")
+
+SEND_REQ = "in/package/telegram/send"
+SENT = "obs/channel/telegram/sent"
+CLI = os.environ.get("LANIUS_CLI", "lanius")
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def park(reason):
+    log(f"[telegram] not configured: {reason}; parking (this is not an error)")
+    while True:
+        time.sleep(3600)
+
+
+def encode_segment(s):
+    """One topic level, mirroring src/topic.rs encode_segment: percent-encode
+    the wildcard chars, `%`, and `/` so a platform id can't add or match
+    levels."""
+    return (
+        str(s)
+        .replace("%", "%25")
+        .replace("+", "%2B")
+        .replace("#", "%23")
+        .replace("/", "%2F")
+    )
+
+
+def bus_pub(topic, payload, correlation=None, qos=1):
+    args = [CLI, "bus", "pub", topic, json.dumps(payload), "--qos", str(qos)]
+    if correlation:
+        args += ["--correlation", correlation]
+    subprocess.run(args, check=True, timeout=30)
+
+
+def api(method, body):
+    """A Bot API call: POST {base}/bot{token}/{method}. Returns the decoded
+    JSON, or raises (the caller decides whether that is a recorded ok:false or a
+    crash-only infrastructure fault)."""
+    req = urllib.request.Request(
+        f"{API_BASE}/bot{TOKEN}/{method}",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=POLL_TIMEOUT + 10) as r:
+        return json.load(r)
+
+
+# ---- egress: in/package/telegram/send -> sendMessage -> obs receipt ----------
+
+def outbound_loop():
+    """Reads the `lanius bus sub` subprocess line-by-line; each line is
+    {"topic":..., "payload": <broker envelope>} where the envelope carries the
+    request body at payload.payload and the triggering correlation."""
+    proc = subprocess.Popen(
+        [CLI, "bus", "sub", SEND_REQ], stdout=subprocess.PIPE, text=True,
+    )
+    log(f"[telegram] serving {SEND_REQ} (egress bridge; direct send + obs record)")
+    for line in proc.stdout:
+        try:
+            env = json.loads(line)
+        except ValueError:
+            continue
+        inner = env.get("payload") if isinstance(env.get("payload"), dict) else {}
+        payload = inner.get("payload") if isinstance(inner.get("payload"), dict) else {}
+        corr = inner.get("correlation_id")
+        # {recipient, text}: `recipient` is the Telegram chat_id (the same
+        # conversation address ingress publishes under).
+        recipient = payload.get("recipient")
+        text = payload.get("text", "")
+        if recipient is None:
+            receipt = {"recipient": None, "ok": False, "detail": "send needs {recipient}", "correlation": corr}
+        else:
+            try:
+                resp = api("sendMessage", {"chat_id": recipient, "text": text})
+                ok = bool(resp.get("ok", True)) if isinstance(resp, dict) else True
+                receipt = {"recipient": recipient, "ok": ok, "correlation": corr}
+            except Exception as e:
+                # A failed send is a RECORDED outcome, not a crash.
+                log(f"[telegram] send failed: {e}")
+                receipt = {"recipient": recipient, "ok": False, "detail": str(e), "correlation": corr}
+        try:
+            bus_pub(SENT, receipt, correlation=corr)
+        except subprocess.SubprocessError:
+            break  # bus trouble is crash-only (handled below)
+    # A daemon thread's sys.exit only unwinds THIS thread and leaves a half-dead
+    # process; os._exit terminates the whole process so the supervisor's
+    # crash-only restart actually fires.
+    log("[telegram] outbound bus subscription died -> exiting for restart")
+    os._exit(1)
+
+
+# ---- ingress: getUpdates -> in/dm/telegram/<chat.id> (+ phonebook sighting) --
+
+def publish_inbound(msg):
+    """One Telegram message -> ONE `in/dm/telegram/<chat.id>` publish, plus a
+    phonebook channel sighting (M4). Addresses the CONVERSATION, not the person:
+    the wire address is the Telegram chat id (1:1 and group are the same shape —
+    the phonebook says who/how-many). Recall keys the correspondent on the
+    broker-verified (kind, addr) from THIS topic, never a body field."""
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+    chat_id = str(chat_id)
+    frm = msg.get("from") or {}
+    inbound = {
+        "chat_id": chat_id,
+        "author": frm.get("username") or frm.get("first_name"),
+        "text": msg.get("text", ""),
+        "message_id": msg.get("message_id"),
+        # A hint for the web projection so a Telegram-originated conversation
+        # renders with source="telegram" via source_for's existing
+        # payload.source branch — no kernel channel-taxonomy edit (M3).
+        "source": "telegram",
+    }
+    addr = encode_segment(chat_id)
+    bus_pub(f"in/dm/telegram/{addr}", inbound, qos=1)
+    # M4: record the sighting so it can later be resolved. UNRESOLVED (no
+    # identity) — linking it to a person is owner/EA territory (M5 seeding),
+    # done once, not on every message. Provenance is this bridge's verified
+    # sender (the broker stamps it), never a payload field. Best-effort: a
+    # phonebook that is down/unapproved must not drop the ingress.
+    try:
+        bus_pub("in/package/phonebook/channel", {"channel_kind": "telegram", "address": chat_id}, qos=1)
+    except subprocess.SubprocessError as e:
+        log(f"[telegram] phonebook sighting failed (non-fatal): {e}")
+
+
+def inbound_loop():
+    """Long-poll getUpdates holding the bot token; publish each new message
+    once. The `offset` acknowledges consumed updates so we never re-deliver."""
+    offset = 0
+    log("[telegram] long-polling getUpdates (ingress bridge)")
+    while True:
+        try:
+            resp = api("getUpdates", {"offset": offset, "timeout": POLL_TIMEOUT})
+        except Exception as e:
+            # A transient API/network error is not fatal — back off and retry.
+            log(f"[telegram] getUpdates error (retrying): {e}")
+            time.sleep(2)
+            continue
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            time.sleep(1)
+            continue
+        for upd in resp.get("result") or []:
+            try:
+                offset = max(offset, int(upd.get("update_id", 0)) + 1)
+            except (TypeError, ValueError):
+                pass
+            msg = upd.get("message") or upd.get("edited_message")
+            if not isinstance(msg, dict):
+                continue
+            # A bot's own echoes must not loop back in as ingress.
+            if (msg.get("from") or {}).get("is_bot"):
+                continue
+            try:
+                publish_inbound(msg)
+            except subprocess.SubprocessError:
+                log("[telegram] inbound publish hit bus trouble -> exiting for restart")
+                os._exit(1)
+            except Exception as e:
+                log(f"[telegram] bad inbound update skipped: {e}")
+
+
+def main():
+    if not TOKEN:
+        park("TELEGRAM_TOKEN not set")
+    # Egress on a daemon thread; ingress owns the main thread. Either dying takes
+    # the whole process down (os._exit) so the supervisor restarts us whole.
+    threading.Thread(target=outbound_loop, daemon=True).start()
+    inbound_loop()
+
+
+if __name__ == "__main__":
+    main()

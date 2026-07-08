@@ -450,11 +450,43 @@ event the running agent emitted itself (its verified sender equals the agent).
 Otherwise a prompt-injected agent could name a correspondent — in a payload, or
 by forging its own dispatch — and pull another person's confidential messages
 into its own prompt. This is the same doctrine the phonebook follows for
-writes: provenance is the verified sender, never a field the writer chose. The
-residual to close as the agent-authorization work matures: an agent holding a
-broad publish grant could forge an `in/dm/...` event for *another* agent that
-is dispatched on the channel plane — the deeper fix is reserving the ingress
-prefix so only bridges, never agents, can publish `in/dm/...` (security ledger).
+writes: provenance is the verified sender, never a field the writer chose. That
+residual is now **closed** (Handoff B M2): the broker publish ACL reserves the
+`in/dm/` prefix to ingress-bridge packages, so an agent holding a broad publish
+grant can no longer forge an `in/dm/...` event for another agent (see
+`src/broker.rs` `actor_may_publish` / `is_dm_scoped_filter`; security ledger
+entry 15). Recall's trust rule now rests on an *enforced* invariant.
+
+### Multi-party resolution: a group resolves to its own identity (Handoff B M4)
+
+Recall resolves **one correspondent per event**, keyed on `(kind, address)`, and
+then loads that identity's history across *every* channel of the identity — the
+cross-channel unified inbox. For a **1:1** that is exactly right:
+`in/dm/telegram/<private-chat-id>` resolves to a *human* identity whose channel
+set spans their platforms, so recall pulls the person's unified history.
+
+For a **group** chat the address *is* the conversation
+(`in/dm/telegram/<group-chat-id>`). The rule that keeps this safe:
+
+> **A group-chat address is a `kind:group` phonebook identity whose channel set
+> is its own conversation address(es) only — never its members'. A 1:1 address
+> resolves to the human.**
+
+The phonebook `identity` table already carries a `kind` column, so a group is
+`identity{kind:"group"}`, distinct from any human participant. Its channel set is
+*only* its own conversation address(es). Then the existing recall code needs
+**zero change**: `resolve` returns the group identity, `gather` loads only that
+conversation's thread, and **no member's private cross-channel history leaks into
+the room** (a group is not a person). The safe default falls out of the phonebook
+*data model*, not new recall logic.
+
+The **per-message sender** (who in the room spoke) is a separate axis from the
+correspondent (the room). Recall keys *which threads load* on the correspondent
+only, so the group's participant set never widens the load — precisely what stops
+a prompt-injected agent from widening it. Optionally annotating each recalled line
+with the resolved sender is a later enhancement; if added, the sender is the
+**broker-verified `sender`**, resolved per line, and is **never** used to widen
+which threads load (the same trust rule, applied to the sender axis).
 
 ## Implementation notes (increment 1, as built)
 

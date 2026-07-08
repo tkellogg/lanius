@@ -1680,6 +1680,66 @@ pub fn dead_unsettled_spawn_edges(conn: &rusqlite::Connection) -> Vec<SpawnEdge>
 /// through this module, never the full-authority fenced-secret path.
 pub const PREFIX: &str = "code-";
 
+/// The CLASS of a connected principal — a *label on* the authority the broker
+/// already resolved by store placement, never a second source of authority
+/// (docs/handoffs/principal-kind.md).
+///
+/// `elanus` decides *authority* by which fenced store a credential resolves in
+/// (session-store → grant-scoped, fenced-secret → full authority, actors-map →
+/// grant-scoped package — docs/security.md entry 20). `kind` is set FROM that
+/// resolution and carried alongside `(actor, sender)` so downstream readers and
+/// humans don't have to re-derive the class from the spelling of a name. It must
+/// AGREE with the store the credential resolved in; it never overrides it. Code
+/// that decides authority from `kind` alone is the bug this type is designed to
+/// avoid.
+///
+/// Values:
+/// - `Session` — a grant-scoped coding worker (`code-*`, session-store token).
+/// - `Human`   — a full-authority human identity (the owner or another human;
+///               a fenced secret named for the principal).
+/// - `Kernel`  — the kernel's own machinery (the fenced secret `kernel`).
+/// - `Package` — a supervisor-minted package actor (the in-memory actors map).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PrincipalKind {
+    /// A grant-scoped coding worker. The default for a `SessionToken` and for a
+    /// `code_sessions` row that predates the stored-`kind` column (they are all
+    /// coding runs by construction — the back-compat fallback).
+    #[default]
+    Session,
+    /// A full-authority human identity (owner or another human).
+    Human,
+    /// The kernel's own machinery.
+    Kernel,
+    /// A supervisor-minted package actor, grant-scoped to its grants.
+    Package,
+}
+
+impl PrincipalKind {
+    /// Parse a stored `kind` string (token JSON or `code_sessions.kind`).
+    /// Unknown/garbage values yield `None` so the caller falls back to the
+    /// prefix test rather than silently misclassifying.
+    pub fn from_stored(s: &str) -> Option<Self> {
+        match s {
+            "session" => Some(Self::Session),
+            "human" => Some(Self::Human),
+            "kernel" => Some(Self::Kernel),
+            "package" => Some(Self::Package),
+            _ => None,
+        }
+    }
+
+    /// The canonical stored spelling (matches the serde `rename_all` lowercase).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Human => "human",
+            Self::Kernel => "kernel",
+            Self::Package => "package",
+        }
+    }
+}
+
 /// Every harness-controlled authority dimension for a session principal, unified
 /// into one value. Carried on `SessionToken` via `#[serde(flatten)]` so the
 /// on-disk JSON shape is UNCHANGED — tokens written by M1 (flat
@@ -1963,6 +2023,15 @@ pub struct SessionToken {
     /// The launcher pid that owns this session — used by the reaper to tell a
     /// live session's token from an orphan a SIGKILL left behind.
     pub owner_pid: i32,
+    /// The class of this principal — always `Session` for a session token (it is
+    /// a grant-scoped coding worker by construction). A *label* on the authority
+    /// the broker resolves by store placement, not a source of authority
+    /// (docs/handoffs/principal-kind.md). `#[serde(default)]` so every token
+    /// written before this field existed deserializes byte-for-byte and reports
+    /// `kind == Session` (the same back-compat discipline `Grants` uses at the
+    /// `#[serde(default)]` fields above).
+    #[serde(default)]
+    pub kind: PrincipalKind,
     /// All harness-controlled authority dimensions for this session. Stored
     /// flattened so the on-disk JSON is unchanged from M1 (back-compat).
     #[serde(flatten)]
@@ -1987,6 +2056,48 @@ impl SessionToken {
 /// Is this principal a coding-session actor (resolved through this module)?
 pub fn is_session_principal(name: &str) -> bool {
     name.starts_with(PREFIX) && secrets::valid_principal(name)
+}
+
+/// The stored class of a session, read from the durable `code_sessions` record
+/// (`kind` column, principal-kind handoff M1). `None` when the session has no
+/// row, or the row predates the `kind` column, or the stored value is garbage —
+/// in every such case the caller falls back to the name-prefix test.
+///
+/// This is a pure read over the ledger DB; it decides no authority.
+pub fn stored_session_kind(conn: &rusqlite::Connection, session: &str) -> Option<PrincipalKind> {
+    conn.query_row(
+        "SELECT kind FROM code_sessions WHERE elanus_session = ?1",
+        [session],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .ok()
+    .flatten() // Result → Option (query ok) → the row's Option<String>
+    .flatten() // NULL kind → None
+    .as_deref()
+    .and_then(PrincipalKind::from_stored)
+}
+
+/// Is this session a coding WORKER, for the UI projections that must hide coding
+/// runs from the human comms/mail views (web comms-list eviction `web.rs`,
+/// mailcli session-mail filter)? This is the SINGLE definition shared by both,
+/// replacing the two independent `starts_with("code-")` copies
+/// (docs/handoffs/principal-kind.md M3).
+///
+/// Decides from the durable stored `kind` (`kind == Session`) when the
+/// `code_sessions` row carries it; falls back to the name-prefix test
+/// (`is_session_principal`) for a row that is absent or predates the column.
+/// The decision now comes from what the kernel RECORDED about the principal, not
+/// from how its id happens to be spelled — a forward-looking non-`code-` id with
+/// `kind = session` is correctly classified as a worker, and a legacy `code-` id
+/// with no stored kind is still classified via the fallback.
+///
+/// This is a UI classifier only; it grants and gates nothing.
+pub fn is_worker_session(conn: &rusqlite::Connection, session: &str) -> bool {
+    match stored_session_kind(conn, session) {
+        Some(kind) => kind == PrincipalKind::Session,
+        None => is_session_principal(session),
+    }
 }
 
 /// The token store directory, inside the fenced secret store so the cage denies
@@ -2368,6 +2479,10 @@ pub fn mint(
         agent: agent.to_string(),
         secret,
         owner_pid,
+        // A minted session token is always a grant-scoped coding worker. Stamped
+        // explicitly (going forward) so the field is present on disk; the
+        // `#[serde(default)]` keeps pre-migration tokens reading as `Session`.
+        kind: PrincipalKind::Session,
         grants: Grants {
             publish: child_publish,
             subscribe: child_subscribe,
@@ -2539,6 +2654,115 @@ mod tests {
         // path-unsafe names are never session principals
         assert!(!is_session_principal("code-../owner"));
         assert!(!is_session_principal("code-a/b"));
+    }
+
+    // ── principal-kind handoff M1: `kind` is a stored field, back-compat ──────
+
+    /// A freshly minted token carries `"kind":"session"` on disk, and a token
+    /// written BEFORE this field existed (no `kind` key) still deserializes
+    /// byte-for-byte and resolves as `PrincipalKind::Session` (the `#[serde(default)]`
+    /// invariant — same discipline `Grants` uses for its optional fields).
+    #[test]
+    fn legacy_token_has_no_kind_key_resolves_as_session() {
+        let root = tmp_root();
+
+        // Fresh mint stamps the field explicitly.
+        let minted = mint(
+            &root,
+            "code-feedface",
+            "claude-code",
+            42,
+            None,
+            RequestedGrants::default(),
+        )
+        .unwrap();
+        assert_eq!(minted.kind, PrincipalKind::Session);
+        let on_disk = std::fs::read_to_string(token_path(&root, "code-feedface")).unwrap();
+        assert!(
+            on_disk.contains("\"kind\":\"session\""),
+            "freshly minted token must serialize its kind: {on_disk}"
+        );
+
+        // A PRE-MIGRATION token: the exact flat JSON shape a prior version wrote,
+        // with NO `kind` key. It must round-trip through `read` unchanged and
+        // report kind == Session via the serde default.
+        let legacy = r#"{"principal":"code-0badf00d","agent":"codex","secret":"s3cr3t","owner_pid":7}"#;
+        std::fs::create_dir_all(store_dir(&root)).unwrap();
+        std::fs::write(token_path(&root, "code-0badf00d"), legacy).unwrap();
+        let tok = read(&root, "code-0badf00d").expect("legacy token must still deserialize");
+        assert_eq!(tok.kind, PrincipalKind::Session);
+        assert_eq!(tok.principal, "code-0badf00d");
+        assert_eq!(tok.agent, "codex");
+        assert_eq!(tok.secret, "s3cr3t");
+        assert_eq!(tok.owner_pid, 7);
+    }
+
+    /// The `PrincipalKind` stored spelling parses back exactly, and garbage
+    /// yields `None` so the caller falls back to the prefix test rather than
+    /// misclassifying.
+    #[test]
+    fn principal_kind_stored_roundtrip() {
+        for k in [
+            PrincipalKind::Session,
+            PrincipalKind::Human,
+            PrincipalKind::Kernel,
+            PrincipalKind::Package,
+        ] {
+            assert_eq!(PrincipalKind::from_stored(k.as_str()), Some(k));
+        }
+        assert_eq!(PrincipalKind::from_stored("bogus"), None);
+        assert_eq!(PrincipalKind::from_stored(""), None);
+        assert_eq!(PrincipalKind::default(), PrincipalKind::Session);
+    }
+
+    // ── principal-kind handoff M3: the shared UI worker classifier ────────────
+
+    /// `is_worker_session` decides from the stored `kind` when the `code_sessions`
+    /// row carries it, and falls back to the name prefix otherwise. Proves the
+    /// decision now comes from the recorded FIELD, not the spelling:
+    ///  - a row with `kind = session` but a NON-`code-` id is a worker (field wins);
+    ///  - a legacy `code-` id with no row is still a worker (prefix fallback);
+    ///  - a row explicitly marked `human` is NOT a worker even if its id were `code-`;
+    ///  - a plain non-`code-` id with no row is not a worker.
+    #[test]
+    fn is_worker_session_reads_kind_then_prefix() {
+        let root = tmp_root();
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let insert = |id: &str, kind: &str| {
+            conn.execute(
+                "INSERT INTO code_sessions
+                   (elanus_session, native_session, tool, agent_noun, workdir, kind)
+                 VALUES (?1, 'nat', 'claude', 'claude-code', '/tmp', ?2)",
+                rusqlite::params![id, kind],
+            )
+            .unwrap();
+        };
+
+        // Forward-looking id shape: NOT `code-`, but recorded as a session.
+        insert("sess-abc123", "session");
+        assert!(
+            is_worker_session(&conn, "sess-abc123"),
+            "kind=session must classify as a worker regardless of id spelling"
+        );
+
+        // A row explicitly a human is never a worker (even though this id happens
+        // to be `code-`-shaped — the field overrides the prefix fallback).
+        insert("code-humanish", "human");
+        assert!(
+            !is_worker_session(&conn, "code-humanish"),
+            "kind=human must NOT be classified as a worker"
+        );
+
+        // Legacy `code-` id with NO row → prefix fallback classifies it a worker.
+        assert!(
+            is_worker_session(&conn, "code-deadbeef"),
+            "a code-* id with no stored kind falls back to the prefix test"
+        );
+
+        // A non-worker, non-code id with no row → not a worker.
+        assert!(!is_worker_session(&conn, "kestrel"));
+        assert!(!is_worker_session(&conn, "web-1234"));
     }
 
     #[test]

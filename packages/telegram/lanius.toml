@@ -1,0 +1,44 @@
+# Telegram bridge — a two-way external-channel DAEMON (docs/channels.md: "a
+# transport is just a package"). Editing ZERO kernel files, this package turns
+# the built-in `in/dm/<kind>/<addr>` grammar (Handoff B) and the already-built
+# phonebook + recall packages into a live Telegram relay.
+#
+# It is a DAEMON, not a per-event exec handler (docs/security.md entry 16): a
+# daemon is spawned token-authed and caged, so when it publishes an ingress or
+# an egress receipt the broker stamps `sender = telegram` — the provenance the
+# record exists to carry. An uncaged, tokenless exec handler would authenticate
+# as the OWNER and mislabel every send. The `packages/webhook` egress exemplar
+# and the `packages/discord` ingress scaffold are daemons for exactly this
+# reason; this package is their union for one real platform.
+#
+# The bridge holds the bot token (TELEGRAM_TOKEN) in its OWN environment; no
+# agent ever sees it. Unconfigured, it PARKS (sleeps) rather than crash-looping
+# the supervisor (mirrors packages/discord).
+#
+# Ships PENDING (it can reach the outside world): parks until `lanius approve
+# telegram`.
+
+[request]
+# EGRESS inbox: an agent commands a send by publishing to this actor's inbox
+# (in/package/telegram/send {recipient, text}).
+subscribe = ["in/package/telegram/send"]
+# Three publish scopes:
+#   in/dm/telegram/#          INGRESS — the canonical, recall-keyable
+#                             conversation address (Handoff B). Holding an
+#                             explicit `in/dm/`-scoped grant is ALSO the
+#                             ingress-bridge capability the broker ACL checks
+#                             (src/broker.rs is_dm_scoped_filter): only an
+#                             owner-approved manifest can carry it, so a
+#                             prompt-injected agent cannot forge conversation
+#                             ingress.
+#   obs/channel/telegram/#    the egress/ingress RECEIPT plane (sent/acked).
+#   in/package/phonebook/#    M4 — record the correspondent's channel sighting
+#                             on ingress; provenance is this bridge's verified
+#                             sender (it is the party that actually saw the wire
+#                             address).
+publish = ["in/dm/telegram/#", "obs/channel/telegram/#", "in/package/phonebook/channel"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+session_expiry_s = 30

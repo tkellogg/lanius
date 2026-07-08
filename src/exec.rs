@@ -2027,6 +2027,36 @@ fn emit_event_in_plane_refused(etype: &str, own_mailbox: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// docs/handoffs/agent-dm-relay.md M3 — the CHANNEL source of the triggering
+/// ingress event, so the agent's reply carries it and the web conversation
+/// projection renders `source = <channel>` via `source_for`'s *existing*
+/// `payload.source` branch — with NO channel-taxonomy edit in the kernel. This
+/// is deliberately channel-AGNOSTIC (it names no platform): the source is either
+/// an explicit `payload.source` the ingress bridge stamped, or the `<kind>`
+/// segment of an `in/dm/<kind>/<addr>` conversation topic (the reserved DM
+/// grammar, Handoff B). Any inbound that is not a `dm` and stamps no source
+/// yields None, so non-DM replies are byte-identical to before.
+fn reply_source(conn: &Connection, event_id: Option<i64>) -> Option<String> {
+    let id = event_id?;
+    let env = events::envelope(conn, id).ok()?;
+    if let Some(s) = env["payload"]["source"].as_str() {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    let topic = env["type"].as_str()?;
+    let mut parts = topic.split('/');
+    if parts.next() == Some("in") && parts.next() == Some("dm") {
+        if let Some(kind) = parts.next() {
+            if !kind.is_empty() {
+                return Some(kind.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn run_tool(
     root: &Root,
     conn: &Connection,
@@ -2198,13 +2228,19 @@ fn run_tool(
             // there is one so a reply continues the conversation instead of
             // dead-ending; uncorrelated (CLI-direct) sends just land on the
             // mailbox. Default channel = the owner's mailbox.
+            // M3: propagate the channel source so a Telegram (or any dm)
+            // conversation renders with its source in the web comms list.
+            let mut payload = json!({ "text": text, "session": session, "format": coerce_format(&args["format"]) });
+            if let Some(src) = reply_source(conn, event_id) {
+                payload["source"] = json!(src);
+            }
             let msg_id = match emit_message(
                 root,
                 conn,
                 event_id,
                 &OutboundMessage {
                     topic: crate::topic::human_mailbox(&prof.owner),
-                    payload: json!({ "text": text, "session": session, "format": coerce_format(&args["format"]) }),
+                    payload,
                     correlation: turn_correlation.map(String::from),
                     deadline: None,
                     default_action: None,
@@ -2257,6 +2293,10 @@ fn run_tool(
             let mut payload = json!({ "question": question, "session": session, "format": coerce_format(&args["format"]) });
             if !options.is_empty() {
                 payload["options"] = json!(options);
+            }
+            // M3: same channel-source propagation as send_message.
+            if let Some(src) = reply_source(conn, event_id) {
+                payload["source"] = json!(src);
             }
             let ask_id = match emit_message(
                 root,
@@ -3122,6 +3162,49 @@ mod tests {
         assert_eq!(a_corr.as_deref(), Some("ask-corr"));
         assert!(a_deadline.is_some(), "ask carries a deadline");
         assert!(a_default.is_some(), "ask carries a default-on-expiry");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // M3 (docs/handoffs/agent-dm-relay.md): the reply's channel source is
+    // derived from the triggering ingress event — an explicit stamped
+    // payload.source wins, else the `<kind>` of an `in/dm/<kind>/<addr>` topic;
+    // a non-dm event with no stamp yields None (reply stays byte-identical).
+    // This is the generic, channel-agnostic seam the web projection renders
+    // through (source_for's existing payload.source branch) — no kernel edit
+    // names "telegram".
+    #[test]
+    fn reply_source_derives_channel_from_ingress() {
+        let dir = std::env::temp_dir().join(format!("el-replysrc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let insert = |etype: &str, payload: Value| -> i64 {
+            conn.execute(
+                "INSERT INTO events(type, payload, created_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                rusqlite::params![etype, payload.to_string()],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+
+        // (1) A bridge-stamped payload.source wins (this is what the Telegram
+        // bridge stamps on its inbound).
+        let stamped = insert("in/dm/telegram/12345", json!({ "text": "hi", "source": "telegram" }));
+        assert_eq!(reply_source(&conn, Some(stamped)).as_deref(), Some("telegram"));
+
+        // (2) No stamp → derive from the `in/dm/<kind>/<addr>` topic (generic to
+        // any dm channel, no platform named here).
+        let bare_dm = insert("in/dm/discord/room1", json!({ "text": "yo" }));
+        assert_eq!(reply_source(&conn, Some(bare_dm)).as_deref(), Some("discord"));
+
+        // (3) A non-dm trigger with no stamp → None (reply unchanged).
+        let non_dm = insert("in/agent/main", json!({ "prompt": "go" }));
+        assert_eq!(reply_source(&conn, Some(non_dm)), None);
+
+        // (4) No triggering event at all → None.
+        assert_eq!(reply_source(&conn, None), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

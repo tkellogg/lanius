@@ -140,6 +140,13 @@ fn parsed_topic(topic: &str) -> Option<(&str, &str, &str)> {
         return None;
     }
     let session = parts.next()?;
+    // principal-kind handoff M4 (optional) DEFERRED: switching this to the shared
+    // kind-aware classifier (codesession::is_worker_session) would require
+    // plumbing a `&Connection` into this pure topic parser that isn't otherwise
+    // here. Per the handoff, M4 is purely cosmetic — this prefix test is already
+    // gated behind the coding-noun subtree match above (noun ∈ {codex,
+    // claude-code}), so it is a shape check on an already-coding topic, not an
+    // authority decision. Left as the prefix test to avoid an unwarranted plumb.
     if !session.starts_with("code-") {
         return None;
     }

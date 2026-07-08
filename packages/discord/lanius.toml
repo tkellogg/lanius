@@ -4,9 +4,15 @@
 # the `websockets` package. Unconfigured, it parks (sleeps) rather than
 # crash-looping the supervisor.
 
+# Ingress publishes the canonical, recall-keyable conversation address
+# `in/dm/discord/<channel-id>` (Handoff B). The `in/dm/discord/#` publish grant
+# is ALSO the ingress-bridge capability the broker ACL checks (src/broker.rs
+# actor_may_publish / is_dm_scoped_filter): only an owner-approved manifest can
+# hold a dm-scoped grant, so a prompt-injected agent cannot forge conversation
+# ingress. Egress inbox and the receipt plane are unchanged — those are correct.
 [request]
 subscribe = ["in/package/discord/send"]
-publish   = ["in/package/discord/triage", "obs/channel/discord/#"]
+publish   = ["in/dm/discord/#", "obs/channel/discord/#"]
 
 [process]
 mode = "daemon"

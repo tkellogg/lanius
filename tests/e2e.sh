@@ -28,6 +28,8 @@ cleanup() {
   [ -n "${LLM_CFG_PID:-}" ] && kill -9 "$LLM_CFG_PID" 2>/dev/null
   [ -n "${LLM_AUTO_PID:-}" ] && kill -9 "$LLM_AUTO_PID" 2>/dev/null
   [ -n "${WH_PID:-}" ] && kill -9 "$WH_PID" 2>/dev/null
+  [ -n "${TG_PID:-}" ] && kill -9 "$TG_PID" 2>/dev/null
+  [ -n "${LLM7_PID:-}" ] && kill -9 "$LLM7_PID" 2>/dev/null
   # Supervised actors are children of the daemon but survive its death;
   # crash-only in production (their bus connection dies), explicit here.
   pkill -9 -f "$TMP/packages/" 2>/dev/null
@@ -1425,6 +1427,170 @@ grep -q "wh-corr-1" "$TMP/wh.receipt" \
 [ -z "$(sql "SELECT id FROM events WHERE type LIKE 'out/%' LIMIT 1")" ] \
   && ok "no out/ plane anywhere (the egress asymmetry holds)" || fail "an out/ event exists"
 kill -9 "$WH_PID" 2>/dev/null
+
+echo "== 20b. telegram bridge: a transport is just a package (egress + ingress + phonebook unification) =="
+# docs/handoffs/agent-dm-relay.md — the payoff of the dm grammar (Handoff B) and
+# the already-built phonebook+recall packages (sections 18/19, still serving):
+# a two-way Telegram relay built as a PACKAGE + grants + phonebook rows, editing
+# ZERO kernel files for the new channel (only the generic, channel-agnostic
+# source stamp in exec::reply_source / web::source_for, unit-tested separately).
+# It is a DAEMON (docs/security.md entry 16), so the broker stamps sender=telegram
+# on both its ingress and its egress receipts. CI uses a STUB Bot API (no live
+# token): a tiny server records sendMessage and serves canned getUpdates.
+cat > "$TMP/tg_stub.py" <<'EOF'
+import json, sys, time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+PORTF, SENTF, INBOXF = sys.argv[1], sys.argv[2], sys.argv[3]
+class H(BaseHTTPRequestHandler):
+    def _j(self, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(200); self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        try: req = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError: req = {}
+        if self.path.endswith("/sendMessage"):
+            with open(SENTF, "a") as f: f.write(json.dumps(req) + "\n")
+            self._j({"ok": True, "result": {"message_id": 1, "chat": {"id": req.get("chat_id")}}})
+        elif self.path.endswith("/getUpdates"):
+            offset = req.get("offset", 0) or 0
+            try: updates = json.load(open(INBOXF))
+            except Exception: updates = []
+            out = [u for u in updates if u.get("update_id", 0) >= offset]
+            if not out: time.sleep(0.3)   # gentle: don't hammer on an empty long-poll
+            self._j({"ok": True, "result": out})
+        else:
+            self._j({"ok": False})
+    def log_message(self, *a): pass
+srv = HTTPServer(("127.0.0.1", 0), H)
+open(PORTF, "w").write(str(srv.server_address[1]))
+srv.serve_forever()
+EOF
+: > "$TMP/tg.sent"
+python3 "$TMP/tg_stub.py" "$TMP/tg.port" "$TMP/tg.sent" "$TMP/tg.inbox" &
+TG_PID=$!
+wait_for "telegram Bot API stub bound" "[ -s '$TMP/tg.port' ]"
+TGPORT=$(cat "$TMP/tg.port")
+
+# M1 (park-not-crash): approved but UNCONFIGURED (no token), the daemon parks —
+# it does not crash-loop the supervisor. The main daemon picks it up like the
+# other pending packages.
+[ -f "$TMP/packages/telegram/elanus.toml" ] || cp -R "$REPO/packages/telegram" "$TMP/packages/"
+elanus approve telegram >/dev/null 2>&1 || fail "approve telegram"
+wait_for "M1: unconfigured bridge PARKS (not crash-looping the supervisor)" \
+  "grep -q parking '$TMP/run/pkg-telegram/stderr.log'"
+
+# Configure it via package config (docs/config.md live branch): the token + the
+# stub Bot API base. The supervisor restarts the daemon so it re-reads and comes
+# alive — no env injection into the already-running supervisor needed. (A real
+# operator holds TELEGRAM_TOKEN in the daemon's environment; config is the CI
+# seam and an operator fallback.)
+elanus config set telegram token '"stub-bot-token"' >/dev/null || fail "config set telegram token"
+elanus config set telegram api_base "\"http://127.0.0.1:$TGPORT\"" >/dev/null || fail "config set telegram api_base"
+wait_for "M1: configured bridge comes alive (long-polling getUpdates)" \
+  "grep -q 'long-polling getUpdates' '$TMP/run/pkg-telegram/stderr.log'"
+
+# M1 (egress): an agent-command lands on the bridge's inbox -> sendMessage
+# DIRECTLY (off the bus) -> an obs receipt stamped sender=telegram (entry 16),
+# correlated to the request. (WHO may publish in/package/telegram/send is
+# EA/policy — decision 3, out of scope; the mechanism is this per-bridge inbox,
+# driven here as the webhook exemplar drives its own.)
+( elanus bus sub obs/channel/telegram/sent --count 1 --timeout 10 > "$TMP/tg.receipt" 2>/dev/null ) &
+TGSUB=$!
+sleep 0.5
+elanus emit "in/package/telegram/send" --correlation tg-egress-1 --payload '{"recipient":"999","text":"hello from an agent"}' >/dev/null 2>&1
+wait_for "M1: the send was delivered to the Bot API (off the bus)" "grep -q 'hello from an agent' '$TMP/tg.sent' 2>/dev/null"
+wait "$TGSUB" 2>/dev/null
+grep -q '"sender": *"telegram"' "$TMP/tg.receipt" \
+  && ok "M1: egress receipt attributed to the bridge (sender=telegram, entry 16)" || fail "egress receipt misattributed: $(cat "$TMP/tg.receipt")"
+grep -q "tg-egress-1" "$TMP/tg.receipt" \
+  && ok "M1: egress receipt correlated to the request" || fail "egress receipt not correlated"
+
+# M2 (ingress): a simulated inbound (via the stub getUpdates) -> the daemon
+# publishes it ONCE to in/dm/telegram/<chat.id>, stamped sender=telegram. The
+# reserved in/dm/ prefix means only this bridge (its dm-scoped grant is the
+# capability) could publish it — a code-* session or a non-bridge package is
+# refused (asserted by broker::in_dm_prefix_is_reserved_to_bridge_packages,
+# which uses this very telegram-shaped grant).
+printf '[{"update_id":1,"message":{"message_id":10,"chat":{"id":424242},"from":{"username":"tim","is_bot":false},"text":"hey, did the bridge ship?"}}]' > "$TMP/tg.inbox"
+wait_for "M2: the inbound was published to the dm plane (in/dm/telegram/424242)" \
+  "[ -n \"\$(sql \"SELECT id FROM events WHERE type='in/dm/telegram/424242'\")\" ]"
+[ "$(sql "SELECT COUNT(*) FROM events WHERE type='in/dm/telegram/424242'")" = 1 ] \
+  && ok "M2: exactly ONE ingress publish (no twin-publish; the arrival is its own echo)" \
+  || fail "M2: expected exactly one in/dm/telegram/424242 event"
+TGSND=$(sql "SELECT sender FROM events WHERE type='in/dm/telegram/424242' ORDER BY id DESC LIMIT 1")
+[ "$TGSND" = telegram ] && ok "M2: ingress attributed to the bridge (sender=telegram)" || fail "M2: ingress sender was '$TGSND', expected telegram"
+
+# M4 (phonebook sighting on ingress): the bridge also recorded the correspondent's
+# channel — UNRESOLVED (identity NULL until an owner/EA links it in M5) — with
+# provenance = the broker-verified bridge, NEVER a payload field.
+wait_for "M4: the bridge recorded a phonebook sighting for the chat" \
+  "curl -s 'http://127.0.0.1:$PBPORT/query' -d '{\"kind\":\"resolve\",\"channel_kind\":\"telegram\",\"address\":\"424242\"}' | grep -q '\"found\": *true'"
+curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"resolve","channel_kind":"telegram","address":"424242"}' | grep -q '"resolved": *false' \
+  && ok "M4: sighting recorded unresolved (a link is owner/EA territory, done in M5)" || fail "M4: sighting should be unresolved before linking"
+curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"resolve","channel_kind":"telegram","address":"424242"}' | grep -q '"provenance": *"telegram"' \
+  && ok "M4: sighting provenance = the broker-verified bridge (not a chosen field)" || fail "M4: sighting provenance not the bridge"
+
+# M5 (make unification live): recall + phonebook are already approved (18/19).
+# Seed the owner and vouch that this Telegram chat + his elanus channel are the
+# SAME person, so recall can unify across platforms (channels.md gap 3).
+elanus bus pub in/package/phonebook/identity '{"id":"owner","kind":"human","canonical":"Tim"}' --qos 1 >/dev/null || fail "seed owner identity"
+elanus bus pub in/package/phonebook/link '{"channel_kind":"elanus","address":"owner","identity":"owner","confidence":1.0}' --qos 1 >/dev/null || fail "link owner elanus"
+elanus bus pub in/package/phonebook/link '{"channel_kind":"telegram","address":"424242","identity":"owner","confidence":1.0}' --qos 1 >/dev/null || fail "link owner telegram"
+wait_for "M5: resolve(telegram,424242) now returns identity owner (the link vouched)" \
+  "curl -s 'http://127.0.0.1:$PBPORT/query' -d '{\"kind\":\"resolve\",\"channel_kind\":\"telegram\",\"address\":\"424242\"}' | grep -q '\"id\": *\"owner\"'"
+curl -s "http://127.0.0.1:$PBPORT/query" -d '{"kind":"resolve","channel_kind":"telegram","address":"424242"}' | grep -q '"resolved": *true' \
+  && ok "M5: the once-unresolved sighting is now resolved to owner" || fail "M5: telegram chat did not resolve to owner"
+# A prior message on Tim's OTHER (elanus) channel — the cross-channel history
+# recall must surface, proving unification (not just the single Telegram thread).
+elanus bus pub "in/dm/elanus/owner" '{"text":"earlier: ship the telegram bridge"}' --qos 1 >/dev/null || fail "seed prior elanus message"
+
+# M6 (round trip: routes, renders, AND unifies). Drive the agent turn on the
+# REAL ledgered Telegram inbound (its id is the run's ELANUS_EVENT_ID, so the
+# reply path derives source=telegram from it). A body-capturing fake LLM (the
+# section-14 script) whose one tool call is send_message, plus a profile.
+python3 "$TMP2/fake_llm2.py" "$TMP/llm7.port" "$TMP/tgcmd.txt" "$TMP/llm7.body" &
+LLM7_PID=$!
+wait_for "telegram-turn fake LLM bound" "[ -s '$TMP/llm7.port' ]"
+printf 'TOOL:{"name":"send_message","input":{"text":"got it Tim, the bridge shipped"}}' > "$TMP/tgcmd.txt"
+mkdir -p "$TMP/profiles/tgtest"
+cat > "$TMP/profiles/tgtest/profile.toml" <<EOF
+agent = "main"
+owner = "owner"
+[model]
+model = "claude-3-5-haiku-latest"
+max_turns = 4
+base_url = "http://127.0.0.1:$(cat "$TMP/llm7.port")"
+api_key_env = "FAKE_LLM_KEY"
+EOF
+TGEV=$(sql "SELECT id FROM events WHERE type='in/dm/telegram/424242' ORDER BY id DESC LIMIT 1")
+printf '{"id":%s,"type":"in/dm/telegram/424242","sender":"telegram","payload":{"prompt":"hey, did the bridge ship?","profile":"tgtest","session":"tg-424242","source":"telegram"}}' "$TGEV" | \
+  ELANUS_EVENT_ID="$TGEV" FAKE_LLM_KEY=dummy elanus handle-exec >/dev/null 2>&1
+# (a) UNIFIES: recall resolved the chat to owner and pulled his prior ELANUS
+# message into THIS Telegram turn's prompt — the "load-test the phonebook" payoff.
+grep -q "earlier: ship the telegram bridge" "$TMP/llm7.body" \
+  && ok "M6: recall unified Tim's prior elanus-channel history into the Telegram turn" \
+  || fail "M6: recall did not pull the cross-channel history into the prompt"
+# (b) RENDERS: the agent's reply carries source=telegram, so the web comms list
+# renders it as a telegram conversation with NO source_for branch (proven by
+# web::telegram_conversation_renders_source_from_stamp).
+sql "SELECT payload FROM events WHERE type='in/human/owner' AND sender='main' ORDER BY id DESC LIMIT 1" | grep -q '"source":"telegram"' \
+  && ok "M6: the agent reply stamps source=telegram (web renders it, zero kernel taxonomy edit)" \
+  || fail "M6: the reply did not carry source=telegram"
+# (c) ROUTES (outbound): the reply is delivered to Tim on Telegram and observed.
+( elanus bus sub obs/channel/telegram/sent --count 1 --timeout 10 > "$TMP/tg.receipt2" 2>/dev/null ) &
+TGSUB2=$!
+sleep 0.5
+elanus emit "in/package/telegram/send" --correlation tg-reply-1 --payload '{"recipient":"424242","text":"got it Tim, the bridge shipped"}' >/dev/null 2>&1
+wait_for "M6: the reply was delivered to Tim's chat (424242) on Telegram" "grep -q 424242 '$TMP/tg.sent' 2>/dev/null"
+wait "$TGSUB2" 2>/dev/null
+grep -q '"sender": *"telegram"' "$TMP/tg.receipt2" \
+  && ok "M6: outbound receipt sender=telegram — the round trip is closed" || fail "M6: outbound receipt misattributed: $(cat "$TMP/tg.receipt2")"
+# The kernel diff for adding Telegram: zero files outside packages/telegram and
+# the generic source stamp — no out/ plane, no telegram branch in the core.
+kill -9 "$LLM7_PID" 2>/dev/null; LLM7_PID=""
+kill -9 "$TG_PID" 2>/dev/null; TG_PID=""
 
 echo "== 21. package config: live-branch write + daemon reload (docs/config.md) =="
 # A human-direct `config set` writes config/packages/<pkg>.toml, commits it on

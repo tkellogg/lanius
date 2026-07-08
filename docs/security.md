@@ -392,7 +392,28 @@ the `elanus schedule` CLI share this discipline: the tool targets self only
 (the mailbox is `agent_mailbox(prof.agent)`, never taken from args); the CLI is
 a trusted operator surface that may target any named agent, decided at
 schedule-time because the deferred fire has no reliable actor to re-authorize.
-The bus-grant half above stays the remaining residual.
+
+**[UPDATE 2026-07-08] Bus-path residual CLOSED (Handoff B M2).** The broker
+publish ACL now reserves the `in/dm/` prefix. `actor_may_publish`
+(`src/broker.rs`) refuses a grant-scoped actor (`actor = Some` — a coding
+session or a package) publishing any `in/dm/...` topic UNLESS the actor is a
+package holding an explicitly *dm-scoped* approved publish grant (e.g.
+`in/dm/discord/#` — the ingress-bridge capability marker, checked by
+`is_dm_scoped_filter`). A merely BROAD grant (`#`, `in/#`) that incidentally
+covers `in/dm/...`, and a coding session's structural scope, are BOTH refused —
+so the "broad publish grant forges `in/dm/...`" path is closed. Only a bridge
+whose *owner-approved* manifest declares the dm-scoped grant, or a full-authority
+principal (owner/kernel, `actor = None`, which never reaches this ACL), may
+publish conversation ingress. The Discord scaffold was reconciled to publish the
+canonical `in/dm/discord/<addr>` and declare that grant
+(`packages/discord/lanius.toml`). Regression: `broker.rs`
+`in_dm_prefix_is_reserved_to_bridge_packages` +
+`dm_scoped_filter_excludes_broad_wildcards`. **Entry 15 is now fixed on both the
+tool path (2026-07-01) and the bus path** — recall's single-correspondent trust
+rule rests on an enforced invariant. (Recall's own multi-party resolution is
+settled in docs/identity.md "Multi-party resolution": a group is a `kind:group`
+phonebook identity whose channel set is its own conversation only, so a group's
+recall never pulls a member's private cross-channel history.)
 
 ## 16. [LEGS / LATENT] Exec handlers publish as the owner, not as themselves
 
