@@ -18,6 +18,21 @@
 # Ships PENDING (it can reach the outside world): parks until `lanius approve
 # telegram`.
 
+# Declared dependencies (docs/handoffs/package-dependencies.md M1). This REPLACES
+# Handoff C M5's by-hand "approve phonebook and recall" step with a declared,
+# checkable fact: `elanus packages check` reports telegram invalid until both
+# deps are approved AND TELEGRAM_TOKEN is set, each paired with its exact fix.
+[requires]
+packages = ["phonebook", "recall"]
+
+# The bot token is a required config key: the bridge stays inert (parks) until
+# it is set, and the validity check surfaces that with a `config set` fix rather
+# than leaving it a silent, remembered setup step. Held in the bridge's OWN env;
+# no agent ever sees it.
+[[config.keys]]
+name = "TELEGRAM_TOKEN"
+description = "The Telegram bot token from BotFather. Held in the bridge's own environment; no agent sees it."
+
 [request]
 # EGRESS inbox: an agent commands a send by publishing to this actor's inbox
 # (in/package/telegram/send {recipient, text}).

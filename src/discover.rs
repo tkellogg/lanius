@@ -49,6 +49,9 @@ pub struct Adds {
     pub harnesses: Vec<String>,
     /// Built-in tools this package gates via `provides_builtin_tools`.
     pub builtin_tools: Vec<String>,
+    /// `[requires] packages` — the package names this package depends on
+    /// (docs/handoffs/package-dependencies.md M1).
+    pub requires: Vec<String>,
 }
 
 /// One discovery hit: a package the caller can NOT see that matches the query.
@@ -127,6 +130,7 @@ fn collect_adds(pkg: &Package) -> Adds {
         adds.mcp = m.mcp.iter().map(|s| s.name.clone()).collect();
         adds.harnesses = m.harness.iter().map(|h| h.name.clone()).collect();
         adds.builtin_tools = m.provides_builtin_tools.clone();
+        adds.requires = m.requires.packages.clone();
     }
     adds
 }
@@ -254,7 +258,7 @@ fn collect_manifest_hits(
 /// the ground: the package is available in the instance but off the profile's
 /// path; enablement rides the existing config-proposal flow (or the owner adds
 /// it). Discovery invents no new enable mechanism (wonky bit 5).
-fn enable_guidance(package: &str, profile: &str) -> String {
+pub fn enable_guidance(package: &str, profile: &str) -> String {
     format!(
         "package {package:?} is available in this instance but not on the {profile:?} \
          profile's path — to use it, request enablement through the existing \

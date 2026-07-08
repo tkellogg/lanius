@@ -16,6 +16,14 @@
 # approved (`elanus approve recall`), because an approved stage shapes every
 # prompt the model sees. Profiles opt out with the usual skills exclude.
 
+# recall unifies a correspondent's conversation by querying the phonebook at
+# runtime (the resolve-at-recall design). That dependency is now DECLARED, not
+# just implied by the code: `packages::validate` will report recall as invalid
+# until phonebook is installed, on-path, and approved — and print the exact
+# `elanus approve phonebook` fix (docs/handoffs/package-dependencies.md M1).
+[requires]
+packages = ["phonebook"]
+
 [request]
 subscribe = ["obs/harness/stagereq/recall/recall"]
 publish   = ["obs/harness/stageresp/#"]

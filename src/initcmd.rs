@@ -446,6 +446,32 @@ const STOCK_KIT_FILES: &[PkgFile] = &[
         content: include_str!("../kits/stdlib/packages/history/SKILL.md"),
         exec: false,
     },
+    // comms — the chat/conversation reconstruction view (docs/handoffs/comms-package.md).
+    // The SECOND reconstruction view after history, requiring it: it owns the
+    // chat-shaped conversation-list + introspection projection that used to be
+    // hard-coded in the core web server. Ships in stdlib so a fresh root's web
+    // comms list (`/api/conversations` relays here) works out of the box, exactly
+    // as history's transcript view does.
+    PkgFile {
+        rel: "stdlib/packages/comms/lanius.toml",
+        content: include_str!("../kits/stdlib/packages/comms/lanius.toml"),
+        exec: false,
+    },
+    PkgFile {
+        rel: "stdlib/packages/comms/scripts/main",
+        content: include_str!("../kits/stdlib/packages/comms/scripts/main"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "stdlib/packages/comms/scripts/comms_view.py",
+        content: include_str!("../kits/stdlib/packages/comms/scripts/comms_view.py"),
+        exec: true,
+    },
+    PkgFile {
+        rel: "stdlib/packages/comms/SKILL.md",
+        content: include_str!("../kits/stdlib/packages/comms/SKILL.md"),
+        exec: false,
+    },
     PkgFile {
         rel: "stdlib/packages/launching-agents/SKILL.md",
         content: include_str!("../kits/stdlib/packages/launching-agents/SKILL.md"),

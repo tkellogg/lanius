@@ -1,0 +1,34 @@
+# comms — the chat/conversation reconstruction view (docs/handoffs/comms-package.md).
+# One package owns the conversation concern end to end: the chat protocol on the
+# bus (SKILL.md) plus a conversation-list + introspection API over the ledger.
+#
+# It is the SECOND reconstruction view after `history` (docs/bus.md [DECIDED]:
+# reconstruction views are USERLAND subscribers, never kernel). Like history it
+# holds NO state of its own — a fresh read-only sqlite connection per query over
+# the kernel's ledger, which is already the single durable copy of every chat
+# message (in/# -> ledger, docs/topics.md). The chat SHAPE + the API are the part
+# that was missing; the durable bytes were already on disk. So it does NOT keep a
+# second store (that would be a second write path the architecture refuses).
+#
+# [requires] history (Handoff E's dependency mechanism): comms answers the
+# chat-shaped conversation questions; history answers transcript/search. Two
+# granular, independently-approvable capabilities composed by a DECLARED
+# dependency edge rather than merged into one daemon (Tim's package-composition
+# principle). A profile that puts comms on its path must also carry an
+# approved history for the pair to be valid.
+#
+# Reads over HTTP (process.http -> grant kind "http"; consumers discover the port
+# from run/pkg-comms/http.json — harness state, never the bus). The web server's
+# /api/conversations relays here (docs/handoffs/comms-package.md M2), exactly as
+# /api/history relays to the history package.
+#
+# Ships PENDING: conversations expose the owner's comms plane, so it parks until
+# `lanius approve comms`.
+
+[requires]
+packages = ["history"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"
+http = true

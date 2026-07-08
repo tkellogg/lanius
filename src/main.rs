@@ -281,13 +281,21 @@ enum Cmd {
     },
     /// List packages: what's discovered, what's requested, what's granted
     Packages {
+        /// `check` runs the deterministic dependency-validity report (each
+        /// problem paired with its exact fix command); omit to list packages.
+        #[arg(value_name = "ACTION")]
+        action: Option<String>,
         /// Machine-readable: one JSON object per package, including each
-        /// pending/approved grant row (the UI's pending-review queue)
+        /// pending/approved grant row (the UI's pending-review queue). With
+        /// `check`, the stable validity-report JSON the helper/UI relays.
         #[arg(long)]
         json: bool,
         /// Resolve packages through this profile's effective elanus_path.
         #[arg(long, default_value = "default")]
         profile: String,
+        /// Run the dependency-validity check (same as `packages check`).
+        #[arg(long)]
+        check: bool,
     },
     /// Approve a package's requested capabilities (prints each one)
     Approve {
@@ -1039,9 +1047,32 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             }
         },
-        Cmd::Packages { json, profile } => {
+        Cmd::Packages {
+            action,
+            json,
+            profile,
+            check,
+        } => {
             let conn = open(&root)?;
             packages::sync(&root, &conn)?;
+            // `elanus packages check` (or `--check`): the dependency-validity
+            // report (docs/handoffs/package-dependencies.md M3). Non-zero exit on
+            // failure so a script/agent can branch on it.
+            if check || action.as_deref() == Some("check") {
+                let report = packages::validate(&root, &conn, &profile)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+                } else {
+                    println!("{}", report.human());
+                }
+                if !report.is_ok() {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            if let Some(a) = &action {
+                anyhow::bail!("unknown packages action {a:?} (did you mean `check`?)");
+            }
             for p in packages::discover_for_profile(&root, &profile)? {
                 if json {
                     let hash = p
@@ -1109,6 +1140,9 @@ fn run(cli: Cli) -> Result<()> {
                                 })).collect::<Vec<_>>(),
                                 "config": {
                                     "agent_tunable": lm.manifest.config.agent_tunable,
+                                },
+                                "requires": {
+                                    "packages": lm.manifest.requires.packages,
                                 },
                             })),
                             "mode": p.manifest.as_ref()
@@ -1479,6 +1513,13 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Approve { name, by } => {
             let conn = open(&root)?;
             packages::decide(&root, &conn, &name, true, &by)?;
+            // Non-refusing dependency nudge (docs/handoffs/package-dependencies.md
+            // M4): the approve already happened; if this package declares deps
+            // that are not yet installed/approved, print the M3-shaped fix line so
+            // "remember to also approve phonebook" is no longer a remembered step.
+            for line in packages::unmet_dep_nudges(&root, &conn, &name)? {
+                println!("{line}");
+            }
         }
         Cmd::Revoke { name, by, force } => {
             // Stdlib packages are protected: the product depends on them, so

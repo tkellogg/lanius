@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""comms — the chat/conversation reconstruction view (docs/handoffs/comms-package.md).
+
+One package owns the conversation concern end to end: (1) the chat protocol on
+the bus (see SKILL.md — the topic conventions, the `in/dm/<kind>/<addr>` grammar,
+the `payload.source` stamp), and (2) a conversation-list + introspection API over
+the ledger. It `requires = ["history"]` (Handoff E): comms answers the
+chat-shaped questions; history answers transcript/search. Two granular,
+independently-approvable capabilities composed by a declared dependency edge, not
+one merged daemon.
+
+Doctrine (docs/bus.md [DECIDED]): reconstruction views are USERLAND subscribers,
+never kernel. Like `history`, this daemon holds NO state of its own — every query
+is a fresh read-only sqlite connection over the ledger the kernel already
+serialized to disk (`in/# -> ledger` is the single durable copy, docs/topics.md).
+The projection logic that used to be hard-coded in the core web server
+(`conversation_rows`/`source_for`/`is_worker_session`) now lives in comms_view.py;
+`/api/conversations` relays here, so adding a channel is a package edit.
+
+  POST /query   one JSON body, dispatched on "kind":
+    conversations      {agent, owner?}    -> [ {session, agent, title, source,
+                                               last_ts, message_count, preview,
+                                               last_role, branched_from}, ... ]
+                        the chat-shaped conversation list (comms-package M1/M2),
+                        byte-compatible with the old in-core /api/conversations.
+    conversation_info  {session, owner?}  -> {session, participants, source,
+                                              channels, message_count, turn_count,
+                                              event_count, first_ts, last_ts,
+                                              branched_from, correlations}
+                        conversation-level introspection (comms-package M4):
+                        who is in it (broker-verified senders, never a payload
+                        field), on which channel, how it is composed.
+  GET /healthz  -> {"ok": true}
+
+Serving is a granted capability (grants kind 'http'): conversations expose the
+owner's comms plane, so this parks until `lanius approve comms`. Crash-only: any
+fault exits nonzero and the supervisor restarts with backoff.
+"""
+import json
+import os
+import sqlite3
+import sys
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comms_view  # noqa: E402
+
+DB = (
+    os.environ.get("LANIUS_DB")
+    or os.environ.get("ELANUS_DB")
+    or os.environ.get("HARNESS_DB")
+    or os.path.join(
+        os.environ.get("LANIUS_ROOT")
+        or os.environ.get("ELANUS_ROOT")
+        or os.environ.get("HARNESS_ROOT", "."),
+        "lanius.db",
+    )
+)
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def owner_default():
+    return (
+        os.environ.get("LANIUS_OWNER")
+        or os.environ.get("ELANUS_OWNER")
+        or "owner"
+    )
+
+
+def ro():
+    """Fresh READ-ONLY connection per query — a view must be physically unable to
+    write the truth it reconstructs (mode=ro is load-bearing)."""
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# ---- query kinds ------------------------------------------------------------
+
+def q_conversations(c, q):
+    agent = q.get("agent")
+    if not agent or not isinstance(agent, str):
+        raise ValueError("conversations needs {agent}")
+    owner = q.get("owner") or owner_default()
+    return {"conversations": comms_view.conversation_rows(c, agent, owner)}
+
+
+def q_conversation_info(c, q):
+    session = q.get("session") or q.get("conv")
+    if not session or not isinstance(session, str):
+        raise ValueError("conversation_info needs {session}")
+    owner = q.get("owner") or owner_default()
+    info = comms_view.conversation_info(c, session, owner)
+    if info is None:
+        raise ValueError(f"no conversation for session {session!r}")
+    return info
+
+
+KINDS = {"conversations": q_conversations, "conversation_info": q_conversation_info}
+
+
+# ---- wire (mirrors the history daemon) --------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body):
+        data = json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            self._send(200, {"ok": True, "kinds": sorted(KINDS)})
+        else:
+            self._send(404, {"ok": False, "error": "POST /query or GET /healthz"})
+
+    def do_POST(self):
+        if self.path != "/query":
+            self._send(404, {"ok": False, "error": "POST /query"})
+            return
+        try:
+            n = int(self.headers.get("content-length", 0))
+            q = json.loads(self.rfile.read(n).decode())
+            if not isinstance(q, dict):
+                raise ValueError("body must be a JSON object")
+        except ValueError as e:
+            self._send(400, {"ok": False, "error": f"bad request body: {e}"})
+            return
+        fn = KINDS.get(q.get("kind"))
+        if fn is None:
+            self._send(400, {"ok": False, "error": f"unknown kind {q.get('kind')!r}", "kinds": sorted(KINDS)})
+            return
+        try:
+            with ro() as c:
+                body = fn(c, q)
+            if not isinstance(body, dict):
+                body = {"result": body}
+            body.update(ok=True, kind=q["kind"])
+            self._send(200, body)
+        except (ValueError, OverflowError, TypeError) as e:  # the requester's problem
+            self._send(400, {"ok": False, "kind": q.get("kind"), "error": str(e)})
+        except sqlite3.Error as e:
+            self._send(500, {"ok": False, "kind": q.get("kind"), "error": str(e)})
+
+    def log_message(self, *a):  # obs-quiet; faults go to stderr explicitly
+        pass
+
+
+def http_grant_approved():
+    """Serving is a capability (grants kind 'http'); park until approved —
+    `lanius approve comms` flips this without a restart dance."""
+    try:
+        with ro() as c:
+            row = c.execute(
+                "SELECT state FROM grants WHERE package = ? AND kind = 'http'"
+                " ORDER BY id DESC LIMIT 1",
+                (os.environ.get("LANIUS_PACKAGE") or os.environ.get("ELANUS_PACKAGE", "comms"),),
+            ).fetchone()
+        return row is not None and row["state"] == "approved"
+    except sqlite3.Error:
+        return False
+
+
+def main():
+    if not os.path.exists(DB):
+        log(f"[comms] no ledger at {DB}; the path is supervisor-given, so a missing db is a real fault")
+        sys.exit(1)
+    port = os.environ.get("LANIUS_HTTP_PORT") or os.environ.get("ELANUS_HTTP_PORT")
+    if not port:
+        log("[comms] no LANIUS_HTTP_PORT (needs a daemon with process.http support); exiting")
+        sys.exit(1)
+    waited = False
+    while not http_grant_approved():
+        if not waited:
+            log("[comms] http grant not approved yet; parking until `lanius approve comms` (this is not an error)")
+            waited = True
+        time.sleep(2)
+    srv = HTTPServer(("127.0.0.1", int(port)), Handler)
+    log(f"[comms] serving http://127.0.0.1:{port} (db {DB}, read-only)")
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -469,6 +469,7 @@ async fn status(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
     let owner = secrets::owner_name(root);
     let cred = secrets::read(root, &owner).is_some();
     let history = history_endpoint(root);
+    let comms = comms_endpoint(root);
     let bus = root.bus_file();
     let db = root.db();
     let trace = root.trace_file();
@@ -492,6 +493,10 @@ async fn status(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
             "agent": hub.agent,
             "binary": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
             "history": { "available": history.is_some(), "endpoint": history },
+            // The comms reconstruction view's availability, reported like
+            // history's (docs/handoffs/comms-package.md M2). The web comms list
+            // relays to it; parked ⇒ the SPA degrades to "approve the package".
+            "comms": { "available": comms.is_some(), "endpoint": comms },
             "read_camera": read_camera_status(root),
             "cage": cage_status(root),
             "llm": llm_detection(root),
@@ -619,25 +624,39 @@ fn binary_in_path_string(bin: &str, path: &std::ffi::OsStr) -> bool {
     })
 }
 
-// ---- conversations (read-only sqlite projection) --------------------------
+// ---- conversations (relay to the comms package) ---------------------------
 
+/// `/api/conversations` → POST <comms endpoint>/query {kind:"conversations"}.
+/// The chat-shaped conversation projection has been RELOCATED out of the kernel
+/// into the `kits/stdlib/packages/comms` daemon (docs/handoffs/comms-package.md M2), so this
+/// route is now a thin relay — exactly like `/api/history` relays to the history
+/// package. The endpoint is re-read per request from run/pkg-comms/http.json
+/// (heals across actor restarts); when the package is parked/unreachable this
+/// degrades to a clear "approve the comms package" 503, NOT a crash — matching
+/// `/api/history`'s posture so there is exactly one projection, in the package.
 async fn conversations(hub: web::types::State<Arc<Hub>>, req: HttpRequest) -> HttpResponse {
     let agent = query_param(&req, "agent").unwrap_or_default();
     if !valid_profile_name(&agent) {
         return json_resp(400, json!({ "ok": false, "error": BAD_NAME_MSG }));
     }
-    let Some(db) = db_path(&hub.root) else {
+    let Some(base) = comms_endpoint(&hub.root) else {
         return json_resp(
             503,
-            json!({ "ok": false, "error": "conversation history unavailable — no lanius.db for this root" }),
+            json!({ "ok": false, "error": "comms view unavailable — is the comms package running and approved? (no run/pkg-comms/http.json)" }),
         );
     };
+    // The web server knows the real owner (secrets/.owner-name); pass it so the
+    // package labels the owner's own messages as "you" without re-deriving it.
     let owner = secrets::owner_name(&hub.root);
-    match web::block(move || conversation_rows(&agent, &db, &owner)).await {
-        Ok(rows) => json_resp(200, json!({ "ok": true, "conversations": rows })),
-        Err(e) => json_resp(
+    let query = json!({ "kind": "conversations", "agent": agent, "owner": owner });
+    let out = web::block(move || proxy_history(&base, &query)).await;
+    match out {
+        Ok((code, text)) => HttpResponse::build(status_code(code))
+            .content_type("application/json")
+            .body(text),
+        Err(_) => json_resp(
             503,
-            json!({ "ok": false, "error": format!("conversation history unavailable: {e}") }),
+            json!({ "ok": false, "error": "comms view unreachable — approve the comms package if it is parked" }),
         ),
     }
 }
@@ -2011,6 +2030,16 @@ fn history_endpoint(root: &Root) -> Option<String> {
     Some(format!("http://127.0.0.1:{port}"))
 }
 
+/// The comms reconstruction-view endpoint (docs/handoffs/comms-package.md M2),
+/// discovered from run/pkg-comms/http.json exactly as `history_endpoint` reads
+/// the history package's — harness state, never retained bus messages.
+fn comms_endpoint(root: &Root) -> Option<String> {
+    let path = root.run_dir().join("pkg-comms").join("http.json");
+    let j: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let port = j.get("port").and_then(Value::as_u64)?;
+    Some(format!("http://127.0.0.1:{port}"))
+}
+
 // ---- small helpers --------------------------------------------------------
 
 const BAD_NAME_MSG: &str = "names can use letters, numbers, dashes and underscores — no spaces";
@@ -2283,8 +2312,10 @@ struct EventRow {
     id: i64,
     correlation_id: Option<String>,
     payload: Option<String>,
-    sender: Option<String>,
     created_at: Option<String>,
+    // (the `sender` column moved with the conversation-list projection into the
+    // comms package — the surviving in-core conversation-detail readers don't use
+    // it; the package reads broker-verified sender for its introspection.)
 }
 
 fn col_string(row: &rusqlite::Row, idx: usize) -> Option<String> {
@@ -2302,7 +2333,6 @@ fn map_event(row: &rusqlite::Row) -> rusqlite::Result<EventRow> {
         id: row.get::<_, i64>(0)?,
         correlation_id: col_string(row, 2),
         payload: col_string(row, 3),
-        sender: col_string(row, 5),
         created_at: col_string(row, 6),
     })
 }
@@ -2354,9 +2384,7 @@ fn truncate_text(value: &str, max: usize) -> String {
     }
 }
 
-fn short_iso(value: &str) -> String {
-    value.replacen('T', " ", 1).chars().take(16).collect()
-}
+// (short_iso relocated to kits/stdlib/packages/comms with the conversation-list projection.)
 
 fn session_for_event(row: &EventRow) -> String {
     let payload = parse_payload(&row.payload);
@@ -2369,338 +2397,19 @@ fn session_for_event(row: &EventRow) -> String {
     }
 }
 
-fn source_for(session: &str, sender: &Option<String>, payload: &Value, owner: &str) -> String {
-    if let Some(claimed) = payload.get("source").and_then(Value::as_str) {
-        let claimed = claimed.trim().to_lowercase();
-        if !claimed.is_empty() {
-            return claimed;
-        }
-    }
-    let s = session.to_lowercase();
-    let from = sender.as_deref().unwrap_or("").to_lowercase();
-    if s.starts_with("web-") {
-        return "web".into();
-    }
-    // TODO(docs/channels.md, closing section): these legacy spelling-based
-    // guesses are a SHRINKING safety net. The right seam is the `payload.source`
-    // branch above: a channel/package stamps its own source at the source (as
-    // the Telegram bridge does — docs/handoffs/agent-dm-relay.md M3, and the
-    // send/ask reply path via exec::reply_source), and these fallbacks wither.
-    // Adding a new channel must NOT add a branch here. github/jira/linear/cron
-    // stay only until they become packages that declare their own source.
-    if from.contains("github") || from.contains("jira") || from.contains("linear") {
-        return "github".into();
-    }
-    if from.contains("cron") || from.contains("timer") || from.contains("schedule") {
-        return "cron".into();
-    }
-    if from.is_empty() || from == owner.to_lowercase() || from == "owner" {
-        return "you".into();
-    }
-    let cleaned: String = from
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let cleaned: String = cleaned.chars().take(20).collect();
-    if cleaned.is_empty() {
-        "you".into()
-    } else {
-        cleaned
-    }
-}
+// docs/handoffs/comms-package.md M2 — the conversation-list projection
+// (`source_for`/`conversation_rows` and the `Conv`/`Convs` threading, the
+// ambient-seed and correlation-join passes, `branch_row_summary`,
+// `fold_human_payload`, `query_owner_mailbox`) has been RELOCATED out of this
+// kernel file into the `kits/stdlib/packages/comms` daemon (`kits/stdlib/packages/comms/scripts/comms_view.py`).
+// The channel-taxonomy hard-codes (`web-`, github/jira/linear, cron) live there
+// now, as a shrinking safety net with the same TODO — adding a channel is a
+// package edit, not a kernel edit (docs/channels.md closing section). `/api/conversations`
+// relays to that package (see the `conversations` route above). The CONVERSATION
+// DETAIL routes (`conversation_messages`/`conversation_branched_from`) still read
+// in-core; `session_for_event` and `query_human_by_corr` are shared with them and
+// stay here.
 
-#[derive(Default, Clone)]
-struct Conv {
-    title: String,
-    source: String,
-    last_ts: String,
-    message_count: u64,
-    preview: String,
-    last_role: String,
-    first_ts: String,
-    // docs/handoffs/reply-branching.md M2 — the branch edge, derived from the
-    // seeding in/agent event's `branched_from` (never invented). `{ session,
-    // event_id, preview }`: the parent session, the parent message's ledger id
-    // (the anchor a third party reads to draw child→parent), and a short preview
-    // of the quoted text. None for a non-branched conversation.
-    branched_from: Option<Value>,
-}
-
-struct Convs {
-    map: HashMap<String, Conv>,
-    order: Vec<String>,
-}
-
-impl Convs {
-    fn new() -> Self {
-        Convs {
-            map: HashMap::new(),
-            order: Vec::new(),
-        }
-    }
-
-    fn ensure(&mut self, session: &str, seed_source: Option<&str>, seed_ts: &str) -> &mut Conv {
-        if !self.map.contains_key(session) {
-            self.order.push(session.to_string());
-            self.map.insert(
-                session.to_string(),
-                Conv {
-                    source: seed_source.unwrap_or("you").to_string(),
-                    last_ts: seed_ts.to_string(),
-                    first_ts: seed_ts.to_string(),
-                    ..Default::default()
-                },
-            );
-        }
-        self.map.get_mut(session).unwrap()
-    }
-
-    fn touch(&mut self, session: &str, role: &str, text: &str, count: bool, ts: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let item = self.ensure(session, None, ts);
-        // The human's own prompt titles a thread when there is one; an
-        // agent-first (ambient) conversation has no "you" prompt, so its title
-        // is the agent's opening message/ask instead (honest about who spoke
-        // first — docs/handoffs/ambient-conversations.md M3). A prompted thread
-        // always folds its "you" prompt before any agent turn, so "you" still
-        // wins there.
-        if item.title.is_empty() && (role == "you" || role == "agent" || role == "ask") {
-            item.title = truncate_text(text, 72);
-        }
-        item.preview = truncate_text(text, 110);
-        item.last_role = role.to_string();
-        if !ts.is_empty() {
-            item.last_ts = ts.to_string();
-        }
-        if item.first_ts.is_empty() {
-            item.first_ts = ts.to_string();
-        }
-        if count {
-            item.message_count += 1;
-        }
-    }
-}
-
-// docs/handoffs/reply-branching.md M2 — the flat branch summary for a
-// conversation-list row, derived (never invented) from the seeding in/agent
-// event's structured `branched_from: { event_id, corr, session, quote }`. The
-// list shows a "branched from …" subtitle, so it needs the parent `session` (to
-// link back), the parent message's `event_id` (the anchor a third party reads to
-// draw child→parent), and a short `preview` of the quoted text. Returns None
-// when the payload carries no honest branch anchor.
-fn branch_row_summary(payload: &Value) -> Option<Value> {
-    let bf = payload.get("branched_from")?;
-    if !bf.is_object() {
-        return None;
-    }
-    let event_id = bf.get("event_id").filter(|v| !v.is_null());
-    let session = bf.get("session").and_then(Value::as_str);
-    let quote = bf.get("quote").and_then(Value::as_str).unwrap_or("");
-    // The edge is only reconstructable with a real anchor: no event_id AND no
-    // parent session means there is nothing to point at — treat as no branch.
-    if event_id.is_none() && session.is_none() {
-        return None;
-    }
-    Some(json!({
-        "session": session,
-        "event_id": event_id,
-        "preview": truncate_text(quote, 110),
-    }))
-}
-
-fn conversation_rows(agent: &str, db: &FsPath, owner: &str) -> Result<Value> {
-    let conn = open_ro(db)?;
-    // `source_for` labels the owner's own messages as "you"; it also matches the
-    // literal "owner", so a default root works either way, but a renamed owner
-    // (.secrets/.owner-name) is honored here exactly as server.mjs does.
-    let mut convs = Convs::new();
-    let mut corr_to_session: HashMap<String, String> = HashMap::new();
-
-    let inbound = {
-        let mut stmt = conn.prepare(
-            "SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type = ? ORDER BY id ASC LIMIT 5000",
-        )?;
-        let rows = stmt.query_map([format!("in/agent/{agent}")], map_event)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    for row in &inbound {
-        let payload = parse_payload(&row.payload);
-        let session = session_for_event(row);
-        // A conversation is dropped from the comms list only when it is a *worker
-        // session* — a coding run — NOT by the agent's noun
-        // (docs/handoffs/chat-rendering.md M2). The decision now reads the durable
-        // `kind` recorded in `code_sessions` (principal-kind handoff M3), falling
-        // back to the `code-*` name prefix for rows that predate it — one shared
-        // definition (codesession::is_worker_session), not a copy. Gating on noun
-        // (codex/claude-code) would wrongly drop a coding-noun agent's genuine
-        // comms-plane conversation; a curated conversation on a non-worker session
-        // is preserved.
-        if crate::codesession::is_worker_session(&conn, &session) {
-            continue;
-        }
-        if let Some(c) = &row.correlation_id {
-            corr_to_session.insert(c.clone(), session.clone());
-        }
-        let source = source_for(&session, &row.sender, &payload, owner);
-        let created = row.created_at.clone().unwrap_or_default();
-        let conv = convs.ensure(&session, Some(&source), &created);
-        // M2 (docs/handoffs/reply-branching.md): expose the branch edge from the
-        // seeding event's structured `branched_from`. First seed wins; a later
-        // reply into the same thread never overwrites the origin.
-        if conv.branched_from.is_none() {
-            if let Some(bf) = branch_row_summary(&payload) {
-                conv.branched_from = Some(bf);
-            }
-        }
-        if let Some(prompt) = payload
-            .get("prompt")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("text").and_then(Value::as_str))
-        {
-            convs.touch(&session, "you", prompt, true, &created);
-        }
-    }
-
-    // M2 (docs/handoffs/ambient-conversations.md): an agent can speak first — a
-    // send_message/ask fired by a timer or an event handler with no preceding
-    // human prompt. It lands on in/human/<owner> carrying the run's session
-    // (stamped by the send_message/ask_human handlers), but no in/agent seed
-    // exists, so the thread was previously dropped. Seed a conversation from any
-    // owner-mailbox row that carries a real (non-worker) session and was NOT
-    // already established by an in/agent prompt (its correlation is not in the
-    // map). The correlation join below still folds replies into prompted
-    // threads; this only adds the agent-first seed source (no new authority —
-    // a pure read over the ledger).
-    let ambient = query_owner_mailbox(&conn, owner, 5000)?;
-    for row in &ambient {
-        // The owner's mailbox is shared across every agent, so an ambient row
-        // belongs to THIS agent's conversation only when THIS agent sent it. The
-        // send_message/ask_human handlers emit with the agent as the kernel
-        // sender (LANIUS_ACTOR = the agent noun), so the sender is the honest,
-        // ledger-recorded link back to the agent — without it, one agent's
-        // unprompted message would surface under every agent.
-        if row.sender.as_deref() != Some(agent) {
-            continue;
-        }
-        // A reply into a prompted thread rides a known correlation and is folded
-        // by the correlation join below — don't re-seed it here.
-        if let Some(c) = &row.correlation_id {
-            if corr_to_session.contains_key(c) {
-                continue;
-            }
-        }
-        let payload = parse_payload(&row.payload);
-        // Anchor only on a real session carried in the payload; the evt-*
-        // fallback is not a thread a human can group by or reply into.
-        let Some(session) = payload.get("session").and_then(Value::as_str) else {
-            continue;
-        };
-        // Same worker eviction as above, via the shared kind-aware classifier.
-        if crate::codesession::is_worker_session(&conn, session) {
-            continue;
-        }
-        let source = source_for(session, &row.sender, &payload, owner);
-        let created = row.created_at.clone().unwrap_or_default();
-        convs.ensure(session, Some(&source), &created);
-        fold_human_payload(&mut convs, session, &payload, &created);
-    }
-
-    if !corr_to_session.is_empty() {
-        let corrs: Vec<String> = corr_to_session.keys().cloned().collect();
-        let human_rows = query_human_by_corr(&conn, &corrs, 5000)?;
-        for row in &human_rows {
-            let Some(corr) = &row.correlation_id else {
-                continue;
-            };
-            let Some(session) = corr_to_session.get(corr).cloned() else {
-                continue;
-            };
-            let payload = parse_payload(&row.payload);
-            let created = row.created_at.clone().unwrap_or_default();
-            fold_human_payload(&mut convs, &session, &payload, &created);
-        }
-    }
-
-    // Durable transcript for every seeded session — prompted or ambient. (Was
-    // gated behind a non-empty correlation map, which starved ambient-only
-    // conversations of their message backfill.)
-    {
-        let sessions: Vec<String> = convs.order.clone();
-        if !sessions.is_empty() {
-            let placeholders = placeholders(sessions.len());
-            let sql = format!(
-                "SELECT m.id, m.session_id, m.role, m.content, m.event_id, m.created_at, e.correlation_id, e.type AS event_type \
-                   FROM messages m LEFT JOIN events e ON m.event_id = e.id \
-                  WHERE m.session_id IN ({placeholders}) \
-                  ORDER BY m.id ASC LIMIT 5000"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(sessions.iter()), |row| {
-                Ok((
-                    col_string(row, 1).unwrap_or_default(), // session_id
-                    col_string(row, 2).unwrap_or_default(), // role
-                    col_string(row, 3),                     // content
-                    col_string(row, 5).unwrap_or_default(), // created_at
-                ))
-            })?;
-            for r in rows {
-                let (session_id, role, content, created) = r?;
-                let text = content
-                    .as_deref()
-                    .map(|c| message_text(&parse_stored(c)))
-                    .unwrap_or_default();
-                let role = normalize_role(&role);
-                // count=false: turns already counted from the in/agent prompt +
-                // in/human reply events; counting messages too double-counts.
-                convs.touch(&session_id, &role, &text, false, &created);
-            }
-        }
-    }
-
-    let mut out: Vec<Value> = convs
-        .order
-        .iter()
-        .map(|k| {
-            let c = &convs.map[k];
-            let source = if c.source.is_empty() { "you" } else { &c.source };
-            let title = if c.title.is_empty() {
-                let when = short_iso(if !c.first_ts.is_empty() { &c.first_ts } else { &c.last_ts });
-                format!("{source} conversation {when}").trim().to_string()
-            } else {
-                c.title.clone()
-            };
-            json!({
-                "session": k,
-                "agent": agent,
-                "title": title,
-                "source": source,
-                "last_ts": if !c.last_ts.is_empty() { c.last_ts.clone() } else { c.first_ts.clone() },
-                "message_count": c.message_count,
-                "preview": c.preview,
-                "last_role": c.last_role,
-                // M2: the branch edge, or null for a root conversation.
-                "branched_from": c.branched_from.clone().unwrap_or(Value::Null),
-            })
-        })
-        .collect();
-    // Sort by last_ts desc (stable — ties keep insertion order), top 100.
-    out.sort_by(|a, b| {
-        let av = a.get("last_ts").and_then(Value::as_str).unwrap_or("");
-        let bv = b.get("last_ts").and_then(Value::as_str).unwrap_or("");
-        bv.cmp(av)
-    });
-    out.truncate(100);
-    Ok(Value::Array(out))
-}
 
 // docs/handoffs/reply-branching.md M2 — the branch origin for a thread's feed,
 // derived from the seeding in/agent event's structured `branched_from`. Unlike
@@ -2874,48 +2583,9 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
     Ok(Value::Array(messages))
 }
 
-// The owner's mailbox rows, oldest first — the source for agent-first (ambient)
-// conversation seeds (docs/handoffs/ambient-conversations.md M2). Matches the
-// exact `in/human/<owner>` topic so another human's mailbox never bleeds in.
-fn query_owner_mailbox(
-    conn: &rusqlite::Connection,
-    owner: &str,
-    limit: i64,
-) -> Result<Vec<EventRow>> {
-    let topic = crate::topic::human_mailbox(owner);
-    let mut stmt = conn.prepare(
-        "SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type = ? ORDER BY id ASC LIMIT ?",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![topic, limit], map_event)?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-// Fold one owner-mailbox event into its conversation the same way whether it was
-// reached by correlation (a reply to a prompted thread) or by session (an
-// agent-first ambient send) — one place so the two seed paths stay identical.
-fn fold_human_payload(convs: &mut Convs, session: &str, payload: &Value, created: &str) {
-    if payload.get("failed").is_some_and(truthy) {
-        let err = payload
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("the agent failed");
-        convs.touch(session, "failed", err, true, created);
-    } else if payload.get("question").is_some_and(|v| !v.is_null()) {
-        let q = payload
-            .get("question")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        convs.touch(session, "ask", q, true, created);
-    } else if let Some(t) = payload.get("text").and_then(Value::as_str) {
-        convs.touch(session, "agent", t, true, created);
-    } else if let Some(a) = payload.get("answer").filter(|v| !v.is_null()) {
-        let a = a
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| a.to_string());
-        convs.touch(session, "you", &a, true, created);
-    }
-}
+// (query_owner_mailbox + fold_human_payload relocated to kits/stdlib/packages/comms — the
+// conversation-list projection lives in the comms package now,
+// docs/handoffs/comms-package.md M2.)
 
 // Owner-mailbox rows whose payload carries this exact session — the session-keyed
 // sibling of query_human_by_corr, used to fold agent-first (ambient) sends into a
@@ -3062,13 +2732,7 @@ fn add_message(list: &mut Vec<Value>, seen: &mut HashSet<String>, mut msg: Value
     list.push(msg);
 }
 
-fn normalize_role(role: &str) -> String {
-    match role {
-        "user" => "you".into(),
-        "assistant" => "agent".into(),
-        other => other.into(),
-    }
-}
+// (normalize_role relocated to kits/stdlib/packages/comms with the conversation-list projection.)
 
 fn placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
@@ -3092,6 +2756,53 @@ mod ambient_tests {
             rusqlite::params![etype, correlation, payload.to_string(), sender, created_at],
         )
         .unwrap();
+    }
+
+    // docs/handoffs/comms-package.md M2 — the conversation-list projection was
+    // RELOCATED out of the kernel into the `kits/stdlib/packages/comms` daemon
+    // (`comms_view.py`). These tests now drive the projection through the package
+    // (the same code `/api/conversations` relays to), which is the real thing
+    // under test after the move. Returns None if python3 is unavailable so the
+    // suite still runs on a python-less box (the port is python either way).
+    fn py_conversations(db: &std::path::Path, agent: &str, owner: &str) -> Option<Value> {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kits/stdlib/packages/comms/scripts/comms_view.py");
+        let out = std::process::Command::new("python3")
+            .arg(&script)
+            .arg("conversations")
+            .arg(db.to_string_lossy().to_string())
+            .arg(agent)
+            .arg(owner)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => Some(serde_json::from_slice(&o.stdout).unwrap()),
+            Ok(o) => panic!("comms_view.py failed: {}", String::from_utf8_lossy(&o.stderr)),
+            Err(e) => {
+                eprintln!("[comms tests] python3 unavailable ({e}); skipping");
+                None
+            }
+        }
+    }
+
+    // The comms package's `conversation_info` introspection kind (comms-package M4).
+    fn py_conversation_info(db: &std::path::Path, session: &str, owner: &str) -> Option<Value> {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kits/stdlib/packages/comms/scripts/comms_view.py");
+        let out = std::process::Command::new("python3")
+            .arg(&script)
+            .arg("conversation_info")
+            .arg(db.to_string_lossy().to_string())
+            .arg(session)
+            .arg(owner)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => Some(serde_json::from_slice(&o.stdout).unwrap()),
+            Ok(o) => panic!("comms_view.py conversation_info failed: {}", String::from_utf8_lossy(&o.stderr)),
+            Err(e) => {
+                eprintln!("[comms tests] python3 unavailable ({e}); skipping");
+                None
+            }
+        }
     }
 
     // M2 (docs/handoffs/ambient-conversations.md): an agent-first send_message —
@@ -3163,7 +2874,10 @@ mod ambient_tests {
             "2026-07-01T12:00:00.000Z",
         );
 
-        let out = conversation_rows(agent, &root.db(), owner).unwrap();
+        let out = match py_conversations(&root.db(), agent, owner) {
+            Some(v) => v,
+            None => { std::fs::remove_dir_all(&dir).ok(); return; }
+        };
         let convs = out.as_array().unwrap();
         let sessions: Vec<&str> = convs
             .iter()
@@ -3253,8 +2967,22 @@ mod ambient_tests {
             Some(agent),
             "2026-07-01T10:00:00.000Z",
         );
+        // A control: an ambient send with NO stamped source. Its source must NOT
+        // become "telegram" — the projection has no telegram spelling branch, so
+        // "telegram" is reachable ONLY through the payload.source stamp above.
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
+            json!({ "text": "no channel stamp here", "session": "plain-1" }),
+            Some(agent),
+            "2026-07-01T10:05:00.000Z",
+        );
 
-        let out = conversation_rows(agent, &root.db(), owner).unwrap();
+        let out = match py_conversations(&root.db(), agent, owner) {
+            Some(v) => v,
+            None => { std::fs::remove_dir_all(&dir).ok(); return; }
+        };
         let convs = out.as_array().unwrap();
         let tg = convs
             .iter()
@@ -3266,19 +2994,18 @@ mod ambient_tests {
             "source is the stamped payload.source, not a source_for spelling guess"
         );
 
-        // Proof of the "no kernel edit" claim: source_for itself contains no
-        // telegram branch — it resolves telegram ONLY through payload.source.
-        let via_stamp = source_for(
-            "tg-424242",
-            &Some(agent.to_string()),
-            &json!({ "source": "telegram" }),
-            owner,
-        );
-        assert_eq!(via_stamp, "telegram");
-        let no_stamp = source_for("tg-424242", &Some(agent.to_string()), &json!({}), owner);
+        // Proof of the "no kernel edit" claim, now against the relocated
+        // projection: the un-stamped control conversation is NOT "telegram".
+        // "telegram" is reachable only through the payload.source stamp — the
+        // package has no telegram spelling branch (grep the package to confirm).
+        let plain = convs
+            .iter()
+            .find(|c| c["session"] == "plain-1")
+            .expect("the un-stamped conversation materialized");
         assert_ne!(
-            no_stamp, "telegram",
-            "without the stamp there is NO telegram branch — the kernel never learned the name"
+            plain["source"].as_str().unwrap(),
+            "telegram",
+            "without the stamp there is NO telegram branch — the projection never learned the name"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3332,7 +3059,10 @@ mod ambient_tests {
         );
 
         // (1) The list row for B references A (parent session + the anchor id).
-        let out = conversation_rows(agent, &root.db(), owner).unwrap();
+        let out = match py_conversations(&root.db(), agent, owner) {
+            Some(v) => v,
+            None => { std::fs::remove_dir_all(&dir).ok(); return; }
+        };
         let convs = out.as_array().unwrap();
         let b = convs.iter().find(|c| c["session"] == "web-B").unwrap();
         let bf = &b["branched_from"];
@@ -3378,6 +3108,156 @@ mod ambient_tests {
             format!("in/agent/{agent}"),
             "the raw anchor resolves to the parent message row"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // docs/handoffs/comms-package.md M1/M2 — the relocated-projection regression.
+    // The conversation projection now lives in the `kits/stdlib/packages/comms` daemon
+    // (comms_view.py), which `/api/conversations` relays to. This drives the
+    // package over one seeded ledger and asserts every tricky case the projection
+    // must still get right after the move: worker eviction, ambient/agent-first
+    // seed (title + non-"you" cron badge), a prompted thread staying a SINGLE
+    // conversation, another agent's send NOT leaking, `source` labeled from the
+    // stamped payload.source (telegram, with NO kernel telegram branch), and the
+    // `branched_from` edge surfaced with its parent anchor. This is the M1 golden,
+    // grown into the durable package regression after M2 deleted the in-core copy.
+    //
+    // Requires python3 on PATH; skips (does not fail) if absent, so the suite
+    // still runs on a python-less box — the projection port is python either way.
+    #[test]
+    fn comms_package_projection_regression() {
+        let dir = std::env::temp_dir().join(format!("el-commsgolden-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let agent = "companion";
+        let owner = "owner";
+        let mailbox = crate::topic::human_mailbox(owner);
+
+        // (1) Ambient agent-first send (badge = cron, not "you").
+        insert_event(&conn, &mailbox, None,
+            json!({ "text": "your build finished — all green", "session": "run-amb-1", "source": "cron" }),
+            Some(agent), "2026-07-01T10:00:00.000Z");
+        // (2) Prompted thread + its correlated reply (single conversation, web).
+        insert_event(&conn, &format!("in/agent/{agent}"), Some("c-prompted"),
+            json!({ "prompt": "how are the tests?", "session": "web-1" }),
+            Some(owner), "2026-07-01T09:00:00.000Z");
+        insert_event(&conn, &mailbox, Some("c-prompted"),
+            json!({ "text": "13 passing", "session": "web-1" }),
+            Some(agent), "2026-07-01T09:00:01.000Z");
+        // (3) Worker-session send: evicted from the chat list.
+        insert_event(&conn, &mailbox, None,
+            json!({ "text": "worker chatter", "session": "code-deadbeef" }),
+            Some(agent), "2026-07-01T11:00:00.000Z");
+        // (4) Another agent's ambient send: must NOT leak in.
+        insert_event(&conn, &mailbox, None,
+            json!({ "text": "not for companion", "session": "run-other-1" }),
+            Some("researcher"), "2026-07-01T12:00:00.000Z");
+        // (5) A Telegram-stamped ambient send: source from payload.source alone.
+        insert_event(&conn, &mailbox, None,
+            json!({ "text": "got it, Tim — the bridge shipped", "session": "tg-424242", "source": "telegram" }),
+            Some(agent), "2026-07-01T10:30:00.000Z");
+        // (6) A branch: root A (web-A) + child B (web-B) carrying branched_from.
+        insert_event(&conn, &format!("in/agent/{agent}"), Some("c-a"),
+            json!({ "prompt": "the plan is to ship on friday", "session": "web-A" }),
+            Some(owner), "2026-07-01T08:00:00.000Z");
+        let parent_event_id = conn.last_insert_rowid();
+        insert_event(&conn, &format!("in/agent/{agent}"), Some("c-b"),
+            json!({ "prompt": "and what about the cost?", "session": "web-B",
+                    "branched_from": { "event_id": parent_event_id, "corr": "c-a",
+                                       "session": "web-A", "quote": "the plan is to ship on friday" } }),
+            Some(owner), "2026-07-01T08:30:00.000Z");
+
+        let out = match py_conversations(&root.db(), agent, owner) {
+            Some(v) => v,
+            None => {
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
+        };
+        let convs = out.as_array().unwrap();
+        let sessions: Vec<&str> = convs.iter().map(|c| c["session"].as_str().unwrap()).collect();
+
+        assert!(sessions.contains(&"run-amb-1"), "ambient send is a conversation ({sessions:?})");
+        assert!(sessions.contains(&"web-1"), "prompted thread is a conversation ({sessions:?})");
+        assert_eq!(sessions.iter().filter(|s| **s == "web-1").count(), 1, "prompted thread is SINGLE");
+        assert!(!sessions.contains(&"code-deadbeef"), "worker send evicted ({sessions:?})");
+        assert!(!sessions.contains(&"run-other-1"), "other agent's send does not leak ({sessions:?})");
+
+        let ambient = convs.iter().find(|c| c["session"] == "run-amb-1").unwrap();
+        assert_eq!(ambient["title"].as_str().unwrap(), "your build finished — all green");
+        assert_eq!(ambient["source"].as_str().unwrap(), "cron", "agent-initiated is not badged 'you'");
+
+        let tg = convs.iter().find(|c| c["session"] == "tg-424242").unwrap();
+        assert_eq!(tg["source"].as_str().unwrap(), "telegram", "source is the stamped payload.source");
+
+        let b = convs.iter().find(|c| c["session"] == "web-B").unwrap();
+        let bf = &b["branched_from"];
+        assert!(bf.is_object(), "B carries a branch edge ({b})");
+        assert_eq!(bf["session"].as_str(), Some("web-A"));
+        assert_eq!(bf["event_id"].as_i64(), Some(parent_event_id));
+        assert!(bf["preview"].as_str().unwrap().contains("ship on friday"));
+        let a = convs.iter().find(|c| c["session"] == "web-A").unwrap();
+        assert!(a["branched_from"].is_null(), "A is a root ({a})");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // docs/handoffs/comms-package.md M4 — the conversation introspection API.
+    // For a seeded conversation, `conversation_info` returns its participants
+    // (broker-verified senders, NEVER a payload-claimed one), its source/channel,
+    // its message/turn counts and time span, and the correlation(s) threading it.
+    // The load-bearing trust assertion: a forged `payload.sender` does not appear
+    // in the participant set — provenance is the ledger's verified `sender`
+    // column, the same rule recall and the phonebook hold.
+    #[test]
+    fn comms_conversation_info_uses_verified_sender() {
+        let dir = std::env::temp_dir().join(format!("el-commsinfo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let agent = "main";
+        let owner = "owner";
+        let mailbox = crate::topic::human_mailbox(owner);
+
+        // A prompted thread: the owner's prompt (verified sender = owner) and the
+        // agent's correlated reply (verified sender = the agent). The reply payload
+        // ALSO carries a forged `sender: "attacker"` a hostile agent might inject.
+        insert_event(&conn, &format!("in/agent/{agent}"), Some("c-9"),
+            json!({ "prompt": "status?", "session": "web-9" }),
+            Some(owner), "2026-07-01T09:00:00.000Z");
+        insert_event(&conn, &mailbox, Some("c-9"),
+            json!({ "text": "all good", "session": "web-9", "sender": "attacker" }),
+            Some(agent), "2026-07-01T09:00:01.000Z");
+
+        let info = match py_conversation_info(&root.db(), "web-9", owner) {
+            Some(v) => v,
+            None => { std::fs::remove_dir_all(&dir).ok(); return; }
+        };
+        let participants: Vec<&str> = info["participants"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(participants, vec!["main", "owner"], "participants are the verified senders");
+        assert!(!participants.contains(&"attacker"),
+            "a forged payload.sender must NOT appear ({participants:?})");
+        assert_eq!(info["source"].as_str().unwrap(), "web");
+        assert_eq!(info["event_count"].as_u64().unwrap(), 2);
+        assert_eq!(info["correlations"].as_array().unwrap()[0].as_str().unwrap(), "c-9");
+        assert_eq!(info["first_ts"].as_str().unwrap(), "2026-07-01T09:00:00.000Z");
+        assert_eq!(info["last_ts"].as_str().unwrap(), "2026-07-01T09:00:01.000Z");
+
+        // A conversation spanning a dm channel reports that channel.
+        insert_event(&conn, &mailbox, None,
+            json!({ "text": "pong", "session": "tg-9", "source": "telegram" }),
+            Some(agent), "2026-07-01T10:00:00.000Z");
+        let dm = py_conversation_info(&root.db(), "tg-9", owner).unwrap();
+        assert_eq!(dm["source"].as_str().unwrap(), "telegram");
+        assert_eq!(dm["channels"].as_array().unwrap()[0].as_str().unwrap(), "telegram");
+        let dm_parts: Vec<&str> = dm["participants"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(dm_parts, vec!["main"], "the dm conversation's sole verified sender");
 
         std::fs::remove_dir_all(&dir).ok();
     }

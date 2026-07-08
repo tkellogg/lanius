@@ -50,6 +50,18 @@ pub struct Manifest {
     pub throttle: BTreeMap<String, ThrottleDecl>,
     #[serde(default)]
     pub config: ConfigDecl,
+    /// Package dependencies (docs/handoffs/package-dependencies.md M1). A flat
+    /// list of package NAMES this package needs present-and-approved to work.
+    /// NO versioning: a package's identity is its name + current content-hash
+    /// (see `LoadedManifest` — the manifest bytes folded with `code_hash`),
+    /// editable in place, so a semver would be a lie and the grants ledger
+    /// already re-reviews on any content change. Absent `[requires]` table =
+    /// empty = no dependencies = always valid (backward compat — every existing
+    /// package). The deterministic `packages::validate` checks each dep is
+    /// installed, on the profile's path, and approved, plus cycle detection —
+    /// a pure set/graph question, no solver, no lockfile.
+    #[serde(default)]
+    pub requires: Requires,
     /// Whether this package flows down to a subagent that resolves the literal
     /// `"$parent"` in its `elanus_path` (docs/handoffs/chat-rendering.md M3).
     /// Default `true`: packages inherit as before. Set `false` to keep a package
@@ -89,6 +101,7 @@ impl Default for Manifest {
             tool: Vec::new(),
             throttle: BTreeMap::new(),
             config: ConfigDecl::default(),
+            requires: Requires::default(),
             inherit_to_subagents: default_inherit_to_subagents(),
             provides_builtin_tools: Vec::new(),
         }
@@ -132,6 +145,24 @@ pub struct ConfigKeyDecl {
 
 fn default_true() -> bool {
     true
+}
+
+/// The `[requires]` table (docs/handoffs/package-dependencies.md M1). A flat
+/// list of package NAMES, nothing else — deliberately versionless (see the
+/// `Manifest::requires` doc comment). Absent = empty = no dependencies.
+///
+/// RESERVED, not implemented: a future `grants` sub-key (a cross-package grant
+/// dependency). No failure mode the "dep present-and-approved" check misses has
+/// been found — a package's own approved grants already cover the one case that
+/// looked like a cross-package grant dep (telegram's `in/dm/` grant). Do NOT
+/// repurpose `[requires]` for anything else without a concrete case (wonky bit 1).
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Requires {
+    /// Names of packages this package depends on — one topic level each, validated
+    /// like the other name fields in `load()` (no `/ + #`).
+    #[serde(default)]
+    pub packages: Vec<String>,
 }
 
 /// What the package asks to be allowed to do. Every field is a request the
@@ -583,6 +614,18 @@ pub fn load(pkg_dir: &Path) -> Result<Option<LoadedManifest>> {
                 f.display(),
                 h.name,
                 h.run
+            );
+        }
+    }
+    // [requires] packages: each dep is a bare package name (one topic level),
+    // validated like the other name fields. It rides the manifest `raw` bytes in
+    // `hash` below, so a dependency edit re-enters review like any manifest edit.
+    for dep in &m.requires.packages {
+        if !crate::topic::valid_name(dep) || dep.contains('/') {
+            anyhow::bail!(
+                "{}: requires.packages entry {:?} must be one topic level (no + # /)",
+                f.display(),
+                dep
             );
         }
     }
@@ -1100,6 +1143,56 @@ type = "string"
             load(&dir).is_err(),
             "a '__' tool name (MCP namespacing) is refused"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn requires_packages_parse_and_ride_the_hash() {
+        // docs/handoffs/package-dependencies.md M1: [requires] packages parses and
+        // surfaces; absent table = empty deps (backward compat); an invalid dep
+        // name is refused at load; editing [requires] moves the manifest hash.
+        let dir = std::env::temp_dir().join(format!("el-man-requires-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        // A [requires] table with one dep.
+        std::fs::write(
+            dir.join("lanius.toml"),
+            "[requires]\npackages = [\"phonebook\"]\n",
+        )
+        .unwrap();
+        let lm = load(&dir).unwrap().unwrap();
+        assert_eq!(lm.manifest.requires.packages, vec!["phonebook"]);
+
+        // No [requires] table → empty deps (backward compat).
+        std::fs::write(dir.join("lanius.toml"), "[request]\nsubscribe = []\n").unwrap();
+        let lm2 = load(&dir).unwrap().unwrap();
+        assert!(lm2.manifest.requires.packages.is_empty());
+
+        // An invalid dep name is refused at load like the other name fields.
+        std::fs::write(
+            dir.join("lanius.toml"),
+            "[requires]\npackages = [\"a/b\"]\n",
+        )
+        .unwrap();
+        assert!(load(&dir).is_err(), "a slashed dep name must be refused");
+        std::fs::write(dir.join("lanius.toml"), "[requires]\npackages = [\"#\"]\n").unwrap();
+        assert!(load(&dir).is_err(), "a wildcard dep name must be refused");
+
+        // Editing [requires] moves the hash (it rides `raw`) — the dependency
+        // change re-enters review like any manifest edit.
+        std::fs::write(
+            dir.join("lanius.toml"),
+            "[requires]\npackages = [\"phonebook\"]\n",
+        )
+        .unwrap();
+        let before = load(&dir).unwrap().unwrap().hash;
+        std::fs::write(
+            dir.join("lanius.toml"),
+            "[requires]\npackages = [\"phonebook\", \"recall\"]\n",
+        )
+        .unwrap();
+        let after = load(&dir).unwrap().unwrap().hash;
+        assert_ne!(before, after, "editing [requires] must move the manifest hash");
         std::fs::remove_dir_all(&dir).ok();
     }
 

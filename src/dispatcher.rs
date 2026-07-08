@@ -251,6 +251,13 @@ fn tick(
     if let Err(e) = packages::sync_if_drifted(root, conn) {
         eprintln!("[daemon] drift sync: {e:#}");
     }
+    // Non-refusing dependency warn (docs/handoffs/package-dependencies.md M4):
+    // surface a drifted-into-invalid config for the active profile, but only when
+    // the problem set changed (kv signature), and NEVER refuse to dispatch — a
+    // half-configured instance must not be bricked.
+    if let Err(e) = packages::warn_deps_if_changed(root, conn, "default") {
+        eprintln!("[daemon] dep check: {e:#}");
+    }
     tick_crons(root, conn)?;
     tick_schedules(root, conn)?;
     expire_deadlines(root, conn)?;
