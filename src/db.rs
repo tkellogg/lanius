@@ -602,6 +602,14 @@ CREATE TABLE IF NOT EXISTS code_spawn_edges (
     // reaps. `conn_updated_at` timestamps the last transition.
     let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN connected INTEGER", []);
     let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN conn_updated_at TEXT", []);
+    // Situational-awareness M4 (agent-situational-awareness handoff): the git BRANCH
+    // this session is working on (the branch checked out in its workdir at launch).
+    // Paired with the already-stored `workdir` (the worktree), this is the durable
+    // session ↔ worktree/branch link that lets `lanius code sitrep` derive a terminal
+    // OUTCOME (active | merged | abandoned | wip-stranded) from `git branch --merged`
+    // + tri-state liveness — turning Incident B's git archaeology into a query.
+    // Nullable: a session launched outside a git repo (or before M4) has no branch.
+    let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN branch TEXT", []);
     // Migrations for databases created before a column existed; the error on
     // a duplicate column is expected and ignored.
     let _ = conn.execute(

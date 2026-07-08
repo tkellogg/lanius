@@ -1703,6 +1703,21 @@ fn run(cli: Cli) -> Result<()> {
                     // over the shipped deliver/inbox/correlation rails.
                     codeagent::ask_cmd(&root, rest)?;
                 }
+                "sitrep" => {
+                    // Situational-awareness M4: ONE view accounting for every
+                    // coding session AND every loose worktree/branch — intent,
+                    // liveness, workdir/branch, and derived outcome (active |
+                    // merged | abandoned | wip-stranded). Replaces git archaeology.
+                    // `lanius code sitrep [--json]`.
+                    codeagent::sitrep_cmd(&root, rest)?;
+                }
+                "watch" => {
+                    // Situational-awareness M5: tail a READABLE digest of a
+                    // session's live obs (assistant messages + tool calls
+                    // summarized). "Spy on what it's doing" in one command.
+                    // `lanius code watch <session> [--count N] [--timeout SECS]`.
+                    codeagent::watch_cmd(&root, rest)?;
+                }
                 "project" => {
                     // Observability: run the trace->sqlite projection once now
                     // (the daemon also does this each tick). Useful to refresh the

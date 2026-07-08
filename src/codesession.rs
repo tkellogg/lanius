@@ -201,11 +201,16 @@ pub fn classify_liveness(broker_connected: Option<bool>, pid_probe: Option<bool>
             Some(false) => Liveness::Disconnected(DisconnectKind::SplitBrain),
             _ => Liveness::Connected,
         },
-        // No local pid to probe: death is unconfirmable (cross host). Only the
-        // broker's view distinguishes connected from disconnected(unknown).
+        // No local pid to probe: death is unconfirmable (cross host / reaped
+        // membership). Connected requires POSITIVE evidence of life — only a
+        // broker view of connected=true yields Connected here. No signal at all
+        // (no pid, no broker view — e.g. a legacy/beacon-less or long-idle
+        // session) is Disconnected(Unknown), NOT Connected: absence of evidence
+        // is not evidence of life. (Still never Dead — death stays unconfirmable
+        // without a pid, so its claims are never reaped.)
         None => match broker_connected {
-            Some(false) => Liveness::Disconnected(DisconnectKind::Unknown),
-            _ => Liveness::Connected,
+            Some(true) => Liveness::Connected,
+            _ => Liveness::Disconnected(DisconnectKind::Unknown),
         },
     }
 }
@@ -531,6 +536,226 @@ pub fn get_intent(root: &Root, session: &str) -> Option<String> {
     .ok()
     .flatten()
     .filter(|s| !s.trim().is_empty())
+}
+
+// ── M4: session ↔ worktree/branch ↔ outcome ledger (situational-awareness) ────
+//
+// A past session's git artifacts (a branch, a worktree) had no lanius record of
+// who made them, why, or their terminal status — so accounting for them meant git
+// archaeology (Incident B). M4 records the branch a session works on (the workdir
+// is already stored — that IS the worktree) and derives a terminal OUTCOME from
+// `git branch --merged` + the tri-state liveness. `lanius code sitrep` renders one
+// view of every session and loose worktree so "account for all the other work" is
+// a query, not archaeology.
+
+/// A session's terminal outcome (M4), derived from git + liveness at display time
+/// (never stored — it changes as the branch merges / the process dies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The session is still live (connected, or a disconnected split brain that may
+    /// still be editing) — its work is in flight, not terminal.
+    Active,
+    /// The session is dead AND its branch's work is in the default branch, with a
+    /// clean worktree: the artifacts are safe to remove.
+    Merged,
+    /// The session is dead, its branch is NOT merged, and it left nothing to save
+    /// (no unmerged commits, a clean worktree) — an empty, abandonable leftover.
+    Abandoned,
+    /// The session is dead but its worktree is dirty OR it has unmerged commits:
+    /// there is UNSHIPPED work stranded here — do NOT remove without rescuing it.
+    WipStranded,
+}
+
+impl Outcome {
+    /// A short, human label for the sitrep view.
+    pub fn label(self) -> &'static str {
+        match self {
+            Outcome::Active => "active",
+            Outcome::Merged => "merged — safe to remove",
+            Outcome::Abandoned => "abandoned — safe to remove",
+            Outcome::WipStranded => "wip-stranded — unshipped work, do not remove",
+        }
+    }
+}
+
+/// Derive a session/worktree's terminal outcome (M4). Pure over its inputs so it is
+/// unit-testable without a git repo. Safety-biased like the liveness classifier: a
+/// non-`Dead` session is always `Active` (never declared removable while it might be
+/// running), and unshipped work (dirty tree or unmerged commits) always wins over
+/// "merged/safe" so a dirty merged worktree is still flagged `WipStranded`.
+///
+/// - `liveness`: the session's tri-state liveness (`classify_liveness`). A loose
+///   worktree with no owning session is classified as `Dead` (nothing is running it).
+/// - `branch_merged`: is the branch's work already in the default branch?
+/// - `has_unmerged_commits`: does the branch carry commits not in the default branch?
+/// - `dirty`: does the worktree have uncommitted changes?
+pub fn classify_outcome(
+    liveness: Liveness,
+    branch_merged: bool,
+    has_unmerged_commits: bool,
+    dirty: bool,
+) -> Outcome {
+    if liveness != Liveness::Dead {
+        return Outcome::Active;
+    }
+    // Unshipped work wins over "merged": a dirty or ahead worktree is never "safe".
+    if dirty || has_unmerged_commits {
+        return Outcome::WipStranded;
+    }
+    if branch_merged {
+        return Outcome::Merged;
+    }
+    Outcome::Abandoned
+}
+
+/// Record the git branch a session works on (M4). Mirrors `set_intent`: an UPDATE,
+/// falling back to a stub INSERT if the record isn't observed yet. Blank branch is
+/// ignored. Best-effort — a ledger hiccup never breaks the launch.
+pub fn set_branch(root: &Root, session: &str, branch: &str) -> Result<()> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Ok(());
+    }
+    let conn = crate::db::open(root).context("opening the ledger to set the branch")?;
+    crate::db::init_schema(&conn)?;
+    let n = conn.execute(
+        "UPDATE code_sessions SET branch = ?2 WHERE elanus_session = ?1",
+        rusqlite::params![session, branch],
+    )?;
+    if n == 0 {
+        conn.execute(
+            "INSERT INTO code_sessions
+               (elanus_session, native_session, tool, agent_noun, workdir, branch)
+             VALUES (?1, '', '', '', '', ?2)
+             ON CONFLICT(elanus_session) DO UPDATE SET branch = excluded.branch",
+            rusqlite::params![session, branch],
+        )?;
+    }
+    Ok(())
+}
+
+/// One coding session in the sitrep view (M4): the durable record enriched with the
+/// tri-state liveness. The git-derived OUTCOME is computed by the CLI (it needs to
+/// run git in the workdir); this carries everything the ledger knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SitrepSession {
+    /// The lanius session id (`code-<id>`).
+    pub session: String,
+    /// The obs noun / tool the session ran under (`claude-code` | `codex` | …).
+    pub agent_noun: String,
+    /// The binary that ran it (`claude` | `codex` | …), for the resume hint.
+    pub tool: String,
+    /// Absolute worktree directory the session ran in.
+    pub workdir: String,
+    /// The git branch it works on, if recorded (M4). None outside a git repo.
+    pub branch: Option<String>,
+    /// The session's baseline intent (M2), if recorded — what it was asked to do.
+    pub intent: Option<String>,
+    /// When it was last active, RFC3339 (the FRESHER of `last_active` and the
+    /// projection's `updated_at`, same recency rule as `live_siblings`).
+    pub last_active: String,
+    /// The session's tri-state liveness (M3) — feeds the outcome classification.
+    pub liveness: Liveness,
+}
+
+/// List EVERY recorded coding session for the sitrep view (M4), each with its
+/// tri-state liveness computed the same way `live_siblings` does (broker view +
+/// same-host pid probe). Unlike `live_siblings` this does NOT filter by workdir or
+/// drop dead sessions — the whole point of sitrep is to account for dead sessions'
+/// leftover artifacts. Stub records with no workdir AND no branch (intent-only
+/// placeholders) are skipped as noise. Most-recently-active first. Best-effort:
+/// returns an empty list on any ledger error.
+pub fn sitrep_sessions(root: &Root) -> Vec<SitrepSession> {
+    let Ok(conn) = crate::db::open(root) else {
+        return Vec::new();
+    };
+    if crate::db::init_schema(&conn).is_err() {
+        return Vec::new();
+    }
+    let mut stmt = match conn.prepare(
+        "SELECT s.elanus_session, s.agent_noun, s.tool, s.workdir, s.branch,
+                s.intent, s.last_active, m.owner_pid, s.connected
+           FROM code_sessions s
+           LEFT JOIN code_room_members m ON m.session = s.elanus_session",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, Option<i32>>(7)?,
+            r.get::<_, Option<i64>>(8)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<(i64, SitrepSession)> = Vec::new();
+    for row in rows.flatten() {
+        let (session, agent_noun, tool, workdir, branch, intent, last_active, owner_pid, connected) =
+            row;
+        // Skip intent/branch-only stubs that never became a real session (no place
+        // on disk to account for).
+        if workdir.trim().is_empty() && branch.as_deref().unwrap_or("").trim().is_empty() {
+            continue;
+        }
+        let stats_upd = session_stats_updated_at(&conn, &session);
+        let last_active = fresher_iso(&last_active, stats_upd.as_deref());
+        let last_secs = iso_to_secs(&last_active).unwrap_or(0);
+        let broker_connected = connected.map(|c| c != 0);
+        let pid_probe = owner_pid.map(pid_alive);
+        let liveness = classify_liveness(broker_connected, pid_probe);
+        out.push((
+            last_secs,
+            SitrepSession {
+                session,
+                agent_noun,
+                tool,
+                workdir,
+                branch: branch.filter(|s| !s.trim().is_empty()),
+                intent: intent.filter(|s| !s.trim().is_empty()),
+                last_active,
+                liveness,
+            },
+        ));
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.session.cmp(&b.1.session)));
+    out.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Classify ONE named session's tri-state liveness (M3/M5) from the ledger: its
+/// broker connection view (`code_sessions.connected`) and a same-host owner-pid
+/// probe (from its room membership). The `ask` liveness pre-check and `watch` use
+/// this to fail fast on a dead target instead of blocking to timeout. None when the
+/// session has no record at all (never launched / unknown id). A session with a
+/// record but no membership pid is probed as `None` → the broker view alone decides
+/// (so an unknown-but-connected session still reads live, never wrongly dead).
+pub fn session_liveness(root: &Root, session: &str) -> Option<Liveness> {
+    let conn = crate::db::open(root).ok()?;
+    let _ = crate::db::init_schema(&conn);
+    let row: Option<(Option<i64>, Option<i32>)> = conn
+        .query_row(
+            "SELECT s.connected, m.owner_pid
+               FROM code_sessions s
+               LEFT JOIN code_room_members m ON m.session = s.elanus_session
+              WHERE s.elanus_session = ?1",
+            [session],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i32>>(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let (connected, owner_pid) = row?;
+    let broker_connected = connected.map(|c| c != 0);
+    let pid_probe = owner_pid.map(pid_alive);
+    Some(classify_liveness(broker_connected, pid_probe))
 }
 
 /// Record the broker's connection view for a session (M3). The liveness beacon
@@ -4336,10 +4561,12 @@ mod tests {
         assert_eq!(classify_liveness(Some(true), Some(false)), Dead);
         assert_eq!(classify_liveness(Some(false), Some(false)), Dead);
         assert_eq!(classify_liveness(None, Some(false)), Dead);
-        // No pid, broker view connected/unknown → treated as connected (alive-ish),
-        // never dead: cross-host death is never inferred without a probe.
+        // No pid but the broker says connected → Connected (positive evidence),
+        // never dead (cross-host death is never inferred without a probe).
         assert_eq!(classify_liveness(Some(true), None), Connected);
-        assert_eq!(classify_liveness(None, None), Connected);
+        // No pid AND no broker view → Disconnected(Unknown), NOT Connected:
+        // absence of evidence is not evidence of life. Still never Dead.
+        assert_eq!(classify_liveness(None, None), Disconnected(Unknown));
     }
 
     #[test]
@@ -4446,6 +4673,93 @@ mod tests {
             get_intent(&root, "code-int00002").as_deref(),
             Some("first prompt")
         );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M4: outcome classification + sitrep listing ───────────────────────────
+
+    #[test]
+    fn classify_outcome_folds_liveness_and_git() {
+        use DisconnectKind::*;
+        use Liveness::*;
+        use Outcome::*;
+        // A live (or split-brain) session is ALWAYS active — never declared removable
+        // while it might still be running (the safety bias).
+        assert_eq!(classify_outcome(Connected, true, false, false), Active);
+        assert_eq!(
+            classify_outcome(Disconnected(SplitBrain), true, false, false),
+            Active
+        );
+        assert_eq!(
+            classify_outcome(Disconnected(Unknown), true, true, true),
+            Active
+        );
+        // A DEAD session whose branch merged with a clean tree = safe to remove.
+        assert_eq!(classify_outcome(Dead, true, false, false), Merged);
+        // A DEAD session with unmerged commits = WIP stranded (do not remove).
+        assert_eq!(classify_outcome(Dead, false, true, false), WipStranded);
+        // A DEAD session with a dirty tree = WIP stranded, even if the branch merged.
+        assert_eq!(classify_outcome(Dead, true, false, true), WipStranded);
+        // A DEAD session, not merged, nothing unshipped, clean = abandoned leftover.
+        assert_eq!(classify_outcome(Dead, false, false, false), Abandoned);
+    }
+
+    #[test]
+    fn sitrep_lists_a_merged_dead_session_and_a_live_one() {
+        // The acceptance shape: a dead session whose branch merged reads as safe to
+        // remove; a live session reads active — WITHOUT git archaeology (the git
+        // outcome fold is the CLI's; here we assert the ledger view + liveness).
+        let root = tmp_root();
+        let wd = root.dir.join("co").display().to_string();
+        std::fs::create_dir_all(&wd).unwrap();
+        let live_pid = std::process::id() as i32;
+        let dead_pid = 0x7fff_fffe; // gone on any sane host
+
+        // A live session on branch feature-x with an intent.
+        sa2_record(&root, "code-live00001", &wd, "r", live_pid);
+        set_branch(&root, "code-live00001", "feature-x").unwrap();
+        set_intent(&root, "code-live00001", "ship feature x").unwrap();
+
+        // A confirmed-dead session on a merged branch.
+        sa2_record(&root, "code-dead00002", &wd, "r", dead_pid);
+        set_branch(&root, "code-dead00002", "wip-merged").unwrap();
+
+        let rows = sitrep_sessions(&root);
+        let live = rows.iter().find(|s| s.session == "code-live00001").unwrap();
+        assert_eq!(live.liveness, Liveness::Connected);
+        assert_eq!(live.branch.as_deref(), Some("feature-x"));
+        assert_eq!(live.intent.as_deref(), Some("ship feature x"));
+        // active, since not dead — regardless of git.
+        assert_eq!(
+            classify_outcome(live.liveness, false, false, false),
+            Outcome::Active
+        );
+
+        let dead = rows.iter().find(|s| s.session == "code-dead00002").unwrap();
+        assert_eq!(dead.liveness, Liveness::Dead);
+        assert_eq!(dead.branch.as_deref(), Some("wip-merged"));
+        // A dead + merged + clean session → safe to remove.
+        let outcome = classify_outcome(dead.liveness, true, false, false);
+        assert_eq!(outcome, Outcome::Merged);
+        assert!(outcome.label().contains("safe to remove"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn session_liveness_reads_dead_and_live_from_the_ledger() {
+        // The `ask` pre-check and `watch` read one named session's liveness. A gone
+        // pid → Dead; a live pid → Connected; an unknown id → None.
+        let root = tmp_root();
+        let live_pid = std::process::id() as i32;
+        let dead_pid = 0x7fff_fffe;
+        sa2_record(&root, "code-l00000001", "/tmp", "r", live_pid);
+        sa2_record(&root, "code-d00000002", "/tmp", "r", dead_pid);
+        assert_eq!(
+            session_liveness(&root, "code-l00000001"),
+            Some(Liveness::Connected)
+        );
+        assert_eq!(session_liveness(&root, "code-d00000002"), Some(Liveness::Dead));
+        assert_eq!(session_liveness(&root, "code-nosuch999"), None);
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }
