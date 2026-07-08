@@ -102,21 +102,21 @@ chat projection + the history/introspection APIs, reconstructing on read. Leave
 
 ## Decisions to confirm / wonky bits
 
-1. **New `comms` package, or grow the existing `history` package?** The
-   conversation-list projection is a *reconstruction view over the same
-   read-only `lanius.db`* that `history` already serves — a second daemon reading
-   the same database, on a second port, behind a second proxy, is close to pure
-   duplication. The cheapest, most honest realization of "make comms a package" is
-   to **add a `conversations` query kind to the `history` package** and rename/reframe
-   it as the comms-and-history view (its SKILL already lists "conversations" in its
-   own description). The alternative — a standalone `packages/comms` — buys a
-   cleaner name and a separately-approvable chat concern, at the cost of a second
-   daemon/port/proxy and a split between "history" and "comms" that read the same
-   truth. **Recommend: grow `history` into the comms package (add the
-   `conversations` kind), unless Tim wants chat approved/parked independently of
-   transcript search — in which case a sibling `comms` package cloning the
-   `history` daemon shape.** Confirm which; the milestones below are written to
-   work either way (they say "the comms view" for the daemon).
+1. **Standalone `comms` package that requires `history` (Tim's decision).** The
+   conversation-list projection is a reconstruction view over the same read-only
+   `lanius.db` that `history` already serves. Rather than merge them, **comms is its
+   OWN package** — `packages/comms`, cloning the `history` daemon shape (a read-only
+   sqlite view served on a loopback port) — that **declares `[requires] packages =
+   ["history"]`** using Handoff E's dependency mechanism. This keeps the chat
+   capability *independently approvable* (an agent can hold `comms` without full
+   transcript search, or vice versa) and **composes the two packages via a
+   dependency edge rather than merging them** — the package-composition principle
+   Tim set for this whole sprint. The cost (a second daemon/port/proxy reading the
+   same db) is accepted; the win is granular capabilities and a clean, declared,
+   E-validated dependency. **Ordering: build Handoff E BEFORE this handoff**, so the
+   `requires = ["history"]` declaration is real and validated the moment comms lands.
+   The milestones below say "the comms view" — read that as the new `packages/comms`
+   daemon.
 
 2. **The "history API" half is already built.** `history`'s `transcript`,
    `conversation`, and `search` kinds ARE the history API Tim named
@@ -156,9 +156,10 @@ chat projection + the history/introspection APIs, reconstructing on read. Leave
 Port `conversation_rows` + `source_for` + `is_worker_session` + the threading
 helpers (`session_for_event` `:2361`, `Convs`/`touch`/`ensure`, `fold_human_payload`,
 `branch_row_summary`, the ambient-seed and correlation-join passes,
-`src/web.rs:2361-2668`) into the comms daemon (the `history` package's `main`, or a
-new `comms` daemon cloning it) as a new query kind — call it `conversations`,
-args `{agent}` — reading `lanius.db` read-only exactly as the other kinds do. Carry
+`src/web.rs:2361-2668`) into the new `packages/comms` daemon (cloning the `history`
+daemon shape, and declaring `[requires] packages = ["history"]`) as its
+`conversations` query kind — args `{agent}` — reading `lanius.db` read-only exactly
+as the `history` kinds do. Carry
 the source-labeling fallbacks verbatim (decision 4) with a TODO pointing at
 "channel/package-declared source." Do NOT yet touch `/api/conversations` — the
 in-core path still serves; this milestone only makes the package able to produce
@@ -333,5 +334,12 @@ is C's job on the emit paths); D only moves the reader that consumes it.
   independent approval. Set the **D-after-C** boundary: C M3 stamps `payload.source`
   in place; D relocates the whole projection (incl. `source_for` + its fallbacks)
   out of the kernel and consumes C's stamp — D builds on C, does not redo it.
+- 2026-07-08 (Tim's decision, via tech-lead) — **standalone `comms` package, NOT
+  growing `history`.** Overrode the planner's grow-history rec: comms is its own
+  `packages/comms` that `requires = ["history"]` (Handoff E's dependency mechanism),
+  keeping the chat capability independently approvable and composing packages via a
+  declared dependency edge rather than merging them (Tim's package-composition
+  principle). New ordering constraint: **build E before D** so the `requires` is
+  E-validated on landing. Milestones' "comms view" = the new `packages/comms` daemon.
 </content>
 </invoke>
