@@ -90,3 +90,55 @@ Copilot CLI, Goose, Cline, OpenHands native; claude/codex via adapters). Our app
 an ACP client already. One generic `acp` harness package would onboard every ACP agent at once WITH elicitation
 (session/request_permission -> the ask/mailbox relay). Journey 13's "remaining dozen" collapses into one package.
 See coding-harness-onboarding.md "The RPC-driver shape".
+
+---
+## 2026-07-08 — sprint close (Fable). Status of the items above + what's still open.
+
+**Resolved & merged to main this sprint — don't re-chase:**
+- **Rename + looks + logos** — elanus→lanius DONE; the "looks less hacker, more professional, Lily/Daniel-facing"
+  overhaul DONE (web redesign M1-M5 + a plain-language copy pass: deleted the cockpit/plain vocabulary toggle, named
+  things as they are — "Message bus" not "broker", "Sandbox" not "cage", removed a shipped "Ganesh" codename + the
+  AI-panel reciting its own function names). 10 SVG logos in `brand/logos/` + a gallery. Two skills, `lanius-voice`
+  + `lanius-brand`, so codex inherits the rules via your symlink.
+- **Memory blocks, 2 levels (system vs user)** — DONE (memory-blocks-placements).
+- **Coding-agent ACP support** — DONE: one generic `acp` harness, A1-A6, validated live against `goose` (full
+  initialize→session/new→session/prompt + a real permission round-trip); ACP resume (session/load) shipped. Answer to
+  your sub-question "does ACP buy deeper integration, e.g. hooks?": **No hooks / no mid-turn injection** — ACP is
+  observer + permission-gate only (same limit as codex). It buys uniform onboarding + elicitation, not hooks. Should
+  ACP be preferred? For onboarding new tools, yes. Retiring codex/opencode onto ACP is spec'd but GATED
+  (acp-consolidation handoff) — premature until a real `codex-acp` is host-validated and A6 is battle-tested.
+- **Stale adapter binaries (option b)** — DONE (refresh when the source binary is newer; macOS fresh-inode safe).
+- **DeepSeek-without-logging-out / does `--provider` set env correctly** — DONE (model-providers M1-M4: encrypted
+  provider resource + per-consumer validity + `--provider`).
+- **Dolt hands-on spike** — DONE (`docs/notes-dolt-spike.md`, verdict: don't adopt — ~9x slower writes, no grep).
+- **Situational awareness ("account for the other work" — you called it the only problem that matters)** — DONE,
+  M1-M5. New: **`lanius code sitrep`** (every session + loose worktree with intent, tri-state liveness, branch,
+  outcome — no more git archaeology), `lanius code watch <session>`, and an `ask` liveness pre-check. Liveness is
+  tri-state (connected/disconnected/dead), broker-driven (MQTT Last-Will → a retained `.../status`). A disconnected
+  agent may be a live **split brain**, so its claims are never reaped until death is confirmed by a same-host pid probe.
+
+**Still open — genuinely not done:**
+- **Web UI routing** (real routes / forward-back) — still one big app; held by another session's web-ui-routing.md.
+  NOTE: rebase it on the new redesigned UI.
+- **15-agentic-configuration, the helper — M4** — M1-M3 (UI panel + LLM detection) shipped; **M4 (harness-backed
+  turns: run the helper through your existing claude/codex CLI, so there's no "oh shit" moment if you don't want
+  API billing) is spec'd but UNBUILT** (helper-m4-harness-backed-turns.md).
+- **Redo notes-dolt-spike relative to SQLite** (replacing the ledger DB, not Git) — UNBUILT.
+- **Secret store attached to profiles + Claude-Tag-style permission walls** (a request's room parameterizes the
+  profile to enable sandboxes) — UNBUILT (some identity/egress arc shipped; the room→sandbox-enable is not).
+- **Unify the sandbox** (files + network + external creds) under one URI scheme, "feel like one system" — UNBUILT.
+- **Replicate _questions/_responses via Lanius + web UI; attach to Signal so an agent can DM you** — UNBUILT, but
+  more feasible now (the messages/comms plane + an egress/webhook daemon exist; a Signal bridge does not).
+
+**Newly surfaced this sprint — worth a look:**
+- **Two real app bugs behind the "flaky" e2e tests** (e2e-flaky-hardening.md): a `loadConfigure` stale-response race
+  (a slower agent's config overwrites the newer selection) and a `.nav-item` flex-truncation bug that leaves
+  `.app-shell.scrollLeft` stuck. Both hit real users; both UNBUILT.
+- **Sitrep cross-host residual**: peers don't yet mirror the retained `.../status` across hosts (same-host is fine;
+  cross-host stays "disconnected (unknown)", never reaped — safe, but incomplete for a true multi-host deploy).
+- **Blog**: announcement drafted (`_posts/2026-07-07-lanius.md`). Naming: keep "OS" as the title metaphor, use
+  "control plane" in the body, and say the differentiator out loud — k8s orchestrates containers, Lanius orchestrates
+  messages.
+
+**After you recompile:** run **`lanius code sitrep`** first — it's the honest "what's happening across all my
+sessions and worktrees" view (it'll correctly show the sessions you're about to shut down as disconnected).
