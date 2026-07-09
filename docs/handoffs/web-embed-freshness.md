@@ -32,15 +32,24 @@ no Node at all.
 
 ## Wonky bits / decisions (already made — do not relitigate)
 
-1. **`ui/web/dist` stays committed.** Machines without Node (CI, a plain
-   `cargo install`) must still build. The committed dist is the fallback
-   artifact, not a mistake.
-2. **No npm ⇒ loud warning, never a hard failure.** If `npm` is not on PATH
-   (or `ui/web/src` does not exist — e.g. a source tarball without the UI
-   tree), build.rs emits `cargo:warning=...` saying the committed dist is
-   being embedded as-is and how to fix it, then succeeds. The runtime
-   Node-free guarantee is untouched — Node is only ever a *build-time*
-   convenience.
+1. **`ui/web/dist` stays GITIGNORED** (decision REVERSED during
+   implementation — planning assumed dist was committed; it never was, and
+   committing a build artifact would poison every UI diff with churn). The
+   fallback artifact is therefore *whatever dist already exists on disk*:
+   a source tarball that ships a prebuilt dist (Cargo.toml's `include`
+   list covers it), or a dev tree that has built before. A fresh git clone
+   effectively requires Node to build the UI — and says so (bit 2c).
+2. **No npm ⇒ honest, case-split behavior.** If `npm` is not on PATH (or
+   `ui/web/src` does not exist — e.g. a source tarball without the UI
+   tree):
+   - (b) a dist EXISTS on disk → loud `cargo:warning` that it is being
+     embedded as-is and how to refresh it, then succeed;
+   - (c) NO dist exists → hard, CLEAR compile error: "the web UI needs
+     Node to build from a fresh clone — install Node, or set
+     LANIUS_SKIP_UI_BUILD=1 only if you have a prebuilt ui/web/dist."
+     Saying so beats a mystery include_dir! failure.
+   The runtime Node-free guarantee is untouched — Node is only ever a
+   *build-time* convenience.
 3. **Watch the source tree, not the output tree.** build.rs must emit
    `cargo:rerun-if-changed=ui/web/src` (plus `ui/web/package.json`,
    `ui/web/index.html`, `ui/web/vite.config.*`). It must NOT emit
@@ -134,3 +143,9 @@ historical references (handoff logs), no live instructions.
   whether to actually commit ui/web/dist (makes no-Node fresh-clone builds
   work; costs diff churn) — the wonky-bit-1 premise assumed it was already
   committed and it is not.
+- 2026-07-09 — residual RESOLVED by Fable: dist stays gitignored (build
+  artifacts don't get committed). Wonky bits 1-2 rewritten to the real
+  semantics; case (c) (no npm + no dist) panic message aligned with the
+  agreed copy. All three cases re-verified empirically: (a) npm → vite
+  build runs; (b) no npm + dist present → warn + embed; (c) no npm + no
+  dist → clear "needs Node" compile error naming the escape hatch.

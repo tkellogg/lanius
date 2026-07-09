@@ -156,10 +156,10 @@ fn fallback(web: &Path, msg: &str) {
         warn(msg);
     } else {
         panic!(
-            "web UI: no ui/web/dist exists to embed (dist is not committed to git), \
-             and the UI build was skipped or unavailable ({msg}). Build the UI once \
-             on a machine with Node (`npm --prefix ui/web install && npm --prefix \
-             ui/web run build`) or use a published tarball that ships dist."
+            "the web UI needs Node to build from a fresh clone (ui/web/dist is \
+             gitignored and none exists to embed) — install Node, or set \
+             LANIUS_SKIP_UI_BUILD=1 only if you have a prebuilt ui/web/dist. \
+             (fallback reason: {msg})"
         );
     }
 }
