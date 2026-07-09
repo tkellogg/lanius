@@ -287,6 +287,7 @@ fn profile_rows(root: &Root, conn: &Connection) -> Result<Vec<Value>> {
             })).collect::<Vec<_>>(),
             "packages": packages,
             "subagents": prof.subagents,
+            "ui": { "surface": prof.ui.surface },
             "autonomy": prof.autonomy,
         }));
     }

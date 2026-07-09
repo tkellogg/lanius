@@ -171,6 +171,29 @@ When an agent is the one proposing, the person sees a plain sentence — "the
 scout agent would like to start watching @example" — and the diff behind it if
 they want it, not a technical approval to triage.
 
+## Profile fields: how an agent is presented (`[ui]`)
+
+Most profile fields decide what an agent *is* — its model, its sandbox, its
+autonomy. One small table decides only how it is **presented** in the web UI,
+and it stays deliberately generic so presentation policy never becomes a
+per-name special case in the kernel (the `is_worker_session` anti-pattern the
+simple-core doctrine forbids — a magic string prefix that leaks product policy
+into core).
+
+```toml
+[ui]
+# Where this profile appears. "panel" = presented ONLY in a dedicated surface
+# (the assistant side-panel) and hidden from the left-hand agent list. Absent
+# or any other value = an ordinary agent, listed like the rest.
+surface = "panel"
+```
+
+The `helper` profile ships with `surface = "panel"`: it is the one agent that
+lives entirely in the assistant panel, so it must not also appear as a row in
+the agent list. The list filters on **this property**, not on the name
+"helper" — so any future panel-only profile is hidden for free, and nothing in
+the interface matches a hard-coded agent name.
+
 ## Still open
 
 - **Repository layout.** One configuration repository with subtrees for the

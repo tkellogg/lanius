@@ -1154,6 +1154,17 @@ fn run(cli: Cli) -> Result<()> {
                                 "requires": {
                                     "packages": lm.manifest.requires.packages,
                                 },
+                                // The coding-harness adapter names this package
+                                // declares (`[[harness]]`). Presentation-only
+                                // metadata for the configure UI's "applies to this
+                                // harness" line (docs/handoffs/package-truth.md,
+                                // wonky bit 1): a package that only provides a
+                                // coding-harness adapter is not loaded by a native
+                                // agent. Computed from the manifest, never a
+                                // hard-coded name list.
+                                "harness": lm.manifest.harness.iter()
+                                    .map(|h| h.name.clone())
+                                    .collect::<Vec<_>>(),
                             })),
                             "mode": p.manifest.as_ref()
                                 .and_then(|lm| lm.manifest.process.as_ref().map(|pr| pr.mode.clone())),

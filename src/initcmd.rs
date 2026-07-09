@@ -672,6 +672,14 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
         crate::config_repo::commit_agent(&root, "default", "config: seed default agent profile");
 
     for f in PKG_FILES {
+        // `echo` reads as demo cruft in a shipped catalog
+        // (docs/handoffs/package-truth.md M3): its bytes still ship (the embed
+        // constant above stays, for a future `--examples` path) but a plain init
+        // neither writes it to the package path nor approves it, so it never
+        // shows up as a row. Everything else lands and is decided below.
+        if f.rel.starts_with("echo/") {
+            continue;
+        }
         let path = root.packages().join(f.rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -702,7 +710,11 @@ pub fn init(dir: PathBuf, kits: Vec<String>, copy_kits: bool) -> Result<()> {
     // their requests are approved here with that provenance. Anything that
     // lands on the package path later asks like everything else.
     packages::sync(&root, &conn)?;
-    for name in ["chat", "echo", "notify", "watchdog"] {
+    // `echo` still ships (its files are embedded above) but is no longer
+    // auto-approved: it read as demo cruft in the shipped catalog
+    // (docs/handoffs/package-truth.md M3). A fresh init surfaces it unapproved
+    // like anything that lands on the path later.
+    for name in ["chat", "notify", "watchdog"] {
         packages::decide(&root, &conn, name, true, "init")?;
     }
 

@@ -60,6 +60,7 @@ pub fn list(root: &Root) -> Result<()> {
                     "stages": p.context.stages,
                 },
                 "subagents": p.subagents,
+                "ui": { "surface": p.ui.surface },
                 "vars": p.vars,
                 "throttle": p.throttle,
                 "dir": pdir,

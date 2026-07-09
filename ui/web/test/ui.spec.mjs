@@ -151,9 +151,12 @@ async function ensureAiPanelClosed(page) {
       root.dataset.theme = theme;
       const css = getComputedStyle(root);
       const hex = (v) => css.getPropertyValue(v).trim();
-      const tok = { bg: hex('--bg'), panel: hex('--panel'), active: hex('--hover'), ink: hex('--ink'), dim: hex('--dim'), meta: hex('--meta') };
+      const tok = { bg: hex('--bg'), panel: hex('--panel'), active: hex('--hover'), ink: hex('--ink'), dim: hex('--dim'), meta: hex('--meta'), btnFace: hex('--btn-face') };
       const min = (fg) => Math.min(ratio(fg, tok.bg), ratio(fg, tok.panel), ratio(fg, tok.active));
-      return { ink: min(tok.ink), dim: min(tok.dim), meta: min(tok.meta) };
+      // chrome-polish M2: body text (ink/bg) is the highest-contrast MARK; a filled
+      // button is a subordinate BLOCK — its face barely departs from the page bg,
+      // and its label (ink on the face) is readable (>=4.5) but below body text.
+      return { ink: min(tok.ink), dim: min(tok.dim), meta: min(tok.meta), bodyText: ratio(tok.ink, tok.bg), btnLabel: ratio(tok.ink, tok.btnFace), btnBlock: ratio(tok.btnFace, tok.bg) };
     };
     const out = { dark: measure('dark'), light: measure('light') };
     if (prior === null) root.removeAttribute('data-theme'); else root.dataset.theme = prior;
@@ -164,6 +167,10 @@ async function ensureAiPanelClosed(page) {
     r.ink >= 4.5 ? ok(`contrast(${theme}): --ink clears AA (${r.ink.toFixed(2)})`) : fail(`contrast(${theme}): --ink below AA (${r.ink.toFixed(2)})`);
     r.dim >= 4.5 ? ok(`contrast(${theme}): --dim clears AA (${r.dim.toFixed(2)})`) : fail(`contrast(${theme}): --dim below AA (${r.dim.toFixed(2)})`);
     r.meta >= 4.5 ? ok(`contrast(${theme}): --meta clears AA (${r.meta.toFixed(2)})`) : fail(`contrast(${theme}): --meta below AA (${r.meta.toFixed(2)})`);
+    // chrome-polish M2: filled buttons are subordinate to body text in BOTH themes.
+    r.btnLabel >= 4.5 && r.btnLabel < r.bodyText && r.btnBlock < r.bodyText
+      ? ok(`contrast(${theme}): filled button subordinate to body text (label ${r.btnLabel.toFixed(2)} < body ${r.bodyText.toFixed(2)}, block ${r.btnBlock.toFixed(2)})`)
+      : fail(`contrast(${theme}): button not subordinate (label ${r.btnLabel.toFixed(2)}, body ${r.bodyText.toFixed(2)}, block ${r.btnBlock.toFixed(2)})`);
   }
   // The harness init seeds a 'default' profile → agent 'main' in the nav.
   await waitFor('boot: default agent visible in nav', async () => {
@@ -283,6 +290,29 @@ const testAgentProfile = 'harrier';
     return false;
   });
   await page.waitForSelector('#agent-tabs', { state: 'visible' });
+  // chrome-polish M1: one meaning per symbol. The configure tab is the WORD
+  // "settings" (not a lone gear that also meant "runs"); the tab strip carries no
+  // bare gear; the runs nav entry no longer borrows the gear sigil; and no lone
+  // gear ICON BUTTON survives anywhere (a ⚙ may stay only next to visible text).
+  {
+    const cfgTabText = await page.$eval('#agent-tabs [data-tab="configure"]', (el) => el.textContent.trim()).catch(() => '');
+    cfgTabText === 'settings'
+      ? ok('chrome M1: the configure tab renders the word "settings"')
+      : fail(`chrome M1: configure tab is not the word settings ("${cfgTabText}")`);
+    const tabHasGear = await page.$eval('#agent-tabs', (el) => (el.textContent || '').includes('⚙')).catch(() => false);
+    !tabHasGear ? ok('chrome M1: the agent tab strip has no bare gear') : fail('chrome M1: a gear survives in the tab strip');
+    const runsSigil = await page.$eval('[data-sel="code-sessions"] .nav-sigil', (el) => el.textContent.trim()).catch(() => '');
+    runsSigil && runsSigil !== '⚙'
+      ? ok(`chrome M1: the runs nav uses a distinct sigil ("${runsSigil}"), not the gear`)
+      : fail(`chrome M1: the runs nav sigil is still the gear ("${runsSigil}")`);
+    const loneGearButtons = await page.evaluate(() =>
+      [...document.querySelectorAll('button, a, [role="button"]')]
+        .filter((el) => (el.textContent || '').trim() === '⚙')
+        .map((el) => el.getAttribute('aria-label') || el.className || el.tagName));
+    loneGearButtons.length === 0
+      ? ok('chrome M1: no lone ⚙ icon button (every survivor sits next to text)')
+      : fail(`chrome M1: lone gear button(s): ${JSON.stringify(loneGearButtons)}`);
+  }
   await page.click('[data-tab="configure"]');
   await page.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
   // loadConfigure is async — wait for it to populate the model field before
@@ -397,7 +427,8 @@ const testAgentProfile = 'harrier';
     return /chat/.test(text)
       && !sections.includes('core')
       && !sections.includes('local')
-      && sections.some((s) => /stdlib|instance/.test(s))
+      && sections.some((s) => /stdlib|this installation/.test(s))
+      && !sections.some((s) => /\binstance\b/.test(s))
       && !/current settings|TOML value/.test(text);
   }, 8000);
   const windowPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="window"]').first();
@@ -408,7 +439,9 @@ const testAgentProfile = 'harrier';
     const text = await windowPackage().locator('summary').textContent();
     return /settings can be saved for every agent or for harrier only/i.test(text);
   }, 5000);
-  await windowPackage().locator('summary').click();
+  // package-truth: the collapsed row now carries buttons inside <summary>, so a
+  // geometric summary click can land on one — open the details node directly.
+  await windowPackage().evaluate((el) => { el.open = true; });
   await windowPackage().locator('.cfg-package-config-toggle').click();
   await waitFor('configure: typed context-stage setting renders from manifest', async () => {
     const text = await windowPackage().textContent();
@@ -492,15 +525,16 @@ const testAgentProfile = 'harrier';
     return !hasNativeModeSelect && /link/.test(menuText) && /copy/.test(menuText);
   }, 5000);
   await page.click('#cfg-kit-add-close');
+  // package-truth M1: the on/off toggle sits ON the collapsed row now — no
+  // summary click needed to reach it (and a geometric summary click could land
+  // on the toggle itself).
   const historyPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="history"]').first();
-  await historyPackage().locator('summary').click();
   const packageToggle = () => historyPackage().locator('.cfg-package-disable').first();
   if (await packageToggle().count()) {
     await packageToggle().click();
     await waitFor('configure: disable package writes exclude', async () => {
       return (await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('history');
     }, 5000);
-    await historyPackage().locator('summary').click();
     await packageToggle().click();
     await waitFor('configure: enable package removes exclude', async () => {
       return !(await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('history');
@@ -524,7 +558,6 @@ const testAgentProfile = 'harrier';
   } else {
     fail('configure: package group toggle not found');
   }
-  await historyPackage().locator('summary').click();
   await packageToggle().click();
   await waitFor('configure: disable package persists through save', async () => {
     return (await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('history');
@@ -910,7 +943,7 @@ const renamedAgent = 'falcon';
   await page.click('#conv-new');
   await waitFor('converse: new conversation clears the visible thread', async () => {
     const t = await page.$eval('#conv-holder', (el) => el.textContent);
-    return !t.includes(msg) && /start a conversation/i.test(t);
+    return !t.includes(msg) && /say hello/i.test(t);
   }, 5000);
   const msg4 = `${msg}-fork`;
   await page.fill('#compose-input', msg4);
@@ -2616,8 +2649,14 @@ const renamedAgent = 'falcon';
       : fail(`ai panel: world c did not show the no-LLM advisory (${JSON.stringify(noLlm)})`);
   } else {
     await page.waitForSelector('#ai-panel .agent-assistant', { timeout: 5000 });
-    const sessionText = await page.$eval('#ai-panel .agent-assistant-head p', (el) => el.textContent.trim());
+    // helper-first-encounter H4 (wonky bit 7): the raw session id is no longer
+    // shown in the panel head (no `assistant-m3k9…` copy). It rides a data-session
+    // attribute instead, which the tool round-trip below still needs.
+    const sessionText = await page.$eval('#ai-panel .agent-assistant', (el) => el.getAttribute('data-session'));
     ok(`ai panel: mounted the assistant (session ${sessionText})`);
+    (await page.$('#ai-panel .agent-assistant-head p')) === null
+      ? ok('ai panel(H4): no raw session id in the panel head')
+      : fail('ai panel(H4): the panel head still shows a raw session id');
 
     // Client-tool round trip: simulate the agent calling `navigate` — as a real
     // dispatcher reply would once a turn resolves — and confirm the call is
@@ -2746,6 +2785,733 @@ const renamedAgent = 'falcon';
     ? ok('routing(M3): GET /does-not-exist.js still 404s (asset miss is loud)')
     : fail(`routing(M3): missing asset returned ${missingAsset}, expected 404`);
 
+  await page.close();
+}
+
+// ── flow 6f: chat-liveness (docs/handoffs/chat-liveness.md) ───────────────────
+// "Dead air is the one unforgivable failure." A sent message shows a "sent" mark;
+// obs activity flips it to a thinking indicator; a reply resolves both; 20s of
+// silence surfaces an honest stalled line with working recourse; and a send with
+// no LLM path renders an immediate in-thread "nothing is running" line (no 20s
+// wait) instead of vanishing. Sends are intercepted so the machine is exercised
+// deterministically; the agent's obs + reply are injected the way flow 6 injects
+// labeled events (no live LLM turn in the suite).
+{
+  const liveAgent = 'liveprobe';
+  // Timeout-guarded emit: a QoS-1 publish blocks until the broker acks, so under
+  // a starved broker an unguarded execFileSync would hang the whole suite. Cap it
+  // so a stall surfaces as a test failure, never an infinite hang.
+  const emit = (type, corr, payload) => {
+    const args = ['emit', type];
+    if (corr) args.push('--correlation', corr);
+    args.push('--payload', payload);
+    execFileSync(path.join(BIN, 'lanius'), args, { env: ENV, encoding: 'utf8', timeout: 15000 });
+  };
+  // Seed a fresh chat agent so the surface is a clean comms thread (not a trace).
+  const seed = await newPage();
+  await seed.goto('/');
+  await seed.evaluate(async (name) => {
+    await fetch('/api/admin/agents', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) }).catch(() => {});
+  }, liveAgent);
+  await seed.close();
+
+  // M1: the shared health projection is a pure function of (status, liveness).
+  // Exercise the SHIPPED function (window.__systemHealth) across every branch the
+  // acceptance names: broker down, world c, history unavailable, actor
+  // running/failed/not-started.
+  const hp = await newPage();
+  await hp.goto('/');
+  const h = await hp.evaluate(() => {
+    const f = (window).__systemHealth;
+    return {
+      brokerDown: f({ broker_connected: false }, { actors: {} }).brokerConnected,
+      brokerUp: f({ broker_connected: true }, { actors: {} }).brokerConnected,
+      worldC: f({ llm: { world: 'c' } }, {}).llmWorld,
+      worldA: f({ llm: { world: 'a' } }, {}).llmWorld,
+      worldNull: f({}, {}).llmWorld,
+      historyOff: f({ history: { available: false } }, {}).historyAvailable,
+      historyOn: f({ history: { available: true } }, {}).historyAvailable,
+      running: f({}, { actors: { git: { status: 'running' } } }).actorStatus('git'),
+      failed: f({}, { actors: { git: { status: 'failed' } } }).actorStatus('git'),
+      notStarted: f({}, { actors: {} }).actorStatus('git'),
+    };
+  });
+  (h.brokerDown === false && h.brokerUp === true) ? ok('health(M1): brokerConnected projects broker_connected') : fail(`health(M1): broker projection wrong (${JSON.stringify(h)})`);
+  (h.worldC === 'c' && h.worldA === 'a' && h.worldNull === null) ? ok('health(M1): llmWorld projects world a/c, null when unknown') : fail(`health(M1): world projection wrong (${JSON.stringify(h)})`);
+  (h.historyOff === false && h.historyOn === true) ? ok('health(M1): historyAvailable projects status.history.available') : fail('health(M1): history projection wrong');
+  (h.running === 'running' && h.failed === 'failed' && h.notStarted === 'not-started') ? ok('health(M1): actorStatus maps running/failed and not-started (never conflated with running)') : fail(`health(M1): actor projection wrong (${JSON.stringify(h)})`);
+  await hp.close();
+
+  // The stack's broker must be connected so the real send-path pre-check passes.
+  await waitFor('chat-liveness: broker connected', async () => {
+    try { return (await (await fetch(`${BASE}/api/status`)).json()).broker_connected === true; } catch { return false; }
+  }, 10000);
+
+  const selectLive = async (page) => {
+    await page.waitForSelector('#nav-agents .nav-agent');
+    await waitFor('chat-liveness: liveprobe selectable', async () => {
+      const agents = await page.$$('#nav-agents .nav-agent');
+      for (const item of agents) {
+        if ((await item.getAttribute('data-sel')) === `agent:${liveAgent}`) { await item.click(); return true; }
+      }
+      return false;
+    }, 8000);
+    await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  };
+
+  // M2 happy path: sent → thinking → reply. Intercept /api/publish so the send is
+  // deterministic; capture the correlation + session to drive the fake agent.
+  const live = await newPage();
+  const pubs = [];
+  await live.route('**/api/publish', async (route) => {
+    try { pubs.push(JSON.parse(route.request().postData() || '{}')); } catch {}
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await live.goto('/');
+  await selectLive(live);
+  // M3 empty-state invite copy.
+  await live.click('#conv-new');
+  await waitFor('chat-liveness(M3): the empty thread invites "say hello"', async () => {
+    return /say hello/i.test(await live.$eval('#conv-holder', (el) => el.textContent));
+  }, 5000);
+
+  const m1 = `live-${Date.now()}`;
+  await live.fill('#compose-input', m1);
+  await live.click('#compose-send');
+  await waitFor('chat-liveness(M2): the sent mark rides the message', async () => {
+    return (await live.$('#conv-holder [data-sel="msg-sent"]')) !== null;
+  }, 8000);
+  await waitFor('chat-liveness(M2): the browser published the message', async () => pubs.length >= 1, 5000);
+  const corr1 = pubs[pubs.length - 1].correlation;
+  const session1 = pubs[pubs.length - 1].payload?.session;
+  // Obs activity = the agent woke up → the thinking indicator. obs/agent topics
+  // ride the broker directly from a live agent (they are NOT part of the ledger
+  // announce sweep, which only fans in/ signal/ obs/config), so inject via the
+  // web server's own bus publish (a node fetch — the page's /api/publish route
+  // interception does not apply here).
+  await fetch(`${BASE}/api/publish`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic: `obs/agent/${liveAgent}/${session1}/tool/probe`, payload: { note: 'awake' } }) });
+  await waitFor('chat-liveness(M2): obs activity shows the thinking indicator', async () => {
+    return (await live.$('#conv-holder [data-sel="conv-thinking"]')) !== null;
+  }, 8000);
+  // The reply lands → both marks resolve and the reply threads here.
+  const replyText = `reply-${Date.now()}`;
+  emit('in/human/owner', corr1, JSON.stringify({ text: replyText, agent: liveAgent }));
+  await waitFor('chat-liveness(M2): the reply lands in the same thread', async () => {
+    return (await live.$eval('#conv-holder', (el) => el.textContent)).includes(replyText);
+  }, 8000);
+  const resolved = (await live.$('#conv-holder [data-sel="conv-thinking"]')) === null && (await live.$('#conv-holder [data-sel="msg-sent"]')) === null;
+  resolved ? ok('chat-liveness(M2): the reply resolves the thinking + sent indicators') : fail('chat-liveness(M2): indicators did not resolve on reply');
+  await live.close();
+
+  // M2 stalled path: 20s of silence with no obs and no reply → the honest stalled
+  // line, corr-keyed so it survives leaving the thread and returning (wonky bit
+  // 2); retry re-sends under a fresh corr and a reply resolves it.
+  const stall = await newPage();
+  const spubs = [];
+  await stall.route('**/api/publish', async (route) => {
+    try { spubs.push(JSON.parse(route.request().postData() || '{}')); } catch {}
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await stall.goto('/');
+  await selectLive(stall);
+  await stall.click('#conv-new');
+  const sm = `stall-${Date.now()}`;
+  await stall.fill('#compose-input', sm);
+  await stall.click('#compose-send');
+  await waitFor('chat-liveness(M2): the stalled line appears after 20s of silence', async () => {
+    return (await stall.$('#conv-holder [data-sel="conv-stalled"]')) !== null;
+  }, 26000);
+  const hasRecourse = (await stall.$('[data-sel="conv-stalled-status"]')) !== null && (await stall.$('[data-sel="conv-stalled-retry"]')) !== null;
+  hasRecourse ? ok('chat-liveness(M2): the stalled line offers check-status and retry') : fail('chat-liveness(M2): stalled line missing recourse affordances');
+  // wonky bit 2: leave the thread (check status → setup) and come back — the
+  // corr-keyed stalled line is still there, not stranded or duplicated.
+  await stall.click('[data-sel="conv-stalled-status"]');
+  await stall.waitForSelector('#view-setup:not([hidden])', { timeout: 5000 });
+  ok('chat-liveness(M2): check-status navigates to setup');
+  await selectLive(stall);
+  const survived = await stall.$$('#conv-holder [data-sel="conv-stalled"]');
+  survived.length === 1 ? ok('chat-liveness(M2): the stalled line survives leaving+returning (corr-keyed, one instance)') : fail(`chat-liveness(M2): stalled line count after return = ${survived.length}, expected 1`);
+  // Retry re-publishes under a fresh corr; a reply on that corr resolves the line.
+  // Clicked TWICE in the same task (before React can unrender the line): retry is
+  // consume-once, so a rapid double-click must publish exactly one re-send.
+  const before = spubs.length;
+  await stall.$eval('[data-sel="conv-stalled-retry"]', (el) => { el.click(); el.click(); });
+  await waitFor('chat-liveness(M2): retry re-publishes under a fresh correlation', async () => spubs.length > before && spubs[spubs.length - 1].correlation !== spubs[before - 1].correlation, 8000);
+  await sleep(600);
+  spubs.length === before + 1
+    ? ok('chat-liveness(M2): a double-clicked retry publishes exactly once (consume-once)')
+    : fail(`chat-liveness(M2): double-clicked retry published ${spubs.length - before} times, expected 1`);
+  const corr2 = spubs[spubs.length - 1].correlation;
+  emit('in/human/owner', corr2, JSON.stringify({ text: 'retry-answered', agent: liveAgent }));
+  await waitFor('chat-liveness(M2): a reply after retry clears the stalled line', async () => {
+    const t = await stall.$eval('#conv-holder', (el) => el.textContent);
+    return t.includes('retry-answered') && (await stall.$('#conv-holder [data-sel="conv-stalled"]')) === null;
+  }, 8000);
+  // Obs AFTER the stall lifts the stalled line: stall a fresh send, then let a
+  // correlated obs event arrive — the agent is demonstrably running, so "No
+  // response yet. The agent may not be running." must yield to the thinking
+  // indicator (the same wake-up signal we trust before the stall).
+  const om = `obslate-${Date.now()}`;
+  const obefore = spubs.length;
+  await stall.fill('#compose-input', om);
+  await stall.click('#compose-send');
+  await waitFor('chat-liveness(M2): late-obs probe send published', async () => spubs.length > obefore, 5000);
+  const corr3 = spubs[spubs.length - 1].correlation;
+  const session3 = spubs[spubs.length - 1].payload?.session;
+  await waitFor('chat-liveness(M2): the late-obs probe send stalls in silence', async () => (await stall.$('#conv-holder [data-sel="conv-stalled"]')) !== null, 26000);
+  await fetch(`${BASE}/api/publish`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic: `obs/agent/${liveAgent}/${session3}/tool/probe`, payload: { note: 'late wake' } }) });
+  await waitFor('chat-liveness(M2): obs after the stall lifts the stalled line into thinking', async () => {
+    return (await stall.$('#conv-holder [data-sel="conv-stalled"]')) === null && (await stall.$('#conv-holder [data-sel="conv-thinking"]')) !== null;
+  }, 8000);
+  emit('in/human/owner', corr3, JSON.stringify({ text: 'late-wake-answered', agent: liveAgent }));
+  await waitFor('chat-liveness(M2): the late reply resolves the revived thinking indicator', async () => {
+    const t = await stall.$eval('#conv-holder', (el) => el.textContent);
+    return t.includes('late-wake-answered') && (await stall.$('#conv-holder [data-sel="conv-thinking"]')) === null;
+  }, 8000);
+  await stall.close();
+
+  // M3 pre-check (wonky bit 4): with no LLM path (world c), a send does not sail
+  // into the void — it renders the immediate in-thread "nothing is running" line
+  // (no 20s wait) with a route to setup. Force world c by intercepting /api/status
+  // (the SSE status frame patches only the broker fields, never llm.world, so the
+  // projection stays world c). The broker-down sibling of this OR is covered by
+  // the M1 projection test above.
+  const dead = await newPage();
+  await dead.route('**/api/status', async (route) => {
+    const resp = await route.fetch();
+    const j = await resp.json().catch(() => ({}));
+    j.llm = { ...(j.llm || {}), world: 'c' };
+    await route.fulfill({ response: resp, json: j });
+  });
+  await dead.goto('/');
+  await selectLive(dead);
+  await dead.click('#conv-new');
+  const dm = `void-${Date.now()}`;
+  await dead.fill('#compose-input', dm);
+  await dead.click('#compose-send');
+  await waitFor('chat-liveness(M3): a send with no path renders the immediate no-path line', async () => {
+    return (await dead.$('#conv-holder [data-sel="conv-nopath"]')) !== null;
+  }, 8000);
+  // The typed message is still visible — nothing silently vanished.
+  (await dead.$eval('#conv-holder', (el) => el.textContent)).includes(dm)
+    ? ok('chat-liveness(M3): the typed message stays visible alongside the no-path line')
+    : fail('chat-liveness(M3): the typed message vanished on the no-path pre-check');
+  const nopathSetup = (await dead.$('[data-sel="conv-nopath-setup"]')) !== null;
+  nopathSetup ? ok('chat-liveness(M3): the no-path line links to setup') : fail('chat-liveness(M3): no-path line missing the setup link');
+  await dead.click('[data-sel="conv-nopath-setup"]');
+  await dead.waitForSelector('#view-setup:not([hidden])', { timeout: 5000 });
+  ok('chat-liveness(M3): the no-path setup link navigates to setup');
+  await dead.close();
+}
+
+// ── flow: chrome-polish M3 — activity rows expand (disclosure) ───────────────
+// Each RailView row is a disclosure: collapsed = today's one-liner; expanded =
+// the full pretty-printed JSON payload. Rows are keyed by EVENT IDENTITY, so an
+// expanded row keeps its content as the live feed appends and the buffer slides.
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents', { timeout: 10000 });
+  await ensureAiPanelClosed(page);
+  await page.click('.nav-signals');
+  await page.waitForSelector('#view-rail:not([hidden])', { timeout: 5000 });
+  await page.click('button[data-f="all"]');
+  const marker = `chromem3${Date.now().toString(36)}`;
+  const pub = (topic, payload) => page.evaluate(async ({ topic, payload }) => {
+    await fetch('/api/publish', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic, payload }) });
+  }, { topic, payload });
+  await pub(`obs/agent/helper/${marker}/assistant/message`, { marker, note: 'expand me please' });
+  const item = page.locator('#tele-feed .rail-item', { hasText: marker }).first();
+  await item.waitFor({ timeout: 8000 });
+  (await item.locator('pre.row-json').count()) === 0
+    ? ok('chrome M3: an activity row starts collapsed (no JSON payload shown)')
+    : fail('chrome M3: an activity row was expanded before any click');
+  // Click to expand → the full JSON payload appears.
+  await item.locator('.row').click();
+  await waitFor('chrome M3: clicking an activity row reveals the full JSON payload', async () => {
+    if ((await item.locator('pre.row-json').count()) === 0) return false;
+    const t = await item.locator('pre.row-json').textContent();
+    return t.includes(marker) && t.includes('expand me please');
+  }, 5000);
+  // Live appends: publish more events (topics WITHOUT the marker); the expanded
+  // row must keep its content — identity keys survive the buffer sliding.
+  for (let i = 0; i < 4; i++) await pub(`obs/agent/helper/liveappend${i}zz/assistant/message`, { i });
+  await waitFor('chrome M3: an expanded row keeps its payload as new events append', async () => {
+    if ((await item.locator('pre.row-json').count()) === 0) return false;
+    const t = await item.locator('pre.row-json').textContent();
+    return t.includes('expand me please');
+  }, 5000);
+  // Click again collapses it.
+  await item.locator('.row').click();
+  await waitFor('chrome M3: clicking again collapses the row', async () =>
+    (await item.locator('pre.row-json').count()) === 0, 5000);
+  // Pause still works.
+  await page.click('#tele-pause');
+  (await page.$eval('#tele-pause', (el) => el.getAttribute('aria-pressed') === 'true'))
+    ? ok('chrome M3: pause still toggles the feed')
+    : fail('chrome M3: pause toggle broke');
+  await page.close();
+}
+
+// ── flow: chrome-polish M4 — say something to a live worker (deliver) ─────────
+// POST /api/code/deliver relays a human note through `lanius code deliver` into
+// the worker's INBOX — never the chat/conversation projection. The route is
+// worker-only (a non-code-* id is refused 400), the requester is the human owner
+// (a plain worker resume, no reply routed back), and feedback is the CLI's own
+// exit — never a fake delivery promise. The compose UI lives on the runs DETAIL
+// surface, which is projection-gated and NOT stood up in this suite (same
+// treatment as the M4/M5 block/estimate panels, driven by route below); the
+// rendered compose is exercised in the manual live check. Here we assert the
+// server contract the compose drives.
+{
+  // Driven Node-side (like the cross-origin write tests): a same-origin/local
+  // request with no Origin passes the human-proof guard, so these reach the route.
+  // Node-side avoids logging deliberate 4xx as browser console errors (the global
+  // console-error gate).
+  const post = async (headers, body) => {
+    const r = await fetch(`${BASE}/api/code/deliver`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
+    return { status: r.status, body: await r.json().catch(() => ({})) };
+  };
+  // A non-worker (non code-*) session id is refused server-side (400): deliver
+  // must never be coaxed into addressing a chat/agent session.
+  const badId = await post({}, { session: 'web-harrier-x1', message: 'hi' });
+  badId.status === 400
+    ? ok('chrome M4: a non-code-* session id is refused 400 server-side')
+    : fail(`chrome M4: non-code session not refused (status ${badId.status}, body ${JSON.stringify(badId.body)})`);
+  // An empty note is refused 400 (nothing to deliver).
+  const emptyMsg = await post({}, { session: 'code-nope01', message: '   ' });
+  emptyMsg.status === 400 ? ok('chrome M4: an empty note is refused 400') : fail(`chrome M4: empty note not refused (status ${emptyMsg.status})`);
+  // A well-formed code-* id with no worker record: the relay SHELLS the CLI and
+  // reports its honest exit — delivered:false with the "no coding session" error.
+  // That the error is the record lookup (not the CLI's "must run inside a coding
+  // session" guard) proves the requester env was supplied to the child.
+  const relay = await post({}, { session: 'code-ghostworker01', message: 'are you there?' });
+  const relayErr = String(relay.body?.error ?? '');
+  relay.status === 200 && relay.body?.delivered === false && /no coding session|deliver to/i.test(relayErr) && !/must run inside a coding session/i.test(relayErr)
+    ? ok(`chrome M4: the relay shells the CLI and reports its honest exit ("${relayErr.slice(0, 56)}…")`)
+    : fail(`chrome M4: relay/honest-feedback wrong (status ${relay.status}, body ${JSON.stringify(relay.body)})`);
+  // A cross-origin POST is refused by the same human-proof/origin guard publish
+  // uses (CSRF/DNS-rebind) — a foreign Origin is refused.
+  const crossOrigin = await post({ Origin: 'http://evil.example' }, { session: 'code-ghostworker01', message: 'pwned' });
+  crossOrigin.status === 403
+    ? ok('chrome M4: a cross-origin deliver POST is refused by the origin guard (403)')
+    : fail(`chrome M4: cross-origin deliver not refused (status ${crossOrigin.status})`);
+}
+
+// ── flow: helper-first-encounter (docs/handoffs/helper-first-encounter.md) ────
+// The helper's first encounter: opening the panel is FREE (no auto-send, nothing
+// durable), the helper is hidden from the agent list by a GENERIC profile
+// property (never the literal name), a first message gets the same dead-air
+// treatment as the main chat, the conversation survives close/reopen, and the
+// concierge `context` seam attaches without being wired. Sends are intercepted so
+// the machine is exercised deterministically; obs + reply are injected like flow
+// 6f. World is forced non-c on these pages so the assistant actually mounts
+// (App gates world c to the no-LLM advisory — that guard is covered elsewhere).
+{
+  // Timeout-guarded emit (same rationale as flow 6f): a QoS-1 publish blocks
+  // until the broker acks, so cap it rather than risk hanging the whole suite.
+  const emit = (type, corr, payload) => {
+    const args = ['emit', type];
+    if (corr) args.push('--correlation', corr);
+    args.push('--payload', payload);
+    execFileSync(path.join(BIN, 'lanius'), args, { env: ENV, encoding: 'utf8', timeout: 15000 });
+  };
+  const forceWorldB = async (page) => {
+    await page.route('**/api/status', async (route) => {
+      const resp = await route.fetch();
+      const j = await resp.json().catch(() => ({}));
+      j.llm = { ...(j.llm || {}), world: 'b' };
+      await route.fulfill({ response: resp, json: j });
+    });
+  };
+  // Start each helper page with a clean slate: the panel's session persists in
+  // localStorage (shared across pages in this one browser context), and an
+  // earlier flow's retained helper tool-call would otherwise replay into a page
+  // that inherits its session. Cleared before app code runs.
+  const freshHelper = async (page) => {
+    await page.addInitScript(() => {
+      try { localStorage.removeItem('lanius.helperSession'); localStorage.setItem('lanius.aiPanel', '0'); } catch { /* ignore */ }
+    });
+  };
+  const openPanel = async (page) => {
+    await ensureAiPanelClosed(page);
+    await page.click('#ai-panel-toggle');
+    await page.waitForSelector('#ai-panel .agent-assistant', { timeout: 8000 });
+  };
+
+  // ── M1: browse is free — no auto-send, hidden by property, honest head ──
+  // Prove hide-by-PROPERTY not by name: a panel-surfaced profile with a DIFFERENT
+  // name (panelbot) is hidden too, while a sibling without the property (listbot)
+  // stays in the list. Written to disk before the page loads its agent list.
+  // Also install a REAL helper profile (agent "helper", panel-surfaced): a
+  // configured system has the helper kit, so the live "helper" agent must be
+  // hidden by the same property. In a fresh root the server otherwise SYNTHESIZES
+  // the helper as a mirror of "default" (agent noun "main"), which cannot stand
+  // in for the distinct "helper" noun a real turn lights up.
+  for (const [name, extra] of [
+    ['helper', '\n[ui]\nsurface = "panel"\n\n[model]\nmodel = "claude-sonnet-4-6"\nmax_turns = 24\n'],
+    ['panelbot', '\n[ui]\nsurface = "panel"\n'],
+    ['listbot', ''],
+  ]) {
+    const pdir = path.join(TMP, 'profiles', name);
+    fs.mkdirSync(pdir, { recursive: true });
+    fs.writeFileSync(path.join(pdir, 'profile.toml'), `agent = "${name}"\nowner = "owner"\n${extra}`);
+  }
+
+  const m1 = await newPage();
+  const m1pubs = [];
+  await m1.route('**/api/publish', async (route) => {
+    try { m1pubs.push(JSON.parse(route.request().postData() || '{}')); } catch {}
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await forceWorldB(m1);
+  await freshHelper(m1);
+  await m1.goto('/');
+  await m1.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  // Opening the panel must publish NOTHING (no auto-send / no live turn on mount).
+  const beforeOpen = m1pubs.length;
+  await openPanel(m1);
+  await sleep(1200);
+  m1pubs.length === beforeOpen
+    ? ok('helper(M1): opening the panel publishes nothing — no auto-send')
+    : fail(`helper(M1): opening the panel published ${m1pubs.length - beforeOpen} event(s) — auto-send leaked`);
+  // The intro renders as a static first bubble.
+  const introBubble = await m1.$eval('#ai-panel .agent-assistant-feed', (el) => el.textContent);
+  /Ask me to help you get set up/i.test(introBubble)
+    ? ok('helper(M1): the intro renders as a static first bubble')
+    : fail('helper(M1): the intro bubble did not render');
+  (await m1.$('#ai-panel .agent-assistant-head p')) === null
+    ? ok('helper(M1): the panel head shows no raw session id')
+    : fail('helper(M1): a raw session id is still in the panel head');
+  // The helper is NOT an agent-list row.
+  const navSel = async (page, sel) => (await page.$(`#nav-agents [data-sel="agent:${sel}"]`)) !== null;
+  (await navSel(m1, 'helper')) === false
+    ? ok('helper(M1): no Helper row in the agent list')
+    : fail('helper(M1): the helper appears in the agent list');
+  // Hide-by-property, proven: panelbot (property, different name) hidden; listbot
+  // (no property) visible.
+  const panelbotHidden = (await navSel(m1, 'panelbot')) === false;
+  const listbotShown = (await navSel(m1, 'listbot')) === true;
+  panelbotHidden && listbotShown
+    ? ok('helper(M1): filtering is by the [ui] surface property, not the name (panelbot hidden, listbot shown)')
+    : fail(`helper(M1): property filtering wrong (panelbotHidden=${panelbotHidden}, listbotShown=${listbotShown})`);
+  await m1.close();
+
+  // ── M2: the first message works or says why not ──
+  // Happy path: sent → thinking (obs) → reply. Intercept the send; drive the fake
+  // agent with the captured corr/session, exactly like flow 6f.
+  const m2 = await newPage();
+  const m2pubs = [];
+  await m2.route('**/api/publish', async (route) => {
+    try { m2pubs.push(JSON.parse(route.request().postData() || '{}')); } catch {}
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await forceWorldB(m2);
+  await freshHelper(m2);
+  await m2.goto('/');
+  await m2.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  await openPanel(m2);
+  const helperMsg = `helper-hi-${Date.now()}`;
+  await m2.fill('#ai-panel .agent-assistant-compose input', helperMsg);
+  await m2.click('#ai-panel .agent-assistant-compose button[type="submit"]');
+  await waitFor('helper(M2): the sent mark rides the first message', async () => (await m2.$('#ai-panel [data-sel="assistant-sent"]')) !== null, 8000);
+  await waitFor('helper(M2): the message is still visible in the feed', async () => /helper-hi-/.test(await m2.$eval('#ai-panel .agent-assistant-feed', (el) => el.textContent)), 3000);
+  await waitFor('helper(M2): the browser published the turn', async () => m2pubs.length >= 1, 5000);
+  const hp = m2pubs[m2pubs.length - 1];
+  const hcorr = hp.correlation;
+  const hsession = hp.payload?.session;
+  // The helper's agent noun (in this throwaway root the helper profile is
+  // synthesized as a mirror of "default", so its noun is "main"; on a configured
+  // system it is "helper"). Derive it from the send rather than assuming.
+  const hagent = /^in\/agent\/(.+)$/.test(hp.topic) ? hp.topic.replace('in/agent/', '') : '';
+  hagent
+    ? ok(`helper(M2): the turn publishes to in/agent/${hagent}`)
+    : fail(`helper(M2): unexpected send topic ${hp.topic}`);
+  // Obs on our session = the agent woke → thinking.
+  await fetch(`${BASE}/api/publish`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic: `obs/agent/${hagent}/${hsession}/tool/probe`, payload: { note: 'awake' } }) });
+  await waitFor('helper(M2): obs activity shows the thinking indicator', async () => (await m2.$('#ai-panel [data-sel="assistant-thinking"]')) !== null, 8000);
+  // The correlated reply resolves it and threads into the feed.
+  const hreply = `helper-reply-${Date.now()}`;
+  emit('in/human/owner', hcorr, JSON.stringify({ text: hreply }));
+  await waitFor('helper(M2): the reply lands in the panel', async () => (await m2.$eval('#ai-panel .agent-assistant-feed', (el) => el.textContent)).includes(hreply), 8000);
+  ((await m2.$('#ai-panel [data-sel="assistant-thinking"]')) === null && (await m2.$('#ai-panel [data-sel="assistant-sent"]')) === null)
+    ? ok('helper(M2): the reply resolves the thinking + sent marks')
+    : fail('helper(M2): the panel indicators did not resolve on reply');
+
+  // Stop (wonky bit 4): while a turn is running, stop ends the wait locally
+  // without wedging busy — the input becomes usable again.
+  const stopMsg = `helper-stop-${Date.now()}`;
+  await m2.fill('#ai-panel .agent-assistant-compose input', stopMsg);
+  await m2.click('#ai-panel .agent-assistant-compose button[type="submit"]');
+  await waitFor('helper(M2): stop is offered while the turn runs', async () => (await m2.$('#ai-panel [data-sel="assistant-stop"]')) !== null, 8000);
+  await m2.click('#ai-panel [data-sel="assistant-stop"]');
+  await waitFor('helper(M2): stop ends the wait without wedging busy', async () => {
+    const stopped = /Stopped waiting/i.test(await m2.$eval('#ai-panel .agent-assistant-feed', (el) => el.textContent));
+    const inputEnabled = await m2.$eval('#ai-panel .agent-assistant-compose input', (el) => !el.disabled);
+    const stopGone = (await m2.$('#ai-panel [data-sel="assistant-stop"]')) === null;
+    return stopped && inputEnabled && stopGone;
+  }, 5000);
+  await m2.close();
+
+  // Stalled path: 20s of silence → the honest "No response yet…" line with
+  // check-status + retry; retry re-sends under a fresh corr (consume-once).
+  const m2s = await newPage();
+  const spubs2 = [];
+  await m2s.route('**/api/publish', async (route) => {
+    try { spubs2.push(JSON.parse(route.request().postData() || '{}')); } catch {}
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await forceWorldB(m2s);
+  await freshHelper(m2s);
+  await m2s.goto('/');
+  await m2s.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  await openPanel(m2s);
+  const stallMsg = `helper-stall-${Date.now()}`;
+  await m2s.fill('#ai-panel .agent-assistant-compose input', stallMsg);
+  await m2s.click('#ai-panel .agent-assistant-compose button[type="submit"]');
+  await waitFor('helper(M2): the stalled line appears after 20s of silence', async () => (await m2s.$('#ai-panel [data-sel="assistant-stalled"]')) !== null, 26000);
+  const stallRecourse = (await m2s.$('#ai-panel [data-sel="assistant-stalled-status"]')) !== null && (await m2s.$('#ai-panel [data-sel="assistant-stalled-retry"]')) !== null;
+  stallRecourse ? ok('helper(M2): the stalled line offers check-status and retry') : fail('helper(M2): stalled line missing recourse');
+  /helper-stall-/.test(await m2s.$eval('#ai-panel .agent-assistant-feed', (el) => el.textContent))
+    ? ok('helper(M2): the sent message stays visible under the stalled line')
+    : fail('helper(M2): the sent message vanished under the stalled line');
+  const beforeRetry = spubs2.length;
+  await m2s.$eval('#ai-panel [data-sel="assistant-stalled-retry"]', (el) => { el.click(); el.click(); });
+  await waitFor('helper(M2): retry re-publishes under a fresh correlation', async () => spubs2.length > beforeRetry && spubs2[spubs2.length - 1].correlation !== spubs2[beforeRetry - 1].correlation, 8000);
+  await sleep(500);
+  spubs2.length === beforeRetry + 1
+    ? ok('helper(M2): a double-clicked retry publishes exactly once (consume-once)')
+    : fail(`helper(M2): double-clicked retry published ${spubs2.length - beforeRetry} times, expected 1`);
+  await m2s.close();
+
+  // ── M3: one thread that survives, plus the seam ──
+  const m3 = await newPage();
+  await m3.route('**/api/publish', async (route) => { await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) }); });
+  await forceWorldB(m3);
+  await freshHelper(m3);
+  await m3.goto('/');
+  await m3.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  await openPanel(m3);
+  const sessBefore = await m3.$eval('#ai-panel .agent-assistant', (el) => el.getAttribute('data-session'));
+  // Send something so there is a turn, then close + reopen the panel.
+  await m3.fill('#ai-panel .agent-assistant-compose input', `keepme-${Date.now()}`);
+  await m3.click('#ai-panel .agent-assistant-compose button[type="submit"]');
+  await sleep(300);
+  await m3.click('#ai-panel-toggle');
+  await m3.waitForSelector('#ai-panel', { state: 'detached', timeout: 5000 });
+  await m3.click('#ai-panel-toggle');
+  await m3.waitForSelector('#ai-panel .agent-assistant', { timeout: 8000 });
+  const sessAfter = await m3.$eval('#ai-panel .agent-assistant', (el) => el.getAttribute('data-session'));
+  sessBefore && sessBefore === sessAfter
+    ? ok('helper(M3): reopening the panel continues the same conversation (session persists)')
+    : fail(`helper(M3): the conversation did not persist (${sessBefore} → ${sessAfter})`);
+  // "new conversation" deliberately rotates the session and resets the feed.
+  await m3.click('#ai-panel [data-sel="assistant-new"]');
+  await waitFor('helper(M3): "new conversation" rotates the session', async () => {
+    const s = await m3.$eval('#ai-panel .agent-assistant', (el) => el.getAttribute('data-session'));
+    return s && s !== sessAfter;
+  }, 5000);
+  const userMsgsAfterNew = await m3.$$eval('#ai-panel .agent-assistant-msg.user', (els) => els.length);
+  userMsgsAfterNew === 0
+    ? ok('helper(M3): "new conversation" resets the feed to the intro')
+    : fail(`helper(M3): "new conversation" left ${userMsgsAfterNew} user message(s) behind`);
+
+  // The concierge seam (wonky bit 6): the shipped payload builder attaches a
+  // `context` when present and omits it entirely when absent. Nothing wires it.
+  const seam = await m3.evaluate(() => {
+    const f = window.__assistantSendPayload;
+    return {
+      withCtx: f({ prompt: 'x', session: 's', profile: 'helper', client_tools: [], context: { view: 'providers', detail: { id: 7 } } }),
+      without: f({ prompt: 'x', session: 's', profile: 'helper', client_tools: [] }),
+    };
+  });
+  (seam.withCtx.context && seam.withCtx.context.view === 'providers' && seam.withCtx.context.detail.id === 7)
+    ? ok('helper(M3): the context seam attaches { view, detail } to the send payload when present')
+    : fail(`helper(M3): the context seam did not attach (${JSON.stringify(seam.withCtx)})`);
+  (!('context' in seam.without))
+    ? ok('helper(M3): the payload omits context entirely when none is provided')
+    : fail('helper(M3): context leaked into a payload that had none');
+
+  // The send-time pre-check predicate (wonky bit 3), the SHIPPED guard: broker
+  // down and world c each refuse the send with an honest line; a healthy path
+  // (and no health at all) does not block. (Broker-down cannot be forced through
+  // the live app — the initial SSE status frame reasserts the real broker state —
+  // so the guard is proven here, as chat-liveness proves its own broker-down.)
+  const pre = await m3.evaluate(() => {
+    const f = window.__assistantPreSend;
+    return {
+      brokerDown: f({ brokerConnected: false, llmWorld: 'b' }),
+      worldC: f({ brokerConnected: true, llmWorld: 'c' }),
+      healthy: f({ brokerConnected: true, llmWorld: 'b' }),
+      noHealth: f(undefined),
+    };
+  });
+  (pre.brokerDown && /bus is not connected/i.test(pre.brokerDown.text) && pre.worldC && /answer this/i.test(pre.worldC.text) && pre.healthy === null && pre.noHealth === null)
+    ? ok('helper(M2): the send-time pre-check refuses broker-down and world-c, passes a healthy path')
+    : fail(`helper(M2): pre-check wrong (${JSON.stringify(pre)})`);
+  await m3.close();
+}
+
+// ── flow: package-truth (docs/handoffs/package-truth.md) ──────────────────────
+// The configure package list tells the truth: three plain facts per collapsed
+// row, an off switch on the row, a harness-applicability line, honest repair
+// (allow a needs-review package live; a revoked one says so with NO button), no
+// onscreen "instance", no echo row. Runs LAST — its recent-history revoke parks a
+// stock stage nothing after it needs.
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+  await waitFor('package-truth: select the default agent', async () => {
+    for (const item of await page.$$('#nav-agents .nav-item')) {
+      if (/\bmain\b/.test(await item.textContent())) { await item.click(); return true; }
+    }
+    return false;
+  });
+  await page.click('[data-tab="configure"]');
+  await page.waitForSelector('#view-configure:not([hidden])');
+  await waitForConfigureLoaded(page, 'main');
+  await page.waitForSelector('#cfg-package-configs .cfg-package-card', { timeout: 8000 });
+
+  // M1: the three collapsed-row facts on a daemon package (history is running).
+  const historyCard = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="history"]').first();
+  await waitFor('package-truth(M1): collapsed row states installed + allowed + running', async () => {
+    if (!(await historyCard().count())) return false;
+    const installed = (await historyCard().locator('.cfg-fact-installed').textContent().catch(() => '')) || '';
+    const allowed = (await historyCard().locator('.cfg-fact-allowed').textContent().catch(() => '')) || '';
+    const running = (await historyCard().locator('.cfg-fact-running').textContent().catch(() => '')) || '';
+    return /installed/i.test(installed) && /on by default/i.test(allowed) && /running/i.test(running);
+  });
+  // "on by default" is NOT the same as a chosen "on" — the word is present, not "enabled".
+  await waitFor('package-truth(M1): a match-everything default reads "on by default", never "enabled"', async () => {
+    const allowed = (await historyCard().locator('.cfg-fact-allowed').textContent().catch(() => '')) || '';
+    return /on by default/i.test(allowed) && !/enabled/i.test(allowed);
+  });
+
+  // M1: harness-applicability — a coding-harness adapter package (harness-codex)
+  // says it won't be loaded by this (native) agent, computed from the manifest.
+  const codexCard = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="harness-codex"]').first();
+  await waitFor('package-truth(M1): harness-codex row says it applies to a different harness', async () => {
+    if (!(await codexCard().count())) return false;
+    const line = (await codexCard().locator('.cfg-fact-harness').textContent().catch(() => '')) || '';
+    return /codex coding tool/i.test(line) && /won.t load it/i.test(line);
+  });
+  // A harness-adapter package is not a service — no running fact fabricated for it.
+  (await codexCard().locator('.cfg-fact-running').count()) === 0
+    ? ok('package-truth(M1): harness-codex shows no running fact (not a service)')
+    : fail('package-truth(M1): harness-codex wrongly shows a running fact');
+
+  // M3: no echo row (dropped from the seed + not written on init), no onscreen
+  // "instance" (the grouping key is renamed to a plain phrase for display).
+  (await page.locator('#cfg-package-configs .cfg-package-card[data-package="echo"]').count()) === 0
+    ? ok('package-truth(M3): a fresh init shows no echo row')
+    : fail('package-truth(M3): echo row present after fresh init');
+  // UI-generated copy only (a package's own manifest prose may legitimately say
+  // "instance" — rewording it would change its manifest hash and re-gate grants,
+  // out of this handoff's scope): group headers and source labels must not say it.
+  const uiLabels = await page.$$eval(
+    '#cfg-package-configs .cfg-kit-name, #cfg-package-configs .cfg-package-facts, #cfg-package-configs .cfg-package-repair',
+    (els) => els.map((el) => el.textContent || '').join(' | '),
+  );
+  !/\binstance\b/i.test(uiLabels) && /this installation/.test(uiLabels)
+    ? ok('package-truth(M3): no UI-generated "instance" — the group reads "this installation"')
+    : fail(`package-truth(M3): "instance" leaked into UI labels or the rename is missing: ${uiLabels.slice(0, 200)}`);
+
+  // M1: the off switch lives on the collapsed row and round-trips skills.exclude.
+  const windowToggle = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="window"] .cfg-package-disable').first();
+  if (await windowToggle().count()) {
+    await windowToggle().click();
+    await waitFor('package-truth(M1): collapsed-row toggle writes skills.exclude', async () =>
+      (await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('window'), 5000);
+    await page.locator('#cfg-package-configs .cfg-package-card[data-package="window"] .cfg-package-disable').first().click();
+    await waitFor('package-truth(M1): collapsed-row toggle removes skills.exclude (round-trip)', async () =>
+      !(await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('window'), 5000);
+  } else {
+    fail('package-truth(M1): window collapsed-row toggle not found');
+  }
+
+  // M2: needs-review repair — recent-history ships with `requested` grants; the
+  // row offers "allow and start" and POST /api/admin/approve flips it live.
+  const rhCard = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="recent-history"]').first();
+  const approveBtn = () => rhCard().locator('.cfg-package-approve');
+  if (await approveBtn().count()) {
+    const repairText = await rhCard().locator('.cfg-package-repair').textContent();
+    /not allowed to run yet/i.test(repairText || '')
+      ? ok('package-truth(M2): needs-review row explains the state in plain words')
+      : fail(`package-truth(M2): needs-review copy unexpected: "${repairText}"`);
+    await approveBtn().first().click();
+    await waitFor('package-truth(M2): allow-and-start clears the needs-review repair live', async () =>
+      (await rhCard().locator('.cfg-package-repair').count()) === 0, 8000);
+    const grants = await page.evaluate(async () => {
+      const j = await fetch('/api/admin/packages?profile=default').then((r) => r.json()).catch(() => ({}));
+      const p = (j.packages || []).find((x) => x.name === 'recent-history');
+      return p ? [...new Set((p.grants || []).map((g) => `${g.state}/${g.decided_by}`))] : [];
+    });
+    grants.length === 1 && grants[0] === 'approved/ui'
+      ? ok('package-truth(M2): approve recorded decided_by=ui with no CLI touch')
+      : fail(`package-truth(M2): grants after approve unexpected: ${JSON.stringify(grants)}`);
+  } else {
+    fail('package-truth(M2): recent-history did not offer an allow button');
+  }
+
+  // M2: revoked is TERMINAL — the row says so and offers NO button. Driven off a
+  // real force-revoke of a daemon package (the row reads the ledger immediately);
+  // history itself is left alone so earlier flows stay valid.
+  lanius('revoke', 'recent-history', '--force');
+  // Fresh load via the front door, NOT reload: reloading the /agents/main/config
+  // deep link triggers a pre-existing `/api/admin/profile?name=main` 404 (agent
+  // `main` lives in profile `default`) that trips the console-error gate.
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+  await waitFor('package-truth(M2): reselect the default agent after revoke', async () => {
+    for (const item of await page.$$('#nav-agents .nav-item')) {
+      if (/\bmain\b/.test(await item.textContent())) { await item.click(); return true; }
+    }
+    return false;
+  });
+  await page.click('[data-tab="configure"]');
+  await page.waitForSelector('#view-configure:not([hidden])');
+  await waitForConfigureLoaded(page, 'main');
+  await waitFor('package-truth(M2): a revoked row shows the honest terminal state', async () => {
+    const revoked = rhCard().locator('.cfg-package-repair.repair-revoked');
+    if (!(await revoked.count())) return false;
+    const text = (await revoked.textContent()) || '';
+    return /switched off/i.test(text) && /isn.t supported yet/i.test(text);
+  });
+  (await rhCard().locator('.cfg-package-approve').count()) === 0
+    ? ok('package-truth(M2): a revoked row offers NO approve button (approve is a no-op)')
+    : fail('package-truth(M2): a revoked row wrongly offers an approve button');
+
+  // The shared repair vocabulary the sessions tab and the row both render, driven
+  // through the SHIPPED projections (window.__packageTruth) so every branch is
+  // pinned deterministically — including the dispatcher-down message the manual
+  // check exercises against a live parked stack.
+  const seam = await page.evaluate(() => {
+    const t = window.__packageTruth;
+    return {
+      revoked: t.packageRepair('revoked', { brokerConnected: true, reachable: false }),
+      down: t.packageRepair('allowed', { brokerConnected: false, reachable: false }),
+      needs: t.packageRepair('needs review', { brokerConnected: true }),
+      ok: t.packageRepair('allowed', { brokerConnected: true, reachable: true }),
+      harness: t.harnessApplicability({ manifest: { harness: ['codex'] } }),
+      noHarness: t.harnessApplicability({ manifest: {} }),
+    };
+  });
+  seam.revoked.kind === 'revoked' && seam.revoked.canApprove === false && /switched off/i.test(seam.revoked.message)
+    ? ok('package-truth(M2): repair(revoked) → terminal, no button, honest words')
+    : fail(`package-truth(M2): repair(revoked) wrong: ${JSON.stringify(seam.revoked)}`);
+  seam.down.kind === 'service-down' && seam.down.canApprove === false && /lanius daemon/.test(seam.down.message)
+    ? ok('package-truth(M2): repair(dispatcher down) → the `lanius daemon` message, no button')
+    : fail(`package-truth(M2): repair(down) wrong: ${JSON.stringify(seam.down)}`);
+  seam.needs.kind === 'needs-review' && seam.needs.canApprove === true
+    ? ok('package-truth(M2): repair(needs review) → repairable via the allow button')
+    : fail(`package-truth(M2): repair(needs review) wrong: ${JSON.stringify(seam.needs)}`);
+  seam.ok.kind === 'ok'
+    ? ok('package-truth(M2): repair(running) → nothing to repair')
+    : fail(`package-truth(M2): repair(ok) wrong: ${JSON.stringify(seam.ok)}`);
+  seam.harness && seam.harness.applies === false && /codex/.test(seam.harness.label) && seam.noHarness === null
+    ? ok('package-truth(M1): harnessApplicability is manifest-derived (present for codex, null otherwise)')
+    : fail(`package-truth(M1): harnessApplicability wrong: ${JSON.stringify(seam)}`);
   await page.close();
 }
 
