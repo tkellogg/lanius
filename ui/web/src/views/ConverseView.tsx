@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect } from 'react';
 import Markdown from '../Markdown';
 import AgentChip from '../components/AgentChip';
+import WorkerNotesPanel from '../components/WorkerNotesPanel';
 import { IconButton } from '../components/primitives';
 import { relativeTime, summarize } from '../lib/format';
 
-function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, selectSetup, pending, retryPending, openConversation, newConversation, startBranch, branchOrigin, selectCodeSessions, isTraceAgent, sendLabel, allowHtml }: any) {
+function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, selectSetup, pending, retryPending, openConversation, newConversation, startBranch, branchOrigin, selectCodeSessions, isTraceAgent, workerSessions, owner, sendLabel, allowHtml }: any) {
   const [conversationSearch, setConversationSearch] = useState('');
   // chat-follow M1: "pinned" is derived from scroll position, never a suppress
   // flag (docs/handoffs/chat-follow.md wonky bit 2) — a programmatic scroll-to-
@@ -65,6 +66,11 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
           <p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p>
           <p>{agent} hasn’t sent any messages on the comms plane — its work shows up as a trace.</p>
           <p className="dim-note">There’s no chat conversation here. Watch what it’s doing in the runs surface.</p>
+          {/* worker-notes-panel: the instinct to "message the worker" lands here.
+              The compose relays into the worker's inbox (never the chat
+              projection), and the notes already sent show above it — read back
+              from the durable mail ledger, so they survive a reload. */}
+          <WorkerNotesPanel agent={agent} liveSessions={workerSessions ?? []} owner={owner} />
           <button id="conv-open-runs" className="ghost" type="button" onClick={() => selectCodeSessions && selectCodeSessions()}>open runs ⟶</button>
         </div>
       </div>

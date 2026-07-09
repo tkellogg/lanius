@@ -1347,6 +1347,8 @@ export function App() {
             branchOrigin={sel.kind === 'agent' ? branchOrigins.get(currentConversation(sel.agent)) : undefined}
             selectCodeSessions={selectCodeSessions}
             isTraceAgent={sel.kind === 'agent' && (isWorkerAgentName(sel.agent) || [...(agents.get(sel.agent)?.sessions ?? [])].some((s) => isWorkerSessionId(s)))}
+            workerSessions={sel.kind === 'agent' ? (isWorkerSessionId(sel.agent) ? [sel.agent] : [...(agents.get(sel.agent)?.sessions ?? [])].filter((s: string) => isWorkerSessionId(s))) : []}
+            owner={systemStatus?.owner}
             sendLabel="Send"
             allowHtml={systemStatus?.trust === 'full'}
           />

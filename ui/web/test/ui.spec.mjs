@@ -3098,6 +3098,152 @@ const renamedAgent = 'falcon';
     : fail(`chrome M4: cross-origin deliver not refused (status ${crossOrigin.status})`);
 }
 
+// ── flow: worker-notes-panel — the compose + sent-notes list on the trace surface
+// The "message this worker" instinct lands on the worker's OWN converse (trace)
+// surface: the SHARED <WorkerNoteCompose> (same component the runs detail mounts)
+// plus the notes already sent, read back from the durable mail ledger
+// (/api/comms/mail — `lanius code mail --json`). The truth source is the ledger,
+// so a sent note SURVIVES a page reload. Worker notes never enter the chat
+// projection; this is presentation on the worker's own surface, not a projection.
+{
+  // Seed a note delivered to a worker's inbox: a 4-segment mailbox event, exactly
+  // what `lanius code deliver` records and what the mail projection reads back.
+  // Seeded here (late in the suite) so it is the NEWEST claude-code mail; the panel
+  // groups a worker NOUN's several runs and the picker below is robust either way.
+  const wses = 'code-workernote01';
+  const noteText = 'please rerun the failing parser test';
+  try {
+    lanius('emit', `in/agent/claude-code/${wses}`, '--payload', JSON.stringify({ prompt: noteText }));
+  } catch (e) { fail(`worker-notes: seeding a delivered note failed: ${e.message ?? e}`); }
+
+  // Reach the claude-code worker's converse (trace) surface via the Workers drawer.
+  const openWorkerConverse = async (page) => {
+    const opened = await page.evaluate(() => {
+      const drawer = document.querySelector('#nav-workers');
+      if (drawer && !drawer.open) drawer.open = true;
+      const btns = [...document.querySelectorAll('#nav-workers .nav-worker')];
+      const hit = btns.find((b) => (b.textContent || '').includes('claude-code'));
+      if (!hit) return false;
+      hit.click();
+      return true;
+    });
+    if (!opened) return false;
+    await page.waitForSelector('#agent-tabs', { state: 'visible' });
+    await page.click('[data-tab="converse"]');
+    await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+    return true;
+  };
+  // A worker noun can cover several runs; the panel shows a run picker. Select the
+  // run whose inbox holds our seeded note (runs are labelled "run N" — no raw id —
+  // so we probe each option until the note surfaces). Robust to run ordering AND to
+  // the panel's async mail fetch (retries until the ledger read lands, or times out).
+  const selectRunWithNote = async (page, timeoutMs = 10000) => {
+    const listText = async () => page.$eval('[data-sel="worker-notes-list"]', (el) => el.textContent).catch(() => null);
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      const hasPicker = await page.$('.worker-notes-pick select');
+      if (!hasPicker) {
+        const txt = await listText();
+        if (txt !== null && new RegExp(noteText).test(txt)) return true;
+      } else {
+        const count = await page.$$eval('.worker-notes-pick select option', (os) => os.length);
+        for (let i = 0; i < count; i++) {
+          await page.selectOption('.worker-notes-pick select', { index: i });
+          await sleep(200);
+          const txt = await listText();
+          if (txt !== null && new RegExp(noteText).test(txt)) return true;
+        }
+      }
+      await sleep(300);
+    }
+    return false;
+  };
+
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+
+  if (!(await openWorkerConverse(page))) {
+    fail('worker-notes: claude-code worker not reachable in the Workers drawer');
+  } else {
+    await waitFor('worker-notes: worker converse lands on the trace fallback', async () =>
+      (await page.$eval('#view-converse', (el) => el.getAttribute('data-mode')).catch(() => null)) === 'trace', 10000);
+
+    // 1) The shared compose renders on the trace surface (the instinct lands here).
+    await waitFor('worker-notes: the send-a-note compose renders on the trace surface', async () =>
+      !!(await page.$('[data-sel="worker-note"] .worker-note-input')), 10000);
+    const framing = await page.$eval('[data-sel="worker-note"] .worker-note-sub', (el) => el.textContent).catch(() => '');
+    /running job, not a chat/i.test(framing)
+      ? ok('worker-notes: the compose carries the honest "running job, not a chat" framing')
+      : fail(`worker-notes: honest framing missing ("${framing}")`);
+
+    // 2) The note already sent to this worker is listed above the compose (read back
+    //    from the durable mail ledger, not an in-memory echo).
+    (await selectRunWithNote(page))
+      ? ok('worker-notes: the sent note appears in the trace panel (from the mail ledger)')
+      : fail('worker-notes: the seeded note did not surface in the panel');
+    // Language: no raw worker/correlation ids leak into the panel copy.
+    const panelText = await page.$eval('[data-sel="worker-notes"]', (el) => el.textContent).catch(() => '');
+    !/code-workernote01|code-deliver-/.test(panelText)
+      ? ok('worker-notes: the panel shows no raw worker/correlation ids')
+      : fail(`worker-notes: a raw id leaked into the panel ("${panelText.slice(0, 90)}")`);
+
+    // 3) Persistence: reload — the note is still there (ledger-backed, survives reload).
+    await page.reload();
+    await page.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+    if (!(await openWorkerConverse(page))) {
+      fail('worker-notes: worker not reachable after reload');
+    } else {
+      (await selectRunWithNote(page))
+        ? ok('worker-notes: the sent note SURVIVES a page reload (durable ledger, not localStorage)')
+        : fail('worker-notes: the note did not survive a reload');
+
+      // 4) Sending a note through the shared compose shows the accepted verdict and
+      //    POSTs {session, message} to /api/code/deliver. A real green delivery needs
+      //    a live worker record the spec stack does not stand up (same limitation the
+      //    chrome-M4 server-contract test documents), so the route is stubbed to the
+      //    accepted verdict; the server contract itself is covered by that flow above.
+      let posted = null;
+      await page.route('**/api/code/deliver', async (route) => {
+        try { posted = JSON.parse(route.request().postData() || '{}'); } catch { /* ignore */ }
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, delivered: true }) });
+      });
+      await page.fill('[data-sel="worker-note"] .worker-note-input', 'and bump the timeout');
+      await page.click('[data-sel="worker-note"] .worker-note-send');
+      await waitFor('worker-notes: a sent note shows the accepted verdict', async () =>
+        !!(await page.$('[data-sel="worker-note"] [data-deliver-feedback="ok"]')), 8000);
+      posted && posted.session === wses && posted.message === 'and bump the timeout'
+        ? ok('worker-notes: the compose POSTs {worker, note} to /api/code/deliver')
+        : fail(`worker-notes: compose POST payload wrong (${JSON.stringify(posted)})`);
+      await page.unroute('**/api/code/deliver');
+    }
+  }
+  await page.close();
+
+  // A normal (non-worker) chat agent's converse must show NO worker-note compose —
+  // the affordance never leaks into ordinary chat.
+  const chatPage = await newPage();
+  await chatPage.goto('/');
+  await chatPage.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  const clickedChat = await chatPage.evaluate(() => {
+    const btn = [...document.querySelectorAll('#nav-agents .nav-agent')][0];
+    if (!btn) return null;
+    btn.click();
+    return btn.getAttribute('data-sel');
+  });
+  if (!clickedChat) {
+    fail('worker-notes: no ordinary chat agent to check for compose leakage');
+  } else {
+    await chatPage.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+    await sleep(600);
+    const leaked = await chatPage.$('[data-sel="worker-note"]');
+    !leaked
+      ? ok(`worker-notes: no worker-note compose leaks into an ordinary chat agent (${clickedChat})`)
+      : fail(`worker-notes: the worker-note compose leaked into a chat agent (${clickedChat})`);
+  }
+  await chatPage.close();
+}
+
 // ── flow: helper-first-encounter (docs/handoffs/helper-first-encounter.md) ────
 // The helper's first encounter: opening the panel is FREE (no auto-send, nothing
 // durable), the helper is hidden from the agent list by a GENERIC profile
