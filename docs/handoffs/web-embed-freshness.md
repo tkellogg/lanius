@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Fable 5 (planner) under Fable, for Tim
 last-updated: 2026-07-08
 ---
@@ -116,3 +116,21 @@ historical references (handoff logs), no live instructions.
 
 - 2026-07-08 — planned (Fable 5 under Fable). Decisions fixed in round-2
   planning: committed dist stays, no-npm warns loudly, watch src not dist.
+- 2026-07-08 — implemented (Opus worker): build.rs + Cargo.toml (comment +
+  `build.rs` added to the include allowlist). All acceptance checks
+  observed passing incl. full ui.spec.mjs against a bare cargo-built
+  binary; staleness ritual retired.
+- 2026-07-08 — VERIFIED (adversarial Opus, fresh context; the planned
+  GPT-5.5 verifier channel was unavailable — `lanius code codex --headless`
+  workers SIGKILLed in this environment, noted for Fable). Verdict:
+  {pass:true, build_ok:true, tests_ok:true} — cargo test 596 pass, e2e ALL
+  PASS, freshness/no-op-rebuild/skip-flag/no-npm all confirmed empirically.
+  Issues: (1) MEDIUM "committed dist" messaging was false — dist is
+  GITIGNORED in this repo; fixed by the planner post-verify: warnings now
+  say "existing dist", and every fallback path checks dist/index.html
+  exists, panicking with a clear message instead of letting include_dir!
+  fail opaquely on a fresh no-Node clone. (2) LOW cosmetic stale-warning
+  replay on no-op recompiles — accepted. RESIDUAL for Tim/Fable: decide
+  whether to actually commit ui/web/dist (makes no-Node fresh-clone builds
+  work; costs diff churn) — the wonky-bit-1 premise assumed it was already
+  committed and it is not.

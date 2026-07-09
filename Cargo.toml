@@ -7,18 +7,23 @@ description = "lanius: a minimal event-driven agent harness (inetd + cron + git 
 
 # What ships in the published crate. `include` is an explicit allowlist (it
 # overrides .gitignore), so it MUST cover everything the binary compiles against:
-# `src`, the `include_str!` roots in src/initcmd.rs (`packages/`, `kits/`), and
-# the web UI that src/web.rs embeds via `include_dir!` (`ui/web/dist`, a build
-# output that is gitignored — the publish step below builds it first). Miss one
-# and `cargo install` fails to compile on the user's machine.
+# `src`, `build.rs`, the `include_str!` roots in src/initcmd.rs (`packages/`,
+# `kits/`), and the web UI that src/web.rs embeds via `include_dir!`
+# (`ui/web/dist`, a build output that is gitignored). Miss one and `cargo
+# install` fails to compile on the user's machine.
 #
-# BUILD/PUBLISH ORDER (see docs/handoffs/web-packaging.md): ui/web/dist must
-# EXIST before `cargo build`/`cargo publish`, because include_dir! embeds it at
-# COMPILE time:
-#   1. (cd ui/web && npm ci && npm run build)   # produce ui/web/dist
-#   2. cargo build  /  cargo publish            # embeds dist, ships the allowlist
+# BUILD ORDER is now automatic: `build.rs` runs the vite build into ui/web/dist
+# BEFORE the crate compiles, so a plain `cargo build` always embeds a fresh UI —
+# no manual rebuild-dist-then-re-embed ritual. On a machine with no npm / no ui
+# source (e.g. a published source tarball, which ships only `ui/web/dist`, not
+# `ui/web/src`), build.rs warns loudly and embeds the existing dist as-is. Set
+# `LANIUS_SKIP_UI_BUILD=1` to skip the npm build and embed the existing dist
+# (broken local Node, CI oddities). Note: dist is gitignored, NOT committed —
+# a fresh no-Node clone has no dist and build.rs fails with a clear message.
+# See build.rs and docs/handoffs/web-embed-freshness.md.
 include = [
     "src/**/*",
+    "build.rs",
     "packages/**/*",
     "kits/**/*",
     "templates/**/*",
