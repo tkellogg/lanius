@@ -143,6 +143,14 @@ there should be a sanctioned "say something to this worker" affordance
 and the observe-vs-converse distinction should be legible rather than a
 silent wall.
 
+Learned the hard way (2026-07-09, first live use): the affordance must live
+**where the instinct goes**, which is the worker's own panel — the thing you
+land on when you click the worker in the agent list — not only on a separate
+runs surface. Tim found the runs-detail compose only after asking; "shipped
+the feature, missed the doorway." And a sent note must be *visible after
+sending*, on that same panel, surviving a reload — a note that vanishes into
+an inbox with no echo reads as a failed send even when delivery worked.
+
 The deeper principle underneath both is the one in
 [../layering.md](../layering.md): the product speaks the user's language, not the
 kernel's. "Session" is an internal word; nobody chatting with their agent should
