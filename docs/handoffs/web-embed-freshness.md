@@ -51,13 +51,24 @@ no Node at all.
    without watching dist.
 4. **Skip the npm run when nothing changed.** cargo already handles this via
    rerun-if-changed; do not add your own mtime comparison logic on top.
-5. **Fail loudly if npm exists and the build FAILS.** A present-but-broken
-   UI build is a real error (panic with the npm output), not a fallback case
-   — falling back silently would re-create the staleness bug with extra
-   steps.
+5. **Two distinct failure cases — do not conflate them.**
+   - A failing `npm --prefix ui/web install` (dependency FETCH — airgapped
+     machine, network hiccup, registry down) → WARN LOUDLY and fall back to
+     the committed dist. The dist is a valid artifact; hard-failing
+     `cargo install` on a network problem is worse than the warning.
+   - A failing npm run BUILD with npm + deps present → panic with the npm
+     output. A present-but-broken UI build is a real error; falling back
+     silently would re-create the staleness bug with extra steps. The panic
+     message must mention the `LANIUS_SKIP_UI_BUILD=1` escape hatch (wonky
+     bit 7).
 6. **Use `npm --prefix ui/web run build`** (no `cd`), and prefer
    `npm ci`-less operation: if `node_modules` is missing, run
    `npm --prefix ui/web install` first (warn that it is doing so).
+7. **Escape hatch: `LANIUS_SKIP_UI_BUILD=1`.** When set, build.rs skips the
+   npm step entirely and embeds the committed dist, with the same loud
+   `cargo:warning`. Someone will need it (broken local Node, CI oddity),
+   and it beats them hacking build.rs. Documented in the panic message and
+   in the M2 doc updates.
 
 ## Milestones
 
@@ -65,8 +76,13 @@ no Node at all.
 
 Add `build.rs` at the repo root implementing the decision table above:
 
-- `ui/web/src` exists AND `npm` resolves on PATH → run the UI build into
-  `ui/web/dist`; panic with output on a non-zero exit.
+- `LANIUS_SKIP_UI_BUILD=1` set → skip the npm step, loud warning, succeed
+  (and `cargo:rerun-if-env-changed=LANIUS_SKIP_UI_BUILD`).
+- `ui/web/src` exists AND `npm` resolves on PATH → ensure deps (install if
+  `node_modules` missing; a FAILED install warns loudly and falls back to
+  the committed dist), then run the UI build into `ui/web/dist`; panic with
+  output on a non-zero BUILD exit, naming `LANIUS_SKIP_UI_BUILD=1` as the
+  escape hatch.
 - otherwise → `cargo:warning=web UI: embedding the committed ui/web/dist
   as-is (npm not found / no ui source); install Node and rebuild to refresh
   the interface` and succeed.
@@ -81,6 +97,8 @@ Add `build.rs` at the repo root implementing the decision table above:
   (check timestamps / build output).
 - With npm hidden from PATH (`PATH=/usr/bin:/bin cargo build` or similar),
   the build succeeds and prints the warning.
+- With `LANIUS_SKIP_UI_BUILD=1`, the build succeeds, skips npm entirely,
+  and prints the warning.
 - `cargo test` passes; `npm run test:ui` (full ui.spec.mjs) passes against a
   binary produced by a bare `cargo build`.
 
@@ -88,7 +106,8 @@ Add `build.rs` at the repo root implementing the decision table above:
 
 Update the staleness notes: Cargo.toml:11-19 ordering comment and any
 mention of the manual `touch src/web.rs` step in docs/ now describe the
-build.rs behavior instead.
+build.rs behavior instead, including the `LANIUS_SKIP_UI_BUILD=1` escape
+hatch and the install-failure fallback.
 
 **Acceptance:** `grep -rn "touch src/web.rs" docs/ Cargo.toml` returns only
 historical references (handoff logs), no live instructions.

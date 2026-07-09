@@ -63,6 +63,24 @@ does not gate the spawn — it gates what the running actor is *allowed to do*
 - **Named residual (follow-up handoff, not this one):** a proper
   start/restart-the-service affordance as a package + permission.
 
+Refinement (planner, same day): the spawn is unconditional, but the BROKER
+enforces grants per package actor (src/broker.rs:296, 333 — a
+supervisor-minted actor is grant-scoped; unapproved subscribe/publish are
+denied). So "parked" = process alive, capabilities denied — approval
+un-parks it live, consistent with web.rs's "approve the package if it is
+parked" copy. Also: history is a PROTECTED stdlib package — `lanius revoke`
+refuses it without `--force` (src/main.rs:312, 1538; src/kit.rs:344
+`protected_packages`).
+
+**MANDATORY pre-impl verification (planner runs it before dispatching this
+handoff; result recorded in the Log):** in a scratch root with the daemon
+running, `lanius revoke history --force`, then observe (a) the history
+daemon still spawns, (b) the sessions tab genuinely degrades to the 503
+"parked" state, (c) POST /api/admin/approve restores transcripts live
+within a tick, no restarts. M2's acceptance assumes yes/yes/yes — if the
+experiment disagrees, restate M2 to the observed truth BEFORE implementing
+the button.
+
 ## Wonky bits / decisions (already made)
 
 1. **"Enabled" decomposes into three visible facts per collapsed row, plus a
@@ -140,11 +158,15 @@ panel or `lanius profile show`); full ui.spec.mjs green.
 
 Wonky bit 3, both directions (row ↔ sessions tab).
 
-**Acceptance:** with the history package parked (revoke it first), the
-package row AND the sessions tab show the same state and the row's "allow
-and start" button repairs it end-to-end (approve → dispatcher tick →
-transcripts load) with no CLI touch; with the dispatcher stopped, both
-surfaces show the `lanius daemon` message and NO button pretends otherwise.
+**Acceptance:** with the history package parked (`lanius revoke history
+--force` — it is protected, plain revoke refuses; see the spike
+refinement), the package row AND the sessions tab show the same state and
+the row's "allow and start" button repairs it end-to-end (approve →
+capabilities reattach → transcripts load) with no CLI touch; with the
+dispatcher stopped, both surfaces show the `lanius daemon` message and NO
+button pretends otherwise. (Scenario contingent on the mandatory pre-impl
+verification above — if parked proves unreachable this way, the milestone
+is restated to the observed truth first.)
 
 ### M3 — copy: one-liners, "instance", echo seed
 
