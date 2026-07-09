@@ -18,6 +18,72 @@ const PARENT_PATH = '$parent';
 // (agent-comms.high_priority_threshold = 5).
 const HIGH_PRIORITY_THRESHOLD = 5;
 
+// ── client-side routing (docs/handoffs/web-ui-routing.md) ────────────────────
+// This app is one stateful console with a single centralized `sel` selection
+// model, not a nested route-loader tree, so per the handoff we hand-roll a small
+// History-API router rather than adopt React Router. `selToPath`/`pathToSel` are
+// the pure, invertible mapping between a selection and a product-facing URL;
+// `App`'s `navigate` wraps `setSel` with `pushState`, and a `popstate` listener
+// restores `sel` from `window.location` so Back/Forward and reload/deep-link all
+// work. Product-facing, stable paths — names/ids are URI-encoded here and decoded
+// defensively in `pathToSel`.
+export type AgentTab = 'converse' | 'sessions' | 'telemetry' | 'configure';
+export type Sel =
+  | { kind: 'welcome' }
+  | { kind: 'signals' }
+  | { kind: 'setup' }
+  | { kind: 'comms' }
+  | { kind: 'providers' }
+  | { kind: 'code-sessions'; focus?: string }
+  | { kind: 'agent'; agent: string; tab: AgentTab };
+// agent tab ⇄ URL segment. `converse` is the bare /agents/:agent (no suffix).
+const TAB_TO_SEG: Record<AgentTab, string> = { converse: '', configure: 'config', sessions: 'history', telemetry: 'activity' };
+const SEG_TO_TAB: Record<string, AgentTab> = { config: 'configure', history: 'sessions', activity: 'telemetry' };
+
+export function selToPath(sel: Sel): string {
+  switch (sel.kind) {
+    case 'welcome': return '/';
+    case 'setup': return '/setup';
+    case 'signals': return '/activity';
+    case 'comms': return '/comms';
+    case 'providers': return '/providers';
+    case 'code-sessions': return sel.focus ? `/runs/${encodeURIComponent(sel.focus)}` : '/runs';
+    case 'agent': {
+      const base = `/agents/${encodeURIComponent(sel.agent)}`;
+      const seg = TAB_TO_SEG[sel.tab];
+      return seg ? `${base}/${seg}` : base;
+    }
+  }
+}
+
+// Parse a pathname back into a Sel. Unknown or malformed paths fall back to
+// welcome (the caller replaceState-normalizes the URL to match). Segments are
+// decoded defensively — a bad %-escape yields welcome rather than throwing.
+export function pathToSel(pathname: string): Sel {
+  let parts: string[];
+  try {
+    parts = pathname.split('/').filter(Boolean).map((s) => decodeURIComponent(s));
+  } catch {
+    return { kind: 'welcome' };
+  }
+  if (parts.length === 0) return { kind: 'welcome' };
+  switch (parts[0]) {
+    case 'setup': return { kind: 'setup' };
+    case 'activity': return { kind: 'signals' };
+    case 'comms': return { kind: 'comms' };
+    case 'providers': return { kind: 'providers' };
+    case 'runs': return parts[1] ? { kind: 'code-sessions', focus: parts[1] } : { kind: 'code-sessions' };
+    case 'agents': {
+      const agent = parts[1];
+      if (!agent) return { kind: 'welcome' };
+      if (parts[2] === undefined) return { kind: 'agent', agent, tab: 'converse' };
+      const tab = SEG_TO_TAB[parts[2]];
+      return tab ? { kind: 'agent', agent, tab } : { kind: 'welcome' };
+    }
+    default: return { kind: 'welcome' };
+  }
+}
+
 const arr = (v: unknown) => String(v ?? '').split(',').map((x) => x.trim()).filter(Boolean);
 const csv = (values: unknown) => Array.isArray(values) ? values.join(', ') : '';
 const shortTs = (t: unknown) => (typeof t === 'string' ? t.replace('T', ' ').slice(0, 19) : '');
@@ -596,24 +662,65 @@ export function App() {
     return [...agents.keys()][0] ?? null;
   };
 
-  const selectWelcome = () => setSel({ kind: 'welcome' });
-  const selectSignals = () => { setFilter('signals'); setSel({ kind: 'signals' }); };
+  // ── routing (docs/handoffs/web-ui-routing.md M2) ───────────────────────────
+  // `navigate` is the one path that mutates `sel`: it pushes (or replaces) a
+  // browser-history entry keyed by `selToPath` and then applies the selection.
+  // `applyRoute` runs the imperative side-effects the declarative
+  // useEffect([sel.kind, sel.agent, sel.tab]) below does NOT cover (the signals
+  // filter), so a Back/Forward-restored view matches a freshly-clicked one; the
+  // effect still owns setup/configure/sessions/converse loading off `sel`.
+  const applyRoute = (next: Sel) => {
+    if (next.kind === 'signals') setFilter('signals');
+    setSel(next);
+  };
+  const navigate = (next: Sel, mode: 'push' | 'replace' = 'push') => {
+    const path = selToPath(next);
+    if (mode === 'replace' || path === window.location.pathname) {
+      window.history.replaceState(null, '', path);
+    } else {
+      window.history.pushState(null, '', path);
+    }
+    applyRoute(next);
+  };
+
+  const selectWelcome = () => navigate({ kind: 'welcome' });
+  const selectSignals = () => navigate({ kind: 'signals' });
   // Observability M4: the coding-session tree (a "workers" surface). Minimal mount
   // — final placement belongs in the Workers nav the chat track is building.
-  const selectCodeSessions = () => setSel({ kind: 'code-sessions' });
+  const selectCodeSessions = () => navigate({ kind: 'code-sessions' });
   // agent-comms-ui M2: the cross-agent comms plane (agent-to-agent mail + rooms).
-  const selectComms = () => setSel({ kind: 'comms' });
+  const selectComms = () => navigate({ kind: 'comms' });
   // model-providers M4: the Providers page (the named, encrypted credential vault).
-  const selectProviders = () => setSel({ kind: 'providers' });
+  const selectProviders = () => navigate({ kind: 'providers' });
   // agent-comms-ui M2: cross-link a comms participant to its run in the runs view.
-  const selectCodeSession = (session: string) => setSel({ kind: 'code-sessions', focus: session });
+  const selectCodeSession = (session: string) => navigate({ kind: 'code-sessions', focus: session });
   const selectSetup = (status?: any) => {
-    setSel({ kind: 'setup' });
+    navigate({ kind: 'setup' });
     void loadSetup(status);
   };
   const selectAgent = (agent: string, tab?: string) => {
-    setSel((prev: any) => ({ kind: 'agent', agent, tab: tab ?? (prev.kind === 'agent' && prev.agent === agent ? prev.tab : 'converse') }));
+    // Read the prior tab from refs (kept in sync each render) rather than a
+    // functional setSel updater, so `navigate`'s single pushState isn't at risk
+    // of a double-invoked reducer: reselecting the same agent keeps its tab.
+    const prev = refs.current.sel;
+    const nextTab = (tab ?? (prev?.kind === 'agent' && prev.agent === agent ? prev.tab : 'converse')) as AgentTab;
+    navigate({ kind: 'agent', agent, tab: nextTab });
   };
+
+  // On mount, normalize the URL → sel: a reload/deep-link lands directly on that
+  // view, and an unknown/malformed path replaces to '/'. popstate then restores
+  // sel as the user walks Back/Forward. Runs once — navigate() owns every push
+  // after this. loadSetup/loadConfigure/loadConversations fire off the sel-change
+  // effect below, so a deep-linked view hydrates its data without extra wiring.
+  useEffect(() => {
+    const initial = pathToSel(window.location.pathname);
+    window.history.replaceState(null, '', selToPath(initial));
+    applyRoute(initial);
+    const onPop = () => applyRoute(pathToSel(window.location.pathname));
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // M2 (agentic-configuration): the helper's client tools — "access to
   // everything the UI has access to", starting with reads + navigation.

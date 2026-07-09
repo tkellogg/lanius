@@ -85,6 +85,15 @@ async function newPage() {
     if (/model list unavailable/i.test(t)) return;
     // history probe returns 503 before the package is installed — expected.
     if (/503|Service Unavailable/i.test(t)) return;
+    // Routing flow: deep-linking a run that isn't in the fixture 404s its read
+    // endpoints (/api/code/sessions|estimate|blocks for `code-deeplink01`), and
+    // the M3 missing-asset probe deliberately fetches `/does-not-exist.js`. Both
+    // are expected 404s in this suite; a real missing bundle asset would carry a
+    // different URL and still trip the gate.
+    if (/404/.test(t)) {
+      const url = msg.location?.().url ?? '';
+      if (/code-deeplink01|does-not-exist\.js/.test(url)) return;
+    }
     consoleErrors.push(`[console.error] ${t}`);
     console.error(`BROWSER CONSOLE ERR: ${t}`);
   });
@@ -2634,6 +2643,109 @@ const renamedAgent = 'falcon';
       return text.includes(`tool/navigate/call`) && text.includes(`tool/navigate/result`) && text.includes(sessionText);
     }, 8000);
   }
+  await page.close();
+}
+
+// ── flow N: client-side routing / browser history ────────────────────────────
+// docs/handoffs/web-ui-routing.md. Every primary surface has a stable, product-
+// facing URL; nav clicks push history; Back/Forward and reload/deep-link restore
+// the right view. The redesigned UI has no dedicated coding-agent config page, so
+// the handoff's "coding-agent gears" case is exercised here against the agent
+// configure tab instead; the M3 Rust SPA fallback is checked at the HTTP layer.
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  await ensureAiPanelClosed(page);
+  const agentName = (await page.$eval('#nav-agents .nav-item', (el) => (el.getAttribute('data-sel') || '').replace(/^agent:/, '')).catch(() => '')) || 'main';
+  const pathname = () => page.evaluate(() => window.location.pathname);
+
+  // Nav clicks push a clean URL without a full page reload.
+  await page.click('.nav-providers');
+  await page.waitForSelector('#view-providers', { timeout: 5000 });
+  (await pathname()) === '/providers'
+    ? ok('routing: clicking providers pushes /providers')
+    : fail(`routing: providers URL wrong (${await pathname()})`);
+  await page.click('.nav-setup');
+  await page.waitForSelector('#view-setup:not([hidden])', { timeout: 5000 });
+  (await pathname()) === '/setup'
+    ? ok('routing: clicking setup pushes /setup')
+    : fail(`routing: setup URL wrong (${await pathname()})`);
+
+  // Browser Back restores the previous view AND its URL (no reload).
+  await page.goBack();
+  await page.waitForSelector('#view-providers', { timeout: 5000 });
+  (await pathname()) === '/providers'
+    ? ok('routing: Back restores the /providers view')
+    : fail(`routing: Back did not restore providers (${await pathname()})`);
+  // Forward returns to setup.
+  await page.goForward();
+  await page.waitForSelector('#view-setup:not([hidden])', { timeout: 5000 });
+  (await pathname()) === '/setup'
+    ? ok('routing: Forward restores /setup')
+    : fail(`routing: Forward did not restore setup (${await pathname()})`);
+
+  // Deep-link / reload on a top-level page renders that page, not welcome.
+  await page.goto('/providers');
+  const providersDirect = await page.waitForSelector('#view-providers', { timeout: 5000 }).then(() => true).catch(() => false);
+  const welcomeHidden = await page.$eval('#view-welcome', (el) => el.hasAttribute('hidden')).catch(() => true);
+  providersDirect && welcomeHidden
+    ? ok('routing: deep-link /providers renders providers, not welcome')
+    : fail('routing: deep-link /providers did not render providers');
+
+  // Reload on an agent config path stays on that agent's configure tab.
+  await page.goto(`/agents/${encodeURIComponent(agentName)}/config`);
+  await page.waitForSelector('#view-configure:not([hidden])', { timeout: 8000 });
+  await waitForConfigureLoaded(page, agentName);
+  const cfgActive = await page.$eval('#agent-tabs [data-tab="configure"]', (el) => el.getAttribute('aria-pressed') === 'true').catch(() => false);
+  cfgActive && (await pathname()) === `/agents/${encodeURIComponent(agentName)}/config`
+    ? ok(`routing: deep-link /agents/${agentName}/config restores the configure tab`)
+    : fail(`routing: agent config deep-link wrong (active=${cfgActive}, path=${await pathname()})`);
+
+  // Agent tab buttons update the path, not just the visible tab.
+  await page.click('#agent-tabs [data-tab="sessions"]');
+  await page.waitForSelector('#view-sessions:not([hidden])', { timeout: 5000 });
+  (await pathname()) === `/agents/${encodeURIComponent(agentName)}/history`
+    ? ok('routing: an agent tab click updates the URL to /history')
+    : fail(`routing: agent tab did not update URL (${await pathname()})`);
+  // Back from the history tab returns to the configure tab (same agent).
+  await page.goBack();
+  await page.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
+  (await pathname()) === `/agents/${encodeURIComponent(agentName)}/config`
+    ? ok('routing: Back from a tab returns to the prior tab URL')
+    : fail(`routing: Back from tab wrong (${await pathname()})`);
+
+  // Deep-link a focused run URL restores the runs surface (the row focus depends
+  // on the projection fixture; the surface itself is the durable assertion).
+  await page.goto('/runs/code-deeplink01');
+  const runsFocused = await page.waitForSelector('[data-sel="code-sessions"].on', { timeout: 5000 }).then(() => true).catch(() => false);
+  runsFocused && (await pathname()) === '/runs/code-deeplink01'
+    ? ok('routing: deep-link /runs/:session restores the runs surface')
+    : fail(`routing: deep-link /runs/:session failed (active=${runsFocused}, path=${await pathname()})`);
+
+  // Unknown / malformed paths normalize to '/' and show welcome.
+  await page.goto(`/agents/${encodeURIComponent(agentName)}/bogus-subview`);
+  await page.waitForSelector('#view-welcome:not([hidden])', { timeout: 5000 });
+  (await pathname()) === '/'
+    ? ok('routing: an unknown path normalizes to / and shows welcome')
+    : fail(`routing: unknown path not normalized (${await pathname()})`);
+
+  // M3 (Rust SPA fallback): clean page routes serve the embedded index.html so a
+  // reload/deep-link boots the SPA; a missing asset stays a hard 404.
+  const idxRoot = await page.evaluate(async () => (await fetch('/')).text());
+  const agentDeep = await page.evaluate(async () => { const r = await fetch('/agents/main/config'); return { status: r.status, ct: r.headers.get('content-type') || '', body: await r.text() }; });
+  const codingDeep = await page.evaluate(async () => { const r = await fetch('/coding-agents/config'); return { status: r.status, body: await r.text() }; });
+  const missingAsset = await page.evaluate(async () => (await fetch('/does-not-exist.js')).status);
+  agentDeep.status === 200 && /text\/html/.test(agentDeep.ct) && agentDeep.body === idxRoot
+    ? ok('routing(M3): GET /agents/main/config serves the SPA index.html')
+    : fail(`routing(M3): agent deep-link did not serve index.html (status=${agentDeep.status}, ct=${agentDeep.ct})`);
+  codingDeep.status === 200 && codingDeep.body === idxRoot
+    ? ok('routing(M3): GET /coding-agents/config falls back to index.html')
+    : fail(`routing(M3): coding-agents deep-link fallback failed (status=${codingDeep.status})`);
+  missingAsset === 404
+    ? ok('routing(M3): GET /does-not-exist.js still 404s (asset miss is loud)')
+    : fail(`routing(M3): missing asset returned ${missingAsset}, expected 404`);
+
   await page.close();
 }
 

@@ -1823,6 +1823,39 @@ fn array_values(raw: &str, key: &str) -> Value {
 
 // ---- static (embedded) ----------------------------------------------------
 
+// web-ui-routing M3: the SPA uses clean History-API paths (/agents/main/config,
+// /runs/:session, …), so a reload/deep-link hits the static server with a path
+// that is not an embedded asset. Decide what to serve WITHOUT touching DIST so
+// the rule stays unit-testable: a real embedded asset is served as itself; an
+// unknown *page* route (no file extension, not traversal) falls back to
+// index.html so the SPA boots and routes client-side; an unknown *asset* path
+// (has an extension, e.g. /assets/missing.js) still 404s.
+#[derive(Debug, PartialEq, Eq)]
+enum SpaResolve {
+    Asset,
+    Index,
+    NotFound,
+}
+
+fn spa_resolve(rel: &str, asset_exists: bool) -> SpaResolve {
+    // include_dir lookups can't traverse out of the embedded tree, but reject
+    // obvious traversal so behavior matches the mjs static guard.
+    if rel.split('/').any(|seg| seg == "..") {
+        return SpaResolve::NotFound;
+    }
+    if asset_exists {
+        return SpaResolve::Asset;
+    }
+    // No embedded file: a page route (last segment has no extension) boots the
+    // SPA; an asset-looking miss stays a 404 so bad bundle URLs fail loudly.
+    let last = rel.rsplit('/').next().unwrap_or(rel);
+    if last.contains('.') {
+        SpaResolve::NotFound
+    } else {
+        SpaResolve::Index
+    }
+}
+
 async fn static_file(req: HttpRequest) -> HttpResponse {
     let raw = req.path();
     let rel = if raw == "/" {
@@ -1830,16 +1863,20 @@ async fn static_file(req: HttpRequest) -> HttpResponse {
     } else {
         raw.trim_start_matches('/')
     };
-    // include_dir lookups can't traverse out of the embedded tree, but reject
-    // obvious traversal so behavior matches the mjs static guard.
-    if rel.split('/').any(|seg| seg == "..") {
-        return text_resp(404, "not found");
-    }
-    match DIST.get_file(rel) {
-        Some(f) => HttpResponse::Ok()
-            .content_type(mime_for(rel))
-            .body(f.contents().to_vec()),
-        None => text_resp(404, "not found"),
+    match spa_resolve(rel, DIST.get_file(rel).is_some()) {
+        SpaResolve::Asset => match DIST.get_file(rel) {
+            Some(f) => HttpResponse::Ok()
+                .content_type(mime_for(rel))
+                .body(f.contents().to_vec()),
+            None => text_resp(404, "not found"),
+        },
+        SpaResolve::Index => match DIST.get_file("index.html") {
+            Some(f) => HttpResponse::Ok()
+                .content_type("text/html")
+                .body(f.contents().to_vec()),
+            None => text_resp(404, "not found"),
+        },
+        SpaResolve::NotFound => text_resp(404, "not found"),
     }
 }
 
@@ -3696,5 +3733,37 @@ mod route_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- web-ui-routing M3: clean-path SPA fallback for reload/deep-link ----
+
+    #[test]
+    fn spa_resolve_serves_real_embedded_assets_as_themselves() {
+        // A path that maps to an embedded file is served as that asset, never
+        // shadowed by the index fallback.
+        assert_eq!(spa_resolve("index.html", true), SpaResolve::Asset);
+        assert_eq!(spa_resolve("assets/app.js", true), SpaResolve::Asset);
+    }
+
+    #[test]
+    fn spa_resolve_falls_back_to_index_for_page_routes() {
+        // Clean History-API routes have no file extension and no embedded file:
+        // boot the SPA so it can route client-side (matches `/`'s index.html).
+        assert_eq!(spa_resolve("setup", false), SpaResolve::Index);
+        assert_eq!(spa_resolve("runs", false), SpaResolve::Index);
+        assert_eq!(spa_resolve("runs/code-abc123", false), SpaResolve::Index);
+        assert_eq!(spa_resolve("agents/main/config", false), SpaResolve::Index);
+        assert_eq!(spa_resolve("coding-agents/config", false), SpaResolve::Index);
+    }
+
+    #[test]
+    fn spa_resolve_404s_missing_assets_and_traversal() {
+        // An asset-looking miss (has an extension) must stay a hard 404 so a
+        // broken bundle URL fails loudly instead of silently serving HTML.
+        assert_eq!(spa_resolve("missing.js", false), SpaResolve::NotFound);
+        assert_eq!(spa_resolve("assets/gone.css", false), SpaResolve::NotFound);
+        // Traversal is refused regardless of extension or existence.
+        assert_eq!(spa_resolve("../etc/passwd", false), SpaResolve::NotFound);
+        assert_eq!(spa_resolve("agents/../../secret", false), SpaResolve::NotFound);
     }
 }
