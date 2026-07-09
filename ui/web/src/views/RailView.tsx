@@ -1,6 +1,29 @@
+import { useState } from 'react';
 import { summarize, timeOf } from '../lib/format';
 
+// A stable per-event identity for the disclosure open-state (chrome-polish M3).
+// The ledger event id is the true identity; a live-only frame carries the relay's
+// monotonic `seq` (stable across the ring re-broadcast on reconnect); otherwise a
+// composite of topic+timestamp. Keyed by identity — NOT the buffer index — so an
+// expanded row keeps its content as the feed appends and the ring slides.
+function eventKey(m: any): string {
+  const id = m?.env?.id;
+  if (id != null && id !== '') return `id:${id}`;
+  if (typeof m?.seq === 'number') return `seq:${m.seq}`;
+  return `t:${m?.topic ?? ''}:${m?.env?.ts ?? ''}:${m?.env?.correlation_id ?? ''}`;
+}
+
 function RailView({ hidden, filter, setFilter, paused, setPaused, rows }: any) {
+  // Which rows are expanded, keyed by event identity so expansion survives the
+  // live feed appending and the buffer sliding (a re-render never reshuffles it).
+  const [open, setOpen] = useState<Set<string>>(new Set());
+  const toggle = (k: string) =>
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
   const verbClass = (topic: string) => topic.startsWith('signal/') ? 'v-signal' : topic.startsWith('in/') ? 'v-in' : /^obs\/[^/]+\/[^/]+\/[^/]+\/tool\//.test(topic) ? 'v-tool' : 'v-obs';
   const empty = !paused && rows.length === 0;
   const filtered = filter !== 'all';
@@ -14,7 +37,31 @@ function RailView({ hidden, filter, setFilter, paused, setPaused, rows }: any) {
             <p>{paused ? 'feed paused — press ▶ to resume.' : filtered ? `nothing has arrived on ${filter} yet. this view updates as the agent works.` : 'nothing has arrived yet. this view updates as the agent runs — tool calls, replies, and signals land here live.'}</p>
           </div>
         )}
-        {!paused && rows.map((m: any, i: number) => <div key={`${i}-${m.topic}-${m.env?.id ?? ''}`} className={`row ${verbClass(m.topic)}`}><span className="t">{timeOf(m.env)}</span><span><span className="topic">{m.topic} </span><span className="pay">{summarize(m.env?.payload)}</span></span></div>)}
+        {!paused && rows.map((m: any) => {
+          const k = eventKey(m);
+          const isOpen = open.has(k);
+          // Collapsed rendering stays cheap (600 rows): exactly today's one-liner,
+          // with summarize() only. The full JSON is stringified ONLY when expanded.
+          return (
+            <div key={k} className="rail-item">
+              <div
+                className={`row ${verbClass(m.topic)}${isOpen ? ' row-open' : ''}`}
+                role="button"
+                tabIndex={0}
+                aria-expanded={isOpen}
+                title={isOpen ? 'collapse' : 'show full payload'}
+                onClick={() => toggle(k)}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(k); } }}
+              >
+                <span className="t">{timeOf(m.env)}</span>
+                <span><span className="topic">{m.topic} </span><span className="pay">{summarize(m.env?.payload)}</span></span>
+              </div>
+              {isOpen && (
+                <pre className="row-json">{JSON.stringify(m.env?.payload ?? m.env ?? {}, null, 2)}</pre>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

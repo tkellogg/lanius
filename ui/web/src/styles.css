@@ -21,6 +21,10 @@
   --ask: #B0A8C0;          /* asks: muted slate-lavender */
   --focus: #9FC1E0;        /* focus-visible ring — AA on bg */
   --button-ink: #0F1115;
+  /* Filled-button face (chrome-polish M2): a quiet raised chrome, NOT --ink.
+     Body text (--ink on --bg) stays the highest-contrast mark; a filled button is
+     a subordinate block whose label rides --ink. Keeps the thorn the loudest fill. */
+  --btn-face: #2E333C;
   --bg-glow: #171B24;
   --scanline: rgba(255,255,255,0.010);
   --vignette: rgba(0,0,0,0.55);
@@ -83,6 +87,9 @@
   --ask: #4B4560;          /* muted violet */
   --focus: #1E5D9E;        /* steel-blue ring — AA on paper */
   --button-ink: #FFFFFF;
+  /* Light filled-button face: a quiet raised paper tone, subordinate to the ink
+     body text; the label rides --ink (chrome-polish M2). */
+  --btn-face: #DBDFE4;
   --bg-glow: #EAECEF;
   --scanline: rgba(0,0,0,0.018);
   --vignette: rgba(22,24,29,0.10);
@@ -511,7 +518,7 @@ body {
 .compose input::placeholder { color: var(--meta); }
 .compose button {
   font: 11px var(--mono); letter-spacing: 0.18em; text-transform: uppercase;
-  color: var(--bg); background: var(--ink); border: 0; border-radius: 2px;
+  color: var(--ink); background: var(--btn-face); border: 0; border-radius: 2px;
   padding: 7px 14px; cursor: pointer; transition: transform 0.06s ease;
 }
 .compose-send {
@@ -551,6 +558,16 @@ body {
 .row.v-signal { border-left-color: var(--pain); background: color-mix(in srgb, var(--pain) 5%, transparent); }
 .row.v-signal .topic, .row.v-signal .pay, .row.v-signal .t { color: var(--pain); }
 .row.v-tool .topic { color: var(--tool); }
+/* Activity disclosure (chrome-polish M3): the summary row is a keyboard-operable
+   toggle; the expanded row reveals the full pretty-printed payload beneath it. */
+.row[role="button"] { cursor: pointer; }
+.row.row-open { background: var(--hover-strong); }
+.row-json {
+  margin: 2px 0 6px 14px; padding: 8px 10px; max-height: 320px; overflow: auto;
+  font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--dim);
+  background: var(--code-bg); border-left: 2px solid var(--panel-edge);
+  white-space: pre-wrap; word-break: break-word;
+}
 .row .badge {
   display: inline-block; font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase;
   border: 1px solid currentColor; border-radius: 2px; padding: 0 4px; margin-right: 6px; opacity: 0.8;
@@ -795,7 +812,7 @@ details.setup-fold > summary .dim-note { padding: 0; flex: 1; min-width: 0; over
 	.cfg-package-row button,
 	.cfg-package-card button {
   font: 11px var(--mono); letter-spacing: 0.12em; text-transform: uppercase;
-  color: var(--bg); background: var(--ink); border: 1px solid var(--ink);
+  color: var(--ink); background: var(--btn-face); border: 1px solid var(--panel-edge);
   border-radius: 3px; padding: 6px 11px; cursor: pointer;
 }
 .setup-row button.ghost,
@@ -1011,8 +1028,8 @@ details[open] > summary .cfg-disclosure { transform: rotate(90deg); color: var(-
 }
 .cfg-split-primary,
 .cfg-split-caret {
-  height: 36px; border-color: var(--panel-edge); background: var(--ink);
-  color: var(--bg); font: inherit; font-weight: 650;
+  height: 36px; border-color: var(--panel-edge); background: var(--btn-face);
+  color: var(--ink); font: inherit; font-weight: 650;
 }
 .cfg-split-primary {
   min-width: 84px; padding: 0 14px; border-radius: var(--r-card) 0 0 var(--r-card);
@@ -1020,7 +1037,7 @@ details[open] > summary .cfg-disclosure { transform: rotate(90deg); color: var(-
 }
 .cfg-split-caret {
   width: 30px; border-left: 0; border-radius: 0 var(--r-card) var(--r-card) 0; padding: 0;
-  display: inline-grid; place-items: center; color: var(--bg);
+  display: inline-grid; place-items: center; color: var(--ink);
 }
 .cfg-split-primary:hover,
 .cfg-split-caret:hover { filter: brightness(1.08); }

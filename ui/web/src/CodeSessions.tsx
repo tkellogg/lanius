@@ -529,6 +529,43 @@ export default function CodeSessions({ focus }: { focus?: string } = {}) {
   const [estimate, setEstimate] = useState<EstimateReport | null>(null);
   // M4: the selected session's memory blocks (durable + recomputed ephemeral).
   const [blocks, setBlocks] = useState<BlockRow[]>([]);
+  // chrome-polish M4: the "send a note to this worker" compose. This is an
+  // observe-surface affordance — the note relays through `lanius code deliver`
+  // (POST /api/code/deliver) into the worker's INBOX; it is never a chat message
+  // and never touches the conversation projection. Feedback comes from the CLI
+  // exit (accepted/failed), never a fake delivery promise.
+  const [note, setNote] = useState('');
+  const [sending, setSending] = useState(false);
+  const [deliverFeedback, setDeliverFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  // Clear the compose when the focus moves to a different worker.
+  useEffect(() => {
+    setNote('');
+    setDeliverFeedback(null);
+  }, [selected]);
+  const sendNote = async () => {
+    const message = note.trim();
+    if (!message || !selected) return;
+    setSending(true);
+    setDeliverFeedback(null);
+    try {
+      const r = await fetch('/api/code/deliver', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ session: selected, message }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.delivered) {
+        setDeliverFeedback({ ok: true, text: 'delivered — the worker reads it on its next turn' });
+        setNote('');
+      } else {
+        setDeliverFeedback({ ok: false, text: d.error ? `not delivered: ${d.error}` : `not delivered (HTTP ${r.status})` });
+      }
+    } catch (e) {
+      setDeliverFeedback({ ok: false, text: `not delivered: ${String((e as Error).message ?? e)}` });
+    } finally {
+      setSending(false);
+    }
+  };
 
   // M2 cross-link: when the runs view is opened focused on a comms participant,
   // select that session (and re-select if the focus changes).
@@ -727,6 +764,30 @@ export default function CodeSessions({ focus }: { focus?: string } = {}) {
             {ds.workdir && (<><span>workdir</span><b className="cs-id">{ds.workdir}</b></>)}
           </div>
 
+          {/* chrome-polish M4: say something to this live worker. Honest label +
+              the observe-vs-converse distinction: a running job's inbox, not a
+              chat. The relay reports the CLI's own accepted/failed verdict. */}
+          <div className="cs-sub cs-deliver" id="cs-deliver">
+            <div className="cs-deliver-head">send a note to this worker</div>
+            <div className="cs-dim cs-deliver-note">this is a running job, not a chat — your note goes to its inbox and it reads it on its next turn.</div>
+            <div className="cs-deliver-row">
+              <input
+                className="cs-deliver-input"
+                type="text"
+                value={note}
+                placeholder="a note for this worker…"
+                aria-label="a note for this worker"
+                disabled={sending}
+                onChange={(e) => setNote(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') sendNote(); }}
+              />
+              <button className="cs-btn cs-deliver-send" disabled={sending || !note.trim()} onClick={sendNote}>{sending ? 'sending…' : 'send'}</button>
+            </div>
+            {deliverFeedback && (
+              <div className={deliverFeedback.ok ? 'cs-deliver-ok' : 'cs-err'} data-deliver-feedback={deliverFeedback.ok ? 'ok' : 'err'}>{deliverFeedback.text}</div>
+            )}
+          </div>
+
           {/* Interactive-resume hint: a managed relaunch with the tool's own
               resume flag. Suggestive and per-tool — absent for tools with no clean
               passthrough (codex/opencode), so render only when present. */}
@@ -856,4 +917,12 @@ const CS_STYLE = `
 .cs-block-editor { margin-top: 4px; }
 .cs-block-textarea { width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: 11px; background: var(--field-bg); color: var(--ink); border: 1px solid var(--field-border); border-radius: var(--r-sharp); padding: 5px 6px; resize: vertical; }
 .cs-block-actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+.cs-deliver { border-top: 1px solid var(--panel-edge); padding-top: 8px; }
+.cs-deliver-head { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink); }
+.cs-deliver-note { font-size: 11px; margin: 2px 0 6px; }
+.cs-deliver-row { display: flex; gap: 8px; align-items: center; }
+.cs-deliver-input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px; background: var(--field-bg); color: var(--ink); border: 1px solid var(--field-border); border-radius: var(--r-sharp); padding: 5px 8px; }
+.cs-deliver-input:focus { border-color: var(--field-border-focus); outline: none; }
+.cs-deliver-send { white-space: nowrap; }
+.cs-deliver-ok { color: var(--work); font-family: var(--mono); font-size: 11px; margin-top: 4px; }
 `;

@@ -151,9 +151,12 @@ async function ensureAiPanelClosed(page) {
       root.dataset.theme = theme;
       const css = getComputedStyle(root);
       const hex = (v) => css.getPropertyValue(v).trim();
-      const tok = { bg: hex('--bg'), panel: hex('--panel'), active: hex('--hover'), ink: hex('--ink'), dim: hex('--dim'), meta: hex('--meta') };
+      const tok = { bg: hex('--bg'), panel: hex('--panel'), active: hex('--hover'), ink: hex('--ink'), dim: hex('--dim'), meta: hex('--meta'), btnFace: hex('--btn-face') };
       const min = (fg) => Math.min(ratio(fg, tok.bg), ratio(fg, tok.panel), ratio(fg, tok.active));
-      return { ink: min(tok.ink), dim: min(tok.dim), meta: min(tok.meta) };
+      // chrome-polish M2: body text (ink/bg) is the highest-contrast MARK; a filled
+      // button is a subordinate BLOCK — its face barely departs from the page bg,
+      // and its label (ink on the face) is readable (>=4.5) but below body text.
+      return { ink: min(tok.ink), dim: min(tok.dim), meta: min(tok.meta), bodyText: ratio(tok.ink, tok.bg), btnLabel: ratio(tok.ink, tok.btnFace), btnBlock: ratio(tok.btnFace, tok.bg) };
     };
     const out = { dark: measure('dark'), light: measure('light') };
     if (prior === null) root.removeAttribute('data-theme'); else root.dataset.theme = prior;
@@ -164,6 +167,10 @@ async function ensureAiPanelClosed(page) {
     r.ink >= 4.5 ? ok(`contrast(${theme}): --ink clears AA (${r.ink.toFixed(2)})`) : fail(`contrast(${theme}): --ink below AA (${r.ink.toFixed(2)})`);
     r.dim >= 4.5 ? ok(`contrast(${theme}): --dim clears AA (${r.dim.toFixed(2)})`) : fail(`contrast(${theme}): --dim below AA (${r.dim.toFixed(2)})`);
     r.meta >= 4.5 ? ok(`contrast(${theme}): --meta clears AA (${r.meta.toFixed(2)})`) : fail(`contrast(${theme}): --meta below AA (${r.meta.toFixed(2)})`);
+    // chrome-polish M2: filled buttons are subordinate to body text in BOTH themes.
+    r.btnLabel >= 4.5 && r.btnLabel < r.bodyText && r.btnBlock < r.bodyText
+      ? ok(`contrast(${theme}): filled button subordinate to body text (label ${r.btnLabel.toFixed(2)} < body ${r.bodyText.toFixed(2)}, block ${r.btnBlock.toFixed(2)})`)
+      : fail(`contrast(${theme}): button not subordinate (label ${r.btnLabel.toFixed(2)}, body ${r.bodyText.toFixed(2)}, block ${r.btnBlock.toFixed(2)})`);
   }
   // The harness init seeds a 'default' profile → agent 'main' in the nav.
   await waitFor('boot: default agent visible in nav', async () => {
@@ -283,6 +290,29 @@ const testAgentProfile = 'harrier';
     return false;
   });
   await page.waitForSelector('#agent-tabs', { state: 'visible' });
+  // chrome-polish M1: one meaning per symbol. The configure tab is the WORD
+  // "settings" (not a lone gear that also meant "runs"); the tab strip carries no
+  // bare gear; the runs nav entry no longer borrows the gear sigil; and no lone
+  // gear ICON BUTTON survives anywhere (a ⚙ may stay only next to visible text).
+  {
+    const cfgTabText = await page.$eval('#agent-tabs [data-tab="configure"]', (el) => el.textContent.trim()).catch(() => '');
+    cfgTabText === 'settings'
+      ? ok('chrome M1: the configure tab renders the word "settings"')
+      : fail(`chrome M1: configure tab is not the word settings ("${cfgTabText}")`);
+    const tabHasGear = await page.$eval('#agent-tabs', (el) => (el.textContent || '').includes('⚙')).catch(() => false);
+    !tabHasGear ? ok('chrome M1: the agent tab strip has no bare gear') : fail('chrome M1: a gear survives in the tab strip');
+    const runsSigil = await page.$eval('[data-sel="code-sessions"] .nav-sigil', (el) => el.textContent.trim()).catch(() => '');
+    runsSigil && runsSigil !== '⚙'
+      ? ok(`chrome M1: the runs nav uses a distinct sigil ("${runsSigil}"), not the gear`)
+      : fail(`chrome M1: the runs nav sigil is still the gear ("${runsSigil}")`);
+    const loneGearButtons = await page.evaluate(() =>
+      [...document.querySelectorAll('button, a, [role="button"]')]
+        .filter((el) => (el.textContent || '').trim() === '⚙')
+        .map((el) => el.getAttribute('aria-label') || el.className || el.tagName));
+    loneGearButtons.length === 0
+      ? ok('chrome M1: no lone ⚙ icon button (every survivor sits next to text)')
+      : fail(`chrome M1: lone gear button(s): ${JSON.stringify(loneGearButtons)}`);
+  }
   await page.click('[data-tab="configure"]');
   await page.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
   // loadConfigure is async — wait for it to populate the model field before
@@ -2963,6 +2993,100 @@ const renamedAgent = 'falcon';
   await dead.waitForSelector('#view-setup:not([hidden])', { timeout: 5000 });
   ok('chat-liveness(M3): the no-path setup link navigates to setup');
   await dead.close();
+}
+
+// ── flow: chrome-polish M3 — activity rows expand (disclosure) ───────────────
+// Each RailView row is a disclosure: collapsed = today's one-liner; expanded =
+// the full pretty-printed JSON payload. Rows are keyed by EVENT IDENTITY, so an
+// expanded row keeps its content as the live feed appends and the buffer slides.
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents', { timeout: 10000 });
+  await ensureAiPanelClosed(page);
+  await page.click('.nav-signals');
+  await page.waitForSelector('#view-rail:not([hidden])', { timeout: 5000 });
+  await page.click('button[data-f="all"]');
+  const marker = `chromem3${Date.now().toString(36)}`;
+  const pub = (topic, payload) => page.evaluate(async ({ topic, payload }) => {
+    await fetch('/api/publish', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic, payload }) });
+  }, { topic, payload });
+  await pub(`obs/agent/helper/${marker}/assistant/message`, { marker, note: 'expand me please' });
+  const item = page.locator('#tele-feed .rail-item', { hasText: marker }).first();
+  await item.waitFor({ timeout: 8000 });
+  (await item.locator('pre.row-json').count()) === 0
+    ? ok('chrome M3: an activity row starts collapsed (no JSON payload shown)')
+    : fail('chrome M3: an activity row was expanded before any click');
+  // Click to expand → the full JSON payload appears.
+  await item.locator('.row').click();
+  await waitFor('chrome M3: clicking an activity row reveals the full JSON payload', async () => {
+    if ((await item.locator('pre.row-json').count()) === 0) return false;
+    const t = await item.locator('pre.row-json').textContent();
+    return t.includes(marker) && t.includes('expand me please');
+  }, 5000);
+  // Live appends: publish more events (topics WITHOUT the marker); the expanded
+  // row must keep its content — identity keys survive the buffer sliding.
+  for (let i = 0; i < 4; i++) await pub(`obs/agent/helper/liveappend${i}zz/assistant/message`, { i });
+  await waitFor('chrome M3: an expanded row keeps its payload as new events append', async () => {
+    if ((await item.locator('pre.row-json').count()) === 0) return false;
+    const t = await item.locator('pre.row-json').textContent();
+    return t.includes('expand me please');
+  }, 5000);
+  // Click again collapses it.
+  await item.locator('.row').click();
+  await waitFor('chrome M3: clicking again collapses the row', async () =>
+    (await item.locator('pre.row-json').count()) === 0, 5000);
+  // Pause still works.
+  await page.click('#tele-pause');
+  (await page.$eval('#tele-pause', (el) => el.getAttribute('aria-pressed') === 'true'))
+    ? ok('chrome M3: pause still toggles the feed')
+    : fail('chrome M3: pause toggle broke');
+  await page.close();
+}
+
+// ── flow: chrome-polish M4 — say something to a live worker (deliver) ─────────
+// POST /api/code/deliver relays a human note through `lanius code deliver` into
+// the worker's INBOX — never the chat/conversation projection. The route is
+// worker-only (a non-code-* id is refused 400), the requester is the human owner
+// (a plain worker resume, no reply routed back), and feedback is the CLI's own
+// exit — never a fake delivery promise. The compose UI lives on the runs DETAIL
+// surface, which is projection-gated and NOT stood up in this suite (same
+// treatment as the M4/M5 block/estimate panels, driven by route below); the
+// rendered compose is exercised in the manual live check. Here we assert the
+// server contract the compose drives.
+{
+  // Driven Node-side (like the cross-origin write tests): a same-origin/local
+  // request with no Origin passes the human-proof guard, so these reach the route.
+  // Node-side avoids logging deliberate 4xx as browser console errors (the global
+  // console-error gate).
+  const post = async (headers, body) => {
+    const r = await fetch(`${BASE}/api/code/deliver`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
+    return { status: r.status, body: await r.json().catch(() => ({})) };
+  };
+  // A non-worker (non code-*) session id is refused server-side (400): deliver
+  // must never be coaxed into addressing a chat/agent session.
+  const badId = await post({}, { session: 'web-harrier-x1', message: 'hi' });
+  badId.status === 400
+    ? ok('chrome M4: a non-code-* session id is refused 400 server-side')
+    : fail(`chrome M4: non-code session not refused (status ${badId.status}, body ${JSON.stringify(badId.body)})`);
+  // An empty note is refused 400 (nothing to deliver).
+  const emptyMsg = await post({}, { session: 'code-nope01', message: '   ' });
+  emptyMsg.status === 400 ? ok('chrome M4: an empty note is refused 400') : fail(`chrome M4: empty note not refused (status ${emptyMsg.status})`);
+  // A well-formed code-* id with no worker record: the relay SHELLS the CLI and
+  // reports its honest exit — delivered:false with the "no coding session" error.
+  // That the error is the record lookup (not the CLI's "must run inside a coding
+  // session" guard) proves the requester env was supplied to the child.
+  const relay = await post({}, { session: 'code-ghostworker01', message: 'are you there?' });
+  const relayErr = String(relay.body?.error ?? '');
+  relay.status === 200 && relay.body?.delivered === false && /no coding session|deliver to/i.test(relayErr) && !/must run inside a coding session/i.test(relayErr)
+    ? ok(`chrome M4: the relay shells the CLI and reports its honest exit ("${relayErr.slice(0, 56)}…")`)
+    : fail(`chrome M4: relay/honest-feedback wrong (status ${relay.status}, body ${JSON.stringify(relay.body)})`);
+  // A cross-origin POST is refused by the same human-proof/origin guard publish
+  // uses (CSRF/DNS-rebind) — a foreign Origin is refused.
+  const crossOrigin = await post({ Origin: 'http://evil.example' }, { session: 'code-ghostworker01', message: 'pwned' });
+  crossOrigin.status === 403
+    ? ok('chrome M4: a cross-origin deliver POST is refused by the origin guard (403)')
+    : fail(`chrome M4: cross-origin deliver not refused (status ${crossOrigin.status})`);
 }
 
 if (pageErrors.length) {

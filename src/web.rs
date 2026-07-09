@@ -719,14 +719,109 @@ async fn conversation(
 /// planner so parallel handoffs don't collide in this file; chrome-polish
 /// fills the body.
 async fn code_deliver(
-    _hub: web::types::State<Arc<Hub>>,
-    _req: HttpRequest,
-    _body: Bytes,
+    hub: web::types::State<Arc<Hub>>,
+    req: HttpRequest,
+    body: Bytes,
 ) -> HttpResponse {
-    json_resp(
-        501,
-        json!({ "ok": false, "error": "not implemented yet (chrome-polish M4)" }),
-    )
+    // A human gesture (send a note to a worker): same origin/human-proof gate as
+    // publish, so a hostile page can't relay into a worker's inbox.
+    if !human_proof_ok(&hub.root, &req) {
+        return json_resp(
+            403,
+            json!({ "ok": false, "error": "cross-origin request refused" }),
+        );
+    }
+    let j: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return text_resp(400, "bad json"),
+    };
+    let session = j
+        .get("session")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let message = j
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // Validate the worker-session id shape server-side (mirrors isWorkerSessionId
+    // in ui/web/src/lib/conversation.ts). Deliver is a WORKER-ONLY affordance: a
+    // non-`code-*` id is refused here so it can never be coaxed into addressing a
+    // chat/agent session (the chat-projection filters stay untouched).
+    if !valid_worker_session(&session) {
+        return json_resp(
+            400,
+            json!({ "ok": false, "error": "not a worker (code-*) session" }),
+        );
+    }
+    if message.is_empty() {
+        return json_resp(400, json!({ "ok": false, "error": "empty message" }));
+    }
+    let root = hub.root.clone();
+    // The human OWNER is the requester: `delivery_requester` (src/codeagent.rs)
+    // treats an `owner` sender as a plain worker resume and routes NO reply back —
+    // exactly a "say something" note, not a peer conversation.
+    let requester = secrets::owner_name(&root);
+    let out = web::block(move || cli_deliver(&root, &requester, &session, &message)).await;
+    match out {
+        Ok(r) if r.ok => json_resp(
+            200,
+            json!({ "ok": true, "delivered": true, "detail": r.stdout.trim() }),
+        ),
+        // The relay ran but the CLI refused (e.g. no such worker) — report the exit
+        // honestly, never a fake delivery promise.
+        Ok(r) => json_resp(
+            200,
+            json!({ "ok": false, "delivered": false, "error": cli_err(&r) }),
+        ),
+        Err(_) => json_resp(
+            502,
+            json!({ "ok": false, "error": "deliver relay unavailable" }),
+        ),
+    }
+}
+
+/// True iff `s` is a worker-session id: `code-` followed by one-or-more
+/// `[A-Za-z0-9_-]`. A WHOLE-string match (stricter than the JS prefix regex) so the
+/// id can be handed to the CLI as a single argv token carrying nothing else.
+fn valid_worker_session(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("code-") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Shell `lanius code deliver <session> <message>` with the requester on
+/// `LANIUS_CODE_SESSION`. The generic `cli()` does NOT set it and `code deliver`
+/// refuses to run without a requester session; the web server is not itself a
+/// coding session, so it supplies the human owner explicitly. Mirrors `cli_owned`.
+fn cli_deliver(root: &Root, requester: &str, session: &str, message: &str) -> Result<CliOut> {
+    // Log the gesture without the note body (parity with cli_stdin's secret-safe
+    // line): one greppable `[web:cli]` entry, the session only.
+    weblog("cli", &format!("lanius code deliver {session} <message>"));
+    let exe = std::env::current_exe().context("locating the running lanius binary")?;
+    let out = std::process::Command::new(exe)
+        .args(["code", "deliver", session, message])
+        .env_dual("ROOT", root.dir.display().to_string())
+        .env_dual("CODE_SESSION", requester.to_string())
+        .output()
+        .context("spawning lanius")?;
+    Ok(CliOut {
+        ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        error: if out.status.success() {
+            None
+        } else {
+            Some(format!("exited {}", out.status))
+        },
+    })
 }
 
 async fn code_sessions(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
@@ -3783,5 +3878,26 @@ mod route_tests {
         // Traversal is refused regardless of extension or existence.
         assert_eq!(spa_resolve("../etc/passwd", false), SpaResolve::NotFound);
         assert_eq!(spa_resolve("agents/../../secret", false), SpaResolve::NotFound);
+    }
+
+    #[test]
+    fn code_deliver_accepts_only_whole_code_session_ids() {
+        // The 400-guard core of `code_deliver` (chrome-polish M4): deliver is a
+        // worker-only affordance, so a non-`code-*` id — a chat/agent session, a
+        // room, or an id smuggling an extra argv token — is refused before the CLI
+        // ever runs. Whole-string match, stricter than the JS prefix regex.
+        assert!(valid_worker_session("code-abc123"));
+        assert!(valid_worker_session("code-DEAD_beef-01"));
+        // Not a worker session: chat/agent/other shapes.
+        assert!(!valid_worker_session("web-harrier-x1"));
+        assert!(!valid_worker_session("main"));
+        assert!(!valid_worker_session("agent"));
+        // `code-` with no id, or trailing/embedded junk that could split into a
+        // second CLI arg or escape the id level.
+        assert!(!valid_worker_session("code-"));
+        assert!(!valid_worker_session("code-abc def"));
+        assert!(!valid_worker_session("code-abc/evil"));
+        assert!(!valid_worker_session("code-abc\"; rm -rf"));
+        assert!(!valid_worker_session(""));
     }
 }

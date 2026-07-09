@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 author: Fable 5 (planner) under Fable, for Tim
 last-updated: 2026-07-08
 ---
@@ -137,3 +137,22 @@ projection filters); full ui.spec.mjs green.
 - 2026-07-08 — planned (Fable 5 under Fable). Deliver goes through a
   pre-carved /api/code/deliver stub shelling the CLI; chat-projection and
   broker filters are explicitly out of bounds.
+- 2026-07-09 — implemented (Opus worker, child worktree h5): M1 settings
+  word (tab strip word; runs sigil ▤; ConverseView gears → text buttons;
+  dead ConfigureView kit gear removed), M2 token-only contrast
+  (--btn-face both themes; body text 15.66:1 dark / 16.28:1 light,
+  buttons subordinate, thorn loudest), M3 identity-keyed disclosure rows,
+  M4 /api/code/deliver filled (whole-string code-* validation, arg-vector
+  CLI relay via owner requester = no reply routed) + compose on the run
+  detail surface. 15 new e2e (suite 351).
+- 2026-07-09 — VERIFIED (adversarial Opus, fresh context; GPT-5.5 channel
+  unavailable): pass=true, build/tests ok, full e2e ALL PASS on a freshly
+  re-embedded binary. Security headline held: broker.rs + both
+  chat-projection filters byte-identical to HEAD; 403 cross-origin, 400 on
+  id-injection (live), zero trace of a delivered note in
+  /api/conversations (live marker probe). Residual LOW notes (triaged, not
+  fixed): codeagent.rs:614 owner short-circuit is a literal "owner" check
+  (custom-principal multi-human setups would route a benign reply);
+  code_deliver has no explicit message length cap (ntex default bound,
+  consistent with publish); RailView composite fallback key could collide
+  for events lacking both id and seq.

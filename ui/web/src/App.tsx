@@ -1283,10 +1283,10 @@ export function App() {
             <div id="agent-tabs" className="tabs" aria-label={`${sel.agent} views`} hidden={sel.kind !== 'agent'}>
               {(['converse', 'sessions', 'telemetry', 'configure'] as const).map((tab) => {
                 const on = sel.kind === 'agent' && sel.tab === tab;
-                const display = tab === 'sessions' ? 'History' : tab === 'telemetry' ? 'Activity' : tab;
-                return tab === 'configure'
-                  ? <IconButton key={tab} data-tab={tab} label={`configure ${sel.agent}`} className={on ? 'on tab-icon-btn' : 'tab-icon-btn'} aria-pressed={on} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>⚙</IconButton>
-                  : <button key={tab} data-tab={tab} className={on ? 'on' : ''} aria-pressed={on} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>{display}</button>;
+                // One meaning per symbol (chrome-polish M1): configure is the WORD
+                // "settings" in the tab strip, not a lone gear that also meant "runs".
+                const display = tab === 'sessions' ? 'History' : tab === 'telemetry' ? 'Activity' : tab === 'configure' ? 'settings' : tab;
+                return <button key={tab} data-tab={tab} className={on ? 'on' : ''} aria-pressed={on} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>{display}</button>;
               })}
             </div>
             <span id="stage-note" className="panel-note">{stageNote}</span>

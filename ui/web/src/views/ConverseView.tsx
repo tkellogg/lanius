@@ -59,7 +59,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
         <div id="conv-configure-hint" className="conv-configure-hint">
           <AgentChip name={agent} size="md" />
           <span>Tune {agent} anytime in configure.</span>
-          <IconButton label={`configure ${agent}`} className="ghost cfg-icon-btn" onClick={() => selectAgent(agent, 'configure')}>⚙</IconButton>
+          <button type="button" className="ghost conv-settings-link" onClick={() => selectAgent(agent, 'configure')}>settings</button>
         </div>
         <div id="conv-trace-fallback" className="conv-trace-fallback">
           <p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p>
@@ -88,7 +88,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
         <AgentChip name={agent} size="md" />
         <span>Tune {agent} anytime in configure.</span>
         <IconButton id="conv-new" label={`new conversation with ${agent}`} className="ghost cfg-icon-btn" onClick={() => newConversation(agent)}>＋</IconButton>
-        <IconButton label={`configure ${agent}`} className="ghost cfg-icon-btn" onClick={() => selectAgent(agent, 'configure')}>⚙</IconButton>
+        <button type="button" className="ghost conv-settings-link" onClick={() => selectAgent(agent, 'configure')}>settings</button>
       </div>
       <div id="conv-recent" className="conv-recent">
         <label className="conv-search">

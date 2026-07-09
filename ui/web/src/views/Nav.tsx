@@ -36,7 +36,7 @@ function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversat
       <div id="nav-list" className="nav-list" onKeyDown={onKey}>
         <button className={`nav-item nav-signals${sel.kind === 'signals' ? ' on' : ''}`} data-sel="signals" title="what's happening now across every agent" onClick={selectSignals}><span className="nav-sigil">◮</span> activity</button>
         <button className={`nav-item nav-setup${sel.kind === 'setup' ? ' on' : ''}`} data-sel="setup" title="health check, agent setup, capabilities, and trust" onClick={() => selectSetup()}><span className="nav-sigil">⚒</span> setup</button>
-        <button className={`nav-item nav-workers${sel.kind === 'code-sessions' ? ' on' : ''}`} data-sel="code-sessions" title="coding runs and the workers they started" onClick={() => selectCodeSessions && selectCodeSessions()}><span className="nav-sigil">⚙</span> runs</button>
+        <button className={`nav-item nav-workers${sel.kind === 'code-sessions' ? ' on' : ''}`} data-sel="code-sessions" title="coding runs and the workers they started" onClick={() => selectCodeSessions && selectCodeSessions()}><span className="nav-sigil">▤</span> runs</button>
         <button className={`nav-item nav-comms${sel.kind === 'comms' ? ' on' : ''}`} data-sel="comms" title="messages agents send each other" onClick={() => selectComms && selectComms()}><span className="nav-sigil">⇄</span> messages</button>
         <button className={`nav-item nav-providers${sel.kind === 'providers' ? ' on' : ''}`} data-sel="providers" title="the model keys your agents use — add, test, pick one per agent" onClick={() => selectProviders && selectProviders()}><span className="nav-sigil">⛁</span> providers</button>
         <div className="nav-label">agents</div>
