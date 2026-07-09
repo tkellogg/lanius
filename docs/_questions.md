@@ -5,22 +5,14 @@ description: This is stuff from Tim. All sessions are busy, things I want to cha
 
 Routing — in the web UI everything really should have it's own route, so that forward-back buttons work as you'd
 expect. Right now it's all one giant app, lol.
-*(sprint-3 note: NOT pulled — session code-e993edd0 holds the web-ui-routing.md handoff and App.tsx claims and is
-actively building this.)*
+*(2026-07-09: DONE — routing-rebase f38275a merged to main; History-API routes + Rust SPA fallback. The
+wip-code-e993edd0-routing park branch is superseded and reapable.)*
 
 
 Can I run DeepSeek in Claude Code without logging out of Claude.AI? What about DeepSeek in Codex without logging
 out of ChatGPT? This is super important. If I can do that, then the harness becomes significantly more decoupled
 from the model and deserves more representation in the UI. This also deserves mentioning inside the "how to onboard
 a new harness" docs. I guess that's what --provider does, but does it actually set the env vars correctly?
-
-
-Rename elanus to Lanius (sorry, but spanish? el anus? yea no). Plus, butcher birds go hard.. Also, do a UX overhaul
-so it looks less hacker vibe and more professional / butcher birds.
-  1. Yeah, rename when ever you want.
-  2. Journey — okay fine I don't actually mean a UX overhaul, just how it looks. Basically reference Lily & Daniel 
-     in the journeys and target them. Especially Lily.
-  3. Oh, while you're at it, see if you can do a few SVG logos
 
 
 Memory blocks need 2 levels. Those that go in the system prompt (infrequently modified) and those that go in the 
@@ -118,8 +110,7 @@ See coding-harness-onboarding.md "The RPC-driver shape".
   agent may be a live **split brain**, so its claims are never reaped until death is confirmed by a same-host pid probe.
 
 **Still open — genuinely not done:**
-- **Web UI routing** (real routes / forward-back) — still one big app; held by another session's web-ui-routing.md.
-  NOTE: rebase it on the new redesigned UI.
+- ~~**Web UI routing**~~ — MERGED 2026-07-09 (routing-rebase f38275a is an ancestor of main; this note was stale).
 - **15-agentic-configuration, the helper — M4** — M1-M3 (UI panel + LLM detection) shipped; **M4 (harness-backed
   turns: run the helper through your existing claude/codex CLI, so there's no "oh shit" moment if you don't want
   API billing) is spec'd but UNBUILT** (helper-m4-harness-backed-turns.md).
