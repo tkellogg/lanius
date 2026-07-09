@@ -72,14 +72,33 @@ parked" copy. Also: history is a PROTECTED stdlib package — `lanius revoke`
 refuses it without `--force` (src/main.rs:312, 1538; src/kit.rs:344
 `protected_packages`).
 
-**MANDATORY pre-impl verification (planner runs it before dispatching this
-handoff; result recorded in the Log):** in a scratch root with the daemon
-running, `lanius revoke history --force`, then observe (a) the history
-daemon still spawns, (b) the sessions tab genuinely degrades to the 503
-"parked" state, (c) POST /api/admin/approve restores transcripts live
-within a tick, no restarts. M2's acceptance assumes yes/yes/yes — if the
-experiment disagrees, restate M2 to the observed truth BEFORE implementing
-the button.
+**Pre-impl verification RESULT (planner ran it 2026-07-08 in a /tmp
+scratch root; this is the ground truth M2 is written against):**
+
+1. `lanius revoke history` refuses (protected); `--force` revokes. The
+   RUNNING actor keeps serving — parked only manifests after the actor
+   restarts (observed after a daemon restart: /api/history → "history view
+   unreachable — approve the history package if it is parked").
+2. **Approve does NOT repair a revoked package.** `packages::decide` flips
+   only `requested`→`approved` rows (src/packages.rs:505-506); revoke
+   leaves rows at `revoked`, which is TERMINAL — `sync` never re-requests
+   under the same manifest hash (packages.rs:331 "Leave its state alone").
+   Observed: POST /api/admin/approve after a force-revoke → "history:
+   nothing requested", still parked. NO web or CLI path re-enables a
+   revoked package short of a manifest-hash change. **Second named
+   residual: a sanctioned re-request/re-enable primitive (today Ganesh can
+   turn a thing off, and nothing turns it back on).** The UI must tell
+   this truth for `revoked` rows — no fake button.
+3. **Approve DOES repair the needs-review case, live.** A package with
+   `requested` grants (e.g. `recent-history` in a fresh init) flips all
+   rows to approved via POST /api/admin/approve with the daemon running —
+   observed: 3 grants approved, decided_by=ui, no restarts.
+4. Side observation for the "running" column: in the scratch stack,
+   /api/liveness reported `actors: {}` even with package daemons up
+   (possibly a retained-status replay gap around web-relay/daemon restart
+   ordering). Implementer: check the running column against a real stack
+   EARLY; if liveness is empty there too, show "status unknown" honestly
+   rather than "not started" for a running actor, and report the finding.
 
 ## Wonky bits / decisions (already made)
 
@@ -106,11 +125,18 @@ the button.
 3. **Pane agreement + the repair affordance.** The history package row and
    the sessions tab must derive from the SAME health projection. On the row
    (and mirrored in the sessions tab's error state, pre-split App.tsx:1482):
-   - needs review → button "allow and start" → POST /api/admin/approve →
-     refresh; the dispatcher picks it up within a tick.
-   - approved but not running / unreachable → the truth + the command (spike
-     verdict): "the background service isn't running — start it with
-     `lanius daemon`". No fake button.
+   - needs review (grants `requested`) → button "allow and start" → POST
+     /api/admin/approve → refresh; capabilities attach live (verified in
+     the pre-impl experiment, no restarts needed).
+   - revoked (grants `revoked`) → NO button (approve is a no-op here —
+     pre-impl finding 2). The truth in plain words: "this was switched
+     off; switching it back on isn't supported yet" (+ the residual is
+     already named for a follow-up). `grantState` (lib/packages.ts)
+     currently buckets revoked into its fallthrough — surface it
+     distinctly.
+   - approved but not running / unreachable → the truth + the command
+     (spike verdict): "the background service isn't running — start it
+     with `lanius daemon`". No fake button.
    - running → nothing to repair; the row says running.
 4. **A plain-language one-liner per row.** `packageDescription` (206-216)
    already tries; tighten the fallbacks so every row answers "what does
@@ -158,15 +184,19 @@ panel or `lanius profile show`); full ui.spec.mjs green.
 
 Wonky bit 3, both directions (row ↔ sessions tab).
 
-**Acceptance:** with the history package parked (`lanius revoke history
---force` — it is protected, plain revoke refuses; see the spike
-refinement), the package row AND the sessions tab show the same state and
-the row's "allow and start" button repairs it end-to-end (approve →
-capabilities reattach → transcripts load) with no CLI touch; with the
-dispatcher stopped, both surfaces show the `lanius daemon` message and NO
-button pretends otherwise. (Scenario contingent on the mandatory pre-impl
-verification above — if parked proves unreachable this way, the milestone
-is restated to the observed truth first.)
+**Acceptance (restated to the pre-impl experiment's observed truth):**
+- Needs-review repair, end-to-end: in a fresh scratch root (where
+  `recent-history` has `requested` grants), its row shows "needs review"
+  with the allow button; clicking it approves via POST /api/admin/approve
+  (observe decided_by=ui rows flip) with no CLI touch and the row updates.
+- Parked history, honest both ways: with history force-revoked AND the
+  actor restarted (the reproduction: `lanius revoke history --force`, then
+  restart the daemon), the sessions tab AND the history package row show
+  the SAME degraded state; the row does NOT offer approve (it is a no-op
+  for revoked rows) — it says plainly that this was switched off and
+  re-enabling isn't supported yet.
+- Dispatcher down: both surfaces show the `lanius daemon` message and NO
+  button pretends otherwise.
 
 ### M3 — copy: one-liners, "instance", echo seed
 
@@ -182,3 +212,8 @@ and cargo test green (fix any init test expecting 4 seeds); a fresh
 
 - 2026-07-08 — planned (Fable 5 under Fable). Spike run same day: approve
   is web-real, dispatcher-start is not — honest fallback + named residual.
+- 2026-07-08 — pre-impl experiment run by the planner (scratch root,
+  daemon+web live): revoked-is-terminal discovered (approve only flips
+  requested rows); M2 restated to the observed truth; second residual
+  named (re-enable primitive); liveness actors:{} side-observation logged
+  for the implementer to check early.
