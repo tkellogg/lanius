@@ -3,7 +3,13 @@ name = "lanius"
 version = "0.1.0"
 edition = "2021"
 default-run = "lanius"
-description = "lanius: a minimal event-driven agent harness (inetd + cron + git hooks + sqlite + a flight recorder)"
+description = "A local control plane for AI work: event-driven agent orchestration with a flight recorder (inetd + cron + git hooks + sqlite)"
+license = "Apache-2.0"
+repository = "https://github.com/tkellogg/lanius"
+homepage = "https://github.com/tkellogg/lanius"
+readme = "README.md"
+keywords = ["agents", "llm", "orchestration", "claude", "harness"]
+categories = ["command-line-utilities", "development-tools"]
 
 # What ships in the published crate. `include` is an explicit allowlist (it
 # overrides .gitignore), so it MUST cover everything the binary compiles against:
@@ -29,6 +35,8 @@ include = [
     "templates/**/*",
     "ui/web/dist/**/*",
     "Cargo.toml",
+    "README.md",
+    "LICENSE",
 ]
 
 [dependencies]

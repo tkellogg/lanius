@@ -1,4 +1,17 @@
-# lanius
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/tkellogg/lanius/main/brand/logos/09-lockup-dark.svg">
+    <img src="https://raw.githubusercontent.com/tkellogg/lanius/main/brand/logos/09-lockup-light.svg" alt="lanius" width="340">
+  </picture>
+</p>
+
+<p align="center"><em>A local control plane for AI work.</em></p>
+
+<p align="center">
+  <a href="https://crates.io/crates/lanius"><img src="https://img.shields.io/crates/v/lanius.svg" alt="crates.io"></a>
+  <a href="https://github.com/tkellogg/lanius/actions/workflows/ci.yml"><img src="https://github.com/tkellogg/lanius/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/tkellogg/lanius/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="license: Apache-2.0"></a>
+</p>
 
 Lanius is a local control plane for AI work.
 
@@ -381,7 +394,8 @@ If you want the deeper mechanics, start here:
 
 ## Developing lanius
 
-From a repo checkout:
+A repo checkout needs Rust and Node (the web UI is built by `build.rs` and
+embedded into the binary; installed releases ship it prebuilt).
 
 ```sh
 cargo run -- dev
@@ -415,3 +429,7 @@ inetd + cron + git hooks + sqlite + a flight recorder
 ```
 
 It is just not the first thing a human should have to understand.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
