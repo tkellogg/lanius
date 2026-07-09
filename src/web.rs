@@ -471,6 +471,7 @@ async fn status(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
     let cred = secrets::read(root, &owner).is_some();
     let history = history_endpoint(root);
     let comms = comms_endpoint(root);
+    let grants = package_grant_words(root, &["history", "comms"]);
     let bus = root.bus_file();
     let db = root.db();
     let trace = root.trace_file();
@@ -493,11 +494,15 @@ async fn status(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
             "web": { "port": Value::Null, "static_dir": "<embedded>", "dist_present": DIST.get_file("index.html").is_some() },
             "agent": hub.agent,
             "binary": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
-            "history": { "available": history.is_some(), "endpoint": history },
+            // `grant` is the honest signal the pane and the configure row share:
+            // `available` (http.json) can read true while the package is parked
+            // after a revoke (package-truth.md pre-impl finding), so the sessions
+            // tab distinguishes revoked (terminal) from unreachable off this word.
+            "history": { "available": history.is_some(), "endpoint": history, "grant": grants.get("history") },
             // The comms reconstruction view's availability, reported like
             // history's (docs/handoffs/comms-package.md M2). The web comms list
             // relays to it; parked ⇒ the SPA degrades to "approve the package".
-            "comms": { "available": comms.is_some(), "endpoint": comms },
+            "comms": { "available": comms.is_some(), "endpoint": comms, "grant": grants.get("comms") },
             "read_camera": read_camera_status(root),
             "cage": cage_status(root),
             "llm": llm_detection(root),
@@ -2171,6 +2176,51 @@ fn proxy_history(base: &str, query: &Value) -> Result<(u16, String)> {
         let body = res.text().await?;
         Ok((code, body))
     })
+}
+
+/// The grant-review word for a package, matching the SPA's `grantState`
+/// (lib/packages.ts): `needs review` (any grant still `requested`), `allowed`
+/// (any `approved`), `revoked` (all `revoked`), or `no review record` (none).
+/// The pre-impl experiment (docs/handoffs/package-truth.md) proved
+/// `history.available` (http.json presence) stays true while a package is parked
+/// after a revoke, so the grant word is the ONLY honest signal that distinguishes
+/// a revoked pane (terminal, no repair) from a merely-unreachable one. The
+/// sessions tab has no package list of its own, so it reads this off /api/status
+/// — keeping the pane and the configure row in agreement (wonky bit 3).
+fn package_grant_words(root: &Root, names: &[&str]) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(conn) = open_ro(&root.db()) else {
+        return out;
+    };
+    let Ok(pkgs) = crate::packages::discover_for_profile(root, "default") else {
+        return out;
+    };
+    for p in pkgs {
+        if !names.contains(&p.name.as_str()) {
+            continue;
+        }
+        let Some(lm) = &p.manifest else { continue };
+        let states: Vec<String> = conn
+            .prepare("SELECT state FROM grants WHERE package=?1 AND manifest_hash=?2")
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![p.name, lm.hash], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap_or_default();
+        let word = if states.is_empty() {
+            "no review record"
+        } else if states.iter().any(|s| s == "requested") {
+            "needs review"
+        } else if states.iter().any(|s| s == "approved") {
+            "allowed"
+        } else if states.iter().all(|s| s == "revoked") {
+            "revoked"
+        } else {
+            "unknown"
+        };
+        out.insert(p.name.clone(), word.to_string());
+    }
+    out
 }
 
 fn history_endpoint(root: &Root) -> Option<String> {

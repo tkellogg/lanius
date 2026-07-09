@@ -1,11 +1,25 @@
+import { useState } from 'react';
 import { conversationLabel, shortTs } from '../lib/format';
 
-function SessionsView({ hidden, state, agent, openTranscript, loadSessions }: any) {
+function SessionsView({ hidden, state, agent, openTranscript, loadSessions, repair, approvePackage }: any) {
+  const [note, setNote] = useState('');
+  // package-truth.md M2 (wonky bit 3): the sessions tab and the history package
+  // row derive the SAME honest degraded state from the shared health projection.
+  // A revoked history pane is TERMINAL — no approve button (approve is a no-op);
+  // a dispatcher-down / parked-approved pane shows the truth and the `lanius
+  // daemon` command, never a fake button. Only a `requested` grant is repairable.
+  const r = repair ?? { kind: 'ok', message: '', canApprove: false };
+  const doApprove = async () => {
+    setNote('allowing…');
+    const res = await approvePackage?.('history');
+    setNote(res?.ok ? 'allowed — reopening…' : (res?.error ?? 'could not allow it'));
+    if (res?.ok) void loadSessions(agent);
+  };
   return (
     <div id="view-sessions" className="view" hidden={hidden}>
       <div id="sessions-pane" className="sessions-pane">
         {state.status === 'loading' && <div className="dim-note">asking the history view…</div>}
-        {state.status === 'error' && <div className="dim-note"><div>transcripts unavailable — live view only.</div>{state.error && <div className="dim-sub">{state.error}</div>}</div>}
+        {state.status === 'error' && <div className="dim-note sessions-degraded" data-repair={r.kind}><div>transcripts unavailable — live view only.</div><div className="dim-sub">{r.message || state.error}</div>{r.canApprove && <div className="setup-row"><button className="sessions-approve" onClick={doApprove}>allow and start</button>{note && <span className="dim-sub">{note}</span>}</div>}</div>}
         {state.status === 'list' && (!state.sessions.length ? <div className="dim-note">no conversations recorded yet.</div> : <div className="sess-list"><div className="sess-row sess-head">{['conversation', 'first', 'last', 'msgs', 'events'].map((h) => <span key={h}>{h}</span>)}</div>{state.sessions.map((s: any) => <button key={s.session} className="sess-row" title={s.session} onClick={() => openTranscript(agent, s.session, undefined, false, conversationLabel(s))}><span className="sess-id">{conversationLabel(s)}</span><span>{shortTs(s.first_ts)}</span><span>{shortTs(s.last_ts)}</span><span>{String(s.message_count)}</span><span>{String(s.event_count)}</span></button>)}</div>)}
         {(state.status === 'transcript-loading' || state.status === 'transcript') && <Transcript agent={agent} state={state} openTranscript={openTranscript} loadSessions={loadSessions} />}
       </div>

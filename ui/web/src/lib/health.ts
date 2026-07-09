@@ -37,6 +37,20 @@ export type SystemHealth = {
   llmWorld: LlmWorld;
   historyAvailable: boolean;
   commsAvailable: boolean;
+  /** The grant-review word for the history / comms packages, read straight off
+   *  /api/status (server `package_grant_words`). package-truth.md M2: `available`
+   *  can read true while a package is parked after a revoke, so a pane that has no
+   *  package list of its own (the sessions tab) reads this to tell a revoked pane
+   *  (terminal — no repair) apart from a merely-unreachable one, keeping it in
+   *  agreement with the configure row. '' when status has not loaded. */
+  historyGrant: string;
+  commsGrant: string;
+  /** Has ANY actor reported a liveness status? A real stack always has resident
+   *  actors (history/comms/…), so an empty map means liveness has not loaded or
+   *  hit the retained-status replay gap seen across a daemon restart
+   *  (package-truth.md M2 side-observation) — a running actor then reads "status
+   *  unknown" honestly rather than "not started". */
+  anyActorReported: boolean;
   /** The product word for a capability actor, or 'not-started' when the actor
    *  has never reported a status (never conflated with 'running'). */
   actorStatus: (name: string) => ActorStatus;
@@ -54,6 +68,9 @@ export function systemHealth(status: any, liveness: any): SystemHealth {
     llmWorld: world === 'a' || world === 'b' || world === 'c' ? world : null,
     historyAvailable: status?.history?.available === true,
     commsAvailable: status?.comms?.available === true,
+    historyGrant: typeof status?.history?.grant === 'string' ? status.history.grant : '',
+    commsGrant: typeof status?.comms?.grant === 'string' ? status.comms.grant : '',
+    anyActorReported: Object.keys(actors).length > 0,
     actorStatus: (name: string) => {
       const a = actors?.[name];
       const s = a?.status;

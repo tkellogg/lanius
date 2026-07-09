@@ -1,7 +1,7 @@
 ---
-status: in-progress
+status: done
 author: Fable 5 (planner) under Fable, for Tim
-last-updated: 2026-07-08
+last-updated: 2026-07-09
 ---
 
 # Handoff: the package list tells the truth (H3)
@@ -217,3 +217,27 @@ and cargo test green (fix any init test expecting 4 seeds); a fresh
   requested rows); M2 restated to the observed truth; second residual
   named (re-enable primitive); liveness actors:{} side-observation logged
   for the implementer to check early.
+- 2026-07-09 — implemented (Opus worker, audit-and-continue across a session
+  interruption). M1-M3 demonstrated live. Three recorded deviations, all
+  presentation-only: `packages --json` emits `manifest.harness` (main.rs) so
+  applicability is manifest-computed; `/api/status` history/comms gained a
+  `grant` word (field, not route — `available` lies while parked, the
+  sessions tab needed the honest revoked-vs-unreachable signal); init also
+  skips WRITING echo's files (drop-from-decide-loop alone would leave a
+  needs-review echo row, contradicting M3). Findings: /api/liveness returns
+  empty actors on some daemon/bus restart orderings (rendered honestly as
+  "status unknown" via health.anyActorReported); package actors OUTLIVE the
+  daemon (history served 200 after daemon death — for the start/restart
+  residual handoff); pre-existing 404 reloading /agents/<agent>/config when
+  agent name ≠ profile name; stdlib discovery manifest prose contains
+  "instance" (left — rewording would change the manifest hash and re-gate
+  grants).
+- 2026-07-09 — verified (fresh adversarial Opus, clean context): pass, ZERO
+  issues. tsc clean; build.rs embed fresh; cargo test 596 + integration
+  green; e2e 356/356. Scope exactly the 10 files; deviations confirmed
+  presentation-only (no kernel/dispatch change, no name lists in UI logic);
+  M2's three repair cases reproduced live (allow-and-start flips grants
+  approved/ui with no restart; revoked terminal with NO button on both
+  surfaces; dispatcher-down shows the lanius-daemon copy); echo upgrade path
+  safe (existing roots with echo don't panic; fresh init has no echo row);
+  retargeted e2e assertions still prove the baseline claims. Status → done.
