@@ -1,5 +1,5 @@
 ---
-status: planned
+status: in-progress
 author: Fable 5 (planner) under Fable, for Tim
 last-updated: 2026-07-08
 ---
