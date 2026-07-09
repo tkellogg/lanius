@@ -31,6 +31,22 @@ Install the released binary with Cargo:
 cargo install lanius
 ```
 
+### Prerequisites
+
+`cargo install` compiles lanius from source, so you need:
+
+- **Rust 1.88 or newer.** This is the minimum supported toolchain. An
+  out-of-date `rustc` is the most common install failure — run `rustup update`
+  first, and check with `rustc --version`.
+- **A C compiler** (`clang` or `gcc` on Linux/macOS, the MSVC Build Tools on
+  Windows). lanius bundles SQLite and compiles it from source at install time,
+  so the build needs a working C toolchain. On macOS, `xcode-select --install`
+  provides one; on Debian/Ubuntu, `apt install build-essential`.
+
+If `cargo install lanius` fails partway through with an error mentioning
+`libsqlite3-sys`, it is almost always one of the two above — an old `rustc` or a
+missing C compiler — not a problem with the crate itself.
+
 Then create a local root and start the app:
 
 ```sh
