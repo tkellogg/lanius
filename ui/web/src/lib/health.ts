@@ -12,6 +12,13 @@ import { useMemo } from 'react';
 // (distinct from 'running'/'failed'), mirroring the server's liveness contract
 // (src/web.rs `liveness_product_word`).
 
+// docs/handoffs/chat-liveness.md M2 (wonky bit 3): how long a sent message waits
+// with NO obs activity and no reply before the surface admits it may be stranded.
+// A fixed constant — not config — so "no response yet" means the same thing in the
+// main chat (ConverseView) AND the helper panel (helper-first-encounter H4), which
+// reuse this ONE value rather than forking a second heuristic.
+export const STALL_MS = 20000;
+
 export type LlmWorld = 'a' | 'b' | 'c' | null;
 export type ActorStatus =
   | 'running'

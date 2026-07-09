@@ -3,8 +3,13 @@ import { IconButton } from '../components/primitives';
 import { relativeTime } from '../lib/format';
 import { isWorkerAgentName, isWorkerSessionId } from '../lib/conversation';
 
-function Nav({ agents, conversations, sel, historyOk, selectAgent, openConversation, selectSignals, selectSetup, selectCodeSessions, selectComms, selectProviders, navOpen, setNavOpen, exploreLabel }: any) {
-  const items = [...agents.keys()].sort();
+function Nav({ agents, panelAgents, conversations, sel, historyOk, selectAgent, openConversation, selectSignals, selectSetup, selectCodeSessions, selectComms, selectProviders, navOpen, setNavOpen, exploreLabel }: any) {
+  // helper-first-encounter H4 (wonky bit 2): a profile presented in a dedicated
+  // surface (`[ui] surface = "panel"`, e.g. the helper) never appears as an
+  // agent-list row. Filter by that GENERIC property — passed down as a set of
+  // agent nouns — not by matching any literal name.
+  const panel: Set<string> = panelAgents ?? new Set();
+  const items = [...agents.keys()].sort().filter((name) => !panel.has(name));
   const isWorkerItem = (name: string) => {
     const a = agents.get(name);
     return isWorkerAgentName(name) || [...(a?.sessions ?? [])].some((s) => isWorkerSessionId(s));

@@ -2291,6 +2291,12 @@ fn profiles_with_helper(root: &Root, text: &str) -> Vec<Value> {
             "dir".into(),
             json!(root.profile_dir("helper").display().to_string()),
         );
+        // The helper lives in the assistant panel, never the agent list. Stamp the
+        // GENERIC surface property (helper-first-encounter H4) so the Nav hides it
+        // by that property, not by matching the literal name "helper". The
+        // on-disk helper profile.toml carries the same `[ui] surface = "panel"`;
+        // this keeps the synthesized fallback row consistent with it.
+        obj.insert("ui".into(), json!({ "surface": "panel" }));
     }
     profiles.push(helper);
     profiles.sort_by(|a, b| {
