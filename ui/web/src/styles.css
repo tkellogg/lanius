@@ -1282,6 +1282,28 @@ button.mast-left.on h1 { color: var(--ink); }
 .fail-reason { font-family: var(--mono, monospace); font-size: 12px; color: var(--danger-soft); white-space: pre-wrap; }
 .fail-hint { font-size: 11px; color: var(--dim); margin-top: 4px; }
 
+/* ---------- chat-liveness (docs/handoffs/chat-liveness.md) ---------- */
+/* The subtle per-message "sent" mark: present while a reply is outstanding,
+   gone the moment it lands. Quiet by design — reassurance, not an alarm. */
+.msg-sent { font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--meta); opacity: 0.7; }
+/* "The agent woke up" — an animated dots row at the foot of the thread. */
+.conv-thinking { display: flex; align-items: center; gap: 8px; padding: 2px 2px 4px; }
+.thinking-dots { display: inline-flex; gap: 4px; }
+.thinking-dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--meta); display: inline-block; animation: thinking-bounce 1.2s infinite ease-in-out both; }
+.thinking-dots i:nth-child(1) { animation-delay: -0.24s; }
+.thinking-dots i:nth-child(2) { animation-delay: -0.12s; }
+@keyframes thinking-bounce { 0%, 80%, 100% { opacity: 0.3; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-3px); } }
+/* 20s of silence: uncertainty phrased as fact, not an error. Muted border, not
+   the pain colour the failure bubble uses. */
+.conv-stalled { border-left: 2px solid var(--panel-edge); padding: 6px 0 6px 10px; margin: 2px 0; }
+.conv-stalled-note { font-size: 12px; color: var(--dim); margin: 0 0 6px; }
+.conv-stalled-actions { display: flex; gap: 8px; }
+.conv-stalled-retry { font-size: 11px; }
+/* The send-time dead-end line — informational, with a route to setup. */
+.msg.notice .msg-body { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; border-left: 2px solid var(--panel-edge); padding-left: 10px; }
+.conv-nopath-note { font-size: 12px; color: var(--dim); }
+.conv-nopath-setup { font-size: 11px; }
+
 /* ---------- a11y: focus, hit targets, reduced motion ---------- */
 /* One global keyboard-focus affordance, applied to every interactive control.
    Source order is last so it overrides per-control `outline: none` rules. */

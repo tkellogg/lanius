@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 author: Fable 5 (planner) under Fable, for Tim
 last-updated: 2026-07-08
 ---
@@ -135,3 +135,33 @@ empty conversation shows the invitation copy; full ui.spec.mjs green.
 - 2026-07-08 — planned (Fable 5 under Fable). Scope call: helper panel's
   dead-air moved to helper-first-encounter (same files as the helper
   rebuild); this handoff owns ConverseView + the shared health hook.
+- 2026-07-09 — implemented (M1-M3): lib/health.ts projection + hook, the
+  corr-keyed pending machine in App, indicators + stalled/no-path lines in
+  ConverseView, invite empty state; verified by ui.spec.mjs flow 6f (25
+  assertions, full suite 331 green) and a manual daemon-up/daemon-down
+  observation run. Note for the suite's caretaker: one full-suite run crashed
+  environmentally at the pre-existing ambient flow (ui.spec.mjs ~1352 — a
+  Playwright click auto-wait TimeoutError escapes waitFor and aborts the whole
+  run) while orphaned stacks from an earlier interrupted run were alive;
+  identical code passed clean. Not fixed here — outside this handoff's scope.
+- 2026-07-09 — VERIFIED (adversarial Opus, fresh context; GPT-5.5 channel
+  unavailable — codex workers SIGKILLed in this environment): pass=true,
+  build/tests ok, 331/331 e2e, live-stack probes confirmed (daemon-down
+  immediate no-path, ~20s stall + retry, resolution clears indicators),
+  scope clean (exactly the six allowed files). Special-attention verdicts:
+  corr-machine survives thread switches; no timer stacking; 306 baseline
+  intact; no smuggled changes.
+- 2026-07-09 — fix round 1 (same implementer, bounded): (1) retry
+  double-click race closed via consume-once retriedCorrs ref — e2e proves
+  exactly one publish on double-click; (2) correlated obs after stall now
+  lifts the stalled line back to thinking — e2e stalls ~20s, publishes a
+  real obs event, observes the flip, then a reply resolves. tsc clean,
+  fresh embed, full suite 336/336 ALL PASS. Fix touched only App.tsx +
+  ui.spec.mjs.
+- 2026-07-09 — residual nits (triaged by Fable, deliberately NOT fixed):
+  stall timers have no unmount cleanup (App is root-lifetime, harmless);
+  clearPendingTimer runs inside the setPending updater (idempotent,
+  style); never-resolved pending entries persist for the session (bounded
+  by sends); duplicate no-path notices dedupe to one line (pre-existing
+  message keying). Also for the suite caretaker: pre-existing structural
+  flake at ui.spec.mjs ~1352 (see implementer note above).

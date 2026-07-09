@@ -10,6 +10,7 @@ import { type Sel, type AgentTab, selToPath, pathToSel } from './routing';
 import { arr, csv, uid } from './lib/format';
 import { agentOf, newWebConversationId, conversationStorageKey, mergeConvMessages, sessionFromPayload, isWorkerAgentName, isWorkerSessionId, topicFilterMatches } from './lib/conversation';
 import { declaredConfigParams, configRowMap, prunedSet } from './lib/packages';
+import { useSystemHealth } from './lib/health';
 import Nav from './views/Nav';
 import WelcomeView from './views/WelcomeView';
 import SetupView from './views/SetupView';
@@ -23,6 +24,10 @@ import SessionsView from './views/SessionsView';
 // docs/ui-flows/README.md and docs/ui-flows/configuration.md.
 const BUFFER_CAP = 2000;
 const PARENT_PATH = '$parent';
+// docs/handoffs/chat-liveness.md M2 (wonky bit 3): how long a sent message waits
+// with NO obs activity and no reply before the thread admits it may be stranded.
+// A fixed constant — not config — so "no response yet" means the same everywhere.
+const STALL_MS = 20000;
 // M6 (agent-comms-ui): the priority at/above which an agent-to-agent delivery is
 // "urgent" and lights the global signal lamp. Mirrors the backend default
 // (agent-comms.high_priority_threshold = 5).
@@ -114,6 +119,13 @@ export function App() {
 
   const [systemStatus, setSystemStatus] = useState<any>(null);
   const [liveness, setLiveness] = useState<any>({ actors: {} });
+  // docs/handoffs/chat-liveness.md M2: the per-message liveness machine, keyed by
+  // `corr` — NOT by the open thread (wonky bit 2). A reply/obs can land in a
+  // conversation the user is no longer looking at; keying to "the open thread"
+  // would strand its indicator. Each entry is
+  // { state: 'sent'|'thinking'|'stalled', sentAt, session, agent, text }.
+  // ConverseView renders indicator state for the corrs whose session it shows.
+  const [pending, setPending] = useState(new Map());
   const [setup, setSetup] = useState<any>({ status: '', statusKind: '', kits: null, packages: null, proposals: null, loading: false });
   const [newAgent, setNewAgent] = useState({ name: '', purpose: '', workdir: '', model: '', turns: '24', autonomy: 'off', capability: '' });
   const [newAgentNote, setNewAgentNote] = useState('');
@@ -152,6 +164,18 @@ export function App() {
   const seenLampEvents = useRef(new Set());
   const agentSessions = useRef(new Map());
   const kitModalRef = useRef<HTMLDialogElement | null>(null);
+  // Live stall timers, keyed by corr (chat-liveness M2). A resolved or thinking
+  // entry clears its timer so a late reply/obs can never fire a phantom stall.
+  const pendingTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  // Retry is consume-once: `retryPending` reads the pending map through a state
+  // closure, so two rapid clicks on the same stalled line would BOTH see the
+  // entry and double-publish. The ref sees the first consumption immediately.
+  const retriedCorrs = useRef(new Set<string>());
+
+  // chat-liveness M1 (wonky bit 5): the shared projection of the already-polled
+  // status + liveness. A read, not a fetch — consumed by submitCompose's
+  // send-time pre-check (M3) and, later, by H3/H4.
+  const health = useSystemHealth(systemStatus, liveness);
 
   const touchAgent = (name: string, opts: any = {}) => {
     if (!name) return;
@@ -918,6 +942,10 @@ export function App() {
     if (noun) {
       const session = topic.match(/^obs\/agent\/[^/]+\/([^/]+)\//)?.[1];
       touchAgent(noun, { live: true, sessions: session ? [session] : [] });
+      // chat-liveness M2: the first obs event on a pending session is the agent
+      // waking up — flip 'sent' → 'thinking'. Only obs topics carry the session
+      // segment (in/agent has none), so this can't false-fire on a bare inbound.
+      if (session && topic.startsWith('obs/agent/')) markThinking(session);
     }
     const p = env?.payload && typeof env.payload === 'object' ? env.payload : {};
     if (topic.startsWith('signal/')) {
@@ -926,6 +954,9 @@ export function App() {
     }
     if (topic.startsWith('in/human/')) {
       const corr = env.correlation_id;
+      // chat-liveness M2: a correlated reply, ask, or failure-mail resolves the
+      // pending machine regardless of which thread is open (keyed by corr).
+      resolvePending(corr);
       const agent = corrAgent.current.get(corr) ?? (refs.current.sel.kind === 'agent' ? refs.current.sel.agent : null) ?? [...refs.current.agents.keys()][0] ?? refs.current.defaultAgent;
       const session = corrSession.current.get(corr);
       const cur = agent ? currentConversation(agent) : '';
@@ -1024,6 +1055,92 @@ export function App() {
     });
   };
 
+  // ── chat-liveness M2/M3: the per-message pending machine ────────────────────
+  const clearPendingTimer = (corr: string) => {
+    const t = pendingTimers.current.get(corr);
+    if (t) { clearTimeout(t); pendingTimers.current.delete(corr); }
+  };
+  // A correlated reply / ask / failure-mail (all arrive on in/human) resolves the
+  // pending entry — the indicator unrenders, even for a thread that isn't open,
+  // and even if the stalled line was already showing (late is fine; lost is what
+  // we refuse to hide).
+  const resolvePending = (corr: string) => {
+    if (!corr) return;
+    clearPendingTimer(corr);
+    setPending((prev) => {
+      if (!prev.has(corr)) return prev;
+      const next = new Map(prev);
+      next.delete(corr);
+      return next;
+    });
+  };
+  // The first obs event for a session is a true "the agent woke up" observation
+  // (wonky bit 3): flip every still-sent entry on that session to 'thinking' and
+  // disarm its stall timer — obs activity means it is not dead air. A STALLED
+  // entry flips too: obs arriving after the 20s line means the agent is
+  // demonstrably running, and "No response yet. The agent may not be running."
+  // would be a lie — the same wake-up signal we trust before the stall lifts it.
+  const markThinking = (session: string) => {
+    if (!session) return;
+    setPending((prev) => {
+      let changed = false;
+      const next = new Map(prev);
+      for (const [corr, e] of prev as Map<string, any>) {
+        if (e.session === session && (e.state === 'sent' || e.state === 'stalled')) {
+          clearPendingTimer(corr);
+          next.set(corr, { ...e, state: 'thinking' });
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  };
+  // Arm a fresh pending entry the moment a publish is accepted onto the broker.
+  // Broker publish is fire-and-forget (src/web.rs), so acceptance is NOT delivery
+  // — the honest word is "sent". The 20s timer flips to 'stalled' only if nothing
+  // (obs or reply) has happened by then.
+  const markPending = (agent: string, session: string, corr: string, text: string) => {
+    setPending((prev) => new Map(prev).set(corr, { state: 'sent', sentAt: Date.now(), session, agent, text }));
+    const timer = setTimeout(() => {
+      pendingTimers.current.delete(corr);
+      setPending((prev) => {
+        const e = prev.get(corr);
+        if (!e || e.state !== 'sent') return prev; // resolved or already thinking
+        return new Map(prev).set(corr, { ...e, state: 'stalled' });
+      });
+    }, STALL_MS);
+    pendingTimers.current.set(corr, timer);
+  };
+  // Send-time pre-check dead-end (wonky bit 4) and transport-refused fallback: an
+  // in-thread line stating what we CAN see ("Nothing is running…"), with a setup
+  // affordance — uncertainty phrased as fact, never a fabricated error.
+  const addNoPath = (agent: string, corr: string) => {
+    addConv(agent, { key: `live:${corr}:nopath`, type: 'notice', kind: 'no-path', who: 'system', cls: 'notice', text: 'Nothing is running that can answer this yet.', corr, ts: new Date().toISOString() });
+  };
+  // Retry a stalled message: re-publish the same text under a FRESH corr and drop
+  // the old pending entry (wonky bit 3). The old you-bubble stays (mergeConvMessages
+  // dedupes the re-echo by text), and the fresh corr threads the eventual reply.
+  const retryPending = async (corr: string) => {
+    const e = pending.get(corr);
+    if (!e) return;
+    // Consume-once guard: `pending` here is a render-time closure, so a second
+    // rapid click still sees the entry — the ref does not (no double-publish).
+    if (retriedCorrs.current.has(corr)) return;
+    retriedCorrs.current.add(corr);
+    resolvePending(corr);
+    const { agent, session, text } = e;
+    const newCorr = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    sentCorrs.current.add(newCorr);
+    corrAgent.current.set(newCorr, agent);
+    corrSession.current.set(newCorr, session);
+    rememberConversation(agent, session);
+    if (!health.brokerConnected || health.llmWorld === 'c') { addNoPath(agent, newCorr); return; }
+    const ok = await publish(`in/agent/${agent}`, { prompt: text, session }, newCorr);
+    void loadConversations(agent);
+    if (ok) markPending(agent, session, newCorr, text);
+    else addNoPath(agent, newCorr);
+  };
+
   const submitCompose = async (e: any) => {
     e.preventDefault();
     if (sel.kind !== 'agent') return;
@@ -1039,6 +1156,14 @@ export function App() {
     corrSession.current.set(corr, session);
     addConv(agent, { key: `live:${corr}:you:${text}`, who: 'you', cls: 'you', text, corr, ts: new Date().toISOString() });
     input.value = '';
+    // chat-liveness M3 (wonky bit 4): don't send into a known void. If no broker
+    // is reachable, or the LLM path is world c (nothing that can answer), skip the
+    // fake optimism — the message stays visible and an honest in-thread line names
+    // the gap, with a route to setup. Mirrors the helper panel's world-c guard.
+    if (!health.brokerConnected || health.llmWorld === 'c') {
+      addNoPath(agent, corr);
+      return;
+    }
     const btn = e.currentTarget.querySelector('#compose-send') as HTMLButtonElement;
     // M3 (reply-branching): if this session is a pending fork, attach the
     // structured `branched_from` to the seed publish (the kernel composes the
@@ -1052,6 +1177,11 @@ export function App() {
     }
     const ok = await publish(`in/agent/${agent}`, payload, corr);
     void loadConversations(agent);
+    // chat-liveness M2: acceptance arms the per-message machine ('sent' → the 20s
+    // stall watch); a refused publish is a known dead end, so name it in-thread
+    // rather than let the 1.4s button flash be the only (and vanishing) signal.
+    if (ok) markPending(agent, session, corr, text);
+    else addNoPath(agent, corr);
     btn.textContent = ok ? 'accepted ✓' : 'failed ✕';
     btn.classList.toggle('sent', ok);
     setTimeout(() => { btn.textContent = '➤'; btn.classList.remove('sent'); }, 1400);
@@ -1172,6 +1302,9 @@ export function App() {
             submitCompose={submitCompose}
             answerAsk={answerAsk}
             selectAgent={selectAgent}
+            selectSetup={selectSetup}
+            pending={pending}
+            retryPending={retryPending}
             openConversation={openConversation}
             newConversation={newConversation}
             startBranch={startBranch}

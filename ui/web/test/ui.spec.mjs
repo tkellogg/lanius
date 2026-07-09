@@ -910,7 +910,7 @@ const renamedAgent = 'falcon';
   await page.click('#conv-new');
   await waitFor('converse: new conversation clears the visible thread', async () => {
     const t = await page.$eval('#conv-holder', (el) => el.textContent);
-    return !t.includes(msg) && /start a conversation/i.test(t);
+    return !t.includes(msg) && /say hello/i.test(t);
   }, 5000);
   const msg4 = `${msg}-fork`;
   await page.fill('#compose-input', msg4);
@@ -2747,6 +2747,222 @@ const renamedAgent = 'falcon';
     : fail(`routing(M3): missing asset returned ${missingAsset}, expected 404`);
 
   await page.close();
+}
+
+// ── flow 6f: chat-liveness (docs/handoffs/chat-liveness.md) ───────────────────
+// "Dead air is the one unforgivable failure." A sent message shows a "sent" mark;
+// obs activity flips it to a thinking indicator; a reply resolves both; 20s of
+// silence surfaces an honest stalled line with working recourse; and a send with
+// no LLM path renders an immediate in-thread "nothing is running" line (no 20s
+// wait) instead of vanishing. Sends are intercepted so the machine is exercised
+// deterministically; the agent's obs + reply are injected the way flow 6 injects
+// labeled events (no live LLM turn in the suite).
+{
+  const liveAgent = 'liveprobe';
+  // Timeout-guarded emit: a QoS-1 publish blocks until the broker acks, so under
+  // a starved broker an unguarded execFileSync would hang the whole suite. Cap it
+  // so a stall surfaces as a test failure, never an infinite hang.
+  const emit = (type, corr, payload) => {
+    const args = ['emit', type];
+    if (corr) args.push('--correlation', corr);
+    args.push('--payload', payload);
+    execFileSync(path.join(BIN, 'lanius'), args, { env: ENV, encoding: 'utf8', timeout: 15000 });
+  };
+  // Seed a fresh chat agent so the surface is a clean comms thread (not a trace).
+  const seed = await newPage();
+  await seed.goto('/');
+  await seed.evaluate(async (name) => {
+    await fetch('/api/admin/agents', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) }).catch(() => {});
+  }, liveAgent);
+  await seed.close();
+
+  // M1: the shared health projection is a pure function of (status, liveness).
+  // Exercise the SHIPPED function (window.__systemHealth) across every branch the
+  // acceptance names: broker down, world c, history unavailable, actor
+  // running/failed/not-started.
+  const hp = await newPage();
+  await hp.goto('/');
+  const h = await hp.evaluate(() => {
+    const f = (window).__systemHealth;
+    return {
+      brokerDown: f({ broker_connected: false }, { actors: {} }).brokerConnected,
+      brokerUp: f({ broker_connected: true }, { actors: {} }).brokerConnected,
+      worldC: f({ llm: { world: 'c' } }, {}).llmWorld,
+      worldA: f({ llm: { world: 'a' } }, {}).llmWorld,
+      worldNull: f({}, {}).llmWorld,
+      historyOff: f({ history: { available: false } }, {}).historyAvailable,
+      historyOn: f({ history: { available: true } }, {}).historyAvailable,
+      running: f({}, { actors: { git: { status: 'running' } } }).actorStatus('git'),
+      failed: f({}, { actors: { git: { status: 'failed' } } }).actorStatus('git'),
+      notStarted: f({}, { actors: {} }).actorStatus('git'),
+    };
+  });
+  (h.brokerDown === false && h.brokerUp === true) ? ok('health(M1): brokerConnected projects broker_connected') : fail(`health(M1): broker projection wrong (${JSON.stringify(h)})`);
+  (h.worldC === 'c' && h.worldA === 'a' && h.worldNull === null) ? ok('health(M1): llmWorld projects world a/c, null when unknown') : fail(`health(M1): world projection wrong (${JSON.stringify(h)})`);
+  (h.historyOff === false && h.historyOn === true) ? ok('health(M1): historyAvailable projects status.history.available') : fail('health(M1): history projection wrong');
+  (h.running === 'running' && h.failed === 'failed' && h.notStarted === 'not-started') ? ok('health(M1): actorStatus maps running/failed and not-started (never conflated with running)') : fail(`health(M1): actor projection wrong (${JSON.stringify(h)})`);
+  await hp.close();
+
+  // The stack's broker must be connected so the real send-path pre-check passes.
+  await waitFor('chat-liveness: broker connected', async () => {
+    try { return (await (await fetch(`${BASE}/api/status`)).json()).broker_connected === true; } catch { return false; }
+  }, 10000);
+
+  const selectLive = async (page) => {
+    await page.waitForSelector('#nav-agents .nav-agent');
+    await waitFor('chat-liveness: liveprobe selectable', async () => {
+      const agents = await page.$$('#nav-agents .nav-agent');
+      for (const item of agents) {
+        if ((await item.getAttribute('data-sel')) === `agent:${liveAgent}`) { await item.click(); return true; }
+      }
+      return false;
+    }, 8000);
+    await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+  };
+
+  // M2 happy path: sent → thinking → reply. Intercept /api/publish so the send is
+  // deterministic; capture the correlation + session to drive the fake agent.
+  const live = await newPage();
+  const pubs = [];
+  await live.route('**/api/publish', async (route) => {
+    try { pubs.push(JSON.parse(route.request().postData() || '{}')); } catch {}
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await live.goto('/');
+  await selectLive(live);
+  // M3 empty-state invite copy.
+  await live.click('#conv-new');
+  await waitFor('chat-liveness(M3): the empty thread invites "say hello"', async () => {
+    return /say hello/i.test(await live.$eval('#conv-holder', (el) => el.textContent));
+  }, 5000);
+
+  const m1 = `live-${Date.now()}`;
+  await live.fill('#compose-input', m1);
+  await live.click('#compose-send');
+  await waitFor('chat-liveness(M2): the sent mark rides the message', async () => {
+    return (await live.$('#conv-holder [data-sel="msg-sent"]')) !== null;
+  }, 8000);
+  await waitFor('chat-liveness(M2): the browser published the message', async () => pubs.length >= 1, 5000);
+  const corr1 = pubs[pubs.length - 1].correlation;
+  const session1 = pubs[pubs.length - 1].payload?.session;
+  // Obs activity = the agent woke up → the thinking indicator. obs/agent topics
+  // ride the broker directly from a live agent (they are NOT part of the ledger
+  // announce sweep, which only fans in/ signal/ obs/config), so inject via the
+  // web server's own bus publish (a node fetch — the page's /api/publish route
+  // interception does not apply here).
+  await fetch(`${BASE}/api/publish`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic: `obs/agent/${liveAgent}/${session1}/tool/probe`, payload: { note: 'awake' } }) });
+  await waitFor('chat-liveness(M2): obs activity shows the thinking indicator', async () => {
+    return (await live.$('#conv-holder [data-sel="conv-thinking"]')) !== null;
+  }, 8000);
+  // The reply lands → both marks resolve and the reply threads here.
+  const replyText = `reply-${Date.now()}`;
+  emit('in/human/owner', corr1, JSON.stringify({ text: replyText, agent: liveAgent }));
+  await waitFor('chat-liveness(M2): the reply lands in the same thread', async () => {
+    return (await live.$eval('#conv-holder', (el) => el.textContent)).includes(replyText);
+  }, 8000);
+  const resolved = (await live.$('#conv-holder [data-sel="conv-thinking"]')) === null && (await live.$('#conv-holder [data-sel="msg-sent"]')) === null;
+  resolved ? ok('chat-liveness(M2): the reply resolves the thinking + sent indicators') : fail('chat-liveness(M2): indicators did not resolve on reply');
+  await live.close();
+
+  // M2 stalled path: 20s of silence with no obs and no reply → the honest stalled
+  // line, corr-keyed so it survives leaving the thread and returning (wonky bit
+  // 2); retry re-sends under a fresh corr and a reply resolves it.
+  const stall = await newPage();
+  const spubs = [];
+  await stall.route('**/api/publish', async (route) => {
+    try { spubs.push(JSON.parse(route.request().postData() || '{}')); } catch {}
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await stall.goto('/');
+  await selectLive(stall);
+  await stall.click('#conv-new');
+  const sm = `stall-${Date.now()}`;
+  await stall.fill('#compose-input', sm);
+  await stall.click('#compose-send');
+  await waitFor('chat-liveness(M2): the stalled line appears after 20s of silence', async () => {
+    return (await stall.$('#conv-holder [data-sel="conv-stalled"]')) !== null;
+  }, 26000);
+  const hasRecourse = (await stall.$('[data-sel="conv-stalled-status"]')) !== null && (await stall.$('[data-sel="conv-stalled-retry"]')) !== null;
+  hasRecourse ? ok('chat-liveness(M2): the stalled line offers check-status and retry') : fail('chat-liveness(M2): stalled line missing recourse affordances');
+  // wonky bit 2: leave the thread (check status → setup) and come back — the
+  // corr-keyed stalled line is still there, not stranded or duplicated.
+  await stall.click('[data-sel="conv-stalled-status"]');
+  await stall.waitForSelector('#view-setup:not([hidden])', { timeout: 5000 });
+  ok('chat-liveness(M2): check-status navigates to setup');
+  await selectLive(stall);
+  const survived = await stall.$$('#conv-holder [data-sel="conv-stalled"]');
+  survived.length === 1 ? ok('chat-liveness(M2): the stalled line survives leaving+returning (corr-keyed, one instance)') : fail(`chat-liveness(M2): stalled line count after return = ${survived.length}, expected 1`);
+  // Retry re-publishes under a fresh corr; a reply on that corr resolves the line.
+  // Clicked TWICE in the same task (before React can unrender the line): retry is
+  // consume-once, so a rapid double-click must publish exactly one re-send.
+  const before = spubs.length;
+  await stall.$eval('[data-sel="conv-stalled-retry"]', (el) => { el.click(); el.click(); });
+  await waitFor('chat-liveness(M2): retry re-publishes under a fresh correlation', async () => spubs.length > before && spubs[spubs.length - 1].correlation !== spubs[before - 1].correlation, 8000);
+  await sleep(600);
+  spubs.length === before + 1
+    ? ok('chat-liveness(M2): a double-clicked retry publishes exactly once (consume-once)')
+    : fail(`chat-liveness(M2): double-clicked retry published ${spubs.length - before} times, expected 1`);
+  const corr2 = spubs[spubs.length - 1].correlation;
+  emit('in/human/owner', corr2, JSON.stringify({ text: 'retry-answered', agent: liveAgent }));
+  await waitFor('chat-liveness(M2): a reply after retry clears the stalled line', async () => {
+    const t = await stall.$eval('#conv-holder', (el) => el.textContent);
+    return t.includes('retry-answered') && (await stall.$('#conv-holder [data-sel="conv-stalled"]')) === null;
+  }, 8000);
+  // Obs AFTER the stall lifts the stalled line: stall a fresh send, then let a
+  // correlated obs event arrive — the agent is demonstrably running, so "No
+  // response yet. The agent may not be running." must yield to the thinking
+  // indicator (the same wake-up signal we trust before the stall).
+  const om = `obslate-${Date.now()}`;
+  const obefore = spubs.length;
+  await stall.fill('#compose-input', om);
+  await stall.click('#compose-send');
+  await waitFor('chat-liveness(M2): late-obs probe send published', async () => spubs.length > obefore, 5000);
+  const corr3 = spubs[spubs.length - 1].correlation;
+  const session3 = spubs[spubs.length - 1].payload?.session;
+  await waitFor('chat-liveness(M2): the late-obs probe send stalls in silence', async () => (await stall.$('#conv-holder [data-sel="conv-stalled"]')) !== null, 26000);
+  await fetch(`${BASE}/api/publish`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic: `obs/agent/${liveAgent}/${session3}/tool/probe`, payload: { note: 'late wake' } }) });
+  await waitFor('chat-liveness(M2): obs after the stall lifts the stalled line into thinking', async () => {
+    return (await stall.$('#conv-holder [data-sel="conv-stalled"]')) === null && (await stall.$('#conv-holder [data-sel="conv-thinking"]')) !== null;
+  }, 8000);
+  emit('in/human/owner', corr3, JSON.stringify({ text: 'late-wake-answered', agent: liveAgent }));
+  await waitFor('chat-liveness(M2): the late reply resolves the revived thinking indicator', async () => {
+    const t = await stall.$eval('#conv-holder', (el) => el.textContent);
+    return t.includes('late-wake-answered') && (await stall.$('#conv-holder [data-sel="conv-thinking"]')) === null;
+  }, 8000);
+  await stall.close();
+
+  // M3 pre-check (wonky bit 4): with no LLM path (world c), a send does not sail
+  // into the void — it renders the immediate in-thread "nothing is running" line
+  // (no 20s wait) with a route to setup. Force world c by intercepting /api/status
+  // (the SSE status frame patches only the broker fields, never llm.world, so the
+  // projection stays world c). The broker-down sibling of this OR is covered by
+  // the M1 projection test above.
+  const dead = await newPage();
+  await dead.route('**/api/status', async (route) => {
+    const resp = await route.fetch();
+    const j = await resp.json().catch(() => ({}));
+    j.llm = { ...(j.llm || {}), world: 'c' };
+    await route.fulfill({ response: resp, json: j });
+  });
+  await dead.goto('/');
+  await selectLive(dead);
+  await dead.click('#conv-new');
+  const dm = `void-${Date.now()}`;
+  await dead.fill('#compose-input', dm);
+  await dead.click('#compose-send');
+  await waitFor('chat-liveness(M3): a send with no path renders the immediate no-path line', async () => {
+    return (await dead.$('#conv-holder [data-sel="conv-nopath"]')) !== null;
+  }, 8000);
+  // The typed message is still visible — nothing silently vanished.
+  (await dead.$eval('#conv-holder', (el) => el.textContent)).includes(dm)
+    ? ok('chat-liveness(M3): the typed message stays visible alongside the no-path line')
+    : fail('chat-liveness(M3): the typed message vanished on the no-path pre-check');
+  const nopathSetup = (await dead.$('[data-sel="conv-nopath-setup"]')) !== null;
+  nopathSetup ? ok('chat-liveness(M3): the no-path line links to setup') : fail('chat-liveness(M3): no-path line missing the setup link');
+  await dead.click('[data-sel="conv-nopath-setup"]');
+  await dead.waitForSelector('#view-setup:not([hidden])', { timeout: 5000 });
+  ok('chat-liveness(M3): the no-path setup link navigates to setup');
+  await dead.close();
 }
 
 if (pageErrors.length) {

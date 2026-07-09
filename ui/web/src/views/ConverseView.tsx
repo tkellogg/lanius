@@ -4,7 +4,7 @@ import AgentChip from '../components/AgentChip';
 import { IconButton } from '../components/primitives';
 import { relativeTime, summarize } from '../lib/format';
 
-function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, openConversation, newConversation, startBranch, branchOrigin, selectCodeSessions, isTraceAgent, sendLabel, allowHtml }: any) {
+function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, selectSetup, pending, retryPending, openConversation, newConversation, startBranch, branchOrigin, selectCodeSessions, isTraceAgent, sendLabel, allowHtml }: any) {
   const [conversationSearch, setConversationSearch] = useState('');
   // chat-follow M1: "pinned" is derived from scroll position, never a suppress
   // flag (docs/handoffs/chat-follow.md wonky bit 2) — a programmatic scroll-to-
@@ -70,6 +70,18 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
       </div>
     );
   }
+  // chat-liveness M2: liveness indicators for THIS thread. The pending machine is
+  // keyed by corr in App; we render only the entries whose session is the open
+  // conversation (wonky bit 2), so switching threads and back never strands or
+  // duplicates an indicator. Sessions are globally unique, so a session match is
+  // an exact thread match.
+  const threadPending: any[] = [];
+  if (pending) for (const [corr, e] of pending as Map<string, any>) if (e.session === current) threadPending.push({ corr, ...e });
+  const thinking = threadPending.some((e) => e.state === 'thinking');
+  const stalled = threadPending.filter((e) => e.state === 'stalled');
+  // The subtle per-message "sent" mark (wonky bit 3) rides an outstanding you-
+  // message (sent or thinking); it resolves the moment the reply lands.
+  const sentMarkCorrs = new Set(threadPending.filter((e) => e.state === 'sent' || e.state === 'thinking').map((e) => e.corr));
   return (
     <div id="view-converse" className="view" data-mode="comms" hidden={hidden}>
       <div id="conv-configure-hint" className="conv-configure-hint">
@@ -110,8 +122,39 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
           </div>
         )}
         <div ref={feedRef} className="conv-feed" role="log" aria-live="polite" aria-label={`conversation with ${agent}`}>
-          {!messages.length && !branchOrigin && <div className="conv-empty"><p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p><p>Start a conversation with {agent}. Replies and asks stay in this thread.</p></div>}
-          {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} allowHtml={allowHtml} /> : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `conversation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span>{!m.failed && startBranch && <button type="button" className="msg-reply" data-sel="msg-reply" title="reply — branches a new conversation" onClick={() => startBranch(agent, m)}>↳ reply</button>}</div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : <Markdown text={String(m.text ?? '')} allowHtml={allowHtml} format={m.format} />}</div></div>)}
+          {/* chat-liveness M3 (wonky bit 7): the empty thread invites — one warm
+              sentence — and saying hello visibly runs the sent → thinking → reply
+              machine below. */}
+          {!messages.length && !branchOrigin && <div className="conv-empty"><p className="conv-empty-mark"><AgentChip name={agent} size="lg" /></p><p>Say hello to {agent} — type below and it answers right here.</p></div>}
+          {messages.map((m: any) => m.type === 'ask' ? <AskMessage key={m.id} agent={agent} message={m} answerAsk={answerAsk} allowHtml={allowHtml} />
+            : m.type === 'notice' ? (
+              // chat-liveness M3: the send-time dead-end line — honest about what we
+              // can see, with a route out. Not styled as an error (we know nothing
+              // failed); it's a "nothing is running yet" statement.
+              <div key={m.id} className="msg notice" data-sel="conv-nopath"><div className="msg-body"><span className="conv-nopath-note">{String(m.text ?? '')}</span>{selectSetup && <button type="button" className="ghost conv-nopath-setup" data-sel="conv-nopath-setup" onClick={() => selectSetup()}>go to setup →</button>}</div></div>
+            )
+            : <div key={m.id} className={`msg ${m.cls}`} title={m.corr ? `conversation ${m.corr}` : ''}><div className="msg-meta"><span className="msg-who">{m.who}</span>{sentMarkCorrs.has(m.corr) && <span className="msg-sent" data-sel="msg-sent" title="sent — waiting for a reply">sent</span>}{!m.failed && startBranch && <button type="button" className="msg-reply" data-sel="msg-reply" title="reply — branches a new conversation" onClick={() => startBranch(agent, m)}>↳ reply</button>}</div><div className="msg-body">{m.failed ? <><div className="fail-reason">{m.text}</div><div className="fail-hint">check the agent: a model set, the background service running, and the add-on turned on.</div></> : <Markdown text={String(m.text ?? '')} allowHtml={allowHtml} format={m.format} />}</div></div>)}
+          {/* chat-liveness M2: the agent woke up — an animated dots row at the foot
+              of the thread. Shown while any open-thread message is 'thinking'. */}
+          {thinking && (
+            <div className="conv-thinking" data-sel="conv-thinking" aria-live="polite">
+              <AgentChip name={agent} size="sm" />
+              <span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span>
+              <span className="dim-inline">thinking…</span>
+            </div>
+          )}
+          {/* chat-liveness M2: 20s of silence → admit it, don't hide it. Uncertainty,
+              not a fabricated error, with two ways forward (check status / retry). A
+              reply arriving later resolves the entry and this line unrenders. */}
+          {stalled.map((e: any) => (
+            <div key={e.corr} className="conv-stalled" data-sel="conv-stalled" role="status">
+              <p className="conv-stalled-note">No response yet. The agent may not be running.</p>
+              <div className="conv-stalled-actions">
+                {selectSetup && <button type="button" className="ghost" data-sel="conv-stalled-status" onClick={() => selectSetup()}>check status</button>}
+                {retryPending && <button type="button" className="conv-stalled-retry" data-sel="conv-stalled-retry" onClick={() => retryPending(e.corr)}>retry</button>}
+              </div>
+            </div>
+          ))}
         </div>
         {!pinned && <button type="button" className="conv-jump" data-sel="conv-jump" onClick={() => { scrollToBottom(); setPinned(true); }}>new messages ↓</button>}
       </div>
