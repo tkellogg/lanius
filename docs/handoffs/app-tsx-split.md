@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 author: Fable 5 (planner) under Fable, for Tim
 last-updated: 2026-07-08
 ---
@@ -118,3 +118,16 @@ import lines).
 - 2026-07-08 — planned (Fable 5 under Fable). Boundary decision: App keeps
   all state + loaders; the shared health hook later handoffs use is created
   by chat-liveness (its first consumer), NOT here.
+- 2026-07-08 — implemented (Opus worker): App.tsx 2786 → 1301 lines; 7 view
+  files, 4 lib modules, routing.ts, components/AgentChip.tsx. Byte-exact
+  line-range moves + import/export lines only. Allowed deviation: dropped
+  a dead `Markdown` import and narrowed the primitives import in App.tsx
+  (`Button` was already dead in HEAD).
+- 2026-07-08 — VERIFIED (adversarial Opus, fresh context; reviewed by
+  Fable): pass=true, build_ok, tests_ok. Zero-line-delta multiset proof +
+  sequence-exact per-function diffs incl. the whole App component body;
+  tsc clean; cargo test 605/605; full e2e 306/306 on clean run (one
+  first-run flake = the real-network deepseek provider probe,
+  environmental); build.rs freshness confirmed live. Residuals (noted,
+  deliberately not fixed): dead exports `convMessageKey`
+  (lib/conversation.ts) and `displayConfigValue` (lib/packages.ts).
