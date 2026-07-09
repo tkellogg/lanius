@@ -1089,10 +1089,40 @@ details[open] > summary .cfg-disclosure { transform: rotate(90deg); color: var(-
   padding: 5px 0; border-top: 1px solid var(--subtle-border);
 }
 .cfg-package-head {
-  display: grid; grid-template-columns: 16px 28px minmax(160px, 1fr);
+  display: grid; grid-template-columns: 16px 28px minmax(160px, 1fr) auto;
   gap: 10px; align-items: center; padding: 5px 6px 5px 2px;
   cursor: pointer; border-left: 2px solid transparent; border-radius: 3px;
 }
+/* package-truth.md M1: the three collapsed-row facts + the on/off toggle. Each
+   fact is a plain word; "on by default" and "off" and the service state read at
+   a glance without opening the card. */
+.cfg-package-name-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.cfg-package-facts { display: inline-flex; flex-wrap: wrap; gap: 5px; align-items: baseline; }
+.cfg-fact {
+  font-size: 10px; letter-spacing: 0.02em; text-transform: lowercase;
+  padding: 1px 6px; border-radius: 999px; border: 1px solid var(--panel-edge);
+  color: var(--dim); white-space: nowrap;
+}
+.cfg-fact-installed { color: var(--meta); }
+.cfg-fact.is-ok { color: var(--work); border-color: color-mix(in srgb, var(--work) 45%, var(--panel-edge)); }
+.cfg-fact.is-warn { color: var(--agent); border-color: color-mix(in srgb, var(--agent) 45%, var(--panel-edge)); }
+.cfg-fact.is-bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--panel-edge)); }
+.cfg-fact.is-idle { color: var(--dim); }
+.cfg-fact-harness { color: var(--meta); font-style: italic; }
+.cfg-package-repair {
+  display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  font-size: 11.5px; color: var(--agent); line-height: 1.4;
+}
+.cfg-package-repair.repair-revoked { color: var(--dim); }
+.cfg-package-repair.repair-service-down { color: var(--dim); }
+.cfg-package-approve, .sessions-approve {
+  font-size: 11px; padding: 2px 9px; border-radius: 4px;
+  border: 1px solid color-mix(in srgb, var(--work) 55%, var(--panel-edge));
+  background: color-mix(in srgb, var(--work) 12%, transparent); color: var(--ink);
+  cursor: pointer;
+}
+.cfg-package-disable { align-self: center; white-space: nowrap; }
+.sessions-degraded { display: flex; flex-direction: column; gap: 6px; }
 .cfg-package-head:hover,
 .cfg-package-card:focus-within > .cfg-package-head {
   background: color-mix(in srgb, var(--work) 8%, transparent);

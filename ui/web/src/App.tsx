@@ -9,7 +9,7 @@ import { IconButton } from './components/primitives';
 import { type Sel, type AgentTab, selToPath, pathToSel } from './routing';
 import { arr, csv, uid } from './lib/format';
 import { agentOf, newWebConversationId, conversationStorageKey, mergeConvMessages, sessionFromPayload, isWorkerAgentName, isWorkerSessionId, topicFilterMatches } from './lib/conversation';
-import { declaredConfigParams, configRowMap, prunedSet } from './lib/packages';
+import { declaredConfigParams, configRowMap, prunedSet, packageRepair } from './lib/packages';
 import { useSystemHealth } from './lib/health';
 import Nav from './views/Nav';
 import WelcomeView from './views/WelcomeView';
@@ -897,6 +897,27 @@ export function App() {
     setCfgForm(form);
     reconcileContextChain(form);
   };
+  // package-truth.md wonky bit 1: a row reads "on by default" (not a chosen
+  // green light) when it is allowed only because this agent's include is the
+  // match-everything default. Mirrors skillIncluded's `include.length ? … : ['#']`.
+  const includeIsDefault = (() => {
+    const inc = arr(cfgForm.include);
+    return inc.length === 0 || (inc.length === 1 && inc[0] === '#');
+  })();
+  // package-truth.md M2: repair a needs-review package live from the row via the
+  // existing POST /api/admin/approve (decided_by=ui). The spike proved this
+  // attaches capabilities with no restart; it is a no-op on a revoked package, so
+  // the row only offers the button when grants are `requested`. Refresh the
+  // package grants (loadConfigure) and the shared health facts after.
+  const approvePackage = async (name: string) => {
+    const r = await adminPost('approve', { package: name });
+    if (r.ok) {
+      await loadConfigure(sel.agent ?? cfgParsed.agent ?? cfgProfile);
+      void loadSystemStatus();
+      void loadLiveness();
+    }
+    return r;
+  };
 
   const openKitModal = () => {
     setKitModalOpen(true);
@@ -1314,7 +1335,7 @@ export function App() {
             sendLabel="Send"
             allowHtml={systemStatus?.trust === 'full'}
           />
-          <SessionsView hidden={!(sel.kind === 'agent' && sel.tab === 'sessions')} state={sessionsState} agent={sel.agent} openTranscript={openTranscript} loadSessions={loadSessions} />
+          <SessionsView hidden={!(sel.kind === 'agent' && sel.tab === 'sessions')} state={sessionsState} agent={sel.agent} openTranscript={openTranscript} loadSessions={loadSessions} repair={packageRepair(health.historyGrant || 'allowed', { brokerConnected: health.brokerConnected, reachable: false })} approvePackage={approvePackage} />
           <ConfigureView
             hidden={!(sel.kind === 'agent' && sel.tab === 'configure')}
             modelOptions={modelOptions}
@@ -1351,6 +1372,9 @@ export function App() {
             setKitPackagesExcluded={setKitPackagesExcluded}
             openKitModal={openKitModal}
             selectProviders={selectProviders}
+            health={health}
+            includeIsDefault={includeIsDefault}
+            approvePackage={approvePackage}
           />
           {sel.kind === 'code-sessions' && <CodeSessions focus={sel.focus} />}
           {sel.kind === 'comms' && <CommsView onSelectSession={selectCodeSession} />}

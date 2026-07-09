@@ -397,7 +397,8 @@ const testAgentProfile = 'harrier';
     return /chat/.test(text)
       && !sections.includes('core')
       && !sections.includes('local')
-      && sections.some((s) => /stdlib|instance/.test(s))
+      && sections.some((s) => /stdlib|this installation/.test(s))
+      && !sections.some((s) => /\binstance\b/.test(s))
       && !/current settings|TOML value/.test(text);
   }, 8000);
   const windowPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="window"]').first();
@@ -408,7 +409,9 @@ const testAgentProfile = 'harrier';
     const text = await windowPackage().locator('summary').textContent();
     return /settings can be saved for every agent or for harrier only/i.test(text);
   }, 5000);
-  await windowPackage().locator('summary').click();
+  // package-truth: the collapsed row now carries buttons inside <summary>, so a
+  // geometric summary click can land on one — open the details node directly.
+  await windowPackage().evaluate((el) => { el.open = true; });
   await windowPackage().locator('.cfg-package-config-toggle').click();
   await waitFor('configure: typed context-stage setting renders from manifest', async () => {
     const text = await windowPackage().textContent();
@@ -492,15 +495,16 @@ const testAgentProfile = 'harrier';
     return !hasNativeModeSelect && /link/.test(menuText) && /copy/.test(menuText);
   }, 5000);
   await page.click('#cfg-kit-add-close');
+  // package-truth M1: the on/off toggle sits ON the collapsed row now — no
+  // summary click needed to reach it (and a geometric summary click could land
+  // on the toggle itself).
   const historyPackage = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="history"]').first();
-  await historyPackage().locator('summary').click();
   const packageToggle = () => historyPackage().locator('.cfg-package-disable').first();
   if (await packageToggle().count()) {
     await packageToggle().click();
     await waitFor('configure: disable package writes exclude', async () => {
       return (await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('history');
     }, 5000);
-    await historyPackage().locator('summary').click();
     await packageToggle().click();
     await waitFor('configure: enable package removes exclude', async () => {
       return !(await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('history');
@@ -524,7 +528,6 @@ const testAgentProfile = 'harrier';
   } else {
     fail('configure: package group toggle not found');
   }
-  await historyPackage().locator('summary').click();
   await packageToggle().click();
   await waitFor('configure: disable package persists through save', async () => {
     return (await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('history');
@@ -2963,6 +2966,169 @@ const renamedAgent = 'falcon';
   await dead.waitForSelector('#view-setup:not([hidden])', { timeout: 5000 });
   ok('chat-liveness(M3): the no-path setup link navigates to setup');
   await dead.close();
+}
+
+// ── flow: package-truth (docs/handoffs/package-truth.md) ──────────────────────
+// The configure package list tells the truth: three plain facts per collapsed
+// row, an off switch on the row, a harness-applicability line, honest repair
+// (allow a needs-review package live; a revoked one says so with NO button), no
+// onscreen "instance", no echo row. Runs LAST — its recent-history revoke parks a
+// stock stage nothing after it needs.
+{
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+  await waitFor('package-truth: select the default agent', async () => {
+    for (const item of await page.$$('#nav-agents .nav-item')) {
+      if (/\bmain\b/.test(await item.textContent())) { await item.click(); return true; }
+    }
+    return false;
+  });
+  await page.click('[data-tab="configure"]');
+  await page.waitForSelector('#view-configure:not([hidden])');
+  await waitForConfigureLoaded(page, 'main');
+  await page.waitForSelector('#cfg-package-configs .cfg-package-card', { timeout: 8000 });
+
+  // M1: the three collapsed-row facts on a daemon package (history is running).
+  const historyCard = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="history"]').first();
+  await waitFor('package-truth(M1): collapsed row states installed + allowed + running', async () => {
+    if (!(await historyCard().count())) return false;
+    const installed = (await historyCard().locator('.cfg-fact-installed').textContent().catch(() => '')) || '';
+    const allowed = (await historyCard().locator('.cfg-fact-allowed').textContent().catch(() => '')) || '';
+    const running = (await historyCard().locator('.cfg-fact-running').textContent().catch(() => '')) || '';
+    return /installed/i.test(installed) && /on by default/i.test(allowed) && /running/i.test(running);
+  });
+  // "on by default" is NOT the same as a chosen "on" — the word is present, not "enabled".
+  await waitFor('package-truth(M1): a match-everything default reads "on by default", never "enabled"', async () => {
+    const allowed = (await historyCard().locator('.cfg-fact-allowed').textContent().catch(() => '')) || '';
+    return /on by default/i.test(allowed) && !/enabled/i.test(allowed);
+  });
+
+  // M1: harness-applicability — a coding-harness adapter package (harness-codex)
+  // says it won't be loaded by this (native) agent, computed from the manifest.
+  const codexCard = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="harness-codex"]').first();
+  await waitFor('package-truth(M1): harness-codex row says it applies to a different harness', async () => {
+    if (!(await codexCard().count())) return false;
+    const line = (await codexCard().locator('.cfg-fact-harness').textContent().catch(() => '')) || '';
+    return /codex coding tool/i.test(line) && /won.t load it/i.test(line);
+  });
+  // A harness-adapter package is not a service — no running fact fabricated for it.
+  (await codexCard().locator('.cfg-fact-running').count()) === 0
+    ? ok('package-truth(M1): harness-codex shows no running fact (not a service)')
+    : fail('package-truth(M1): harness-codex wrongly shows a running fact');
+
+  // M3: no echo row (dropped from the seed + not written on init), no onscreen
+  // "instance" (the grouping key is renamed to a plain phrase for display).
+  (await page.locator('#cfg-package-configs .cfg-package-card[data-package="echo"]').count()) === 0
+    ? ok('package-truth(M3): a fresh init shows no echo row')
+    : fail('package-truth(M3): echo row present after fresh init');
+  // UI-generated copy only (a package's own manifest prose may legitimately say
+  // "instance" — rewording it would change its manifest hash and re-gate grants,
+  // out of this handoff's scope): group headers and source labels must not say it.
+  const uiLabels = await page.$$eval(
+    '#cfg-package-configs .cfg-kit-name, #cfg-package-configs .cfg-package-facts, #cfg-package-configs .cfg-package-repair',
+    (els) => els.map((el) => el.textContent || '').join(' | '),
+  );
+  !/\binstance\b/i.test(uiLabels) && /this installation/.test(uiLabels)
+    ? ok('package-truth(M3): no UI-generated "instance" — the group reads "this installation"')
+    : fail(`package-truth(M3): "instance" leaked into UI labels or the rename is missing: ${uiLabels.slice(0, 200)}`);
+
+  // M1: the off switch lives on the collapsed row and round-trips skills.exclude.
+  const windowToggle = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="window"] .cfg-package-disable').first();
+  if (await windowToggle().count()) {
+    await windowToggle().click();
+    await waitFor('package-truth(M1): collapsed-row toggle writes skills.exclude', async () =>
+      (await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('window'), 5000);
+    await page.locator('#cfg-package-configs .cfg-package-card[data-package="window"] .cfg-package-disable').first().click();
+    await waitFor('package-truth(M1): collapsed-row toggle removes skills.exclude (round-trip)', async () =>
+      !(await page.$eval('#cfg-exclude', (el) => el.value)).split(',').map((s) => s.trim()).includes('window'), 5000);
+  } else {
+    fail('package-truth(M1): window collapsed-row toggle not found');
+  }
+
+  // M2: needs-review repair — recent-history ships with `requested` grants; the
+  // row offers "allow and start" and POST /api/admin/approve flips it live.
+  const rhCard = () => page.locator('#cfg-package-configs .cfg-package-card[data-package="recent-history"]').first();
+  const approveBtn = () => rhCard().locator('.cfg-package-approve');
+  if (await approveBtn().count()) {
+    const repairText = await rhCard().locator('.cfg-package-repair').textContent();
+    /not allowed to run yet/i.test(repairText || '')
+      ? ok('package-truth(M2): needs-review row explains the state in plain words')
+      : fail(`package-truth(M2): needs-review copy unexpected: "${repairText}"`);
+    await approveBtn().first().click();
+    await waitFor('package-truth(M2): allow-and-start clears the needs-review repair live', async () =>
+      (await rhCard().locator('.cfg-package-repair').count()) === 0, 8000);
+    const grants = await page.evaluate(async () => {
+      const j = await fetch('/api/admin/packages?profile=default').then((r) => r.json()).catch(() => ({}));
+      const p = (j.packages || []).find((x) => x.name === 'recent-history');
+      return p ? [...new Set((p.grants || []).map((g) => `${g.state}/${g.decided_by}`))] : [];
+    });
+    grants.length === 1 && grants[0] === 'approved/ui'
+      ? ok('package-truth(M2): approve recorded decided_by=ui with no CLI touch')
+      : fail(`package-truth(M2): grants after approve unexpected: ${JSON.stringify(grants)}`);
+  } else {
+    fail('package-truth(M2): recent-history did not offer an allow button');
+  }
+
+  // M2: revoked is TERMINAL — the row says so and offers NO button. Driven off a
+  // real force-revoke of a daemon package (the row reads the ledger immediately);
+  // history itself is left alone so earlier flows stay valid.
+  lanius('revoke', 'recent-history', '--force');
+  // Fresh load via the front door, NOT reload: reloading the /agents/main/config
+  // deep link triggers a pre-existing `/api/admin/profile?name=main` 404 (agent
+  // `main` lives in profile `default`) that trips the console-error gate.
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item');
+  await waitFor('package-truth(M2): reselect the default agent after revoke', async () => {
+    for (const item of await page.$$('#nav-agents .nav-item')) {
+      if (/\bmain\b/.test(await item.textContent())) { await item.click(); return true; }
+    }
+    return false;
+  });
+  await page.click('[data-tab="configure"]');
+  await page.waitForSelector('#view-configure:not([hidden])');
+  await waitForConfigureLoaded(page, 'main');
+  await waitFor('package-truth(M2): a revoked row shows the honest terminal state', async () => {
+    const revoked = rhCard().locator('.cfg-package-repair.repair-revoked');
+    if (!(await revoked.count())) return false;
+    const text = (await revoked.textContent()) || '';
+    return /switched off/i.test(text) && /isn.t supported yet/i.test(text);
+  });
+  (await rhCard().locator('.cfg-package-approve').count()) === 0
+    ? ok('package-truth(M2): a revoked row offers NO approve button (approve is a no-op)')
+    : fail('package-truth(M2): a revoked row wrongly offers an approve button');
+
+  // The shared repair vocabulary the sessions tab and the row both render, driven
+  // through the SHIPPED projections (window.__packageTruth) so every branch is
+  // pinned deterministically — including the dispatcher-down message the manual
+  // check exercises against a live parked stack.
+  const seam = await page.evaluate(() => {
+    const t = window.__packageTruth;
+    return {
+      revoked: t.packageRepair('revoked', { brokerConnected: true, reachable: false }),
+      down: t.packageRepair('allowed', { brokerConnected: false, reachable: false }),
+      needs: t.packageRepair('needs review', { brokerConnected: true }),
+      ok: t.packageRepair('allowed', { brokerConnected: true, reachable: true }),
+      harness: t.harnessApplicability({ manifest: { harness: ['codex'] } }),
+      noHarness: t.harnessApplicability({ manifest: {} }),
+    };
+  });
+  seam.revoked.kind === 'revoked' && seam.revoked.canApprove === false && /switched off/i.test(seam.revoked.message)
+    ? ok('package-truth(M2): repair(revoked) → terminal, no button, honest words')
+    : fail(`package-truth(M2): repair(revoked) wrong: ${JSON.stringify(seam.revoked)}`);
+  seam.down.kind === 'service-down' && seam.down.canApprove === false && /lanius daemon/.test(seam.down.message)
+    ? ok('package-truth(M2): repair(dispatcher down) → the `lanius daemon` message, no button')
+    : fail(`package-truth(M2): repair(down) wrong: ${JSON.stringify(seam.down)}`);
+  seam.needs.kind === 'needs-review' && seam.needs.canApprove === true
+    ? ok('package-truth(M2): repair(needs review) → repairable via the allow button')
+    : fail(`package-truth(M2): repair(needs review) wrong: ${JSON.stringify(seam.needs)}`);
+  seam.ok.kind === 'ok'
+    ? ok('package-truth(M2): repair(running) → nothing to repair')
+    : fail(`package-truth(M2): repair(ok) wrong: ${JSON.stringify(seam.ok)}`);
+  seam.harness && seam.harness.applies === false && /codex/.test(seam.harness.label) && seam.noHarness === null
+    ? ok('package-truth(M1): harnessApplicability is manifest-derived (present for codex, null otherwise)')
+    : fail(`package-truth(M1): harnessApplicability wrong: ${JSON.stringify(seam)}`);
+  await page.close();
 }
 
 if (pageErrors.length) {

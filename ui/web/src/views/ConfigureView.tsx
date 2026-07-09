@@ -4,10 +4,10 @@ import AgentAssistant, { ClientTool } from '../components/AgentAssistant';
 import { IconButton, ModelField, WorkdirInput } from '../components/primitives';
 import { arr, uid } from '../lib/format';
 import { costSummary, autonomyConsequence, modelCostHint } from '../lib/cost';
-import { kitNameFor, declaredConfigParams, packageSource, effectiveConfigValue, tomlDisplayValue, valueSourceLabel, parseConfigRows, packageDescription, packageHasAgentScopedSettings, actorDetail, packageBadges, riskBadges, grantState } from '../lib/packages';
+import { kitNameFor, kitLabel, declaredConfigParams, packageSource, effectiveConfigValue, tomlDisplayValue, valueSourceLabel, parseConfigRows, packageDescription, packageHasAgentScopedSettings, actorDetail, packageBadges, riskBadges, grantState, installedFact, allowedFact, serviceRunningFact, harnessApplicability, packageRepair } from '../lib/packages';
 
 function ConfigureView(props: any) {
-  const { hidden, modelOptions, form, setForm, cfgProfile, cfgParsed, cfgLoading, cfgNote, cfgToml, setCfgToml, cfgTomlNote, saveConfigure, saveRawToml, cfgPackages, cfgKits, cfgConfigPackages, cfgSharedConfigRows, setCfgSharedConfigRows, cfgContextChain, setCfgContextChain, cfgContextVarEdits, setCfgContextVarEdits, contextDefs, availableContextStages, moveContextStage, removeContextStage, saveContextStageFromAssistant, skillIncluded, skillExcluded, setSkillExcluded, setKitPackagesExcluded, openKitModal, selectProviders } = props;
+  const { hidden, modelOptions, form, setForm, cfgProfile, cfgParsed, cfgLoading, cfgNote, cfgToml, setCfgToml, cfgTomlNote, saveConfigure, saveRawToml, cfgPackages, cfgKits, cfgConfigPackages, cfgSharedConfigRows, setCfgSharedConfigRows, cfgContextChain, setCfgContextChain, cfgContextVarEdits, setCfgContextVarEdits, contextDefs, availableContextStages, moveContextStage, removeContextStage, saveContextStageFromAssistant, skillIncluded, skillExcluded, setSkillExcluded, setKitPackagesExcluded, openKitModal, selectProviders, health, includeIsDefault, approvePackage } = props;
   // model-providers M4: the named-provider tie-in. Load the vault list so the
   // agent can SELECT a provider (writing model.provider on save); when an api-key
   // provider is selected the model dropdown sources its list from that provider's
@@ -135,7 +135,7 @@ function ConfigureView(props: any) {
             <input id="cfg-exclude" type="hidden" value={form.exclude} readOnly />
             <div className="setup-row cfg-package-toolbar"><IconButton id="cfg-kit-add-toggle" label="add add-ons" className="cfg-icon-btn" disabled={disabled} onClick={openKitModal}>＋</IconButton><span className="dim-note">copy or link add-ons to change what {agentName} can use</span></div>
             <div id="cfg-package-configs" className="cfg-tree">
-              <PackageTree packages={cfgPackages.filter((p: any) => skillIncluded(p))} skillExcluded={skillExcluded} setSkillExcluded={setSkillExcluded} setKitPackagesExcluded={setKitPackagesExcluded} cfgConfigPackages={cfgConfigPackages} cfgSharedConfigRows={cfgSharedConfigRows} setCfgSharedConfigRows={setCfgSharedConfigRows} cfgProfile={cfgProfile} cfgParsed={cfgParsed} setCfgContextVarEdits={setCfgContextVarEdits} />
+              <PackageTree packages={cfgPackages.filter((p: any) => skillIncluded(p))} skillExcluded={skillExcluded} setSkillExcluded={setSkillExcluded} setKitPackagesExcluded={setKitPackagesExcluded} cfgConfigPackages={cfgConfigPackages} cfgSharedConfigRows={cfgSharedConfigRows} setCfgSharedConfigRows={setCfgSharedConfigRows} cfgProfile={cfgProfile} cfgParsed={cfgParsed} setCfgContextVarEdits={setCfgContextVarEdits} health={health} includeIsDefault={includeIsDefault} approvePackage={approvePackage} />
             </div>
           </section>
 
@@ -315,7 +315,7 @@ function ConfigInputRow({ param, value, setValue, contextVar, contextStage, save
   );
 }
 
-function PackageTree({ packages, skillExcluded, setSkillExcluded, setKitPackagesExcluded, cfgConfigPackages, cfgSharedConfigRows, setCfgSharedConfigRows, cfgProfile, cfgParsed, setCfgContextVarEdits }: any) {
+function PackageTree({ packages, skillExcluded, setSkillExcluded, setKitPackagesExcluded, cfgConfigPackages, cfgSharedConfigRows, setCfgSharedConfigRows, cfgProfile, cfgParsed, setCfgContextVarEdits, health, includeIsDefault, approvePackage }: any) {
   if (!packages.length) return <div className="dim-note">no packages found</div>;
   const groups = new Map();
   for (const p of packages) {
@@ -325,23 +325,40 @@ function PackageTree({ packages, skillExcluded, setSkillExcluded, setKitPackages
   }
   return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([kit, pkgs]: any) => {
     const disabledCount = pkgs.filter((p: any) => skillExcluded(p)).length;
+    const label = kitLabel(kit);
     return (
       <details key={kit} className="cfg-package-group" data-kit={kit} open>
-        <summary className="cfg-kit-summary cfg-kit-head"><span className="cfg-disclosure">▸</span><span className="cfg-kit-name">{kit}</span><span className="cfg-pkg-desc">{pkgs.length} package{pkgs.length === 1 ? '' : 's'}</span><IconButton label={disabledCount === pkgs.length ? `enable all ${kit} packages` : `disable all ${kit} packages`} className={disabledCount === pkgs.length ? 'ghost cfg-icon-btn cfg-kit-toggle' : 'cfg-icon-btn cfg-kit-toggle'} onClick={(e) => { e.preventDefault(); setKitPackagesExcluded(pkgs, disabledCount !== pkgs.length); }}>{disabledCount === pkgs.length ? '✓' : '⊘'}</IconButton></summary>
+        <summary className="cfg-kit-summary cfg-kit-head"><span className="cfg-disclosure">▸</span><span className="cfg-kit-name">{label}</span><span className="cfg-pkg-desc">{pkgs.length} add-on{pkgs.length === 1 ? '' : 's'}</span><IconButton label={disabledCount === pkgs.length ? `enable all ${label} add-ons` : `disable all ${label} add-ons`} className={disabledCount === pkgs.length ? 'ghost cfg-icon-btn cfg-kit-toggle' : 'cfg-icon-btn cfg-kit-toggle'} onClick={(e) => { e.preventDefault(); setKitPackagesExcluded(pkgs, disabledCount !== pkgs.length); }}>{disabledCount === pkgs.length ? '✓' : '⊘'}</IconButton></summary>
         <div className="cfg-package-table">{[...pkgs].sort((a, b) => a.name.localeCompare(b.name)).map((p) => {
           const disabled = skillExcluded(p);
-          return <PackageCard key={`${cfgProfile || cfgParsed.agent || 'agent'}-${p.name}-${disabled ? 'disabled' : 'enabled'}`} pkg={p} disabled={disabled} canConfigure={declaredConfigParams(p).length > 0 || cfgConfigPackages.has(p.name)} toggle={() => setSkillExcluded(p.name, !disabled)} sharedRows={cfgSharedConfigRows.get(p.name) ?? new Map()} setCfgSharedConfigRows={setCfgSharedConfigRows} setCfgContextVarEdits={setCfgContextVarEdits} cfgProfile={cfgProfile} cfgParsed={cfgParsed} />;
+          return <PackageCard key={`${cfgProfile || cfgParsed.agent || 'agent'}-${p.name}-${disabled ? 'disabled' : 'enabled'}`} pkg={p} disabled={disabled} canConfigure={declaredConfigParams(p).length > 0 || cfgConfigPackages.has(p.name)} toggle={() => setSkillExcluded(p.name, !disabled)} sharedRows={cfgSharedConfigRows.get(p.name) ?? new Map()} setCfgSharedConfigRows={setCfgSharedConfigRows} setCfgContextVarEdits={setCfgContextVarEdits} cfgProfile={cfgProfile} cfgParsed={cfgParsed} health={health} includeIsDefault={includeIsDefault} approvePackage={approvePackage} />;
         })}</div>
       </details>
     );
   });
 }
 
-function PackageCard({ pkg, disabled, canConfigure, toggle, sharedRows, setCfgSharedConfigRows, setCfgContextVarEdits, cfgProfile, cfgParsed }: any) {
+function PackageCard({ pkg, disabled, canConfigure, toggle, sharedRows, setCfgSharedConfigRows, setCfgContextVarEdits, cfgProfile, cfgParsed, health, includeIsDefault, approvePackage }: any) {
   const [panelOpen, setPanelOpen] = useState(false);
   const [rows, setRows] = useState<any[] | null>(null);
+  const [approveNote, setApproveNote] = useState('');
   const source = packageSource(pkg);
   const declared = declaredConfigParams(pkg);
+  // The three collapsed-row facts + the harness line + the honest repair state
+  // (package-truth.md wonky bits 1 & 3), each computed from the manifest, the
+  // grant word, and the shared health projection — never a hard-coded list.
+  const installed = installedFact(pkg);
+  const allowed = allowedFact({ excluded: disabled, includeIsDefault });
+  const running = serviceRunningFact(health, pkg);
+  const harness = harnessApplicability(pkg);
+  const grant = grantState(pkg);
+  const reachable = running ? (running.cls === 'ok' || running.cls === 'warn') : undefined;
+  const repair = packageRepair(grant, { brokerConnected: health?.brokerConnected !== false, reachable });
+  const doApprove = async () => {
+    setApproveNote('allowing…');
+    const r = await approvePackage?.(pkg.name);
+    setApproveNote(r?.ok ? 'allowed' : (r?.error ?? 'could not allow it'));
+  };
   useEffect(() => {
     setPanelOpen(false);
     setRows(null);
@@ -411,8 +428,23 @@ function PackageCard({ pkg, disabled, canConfigure, toggle, sharedRows, setCfgSh
   };
   return (
     <details className={`cfg-package-card${disabled ? ' is-disabled' : ''}`} data-package={pkg.name}>
-      <summary className="cfg-package-head"><span className="cfg-disclosure">▸</span><span className={`cfg-source-icon source-${source.kind}`} title={`${source.kind}: ${source.label}`}>{source.icon}</span><span className="cfg-package-title"><span className="setup-kit-name">{pkg.name}</span><span className="cfg-pkg-desc">{packageDescription(pkg)}</span>{canConfigure && <span className="cfg-pkg-desc">{packageHasAgentScopedSettings(pkg) ? `settings can be saved for every agent or for ${cfgParsed.agent || cfgProfile || 'this agent'} only` : 'settings save for every agent'}</span>}</span></summary>
-      <div className="cfg-package-body"><div className="cfg-package-detail">{actorDetail(pkg)}</div><div className="cfg-package-meta">{packageBadges(pkg).map((b) => <span key={b.text} className={b.cls}>{b.text}</span>)}{riskBadges(pkg).map((b) => <span key={`risk-${b}`} className="badge badge-wait">{b}</span>)}</div><div className="cfg-package-controls"><span className="dim-note">{disabled ? 'disabled for this agent' : 'enabled for this agent'} · {grantState(pkg)}</span><button className={disabled ? 'ghost cfg-package-disable' : 'cfg-package-disable'} title={disabled ? `remove ${pkg.name} from skills.exclude` : `add ${pkg.name} to skills.exclude`} onClick={(e) => { e.preventDefault(); toggle(); }}>{disabled ? 'enable' : 'disable'}</button><button className="ghost cfg-package-config-toggle" hidden={!canConfigure} onClick={(e) => { e.preventDefault(); load(); }}>settings</button></div>
+      <summary className="cfg-package-head">
+        <span className="cfg-disclosure">▸</span>
+        <span className={`cfg-source-icon source-${source.kind}`} title={`${source.kind}: ${source.label}`}>{source.icon}</span>
+        <span className="cfg-package-title">
+          <span className="cfg-package-name-row"><span className="setup-kit-name">{pkg.name}</span><span className="cfg-package-facts">
+            <span className="cfg-fact cfg-fact-installed" title={installed.detail}>{installed.label}</span>
+            <span className={`cfg-fact cfg-fact-allowed is-${allowed.cls}`} title={allowed.detail}>{allowed.label}</span>
+            {running && <span className={`cfg-fact cfg-fact-running is-${running.cls}`}>{running.label}</span>}
+          </span></span>
+          <span className="cfg-pkg-desc">{packageDescription(pkg)}</span>
+          {harness && <span className="cfg-pkg-desc cfg-fact-harness">{harness.label} — {harness.note}</span>}
+          {repair.kind !== 'ok' && <span className={`cfg-package-repair repair-${repair.kind}`}>{repair.message}{repair.canApprove && <button className="cfg-package-approve" onClick={(e) => { e.preventDefault(); e.stopPropagation(); void doApprove(); }}>allow and start</button>}{approveNote && <span className="dim-note">{approveNote}</span>}</span>}
+          {canConfigure && <span className="cfg-pkg-desc">{packageHasAgentScopedSettings(pkg) ? `settings can be saved for every agent or for ${cfgParsed.agent || cfgProfile || 'this agent'} only` : 'settings save for every agent'}</span>}
+        </span>
+        <button className={disabled ? 'ghost cfg-package-disable' : 'cfg-package-disable'} title={disabled ? `turn ${pkg.name} on for this agent` : `turn ${pkg.name} off for this agent`} onClick={(e) => { e.preventDefault(); e.stopPropagation(); toggle(); }}>{disabled ? 'turn on' : 'turn off'}</button>
+      </summary>
+      <div className="cfg-package-body"><div className="cfg-package-detail">{actorDetail(pkg)}</div><div className="cfg-package-meta">{packageBadges(pkg).map((b) => <span key={b.text} className={b.cls}>{b.text}</span>)}{riskBadges(pkg).map((b) => <span key={`risk-${b}`} className="badge badge-wait">{b}</span>)}</div><div className="cfg-package-controls"><span className="dim-note">{allowed.detail} · {grant}</span><button className="ghost cfg-package-config-toggle" hidden={!canConfigure} onClick={(e) => { e.preventDefault(); load(); }}>settings</button></div>
         <div className="cfg-package-config-panel" hidden={!panelOpen}>{rows === null ? 'loading...' : !rows.length ? <div className="dim-note">no configurable settings declared</div> : rows.map((row, idx) => <ConfigInputRow key={row.param.key} param={row.param} value={row.value} setValue={(v: string) => setRows(rows.map((r, i) => i === idx ? { ...r, value: v } : r))} save={<><IconButton label={`save ${pkg.name}.${row.param.key} for every agent — affects every agent using this add-on`} className="cfg-icon-btn cfg-shared-save" onClick={() => saveRow(idx)}>⚑ every agent</IconButton><span className="dim-note">{row.note}</span></>} secondarySave={row.param.agentScoped ? <><IconButton label={`save ${pkg.name}.${row.param.key} for ${cfgParsed.agent || cfgProfile || 'this agent'} only`} className="cfg-icon-btn cfg-agent-save" onClick={() => saveAgentRow(idx)}>this agent</IconButton><span className="dim-note">{row.agentNote}</span></> : null} />)}</div>
       </div>
     </details>
