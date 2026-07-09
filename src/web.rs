@@ -219,6 +219,7 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
                     .route("/api/conversations/{session}", web::get().to(conversation))
                     .route("/api/code/sessions", web::get().to(code_sessions))
                     .route("/api/code/sessions/{id}", web::get().to(code_session))
+                    .route("/api/code/deliver", web::post().to(code_deliver))
                     .route("/api/comms/mail", web::get().to(comms_mail))
                     .route("/api/comms/rooms", web::get().to(comms_rooms))
                     .route("/api/blocks", web::get().to(blocks))
@@ -710,6 +711,23 @@ async fn conversation(
 }
 
 // ---- code projection + history + admin (shell-out / proxy) ----------------
+
+/// STUB (docs/handoffs/chrome-polish.md M4): `POST /api/code/deliver`
+/// {session, message} — will validate the `code-*` worker-session id shape and
+/// relay through `lanius code deliver` (the CLI path; never a write into the
+/// chat projection — see the SECURITY NOTE in that handoff). Pre-carved by the
+/// planner so parallel handoffs don't collide in this file; chrome-polish
+/// fills the body.
+async fn code_deliver(
+    _hub: web::types::State<Arc<Hub>>,
+    _req: HttpRequest,
+    _body: Bytes,
+) -> HttpResponse {
+    json_resp(
+        501,
+        json!({ "ok": false, "error": "not implemented yet (chrome-polish M4)" }),
+    )
+}
 
 async fn code_sessions(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
     let root = hub.root.clone();
