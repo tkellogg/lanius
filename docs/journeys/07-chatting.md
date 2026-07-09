@@ -101,6 +101,48 @@ Coding runs belong in their own surface, quiet by default, expanded when he's
 actually watching the work — see
 [../handoffs/coding-agent-observability.md](../handoffs/coding-agent-observability.md).
 
+# Dead air is the one unforgivable failure
+
+Three separate times in the 2026-07-08 walkthrough, Tim typed a message and got
+*nothing*: no typing indicator, no response, no error, no recourse. Once to the
+main agent, once to the helper, once again to the main agent at the end. Each
+time the same triple absence:
+
+1. **No acknowledgment** — nothing confirmed the message even left the browser.
+   A chat surface needs an immediate, local "sent" state and then a live
+   "agent is thinking" indicator (typing dots, a spinner on the message, a
+   status line — pick one). Silence between send and reply is where trust dies.
+2. **No failure surfaced** — if the daemon is down, the provider rejected the
+   call, or nothing is subscribed to the topic, *say so in the thread*, where
+   the person is looking. A message that sails into the void is
+   indistinguishable from a broken product. (Compare the failure-mail contract
+   for runs: failed runs mail the human. The chat pane needs the same honesty.)
+3. **No recourse** — even knowing it failed, there was nothing to *do*: no
+   retry, no "check agent status" link, no pointer at the log line that
+   explains it. Every dead-end error needs one next step attached.
+
+Lily interprets dead air as her companion ignoring her. Daniel interprets it as
+the product being broken and leaves. Tim interprets it as a debugging session he
+didn't ask for. Nobody interprets it charitably.
+
+A related expectation from the same walkthrough: the empty state should invite,
+not just describe. "The agent hasn't sent any messages" is a shrug; the empty
+Converse pane should be the *strongest* prompt to say hello, and saying hello
+must visibly work (see 1–3 above).
+
+## Talking to a coding session
+
+When Tim saw his Claude Code worker appear (delightfully fast, to his surprise —
+that moment should be protected), his very next instinct was: *can I send it a
+message and see if it responds?* The current model treats coding sessions as
+work-you-observe, not conversations (see above), and the DM plumbing filters
+`code-*` sessions out. The walkthrough says the instinct to poke a live worker
+is real anyway. That doesn't mean coding runs become peer conversations — but
+there should be a sanctioned "say something to this worker" affordance
+(lanius already has `deliver`; the UI should expose it on the worker's surface),
+and the observe-vs-converse distinction should be legible rather than a
+silent wall.
+
 The deeper principle underneath both is the one in
 [../layering.md](../layering.md): the product speaks the user's language, not the
 kernel's. "Session" is an internal word; nobody chatting with their agent should

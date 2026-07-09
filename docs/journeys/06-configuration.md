@@ -29,6 +29,46 @@ control, opposite blast radius, and nothing on the screen tells you which is
 which. Hold that thought — it shows up in three of the four journeys below.
 
 
+# The package list has to tell the truth, fast
+
+The 2026-07-08 walkthrough hit the packages surface as a wall of five compounding
+confusions, worth listing because each is a distinct fix:
+
+- **What does the count mean?** "18 packages" — installed? available? enabled
+  for this agent? The list must declare which population it's showing, and the
+  installed/available/enabled-here distinction has to be visible per row, not
+  discovered by expanding.
+- **The list must agree with the panes.** The chat package said "installed"
+  while the chat pane acted absent; history said "enabled" while the history
+  pane said unreachable — with no button to make it reachable. Two surfaces
+  disagreeing about the same fact is worse than either being wrong alone
+  ("WTF?" is a direct quote). Whatever state the pane derives its behavior
+  from, the package row must show *that same state* — and a degraded state
+  needs an enable/repair affordance right there, not just a shrug.
+- **Rows must make sense to Daniel.** "What does it mean to add packages to
+  Claude Code? What does it mean to set the provider?" If a package or setting
+  doesn't meaningfully apply to a coding-harness agent, it shouldn't be
+  presented as if it does. Each row needs a plain-language one-liner about what
+  enabling it *does for this agent* — the current entries don't carry their
+  own explanation.
+- **Cross-harness surprises need a why.** `harness-codex` showing up enabled on
+  a Claude Code agent reads as a mistake. If it's intentional (a default, a
+  dependency), the row should say why it's there; either way disabling it
+  should be one click.
+- **Toggle without expanding.** Enable/disable is the primary verb on this
+  surface; it should be on the collapsed row, not buried inside each expanded
+  entry.
+- **No demo cruft in the shipped catalog.** `echo` reads as "just for a demo,"
+  and one obviously-toy entry cheapens the other seventeen (this is Daniel's
+  weekend-hack-job detector firing; see
+  [ui-preferences.md](ui-preferences.md) on vibe). Demo packages belong behind
+  a dev flag or in an examples kit, not in the default list.
+
+Also from the same walkthrough: the word **"instance"** surfaced in the UI raw.
+It's the right word for this doc; it is not a UI word. Tim wrote this file and
+still stumbled on it onscreen. Say "this installation" or say nothing.
+
+
 # Journey: Lily tunes her pets
 
 Lily doesn't "configure an instance." She has agents — a weather-watcher, a

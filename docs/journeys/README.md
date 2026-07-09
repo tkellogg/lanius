@@ -67,6 +67,16 @@ the UI.
   [../handoffs/memory-blocks.md](../handoffs/memory-blocks.md),
   [../handoffs/agent-comms-package.md](../handoffs/agent-comms-package.md), and
   [../handoffs/work-estimation.md](../handoffs/work-estimation.md).
+- [16-the-helper.md](16-the-helper.md) - the built-in helper as a **UI
+  concierge**: "Ask" buttons on confusing elements, view-context injection, and
+  the 2026-07-08 first-encounter failures (dead air, surprise agent-spawn from
+  merely opening a tab, the vanished message). Read before touching the helper
+  or any "explain this UI" affordance.
+- [ui-preferences.md](ui-preferences.md) - cross-cutting UI expectations:
+  options over text boxes, agent-operated UI, navigation (URLs change with
+  pages, words over icons, no kernel vocabulary onscreen), log-like surfaces
+  (collapsed rows, click-to-expand JSON, never the default page), and color
+  (text outranks chrome in contrast).
 - [reaching-the-user.md](reaching-the-user.md) - **stub**: the human-proxy / EA
   actor. A person is one identity reachable many ways (elanus, phone, Bluesky,
   Teams, email) with varying effectiveness; the idea is a rules-engine-or-LLM

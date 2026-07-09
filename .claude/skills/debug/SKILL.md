@@ -45,6 +45,11 @@ real stack. Most runtime weirdness traces back to strays.
 - [daemon-stack-health.md](daemon-stack-health.md) — "is lanius even up?" Deliveries
   stuck, agents not dispatching, the UI not loading. Confirm the serve→daemon→web
   stack and the broker port.
+- [binary-silently-sigkilled.md](binary-silently-sigkilled.md) — `lanius` (even
+  `--version`) exits instantly with NO output, exit 137, and "won't restart";
+  headless workers reported "SIGKILLed". A `cp`-over-installed-binary broke the
+  macOS code signature; the kernel kills it at exec. Fix = `codesign -f -s -`;
+  prevent = install with `cargo install --path .`, never in-place `cp`.
 
 ## Adding a runbook entry
 Hit a new failure, fixed it, want it to be a 30-second lookup next time? Add
