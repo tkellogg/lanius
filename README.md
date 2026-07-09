@@ -1,122 +1,417 @@
 # lanius
 
-A minimal event-driven agent harness: `inetd + cron + git hooks + sqlite + a
-flight recorder`. The kernel is an event log, a trace log, a dispatcher, and
-two narrow contracts (handler execution, render provider). Everything else is
-userland: skill packages containing executables.
+Lanius is a local control plane for AI work.
 
-Design doc: [docs/init.md](docs/init.md).
+It is built around one idea: the human should stay in charge of attention,
+budget, and intent. Models, scripts, coding tools, webhooks, and background
+workers should do the right-sized part of the job and then report back.
 
-## Build & init
+The point is not to make one giant agent that does everything. The point is to
+make it easy to use the cheap thing for cheap work, the fast thing for live
+interaction, and the strong thing when judgment actually matters.
 
-```sh
-cargo build --release
-export PATH="$PWD/target/release:$PATH"
+## Install
 
-lanius init ~/agent          # scaffolds db, trace, default profile, stock skills
-export LANIUS_ROOT=~/agent
-export ANTHROPIC_API_KEY=...  # any genai-supported provider works; see profile.toml
-```
-
-## Run
+Install the released binary with Cargo:
 
 ```sh
-lanius daemon &                                  # the dispatcher (supervisor, not doer)
-
-lanius exec --session hi "hello"                 # chat = exec with a session id
-lanius emit work/agent/exec --payload '{"prompt":"summarize echo.log"}'   # async agent turn
-lanius emit work/demo/echo --payload '{"x":1}'        # any event; handlers.d decides who cares
-
-lanius inbox                                     # what's blocked on you?
-lanius answer 42 "yes, ship it"                  # answers route by correlation_id
-lanius events --limit 30                         # debug view of the log
-lanius render | less                             # inspect assembled context
-tail -f $LANIUS_ROOT/trace.jsonl | jq .          # the flight recorder
+cargo install lanius
 ```
 
-For web development, one supervised command starts the dispatcher, the web
-relay, and Vite:
+Then create a local root and start the app:
+
+```sh
+lanius init
+lanius serve
+```
+
+Open the web UI:
+
+```sh
+open http://127.0.0.1:7180
+```
+
+`lanius serve` runs the dispatcher and the embedded web app. You do not need a
+repo checkout, Node, or Vite for normal use.
+
+By default, your lanius root lives at `~/.lanius/root`. To use a different one:
+
+```sh
+export LANIUS_ROOT=~/my-lanius-root
+lanius init "$LANIUS_ROOT"
+lanius serve
+```
+
+## What you use it for
+
+Use lanius when you want AI tools to work around you instead of through you.
+
+- Start Claude Code, Codex, or opencode with shared context and observability.
+- Run multiple coding sessions in the same repo without using yourself as the
+  coordination layer.
+- Let one worker hand a narrow task to another worker.
+- Keep a live UI, terminal session, script, webhook, or notification channel in
+  the same message space.
+- Add packages that bring skills, memory, background processes, and integrations.
+- See what happened after the fact: sessions, messages, telemetry, asks, and
+  failures.
+
+The human-facing model is simple:
+
+1. You start the system.
+2. You launch or talk to a worker.
+3. Lanius records what is happening.
+4. Workers can message you or each other.
+5. You approve the parts that need human judgment.
+
+## First run
+
+Start with the web UI:
+
+```sh
+lanius init
+lanius serve
+open http://127.0.0.1:7180
+```
+
+From there you can:
+
+- chat with the default profile;
+- create or edit profiles;
+- configure model providers;
+- inspect coding sessions;
+- review package settings and grants;
+- answer messages that are waiting on you.
+
+You can do the same things from the CLI. The UI intentionally shells through the
+same `lanius` commands, so there is one path for human actions.
+
+## Model providers
+
+For normal chat/profile agents, add a provider and point a profile at it.
+
+Example Anthropic-compatible provider:
+
+```sh
+export ANTHROPIC_API_KEY=...
+lanius provider add anthropic \
+  --wire anthropic \
+  --base-url https://api.anthropic.com \
+  --key-env ANTHROPIC_API_KEY
+
+lanius provider test anthropic
+lanius profile set default model.provider=anthropic model.model=claude-sonnet-4-6
+```
+
+For coding tools, you can also use their native login instead of an API key:
+
+```sh
+lanius provider add claude-login --native --tool claude
+lanius provider add codex-login --native --tool codex
+```
+
+The web UI has provider setup as well. Use whichever path is less annoying.
+
+## Coding with lanius
+
+Run coding tools through lanius from the project you want them to work on:
+
+```sh
+cd ~/code/my-project
+
+lanius code claude
+lanius code codex
+lanius code opencode
+```
+
+Those commands launch the real tools. Lanius does not fake a coding agent. It
+wraps the session so the work becomes visible, addressable, and resumable.
+
+Run a headless worker when you want a narrow task completed without opening a
+TUI:
+
+```sh
+lanius code codex --headless "run the test suite and fix the first failure"
+lanius code claude --headless "review this diff for behavioral regressions"
+```
+
+Inspect what is going on:
+
+```sh
+lanius code sessions
+lanius code sitrep
+lanius code claims
+lanius code whose --dirty
+```
+
+Watch a running session:
+
+```sh
+lanius code watch <session-id>
+```
+
+Open a specific session report:
+
+```sh
+lanius code session <session-id>
+```
+
+That report includes the tool, status, timeline, changed files, and the exact
+resume command when lanius knows one.
+
+## Dispatching work
+
+The most useful pattern is not "one assistant does everything." It is:
+
+- one worker plans;
+- another worker implements;
+- another verifies;
+- you make the calls that actually need you.
+
+Inside a lanius-launched coding session, a worker can start another worker:
+
+```sh
+lanius code spawn codex "implement the parser change described in docs/parser.md"
+```
+
+It can also send a message to an existing worker:
+
+```sh
+lanius code deliver <worker-session> "please check whether your change touches auth"
+```
+
+The worker's completion comes back through the requester's mailbox. That means a
+planner can hand off implementation, end its turn, and wake back up when the
+worker is done.
+
+For humans, the important bit is that the handoff is visible. You can inspect the
+sessions, see what files changed, and intervene without becoming the message bus
+yourself.
+
+## Messages and human attention
+
+Lanius uses a mailbox model. Anything can send a message if it has the authority:
+a profile, a coding session, a package daemon, a webhook, a CLI command, or the
+web UI.
+
+See what is waiting on you:
+
+```sh
+lanius inbox
+```
+
+Answer a question:
+
+```sh
+lanius answer <ask-id> "yes, ship it"
+```
+
+Send a message directly to a profile:
+
+```sh
+lanius emit in/agent/main --payload '{"prompt":"summarize what changed today"}'
+```
+
+Schedule a wake-up:
+
+```sh
+lanius schedule --agent main --in 3600 --message "check whether the build finished"
+```
+
+This is where interaction models fit. A fast voice or chat model does not need to
+be smart enough to write code, debug a system, or make every decision. It can
+translate human intent into a message for the worker that is actually good at the
+task.
+
+## Packages
+
+Packages are how lanius grows without turning into a giant core.
+
+A package can include:
+
+- instructions for an AI tool;
+- memory blocks;
+- knowledge bases;
+- background processes;
+- cron jobs;
+- tools;
+- config fields;
+- coding harness adapters;
+- message subscriptions and publish grants.
+
+List packages:
+
+```sh
+lanius packages
+```
+
+Check package validity:
+
+```sh
+lanius packages check
+```
+
+Approve a package's requested authority:
+
+```sh
+lanius approve <package-name>
+```
+
+Revoke it later:
+
+```sh
+lanius revoke <package-name>
+```
+
+Install a kit, which is a bundle of packages and profiles:
+
+```sh
+lanius kit list
+lanius kit show core
+lanius kit add core
+```
+
+Install with review first:
+
+```sh
+lanius kit add core --pending
+lanius packages
+lanius approve <package-name>
+```
+
+Useful starting points:
+
+- `core` teaches workers how to coordinate, escalate, estimate work, and use
+  lanius itself.
+- `funnel` demonstrates right-sized work: scripts drop obvious noise, a cheap
+  model reviews the survivors, and only the interesting items reach a human.
+- `helper` adds a helper profile and knowledge about the local lanius setup.
+
+## Practical workflows
+
+### 1. Use a coding tool normally, but make it observable
+
+```sh
+cd ~/code/my-project
+lanius code claude
+```
+
+Work as usual. Then inspect:
+
+```sh
+lanius code sessions
+lanius code sitrep
+```
+
+This is the lowest-friction way to start. You still use the tool you already
+use, but lanius can see the session, changed files, claims, and messages.
+
+### 2. Run a cheap worker for a narrow job
+
+```sh
+lanius code codex --headless "update the README examples to match the new CLI"
+```
+
+Use this for work where a frontier model would be overkill. The worker can still
+be observed, resumed, and reviewed.
+
+### 3. Split planning and implementation
+
+Start a strong planning session:
+
+```sh
+lanius code claude
+```
+
+Then have it spawn a cheaper implementation worker:
+
+```sh
+lanius code spawn codex "implement the migration described in the plan"
+```
+
+The planner does not have to sit there while the worker runs. Lanius carries the
+completion message back.
+
+### 4. Build a funnel
+
+Install the funnel kit:
+
+```sh
+lanius kit add funnel
+```
+
+Then feed it noisy text. The first stages are deterministic and cheap; the model
+only sees the residue. This is the same pattern you want for feeds, inboxes,
+alerts, issue queues, and research streams.
+
+### 5. Keep durable memory outside any one worker
+
+Use knowledge bases and blocks when something should survive a session:
+
+```sh
+lanius kb list
+lanius kb search "release checklist"
+lanius block set project-style "Prefer small, reviewable changes."
+```
+
+The point is not to make every prompt huge. It is to make the right context
+available to the right worker when it needs it.
+
+## The mental model
+
+Lanius is shaped like a small local operating system for AI work:
+
+- `in/...` topics are mailboxes.
+- `obs/...` topics are telemetry.
+- `signal/...` topics are alarms.
+- SQLite is the durable ledger.
+- The trace log is the flight recorder.
+- Packages are userland.
+- The web UI and CLI are human control surfaces.
+
+If you want the deeper mechanics, start here:
+
+- [docs/topics.md](docs/topics.md) - topic grammar and mailbox model
+- [docs/actors.md](docs/actors.md) - actors, scripts, humans, and models
+- [docs/context.md](docs/context.md) - how context is assembled
+- [docs/config.md](docs/config.md) - profile and package configuration
+- [docs/coding-harness-onboarding.md](docs/coding-harness-onboarding.md) -
+  adding a new coding tool adapter
+- [docs/security.md](docs/security.md) - current security notes and known gaps
+
+## Developing lanius
+
+From a repo checkout:
 
 ```sh
 cargo run -- dev
-# -> daemon: restarted on Rust source changes
-# -> web relay: http://127.0.0.1:7180, node --watch for backend files
-# -> Vite UI:   http://127.0.0.1:5173
-# -> log:       target/lanius-dev.log
 ```
 
-If any child exits, the supervisor restarts it. `Ctrl-C` shuts down all child
-process groups, including Node/Vite descendants. The log file is overwritten on
-each start and lives under the gitignored `target/` directory.
+That starts the dispatcher, Rust web relay, and Vite UI with restarts:
 
-## The milestone loop
-
-A cron tick wakes the agent → it works → hits a question → emits `human/ask`
-and exits 75 (checkpoint-and-exit; the transcript in sqlite *is* the process
-state) → notify pops a macOS notification → you `lanius answer` → the
-dispatcher matches the correlation_id and re-invokes the handler with the
-answer → it finishes. If the deadline passes first, the declared default is
-applied and the assumption is logged as an ordinary event — auditable,
-vetoable.
-
-`tests/e2e.sh` exercises exactly this loop (no API key needed).
-
-## Skill packages
-
-A skill package is a directory in `$LANIUS_ROOT/skills/`, per the
-[agentskills.io](https://agentskills.io) spec, optionally extended with a
-sibling `harness.toml` manifest:
-
-```toml
-[[handler]]
-on = "work/discord/message"     # topic filter, wildcards ok ("signal/#")
-run = "scripts/reply"      # any language; event JSON on stdin
-order = 0                  # cross-package ordering
-
-[[cron]]
-schedule = "*/5 * * * *"   # 5-field (seconds-resolution 6-field also ok)
-emit = "feeds.check"
-
-[[provider]]
-run = "scripts/context"    # contributes a context block at render time
-
-[throttle."work/discord/#"]
-max_concurrent = 2
+```text
+web relay: http://127.0.0.1:7180
+Vite UI:   http://127.0.0.1:5173
+log:       target/lanius-dev.log
 ```
 
-`lanius enable <name>` materializes the manifest into `handlers.d/` symlinks
-(systemd-enable style); the manifest is the source of truth, `handlers.d/` is
-the compiled routing table, and debugging is `ls`. `SKILL.md` (agent-facing
-instructions) and `harness.toml` (dispatcher-facing wiring) never mix.
+For a production-style local run from a checkout:
 
-Stock packages: `chat` (work/agent/exec → agent turn), `notify` (asks/signals →
-macOS notification), `watchdog` (cron monitor emitting `signal/pain` on
-failures — measured pain, not self-reported), `echo` (demo), `notes`
-(instructions-only skill).
+```sh
+cargo run -- serve
+```
 
-## Handler contract
+Run tests:
 
-- Event JSON envelope on stdin (`{"resume": <answer event>}` added on resume).
-- Env: `LANIUS_EVENT_ID`, `LANIUS_CAUSE_ID`, `LANIUS_CORRELATION_ID`,
-  `LANIUS_DB`, `LANIUS_TRACE`, `LANIUS_ROOT`, `LANIUS_PROFILE`,
-  `LANIUS_RESUME=1` on resume.
-- Exit 0 done; exit 75 suspended (emit a `human/ask` with a correlation_id
-  first — that's the resume key); anything else failed.
-- Emit follow-up events with `lanius emit`; `cause_id` threads automatically
-  from the environment.
+```sh
+cargo test
+tests/e2e.sh
+```
 
-## Trace log
+The old low-level tagline still applies:
 
-`trace.jsonl` is append-only and write-only — nothing reads it for control
-flow. One JSON object per line: `dispatch`, `handler.exit`, `llm.request`,
-`llm.response`, `tool.call` (written *before* execution), `tool.result`,
-`emit`, `signal`, `expire`. Thinking is excluded (not evidence); full
-transcripts live in the `messages` table.
+```text
+inetd + cron + git hooks + sqlite + a flight recorder
+```
 
-## Status / non-goals (MVP)
-
-- Sandbox is the VM preset only: the box is the boundary. `[sandbox]` in
-  profile.toml is parsed, not enforced.
-- One daemon per root; don't run two (no lock yet).
-- KB-in-git, channel adapters beyond macOS notifications, and indexer packages
-  are userland exercises the contracts already support.
+It is just not the first thing a human should have to understand.
