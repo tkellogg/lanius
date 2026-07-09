@@ -1223,7 +1223,20 @@ details[open] > summary .cfg-disclosure { transform: rotate(90deg); color: var(-
 }
 .agent-assistant-msg.user { align-self: flex-end; max-width: 82%; background: var(--human-bg); }
 .agent-assistant-msg.assistant { align-self: flex-start; max-width: 88%; background: var(--agent-bg); }
-.agent-assistant-msg.status { color: var(--danger-soft); border-color: var(--danger); }
+.agent-assistant-msg.status { color: var(--dim); font-size: 12px; }
+/* helper-first-encounter H4: head action row (new conversation / stop). */
+.agent-assistant-head-actions { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+/* Dead-air recourse, mirroring the main chat's vocabulary (wonky bit 3). */
+.agent-assistant-nopath {
+  align-self: stretch; border: 1px solid var(--panel-edge); border-radius: var(--r-card);
+  background: var(--hover-soft); padding: 8px 10px; font-size: 12.5px; color: var(--dim);
+  display: flex; flex-direction: column; gap: 6px; align-items: flex-start;
+}
+.agent-assistant-sent { align-self: flex-end; font-size: 11px; color: var(--meta); padding: 0 2px; }
+.agent-assistant-thinking { display: flex; align-items: center; gap: 8px; padding: 2px; }
+.agent-assistant-stalled { border-left: 2px solid var(--panel-edge); padding: 6px 0 6px 10px; }
+.agent-assistant-stalled-note { font-size: 12px; color: var(--dim); margin: 0 0 6px; }
+.agent-assistant-stalled-actions { display: flex; gap: 8px; }
 .agent-assistant-tool {
   border: 1px solid var(--panel-edge); border-radius: var(--r-card); background: var(--hover-soft);
 }

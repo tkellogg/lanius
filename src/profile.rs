@@ -40,6 +40,15 @@ pub struct Profile {
     pub context: ContextCfg,
     #[serde(default)]
     pub subagents: SubagentCfg,
+    /// How this profile is PRESENTED in the web UI (docs/config.md). Generic
+    /// surface hint, never a per-name special case: a profile whose `[ui]
+    /// surface` is `"panel"` is shown only in a dedicated surface (the
+    /// assistant side-panel) and hidden from the left-hand agent list; any
+    /// other value / absent = an ordinary list agent. The Nav filters on THIS
+    /// property, so any future panel-surfaced profile is hidden for free and
+    /// nothing anywhere matches the literal name "helper".
+    #[serde(default)]
+    pub ui: UiCfg,
     /// Effective ordered package/kit search path. Relative entries resolve
     /// against the root. If an entry has a packages/ child it is treated as a
     /// kit, otherwise the entry itself is treated as a package directory.
@@ -89,6 +98,7 @@ impl Default for Profile {
             vars: BTreeMap::new(),
             context: ContextCfg::default(),
             subagents: SubagentCfg::default(),
+            ui: UiCfg::default(),
             elanus_path: default_elanus_path(),
             autonomy: default_autonomy(),
         }
@@ -151,6 +161,22 @@ impl Default for SkillsCfg {
             exclude: vec![],
         }
     }
+}
+
+/// Web-UI presentation hints (docs/config.md, helper-first-encounter H4). Kept
+/// generic so presentation policy never leaks into the kernel as a per-name
+/// special case (the `is_worker_session` anti-pattern the simple-core doctrine
+/// forbids). Today's one field is `surface`.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UiCfg {
+    /// Where this profile appears in the web UI. `"panel"` = presented ONLY in a
+    /// dedicated surface (the assistant side-panel) and filtered out of the
+    /// left-hand agent list. Absent / any other value = an ordinary list agent.
+    /// Boolean-ish and generic on purpose: the Nav hides EVERY panel-surfaced
+    /// profile the same way, so nothing matches the literal name "helper".
+    #[serde(default)]
+    pub surface: Option<String>,
 }
 
 /// The whole-agent fs grant (docs/sandbox.md). `fs_write` prefixes are the

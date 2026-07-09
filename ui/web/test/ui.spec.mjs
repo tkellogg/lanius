@@ -2646,8 +2646,14 @@ const renamedAgent = 'falcon';
       : fail(`ai panel: world c did not show the no-LLM advisory (${JSON.stringify(noLlm)})`);
   } else {
     await page.waitForSelector('#ai-panel .agent-assistant', { timeout: 5000 });
-    const sessionText = await page.$eval('#ai-panel .agent-assistant-head p', (el) => el.textContent.trim());
+    // helper-first-encounter H4 (wonky bit 7): the raw session id is no longer
+    // shown in the panel head (no `assistant-m3k9…` copy). It rides a data-session
+    // attribute instead, which the tool round-trip below still needs.
+    const sessionText = await page.$eval('#ai-panel .agent-assistant', (el) => el.getAttribute('data-session'));
     ok(`ai panel: mounted the assistant (session ${sessionText})`);
+    (await page.$('#ai-panel .agent-assistant-head p')) === null
+      ? ok('ai panel(H4): no raw session id in the panel head')
+      : fail('ai panel(H4): the panel head still shows a raw session id');
 
     // Client-tool round trip: simulate the agent calling `navigate` — as a real
     // dispatcher reply would once a turn resolves — and confirm the call is
@@ -3087,6 +3093,260 @@ const renamedAgent = 'falcon';
   crossOrigin.status === 403
     ? ok('chrome M4: a cross-origin deliver POST is refused by the origin guard (403)')
     : fail(`chrome M4: cross-origin deliver not refused (status ${crossOrigin.status})`);
+}
+
+// ── flow: helper-first-encounter (docs/handoffs/helper-first-encounter.md) ────
+// The helper's first encounter: opening the panel is FREE (no auto-send, nothing
+// durable), the helper is hidden from the agent list by a GENERIC profile
+// property (never the literal name), a first message gets the same dead-air
+// treatment as the main chat, the conversation survives close/reopen, and the
+// concierge `context` seam attaches without being wired. Sends are intercepted so
+// the machine is exercised deterministically; obs + reply are injected like flow
+// 6f. World is forced non-c on these pages so the assistant actually mounts
+// (App gates world c to the no-LLM advisory — that guard is covered elsewhere).
+{
+  // Timeout-guarded emit (same rationale as flow 6f): a QoS-1 publish blocks
+  // until the broker acks, so cap it rather than risk hanging the whole suite.
+  const emit = (type, corr, payload) => {
+    const args = ['emit', type];
+    if (corr) args.push('--correlation', corr);
+    args.push('--payload', payload);
+    execFileSync(path.join(BIN, 'lanius'), args, { env: ENV, encoding: 'utf8', timeout: 15000 });
+  };
+  const forceWorldB = async (page) => {
+    await page.route('**/api/status', async (route) => {
+      const resp = await route.fetch();
+      const j = await resp.json().catch(() => ({}));
+      j.llm = { ...(j.llm || {}), world: 'b' };
+      await route.fulfill({ response: resp, json: j });
+    });
+  };
+  // Start each helper page with a clean slate: the panel's session persists in
+  // localStorage (shared across pages in this one browser context), and an
+  // earlier flow's retained helper tool-call would otherwise replay into a page
+  // that inherits its session. Cleared before app code runs.
+  const freshHelper = async (page) => {
+    await page.addInitScript(() => {
+      try { localStorage.removeItem('lanius.helperSession'); localStorage.setItem('lanius.aiPanel', '0'); } catch { /* ignore */ }
+    });
+  };
+  const openPanel = async (page) => {
+    await ensureAiPanelClosed(page);
+    await page.click('#ai-panel-toggle');
+    await page.waitForSelector('#ai-panel .agent-assistant', { timeout: 8000 });
+  };
+
+  // ── M1: browse is free — no auto-send, hidden by property, honest head ──
+  // Prove hide-by-PROPERTY not by name: a panel-surfaced profile with a DIFFERENT
+  // name (panelbot) is hidden too, while a sibling without the property (listbot)
+  // stays in the list. Written to disk before the page loads its agent list.
+  // Also install a REAL helper profile (agent "helper", panel-surfaced): a
+  // configured system has the helper kit, so the live "helper" agent must be
+  // hidden by the same property. In a fresh root the server otherwise SYNTHESIZES
+  // the helper as a mirror of "default" (agent noun "main"), which cannot stand
+  // in for the distinct "helper" noun a real turn lights up.
+  for (const [name, extra] of [
+    ['helper', '\n[ui]\nsurface = "panel"\n\n[model]\nmodel = "claude-sonnet-4-6"\nmax_turns = 24\n'],
+    ['panelbot', '\n[ui]\nsurface = "panel"\n'],
+    ['listbot', ''],
+  ]) {
+    const pdir = path.join(TMP, 'profiles', name);
+    fs.mkdirSync(pdir, { recursive: true });
+    fs.writeFileSync(path.join(pdir, 'profile.toml'), `agent = "${name}"\nowner = "owner"\n${extra}`);
+  }
+
+  const m1 = await newPage();
+  const m1pubs = [];
+  await m1.route('**/api/publish', async (route) => {
+    try { m1pubs.push(JSON.parse(route.request().postData() || '{}')); } catch {}
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await forceWorldB(m1);
+  await freshHelper(m1);
+  await m1.goto('/');
+  await m1.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  // Opening the panel must publish NOTHING (no auto-send / no live turn on mount).
+  const beforeOpen = m1pubs.length;
+  await openPanel(m1);
+  await sleep(1200);
+  m1pubs.length === beforeOpen
+    ? ok('helper(M1): opening the panel publishes nothing — no auto-send')
+    : fail(`helper(M1): opening the panel published ${m1pubs.length - beforeOpen} event(s) — auto-send leaked`);
+  // The intro renders as a static first bubble.
+  const introBubble = await m1.$eval('#ai-panel .agent-assistant-feed', (el) => el.textContent);
+  /Ask me to help you get set up/i.test(introBubble)
+    ? ok('helper(M1): the intro renders as a static first bubble')
+    : fail('helper(M1): the intro bubble did not render');
+  (await m1.$('#ai-panel .agent-assistant-head p')) === null
+    ? ok('helper(M1): the panel head shows no raw session id')
+    : fail('helper(M1): a raw session id is still in the panel head');
+  // The helper is NOT an agent-list row.
+  const navSel = async (page, sel) => (await page.$(`#nav-agents [data-sel="agent:${sel}"]`)) !== null;
+  (await navSel(m1, 'helper')) === false
+    ? ok('helper(M1): no Helper row in the agent list')
+    : fail('helper(M1): the helper appears in the agent list');
+  // Hide-by-property, proven: panelbot (property, different name) hidden; listbot
+  // (no property) visible.
+  const panelbotHidden = (await navSel(m1, 'panelbot')) === false;
+  const listbotShown = (await navSel(m1, 'listbot')) === true;
+  panelbotHidden && listbotShown
+    ? ok('helper(M1): filtering is by the [ui] surface property, not the name (panelbot hidden, listbot shown)')
+    : fail(`helper(M1): property filtering wrong (panelbotHidden=${panelbotHidden}, listbotShown=${listbotShown})`);
+  await m1.close();
+
+  // ── M2: the first message works or says why not ──
+  // Happy path: sent → thinking (obs) → reply. Intercept the send; drive the fake
+  // agent with the captured corr/session, exactly like flow 6f.
+  const m2 = await newPage();
+  const m2pubs = [];
+  await m2.route('**/api/publish', async (route) => {
+    try { m2pubs.push(JSON.parse(route.request().postData() || '{}')); } catch {}
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await forceWorldB(m2);
+  await freshHelper(m2);
+  await m2.goto('/');
+  await m2.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  await openPanel(m2);
+  const helperMsg = `helper-hi-${Date.now()}`;
+  await m2.fill('#ai-panel .agent-assistant-compose input', helperMsg);
+  await m2.click('#ai-panel .agent-assistant-compose button[type="submit"]');
+  await waitFor('helper(M2): the sent mark rides the first message', async () => (await m2.$('#ai-panel [data-sel="assistant-sent"]')) !== null, 8000);
+  await waitFor('helper(M2): the message is still visible in the feed', async () => /helper-hi-/.test(await m2.$eval('#ai-panel .agent-assistant-feed', (el) => el.textContent)), 3000);
+  await waitFor('helper(M2): the browser published the turn', async () => m2pubs.length >= 1, 5000);
+  const hp = m2pubs[m2pubs.length - 1];
+  const hcorr = hp.correlation;
+  const hsession = hp.payload?.session;
+  // The helper's agent noun (in this throwaway root the helper profile is
+  // synthesized as a mirror of "default", so its noun is "main"; on a configured
+  // system it is "helper"). Derive it from the send rather than assuming.
+  const hagent = /^in\/agent\/(.+)$/.test(hp.topic) ? hp.topic.replace('in/agent/', '') : '';
+  hagent
+    ? ok(`helper(M2): the turn publishes to in/agent/${hagent}`)
+    : fail(`helper(M2): unexpected send topic ${hp.topic}`);
+  // Obs on our session = the agent woke → thinking.
+  await fetch(`${BASE}/api/publish`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic: `obs/agent/${hagent}/${hsession}/tool/probe`, payload: { note: 'awake' } }) });
+  await waitFor('helper(M2): obs activity shows the thinking indicator', async () => (await m2.$('#ai-panel [data-sel="assistant-thinking"]')) !== null, 8000);
+  // The correlated reply resolves it and threads into the feed.
+  const hreply = `helper-reply-${Date.now()}`;
+  emit('in/human/owner', hcorr, JSON.stringify({ text: hreply }));
+  await waitFor('helper(M2): the reply lands in the panel', async () => (await m2.$eval('#ai-panel .agent-assistant-feed', (el) => el.textContent)).includes(hreply), 8000);
+  ((await m2.$('#ai-panel [data-sel="assistant-thinking"]')) === null && (await m2.$('#ai-panel [data-sel="assistant-sent"]')) === null)
+    ? ok('helper(M2): the reply resolves the thinking + sent marks')
+    : fail('helper(M2): the panel indicators did not resolve on reply');
+
+  // Stop (wonky bit 4): while a turn is running, stop ends the wait locally
+  // without wedging busy — the input becomes usable again.
+  const stopMsg = `helper-stop-${Date.now()}`;
+  await m2.fill('#ai-panel .agent-assistant-compose input', stopMsg);
+  await m2.click('#ai-panel .agent-assistant-compose button[type="submit"]');
+  await waitFor('helper(M2): stop is offered while the turn runs', async () => (await m2.$('#ai-panel [data-sel="assistant-stop"]')) !== null, 8000);
+  await m2.click('#ai-panel [data-sel="assistant-stop"]');
+  await waitFor('helper(M2): stop ends the wait without wedging busy', async () => {
+    const stopped = /Stopped waiting/i.test(await m2.$eval('#ai-panel .agent-assistant-feed', (el) => el.textContent));
+    const inputEnabled = await m2.$eval('#ai-panel .agent-assistant-compose input', (el) => !el.disabled);
+    const stopGone = (await m2.$('#ai-panel [data-sel="assistant-stop"]')) === null;
+    return stopped && inputEnabled && stopGone;
+  }, 5000);
+  await m2.close();
+
+  // Stalled path: 20s of silence → the honest "No response yet…" line with
+  // check-status + retry; retry re-sends under a fresh corr (consume-once).
+  const m2s = await newPage();
+  const spubs2 = [];
+  await m2s.route('**/api/publish', async (route) => {
+    try { spubs2.push(JSON.parse(route.request().postData() || '{}')); } catch {}
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await forceWorldB(m2s);
+  await freshHelper(m2s);
+  await m2s.goto('/');
+  await m2s.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  await openPanel(m2s);
+  const stallMsg = `helper-stall-${Date.now()}`;
+  await m2s.fill('#ai-panel .agent-assistant-compose input', stallMsg);
+  await m2s.click('#ai-panel .agent-assistant-compose button[type="submit"]');
+  await waitFor('helper(M2): the stalled line appears after 20s of silence', async () => (await m2s.$('#ai-panel [data-sel="assistant-stalled"]')) !== null, 26000);
+  const stallRecourse = (await m2s.$('#ai-panel [data-sel="assistant-stalled-status"]')) !== null && (await m2s.$('#ai-panel [data-sel="assistant-stalled-retry"]')) !== null;
+  stallRecourse ? ok('helper(M2): the stalled line offers check-status and retry') : fail('helper(M2): stalled line missing recourse');
+  /helper-stall-/.test(await m2s.$eval('#ai-panel .agent-assistant-feed', (el) => el.textContent))
+    ? ok('helper(M2): the sent message stays visible under the stalled line')
+    : fail('helper(M2): the sent message vanished under the stalled line');
+  const beforeRetry = spubs2.length;
+  await m2s.$eval('#ai-panel [data-sel="assistant-stalled-retry"]', (el) => { el.click(); el.click(); });
+  await waitFor('helper(M2): retry re-publishes under a fresh correlation', async () => spubs2.length > beforeRetry && spubs2[spubs2.length - 1].correlation !== spubs2[beforeRetry - 1].correlation, 8000);
+  await sleep(500);
+  spubs2.length === beforeRetry + 1
+    ? ok('helper(M2): a double-clicked retry publishes exactly once (consume-once)')
+    : fail(`helper(M2): double-clicked retry published ${spubs2.length - beforeRetry} times, expected 1`);
+  await m2s.close();
+
+  // ── M3: one thread that survives, plus the seam ──
+  const m3 = await newPage();
+  await m3.route('**/api/publish', async (route) => { await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) }); });
+  await forceWorldB(m3);
+  await freshHelper(m3);
+  await m3.goto('/');
+  await m3.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+  await openPanel(m3);
+  const sessBefore = await m3.$eval('#ai-panel .agent-assistant', (el) => el.getAttribute('data-session'));
+  // Send something so there is a turn, then close + reopen the panel.
+  await m3.fill('#ai-panel .agent-assistant-compose input', `keepme-${Date.now()}`);
+  await m3.click('#ai-panel .agent-assistant-compose button[type="submit"]');
+  await sleep(300);
+  await m3.click('#ai-panel-toggle');
+  await m3.waitForSelector('#ai-panel', { state: 'detached', timeout: 5000 });
+  await m3.click('#ai-panel-toggle');
+  await m3.waitForSelector('#ai-panel .agent-assistant', { timeout: 8000 });
+  const sessAfter = await m3.$eval('#ai-panel .agent-assistant', (el) => el.getAttribute('data-session'));
+  sessBefore && sessBefore === sessAfter
+    ? ok('helper(M3): reopening the panel continues the same conversation (session persists)')
+    : fail(`helper(M3): the conversation did not persist (${sessBefore} → ${sessAfter})`);
+  // "new conversation" deliberately rotates the session and resets the feed.
+  await m3.click('#ai-panel [data-sel="assistant-new"]');
+  await waitFor('helper(M3): "new conversation" rotates the session', async () => {
+    const s = await m3.$eval('#ai-panel .agent-assistant', (el) => el.getAttribute('data-session'));
+    return s && s !== sessAfter;
+  }, 5000);
+  const userMsgsAfterNew = await m3.$$eval('#ai-panel .agent-assistant-msg.user', (els) => els.length);
+  userMsgsAfterNew === 0
+    ? ok('helper(M3): "new conversation" resets the feed to the intro')
+    : fail(`helper(M3): "new conversation" left ${userMsgsAfterNew} user message(s) behind`);
+
+  // The concierge seam (wonky bit 6): the shipped payload builder attaches a
+  // `context` when present and omits it entirely when absent. Nothing wires it.
+  const seam = await m3.evaluate(() => {
+    const f = window.__assistantSendPayload;
+    return {
+      withCtx: f({ prompt: 'x', session: 's', profile: 'helper', client_tools: [], context: { view: 'providers', detail: { id: 7 } } }),
+      without: f({ prompt: 'x', session: 's', profile: 'helper', client_tools: [] }),
+    };
+  });
+  (seam.withCtx.context && seam.withCtx.context.view === 'providers' && seam.withCtx.context.detail.id === 7)
+    ? ok('helper(M3): the context seam attaches { view, detail } to the send payload when present')
+    : fail(`helper(M3): the context seam did not attach (${JSON.stringify(seam.withCtx)})`);
+  (!('context' in seam.without))
+    ? ok('helper(M3): the payload omits context entirely when none is provided')
+    : fail('helper(M3): context leaked into a payload that had none');
+
+  // The send-time pre-check predicate (wonky bit 3), the SHIPPED guard: broker
+  // down and world c each refuse the send with an honest line; a healthy path
+  // (and no health at all) does not block. (Broker-down cannot be forced through
+  // the live app — the initial SSE status frame reasserts the real broker state —
+  // so the guard is proven here, as chat-liveness proves its own broker-down.)
+  const pre = await m3.evaluate(() => {
+    const f = window.__assistantPreSend;
+    return {
+      brokerDown: f({ brokerConnected: false, llmWorld: 'b' }),
+      worldC: f({ brokerConnected: true, llmWorld: 'c' }),
+      healthy: f({ brokerConnected: true, llmWorld: 'b' }),
+      noHealth: f(undefined),
+    };
+  });
+  (pre.brokerDown && /bus is not connected/i.test(pre.brokerDown.text) && pre.worldC && /answer this/i.test(pre.worldC.text) && pre.healthy === null && pre.noHealth === null)
+    ? ok('helper(M2): the send-time pre-check refuses broker-down and world-c, passes a healthy path')
+    : fail(`helper(M2): pre-check wrong (${JSON.stringify(pre)})`);
+  await m3.close();
 }
 
 if (pageErrors.length) {

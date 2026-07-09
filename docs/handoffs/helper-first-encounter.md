@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 author: Fable 5 (planner) under Fable, for Tim
 last-updated: 2026-07-08
 ---
@@ -150,3 +150,30 @@ it yet.
   literal name); helper's dead-air fixed here (not H2) to keep one owner
   for AgentAssistant.tsx; Ask-button concierge deferred to a named
   follow-up with only the `context` seam built now.
+- 2026-07-09 — implemented (Opus worker, child worktree h4): auto-send
+  removed (intro = static bubble; opening the panel publishes NOTHING);
+  helper hidden from Nav via the generic `[ui] surface = "panel"` profile
+  property (src/profile.rs UiCfg, emitted by profile list + agent catalog,
+  stamped on the synthesized helper row, documented in docs/config.md);
+  panel dead-air reuses lib/health.ts (STALL_MS moved there — one
+  constant); stop/dismiss; session persisted in localStorage
+  (lanius.helperSession) + "new conversation" rotation; concierge
+  `context` prop seam (documented, unit-asserted, wired to nothing); raw
+  session id out of the panel head. 26 new e2e (suite 362).
+- 2026-07-09 — VERIFIED (adversarial Opus, fresh context; GPT-5.5 channel
+  unavailable): pass=true, all 8 focus items PASS — property-driven
+  filtering with zero literal-name logic ("main" provably never hidden in
+  a fresh root); live-stack zero-publish-on-open (incl. persisted
+  remount); ConfigureView modal regresses nothing; single STALL_MS;
+  crash-safe persistence; seam attaches only-when-present; server
+  plumbing additive/back-compat (no synthetic-helper double rows); scope
+  exactly the 12 expected files. tsc clean, full cargo test green,
+  ui.spec.mjs 362/362 (an earlier rc=1 was a port/pid collision between
+  back-to-back suite runs, not a failure).
+- 2026-07-09 — merge-back (planner): two stale comments fixed as part of
+  the merge (App.tsx ai-panel + ConfigureView modal both still claimed an
+  auto-send "opening publish"). Residual LOW notes (triaged by Fable, not
+  fixed): window.__assistant* test hooks ship in the production bundle;
+  closing the panel drops stalled/pending indicator state (the thread
+  itself survives) — corr-keyed survival across close/reopen not required
+  by this handoff.

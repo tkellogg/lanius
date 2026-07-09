@@ -214,8 +214,10 @@ function ConfigureView(props: any) {
             <dialog id="cfg-context-assistant-modal" className="cfg-modal cfg-assistant-modal" ref={contextAssistantRef} onClick={(e) => { if (e.target === e.currentTarget) setContextAssistantOpen(false); }}>
               <div className="cfg-modal-head"><div><h3>new context step</h3><p className="dim-note">The assistant can inspect available blocks and save one for this agent.</p></div><button className="cfg-icon-btn" type="button" aria-label="close context assistant" onClick={() => setContextAssistantOpen(false)}>×</button></div>
               {/* Only mount the assistant while the modal is open: the views are
-                  rendered-and-[hidden], so an always-mounted assistant would fire
-                  its opening publish on every page load. */}
+                  rendered-and-[hidden], so this keeps the closed modal free of a
+                  live SSE subscription. (Mounting no longer publishes anything —
+                  helper-first-encounter M1 removed the auto-send; the intro is a
+                  static bubble and the first send is the user's.) */}
               {contextAssistantOpen && <AgentAssistant
                 title="Add a prompt step"
                 intro={`Help add one useful prompt step for ${agentName}. Look up the available steps, then save the one that fits.`}

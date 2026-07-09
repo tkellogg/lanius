@@ -5,6 +5,14 @@
 agent = "helper"
 owner = "owner"
 
+[ui]
+# The helper is presented in the assistant side-panel, not the left-hand agent
+# list. The web UI hides any profile with surface = "panel" from that list by
+# THIS property (never by matching the name "helper"), so a future panel-only
+# profile is hidden for free. See docs/config.md (profile fields) and
+# docs/handoffs/helper-first-encounter.md.
+surface = "panel"
+
 [model]
 # Mirrors the default profile's model posture. If no dispatcher-usable API
 # provider exists yet, later milestones route helper turns through a logged-in

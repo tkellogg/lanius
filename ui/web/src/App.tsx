@@ -10,7 +10,7 @@ import { type Sel, type AgentTab, selToPath, pathToSel } from './routing';
 import { arr, csv, uid } from './lib/format';
 import { agentOf, newWebConversationId, conversationStorageKey, mergeConvMessages, sessionFromPayload, isWorkerAgentName, isWorkerSessionId, topicFilterMatches } from './lib/conversation';
 import { declaredConfigParams, configRowMap, prunedSet } from './lib/packages';
-import { useSystemHealth } from './lib/health';
+import { useSystemHealth, STALL_MS } from './lib/health';
 import Nav from './views/Nav';
 import WelcomeView from './views/WelcomeView';
 import SetupView from './views/SetupView';
@@ -24,10 +24,6 @@ import SessionsView from './views/SessionsView';
 // docs/ui-flows/README.md and docs/ui-flows/configuration.md.
 const BUFFER_CAP = 2000;
 const PARENT_PATH = '$parent';
-// docs/handoffs/chat-liveness.md M2 (wonky bit 3): how long a sent message waits
-// with NO obs activity and no reply before the thread admits it may be stranded.
-// A fixed constant — not config — so "no response yet" means the same everywhere.
-const STALL_MS = 20000;
 // M6 (agent-comms-ui): the priority at/above which an agent-to-agent delivery is
 // "urgent" and lights the global signal lamp. Mirrors the backend default
 // (agent-comms.high_priority_threshold = 5).
@@ -176,6 +172,25 @@ export function App() {
   // status + liveness. A read, not a fetch — consumed by submitCompose's
   // send-time pre-check (M3) and, later, by H3/H4.
   const health = useSystemHealth(systemStatus, liveness);
+
+  // helper-first-encounter H4 (wonky bit 2): the agent nouns to hide from the
+  // left-hand agent list because they are presented in a dedicated surface
+  // (`[ui] surface = "panel"`). The Nav filters on THIS generic property — never
+  // on the literal name "helper" (the is_worker_session anti-pattern). A noun is
+  // hidden only when EVERY profile that uses it is panel-surfaced: the synthetic
+  // fallback helper row mirrors "default" and so shares the "main" agent noun,
+  // and we must never hide "main" out from under the default agent.
+  const panelAgents = useMemo(() => {
+    const panel = new Set<string>();
+    const listed = new Set<string>();
+    for (const p of diskProfiles as any[]) {
+      if (!p?.agent) continue;
+      if (p?.ui?.surface === 'panel') panel.add(p.agent);
+      else listed.add(p.agent);
+    }
+    for (const noun of listed) panel.delete(noun);
+    return panel;
+  }, [diskProfiles]);
 
   const touchAgent = (name: string, opts: any = {}) => {
     if (!name) return;
@@ -1275,7 +1290,7 @@ export function App() {
 
       <div className="body-row">
       <main className="deck">
-        <Nav agents={agents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} selectComms={selectComms} selectProviders={selectProviders} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel="explore" />
+        <Nav agents={agents} panelAgents={panelAgents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} selectComms={selectComms} selectProviders={selectProviders} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel="explore" />
 
         <section className="stage panel" aria-label="view">
           <div className="panel-head">
@@ -1395,8 +1410,10 @@ export function App() {
           toggles from every view. A real flex column (not a fixed overlay),
           so opening it shrinks `.deck` instead of covering the masthead or
           other page content. Mounted only while open (mirrors the
-          context-assistant modal's own comment): an always-mounted
-          AgentAssistant would fire its opening publish on every page load. */}
+          context-assistant modal): keeps the closed panel truly free —
+          no SSE subscription, no state. Opening the panel publishes
+          NOTHING (helper-first-encounter M1); the first live turn starts
+          on the user's first message. */}
       {aiPanelOpen && (
         <aside id="ai-panel" className="ai-panel" aria-label="helper assistant">
           <div className="ai-panel-head">
@@ -1417,6 +1434,9 @@ export function App() {
               title="helper"
               intro="Ask me to help you get set up, or about anything here — your agents, models, and settings. I can look things up and take you where you need to go."
               tools={helperTools}
+              health={health}
+              onCheckStatus={() => selectSetup()}
+              persistKey="lanius.helperSession"
               onDone={() => setAiPanelOpen(false)}
             />
           )}
