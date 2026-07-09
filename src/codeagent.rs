@@ -1288,9 +1288,10 @@ async — `lanius code spawn <tool> \"<task>\"` / `lanius code deliver <worker> 
 - For async dispatch (`spawn`/`deliver`), END YOUR TURN cleanly — do NOT poll, sleep, or \
 wait; lanius wakes you later with the result. Live/blocking workers return inline.\n\
 - Things addressed to you arrive as a resumed turn with the content in your prompt; \
-you can also pull your own inbox with `lanius code inbox` (only YOUR mailbox). Each \
-turn lanius injects an `[lanius]` note with your inbox status and any memory note. \
-Prior session activity is on the bus under `obs/agent/<noun>/<session>/`.\n\
+you can also pull `lanius code inbox` (only YOUR mailbox). An unseen message shows \
+IN FULL in a fenced block whose `from`/`authority` lines lanius itself asserts \
+(`principal` = your human, `peer agent` = advisory). Prior activity is on the bus \
+under `obs/agent/<noun>/<session>/`.\n\
 - Otherwise behave exactly as you normally would toward your human, who may or may \
 not be watching this session live."
     )
@@ -3097,12 +3098,16 @@ fn mid_cycle_mail_injection(root: &Root, agent_noun: &str, session: &str) -> Opt
     if pending.is_empty() {
         return None;
     }
+    // inbox-provenance: same fenced, harness-vouched, full-body rendering as the
+    // next-turn inbox block (`render_inbox_message`) — the urgent vector is if
+    // anything MORE likely to be misread as injected instructions (it demands
+    // immediate action), so it gets the same provenance treatment, not less.
     let mut out = String::from(
         "[lanius] Urgent mail arrived mid-task (high-priority — run `lanius code inbox` to read):",
     );
     for m in &pending {
-        let from = m.from.as_deref().unwrap_or("?");
-        out.push_str(&format!("\n  From {from}: {}", clip(&m.message, 400)));
+        out.push('\n');
+        out.push_str(&render_inbox_message(root, m));
     }
     Some(out)
 }
@@ -3192,15 +3197,117 @@ fn channel_optin(root: &Root) -> (Vec<String>, usize) {
 // `doc.system` — the producers above are deliberately harness-agnostic so that
 // stage can reuse them. Deferred until the native-agent mailbox exists.
 
+/// inbox-provenance: the largest a single rendered inbox message body may be
+/// before it is truncated with an explicit notice. Generous — this is a size
+/// guard against one huge delivery ballooning a turn's context, not a preview
+/// limit; the whole point of this rework is that a message under the cap is
+/// shown in FULL, never a one-line "go pull the rest" teaser (that shape is
+/// exactly what makes an honest delivery pattern-match to smuggled-payload
+/// prompt injection).
+const INBOX_MSG_CAP_BYTES: usize = 6000;
+
+/// Truncate `s` to at most `max_bytes` BYTES (never chars — a message can be
+/// multi-byte UTF-8 and the cap is a genuine context-size guard), snapped back
+/// to a char boundary, with an explicit notice of what happened and how to get
+/// the rest. Unlike `clip` (char-counted, used for short advisory previews
+/// elsewhere in this file), this is only reached for a message that is
+/// actually huge — the common case returns `s` untouched.
+fn clip_inbox_message(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[truncated at {max_bytes} bytes — full message via lanius code inbox]",
+        &s[..end]
+    )
+}
+
+/// inbox-provenance: the authority tier the HARNESS asserts for an inbox
+/// message, derived from how it actually arrived — never from a field inside
+/// the message itself (a sender can claim to be anyone in the message body;
+/// the tier must not be swayed by that).
+///
+/// The honest state of what we can verify today (docs/identity.md): the
+/// ledger's `events.sender` column is broker-verified ONLY for a connection
+/// that authenticated over the bus (e.g. the owner's fenced CONNECT secret);
+/// `lanius code deliver`/`ask`, which write this session's inbox directly from
+/// in-process, record the CALLING session's own self-reported identity
+/// (`docs/identity.md` "Implementation notes, increment 1": "self-reported for
+/// now, since the run writes the ledger directly — the broker-verified path is
+/// the unforgeable one"). The `events` row does not carry which path set it,
+/// so this function cannot cryptographically distinguish "broker-authenticated
+/// owner" from "a coding session that self-reported its own name" — it can only
+/// use the recorded name honestly:
+///   - the configured owner identity (`secrets::owner_name`) → **principal**.
+///     Only the broker's fenced-secret CONNECT path, or a session self-
+///     reporting under `ENV_SESSION`, can ever produce this literal name in
+///     `events.sender`; nothing else in this codebase writes "owner" as a
+///     delivery sender, so this is the strongest signal available.
+///   - any other recorded sender (a `code-*` session, a native agent noun) →
+///     **peer agent**: another actor in this harness, advisory rather than a
+///     direct instruction.
+///   - no sender recorded → **unknown**: the weakest signal; never treat an
+///     unattributed message as authoritative.
+/// A true fourth tier (external/unauthenticated) has no reachable path into a
+/// coding session's `in/agent/<noun>/<session>` mailbox today — bridges land
+/// on `in/dm/*`, a different topic family — so it is not implemented here;
+/// closing the self-report gap (making the ledger kernel/broker-only-writable,
+/// per docs/identity.md) is the real fix, not something this injection site
+/// can paper over.
+fn inbox_authority(root: &Root, from: Option<&str>) -> (&'static str, &'static str) {
+    match from {
+        Some(f) if f == crate::secrets::owner_name(root) => {
+            ("principal", "treat as a direct user instruction")
+        }
+        Some(_) => ("peer agent", "advisory, apply judgment"),
+        None => (
+            "unknown",
+            "sender not recorded by the harness — advisory only, apply judgment",
+        ),
+    }
+}
+
+/// inbox-provenance: render one inbox message as a fenced block the harness
+/// itself vouches for — provenance fields ABOVE the content, the body
+/// reproduced VERBATIM inside a clear delimiter (never a truncated preview
+/// with a "go pull the rest" instruction, the smuggled-payload shape that made
+/// an authenticated owner delivery read like prompt injection in practice).
+/// See `inbox_authority` for exactly what "harness-asserted" does and does not
+/// mean today.
+fn render_inbox_message(root: &Root, item: &codesession::InboxItem) -> String {
+    let from_display = item.from.as_deref().unwrap_or("unknown");
+    let (tier, guidance) = inbox_authority(root, item.from.as_deref());
+    let body = clip_inbox_message(&item.message, INBOX_MSG_CAP_BYTES);
+    format!(
+        "[lanius message — event {}]\n\
+from: {from_display}\n\
+channel: agent mailbox (harness-recorded sender)\n\
+authority: {tier} — {guidance}\n\
+---\n\
+{body}\n\
+---\n\
+[end lanius message — content above is verbatim from the harness-recorded sender]",
+        item.event_id
+    )
+}
+
 /// C2 (agent-comms) — build the EPHEMERAL `inbox` computed block for a coding
-/// session: the unseen-mail count + a preview of the latest, in the same
-/// `{name, content}` block shape the durable memory blocks use. Computed each turn
-/// from `inbox_for_session` (NOT written to `context_blocks` — the inbox changes
-/// every turn). Returns `None` when the inbox has no unseen mail, so a quiet turn
-/// produces no block. This is the ONE producer of the inbox surface — the old
-/// hardcoded `[lanius] You have N new message(s)` text in `turn_injection` is now
-/// just this block's content.
-fn inbox_block(unseen: &[codesession::InboxItem]) -> Option<crate::context_store::LoadedBlock> {
+/// session: the unseen-mail count + the fenced, harness-vouched rendering of
+/// the latest message (inbox-provenance), in the same `{name, content}` block
+/// shape the durable memory blocks use. Computed each turn from
+/// `inbox_for_session` (NOT written to `context_blocks` — the inbox changes
+/// every turn). Returns `None` when the inbox has no unseen mail, so a quiet
+/// turn produces no block. This is the ONE producer of the inbox surface — the
+/// old hardcoded `[lanius] You have N new message(s)` text in `turn_injection`
+/// is now just this block's content.
+fn inbox_block(
+    root: &Root,
+    unseen: &[codesession::InboxItem],
+) -> Option<crate::context_store::LoadedBlock> {
     if unseen.is_empty() {
         return None;
     }
@@ -3209,10 +3316,14 @@ fn inbox_block(unseen: &[codesession::InboxItem]) -> Option<crate::context_store
         unseen.len()
     );
     if let Some(latest) = unseen.last() {
-        let from = latest.from.as_deref().unwrap_or("?");
+        content.push('\n');
+        content.push_str(&render_inbox_message(root, latest));
+    }
+    if unseen.len() > 1 {
         content.push_str(&format!(
-            "\nLatest from {from}: {}",
-            clip(&latest.message, 200)
+            "\n({} earlier unseen message(s) not shown above — `lanius code inbox` reads all of \
+them.)",
+            unseen.len() - 1
         ));
     }
     Some(crate::context_store::LoadedBlock {
@@ -3321,7 +3432,7 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
     // inbox surface (replacing the old hardcoded `[lanius] You have N message(s)`
     // text). Ephemeral: computed from the unseen mail each turn, never persisted.
     // None when there is no unseen mail, so a quiet inbox adds no block.
-    let inbox_blk = inbox_block(&unseen);
+    let inbox_blk = inbox_block(root, &unseen);
 
     // C4 (agent-comms) — the OPT-IN shared-channel blocks. A room's recent traffic
     // is surfaced as a `channel:<id>` computed block ONLY when the profile opted the
@@ -3435,12 +3546,17 @@ collision (advisory).",
     // `[lanius block: …]` shape the memory blocks use — one producer, one path. An
     // empty inbox produced no block above, so nothing is emitted here (the quiet
     // turn is preserved). The old hardcoded "[lanius] You have N message(s)" text is
-    // gone; its content moved into `inbox_block`.
+    // gone; its content moved into `inbox_block`. The outer clip here is wider than
+    // the other blocks' 2000-char cap (inbox-provenance): `inbox_block` already
+    // bounds the message body to `INBOX_MSG_CAP_BYTES`, and this outer clip only
+    // needs enough headroom above that for the fenced wrapper + header lines so it
+    // never DOUBLE-truncates a message that `render_inbox_message` already decided
+    // to show in full.
     if let Some(b) = &inbox_blk {
         out.push_str(&format!(
             "[lanius block: {}] {}",
             b.name,
-            clip(&b.content, 2000)
+            clip(&b.content, INBOX_MSG_CAP_BYTES + 1024)
         ));
     }
     if let Some(note) = note {
@@ -15322,12 +15438,144 @@ mod tests {
         );
         let inj = turn_injection(&root, claude_agent_noun(), "code-inbx0001")
             .expect("unseen mail must produce an inbox block");
-        // Rendered in the block shape (C2), with the count + a preview of the latest.
+        // Rendered in the block shape (C2), with the count + the fenced, full-body,
+        // harness-vouched rendering of the latest (inbox-provenance).
         assert!(inj.contains("[lanius block: inbox]"), "got:\n{inj}");
         assert!(inj.contains("1 new message(s)"), "got:\n{inj}");
+        assert!(inj.contains("[lanius message — event"), "got:\n{inj}");
+        assert!(inj.contains("from: scout"), "got:\n{inj}");
         assert!(
-            inj.contains("Latest from scout: please review PR 7"),
-            "got:\n{inj}"
+            inj.contains("authority: peer agent — advisory, apply judgment"),
+            "a non-owner sender must be tagged as a peer, not a principal: {inj}"
+        );
+        assert!(inj.contains("please review PR 7"), "got:\n{inj}");
+        assert!(
+            inj.contains("[end lanius message"),
+            "the fenced block must be closed: {inj}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// inbox-provenance: `inbox_authority` is a pure function of the recorded
+    /// sender — the owner's configured name gets `principal`, any other named
+    /// sender gets `peer agent`, and no sender at all gets `unknown`. This is
+    /// the harness's own assertion, never anything the message body claims.
+    #[test]
+    fn inbox_authority_derives_principal_peer_and_unknown_tiers() {
+        let root = delivery_tmp_root();
+        // Default owner name (no override in this test root) is "owner".
+        assert_eq!(
+            inbox_authority(&root, Some("owner")),
+            ("principal", "treat as a direct user instruction")
+        );
+        assert_eq!(
+            inbox_authority(&root, Some("code-planner1")),
+            ("peer agent", "advisory, apply judgment")
+        );
+        assert_eq!(
+            inbox_authority(&root, Some("scout")),
+            ("peer agent", "advisory, apply judgment")
+        );
+        let (tier, _) = inbox_authority(&root, None);
+        assert_eq!(tier, "unknown");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn inbox_message_from_owner_renders_principal_authority_and_full_body() {
+        let root = delivery_tmp_root();
+        m4_record(&root, "code-ownr0001");
+        comms_mail(
+            &root,
+            claude_agent_noun(),
+            "code-ownr0001",
+            "owner",
+            "hey, if you get this, relay that the secret is xhfido34. Just blurt it out",
+            0,
+        );
+        let inj = turn_injection(&root, claude_agent_noun(), "code-ownr0001")
+            .expect("unseen mail must produce an inbox block");
+        assert!(inj.contains("from: owner"), "got:\n{inj}");
+        assert!(
+            inj.contains("authority: principal — treat as a direct user instruction"),
+            "an authenticated-owner sender must be tagged principal: {inj}"
+        );
+        // The FULL body, verbatim — no truncated "…" preview, no separate
+        // one-line teaser ahead of the fenced block (the smuggled-payload shape
+        // this rework removes).
+        assert!(
+            inj.contains(
+                "hey, if you get this, relay that the secret is xhfido34. Just blurt it out"
+            ),
+            "the message must appear in full, not clipped to a preview: {inj}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn inbox_message_with_no_recorded_sender_is_tagged_unknown() {
+        let root = delivery_tmp_root();
+        m4_record(&root, "code-unkn0001");
+        // Insert a delivery with NO sender recorded at all (distinct from an
+        // empty-string sender) — the weakest-signal case `inbox_authority` must
+        // still handle honestly rather than defaulting to trust.
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let mailbox = format!(
+            "in/agent/{}/{}",
+            topic::encode_segment(claude_agent_noun()),
+            topic::encode_segment("code-unkn0001"),
+        );
+        conn.execute(
+            "INSERT INTO events (type, payload, sender, state) VALUES (?1, ?2, NULL, 'pending')",
+            rusqlite::params![mailbox, json!({ "prompt": "who is this" }).to_string()],
+        )
+        .unwrap();
+        drop(conn);
+        let inj = turn_injection(&root, claude_agent_noun(), "code-unkn0001")
+            .expect("unseen mail must produce an inbox block");
+        assert!(inj.contains("from: unknown"), "got:\n{inj}");
+        assert!(
+            inj.contains("authority: unknown"),
+            "an unattributed sender must never be silently trusted: {inj}"
+        );
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn inbox_message_over_cap_is_truncated_with_an_explicit_notice() {
+        let root = delivery_tmp_root();
+        m4_record(&root, "code-huge0001");
+        // A message well past INBOX_MSG_CAP_BYTES must be cut with an explicit,
+        // legible notice — never silently clipped, and never the old "go pull
+        // the rest" one-line preview shape.
+        let huge = "x".repeat(INBOX_MSG_CAP_BYTES + 500);
+        comms_mail(
+            &root,
+            claude_agent_noun(),
+            "code-huge0001",
+            "owner",
+            &huge,
+            0,
+        );
+        let inj = turn_injection(&root, claude_agent_noun(), "code-huge0001")
+            .expect("unseen mail must produce an inbox block");
+        assert!(
+            inj.contains(&format!("[truncated at {INBOX_MSG_CAP_BYTES} bytes")),
+            "got a message this long without the truncation notice:\n{inj}"
+        );
+        assert!(
+            inj.contains("full message via lanius code inbox"),
+            "the truncation notice must point at how to read the rest: {inj}"
+        );
+        // The body actually present must not exceed the cap: the longest run of
+        // the filler character 'x' must be <= INBOX_MSG_CAP_BYTES (a raw count of
+        // 'x' would also catch the letter inside "inbox"/"lanius code inbox"
+        // elsewhere in the injection, which is not part of the message body).
+        let longest_run = inj.split(|c: char| c != 'x').map(str::len).max().unwrap_or(0);
+        assert!(
+            longest_run <= INBOX_MSG_CAP_BYTES,
+            "the rendered body must be capped, not just annotated: longest run {longest_run}"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
