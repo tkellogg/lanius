@@ -225,7 +225,13 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
 /// There is no file-watch and no restart-on-source-change: a packaged service runs
 /// the artifact as-is. Everything is rooted at `<root>` — no build tree
 /// (CARGO_MANIFEST_DIR) is consulted, so an installed binary with no checkout works.
-pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Result<()> {
+pub fn serve(
+    root: &Root,
+    interval_ms: u64,
+    web_port: u16,
+    rebuild: bool,
+    trusted_hosts: &[String],
+) -> Result<()> {
     install_signal_handlers();
 
     // Everything is rooted at <root>: no build tree is consulted, so an installed
@@ -245,6 +251,18 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
         log.line("[serve] --rebuild ignored: the web UI is embedded in the binary (nothing to npm-build at serve time; use `lanius dev` for the Vite hot-reload loop)");
     }
 
+    let mut web_command = CommandSpec::new(self_exe.clone(), &root.dir)
+        .arg("-C")
+        .arg(&root_s)
+        .arg("web")
+        .arg("--port")
+        .arg(&web_port_s)
+        .env_dual("ROOT", &root_s)
+        .env_dual("WEB_PORT", &web_port_s);
+    for host in trusted_hosts {
+        web_command = web_command.arg("--trusted-host").arg(host);
+    }
+
     let mut services = vec![
         Service::new(
             "daemon",
@@ -261,14 +279,7 @@ pub fn serve(root: &Root, interval_ms: u64, web_port: u16, rebuild: bool) -> Res
         // needed at runtime. ui/web/server.mjs was retired (web-packaging M4).
         Service::new(
             "web",
-            CommandSpec::new(self_exe.clone(), &root.dir)
-                .arg("-C")
-                .arg(&root_s)
-                .arg("web")
-                .arg("--port")
-                .arg(&web_port_s)
-                .env_dual("ROOT", &root_s)
-                .env_dual("WEB_PORT", &web_port_s),
+            web_command,
         ),
     ];
 

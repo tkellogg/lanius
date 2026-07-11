@@ -81,6 +81,33 @@ struct Hub {
     // replays on subscribe). The read endpoint /api/liveness projects this to the
     // product words the interface shows (running/stopped/failed).
     liveness: Mutex<HashMap<String, Value>>,
+    trusted_hosts: TrustedHosts,
+}
+
+#[derive(Clone, Debug)]
+struct TrustedHosts {
+    names: HashSet<String>,
+}
+
+impl TrustedHosts {
+    fn new(configured: &[String]) -> Result<Self> {
+        let mut names = HashSet::from([
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "::1".to_string(),
+        ]);
+        for value in configured {
+            let name = authority_hostname(value)
+                .with_context(|| format!("invalid --trusted-host value {value:?}"))?;
+            names.insert(name);
+        }
+        Ok(Self { names })
+    }
+
+    fn allows(&self, authority: &str) -> bool {
+        authority_hostname(authority)
+            .is_some_and(|hostname| self.names.contains(&hostname))
+    }
 }
 
 impl Hub {
@@ -131,7 +158,8 @@ impl Hub {
 /// thread, spawn the bus relay, run the HTTP server (one worker — everything is
 /// single-threaded on the system). Blocks until the system stops (Ctrl-C, or
 /// SIGTERM from `serve`'s supervisor).
-pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
+pub fn serve_web(root: &Root, port: u16, agent: &str, trusted_hosts: &[String]) -> Result<()> {
+    let trusted_hosts = TrustedHosts::new(trusted_hosts)?;
     let cfg = bus::config(root);
     let addr = bus::connect_addr(&cfg)
         .with_context(|| format!("unparseable bus bind address {:?}", cfg.bind))?;
@@ -178,6 +206,7 @@ pub fn serve_web(root: &Root, port: u16, agent: &str) -> Result<()> {
             next_client_id: AtomicU64::new(0),
             clients: Mutex::new(Vec::new()),
             liveness: Mutex::new(HashMap::new()),
+            trusted_hosts,
         });
 
         // The bus relay runs on its OWN real-tokio thread, NOT the ntex runtime:
@@ -354,7 +383,7 @@ async fn relay(hub: Arc<Hub>, mut eventloop: rumqttc::v5::EventLoop) {
 // ---- publish --------------------------------------------------------------
 
 async fn publish(hub: web::types::State<Arc<Hub>>, req: HttpRequest, body: Bytes) -> HttpResponse {
-    if !human_proof_ok(&hub.root, &req) {
+    if !human_proof_ok(&hub.root, &hub.trusted_hosts, &req) {
         return json_resp(
             403,
             json!({ "ok": false, "error": "cross-origin request refused" }),
@@ -730,7 +759,7 @@ async fn code_deliver(
 ) -> HttpResponse {
     // A human gesture (send a note to a worker): same origin/human-proof gate as
     // publish, so a hostile page can't relay into a worker's inbox.
-    if !human_proof_ok(&hub.root, &req) {
+    if !human_proof_ok(&hub.root, &hub.trusted_hosts, &req) {
         return json_resp(
             403,
             json!({ "ok": false, "error": "cross-origin request refused" }),
@@ -1076,7 +1105,7 @@ async fn block_set(
     req: HttpRequest,
     body: Bytes,
 ) -> HttpResponse {
-    if !origin_ok(&req) {
+    if !origin_ok(&hub.trusted_hosts, &req) {
         return json_resp(
             403,
             json!({ "ok": false, "error": "cross-origin request refused (CSRF/DNS-rebinding guard)" }),
@@ -1209,7 +1238,9 @@ async fn admin(
     // origin guard is the CSRF/DNS-rebinding floor; at reduced trust it tightens
     // to require a browser gesture so a caged agent's no-Origin curl cannot
     // approve its own grants (M5, partial close of security.md entry 13).
-    if method != ntex::http::Method::GET && !human_proof_ok(&hub.root, &req) {
+    if method != ntex::http::Method::GET
+        && !human_proof_ok(&hub.root, &hub.trusted_hosts, &req)
+    {
         return json_resp(
             403,
             json!({ "ok": false, "error": "cross-origin request refused (CSRF/DNS-rebinding guard)" }),
@@ -2334,8 +2365,8 @@ fn trust_word(root: &Root) -> &'static str {
 ///   the confused deputy is closed for high-stakes actions on shared/remote
 ///   machines. Free reads (GET) and converse are unaffected — a browser fetch
 ///   always sends Origin.
-fn human_proof_ok(root: &Root, req: &HttpRequest) -> bool {
-    if !origin_ok(req) {
+fn human_proof_ok(root: &Root, trusted_hosts: &TrustedHosts, req: &HttpRequest) -> bool {
+    if !origin_ok(trusted_hosts, req) {
         return false;
     }
     if bus::trust(root) == bus::TrustLevel::Reduced {
@@ -2348,28 +2379,60 @@ fn human_proof_ok(root: &Root, req: &HttpRequest) -> bool {
     true
 }
 
-fn origin_ok(req: &HttpRequest) -> bool {
+fn origin_ok(trusted_hosts: &TrustedHosts, req: &HttpRequest) -> bool {
     let headers = req.headers();
     let host = headers
         .get("host")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    if !host_is_local(host) {
+    if !trusted_hosts.allows(host) {
         return false;
     }
     match headers.get("origin").and_then(|h| h.to_str().ok()) {
         None => true,
         // The Origin's host need only be LOCAL, not byte-equal to Host: the Vite
         // dev proxy is a local cross-PORT origin. A foreign Origin is still refused.
-        Some(origin) => origin_host(origin)
-            .map(|h| host_is_local(&h))
-            .unwrap_or(false),
+        Some(origin) => origin_host(origin).is_some_and(|h| trusted_hosts.allows(&h)),
     }
 }
 
-fn host_is_local(host: &str) -> bool {
-    let bare = host.split(':').next().unwrap_or("");
-    matches!(bare, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+fn authority_hostname(authority: &str) -> Option<String> {
+    let authority = authority.trim();
+    if authority.is_empty()
+        || authority
+            .chars()
+            .any(|c| c.is_ascii_whitespace() || matches!(c, '/' | '\\' | '@'))
+    {
+        return None;
+    }
+
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let end = bracketed.find(']')?;
+        let remainder = &bracketed[end + 1..];
+        if !remainder.is_empty()
+            && !remainder
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        {
+            return None;
+        }
+        &bracketed[..end]
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if authority.matches(':').count() == 1
+            && !host.is_empty()
+            && !port.is_empty()
+            && port.chars().all(|c| c.is_ascii_digit())
+        {
+            host
+        } else {
+            authority
+        }
+    } else {
+        authority
+    };
+
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn origin_host(origin: &str) -> Option<String> {
@@ -3761,28 +3824,54 @@ mod route_tests {
     }
 
     // The CSRF/DNS-rebinding guard `origin_ok` enforces on mutations, via its
-    // `host_is_local`/`origin_host` predicates: a local Host is required; when a
+    // trusted-host/origin predicates: a trusted Host is required; when a
     // browser supplies Origin, that Origin's host must be LOCAL (any loopback port,
     // so the Vite dev proxy passes) but a FOREIGN origin is refused.
     #[test]
     fn origin_guard_allows_local_cross_port_refuses_foreign() {
+        let trusted = TrustedHosts::new(&[]).unwrap();
         // Local host, no Origin (curl / local agent) → allowed (host check only).
-        assert!(host_is_local("127.0.0.1:8080"));
+        assert!(trusted.allows("127.0.0.1:8080"));
         // Same-origin browser POST → Origin host is local. allowed.
-        assert!(host_is_local(
+        assert!(trusted.allows(
             &origin_host("http://127.0.0.1:7182/").unwrap()
         ));
         // Vite dev proxy: UI on :5174, relay on :7182 — a local cross-PORT origin.
         // Different port, but still local → origin_ok accepts it (the dev-loop fix).
         let vite = origin_host("http://127.0.0.1:5174/").unwrap();
         assert_ne!(vite, "127.0.0.1:7182");
-        assert!(host_is_local(&vite));
+        assert!(trusted.allows(&vite));
         // A foreign Origin (an attacker page) is refused: its host is not local.
-        assert!(!host_is_local(
+        assert!(!trusted.allows(
             &origin_host("http://evil.example/page").unwrap()
         ));
         // A rebound / non-local Host is refused outright by the Host check.
-        assert!(!host_is_local("evil.example"));
+        assert!(!trusted.allows("evil.example"));
+        assert!(trusted.allows("[::1]:7180"));
+    }
+
+    #[test]
+    fn origin_guard_allows_only_configured_remote_hosts() {
+        use ntex::web::test::TestRequest;
+
+        let trusted = TrustedHosts::new(&["My-Sys---TS.net".into()]).unwrap();
+        let allowed = TestRequest::default()
+            .header("host", "my-sys---ts.net:7180")
+            .header("origin", "https://MY-SYS---TS.NET")
+            .to_http_request();
+        assert!(origin_ok(&trusted, &allowed));
+
+        let foreign_origin = TestRequest::default()
+            .header("host", "my-sys---ts.net:7180")
+            .header("origin", "https://evil.example")
+            .to_http_request();
+        assert!(!origin_ok(&trusted, &foreign_origin));
+
+        let rebound_host = TestRequest::default()
+            .header("host", "evil.example")
+            .header("origin", "https://my-sys---ts.net")
+            .to_http_request();
+        assert!(!origin_ok(&trusted, &rebound_host));
     }
 
     // M5 (docs/handoffs/platform-trust.md, partial close of security.md entry
@@ -3795,6 +3884,7 @@ mod route_tests {
         let dir = std::env::temp_dir().join(format!("el-trustgate-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let root = Root { dir: dir.clone() };
+        let trusted = TrustedHosts::new(&[]).unwrap();
 
         let no_origin = || {
             TestRequest::default()
@@ -3811,20 +3901,20 @@ mod route_tests {
         // Full trust (default / no bus.toml): a no-Origin local curl still passes
         // — the historical behavior, unchanged.
         assert!(
-            human_proof_ok(&root, &no_origin()),
+            human_proof_ok(&root, &trusted, &no_origin()),
             "full trust: no-Origin local request passes (today's behavior)"
         );
-        assert!(human_proof_ok(&root, &with_origin()));
+        assert!(human_proof_ok(&root, &trusted, &with_origin()));
 
         // Reduced trust: the no-Origin curl is refused (no browser gesture); a
         // browser request with a local Origin still passes so converse/reads work.
         std::fs::write(root.bus_file(), "trust = \"reduced\"\n").unwrap();
         assert!(
-            !human_proof_ok(&root, &no_origin()),
+            !human_proof_ok(&root, &trusted, &no_origin()),
             "reduced trust: a no-Origin local curl presents no human proof — refused"
         );
         assert!(
-            human_proof_ok(&root, &with_origin()),
+            human_proof_ok(&root, &trusted, &with_origin()),
             "reduced trust: a browser gesture (present local Origin) passes"
         );
 
@@ -3833,7 +3923,7 @@ mod route_tests {
             .header("host", "127.0.0.1:7180")
             .header("origin", "http://evil.example")
             .to_http_request();
-        assert!(!human_proof_ok(&root, &foreign));
+        assert!(!human_proof_ok(&root, &trusted, &foreign));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

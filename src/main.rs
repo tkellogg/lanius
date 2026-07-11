@@ -201,6 +201,10 @@ enum Cmd {
         /// Vite hot-reload loop.
         #[arg(long)]
         rebuild: bool,
+        /// Additional hostname allowed by the web UI's Host/Origin guard.
+        /// Repeat for multiple reverse-proxy or private-network names.
+        #[arg(long = "trusted-host")]
+        trusted_hosts: Vec<String>,
     },
     /// Serve the web dashboard in-process: the embedded SPA + the SSE bus relay +
     /// the JSON API (the Rust port of ui/web/server.mjs — no Node at runtime). Run
@@ -212,6 +216,10 @@ enum Cmd {
         /// Agent the dashboard targets by default.
         #[arg(long, default_value = "main")]
         agent: String,
+        /// Additional hostname allowed by the Host/Origin guard. Loopback names
+        /// remain trusted by default. Repeat for multiple names.
+        #[arg(long = "trusted-host")]
+        trusted_hosts: Vec<String>,
     },
     /// Emit an event — the universal entry point
     Emit {
@@ -923,8 +931,13 @@ fn run(cli: Cli) -> Result<()> {
             interval_ms,
             web_port,
             rebuild,
-        } => dev::serve(&root, interval_ms, web_port, rebuild)?,
-        Cmd::Web { port, agent } => {
+            trusted_hosts,
+        } => dev::serve(&root, interval_ms, web_port, rebuild, &trusted_hosts)?,
+        Cmd::Web {
+            port,
+            agent,
+            trusted_hosts,
+        } => {
             // server.mjs parity: LANIUS_WEB_PORT overrides the default when no
             // explicit --port is on the command line. clap can't tell a default
             // from an explicit equal value, so honor the env var only when --port
@@ -937,7 +950,7 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 port
             };
-            web::serve_web(&root, port, &agent)?
+            web::serve_web(&root, port, &agent, &trusted_hosts)?
         }
         Cmd::Emit {
             r#type,
