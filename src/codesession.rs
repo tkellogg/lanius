@@ -2239,6 +2239,10 @@ fn token_path(root: &Root, principal: &str) -> PathBuf {
 }
 
 /// Path of the cross-process advisory lock file for the budget critical section.
+/// Only the Unix `BudgetLock` (flock) consumes this; on Windows the budget
+/// critical section degrades to best-effort without a cross-process lock (M1 —
+/// docs/handoffs/windows-support.md; LockFileEx is a follow-up).
+#[cfg(unix)]
 fn budget_lock_path(root: &Root) -> PathBuf {
     store_dir(root).join("budget.lock")
 }

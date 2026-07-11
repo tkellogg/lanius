@@ -852,13 +852,8 @@ fn refresh_adapter_if_stale(source: &Path, adapter: &Path) -> Result<()> {
 }
 
 fn set_executable(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(perms.mode() | 0o755);
-        std::fs::set_permissions(path, perms)?;
-    }
+    // Unix: chmod +x. Windows: no-op (no exec bit).
+    crate::platform::set_executable(path)?;
     Ok(())
 }
 
