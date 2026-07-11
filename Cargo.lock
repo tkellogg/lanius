@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "lanius"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
