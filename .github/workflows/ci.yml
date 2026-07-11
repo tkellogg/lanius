@@ -20,3 +20,25 @@ jobs:
       # build.rs runs the vite build into ui/web/dist before the crate
       # compiles, so cargo test covers the embedded UI build path too.
       - run: cargo test
+
+  # Native Windows (MSVC) build. Guards against a reintroduced bare unix-ism
+  # (libc/std::os::unix) regressing the Windows compile — see
+  # docs/handoffs/windows-support.md M1/M5. No NASM/aws-lc step: the TLS stack is
+  # native-tls (SChannel) and the MQTT bus is plain-TCP, so the graph has no C
+  # crypto crate to build. sqlite (rusqlite bundled) builds with the MSVC C
+  # toolchain that ships on windows-latest. `cargo build` only for now: the test
+  # harness still contains a few unix-only `#[cfg(test)]` helpers, so
+  # `cargo test` on Windows awaits a later milestone.
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # build.rs runs the vite build into ui/web/dist before the crate compiles.
+      - run: cargo build
