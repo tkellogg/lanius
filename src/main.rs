@@ -880,6 +880,8 @@ enum BusCmd {
 
 fn main() {
     // Die quietly on EPIPE like a normal Unix tool (`lanius inbox | grep -q`).
+    // SIGPIPE does not exist on Windows (broken-pipe surfaces as an io error).
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }

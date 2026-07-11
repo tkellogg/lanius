@@ -1133,13 +1133,10 @@ pub fn spawn(root: &Root, tool: &str, prompt: &str, provider: Option<&str>) -> R
         .env(ENV_REPLY_CORRELATION, &correlation)
         .env(ENV_SPAWN_DEPTH, (spawn_depth + 1).to_string())
         .env_dual("ROOT", &root.dir);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        // Put the worker wrapper in its own process group so it does not share
-        // terminal-generated signals with this short-lived CLI process.
-        cmd.process_group(0);
-    }
+    // Put the worker wrapper in its own process group so it does not share
+    // terminal-generated signals with this short-lived CLI process. (Windows:
+    // no-op for M1 — Job Objects are M2.)
+    crate::platform::set_process_group(&mut cmd);
 
     let child = cmd
         .spawn()
@@ -1502,7 +1499,9 @@ fn link_skill_packages(skills_dir: &Path, skills: &[(String, PathBuf)]) -> Resul
         .with_context(|| format!("creating skills dir {}", skills_dir.display()))?;
     for (name, dir) in skills {
         let link = skills_dir.join(name);
-        if let Err(e) = std::os::unix::fs::symlink(dir, &link) {
+        // Unix: symlink (edits reflect live). Windows: copy (M1 — symlinks need
+        // Developer Mode/privilege; these links are ephemeral per-session).
+        if let Err(e) = crate::platform::link_or_copy(dir, &link) {
             eprintln!(
                 "[code] linking skill {name} -> {} into {}: {e:#}",
                 dir.display(),
@@ -1540,7 +1539,9 @@ fn build_codex_skills_home(
             if src.exists() {
                 let dst = home.join(entry);
                 let _ = std::fs::remove_file(&dst);
-                if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                // Unix: symlink (secret read in place, never copied). Windows:
+                // copy (M1) — the ephemeral CODEX_HOME is removed at exit.
+                if let Err(e) = crate::platform::link_or_copy(&src, &dst) {
                     eprintln!(
                         "[code] linking codex {entry} {} -> {}: {e:#}",
                         dst.display(),

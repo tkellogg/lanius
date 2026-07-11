@@ -22,8 +22,9 @@ pub const COMMITTER_EMAIL: &str = "lanius@localhost";
 
 /// Apply the untrusted-input hardening every kernel git invocation shares.
 pub fn harden(c: &mut Command) {
+    let null = crate::platform::NULL_DEVICE; // "/dev/null" on Unix, "NUL" on Windows
     c.arg("-c")
-        .arg("core.hooksPath=/dev/null")
+        .arg(format!("core.hooksPath={null}"))
         .arg("-c")
         .arg("core.fsmonitor=false")
         .arg("-c")
@@ -32,8 +33,8 @@ pub fn harden(c: &mut Command) {
         .arg(format!("user.name={COMMITTER_NAME}"))
         .arg("-c")
         .arg(format!("user.email={COMMITTER_EMAIL}"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", null)
+        .env("GIT_CONFIG_SYSTEM", null)
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")

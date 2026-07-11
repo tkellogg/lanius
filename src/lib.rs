@@ -37,6 +37,7 @@ pub mod mcp;
 pub mod models;
 pub mod packages;
 pub mod paths;
+pub mod platform;
 pub mod pkgtool;
 pub mod profile;
 pub mod profilecli;

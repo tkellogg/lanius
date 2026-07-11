@@ -1568,14 +1568,9 @@ fn admin_dispatch(
             return Ok(match std::fs::metadata(&abs) {
                 Err(_) => (200, json!({ "ok": true, "exists": false, "path": abs_s })),
                 Ok(stat) => {
-                    // W_OK probe via libc::access — matches fs.accessSync(W_OK).
-                    let writable = {
-                        let c = std::ffi::CString::new(abs.as_os_str().as_encoded_bytes()).ok();
-                        match c {
-                            Some(c) => unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 },
-                            None => false,
-                        }
-                    };
+                    // Writability probe — matches fs.accessSync(W_OK). Unix uses
+                    // access(W_OK); Windows approximates via the read-only attr.
+                    let writable = crate::platform::is_writable(&abs);
                     (
                         200,
                         json!({

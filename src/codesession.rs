@@ -2692,13 +2692,7 @@ pub fn reap_orphans(root: &Root) -> Vec<String> {
 /// wrongly reaped (fail-safe toward keeping a live session, not toward
 /// dropping authority).
 fn pid_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    crate::platform::is_alive(pid)
 }
 
 /// Public liveness probe (same signal-0 semantics as `pid_alive`) for the

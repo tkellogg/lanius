@@ -13,7 +13,6 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr as _;
@@ -390,7 +389,7 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
             // daemon's descendants and the sandbox-exec wrapper would otherwise
             // outlive the "reload" (the actor was spawned with process_group(0),
             // so its pgid == its pid).
-            unsafe { libc::killpg(a.child.id() as i32, libc::SIGKILL) };
+            crate::platform::kill_group(a.child.id() as i32);
             let _ = a.child.wait();
             actors.strikes.remove(&name);
             actors.backoff_until.remove(&name);
@@ -488,8 +487,8 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
         // Own process group so a reload/stop can kill the whole tree, not just
         // the direct child (the sandbox-exec wrapper or a shell daemon's
         // descendants would otherwise survive) — same discipline as exec.rs.
-        cmd.process_group(0)
-            .current_dir(&pkg.dir)
+        crate::platform::set_process_group(&mut cmd);
+        cmd.current_dir(&pkg.dir)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err)
@@ -590,8 +589,8 @@ fn release_dead_leases(conn: &Connection) -> Result<()> {
         r
     };
     for (id, pid) in stale {
-        // Signal 0: existence probe, no effect on the process.
-        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        // Existence probe, no effect on the process (signal-0 on Unix).
+        let alive = crate::platform::is_alive(pid as i32);
         if !alive {
             conn.execute(
                 "UPDATE leases SET released_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",

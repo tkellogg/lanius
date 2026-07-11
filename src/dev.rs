@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
 extern "C" fn request_shutdown(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
@@ -312,6 +313,7 @@ pub fn serve(
     Ok(())
 }
 
+#[cfg(unix)]
 fn install_signal_handlers() {
     unsafe {
         libc::signal(
@@ -328,6 +330,13 @@ fn install_signal_handlers() {
         );
     }
 }
+
+// M1 Windows: no console-ctrl handler yet — Ctrl-C uses the default (terminate)
+// behavior, so `serve` does not run its graceful child-teardown path. Wiring
+// `SetConsoleCtrlHandler`/`ctrlc` to flip SHUTDOWN is M2 (docs/handoffs/
+// windows-support.md), alongside the Job-Object teardown it enables.
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
 
 #[derive(Clone)]
 struct CommandSpec {
@@ -777,48 +786,16 @@ fn signal_pids(pids: &[i32], signal: libc::c_int) {
     }
 }
 
-#[cfg(unix)]
 fn set_process_group(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    crate::platform::set_process_group(cmd);
 }
 
-#[cfg(not(unix))]
-fn set_process_group(_: &mut Command) {}
-
-#[cfg(unix)]
 fn terminate_child_group(child: &RunningChild) {
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGTERM);
-    }
+    crate::platform::terminate_group(child.id() as i32);
 }
 
-#[cfg(not(unix))]
-fn terminate_child_group(child: &RunningChild) {
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGTERM);
-    }
-}
-
-#[cfg(unix)]
 fn kill_child_group(child: &RunningChild) {
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_child_group(child: &RunningChild) {
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGKILL);
-    }
+    crate::platform::kill_group(child.id() as i32);
 }
 
 #[cfg(test)]

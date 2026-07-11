@@ -671,10 +671,9 @@ pub fn upsert_throttle(conn: &Connection, pat: &str, t: &ThrottleDecl) -> Result
 }
 
 fn make_executable(p: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(p)?.permissions();
-    perms.set_mode(perms.mode() | 0o755);
-    std::fs::set_permissions(p, perms)?;
+    // Unix: chmod +x. Windows: no-op (no exec bit; script run-ability is the
+    // M3 "require a POSIX shell" concern).
+    crate::platform::set_executable(p)?;
     Ok(())
 }
 

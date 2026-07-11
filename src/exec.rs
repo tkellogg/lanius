@@ -2451,7 +2451,6 @@ fn run_shell(
     timeout_secs: u64,
     workdir: Option<&std::path::Path>,
 ) -> String {
-    use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
     let mut c = cage.shell_command(cmd);
@@ -2463,7 +2462,7 @@ fn run_shell(
         .env_dual("DB", root.db())
         .env_dual("TRACE", root.trace_file());
     // Own process group so a timeout can kill the whole tree, not just sh.
-    c.process_group(0);
+    crate::platform::set_process_group(&mut c);
     let mut child = match c.spawn() {
         Ok(c) => c,
         Err(e) => return json!({ "error": format!("spawn failed: {e}") }).to_string(),
@@ -2491,9 +2490,7 @@ fn run_shell(
             Ok(Some(s)) => break Some(s),
             Ok(None) | Err(_) => {
                 if Instant::now() > deadline {
-                    unsafe {
-                        libc::killpg(pid, libc::SIGKILL);
-                    }
+                    crate::platform::kill_group(pid);
                     let _ = child.wait(); // reap; no zombies
                     break None;
                 }

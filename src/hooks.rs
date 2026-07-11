@@ -117,7 +117,6 @@ enum Invoked {
 }
 
 fn invoke(root: &Root, h: &HookRow, subject: &Value) -> Invoked {
-    use std::os::unix::process::CommandExt as _;
     let mut c = Command::new(root.dir.join(&h.run));
     c.current_dir(&root.dir)
         .stdin(Stdio::piped())
@@ -127,7 +126,7 @@ fn invoke(root: &Root, h: &HookRow, subject: &Value) -> Invoked {
         .env_dual("DB", root.db())
         .env_dual("TRACE", root.trace_file());
     // Own process group so a timeout kills the whole tree, like run_shell.
-    c.process_group(0);
+    crate::platform::set_process_group(&mut c);
     let mut child = match c.spawn() {
         Ok(c) => c,
         Err(e) => return Invoked::SpawnError(e.to_string()),
@@ -158,9 +157,7 @@ fn invoke(root: &Root, h: &HookRow, subject: &Value) -> Invoked {
             Ok(Some(s)) => break Some(s),
             Ok(None) | Err(_) => {
                 if Instant::now() > deadline {
-                    unsafe {
-                        libc::killpg(pid, libc::SIGKILL);
-                    }
+                    crate::platform::kill_group(pid);
                     let _ = child.wait();
                     break None;
                 }
