@@ -124,3 +124,17 @@ watchdog/reopen loop in `ui/web/src/live.ts`. Regression:
 ping keepalive, forces the first browser `/api/stream` response to close, then
 proves the UI opens a replacement stream and receives a live MQTT event through
 it.
+
+# Worker-surface investigation (run 2026-07-11)
+
+A read-only Playwright walkthrough of the live Claude Code/Codex surfaces
+confirmed that worker navigation defaults to Activity; Activity is a dense raw
+event tail; History was unreachable and gave an inaccurate daemon diagnosis;
+and Runs exposed real parent/child structure without human task identity. A
+focused Runs URL also left the selected detail below the complete ledger.
+
+The browser findings, runtime probes, data-plane map, and unresolved product
+questions live in
+[../bugs/worker-surfaces.md](../bugs/worker-surfaces.md). No regression was
+added: this investigation establishes the behavior and conceptual gaps, but a
+desired replacement experience has not been decided.

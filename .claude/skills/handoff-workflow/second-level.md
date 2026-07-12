@@ -29,6 +29,17 @@ than detailed instructions. Also, because they're so information-dense, they ten
 The catch is that weak models do indeed need things spelled out more than stronger ones. This is a learning
 experience!
 
+## Spikes
+Sometimes you can't do a full handoff yet, because you need information. Maybe it's debugging, or research. Whatever
+it is, launch a subagent that can process asynchronously. Launch it off first, while you deliberate with other 
+planning subagents or write files. In general, you should be aiming for keeping a lot of tasks in the air at once.
+
+
+## Durable task state
+Use `chainlink` (a CLI command) to document what's in each sprint, and which subagent is responsible for each.
+Then further break down the full set of tasks there. Have subagents comment within chainlinka to update statuses,
+blockers, etc.
+
 ## Model choice
 This is how I think about it (Tim)
 

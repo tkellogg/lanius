@@ -89,9 +89,11 @@ Model choice is a big deal; it is the main lever this skill exists to pull.
   **Fable is unparalleled at planning** but expensive: bank it for planning, and
   occasionally for verifying very hard or very critical work, when it's available.
   **Only trust Claude (or Fable) for planning.** Do not hand planning to GPT/GLM.
-- **Implementation (phase 3): a weaker/cheaper tier.** Opus on **medium**,
-  GPT-5.5 on **medium**, or GLM-5.2 on **medium/high**. GPT-5.5 is extremely smart
-  and pedantic — a strong implementer.
+- **Implementation (phase 3): a weaker/cheaper tier.** **Prefer Sonnet 5
+  (low–high effort) when possible — it's cheap and strong** (Tim, 2026-07-11).
+  Opus on **medium** for judgment-heavy impl, GPT-5.5 on **medium**, or GLM-5.2
+  on **medium/high**. GPT-5.5 is extremely smart and pedantic — a strong
+  implementer.
 - **Verification (phase 4): a stronger tier.** Opus on **high**, GPT-5.5 on
   **high/xhigh**. GPT-5.5's pedantry is an asset here. Fable for the hardest/most
   critical verifications when available.
@@ -104,20 +106,19 @@ Model choice is a big deal; it is the main lever this skill exists to pull.
 
 ## Dispatching the worker agents
 
-Two ways to get clean-context impl/verify agents; pick by whether you need a
-non-Claude model.
+Two ways to get clean-context impl/verify agents; pick by which model you need.
 
-- **Staying on Claude/Opus → the `Workflow` tool.** `agent()` with
+- **Staying native (you're claude, staying on claude, or codex and staying GPT) → Use native subagents or workflows** `agent()` with
   `{ model: 'opus', effort: 'medium' }` for impl and `{ effort: 'xhigh' }` for
   verify gives clean separate contexts, a structured-output schema for the
   verdict, and a natural place to code the fix loop. This is the default when the
   task fits Opus.
-- **Cross-model → `lanius code`.** Dispatch the underlying harness:
+- **Cross-harness → `lanius code`.** Dispatch the underlying harness:
   `lanius code codex "<task>"` (GPT-5.5), `lanius code opencode "<task>"`
   (GLM-5.2, via the configured provider), `lanius code claude --worker "<task>"`
   (Opus). Use `spawn`/`deliver` for async. Each worker is its own clean context.
 
-The orchestrator (you, as Claude) acts as **planner + conductor**: do phases 1–2
+The orchestrator (you, as Claude/GPT) acts as **planner + conductor**: do phases 1–2
 yourself, then dispatch 3 and 4 to workers and drive the fix loop. Review the diff
 and **commit yourself** — see discipline below.
 

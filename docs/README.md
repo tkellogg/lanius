@@ -8,7 +8,9 @@ that layer.
 
 - Product or UI language: read [layering.md](layering.md), then
   [journeys/README.md](journeys/README.md) for audience fit and
-  [ui-flows/README.md](ui-flows/README.md) for browser-flow assertions.
+  [ui-flows/README.md](ui-flows/README.md) for browser-flow assertions. For a
+  deep investigation of behavior that does not yet have a decided fix, start
+  at [bugs/README.md](bugs/README.md).
 - Bus, broker, topic routing, packages, recorder, hooks, or delivery contracts:
   read [bus.md](bus.md); read [topics.md](topics.md) when the topic grammar or
   mailbox shape matters.
@@ -68,6 +70,8 @@ that layer.
 - [journeys/](journeys/README.md) - personas and product journeys for setup,
   coding agents (Codex and Claude Code), costs, risk/trust, and configuration.
 - [ui-flows/](ui-flows/README.md) - executable web-flow catalog and QA findings.
+- [bugs/](bugs/README.md) - evidence-led behavioral investigations: what the
+  live product does, what the implementation means, and what remains unknown.
 - [handoffs/](handoffs/README.md) - forward-looking implementation handoffs
   (work plans with milestones and acceptance criteria): the coding-agents
   envelope (Codex & Claude Code) and the configuration-UX altitude/scope pass.

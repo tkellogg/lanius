@@ -58,6 +58,11 @@ statuses: planned | in-progress | verifying | done
   completeness (D4b), and in-band result visibility. Follow-on to
   [coding-agents.md](coding-agents.md). Backed by
   [../journeys/08-dispatching-a-worker.md](../journeys/08-dispatching-a-worker.md).
+- [coding-session-reliability.md](coding-session-reliability.md) - **planned**:
+  make `lanius code whose` evidence-based, make manual claim/unclaim normalization
+  consistent across all claim readers, shift conflicting dev ports by default with
+  `--fixed-ports`, and record the `.codex/skills` symlink invariant. Defers the
+  dev-supervisor lifecycle spike and async spawn model/effort controls.
 - [coding-agent-observability.md](coding-agent-observability.md) - the
   human-facing companion: materialize the obs/MQTT stream into sqlite, expose it
   via an API (server.mjs), and render the live session + nested subagent tree in
