@@ -13,6 +13,7 @@ All notable changes to lanius are documented here.
   repeat the flag for multiple names.
 
 ### Changed
+- worker-dm-unification: unify coding-session DMs into the chat plane (#4)
 
 - `Cargo.toml` now declares `rust-version = "1.88"`, so installing with an
   older toolchain fails with a clear "requires Rust 1.88" message instead of a
