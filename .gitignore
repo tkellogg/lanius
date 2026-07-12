@@ -21,3 +21,8 @@ ui/web/dist/
 # I like linking these instead
 CLAUDE.md
 !kits/stdlib/packages/kb-llm-strengths/kb/claude.md
+
+# Local orchestration state / per-machine tool config (`.codex/skills` is a
+# symlink into .claude/skills — git can't ignore by symlink-ness, so by name)
+/.chainlink/
+/.codex/
