@@ -22,6 +22,17 @@ returned in-core (comms-package M1 golden). The source-labeling fallbacks
 with the same TODO — they empty only as those sources become packages that stamp
 their own `payload.source` (Handoff C's seam), and adding a new channel must NOT
 add a branch to `source_for`.
+
+Worker DMs (worker-dm unification M1/M3): a coding session's exchange with the
+owner now threads as a first-class conversation instead of being DROPPED. It is
+folded from two broker-verified directions — owner→worker deliveries on
+`in/agent/<agent>/<session>` (attributed by topic segment + `code-deliver-*`
+correlation) and worker→owner sends on `in/human/<owner>` whose sender column is
+a coding session of this tool-noun — and carries the honest `"code"` source
+label. The former display-routing `is_worker_session` DROPs are gone;
+`is_worker_session` now survives only as a durable-kind FACT read (the `"code"`
+source label and the spoof guard that rejects a payload `session:` claim not
+matching its verified sender), never to segregate a thread out of chat.
 """
 import json
 import sqlite3
@@ -163,6 +174,20 @@ def is_worker_session(conn, session):
     return session.startswith(WORKER_PREFIX) and _valid_principal(session)
 
 
+def worker_session_noun(conn, session):
+    """The tool-noun (claude-code / codex) a coding session belongs to, from the
+    durable `code_sessions` record; None when the session has no record. Used to
+    scope a worker's DM thread to its tool-noun's converse bucket (worker-dm
+    unification M1). A durable-fact read, never display routing."""
+    try:
+        row = conn.execute(
+            "SELECT agent_noun FROM code_sessions WHERE elanus_session = ?", (session,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row is not None else None
+
+
 # ---- source labeling (ported from web.rs source_for) ------------------------
 
 def source_for(session, sender, payload, owner):
@@ -196,6 +221,24 @@ def source_for(session, sender, payload, owner):
     )
     cleaned = cleaned[:20]
     return cleaned if cleaned else "you"
+
+
+def worker_source(conn, payload, subject):
+    """Row source for a worker-DM fold (worker-dm unification M1/M3). Prefers the
+    stamped `payload.source` (the `"code"` emit path from `lanius code send` /
+    `record_send`); for legacy unstamped rows it falls back to the durable-kind
+    fact — a coding session ⇒ `"code"`. This is a fact read for the source
+    LABEL, never display routing: it decides how a row is BADGED, not whether it
+    is shown. Returns None when neither applies, so the caller falls back to its
+    normal `source_for` guess."""
+    claimed = payload.get("source")
+    if isinstance(claimed, str):
+        claimed = claimed.strip().lower()
+        if claimed:
+            return claimed
+    if is_worker_session(conn, subject):
+        return "code"
+    return None
 
 
 # ---- threading (ported from web.rs Conv / Convs) ----------------------------
@@ -307,18 +350,57 @@ def conversation_rows(conn, agent, owner):
     for row in inbound:
         payload = parse_payload(row["payload"])
         session = session_for_event(row)
-        # Worker (coding-run) sessions stay in the trace view, not chat.
-        if is_worker_session(conn, session):
-            continue
+        # A worker session on this exact-noun inbound topic (rare; owner/kernel
+        # authored, so its payload.session is trusted) is folded like any thread
+        # — it just carries the honest `"code"` source label instead of a
+        # spelling guess. No worker DROP remains here (worker-dm M3).
         if row["correlation_id"] is not None:
             corr_to_session[row["correlation_id"]] = session
-        source = source_for(session, row["sender"], payload, owner)
+        source = worker_source(conn, payload, session)
+        if source is None:
+            source = source_for(session, row["sender"], payload, owner)
         created = row["created_at"] or ""
         conv = convs.ensure(session, source, created)
         if conv["branched_from"] is None:
             bf = branch_row_summary(payload)
             if bf is not None:
                 conv["branched_from"] = bf
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str):
+            prompt = payload.get("text")
+        if isinstance(prompt, str):
+            convs.touch(session, "you", prompt, True, created)
+
+    # Owner → worker deliveries (worker-dm unification M1): a `lanius code
+    # deliver` / `/api/code/deliver` prompt lands on the worker's mailbox
+    # `in/agent/<agent>/<session>` — the EXTRA trailing segment the exact-noun
+    # inbound query above misses. The worker session is the trailing topic
+    # segment (a broker-addressed mailbox the owner delivered to — attribution
+    # by topic, NOT a payload claim), the correlation is `code-deliver-*`, and
+    # the payload carries the delivered prompt. Seed the worker conversation and
+    # fold the prompt as the owner's turn; the correlation join below threads the
+    # worker's correlated reply into the SAME conversation.
+    delivery_prefix = "in/agent/" + agent + "/"
+    deliveries = _rows(
+        conn,
+        "SELECT id, type, correlation_id, payload, state, sender, created_at "
+        "FROM events WHERE type LIKE ? ORDER BY id ASC LIMIT 5000",
+        (delivery_prefix + "%",),
+    )
+    for row in deliveries:
+        etype = row["type"] or ""
+        if not etype.startswith(delivery_prefix):
+            continue
+        session = etype[len(delivery_prefix):]
+        # Only the direct worker mailbox (one trailing segment); no deeper topic.
+        if session == "" or "/" in session:
+            continue
+        payload = parse_payload(row["payload"])
+        if row["correlation_id"] is not None:
+            corr_to_session[row["correlation_id"]] = session
+        created = row["created_at"] or ""
+        source = worker_source(conn, payload, session) or "code"
+        convs.ensure(session, source, created)
         prompt = payload.get("prompt")
         if not isinstance(prompt, str):
             prompt = payload.get("text")
@@ -344,12 +426,43 @@ def conversation_rows(conn, agent, owner):
         session = payload.get("session")
         if not isinstance(session, str):
             continue
-        if is_worker_session(conn, session):
+        # Attribution integrity (worker-dm M1 invariant): these rows are
+        # broker-verified as sent by the agent NOUN. A payload naming a DISTINCT
+        # worker principal (`code-*`, its own identity) the noun is not — is a
+        # spoof; a worker's own sends are attributed by the sender column in the
+        # worker-send pass below, NEVER by an agent-noun row's payload claim. A
+        # native run session (sender's own run) is still honored. (A durable-fact
+        # read to reject a forged claim, not display routing.)
+        if session != row["sender"] and is_worker_session(conn, session):
             continue
         source = source_for(session, row["sender"], payload, owner)
         created = row["created_at"] or ""
         convs.ensure(session, source, created)
         fold_human_payload(convs, session, payload, created)
+
+    # Worker → owner sends (worker-dm unification M1): an in/human/<owner> row
+    # whose BROKER-VERIFIED sender is a coding session belonging to THIS
+    # tool-noun. Attributed by the sender column (the worker speaks only as
+    # itself), never by payload.session — a forged `session:` claim from a
+    # non-worker sender is caught above and never reaches this pass. A reply
+    # correlated to a delivery is threaded by the correlation join below (its
+    # correlation is already in corr_to_session), so skip it here to avoid
+    # double-seeding; a bare ambient send threads on its own sender.
+    for row in ambient:
+        sender = row["sender"]
+        if sender is None:
+            continue
+        if not is_worker_session(conn, sender):
+            continue
+        if worker_session_noun(conn, sender) != agent:
+            continue
+        if row["correlation_id"] is not None and row["correlation_id"] in corr_to_session:
+            continue
+        payload = parse_payload(row["payload"])
+        created = row["created_at"] or ""
+        source = worker_source(conn, payload, sender) or "code"
+        convs.ensure(sender, source, created)
+        fold_human_payload(convs, sender, payload, created)
 
     # Correlation join: replies into a prompted thread.
     if corr_to_session:

@@ -3,12 +3,12 @@ import CodeSessions from './CodeSessions';
 import CommsView from './CommsView';
 import ProvidersView from './ProvidersView';
 import AgentAssistant, { ClientTool } from './components/AgentAssistant';
-import { adminGet, adminPost, adminPut, history, publish, status as fetchStatus, liveness as fetchLiveness } from './api';
+import { adminGet, adminPost, adminPut, codeDeliver, history, publish, status as fetchStatus, liveness as fetchLiveness } from './api';
 import { openLiveStream } from './live';
 import { IconButton } from './components/primitives';
 import { type Sel, type AgentTab, selToPath, pathToSel } from './routing';
 import { arr, csv, uid } from './lib/format';
-import { agentOf, newWebConversationId, conversationStorageKey, mergeConvMessages, sessionFromPayload, isWorkerAgentName, isWorkerSessionId, topicFilterMatches } from './lib/conversation';
+import { agentOf, newWebConversationId, conversationStorageKey, mergeConvMessages, sessionFromPayload, isWorkerAgentName, isWorkerSessionId, isWorkerSource, codingAgentNouns, topicFilterMatches } from './lib/conversation';
 import { declaredConfigParams, configRowMap, prunedSet, packageRepair } from './lib/packages';
 import { useSystemHealth, STALL_MS } from './lib/health';
 import Nav from './views/Nav';
@@ -548,8 +548,13 @@ export function App() {
 
   const agentNamesKey = [...agents.keys()].sort().join('|');
   useEffect(() => {
+    // worker-dm unification M2: load conversations for EVERY agent, coding
+    // tool-nouns (claude-code / codex) included. Worker DM threads surface in the
+    // same converse conversation list as native-agent DMs, distinguished by chip
+    // — Tim's ruling: converse pane, no silo. The projection returns [] for a noun
+    // with no worker DM traffic, so this is a no-op there.
     for (const name of agentNamesKey.split('|').filter(Boolean)) {
-      if (!isWorkerAgentName(name)) void loadConversations(name);
+      void loadConversations(name);
     }
   }, [agentNamesKey]);
 
@@ -1012,6 +1017,15 @@ export function App() {
         void loadConversation(agent, cur);
       }
       if (agent) void loadConversations(agent);
+      // worker-dm unification M2 liveness: a worker's own send carries a code-*
+      // worker session in its payload and threads under a coding tool-noun's
+      // converse bucket — NOT the `agent` resolved above (which falls back to the
+      // current selection). Refresh the coding nouns so the worker DM thread
+      // appears/updates live even when the open view isn't that noun. Cheap: the
+      // projection returns [] for a noun with no worker traffic.
+      if (typeof p.session === 'string' && isWorkerSessionId(p.session)) {
+        for (const noun of codingAgentNouns) void loadConversations(noun);
+      }
       return;
     }
     if (topic.startsWith('in/agent/')) {
@@ -1192,6 +1206,25 @@ export function App() {
     corrSession.current.set(corr, session);
     addConv(agent, { key: `live:${corr}:you:${text}`, who: 'you', cls: 'you', text, corr, ts: new Date().toISOString() });
     input.value = '';
+    // worker-dm unification M2: a coding-session DM thread routes the compose into
+    // the worker's inbox via the deliver path, not the native-agent publish. The
+    // decision is DATA-DRIVEN — the open conversation row's honest `source` token
+    // the projection returned (`"code"`) — never a client-side re-derivation of
+    // worker-ness from the session id. The deliver path is owner-as-requester and
+    // routes NO completion reply, so there is no pending machine to arm here: the
+    // worker's answer arrives as its own in/human send over SSE (M0/M1).
+    const openRow = (conversations.get(agent)?.list ?? []).find((c: any) => c.session === session);
+    if (isWorkerSource(openRow?.source)) {
+      const btn = e.currentTarget.querySelector('#compose-send') as HTMLButtonElement;
+      const d = await codeDeliver(session, text);
+      const delivered = d.ok !== false && d.delivered === true;
+      void loadConversations(agent);
+      if (!delivered) addNoPath(agent, corr);
+      btn.textContent = delivered ? 'delivered ✓' : 'failed ✕';
+      btn.classList.toggle('sent', delivered);
+      setTimeout(() => { btn.textContent = '➤'; btn.classList.remove('sent'); }, 1400);
+      return;
+    }
     // chat-liveness M3 (wonky bit 4): don't send into a known void. If no broker
     // is reachable, or the LLM path is world c (nothing that can answer), skip the
     // fake optimism — the message stays visible and an honest in-thread line names
@@ -1346,6 +1379,7 @@ export function App() {
             startBranch={startBranch}
             branchOrigin={sel.kind === 'agent' ? branchOrigins.get(currentConversation(sel.agent)) : undefined}
             selectCodeSessions={selectCodeSessions}
+            selectCodeSession={selectCodeSession}
             isTraceAgent={sel.kind === 'agent' && (isWorkerAgentName(sel.agent) || [...(agents.get(sel.agent)?.sessions ?? [])].some((s) => isWorkerSessionId(s)))}
             workerSessions={sel.kind === 'agent' ? (isWorkerSessionId(sel.agent) ? [sel.agent] : [...(agents.get(sel.agent)?.sessions ?? [])].filter((s: string) => isWorkerSessionId(s))) : []}
             owner={systemStatus?.owner}
@@ -1393,7 +1427,7 @@ export function App() {
             includeIsDefault={includeIsDefault}
             approvePackage={approvePackage}
           />
-          {sel.kind === 'code-sessions' && <CodeSessions focus={sel.focus} />}
+          {sel.kind === 'code-sessions' && <CodeSessions focus={sel.focus} onOpenConversation={(noun: string, session: string) => openConversation(noun, session)} />}
           {sel.kind === 'comms' && <CommsView onSelectSession={selectCodeSession} />}
           {sel.kind === 'providers' && <ProvidersView />}
           <SetupView

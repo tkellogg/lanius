@@ -55,6 +55,11 @@ inbox as an argument — it is derived, so you can only ever act as yourself).
   wants a worker to keep in view (it becomes that session's `note` block).
   Empty text clears it.
 
+- **`lanius code send "<message>" [--corr <id>]`** — speak to the human
+  owner non-blockingly. The message goes to the owner's chat (the web converse
+  pane); identity is derived from your environment, so you can only speak as
+  yourself. Use `--corr` to thread a reply onto a delivery's correlation.
+
 You see waiting mail *without* asking: each turn an `inbox` block reports the
 unseen count and a preview of the latest. Treat it as a notification — run
 `lanius code inbox` to actually read and act.
@@ -91,6 +96,9 @@ same turn, use `agent run`.
 Talking to the human is the same primitive as talking to a peer — *send a
 message to a channel* — and it has exactly two verbs, separated only by
 whether you **block**:
+
+From a CODING session, the equivalent of `send_message` is `lanius code send`;
+`ask_human` has no coding-session equivalent yet.
 
 - **`send_message`** — speak **unprompted** and **keep working**. It writes a
   message to the human's mailbox (`in/human/<owner>` by default) and returns

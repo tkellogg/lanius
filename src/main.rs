@@ -357,6 +357,8 @@ enum Cmd {
     /// `lanius code claude --resume <native_session>`; there is no `resume` verb.)
     /// `deliver <worker-session> "<message>"` (run from inside a session) dispatches
     /// work to a worker and records the running session as the requester (M4-B);
+    /// `send "<message>" [--corr <id>]` (run from inside a session) sends a
+    /// non-blocking message to the human owner's chat as the running session;
     /// `spawn <tool> "<task>"` (run from inside a session) starts a worker
     /// detached and delivers its completion back to the spawner's mailbox;
     /// `inbox` (run from inside a session) reads ITS OWN inbox (M3, own-inbox-only by
@@ -1683,6 +1685,35 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     let message = rest.get(1..).unwrap_or(&[]).join(" ");
                     codeagent::deliver(&root, worker, &message)?;
+                }
+                "send" => {
+                    // A coding session sends a non-blocking message to the human
+                    // owner's chat. Identity comes from LANIUS_CODE_SESSION, never
+                    // an argument, so a session can only speak as itself.
+                    let mut corr: Option<String> = None;
+                    let mut words: Vec<String> = Vec::new();
+                    let mut i = 0;
+                    while i < rest.len() {
+                        match rest[i].as_str() {
+                            "--corr" => {
+                                i += 1;
+                                let value = rest.get(i).map(String::as_str).unwrap_or("").trim();
+                                if value.is_empty() {
+                                    anyhow::bail!(
+                                        "usage: lanius code send \"<message>\" [--corr <id>]"
+                                    );
+                                }
+                                corr = Some(value.to_string());
+                            }
+                            other => words.push(other.to_string()),
+                        }
+                        i += 1;
+                    }
+                    let message = words.join(" ");
+                    if message.trim().is_empty() {
+                        anyhow::bail!("usage: lanius code send \"<message>\" [--corr <id>]");
+                    }
+                    codeagent::send(&root, &message, corr.as_deref())?;
                 }
                 "spawn" => {
                     // A planner creates a new worker in the background. The child

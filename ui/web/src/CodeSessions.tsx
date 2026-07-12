@@ -518,7 +518,7 @@ function BlockCard({
   );
 }
 
-export default function CodeSessions({ focus }: { focus?: string } = {}) {
+export default function CodeSessions({ focus, onOpenConversation }: { focus?: string; onOpenConversation?: (noun: string, session: string) => void } = {}) {
   const [backfill, setBackfill] = useState<Stat[]>([]);
   const [livePatches, setLivePatches] = useState<Map<string, LivePatch>>(new Map());
   const [error, setError] = useState('');
@@ -739,6 +739,18 @@ export default function CodeSessions({ focus }: { focus?: string } = {}) {
               accepted/failed verdict. */}
           <div className="cs-sub">
             <WorkerNoteCompose session={ds.elanus_session} id="cs-deliver" />
+            {/* worker-dm unification M2: cross-link into this worker's DM thread in
+                the converse pane (the human-facing exchange; this panel is the
+                trace). One link each way — the chat header links back here. */}
+            {onOpenConversation && ds.agent_noun && (
+              <button
+                className="cs-btn"
+                data-sel="cs-open-chat"
+                onClick={() => onOpenConversation(ds.agent_noun!, ds.elanus_session)}
+              >
+                open chat thread ⟶
+              </button>
+            )}
           </div>
 
           {/* Interactive-resume hint: a managed relaunch with the tool's own

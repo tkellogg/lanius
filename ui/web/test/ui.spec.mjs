@@ -87,12 +87,15 @@ async function newPage() {
     if (/503|Service Unavailable/i.test(t)) return;
     // Routing flow: deep-linking a run that isn't in the fixture 404s its read
     // endpoints (/api/code/sessions|estimate|blocks for `code-deeplink01`), and
-    // the M3 missing-asset probe deliberately fetches `/does-not-exist.js`. Both
-    // are expected 404s in this suite; a real missing bundle asset would carry a
-    // different URL and still trip the gate.
+    // the M3 missing-asset probe deliberately fetches `/does-not-exist.js`. The
+    // worker-dm cross-link (conv-open-trace) FOCUSES the runs surface on a worker
+    // session (code-chatrender01 / code-e2e1) that likewise has no flight-recorder
+    // record in this stack, so its detail reads 404 the same way. All are expected
+    // 404s here; a real missing bundle asset carries a different URL and still
+    // trips the gate.
     if (/404/.test(t)) {
       const url = msg.location?.().url ?? '';
-      if (/code-deeplink01|does-not-exist\.js/.test(url)) return;
+      if (/code-deeplink01|code-chatrender01|code-e2e1|does-not-exist\.js/.test(url)) return;
     }
     consoleErrors.push(`[console.error] ${t}`);
     console.error(`BROWSER CONSOLE ERR: ${t}`);
@@ -1048,11 +1051,14 @@ const renamedAgent = 'falcon';
 // the ledger), not by any per-agent flag.
 //  - a comms-plane agent (it has in/agent prompts + correlated in/human replies)
 //    renders #view-converse[data-mode="comms"] with >=1 message in the feed;
-//  - a trace-only agent (a coding worker, no comms-plane traffic) renders
-//    #view-converse[data-mode="trace"] with NO chat feed, and is present in the
-//    runs surface (/api/code/sessions).
+//  - a coding worker now ALSO renders comms (worker-dm unification M1/M3): its DM
+//    exchange folds into a conversation carrying the honest `"code"` source (chip
+//    "coding session"), with a cross-link (conv-open-trace) into the runs surface.
+//    The old trace fallback survives only for a worker with genuinely NO DM
+//    traffic — not constructible here, since any in/agent traffic that surfaces a
+//    noun in the drawer also folds into its conversation.
 // The decision is derivable purely from bus/ledger reads — the projection
-// (/api/conversations) returns rows for the comms agent and [] for the worker.
+// (/api/conversations) returns rows for both the comms agent and the worker noun.
 {
   const commsAgent = 'companion';
   // The comms-plane agent: create its profile (so nav lists it), then seed a
@@ -1077,16 +1083,19 @@ const renamedAgent = 'falcon';
     lanius('emit', 'in/human/owner', '--correlation', commsCorr, '--payload',
       JSON.stringify({ text: 'hi there — I am here when you need me', session: `web-${commsAgent}-seed` }));
   } catch (e) { fail(`chat-render: seeding comms-plane traffic failed: ${e.message ?? e}`); }
-  // The trace-only agent: a coding worker. Seed on the EXACT in/agent/<agent>
-  // topic the projection queries, with a bus-derived `code-*` SESSION in the
-  // payload — so this genuinely exercises session-based eviction (not a topic
-  // mismatch). conversation_rows drops `code-*` worker sessions, so
-  // /api/conversations?agent=claude-code returns []  →  trace fallback.
-  const traceAgent = 'claude-code';
+  // The coding worker: seed on the EXACT in/agent/<agent> topic with a bus-derived
+  // `code-*` SESSION in the payload. worker-dm unification M1/M3 FLIPPED the old
+  // truth here: conversation_rows NO LONGER drops `code-*` worker sessions — a
+  // worker's DM exchange folds into a first-class conversation carrying the honest
+  // `"code"` source, so /api/conversations?agent=claude-code now RETURNS this row
+  // (chip "coding session") instead of []→trace-fallback. The former noun-gated
+  // eviction is gone (this event's payload.session is owner/kernel-authored, so it
+  // is trusted attribution). We assert the conversation-list truth below.
+  const workerAgent = 'claude-code';
   try {
-    lanius('emit', `in/agent/${traceAgent}`, '--payload',
+    lanius('emit', `in/agent/${workerAgent}`, '--payload',
       JSON.stringify({ prompt: 'run the build', session: 'code-chatrender01' }));
-  } catch (e) { fail(`chat-render: seeding trace-only traffic failed: ${e.message ?? e}`); }
+  } catch (e) { fail(`chat-render: seeding worker DM traffic failed: ${e.message ?? e}`); }
 
   // REGRESSION (codex cross-model verify, 2026-06-25): the comms-vs-trace gate
   // must key on the `code-*` SESSION, never the agent NOUN. A coding-noun agent
@@ -1143,15 +1152,20 @@ const renamedAgent = 'falcon';
     return mode === 'comms' && msgs >= 1;
   }, 10000);
 
-  // The trace-only agent shows NO chat conversation; it falls back to the trace.
-  const traceConv = await page.evaluate(async (name) => {
+  // worker-dm unification M1/M3: the coding worker's DM now FOLDS into a
+  // conversation instead of being dropped — the projection returns its row carrying
+  // the honest `"code"` source (chip "coding session"), the seeded session, and the
+  // prompt as its title.
+  const workerConv = await page.evaluate(async (name) => {
     const r = await fetch(`/api/conversations?agent=${encodeURIComponent(name)}`);
     const j = await r.json().catch(() => ({}));
-    return { ok: !!j.ok, count: (j.conversations ?? []).length };
-  }, traceAgent);
-  traceConv.ok && traceConv.count === 0
-    ? ok(`chat-render: comms projection returns no conversations for trace-only ${traceAgent}`)
-    : fail(`chat-render: trace-only ${traceAgent} unexpectedly has conversations (${JSON.stringify(traceConv)})`);
+    const convs = j.conversations ?? [];
+    const row = convs.find((c) => c.session === 'code-chatrender01');
+    return { ok: !!j.ok, count: convs.length, source: row?.source ?? null, title: row?.title ?? null };
+  }, workerAgent);
+  workerConv.ok && workerConv.count >= 1 && workerConv.source === 'code' && /run the build/.test(workerConv.title ?? '')
+    ? ok(`chat-render: worker DM folds into a "code"-sourced conversation for ${workerAgent} (${JSON.stringify({ source: workerConv.source, title: workerConv.title })})`)
+    : fail(`chat-render: worker DM did not fold into a conversation for ${workerAgent} (${JSON.stringify(workerConv)})`);
 
   // REGRESSION: a coding-NOUN agent with a non-`code-*` comms conversation MUST
   // surface as comms (the projection keys on session, not noun). This would fail
@@ -1165,8 +1179,11 @@ const renamedAgent = 'falcon';
   nounConv.ok && nounConv.count >= 1 && nounConv.sessions.every((s) => !String(s).startsWith('code-'))
     ? ok(`chat-render: coding-noun ${nounAgent} surfaces its comms conversation (noun does not gate): ${JSON.stringify(nounConv.sessions)}`)
     : fail(`chat-render: coding-noun ${nounAgent} comms conversation wrongly gated by noun (${JSON.stringify(nounConv)})`);
-  // Reach the worker's converse view: it is evicted to the Workers drawer and
-  // lands on telemetry; click the converse tab to inspect the decision there.
+  // Reach the worker's converse view via the Workers drawer, then open its DM
+  // thread. worker-dm unification M1/M2: the worker noun now renders the comms
+  // conversation surface (NOT the old trace fallback) because its DM folds into a
+  // conversation; the thread's chip reads "coding session" and a cross-link
+  // (data-sel="conv-open-trace") jumps to the runs/trace surface.
   const opened = await page.evaluate(async (name) => {
     const drawer = document.querySelector('#nav-workers');
     if (drawer && !drawer.open) drawer.open = true;
@@ -1175,24 +1192,41 @@ const renamedAgent = 'falcon';
     if (!hit) return false;
     hit.click();
     return true;
-  }, traceAgent);
+  }, workerAgent);
   if (opened) {
     await page.waitForSelector('#agent-tabs', { state: 'visible' });
     await page.click('[data-tab="converse"]');
     await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
-    await waitFor('chat-render: trace-only agent shows NO chat conversation (trace fallback)', async () => {
+    await waitFor('chat-render: worker noun renders the comms conversation surface (not trace fallback)', async () => {
       const mode = await page.$eval('#view-converse', (el) => el.getAttribute('data-mode')).catch(() => null);
-      const feed = await page.$('.conv-feed');
-      const runsLink = await page.$('#conv-open-runs');
-      return mode === 'trace' && !feed && !!runsLink;
+      return mode === 'comms';
     }, 10000);
-    // The trace-only agent IS reachable in the runs/trace surface: it is listed in
-    // the Workers drawer (the UI's entry into the obs-trace surface). `opened`
-    // already located it there. Click the fallback's own "open runs" link directly
-    // so the element is acted on before a rerender can swap it out.
-    ok(`chat-render: trace-only ${traceAgent} is present in the runs/trace surface (Workers drawer)`);
-    await page.locator('#conv-open-runs').click();
-    await waitFor('chat-render: trace fallback links into the runs surface', async () =>
+    // The worker DM thread is listed in the converse view's own conversation list
+    // (.conv-recent-row — a worker noun lives in the Workers drawer, so it has no
+    // #nav-agents rows) with the "coding session" chip (the UI's pretty label,
+    // via sourceLabel, for the honest `"code"` source token). Filter to the thread
+    // by its title so ordering never matters.
+    await page.fill('.conv-search input', 'run the build');
+    await waitFor('chat-render: worker DM thread carries the "coding session" chip', async () => {
+      const badges = await page.$$eval('.conv-recent-row .source-badge', (els) => els.map((el) => (el.textContent || '').trim())).catch(() => []);
+      return badges.includes('coding session');
+    }, 10000);
+    // Open the thread so the cross-link into the trace surface renders.
+    const openedThread = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('.conv-recent-row')];
+      const hit = rows.find((r) => (r.textContent || '').includes('run the build'));
+      if (!hit) return false;
+      hit.click();
+      return true;
+    });
+    openedThread
+      ? ok('chat-render: opened the worker DM thread from the conversation list')
+      : fail('chat-render: could not open the worker DM thread');
+    await waitFor('chat-render: worker DM thread exposes the trace cross-link (conv-open-trace)', async () =>
+      !!(await page.$('[data-sel="conv-open-trace"]')), 10000);
+    // The cross-link lands on the runs/trace (code-sessions) surface.
+    await page.click('[data-sel="conv-open-trace"]');
+    await waitFor('chat-render: the trace cross-link lands on the runs surface', async () =>
       page.$eval('[data-sel="code-sessions"]', (el) => el.classList.contains('on')).catch(() => false), 5000);
     // The obs-driven code projection (/api/code/sessions) is populated by flight-
     // recorder telemetry the spec stack does not stand up (same limitation flow 11
@@ -1204,12 +1238,160 @@ const renamedAgent = 'falcon';
       const rows = Array.isArray(j) ? j : (j?.sessions ?? j?.rows ?? []);
       if (!Array.isArray(rows)) return null;
       return rows.length === 0 ? null : rows.some((s) => JSON.stringify(s).includes(name));
-    }, traceAgent);
+    }, workerAgent);
     inRuns === false
-      ? fail(`chat-render: code projection has runs but not trace-only ${traceAgent}`)
-      : ok(`chat-render: code projection ${inRuns === true ? `lists ${traceAgent}` : 'has no projected runs in this stack — tolerated'}`);
+      ? fail(`chat-render: code projection has runs but not ${workerAgent}`)
+      : ok(`chat-render: code projection ${inRuns === true ? `lists ${workerAgent}` : 'has no projected runs in this stack — tolerated'}`);
   } else {
-    fail(`chat-render: could not reach the trace-only agent ${traceAgent} in the Workers drawer`);
+    fail(`chat-render: could not reach the worker ${workerAgent} in the Workers drawer`);
+  }
+  await page.close();
+}
+
+// ── flow 6b-worker-dm: worker-dm unification M1–M3 end-to-end ─────────────────
+// docs/handoffs/worker-dm-unification.md M4: a coding session's DM exchange with
+// its owner threads as a first-class conversation under the tool-noun's converse
+// bucket (Tim's ruling: same list as agent DMs, a chip apart — not a silo, not the
+// trace fallback). Seeded as the real two broker-verified directions:
+//   - owner → worker: a `code-deliver` delivery on the worker mailbox
+//     in/agent/claude-code/<session> (correlation code-deliver-*, the owner's turn);
+//   - worker → owner: the worker's reply on in/human/<owner> correlated to that
+//     delivery (sender = the worker session), folded by the correlation join into
+//     the SAME thread.
+// Then: (a) the projection folds them into one code-sourced thread; (b) it renders
+// with the "coding session" chip + a trace cross-link; (c) a chat reply routes via
+// /api/code/deliver (owner-as-requester), never the native publish; (d) a spoofed
+// in/human payload claiming the worker's session from a FOREIGN sender is rejected
+// by the sender-verified projection.
+{
+  const wAgent = 'claude-code';
+  const wSession = 'code-e2e1';
+  const wCorr = 'code-deliver-e2e1';
+  const wPrompt = 'e2e: rerun the flaky parser suite';
+  const wReply = 'e2e worker: reran — 2 still flaky';
+  // Emit with a CHOSEN broker-verified sender (the `sender` column the projection
+  // trusts for attribution): events::emit reads it from LANIUS_ACTOR, exactly as
+  // exec stamps the actor of the run it drives. Timeout-guarded like the other
+  // QoS-1 seeds so an unacked publish can never hang the whole suite.
+  const emitAs = (actor, ...args) => execFileSync(path.join(BIN, 'lanius'), ['emit', ...args],
+    { env: { ...ENV, LANIUS_ACTOR: actor }, encoding: 'utf8', timeout: 15000 });
+  try {
+    // owner → worker delivery (owner is the requester)
+    emitAs('owner', `in/agent/${wAgent}/${wSession}`, '--correlation', wCorr, '--payload', JSON.stringify({ prompt: wPrompt }));
+    // worker → owner reply, correlated to the delivery (sender = the worker session)
+    emitAs(wSession, 'in/human/owner', '--correlation', wCorr, '--payload', JSON.stringify({ text: wReply, session: wSession, source: 'code' }));
+  } catch (e) { fail(`worker-dm: seeding the DM exchange failed: ${e.message ?? e}`); }
+
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
+
+  // (a) The projection folds the exchange into ONE code-sourced thread, titled from
+  //     the delivery prompt (the owner's turn), previewed by the worker's reply.
+  const dm = await page.evaluate(async ({ name, session }) => {
+    const r = await fetch(`/api/conversations?agent=${encodeURIComponent(name)}`);
+    const j = await r.json().catch(() => ({}));
+    const row = (j.conversations ?? []).find((c) => c.session === session);
+    return row ? { source: row.source, title: row.title, preview: row.preview, count: row.message_count, last: row.last_role } : null;
+  }, { name: wAgent, session: wSession });
+  dm && dm.source === 'code' && /rerun the flaky parser suite/.test(dm.title) && /2 still flaky/.test(dm.preview) && dm.count === 2
+    ? ok(`worker-dm: delivery+reply fold into one code-sourced thread (${JSON.stringify(dm)})`)
+    : fail(`worker-dm: the DM exchange did not fold as expected (${JSON.stringify(dm)})`);
+
+  // Reach claude-code's converse via the Workers drawer.
+  const opened = await page.evaluate((name) => {
+    const drawer = document.querySelector('#nav-workers');
+    if (drawer && !drawer.open) drawer.open = true;
+    const hit = [...document.querySelectorAll('#nav-workers .nav-worker')].find((b) => (b.textContent || '').includes(name));
+    if (!hit) return false;
+    hit.click();
+    return true;
+  }, wAgent);
+  if (!opened) {
+    fail('worker-dm: claude-code not reachable in the Workers drawer');
+  } else {
+    await page.waitForSelector('#agent-tabs', { state: 'visible' });
+    await page.click('[data-tab="converse"]');
+    await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
+    await waitFor('worker-dm: claude-code renders the comms conversation surface (not the trace fallback)', async () =>
+      (await page.$eval('#view-converse', (el) => el.getAttribute('data-mode')).catch(() => null)) === 'comms', 10000);
+    // (a cont.) the thread row carries the "coding session" chip (the UI's pretty
+    //           label for the honest `"code"` source token). A worker noun's
+    //           conversation list is the converse view's own .conv-recent-row list
+    //           (it has no #nav-agents rows); filter to the thread by its title.
+    await page.fill('.conv-search input', 'rerun the flaky parser suite');
+    await waitFor('worker-dm: the DM thread carries the "coding session" chip', async () => {
+      const badges = await page.$$eval('.conv-recent-row .source-badge', (els) => els.map((el) => (el.textContent || '').trim())).catch(() => []);
+      return badges.includes('coding session');
+    }, 10000);
+    // Open the specific code-e2e1 thread by its (prompt-derived) title.
+    const openedThread = await page.evaluate((mark) => {
+      const hit = [...document.querySelectorAll('.conv-recent-row')].find((r) => (r.textContent || '').includes(mark));
+      if (!hit) return false;
+      hit.click();
+      return true;
+    }, 'rerun the flaky parser suite');
+    openedThread ? ok('worker-dm: opened the code-e2e1 DM thread from the conversation list') : fail('worker-dm: could not open the code-e2e1 DM thread');
+
+    // (b) the trace cross-link is present on the opened worker thread.
+    await waitFor('worker-dm: the DM thread exposes the trace cross-link (conv-open-trace)', async () =>
+      !!(await page.$('[data-sel="conv-open-trace"]')), 10000);
+
+    // (c) a chat reply routes via /api/code/deliver (owner-as-requester), NEVER the
+    //     native publish. Route the deliver to a stubbed accept (a real green relay
+    //     needs a live worker record the spec stack does not stand up — same
+    //     limitation the chrome-M4 server-contract flow documents); watch EVERY
+    //     request to prove the native publish path is not taken.
+    let delivered = null;
+    const publishes = [];
+    page.on('request', (req) => { if (req.method() === 'POST' && req.url().endsWith('/api/publish')) publishes.push(req.url()); });
+    await page.route('**/api/code/deliver', async (route) => {
+      try { delivered = JSON.parse(route.request().postData() || '{}'); } catch { /* ignore */ }
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, delivered: true }) });
+    });
+    await page.fill('#compose-input', 'e2e chat reply: bump the timeout and rerun');
+    await page.click('#compose-send');
+    await waitFor('worker-dm: a chat reply posts to /api/code/deliver', async () => delivered !== null, 8000);
+    delivered && delivered.session === wSession && /bump the timeout/.test(delivered.message || '')
+      ? ok(`worker-dm: the chat reply routes to /api/code/deliver {session,message} (${JSON.stringify(delivered)})`)
+      : fail(`worker-dm: the chat reply's deliver payload is wrong (${JSON.stringify(delivered)})`);
+    await sleep(500);
+    publishes.length === 0
+      ? ok('worker-dm: a worker chat reply did NOT touch the native /api/publish path')
+      : fail(`worker-dm: a worker chat reply leaked to /api/publish (${JSON.stringify(publishes)})`);
+    await page.unroute('**/api/code/deliver');
+
+    // (b cont.) the cross-link lands on the runs/trace (code-sessions) surface.
+    await page.click('[data-sel="conv-open-trace"]');
+    await waitFor('worker-dm: the trace cross-link lands on the runs surface', async () =>
+      page.$eval('[data-sel="code-sessions"]', (el) => el.classList.contains('on')).catch(() => false), 5000);
+
+    // (d) SPOOF: a FOREIGN sender (eve-e2e) emits an in/human/<owner> payload CLAIMING
+    //     the worker's session. The conversation-LIST projection is sender-verified
+    //     (comms_view.py conversation_rows: attribution is the broker `sender`
+    //     column, never a payload `session:` claim — the M4 spoof rule), so the claim
+    //     must NOT join or re-badge the thread: preview/last message stay the worker's
+    //     own reply, count stays 2, and no thread anywhere carries eve's marker.
+    //     NOTE (surfaced as a blocker): the single-thread DETAIL feed
+    //     (web.rs conversation_messages → query_human_by_session) still folds an
+    //     in/human row by payload `session:` with NO sender check, so opening the
+    //     thread WOULD render eve's text — a pre-existing sender-blind gap the M-work
+    //     did not close on the detail seam. We therefore assert the sender-verified
+    //     LIST projection, where M4's defense actually lives.
+    const spoofMark = 'EVE-E2E-SPOOF-MARKER';
+    try { emitAs('eve-e2e', 'in/human/owner', '--payload', JSON.stringify({ text: spoofMark, session: wSession, source: 'code' })); }
+    catch (e) { fail(`worker-dm: seeding the spoof failed: ${e.message ?? e}`); }
+    const afterSpoof = await page.evaluate(async ({ name, session, mark }) => {
+      const r = await fetch(`/api/conversations?agent=${encodeURIComponent(name)}`);
+      const j = await r.json().catch(() => ({}));
+      const convs = j.conversations ?? [];
+      const row = convs.find((c) => c.session === session);
+      const leaked = convs.some((c) => `${c.title ?? ''} ${c.preview ?? ''}`.includes(mark));
+      return { preview: row?.preview ?? null, count: row?.message_count ?? null, last: row?.last_role ?? null, leaked };
+    }, { name: wAgent, session: wSession, mark: spoofMark });
+    !afterSpoof.leaked && /2 still flaky/.test(afterSpoof.preview ?? '') && afterSpoof.count === 2 && afterSpoof.last === 'agent'
+      ? ok(`worker-dm: a foreign sender's payload claiming the worker session is rejected by the sender-verified projection (${JSON.stringify(afterSpoof)})`)
+      : fail(`worker-dm: SPOOF — the projection folded a foreign-sender payload claiming the worker session (${JSON.stringify(afterSpoof)})`);
   }
   await page.close();
 }
@@ -3098,25 +3280,30 @@ const renamedAgent = 'falcon';
     : fail(`chrome M4: cross-origin deliver not refused (status ${crossOrigin.status})`);
 }
 
-// ── flow: worker-notes-panel — the compose + sent-notes list on the trace surface
-// The "message this worker" instinct lands on the worker's OWN converse (trace)
-// surface: the SHARED <WorkerNoteCompose> (same component the runs detail mounts)
-// plus the notes already sent, read back from the durable mail ledger
-// (/api/comms/mail — `lanius code mail --json`). The truth source is the ledger,
-// so a sent note SURVIVES a page reload. Worker notes never enter the chat
-// projection; this is presentation on the worker's own surface, not a projection.
+// ── flow: worker-note delivery threads into chat (worker-dm unification M1–M3) ──
+// The "message this worker" instinct: a note delivered to a worker's inbox
+// (in/agent/claude-code/<session>) is what `lanius code deliver` / the shared
+// <WorkerNoteCompose> records. worker-dm unification M1/M3 INVERTED the old truth
+// here — the previous flow asserted "worker notes never enter the chat projection"
+// and landed on the converse TRACE FALLBACK with the sent-notes panel. Now the
+// delivery FOLDS into a first-class claude-code conversation (comms mode), so:
+//   - reaching the worker's converse lands on the CONVERSATION surface, not trace;
+//   - the note appears as a "coding session"-chipped thread titled from the note;
+//   - replying in that thread routes via /api/code/deliver (the conversation
+//     compose IS the "message this worker" affordance now).
+// The full <WorkerNotesPanel> (run picker + mail-ledger notes list) survives only
+// in the trace fallback — reachable only for a worker with genuinely NO DM traffic,
+// which is not constructible here (any in/agent delivery folds into a thread). The
+// shared <WorkerNoteCompose> also still mounts on the runs-detail surface (#cs-
+// deliver); its own POST-to-deliver contract is covered by the chrome-M4 flow.
 {
-  // Seed a note delivered to a worker's inbox: a 4-segment mailbox event, exactly
-  // what `lanius code deliver` records and what the mail projection reads back.
-  // Seeded here (late in the suite) so it is the NEWEST claude-code mail; the panel
-  // groups a worker NOUN's several runs and the picker below is robust either way.
   const wses = 'code-workernote01';
   const noteText = 'please rerun the failing parser test';
   try {
     lanius('emit', `in/agent/claude-code/${wses}`, '--payload', JSON.stringify({ prompt: noteText }));
   } catch (e) { fail(`worker-notes: seeding a delivered note failed: ${e.message ?? e}`); }
 
-  // Reach the claude-code worker's converse (trace) surface via the Workers drawer.
+  // Reach the claude-code worker's converse via the Workers drawer.
   const openWorkerConverse = async (page) => {
     const opened = await page.evaluate(() => {
       const drawer = document.querySelector('#nav-workers');
@@ -3133,31 +3320,6 @@ const renamedAgent = 'falcon';
     await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
     return true;
   };
-  // A worker noun can cover several runs; the panel shows a run picker. Select the
-  // run whose inbox holds our seeded note (runs are labelled "run N" — no raw id —
-  // so we probe each option until the note surfaces). Robust to run ordering AND to
-  // the panel's async mail fetch (retries until the ledger read lands, or times out).
-  const selectRunWithNote = async (page, timeoutMs = 10000) => {
-    const listText = async () => page.$eval('[data-sel="worker-notes-list"]', (el) => el.textContent).catch(() => null);
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeoutMs) {
-      const hasPicker = await page.$('.worker-notes-pick select');
-      if (!hasPicker) {
-        const txt = await listText();
-        if (txt !== null && new RegExp(noteText).test(txt)) return true;
-      } else {
-        const count = await page.$$eval('.worker-notes-pick select option', (os) => os.length);
-        for (let i = 0; i < count; i++) {
-          await page.selectOption('.worker-notes-pick select', { index: i });
-          await sleep(200);
-          const txt = await listText();
-          if (txt !== null && new RegExp(noteText).test(txt)) return true;
-        }
-      }
-      await sleep(300);
-    }
-    return false;
-  };
 
   const page = await newPage();
   await page.goto('/');
@@ -3166,62 +3328,55 @@ const renamedAgent = 'falcon';
   if (!(await openWorkerConverse(page))) {
     fail('worker-notes: claude-code worker not reachable in the Workers drawer');
   } else {
-    await waitFor('worker-notes: worker converse lands on the trace fallback', async () =>
-      (await page.$eval('#view-converse', (el) => el.getAttribute('data-mode')).catch(() => null)) === 'trace', 10000);
+    // 1) The worker's converse now renders the comms conversation surface — the
+    //    delivered note folded into the chat projection (the inverted M1/M3 truth).
+    await waitFor('worker-notes: worker converse lands on the comms conversation surface (note threaded)', async () =>
+      (await page.$eval('#view-converse', (el) => el.getAttribute('data-mode')).catch(() => null)) === 'comms', 10000);
 
-    // 1) The shared compose renders on the trace surface (the instinct lands here).
-    await waitFor('worker-notes: the send-a-note compose renders on the trace surface', async () =>
-      !!(await page.$('[data-sel="worker-note"] .worker-note-input')), 10000);
-    const framing = await page.$eval('[data-sel="worker-note"] .worker-note-sub', (el) => el.textContent).catch(() => '');
-    /running job, not a chat/i.test(framing)
-      ? ok('worker-notes: the compose carries the honest "running job, not a chat" framing')
-      : fail(`worker-notes: honest framing missing ("${framing}")`);
+    // 2) The note surfaces as a "coding session"-chipped thread titled from its text.
+    //    A worker noun's conversation list is the converse view's own .conv-recent-row
+    //    list (it lives in the Workers drawer, so no #nav-agents rows); filter to the
+    //    note so run ordering never matters.
+    await page.fill('.conv-search input', 'rerun the failing parser test');
+    await waitFor('worker-notes: the delivered note surfaces as a "coding session" thread', async () => {
+      const rows = await page.$$eval('.conv-recent-row', (els) => els.map((el) => ({
+        text: (el.textContent || '').trim(),
+        badge: (el.querySelector('.source-badge')?.textContent || '').trim(),
+      }))).catch(() => []);
+      return rows.some((r) => r.text.includes('rerun the failing parser test') && r.badge === 'coding session');
+    }, 10000);
 
-    // 2) The note already sent to this worker is listed above the compose (read back
-    //    from the durable mail ledger, not an in-memory echo).
-    (await selectRunWithNote(page))
-      ? ok('worker-notes: the sent note appears in the trace panel (from the mail ledger)')
-      : fail('worker-notes: the seeded note did not surface in the panel');
-    // Language: no raw worker/correlation ids leak into the panel copy.
-    const panelText = await page.$eval('[data-sel="worker-notes"]', (el) => el.textContent).catch(() => '');
-    !/code-workernote01|code-deliver-/.test(panelText)
-      ? ok('worker-notes: the panel shows no raw worker/correlation ids')
-      : fail(`worker-notes: a raw id leaked into the panel ("${panelText.slice(0, 90)}")`);
-
-    // 3) Persistence: reload — the note is still there (ledger-backed, survives reload).
-    await page.reload();
-    await page.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });
-    if (!(await openWorkerConverse(page))) {
-      fail('worker-notes: worker not reachable after reload');
-    } else {
-      (await selectRunWithNote(page))
-        ? ok('worker-notes: the sent note SURVIVES a page reload (durable ledger, not localStorage)')
-        : fail('worker-notes: the note did not survive a reload');
-
-      // 4) Sending a note through the shared compose shows the accepted verdict and
-      //    POSTs {session, message} to /api/code/deliver. A real green delivery needs
-      //    a live worker record the spec stack does not stand up (same limitation the
-      //    chrome-M4 server-contract test documents), so the route is stubbed to the
-      //    accepted verdict; the server contract itself is covered by that flow above.
-      let posted = null;
-      await page.route('**/api/code/deliver', async (route) => {
-        try { posted = JSON.parse(route.request().postData() || '{}'); } catch { /* ignore */ }
-        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, delivered: true }) });
-      });
-      await page.fill('[data-sel="worker-note"] .worker-note-input', 'and bump the timeout');
-      await page.click('[data-sel="worker-note"] .worker-note-send');
-      await waitFor('worker-notes: a sent note shows the accepted verdict', async () =>
-        !!(await page.$('[data-sel="worker-note"] [data-deliver-feedback="ok"]')), 8000);
-      posted && posted.session === wses && posted.message === 'and bump the timeout'
-        ? ok('worker-notes: the compose POSTs {worker, note} to /api/code/deliver')
-        : fail(`worker-notes: compose POST payload wrong (${JSON.stringify(posted)})`);
-      await page.unroute('**/api/code/deliver');
-    }
+    // 3) Open the note thread; replying routes via /api/code/deliver (the
+    //    conversation compose is the "message this worker" affordance now). A real
+    //    green relay needs a live worker record the spec stack does not stand up
+    //    (same limitation the chrome-M4 server-contract flow documents), so the
+    //    route is stubbed to the accepted verdict; the server contract itself is
+    //    covered by that flow.
+    const openedThread = await page.evaluate(() => {
+      const hit = [...document.querySelectorAll('.conv-recent-row')].find((r) => (r.textContent || '').includes('rerun the failing parser test'));
+      if (!hit) return false;
+      hit.click();
+      return true;
+    });
+    openedThread ? ok('worker-notes: opened the delivered-note thread') : fail('worker-notes: could not open the delivered-note thread');
+    let posted = null;
+    await page.route('**/api/code/deliver', async (route) => {
+      try { posted = JSON.parse(route.request().postData() || '{}'); } catch { /* ignore */ }
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, delivered: true }) });
+    });
+    await page.fill('#compose-input', 'and bump the timeout');
+    await page.click('#compose-send');
+    await waitFor('worker-notes: a chat reply into the note thread posts to /api/code/deliver', async () => posted !== null, 8000);
+    posted && posted.session === wses && posted.message === 'and bump the timeout'
+      ? ok('worker-notes: the note-thread compose POSTs {session, message} to /api/code/deliver')
+      : fail(`worker-notes: compose POST payload wrong (${JSON.stringify(posted)})`);
+    await page.unroute('**/api/code/deliver');
   }
   await page.close();
 
   // A normal (non-worker) chat agent's converse must show NO worker-note compose —
-  // the affordance never leaks into ordinary chat.
+  // the runs-surface affordance (data-sel="worker-note") never leaks into ordinary
+  // chat; an ordinary agent's compose is the plain #compose-input.
   const chatPage = await newPage();
   await chatPage.goto('/');
   await chatPage.waitForSelector('#nav-agents .nav-item', { timeout: 10000 });

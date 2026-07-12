@@ -2579,12 +2579,15 @@ fn open_ro(db: &FsPath) -> Result<rusqlite::Connection> {
 /// text or null) to match the JS that treated them as untyped.
 struct EventRow {
     id: i64,
+    type_: Option<String>,
     correlation_id: Option<String>,
     payload: Option<String>,
     created_at: Option<String>,
-    // (the `sender` column moved with the conversation-list projection into the
-    // comms package — the surviving in-core conversation-detail readers don't use
-    // it; the package reads broker-verified sender for its introspection.)
+    // Broker-verified sender (column 5 of the shared 7-column SELECT below) —
+    // the detail feed's spoof guard mirrors comms_view.py's: a payload
+    // `session` claim is honored only when it's not a worker, or the
+    // broker-verified sender IS that worker.
+    sender: Option<String>,
 }
 
 fn col_string(row: &rusqlite::Row, idx: usize) -> Option<String> {
@@ -2600,9 +2603,11 @@ fn col_string(row: &rusqlite::Row, idx: usize) -> Option<String> {
 fn map_event(row: &rusqlite::Row) -> rusqlite::Result<EventRow> {
     Ok(EventRow {
         id: row.get::<_, i64>(0)?,
+        type_: col_string(row, 1),
         correlation_id: col_string(row, 2),
         payload: col_string(row, 3),
         created_at: col_string(row, 6),
+        sender: col_string(row, 5),
     })
 }
 
@@ -2823,6 +2828,58 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
         }
     }
 
+    // Owner → worker deliveries (worker-dm unification M5): a `lanius code
+    // deliver` prompt lands on topic `in/agent/<agent>/<session>` — the EXTRA
+    // trailing segment the in/agent query above (payload-session or
+    // correlation match) misses, since the delivery payload carries no
+    // `payload.session`. Attribution here is by TOPIC (a broker-addressed
+    // mailbox the owner delivered to), not a payload claim. Mirrors
+    // comms_view.py:374-408. Gated on is_worker_session so native/evt threads
+    // are untouched. Runs before the corr-join below so a correlated reply
+    // that omits payload.session still threads via that join.
+    if crate::codesession::is_worker_session(&conn, session) {
+        let mut stmt = conn.prepare(
+            "SELECT id, type, correlation_id, payload, state, sender, created_at FROM events WHERE type LIKE 'in/agent/%/%' ORDER BY id ASC LIMIT 4000",
+        )?;
+        let delivery_rows: Vec<EventRow> = stmt
+            .query_map([], map_event)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for row in &delivery_rows {
+            let Some(etype) = &row.type_ else { continue };
+            let Some(rest) = etype.strip_prefix("in/agent/") else { continue };
+            let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() != 2 || parts[1] != session {
+                continue;
+            }
+            if let Some(c) = &row.correlation_id {
+                if !corrs.contains(c) {
+                    corrs.push(c.clone());
+                }
+            }
+            let payload = parse_payload(&row.payload);
+            if let Some(text) = payload
+                .get("prompt")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("text").and_then(Value::as_str))
+            {
+                add_message(
+                    &mut messages,
+                    &mut seen,
+                    json!({
+                        "id": format!("e-{}", row.id),
+                        "type": "msg",
+                        "who": "you",
+                        "cls": "you",
+                        "text": text,
+                        "corr": row.correlation_id,
+                        "ts": row.created_at,
+                        "event_id": row.id,
+                    }),
+                );
+            }
+        }
+    }
+
     if !corrs.is_empty() {
         let human_rows = query_human_by_corr(&conn, &corrs, 4000)?;
         for row in &human_rows {
@@ -2840,6 +2897,15 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
     if !is_evt {
         let ambient = query_human_by_session(&conn, session, 4000)?;
         for row in &ambient {
+            // Spoof guard mirroring comms_view.py:436 — a payload `session`
+            // claim is honored only when the claimed session is not a worker,
+            // or the broker-verified sender IS that worker (a worker speaks
+            // only as itself).
+            if crate::codesession::is_worker_session(&conn, session)
+                && row.sender.as_deref() != Some(session)
+            {
+                continue;
+            }
             push_human_feed_message(&mut messages, &mut seen, row);
         }
     }
@@ -3201,6 +3267,74 @@ mod ambient_tests {
                     && m["cls"].as_str() == Some("agent")
             ),
             "the ambient send renders as an agent turn in the feed ({feed:?})"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // docs/handoffs/worker-dm-unification.md M5 — the single-thread DETAIL feed
+    // (conversation_messages) must apply the SAME sender-verified spoof guard
+    // the list projection (comms_view.py:436) already applies, and must also
+    // fold the owner's delivery prompt (`in/agent/<agent>/<session>`) into the
+    // opened worker thread. A row on the owner mailbox claiming
+    // `"session":"code-e2e5"` is honored only when its broker-verified sender
+    // IS that worker session.
+    #[test]
+    fn worker_thread_sender_verified_and_delivery_folded() {
+        let dir = std::env::temp_dir().join(format!("el-workerdm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        let conn = crate::db::open(&root).unwrap();
+        crate::db::init_schema(&conn).unwrap();
+        let owner = "owner";
+        let session = "code-e2e5";
+        let mailbox = crate::topic::human_mailbox(owner);
+
+        // Owner → worker delivery: lands on the worker's mailbox topic, not
+        // the owner's — the trailing topic segment IS the worker session.
+        insert_event(
+            &conn,
+            "in/agent/claude-code/code-e2e5",
+            Some("code-deliver-e2e5"),
+            json!({ "prompt": "owner-prompt-marker" }),
+            Some(owner),
+            "2026-07-11T09:00:00.000Z",
+        );
+
+        // The worker's genuine reply: broker-verified sender IS the worker.
+        insert_event(
+            &conn,
+            &mailbox,
+            Some("code-deliver-e2e5"),
+            json!({ "text": "worker-reply-marker", "session": session, "source": "code" }),
+            Some(session),
+            "2026-07-11T09:00:01.000Z",
+        );
+
+        // A spoof: some OTHER sender claims the worker's session in payload.
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
+            json!({ "text": "spoof-marker", "session": session }),
+            Some("eve"),
+            "2026-07-11T09:00:02.000Z",
+        );
+
+        let feed = conversation_messages(session, &root.db()).unwrap();
+        let feed = feed.as_array().unwrap();
+
+        assert!(
+            feed.iter().any(|m| m["text"].as_str() == Some("worker-reply-marker")),
+            "the worker's genuine reply renders in its own thread ({feed:?})"
+        );
+        assert!(
+            feed.iter().any(|m| m["text"].as_str() == Some("owner-prompt-marker")),
+            "the owner's delivery prompt folds into the opened worker thread ({feed:?})"
+        );
+        assert!(
+            !feed.iter().any(|m| m["text"].as_str() == Some("spoof-marker")),
+            "a non-worker sender's claimed-session payload does not spoof into the worker thread ({feed:?})"
         );
 
         std::fs::remove_dir_all(&dir).ok();

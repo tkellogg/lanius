@@ -7,9 +7,20 @@ export const conversationStorageKey = (agent: string) => `lanius.currentConversa
 // `claude` is only a CLI alias, never a bus agent — keep it out so a real agent a
 // user names `claude` isn't evicted to Workers. The `code-*` session id (see
 // isWorkerSessionId) is the reliable per-run fallback.
-const codingAgentNames = new Set(['claude-code', 'codex']);
+export const codingAgentNouns = ['claude-code', 'codex'] as const;
+const codingAgentNames = new Set<string>(codingAgentNouns);
 export const isWorkerAgentName = (name: string) => codingAgentNames.has(String(name ?? '').toLowerCase());
 export const isWorkerSessionId = (session: string) => /^code-[A-Za-z0-9_-]+/.test(String(session ?? ''));
+
+// Presentational source-token → chip label (worker-dm unification M2). The
+// projection stamps a machine token — `"code"` for a coding-session DM thread —
+// and the UI owns the pretty label. This is a LABEL LOOKUP ONLY: it must never
+// grow a behavioral branch. Routing/behavior keys on the raw token directly
+// (`source === 'code'`), never on this map. An unknown token falls through to
+// itself, so an honest source name always shows.
+const sourceLabels: Record<string, string> = { code: 'coding session' };
+export const sourceLabel = (token: string) => sourceLabels[String(token ?? '')] ?? String(token ?? '');
+export const isWorkerSource = (source: unknown) => source === 'code';
 export const sessionFromPayload = (payload: any, env: any) => payload?.session || (env?.correlation_id ? `evt-${env.correlation_id}` : env?.id ? `evt-${env.id}` : '');
 // Content-identity for a conversation message, IDENTICAL to convKey in
 // server.mjs. The same logical message arrives both as a live bus event (keyed

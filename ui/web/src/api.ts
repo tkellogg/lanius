@@ -45,6 +45,19 @@ export function publish(topic: string, payload: unknown, correlation?: string): 
   }).then((r) => r.ok === true).catch(() => false);
 }
 
+// worker-dm unification M2: relay a chat reply in a coding-session DM thread
+// into the worker's inbox via the deliver path (owner-as-requester; routes NO
+// completion reply — the worker answers via its own in/human send). Mirrors the
+// WorkerNoteCompose POST, so a worker-thread compose and a runs-panel note hit
+// the same server seam. Returns the relay's honest verdict ({ delivered, error }).
+export function codeDeliver(session: string, message: string): Promise<ApiResult> {
+  return json<ApiResult>('/api/code/deliver', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ session, message }),
+  }).catch(() => ({ ok: false, delivered: false, error: 'server unreachable' }));
+}
+
 export async function history(params: Record<string, string | number | undefined>): Promise<ApiResult | null> {
   try {
     const qs = new URLSearchParams();

@@ -4,8 +4,9 @@ import AgentChip from '../components/AgentChip';
 import WorkerNotesPanel from '../components/WorkerNotesPanel';
 import { IconButton } from '../components/primitives';
 import { relativeTime, summarize } from '../lib/format';
+import { sourceLabel, isWorkerSource } from '../lib/conversation';
 
-function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, selectSetup, pending, retryPending, openConversation, newConversation, startBranch, branchOrigin, selectCodeSessions, isTraceAgent, workerSessions, owner, sendLabel, allowHtml }: any) {
+function ConverseView({ hidden, agent, messages, conversations, current, submitCompose, answerAsk, selectAgent, selectSetup, pending, retryPending, openConversation, newConversation, startBranch, branchOrigin, selectCodeSessions, selectCodeSession, isTraceAgent, workerSessions, owner, sendLabel, allowHtml }: any) {
   const [conversationSearch, setConversationSearch] = useState('');
   // chat-follow M1: "pinned" is derived from scroll position, never a suppress
   // flag (docs/handoffs/chat-follow.md wonky bit 2) — a programmatic scroll-to-
@@ -33,6 +34,12 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
   const lastMessageId = messages.length ? messages[messages.length - 1].id : null;
   useEffect(() => { if (pinned) scrollToBottom(); }, [lastMessageId, pinned]);
   const allConversations = conversations?.list ?? [];
+  // worker-dm unification M2: is the OPEN conversation a coding-session DM thread?
+  // Read from the projection's honest `source` token on the current row — the
+  // same data that routes the compose (App.submitCompose) — never a client-side
+  // session-id heuristic. Drives the cross-link into the trace/runs surface.
+  const currentRow = allConversations.find((c: any) => c.session === current);
+  const isWorkerThread = isWorkerSource(currentRow?.source);
   const query = conversationSearch.trim().toLowerCase();
   const resultConversations = query
     ? allConversations.filter((c: any) => [c.title, c.preview, c.session, c.source].some((v) => String(v ?? '').toLowerCase().includes(query)))
@@ -95,6 +102,12 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
         <span>Tune {agent} anytime in configure.</span>
         <IconButton id="conv-new" label={`new conversation with ${agent}`} className="ghost cfg-icon-btn" onClick={() => newConversation(agent)}>＋</IconButton>
         <button type="button" className="ghost conv-settings-link" onClick={() => selectAgent(agent, 'configure')}>settings</button>
+        {/* worker-dm unification M2: a coding-session DM thread cross-links to its
+            trace/runs view (the tool calls, edits, sub-workers live there, not in
+            this chat). One link each way; the runs detail links back to chat. */}
+        {isWorkerThread && current && selectCodeSession && (
+          <button type="button" className="ghost conv-trace-link" data-sel="conv-open-trace" onClick={() => selectCodeSession(current)}>open trace ⟶</button>
+        )}
       </div>
       <div id="conv-recent" className="conv-recent">
         <label className="conv-search">
@@ -110,7 +123,7 @@ function ConverseView({ hidden, agent, messages, conversations, current, submitC
                   <button key={c.session} className={`conv-recent-row${c.session === current ? ' on' : ''}`} title={c.session} type="button" onClick={() => openConversation(agent, c.session)}>
                     <span>{c.title || c.preview || 'conversation'}</span>
                     {c.branched_from && <span className="conv-branched-sub" data-sel="conv-branched">branched from: {c.branched_from.preview || 'an earlier message'}</span>}
-                    <em><span className="source-badge">{c.source || 'you'}</span>{relativeTime(c.last_ts)}</em>
+                    <em><span className="source-badge">{sourceLabel(c.source || 'you')}</span>{relativeTime(c.last_ts)}</em>
                   </button>
                 ))}
         </div>

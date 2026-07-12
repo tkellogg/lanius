@@ -131,6 +131,7 @@ Use this cheatsheet when you need another coding worker:
   (bare `lanius code <tool>` opens the interactive TUI; `--worker` = deprecated alias for `--headless`)
 - Async spawn: `lanius code spawn <tool> "<task>"`
 - Async deliver to an existing worker: `lanius code deliver <worker> "<msg>"`
+- Message your human: `lanius code send "<message>" [--corr <id>]`
 - Check your own mailbox: `lanius code inbox`
 
 For async `spawn` or `deliver`, end your turn after dispatch. Do not poll, sleep,
@@ -334,6 +335,7 @@ Authority-narrowing flags (M4 — strip before tool, enforced at mint):
 
 Commands:
   lanius code deliver <worker-session> \"<message>\"  dispatch work to a worker session
+  lanius code send \"<message>\" [--corr <id>]         message your human owner's chat
   lanius code spawn <tool> \"<task>\"                  start a worker in the background
   lanius code inbox [--all] [--json]                  show this session's inbox
   lanius code resume <lanius-session> \"<message>\"    resume a recorded session
@@ -898,6 +900,63 @@ pub fn record_delivery_priority(
     )
     .context("recording the delivery on the ledger")?;
     Ok((id, correlation))
+}
+
+// ── The send tool: a coding session messages its human owner (worker-DM M0) ──
+
+/// `lanius code send "<message>" [--corr <id>]` — send a non-blocking message to
+/// the human owner's chat as THIS coding session.
+///
+/// The running session identity is derived only from `LANIUS_CODE_SESSION`, the
+/// env the launcher set. A session can only speak as itself. This is a kernel
+/// ledger write like `deliver`: it does NOT use or widen the session bus token.
+pub fn send(root: &Root, message: &str, corr: Option<&str>) -> Result<()> {
+    // Deferred per docs/handoffs/worker-dm-unification.md M0: a future
+    // `lanius code ask-human` (distinct from sibling `lanius code ask`) would
+    // block on the answer, but needs checkpoint-and-exit suspend machinery.
+    let sender = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
+    let Some(sender) = sender else {
+        bail!(
+            "lanius code send must run inside a coding session \
+             (no {ENV_SESSION} in the environment — a session can only speak as \
+             itself when launched by `lanius code`)"
+        );
+    };
+    let id = record_send(root, &sender, message, corr)?;
+    eprintln!("[code] sent message to owner (event {id}, from {sender})");
+    println!("message sent to the owner; it will appear in the web chat.");
+    Ok(())
+}
+
+/// Build and record a worker→owner message with `sender` as the recorded session.
+/// Env-free core of `send`, so tests can verify the ledger row directly.
+pub fn record_send(root: &Root, sender: &str, message: &str, corr: Option<&str>) -> Result<i64> {
+    let message = message.trim();
+    if message.is_empty() {
+        bail!("a send message must not be empty");
+    }
+    let sender = sender.to_string();
+    let owner = crate::secrets::owner_name(root);
+    let mailbox = topic::human_mailbox(&owner);
+    let payload = json!({
+        "text": message,
+        "session": sender,
+        "source": "code",
+    });
+    let conn = crate::db::open(root).context("opening the ledger to record the message")?;
+    crate::db::init_schema(&conn)?;
+    let id = crate::events::emit(
+        root,
+        &conn,
+        crate::events::EmitOpts {
+            payload: Some(payload),
+            correlation: corr.map(str::to_string),
+            sender: Some(sender),
+            ..crate::events::EmitOpts::new(&mailbox)
+        },
+    )
+    .context("recording the message on the ledger")?;
+    Ok(id)
 }
 
 // ── The spawn tool: create a worker and route completion back (D3) ───────────
@@ -12155,8 +12214,8 @@ mod tests {
         .unwrap();
     }
 
-    /// Read back the most recent event a `record_delivery` emitted (id, type,
-    /// sender, payload, correlation, state).
+    /// Read back the most recent event a `record_delivery`/`record_send` emitted
+    /// (id, type, sender, payload, correlation, state).
     fn read_event(root: &Root, id: i64) -> (String, String, String, String, String) {
         let conn = crate::db::open(root).unwrap();
         conn.query_row(
@@ -12243,6 +12302,55 @@ mod tests {
         assert_eq!(sender, "code-planner-unrec");
         let pv: Value = serde_json::from_str(&payload).unwrap();
         assert!(pv.get("reply_to").is_none(), "no reply_to without a record");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn send_records_owner_mailbox_message_with_session_sender_and_payload_stamp() {
+        let root = delivery_tmp_root();
+        let id = record_send(&root, "code-sender1", "  hello owner  ", None).unwrap();
+        let (etype, sender, payload, _corr, _state) = read_event(&root, id);
+
+        assert_eq!(etype, "in/human/owner");
+        assert_eq!(sender, "code-sender1");
+        let pv: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["text"], "hello owner");
+        assert_eq!(pv["session"], "code-sender1");
+        assert_eq!(pv["source"], "code");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn send_rejects_empty_message() {
+        let root = delivery_tmp_root();
+        let err = record_send(&root, "code-sender1", "   ", None).unwrap_err();
+        assert!(format!("{err:#}").contains("must not be empty"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn send_carries_correlation_when_given() {
+        let root = delivery_tmp_root();
+        let id = record_send(
+            &root,
+            "code-sender1",
+            "replying on the thread",
+            Some("code-deliver-abc"),
+        )
+        .unwrap();
+        let (_etype, _sender, _payload, corr, _state) = read_event(&root, id);
+
+        assert_eq!(corr, "code-deliver-abc");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn send_omits_correlation_when_not_given() {
+        let root = delivery_tmp_root();
+        let id = record_send(&root, "code-sender1", "new thread", None).unwrap();
+        let (_etype, _sender, _payload, corr, _state) = read_event(&root, id);
+
+        assert!(corr.is_empty());
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
