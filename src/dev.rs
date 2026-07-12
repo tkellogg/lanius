@@ -16,7 +16,7 @@ extern "C" fn request_shutdown(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
-pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -> Result<()> {
+pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, fixed_ports: bool) -> Result<()> {
     install_signal_handlers();
 
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -38,34 +38,19 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
         dir: dev_dir.canonicalize().unwrap_or(dev_dir),
     };
 
-    // The dev bus lives on its OWN port (never the prod default 1883), written into
-    // the dev root's bus.toml each run so the dev daemon binds it and the dev web
-    // connects to it. --shift-ports walks it up if a second dev stack holds it.
-    let bus_port = if shift_ports {
-        first_free_port(11883)
-    } else {
-        11883
-    };
+    // Port selection. BY DEFAULT `dev` probes upward for the first free web relay,
+    // Vite, and dev-bus ports so a second `lanius dev` just works; --fixed-ports
+    // binds the exact requested values and lets a conflict fail normally. The dev
+    // bus lives on its OWN port (never the prod default 1883), written into the dev
+    // root's bus.toml each run so the dev daemon binds it and the dev web connects
+    // to it. The banner prints the resolved values either way.
+    let (req_web, req_vite, req_bus) = (web_port, vite_port, 11883_u16);
+    let (web_port, vite_port, bus_port) = select_ports(req_web, req_vite, req_bus, fixed_ports);
     std::fs::write(
         root.bus_file(),
         format!("enabled = true\nbind = \"127.0.0.1:{bus_port}\"\n"),
     )
     .context("writing the dev bus config")?;
-
-    // --shift-ports also walks the web relay + Vite ports if the defaults (7180 /
-    // 5173) are busy, rather than failing to bind. The banner prints the resolved
-    // pair either way.
-    let (req_web, req_vite) = (web_port, vite_port);
-    let (web_port, vite_port) = if shift_ports {
-        let w = first_free_port(web_port);
-        let mut v = first_free_port(vite_port);
-        if v == w {
-            v = first_free_port(w.saturating_add(1));
-        }
-        (w, v)
-    } else {
-        (web_port, vite_port)
-    };
 
     let web_dir = repo.join("ui/web");
     let cargo = std::env::var_os("CARGO")
@@ -139,12 +124,18 @@ pub fn run(interval_ms: u64, web_port: u16, vite_port: u16, shift_ports: bool) -
         root.dir.display()
     ));
     log.line(format!("[dev] log={}", log_path.display()));
-    log.line(format!(
-        "[dev] bus: 127.0.0.1:{bus_port}   (dev broker — separate from prod's 1883)"
-    ));
-    if shift_ports && (web_port != req_web || vite_port != req_vite) {
+    if bus_port != req_bus {
         log.line(format!(
-            "[dev] ports shifted off a conflict (you asked for web={req_web} vite={req_vite})"
+            "[dev] bus: 127.0.0.1:{bus_port}   (dev broker — separate from prod's 1883; shifted off requested {req_bus})"
+        ));
+    } else {
+        log.line(format!(
+            "[dev] bus: 127.0.0.1:{bus_port}   (dev broker — separate from prod's 1883)"
+        ));
+    }
+    if web_port != req_web || vite_port != req_vite {
+        log.line(format!(
+            "[dev] ports shifted off a conflict (you asked for web={req_web} vite={req_vite}; using web={web_port} vite={vite_port})"
         ));
     }
     log.line(format!(
@@ -593,8 +584,31 @@ fn prepend_path(dir: &Path) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("PATH contains non-UTF-8 data"))
 }
 
+/// Decide the web-relay, Vite, and dev-bus ports for a `dev` run. By default
+/// (`fixed == false`) each requested value is probed upward for the first free
+/// port via `first_free_port`, and Vite is nudged off the web port if the probes
+/// collide (they can, since the two ranges overlap). With `fixed == true` the
+/// requested values are returned verbatim so a real conflict fails at bind time.
+///
+/// This is the pure port-SELECTION decision, factored out so it is unit-testable
+/// without launching the supervisor. It inherits `first_free_port`'s TOCTOU limit:
+/// each probe listener is dropped before the service rebinds, so this reduces —
+/// but does not eliminate — dev port conflicts; it is not a race-free reservation.
+fn select_ports(req_web: u16, req_vite: u16, req_bus: u16, fixed: bool) -> (u16, u16, u16) {
+    if fixed {
+        return (req_web, req_vite, req_bus);
+    }
+    let web = first_free_port(req_web);
+    let mut vite = first_free_port(req_vite);
+    if vite == web {
+        vite = first_free_port(web.saturating_add(1));
+    }
+    let bus = first_free_port(req_bus);
+    (web, vite, bus)
+}
+
 /// Probe upward from `start` for a TCP port that binds on 127.0.0.1, returning the
-/// first free one (for `lanius dev --shift-ports`). The probe listener is dropped
+/// first free one (used by `select_ports` for default dev port shifting). The probe listener is dropped
 /// immediately, so there is a tiny TOCTOU window before the service rebinds — fine
 /// for a dev convenience. Falls back to `start` if the whole window is busy, so the
 /// service surfaces the real "address in use" error rather than this masking it.
@@ -809,9 +823,65 @@ fn kill_child_group(child: &RunningChild) {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_free_port, wait_for_port, Log};
+    use super::{first_free_port, select_ports, wait_for_port, Log};
     use std::net::TcpListener;
     use std::time::Duration;
+
+    // Bind an ephemeral loopback port and hand back (listener, port). Holding the
+    // listener keeps the port occupied so select_ports must probe past it.
+    fn held_port() -> (TcpListener, u16) {
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        (l, port)
+    }
+
+    #[test]
+    fn select_ports_default_shifts_web_and_vite_off_held_ports() {
+        let (_web_hold, req_web) = held_port();
+        let (_vite_hold, req_vite) = held_port();
+        let (_bus_hold, req_bus) = held_port();
+        let (web, vite, bus) = select_ports(req_web, req_vite, req_bus, false);
+        assert_ne!(web, req_web, "web must move off the held port");
+        assert_ne!(vite, req_vite, "vite must move off the held port");
+        assert_ne!(bus, req_bus, "dev-bus must move off the held port");
+    }
+
+    #[test]
+    fn select_ports_default_shifts_dev_bus_off_a_held_port() {
+        // Isolate the dev-bus probe: only the bus's requested port is occupied.
+        let (_bus_hold, req_bus) = held_port();
+        let (free_probe, free_a) = held_port();
+        let (free_probe2, free_b) = held_port();
+        drop(free_probe);
+        drop(free_probe2); // web/vite requests are free, so they should not move
+        let (web, vite, bus) = select_ports(free_a, free_b, req_bus, false);
+        assert_ne!(bus, req_bus, "dev-bus must shift off the held 11883-analog");
+        assert_eq!(web, free_a, "a free web request stays put");
+        assert_eq!(vite, free_b, "a free vite request stays put");
+    }
+
+    #[test]
+    fn select_ports_fixed_returns_requested_without_probing() {
+        // Even with the requested ports occupied, fixed mode hands them back as-is
+        // so the real bind conflict surfaces normally.
+        let (_web_hold, req_web) = held_port();
+        let (_vite_hold, req_vite) = held_port();
+        let (_bus_hold, req_bus) = held_port();
+        assert_eq!(
+            select_ports(req_web, req_vite, req_bus, true),
+            (req_web, req_vite, req_bus)
+        );
+    }
+
+    #[test]
+    fn select_ports_web_and_vite_never_collide() {
+        // Requesting the SAME starting port for web and vite must still yield a
+        // distinct pair (the collision-avoidance nudge).
+        let (probe, port) = held_port();
+        drop(probe); // free it so both probes would otherwise land here
+        let (web, vite, _bus) = select_ports(port, port, port, false);
+        assert_ne!(web, vite, "web and vite must never share a port");
+    }
 
     #[test]
     fn first_free_port_skips_a_bound_port() {

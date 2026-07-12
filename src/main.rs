@@ -179,10 +179,12 @@ enum Cmd {
         /// Port for the Vite dev server.
         #[arg(long, default_value_t = 5173)]
         vite_port: u16,
-        /// If the requested web/vite ports are busy, walk up to the next free pair
-        /// instead of failing to bind. The banner prints the resolved ports.
+        /// By default `dev` probes upward from the requested web/vite/dev-bus
+        /// ports and binds the first free ones (so a second `lanius dev` just
+        /// works). Pass --fixed-ports to bind the exact requested values and fail
+        /// normally on a conflict instead. The banner prints the resolved ports.
         #[arg(long)]
-        shift_ports: bool,
+        fixed_ports: bool,
     },
     /// Run the packaged stack: the daemon (this binary) + the web server (also
     /// this binary, `lanius web`), supervised. The prod counterpart of `dev` —
@@ -922,12 +924,12 @@ fn run(cli: Cli) -> Result<()> {
             interval_ms,
             web_port,
             vite_port,
-            shift_ports,
+            fixed_ports,
         } => {
             // dev resolves its OWN isolated, repo-local root (target/lanius-dev) —
             // it deliberately ignores the global root so it can never run against
             // ~/.lanius/root and collide with `serve`/coding sessions. See dev::run.
-            dev::run(interval_ms, web_port, vite_port, shift_ports)?
+            dev::run(interval_ms, web_port, vite_port, fixed_ports)?
         }
         Cmd::Serve {
             interval_ms,

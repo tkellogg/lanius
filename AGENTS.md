@@ -6,6 +6,7 @@
 - docs/ui-flows/ — browser-flow catalogs and findings for web UI work. Start at docs/ui-flows/README.md, and use the web-qa skill for real UI verification.
 - Use .claude/skills/docs-disclosure-indexer/SKILL.md when adding or auditing docs indexes or docs/code cross-references.
 - Use skills
+- `.codex/skills` must stay a symlink pointing at `../.claude/skills` — do not replace it with a copied directory. This is local project/tool configuration (it lets the Codex CLI reuse the same skills tree), not a Lanius package, grant, skill install, profile, or runtime capability.
 
 
 # Current status of this project
