@@ -1652,6 +1652,47 @@ pub fn touch_record(root: &Root, elanus_session: &str) -> Result<()> {
     Ok(())
 }
 
+// ── M3 (incarnation-safe coding-session credentials): the kernel-side terminal
+// reason ────────────────────────────────────────────────────────────────────
+//
+// Today, when the credential is gone, the final session/stop publish is
+// refused and the session's terminal state is simply unknown. These helpers
+// record the stop reason on the durable `code_sessions` row — independent of
+// the bus — so a refused publish never leaves the terminal state unknown. The
+// child's real exit (status/signal, captured at the `child.wait()` boundary)
+// is the ONLY thing that feeds this; adapter-summary ENOENT and any post-exit
+// auth refusal are teardown artifacts and must never overwrite it.
+
+/// Format a child's `ExitStatus` into a durable terminal reason string. Total
+/// over its input: a signal death reads as `"signal: <n>"` (with a `(SIGKILL)`
+/// suffix for signal 9, for legibility), otherwise `"exited: <code>"` (using -1
+/// for the pathological case where neither a code nor a signal is available).
+#[cfg(unix)]
+pub fn terminal_reason_from_status(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt as _;
+    match status.signal() {
+        Some(sig) if sig == 9 => format!("signal: {sig} (SIGKILL)"),
+        Some(sig) => format!("signal: {sig}"),
+        None => format!("exited: {}", status.code().unwrap_or(-1)),
+    }
+}
+
+/// Record a session's terminal reason (M3), independent of the bus. Best-effort:
+/// callers ignore the error — a ledger hiccup never masks the child's real exit
+/// from the process's own point of view (`std::process::exit` below it still
+/// reflects the true status). Callers must only ever pass the real exit reason
+/// derived from the child's `ExitStatus` (or "killed before exit" on a wait
+/// failure) — never a teardown artifact (adapter-summary ENOENT, a post-exit
+/// auth refusal), so this never gets a chance to masquerade as the exit reason.
+pub fn record_terminal_reason(root: &Root, elanus_session: &str, reason: &str) -> Result<()> {
+    let conn = crate::db::open(root)?;
+    conn.execute(
+        "UPDATE code_sessions SET terminal_reason = ?2 WHERE elanus_session = ?1",
+        rusqlite::params![elanus_session, reason],
+    )?;
+    Ok(())
+}
+
 /// SI1 (sibling-intent): bump a session's `code_sessions.last_active` to now from
 /// the obs-publish path (codeagent.rs calls this each time the session emits
 /// telemetry), so a long-running session stays "live" between resumes rather than
@@ -2314,6 +2355,67 @@ impl Drop for BudgetLock {
     }
 }
 
+/// Path of the cross-process advisory lock file for one principal's IDLE resume
+/// critical section (session-credential-lifecycle handoff M2). Lives beside the
+/// principal's token file, inside the same fenced store — no new fence needed.
+#[cfg(unix)]
+fn resume_lock_path(root: &Root, principal: &str) -> PathBuf {
+    store_dir(root).join(format!("{principal}.lock"))
+}
+
+/// RAII guard that holds an exclusive `flock(LOCK_EX)` on a per-PRINCIPAL resume
+/// lock file — SERIALIZE/WAIT policy (session-credential-lifecycle handoff M2):
+/// a burst of deliveries to one idle worker all get processed, one at a time,
+/// rather than a second idle resume minting a fresh credential over the first's
+/// (which would orphan the first run's `retire_if` into a silent no-op against
+/// the wrong secret — see `idle_resume_retire_is_a_noop_after_concurrent_replacement`
+/// for the exact hazard this closes).
+///
+/// Follows the exact same open/flock/Drop discipline as `BudgetLock` above, just
+/// keyed by principal instead of being a single global file. Acquiring blocks
+/// (`LOCK_EX`, not `LOCK_EX | LOCK_NB`) so callers queue rather than fail.
+#[cfg(unix)]
+pub struct SessionResumeLock {
+    fd: std::os::unix::io::RawFd,
+}
+
+#[cfg(unix)]
+impl SessionResumeLock {
+    pub fn acquire(root: &Root, principal: &str) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = resume_lock_path(root, principal);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false) // lock file: content is irrelevant, do not truncate
+            .mode(0o600)
+            .open(&path)?;
+        let fd = std::os::unix::io::IntoRawFd::into_raw_fd(file);
+        // Blocking LOCK_EX: a second idle resume of the same principal WAITS
+        // rather than racing ahead to mint over the first (default policy: wait).
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        Ok(SessionResumeLock { fd })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SessionResumeLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+            libc::close(self.fd);
+        }
+    }
+}
+
 /// Mint a grant-scoped session token for `principal` publishing `agent`
 /// telemetry. Writes the 0600 token file inside the fenced store and returns
 /// the token (the launcher hands `.secret` to the child as LANIUS_BUS_TOKEN).
@@ -2652,6 +2754,21 @@ pub fn retire(root: &Root, principal: &str) {
     }
 }
 
+/// Retire a session's token ONLY if the on-disk secret still matches the one this
+/// caller minted — a compare-and-delete. A run that reused a live credential (a
+/// guest) must never call this; an ephemeral-mint run passes its own secret so it
+/// can never delete a credential a concurrently relaunched launcher just minted.
+pub fn retire_if(root: &Root, principal: &str, expected_secret: &str) {
+    if !is_session_principal(principal) {
+        return;
+    }
+    if let Some(tok) = read(root, principal) {
+        if tok.secret == expected_secret {
+            let _ = std::fs::remove_file(token_path(root, principal));
+        }
+    }
+}
+
 /// Reap orphaned session tokens: any token whose owning launcher pid is no
 /// longer alive is a credential a SIGKILL leaked (the launcher never reached its
 /// best-effort `retire`). Removing it makes the credential unusable — the broker
@@ -2938,6 +3055,98 @@ mod tests {
         assert_eq!(read_back.owner_pid, 1234);
         retire(&root, "code-cafef00d");
         assert!(read(&root, "code-cafef00d").is_none());
+    }
+
+    // ── session-credential-lifecycle handoff M1: secret-scoped retire ─────────
+
+    /// `retire_if` is a compare-and-delete: a non-matching secret leaves the
+    /// token file untouched (a guest run, or a stale caller, can never delete a
+    /// credential that isn't its own), while a matching secret removes it.
+    #[test]
+    fn retire_if_is_secret_scoped() {
+        let root = tmp_root();
+        let minted = mint(
+            &root,
+            "code-abc12300",
+            "claude-code",
+            std::process::id() as i32,
+            None,
+            RequestedGrants::default(),
+        )
+        .unwrap();
+
+        // Wrong secret: no-op, file survives.
+        retire_if(&root, "code-abc12300", "not-the-real-secret");
+        assert!(
+            read(&root, "code-abc12300").is_some(),
+            "retire_if must not remove a token when the secret doesn't match"
+        );
+
+        // Matching secret: removed.
+        retire_if(&root, "code-abc12300", &minted.secret);
+        assert!(read(&root, "code-abc12300").is_none());
+    }
+
+    // ── session-credential-lifecycle handoff M2: per-principal resume lock ────
+
+    /// `SessionResumeLock::acquire` creates `<store>/<principal>.lock` beside the
+    /// token store (not a global lock file), and a second acquire from the same
+    /// thread succeeds once the first guard is dropped (LOCK_EX releases cleanly).
+    #[test]
+    fn session_resume_lock_path_and_reacquire() {
+        let root = tmp_root();
+        let expected = store_dir(&root).join("code-lockme01.lock");
+        assert!(!expected.exists());
+        {
+            let _g = SessionResumeLock::acquire(&root, "code-lockme01").unwrap();
+            assert!(expected.exists(), "lock file must be created beside the token store");
+        }
+        // First guard dropped (flock released) — a second acquire must not hang.
+        let _g2 = SessionResumeLock::acquire(&root, "code-lockme01").unwrap();
+        drop(_g2);
+
+        // A different principal gets its own, independent lock file.
+        let other = store_dir(&root).join("code-lockme02.lock");
+        let _g3 = SessionResumeLock::acquire(&root, "code-lockme02").unwrap();
+        assert!(other.exists());
+        assert_ne!(expected, other);
+    }
+
+    /// Idle-resume mint then retire removes exactly its own secret. If a fresh
+    /// launch mint REPLACES the file mid-run (a concurrently relaunched
+    /// incarnation), the old resume's `retire_if(old_secret)` is a no-op and the
+    /// replacement survives untouched.
+    #[test]
+    fn idle_resume_retire_is_a_noop_after_concurrent_replacement() {
+        let root = tmp_root();
+        let minted = mint(
+            &root,
+            "code-idleresm",
+            "claude-code",
+            std::process::id() as i32,
+            None,
+            RequestedGrants::default(),
+        )
+        .unwrap();
+        let old_secret = minted.secret.clone();
+
+        // A concurrent relaunch replaces the token with a NEW secret before the
+        // old resume gets to retire.
+        let replacement = mint(
+            &root,
+            "code-idleresm",
+            "claude-code",
+            std::process::id() as i32,
+            None,
+            RequestedGrants::default(),
+        )
+        .unwrap();
+        assert_ne!(old_secret, replacement.secret);
+
+        // The stale resume's scoped retire must not touch the replacement.
+        retire_if(&root, "code-idleresm", &old_secret);
+        let survivor = read(&root, "code-idleresm").expect("replacement must survive");
+        assert_eq!(survivor.secret, replacement.secret);
     }
 
     #[test]
@@ -5217,6 +5426,61 @@ mod tests {
             Some(Liveness::Dead)
         );
         assert_eq!(session_liveness(&root, "code-nosuch999"), None);
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M3 (incarnation-safe coding-session credentials): terminal reason ────
+
+    #[test]
+    fn terminal_reason_from_status_formats_exit_and_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let exit0 = std::process::ExitStatus::from_raw(0);
+        assert_eq!(terminal_reason_from_status(&exit0), "exited: 0");
+
+        let exit1 = std::process::ExitStatus::from_raw(256);
+        assert_eq!(terminal_reason_from_status(&exit1), "exited: 1");
+
+        let sigkill = std::process::ExitStatus::from_raw(9);
+        assert_eq!(terminal_reason_from_status(&sigkill), "signal: 9 (SIGKILL)");
+    }
+
+    #[test]
+    fn record_terminal_reason_writes_and_survives_unrelated_touch() {
+        let root = tmp_root();
+        let rec = SessionRecord {
+            elanus_session: "code-term0001".to_string(),
+            native_session: "native-term0001".to_string(),
+            tool: "claude".to_string(),
+            agent_noun: "claude-code".to_string(),
+            workdir: "/tmp/proj".to_string(),
+            room: None,
+        };
+        upsert_record(&root, &rec).unwrap();
+
+        record_terminal_reason(&root, "code-term0001", "exited: 0").unwrap();
+        let conn = crate::db::open(&root).unwrap();
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT terminal_reason FROM code_sessions WHERE elanus_session = ?1",
+                ["code-term0001"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("exited: 0"));
+
+        // Teardown noise: an unrelated touch_record (the kind of bump a
+        // post-exit summary/auth-refusal path might trigger) must NOT clear or
+        // overwrite the recorded terminal reason — only the wait-boundary
+        // writer (record_terminal_reason) ever sets this column.
+        touch_record(&root, "code-term0001").unwrap();
+        let reason_after: Option<String> = conn
+            .query_row(
+                "SELECT terminal_reason FROM code_sessions WHERE elanus_session = ?1",
+                ["code-term0001"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason_after.as_deref(), Some("exited: 0"));
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 }

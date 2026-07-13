@@ -822,7 +822,7 @@ fn seed_stock_harness_packages(root: &Root) -> Result<()> {
 /// than the installed adapter's. Any metadata error is treated as stale too —
 /// fail toward re-copying a correct binary rather than leaving a possibly-old
 /// one in place.
-fn is_adapter_stale(source: &Path, adapter: &Path) -> bool {
+pub(crate) fn is_adapter_stale(source: &Path, adapter: &Path) -> bool {
     if !adapter.exists() {
         return true;
     }
@@ -842,13 +842,24 @@ fn is_adapter_stale(source: &Path, adapter: &Path) -> bool {
 /// SIGKILLs the next launch of the process using the old inode) — removes
 /// the old file first so the copy lands on a fresh inode. A no-op (existing
 /// inode left untouched) when the adapter is already up to date.
-fn refresh_adapter_if_stale(source: &Path, adapter: &Path) -> Result<()> {
+pub(crate) fn refresh_adapter_if_stale(source: &Path, adapter: &Path) -> Result<()> {
     if is_adapter_stale(source, adapter) {
         let _ = std::fs::remove_file(adapter);
         std::fs::copy(source, adapter)
             .with_context(|| format!("copying {} -> {}", source.display(), adapter.display()))?;
     }
     Ok(())
+}
+
+/// Look up the source binary name for a stock harness package by its
+/// package-directory basename (e.g. "harness-claude" -> "harness-claude").
+/// Returns `None` for a directory name that doesn't match any stock
+/// package (a user-supplied/non-stock external harness).
+pub(crate) fn stock_harness_source_binary(package_dir_name: &str) -> Option<&'static str> {
+    STOCK_HARNESS_PACKAGES
+        .iter()
+        .find(|pkg| pkg.dir == package_dir_name)
+        .map(|pkg| pkg.binary)
 }
 
 fn set_executable(path: &Path) -> Result<()> {
@@ -975,5 +986,14 @@ mod adapter_refresh_tests {
         assert_eq!(fs::read(&adapter).unwrap(), b"fresh install");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stock_harness_source_binary_matches_known_dir_and_rejects_unknown() {
+        assert_eq!(
+            stock_harness_source_binary("harness-claude"),
+            Some("harness-claude")
+        );
+        assert_eq!(stock_harness_source_binary("not-a-stock-harness"), None);
     }
 }

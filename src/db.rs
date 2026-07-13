@@ -634,6 +634,11 @@ CREATE TABLE IF NOT EXISTS code_spawn_edges (
         "ALTER TABLE code_sessions ADD COLUMN launched_by_event TEXT",
         [],
     );
+    // M3 (incarnation-safe coding-session credentials): the kernel-side terminal
+    // reason (child exit status/signal, or "killed before exit"), recorded
+    // independent of the bus so a refused session/stop publish never leaves the
+    // record's terminal state unknown.
+    let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN terminal_reason TEXT", []);
     // Migrations for databases created before a column existed; the error on
     // a duplicate column is expected and ignored.
     let _ = conn.execute(

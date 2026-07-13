@@ -3848,6 +3848,42 @@ fn build_resume_message(root: &Root, agent_noun: &str, session: &str, message: &
     }
 }
 
+/// Hoist the init-time adapter-staleness check to the launch/use boundary: if
+/// `external` is a STOCK harness package (its package-dir basename matches a
+/// `STOCK_HARNESS_PACKAGES` entry) and the running lanius binary's exe_dir
+/// still carries that stock harness's source binary, refresh `adapter` before
+/// it execs — so a `cargo install`-upgraded lanius doesn't keep running a
+/// stale installed adapter until someone re-runs `lanius init`. A non-stock
+/// (user-supplied) external harness has no matching source binary and is left
+/// untouched. An already-up-to-date adapter is not re-copied (avoids
+/// needless churn/SIGKILL risk) and does not log.
+fn refresh_stock_adapter_if_stale(external: &ExternalHarness, adapter: &std::path::Path) -> Result<()> {
+    let Some(dir_name) = external.package_dir.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
+    let Some(binary) = crate::initcmd::stock_harness_source_binary(dir_name) else {
+        return Ok(());
+    };
+    let exe = std::env::current_exe().context("locating the running lanius binary")?;
+    let exe_dir = exe
+        .parent()
+        .context("running lanius binary has no parent directory")?;
+    let source = exe_dir.join(format!("{}{}", binary, std::env::consts::EXE_SUFFIX));
+    if source.is_file() {
+        let stale = crate::initcmd::is_adapter_stale(&source, adapter);
+        crate::initcmd::refresh_adapter_if_stale(&source, adapter)?;
+        crate::platform::set_executable(adapter)?;
+        if stale {
+            eprintln!(
+                "[code] refreshed stale stock adapter for {} at {}",
+                external.package,
+                adapter.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_external_harness(
     root: &Root,
@@ -3877,6 +3913,7 @@ fn launch_external_harness(
     };
     let workdir = std::env::current_dir().unwrap_or_else(|_| root.dir.clone());
     let adapter = external.package_dir.join(&external.decl.run);
+    refresh_stock_adapter_if_stale(&external, &adapter)?;
     if !adapter.exists() {
         bail!(
             "external harness {:?} from package {:?} points at missing adapter {}",
@@ -4175,7 +4212,19 @@ fn launch_external_harness(
         }
     }
 
-    codesession::retire(root, &principal);
+    // M3 (incarnation-safe coding-session credentials): stamp the kernel-side
+    // terminal reason from the child's real exit — independent of the bus/mail
+    // above, and BEFORE the `?` below can early-return, so a non-zero exit or a
+    // wait failure still leaves the durable record with an accurate reason even
+    // if session/stop is refused. Only the child's own ExitStatus/wait-error
+    // feeds this; the completion-mail path above (teardown noise) never does.
+    let terminal_reason = match status_result.as_ref() {
+        Ok(status) => codesession::terminal_reason_from_status(status),
+        Err(e) => format!("killed before exit: {e:#}"),
+    };
+    let _ = codesession::record_terminal_reason(root, &session, &terminal_reason);
+
+    codesession::retire_if(root, &principal, &token.secret);
 
     let status = status_result?;
     if !status.success() {
@@ -8509,6 +8558,14 @@ pub struct ResumeOutcome {
     /// The on-disk paths the worker reported writing this turn (deduped, possibly
     /// empty).
     pub file_changes: Vec<String>,
+    /// True only for the M2 "deferred to live session" outcome: a live launcher
+    /// owns the credential, so this resume spawned NO native child at all — the
+    /// message was already written to the session's inbox by `deliver`, and the
+    /// live incarnation will surface it on its next turn. `success` is `true` on
+    /// this path (nothing failed) so the dispatcher's `settle_code_deliveries`
+    /// seam (`!matches!(done.success, Some(true))`) routes it to `done`, never
+    /// `failed`. Every other `ResumeOutcome` construction sets this `false`.
+    pub deferred: bool,
 }
 
 /// Resolve the ACP `[[harness]]` block for a recorded session, or None when the
@@ -8551,6 +8608,7 @@ fn resume_acp_capture(
     injected: &str,
 ) -> Result<(bool, Option<i32>, CaptureSummary)> {
     let adapter = external.package_dir.join(&external.decl.run);
+    refresh_stock_adapter_if_stale(external, &adapter)?;
     if !adapter.exists() {
         bail!(
             "ACP harness {:?} from package {:?} points at missing adapter {}",
@@ -8621,6 +8679,35 @@ fn resume_acp_capture(
     Ok((status.success(), status.code(), summary))
 }
 
+/// What a resume should do with the session's credential, given whatever token
+/// is currently on disk (if any) and the pid this resume is running as.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeCredentialDecision {
+    /// A live TUI (or other) incarnation owns the credential — reuse its
+    /// secret. A guest run: it never mints, and must never retire.
+    Reuse(String),
+    /// No token, or its owner is dead (or is this same process): mint a fresh
+    /// ephemeral credential for the idle session.
+    Mint,
+}
+
+/// Pure decision helper (session-credential-lifecycle handoff M1): a resume
+/// reuses a live FOREIGN owner's credential rather than overwriting it, and
+/// only mints when the session is genuinely idle (no token, a dead owner, or
+/// self-owned). Factored out so the reuse-vs-mint branch is unit-testable
+/// without driving the full `resume_capture` process spawn.
+fn resume_credential_decision(
+    existing: Option<&codesession::SessionToken>,
+    self_pid: i32,
+) -> ResumeCredentialDecision {
+    match existing {
+        Some(tok) if tok.owner_pid != self_pid && codesession::pid_alive_pub(tok.owner_pid) => {
+            ResumeCredentialDecision::Reuse(tok.secret.clone())
+        }
+        _ => ResumeCredentialDecision::Mint,
+    }
+}
+
 /// Continue a recorded coding session with a fresh, emit-only scoped token,
 /// capturing the result under the same lanius session, and RETURN the outcome
 /// (never `process::exit`). This is the in-process resume primitive the daemon
@@ -8630,10 +8717,11 @@ fn resume_acp_capture(
 ///
 /// The native resume command is wrapped in `timeout` (handoff guardrail) and run
 /// non-interactively (empty stdin, piped stdout we parse, inherited stderr). The
-/// token is emit-only — minted here, retired at the end, reaped on crash — so a
-/// driven resume gains the session NO read authority (M3's interactive-pull
-/// remains deferred); the DAEMON, which already has authority, is the only reader
-/// of the mailbox.
+/// token is emit-only — reused from a live incarnation or minted fresh here,
+/// retired (secret-scoped) at the end only when this run minted it, reaped on
+/// crash — so a driven resume gains the session NO read authority (M3's
+/// interactive-pull remains deferred); the DAEMON, which already has authority,
+/// is the only reader of the mailbox.
 pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Result<ResumeOutcome> {
     use std::process::{Command, Stdio};
 
@@ -8651,25 +8739,72 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
             )
         })?;
 
-    // Mint a FRESH scoped token for this resume run, with the SAME deterministic
-    // principal/scope derived from the session name — exactly as a launch does.
-    // An idle session has no token; this one lives only for the resume and is
-    // retired at the end (reaped on crash). It is emit-only: no read/subscribe
-    // grant (M3's interactive-pull is deferred), so resume cannot read the bus.
+    // A resume either REUSES a live launcher's credential (a guest — the TUI
+    // incarnation is still running and owns the secret) or MINTS a fresh
+    // ephemeral one (the session is idle: no token, or its owner is dead). A
+    // guest must never mint (it would overwrite the live secret, breaking the
+    // live session's later publishes) and must never retire (see the three
+    // exit sites below). Resume re-mints/reuses for the SAME session — it is
+    // not a new spawn, so it is not charged against any spawner budget (the
+    // budget was consumed at launch time, not at resume).
     let principal = rec.elanus_session.clone();
-    // Resume re-mints a credential for the SAME session — it is not a new spawn,
-    // so it is not charged against any spawner budget (the budget was consumed
-    // at launch time, not at resume). Pass spawner=None, requested_budget=None.
+    let self_pid = std::process::id() as i32;
+    let existing_token = codesession::read(root, &principal);
+
+    // M2 (session-credential-lifecycle handoff, containment): a live FOREIGN
+    // owner means a human-driven TUI already has this session open. Spawning a
+    // parallel native `claude -p --resume` against it would be wasteful and
+    // confusing, AND M1's guest-never-mints/never-retires rule means this run
+    // would produce a real result the live session never sees (it isn't reading
+    // the resume's stdout). So refuse the parallel resume outright: return a
+    // distinct, successful "deferred to live session" outcome with NO native
+    // child spawned. `deliver` already wrote the message to the session's
+    // inbox — the live incarnation surfaces it on its own next turn — so
+    // `success: true` is correct (nothing failed) and routes this to `done`,
+    // not `failed`, via the dispatcher's settle seam.
+    if let ResumeCredentialDecision::Reuse(_) = resume_credential_decision(existing_token.as_ref(), self_pid) {
+        let owner_pid = existing_token.as_ref().map(|t| t.owner_pid).unwrap_or(-1);
+        eprintln!(
+            "[code] resume deferred to live session {principal} (owner pid {owner_pid} alive); \
+             message queued to inbox"
+        );
+        return Ok(ResumeOutcome {
+            success: true,
+            exit_code: None,
+            final_text: Some(format!(
+                "a live incarnation of session {principal} owns it; the delivery is queued to \
+                 the session inbox and will be picked up on its next turn"
+            )),
+            file_changes: vec![],
+            deferred: true,
+        });
+    }
+
+    // Idle path (no token, dead owner, or self-owned): mint an ephemeral
+    // credential for this run. Serialize idle resumes of the SAME principal
+    // under a blocking per-principal flock (M2) — two concurrent idle resumes
+    // must not race to mint over each other's credential (the second mint
+    // would replace the first's secret, turning the first's later `retire_if`
+    // into a silent no-op against the wrong token — see
+    // `idle_resume_retire_is_a_noop_after_concurrent_replacement`). Default
+    // policy is SERIALIZE/WAIT: a burst of deliveries to one idle worker all
+    // get processed, one at a time. Held across mint+spawn+retire (dropped at
+    // function end, on every return path below).
+    #[cfg(unix)]
+    let _resume_lock = codesession::SessionResumeLock::acquire(root, &principal)
+        .with_context(|| format!("acquiring the resume lock for {principal}"))?;
+
     let token = codesession::mint(
         root,
         &principal,
         &rec.agent_noun,
-        std::process::id() as i32,
+        self_pid,
         None,
         codesession::RequestedGrants::default(),
     )
     .with_context(|| format!("minting the resume credential for {principal}"))?;
-    let bus_token = token.secret.clone();
+    let secret = token.secret.clone();
+    let (bus_token, minted_secret): (String, Option<String>) = (secret.clone(), Some(secret));
     let agent = rec.agent_noun.clone();
     let session = rec.elanus_session.clone();
     let workdir = std::path::PathBuf::from(&rec.workdir);
@@ -8727,7 +8862,10 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
             root, &external, &rec, &principal, &agent, &session, &bus_token, &workdir, &owner,
             &injected,
         );
-        codesession::retire(root, &principal);
+        if let Some(secret) = &minted_secret {
+            codesession::retire_if(root, &principal, secret);
+        }
+        // minted_secret is always Some past the M2 guest-deferral gate above.
         let _ = codesession::touch_record(root, &session);
         let (success, exit_code, summary) = summary?;
         // Surface a reason on failure: a fail-closed capability gate (the agent
@@ -8747,6 +8885,7 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
             exit_code,
             final_text,
             file_changes: summary.file_changes,
+            deferred: false,
         });
     }
 
@@ -8757,7 +8896,10 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     // — as `claude -p --resume <id>`. This closes the latent-bug CLASS the ACP fork
     // only routes around for the standard config.
     if harness_id_for_tool(&rec.tool).is_none() {
-        codesession::retire(root, &principal);
+        if let Some(secret) = &minted_secret {
+            codesession::retire_if(root, &principal, secret);
+        }
+        // minted_secret is always Some past the M2 guest-deferral gate above.
         return Ok(ResumeOutcome {
             success: false,
             exit_code: None,
@@ -8768,6 +8910,7 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
                 rec.tool
             )),
             file_changes: vec![],
+            deferred: false,
         });
     }
 
@@ -8817,8 +8960,22 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
     // would leak it, but it is reaped at the next launcher/daemon boot, and even
     // unreaped it can only publish this dead session's own obs subtree). Bump
     // last_active so the record reflects the resume.
-    codesession::retire(root, &principal);
+    if let Some(secret) = &minted_secret {
+        codesession::retire_if(root, &principal, secret);
+    }
+    // minted_secret is always Some past the M2 guest-deferral gate above.
     let _ = codesession::touch_record(root, &session);
+    // M3 (incarnation-safe coding-session credentials): stamp the kernel-side
+    // terminal reason from the child's real exit, BEFORE the `?` below can
+    // early-return, so a non-zero exit or a wait failure still leaves the
+    // durable record accurate even if session/stop is refused. Only the
+    // child's own ExitStatus/wait-error feeds this — never teardown noise
+    // (an adapter-summary ENOENT or a post-exit auth refusal).
+    let terminal_reason = match result.as_ref() {
+        Ok(status) => codesession::terminal_reason_from_status(status),
+        Err(e) => format!("killed before exit: {e:#}"),
+    };
+    let _ = codesession::record_terminal_reason(root, &session, &terminal_reason);
 
     let status = result?;
     Ok(ResumeOutcome {
@@ -8826,6 +8983,7 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
         exit_code: status.code(),
         final_text: summary.final_text,
         file_changes: summary.file_changes,
+        deferred: false,
     })
 }
 
@@ -16771,5 +16929,140 @@ mod tests {
             "ask on a dead target must return immediately, not block ({elapsed:?})"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
+    }
+}
+
+/// Unit tests for the pure reuse-vs-mint decision (session-credential-lifecycle
+/// handoff M1 acceptance gap) — kept in their own module so they don't need the
+/// heavier fixtures (`tmp_root`/env locks) the main `tests` module carries.
+#[cfg(test)]
+mod resume_credential_tests {
+    use super::*;
+
+    fn make_token(owner_pid: i32, secret: &str) -> codesession::SessionToken {
+        codesession::SessionToken {
+            principal: "code-decisn01".to_string(),
+            agent: "claude-code".to_string(),
+            secret: secret.to_string(),
+            owner_pid,
+            kind: codesession::PrincipalKind::Session,
+            grants: codesession::Grants::default(),
+        }
+    }
+
+    #[test]
+    fn no_token_mints() {
+        let decision = resume_credential_decision(None, std::process::id() as i32);
+        assert_eq!(decision, ResumeCredentialDecision::Mint);
+    }
+
+    #[test]
+    fn live_foreign_owner_is_reused() {
+        // pid 1 (init/launchd) is always alive and is never this test process.
+        let tok = make_token(1, "live-secret");
+        let self_pid = std::process::id() as i32;
+        assert_ne!(1, self_pid);
+        assert!(codesession::pid_alive_pub(1));
+        let decision = resume_credential_decision(Some(&tok), self_pid);
+        assert_eq!(decision, ResumeCredentialDecision::Reuse("live-secret".to_string()));
+    }
+
+    #[test]
+    fn self_owned_token_mints() {
+        let self_pid = std::process::id() as i32;
+        let tok = make_token(self_pid, "self-secret");
+        let decision = resume_credential_decision(Some(&tok), self_pid);
+        assert_eq!(decision, ResumeCredentialDecision::Mint);
+    }
+
+    #[test]
+    fn dead_owner_mints() {
+        // Spawn+reap a trivial child so its pid is guaranteed dead (reaped), then
+        // use that now-dead pid as the token's owner.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawning `true`");
+        let dead_pid = child.id() as i32;
+        child.wait().expect("waiting for `true`");
+        assert!(
+            !codesession::pid_alive_pub(dead_pid),
+            "a reaped child's pid must not read as alive"
+        );
+        let tok = make_token(dead_pid, "dead-secret");
+        let self_pid = std::process::id() as i32;
+        let decision = resume_credential_decision(Some(&tok), self_pid);
+        assert_eq!(decision, ResumeCredentialDecision::Mint);
+    }
+
+    /// VERIFIER (M2 keystone): a resume against a LIVE foreign owner returns the
+    /// deferred-to-inbox outcome (success:true, deferred:true), spawns NO native
+    /// child (proven because `claude` is never on PATH here yet the call still
+    /// succeeds without a spawn error), and the live credential's secret is
+    /// UNTOUCHED on disk after the call.
+    #[test]
+    fn m2_live_owner_resume_defers_without_spawn_and_preserves_credential() {
+        let dir = std::env::temp_dir().join(format!(
+            "lanius-verify-m2-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Root { dir: dir.clone() };
+        // Force the db/migrations to exist so upsert_record/read_record work.
+        let _ = crate::db::open(&root).unwrap();
+
+        let session = "code-live0m02";
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: session.into(),
+                native_session: "native-live-x".into(),
+                tool: "claude".into(),
+                agent_noun: "claude-code".into(),
+                workdir: dir.to_string_lossy().to_string(),
+                room: None,
+            },
+        )
+        .unwrap();
+
+        // A REAL live process to own the credential (kept alive across the call).
+        let mut owner = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawning `sleep 60` as the live owner");
+        let owner_pid = owner.id() as i32;
+        assert!(codesession::pid_alive_pub(owner_pid));
+
+        // Mint the live launcher's credential owned by that live pid.
+        let minted = codesession::mint(
+            &root,
+            session,
+            "claude-code",
+            owner_pid,
+            None,
+            codesession::RequestedGrants::default(),
+        )
+        .unwrap();
+        let live_secret = minted.secret.clone();
+
+        // Drive the resume: must defer, must NOT spawn a native child.
+        let outcome = resume_capture(&root, session, "hello from a delivery")
+            .expect("resume_capture must succeed (deferred), not error");
+        assert!(outcome.deferred, "must be deferred to the live session");
+        assert!(outcome.success, "deferred is a success, not a failure");
+        assert!(outcome.file_changes.is_empty(), "no child ran → no file changes");
+
+        // The live credential is UNTOUCHED: same secret still on disk.
+        let after = codesession::read(&root, session)
+            .expect("the live credential file must still exist after a deferred resume");
+        assert_eq!(
+            after.secret, live_secret,
+            "the deferred resume must NOT overwrite or delete the live secret"
+        );
+        assert_eq!(after.owner_pid, owner_pid, "owner pid must be preserved");
+
+        owner.kill().ok();
+        owner.wait().ok();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,5 +1,5 @@
 ---
-status: planned
+status: implemented
 author: Claude Opus 4.8 (planner) in Claude Code on Elanus
 last-updated: 2026-07-13
 ---
@@ -275,3 +275,37 @@ than the source binary). **This is a real residual, not a done item.**
   Ruled: M1 reuse-live + secret-scoped retire (rejected multi-generation); M2
   refuse parallel resume for live sessions (deliver → inbox) + serialize idle
   resumes. M4 flagged as a genuine residual, not done.
+- 2026-07-13 — Implemented + verified (planner-reconciled after a sonnet worker
+  hit the fleet session limit mid-M1). Landed UNSTAGED across src/codesession.rs,
+  src/codeagent.rs, src/db.rs (one migration), src/initcmd.rs. Fable to commit.
+  - **M1** — `retire_if` secret-scoped compare-and-delete; `resume_credential_decision`
+    (Reuse iff token present ∧ owner_pid≠self ∧ `pid_alive_pub`); launch + all three
+    resume exits retire via `retire_if(minted_secret)` only; guest never retires.
+  - **M2** — `resume_capture` returns early on a live foreign owner with
+    `ResumeOutcome{success:true, deferred:true}` and spawns NO native child; the
+    dispatcher settle seam (`failed = !matches!(success, Some(true))`) routes it to
+    `done`, never `failed`. Idle (Mint) path serialized by a new blocking
+    per-principal `SessionResumeLock` (flock LOCK_EX on `<store>/<principal>.lock`).
+  - **M3** — new nullable `code_sessions.terminal_reason`; `terminal_reason_from_status`
+    (`exited: N` / `signal: 9 (SIGKILL)`) + best-effort `record_terminal_reason`
+    stamped at launch (~4185) and resume (~4188/8937) BEFORE the `?` early-exit, so a
+    non-zero/killed child still records even when the bus refuses `session/stop`;
+    teardown noise (summary ENOENT / auth refusal) stays an `eprintln!` warning.
+  - **M4** — `refresh_stock_adapter_if_stale` at both exec sites (launch ~3916, resume
+    ~8611) BEFORE the `exists()`-bail, reusing `initcmd::refresh_adapter_if_stale`/
+    `is_adapter_stale` (now `pub(crate)`) + a new `stock_harness_source_binary` lookup;
+    only for stock harnesses, fresh-inode + `set_executable`, no re-copy/log when current.
+    Closes the observed still-stale installed adapter (a 12:30 launch still ENOENT'd).
+  - Reconcile fix: the crashed worker's non-compiling `E0382` (secret move in the Mint
+    branch) was corrected.
+  - Verify (clean-context opus/high, isolated /tmp roots, no production broker):
+    `cargo build` clean; `cargo test --lib --test-threads=1` = 645/645. The M2
+    deferred-resume keystone was DRIVEN LIVE (a real live owner pid → deferred outcome,
+    no spawn, on-disk credential + secret untouched). All broker/claude-dependent
+    clauses audited to exact code sites. No defects; zero fix rounds. Verdict pass.
+  - Deviations for Fable's attention: **none** from the two rulings — reuse-live is
+    implemented AND, once M2 defers a live delivery to the inbox (never spawning),
+    the live-owner case never reaches mint, so M1's secret-reuse is the (correct)
+    unreachable safety net for that case; deliver-to-live queues to inbox exactly as
+    ruled. `ResumeOutcome` gained a public `deferred: bool` (set false at all prior
+    construction sites). Idle-resume policy = serialize/wait (R4 default), as proposed.
