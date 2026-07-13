@@ -90,7 +90,7 @@ fn main() {
     // hard-failing `cargo install` on a network hiccup.
     if !web.join("node_modules").is_dir() {
         warn("web UI: node_modules missing — running `npm --prefix ui/web install`");
-        let installed = Command::new("npm")
+        let installed = npm()
             .arg("--prefix")
             .arg(&web)
             .arg("install")
@@ -111,7 +111,7 @@ fn main() {
     // Build the SPA into ui/web/dist. A non-zero BUILD exit with deps present is
     // a real error (a broken UI build) — panic with the output. Silently
     // falling back here would re-create the staleness bug with extra steps.
-    let output = Command::new("npm")
+    let output = npm()
         .arg("--prefix")
         .arg(&web)
         .arg("run")
@@ -169,9 +169,16 @@ fn warn(msg: &str) {
     println!("cargo:warning={msg}");
 }
 
+/// `npm` on unix; on Windows the npm CLI is a `.cmd` shim that CreateProcess
+/// cannot exec by its bare name, so name it explicitly. build.rs compiles for
+/// the HOST, so cfg!(windows) is the machine running this script.
+fn npm() -> Command {
+    Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
+}
+
 /// Does `npm` resolve on PATH? (`npm --version` succeeds.)
 fn npm_available() -> bool {
-    Command::new("npm")
+    npm()
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
