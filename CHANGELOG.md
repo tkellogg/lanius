@@ -5,6 +5,7 @@ All notable changes to lanius are documented here.
 ## 0.1.1 — 2026-07-10
 
 ### Fixed
+- Messages should show message text and explain worker references (#12)
 - Codex resumed turns miss inbox block / lanius code inbox affordance (#11)
 
 ### Added
