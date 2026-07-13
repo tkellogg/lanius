@@ -1367,6 +1367,91 @@ pub fn whose_path(root: &Root, path: &str) -> Option<Attribution> {
     })
 }
 
+/// M1 (coding-session-reliability): the three cardinal outcomes `whose` renders.
+/// Decided by asking "does the VIEWER hold a present claim on this path" FIRST and
+/// explicitly — never by whether the freshest claim across all sessions happens to
+/// coincide with the viewer. This is the fix for the bug where an unclaimed path
+/// rendered "likely yours": that fallback conflated "no evidence" with "probably
+/// the viewer", which mislabels e.g. a human-created `.codex/` dir as the viewer's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributionState {
+    /// The viewer's OWN session holds a present claim on the path — render "yours".
+    Viewer,
+    /// A claim exists, but held by a DIFFERENT session — never rendered as "yours".
+    Other,
+    /// No session claims the path at all — honestly unattributed, not a guess.
+    Unknown,
+}
+
+/// The full `whose` answer for one (path, viewer) pair: the state plus its cited
+/// evidence. `attribution` is `Some` for `Viewer`/`Other` (the claim IS the
+/// evidence) and `None` only for `Unknown`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewerAttribution {
+    pub state: AttributionState,
+    pub attribution: Option<Attribution>,
+}
+
+/// Whether `session` holds a present claim on `path` — checked against BOTH the
+/// canonical form (`canon`) and the raw/verbatim form (mirrors the fallback
+/// `whose_path` uses for a manual claim recorded with no workdir base).
+fn session_holds_claim(conn: &rusqlite::Connection, canon: &str, raw: &str, session: &str) -> bool {
+    let holds = |p: &str| -> bool {
+        conn.query_row(
+            "SELECT 1 FROM code_claims WHERE path = ?1 AND session = ?2 LIMIT 1",
+            rusqlite::params![p, session],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    };
+    holds(canon) || (raw != canon && holds(raw))
+}
+
+/// M1: resolve `path` for `viewer` into the explicit three-state answer. Asks the
+/// VIEWER question first (does `viewer` itself hold a present claim here?) — if so,
+/// that is state `Viewer` regardless of what any other session's claim looks like.
+/// Only when the viewer holds no claim do we fall back to `whose_path`'s
+/// freshest-claim-wins lookup, which (having just ruled out the viewer) can only
+/// ever resolve to a DIFFERENT session (`Other`) or nothing (`Unknown`). `viewer`
+/// is `None` for a caller with no session identity (e.g. run outside a coding
+/// session) — such a caller can never see state `Viewer`.
+pub fn whose_path_for_viewer(root: &Root, path: &str, viewer: Option<&str>) -> ViewerAttribution {
+    if let Some(viewer) = viewer {
+        if let Ok(conn) = crate::db::open(root) {
+            if crate::db::init_schema(&conn).is_ok() {
+                let canon = canon_claim_lookup(path);
+                let raw = path.trim();
+                if session_holds_claim(&conn, &canon, raw, viewer) {
+                    let (agent_noun, last_active) = session_identity(&conn, viewer);
+                    let current_task = current_task_on(&conn, viewer).map(|(text, _)| text);
+                    return ViewerAttribution {
+                        state: AttributionState::Viewer,
+                        attribution: Some(Attribution {
+                            session: viewer.to_string(),
+                            agent_noun,
+                            last_active,
+                            current_task,
+                        }),
+                    };
+                }
+            }
+        }
+    }
+    match whose_path(root, path) {
+        Some(att) => ViewerAttribution {
+            state: AttributionState::Other,
+            attribution: Some(att),
+        },
+        None => ViewerAttribution {
+            state: AttributionState::Unknown,
+            attribution: None,
+        },
+    }
+}
+
 /// One recent message seen on a shared channel (C4 — agent-comms): a room's
 /// (`in/group/<id>`) traffic, surfaced advisory in the `channel:<id>` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3336,6 +3421,65 @@ mod tests {
         assert!(peer_claims(&root, "room-z", "code-liveone2")
             .unwrap()
             .is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M1: explicit viewer/other/unknown attribution ─────────────────────────
+
+    #[test]
+    fn whose_path_for_viewer_unknown_when_no_claim_at_all() {
+        // No session has ever claimed this path — Unknown, no attribution, and
+        // (the regression this guards) NEVER coerced to "probably the viewer's".
+        let root = tmp_root();
+        // A human-created `.codex/` dir inside the test's own tmp root — nothing
+        // ever claims it. Uniqueness rides tmp_root()'s own uuid'd dir.
+        let path = root.dir.join(".codex").to_string_lossy().into_owned();
+        let result = whose_path_for_viewer(&root, &path, Some("code-viewer01"));
+        assert_eq!(result.state, AttributionState::Unknown);
+        assert!(result.attribution.is_none());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn whose_path_for_viewer_viewer_state_when_viewer_holds_the_claim() {
+        // The viewer's OWN present claim decides state Viewer directly — not via a
+        // "freshest claim happens to be the viewer" coincidence.
+        let root = tmp_root();
+        let live = std::process::id() as i32;
+        member(&root, "room-v", "code-viewer02", live);
+        add_claim(&root, "room-v", "code-viewer02", "/tmp/m1/mine.rs").unwrap();
+        let result = whose_path_for_viewer(&root, "/tmp/m1/mine.rs", Some("code-viewer02"));
+        assert_eq!(result.state, AttributionState::Viewer);
+        let att = result.attribution.expect("viewer state carries the claim as evidence");
+        assert_eq!(att.session, "code-viewer02");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn whose_path_for_viewer_other_state_when_only_a_peer_holds_the_claim() {
+        // Only a DIFFERENT session claims the path — Other, and the viewer's
+        // identity must never leak into the "yours" state.
+        let root = tmp_root();
+        let live = std::process::id() as i32;
+        member(&root, "room-v", "code-peer00003", live);
+        member(&root, "room-v", "code-viewer04", live);
+        add_claim(&root, "room-v", "code-peer00003", "/tmp/m1/theirs.rs").unwrap();
+        let result = whose_path_for_viewer(&root, "/tmp/m1/theirs.rs", Some("code-viewer04"));
+        assert_eq!(result.state, AttributionState::Other);
+        let att = result.attribution.expect("other state still carries the claimant as evidence");
+        assert_eq!(att.session, "code-peer00003");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn whose_path_for_viewer_other_wins_even_when_no_viewer_identity_given() {
+        // A caller with no session identity (viewer: None) can never see Viewer.
+        let root = tmp_root();
+        let live = std::process::id() as i32;
+        member(&root, "room-v", "code-peer00005", live);
+        add_claim(&root, "room-v", "code-peer00005", "/tmp/m1/noviewer.rs").unwrap();
+        let result = whose_path_for_viewer(&root, "/tmp/m1/noviewer.rs", None);
+        assert_eq!(result.state, AttributionState::Other);
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 

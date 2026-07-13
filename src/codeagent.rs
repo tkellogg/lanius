@@ -2590,10 +2590,12 @@ pub fn ask_cmd(root: &Root, args: &[String]) -> Result<()> {
 }
 
 /// `lanius code whose <path>` / `lanius code whose --dirty [--json]` — change
-/// attribution (SI4). Maps a path (or the whole `git status --porcelain` set) to its
-/// owning coding session via `codesession::whose_path`, printing the owner, its
-/// tool, humanized last-active, and current task. A path no session claims reads as
-/// "unattributed" (likely the viewer's own work, or untracked-by-lanius).
+/// attribution (SI4). Maps a path (or the whole `git status --porcelain` set) to an
+/// explicit three-state answer via `codesession::whose_path_for_viewer` (M1):
+/// the VIEWER's own present claim renders "yours"; a claim held by a different
+/// session renders "claimed by <session>" (never "yours"); no claim at all renders
+/// "unattributed/unknown" — a claim is evidence, never a guess, so an unclaimed
+/// path (e.g. a human-created `.codex/` dir) is never mislabelled as the viewer's.
 pub fn whose_cmd(root: &Root, args: &[String]) -> Result<()> {
     let want_json = args.iter().any(|a| a == "--json");
     let want_dirty = args.iter().any(|a| a == "--dirty");
@@ -2667,45 +2669,71 @@ fn parse_porcelain_paths(text: &str) -> Vec<String> {
     paths
 }
 
-/// One human-readable attribution line for `whose`.
+/// One human-readable attribution line for `whose`. M1: the three states are
+/// decided explicitly by `whose_path_for_viewer` (does the VIEWER hold the claim?),
+/// never by a "no claim → probably yours" guess — a human-created, unclaimed path
+/// (e.g. `.codex/`) must read as unattributed, not "likely yours".
 fn whose_line(root: &Root, path: &str, viewer: Option<&str>) -> String {
-    match codesession::whose_path(root, path) {
-        Some(att) => {
+    let result = codesession::whose_path_for_viewer(root, path, viewer);
+    match (result.state, result.attribution) {
+        (codesession::AttributionState::Viewer, Some(att)) => {
             let since = humanize_since(&att.last_active);
             let task = att
                 .current_task
                 .as_deref()
                 .map(|t| format!(" — {}", clip_task(t)))
                 .unwrap_or_default();
-            let mine = viewer == Some(att.session.as_str());
-            let yours = if mine { ", yours" } else { "" };
             format!(
-                "{path}  ← {} ({}, last active {since}{yours}){task}",
+                "{path}  ← {} ({}, last active {since}, yours){task}",
                 att.session, att.agent_noun
             )
         }
-        None => format!("{path}  ← unattributed (no session claims it — likely yours)"),
+        (codesession::AttributionState::Other, Some(att)) => {
+            let since = humanize_since(&att.last_active);
+            let task = att
+                .current_task
+                .as_deref()
+                .map(|t| format!(" — {}", clip_task(t)))
+                .unwrap_or_default();
+            format!(
+                "{path}  ← claimed by {} ({}, last active {since}){task}",
+                att.session, att.agent_noun
+            )
+        }
+        _ => format!("{path}  ← unattributed (no session claims it — unknown owner)"),
     }
 }
 
-/// One JSON attribution object for `whose --json`.
+/// One JSON attribution object for `whose --json`. Carries an explicit `state`
+/// (`"viewer"` | `"other"` | `"unknown"`) so a JSON caller can distinguish all
+/// three M1 states without parsing the human prose; `mine` stays boolean
+/// (`true` only for `state: "viewer"`) for backward-compatible callers.
 fn whose_json(root: &Root, path: &str, viewer: Option<&str>) -> Value {
-    match codesession::whose_path(root, path) {
+    let result = codesession::whose_path_for_viewer(root, path, viewer);
+    let state = match result.state {
+        codesession::AttributionState::Viewer => "viewer",
+        codesession::AttributionState::Other => "other",
+        codesession::AttributionState::Unknown => "unknown",
+    };
+    let mine = matches!(result.state, codesession::AttributionState::Viewer);
+    match result.attribution {
         Some(att) => json!({
             "path": path,
             "attributed": true,
+            "state": state,
             "session": att.session,
             "tool": att.agent_noun,
             "last_active": att.last_active,
             "last_active_human": humanize_since(&att.last_active),
             "current_task": att.current_task,
-            "mine": viewer == Some(att.session.as_str()),
+            "mine": mine,
         }),
         None => json!({
             "path": path,
             "attributed": false,
+            "state": state,
             "session": Value::Null,
-            "mine": Value::Null,
+            "mine": mine,
         }),
     }
 }
@@ -2814,21 +2842,27 @@ pub fn claim_cmd(root: &Root, path: &str) -> Result<()> {
         bail!("usage: lanius code claim <path>");
     }
     let (session, room) = session_room_identity(root)?;
-    // Canonicalize to the SAME absolute form auto_claim_write uses (BUG B): a manual
-    // `claim src/foo.rs` and the SA3 auto-claim of that file must collapse to ONE row
-    // per session, not a lexical row plus a canonical one double-listing it for a
-    // roommate. A relative manual path resolves against the session's recorded
-    // workdir, mirroring auto-claim's base. Fall back to the trimmed input if the
-    // record/workdir is somehow unavailable (still advisory, never a panic).
-    let workdir = session_auto_claim_room_and_workdir(root, &session).map(|(_, wd)| wd);
-    let claim_path =
-        canonicalize_claim_path(path, workdir.as_deref()).unwrap_or_else(|| path.to_string());
+    let claim_path = resolve_own_claim_path(root, &session, path);
     codesession::add_claim(root, &room, &session, &claim_path)?;
     println!(
         "claimed {claim_path} in room {room} (advisory — your peers will see you are \
 editing it; nothing is locked)"
     );
     Ok(())
+}
+
+/// M2 (coding-session-reliability): the ONE canonicalization resolver `claim` and
+/// `unclaim` both call, so a claim and its later release always target the SAME
+/// stored row. This is the fix for the bug where `claim` canonicalized the path
+/// (the SAME absolute form `auto_claim_write` uses, BUG B) before INSERT but
+/// `unclaim` passed the raw argument straight to `remove_claim` — the DELETE then
+/// missed the canonical row, so releasing honestly reported "removed" nothing while
+/// the claim stayed visible to every reader (own/peer/whose/room views). Falls back
+/// to the trimmed input if the record/workdir is unavailable (still advisory, never
+/// a panic) — `claim` and `unclaim` fall back identically, so they still agree.
+fn resolve_own_claim_path(root: &Root, session: &str, path: &str) -> String {
+    let workdir = session_auto_claim_room_and_workdir(root, session).map(|(_, wd)| wd);
+    canonicalize_claim_path(path, workdir.as_deref()).unwrap_or_else(|| path.to_string())
 }
 
 // ── SA3 (write half): touching a file IS the claim ───────────────────────────
@@ -2964,11 +2998,15 @@ pub fn unclaim_cmd(root: &Root, path: &str) -> Result<()> {
         bail!("usage: lanius code unclaim <path>");
     }
     let (session, room) = session_room_identity(root)?;
-    let removed = codesession::remove_claim(root, &room, &session, path)?;
+    // M2: resolve through the SAME canonicalizer `claim` used, so the DELETE
+    // targets the row the INSERT actually created (an equivalent-spelling arg —
+    // relative vs absolute, a resolvable symlink — now still finds it).
+    let claim_path = resolve_own_claim_path(root, &session, path);
+    let removed = codesession::remove_claim(root, &room, &session, &claim_path)?;
     if removed {
-        println!("released your claim on {path} in room {room}");
+        println!("released your claim on {claim_path} in room {room}");
     } else {
-        println!("(you held no claim on {path} in room {room})");
+        println!("(you held no claim on {claim_path} in room {room})");
     }
     Ok(())
 }
@@ -3462,6 +3500,16 @@ pub fn turn_injection(root: &Root, agent_noun: &str, session: &str) -> Option<St
                 resolve_room(None, Path::new(&workdir))
             }
         });
+    // M2 PHANTOM-CLAIM: reap any confirmed-dead session's room membership + claims
+    // BEFORE reading peer_claims. Without this, a crashed roommate's claims (whose
+    // clean `release_session`/unclaim never ran) sit advertised in a live peer's
+    // turn injection until the next `lanius code` launch or daemon tick reaps them
+    // — a field-observed 30+ minute window. reap_dead_members is reused exactly as
+    // the launch/daemon call sites use it: confirmed-same-host-pid-death only, so a
+    // disconnected-but-alive split-brain session's claims are left untouched.
+    for (reaped_room, reaped_sess) in codesession::reap_dead_members(root) {
+        eprintln!("[code] reaped claims of dead session {reaped_sess} in room {reaped_room}");
+    }
     let peer_claims = if room.is_empty() {
         Vec::new()
     } else {
@@ -10268,6 +10316,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
+    /// Serializes tests that mutate the process-global ENV_SESSION var so they
+    /// don't race each other under the default parallel test runner.
+    static ENV_SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The soft-degrade state machine (docs/handoffs/bus-resilience.md M2): a
     /// down bus warns ONCE per degraded stretch (not per publish — the drip fix),
     /// a recovery emits ONE reconnect line, and a Denied credential is loud on
@@ -15082,6 +15134,356 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
+    // ── M1: whose renders the explicit viewer/other/unknown states ────────────
+
+    #[test]
+    fn whose_line_and_json_render_the_three_explicit_states() {
+        let root = m3_tmp_root();
+        let dir = root.dir.join("whose-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // (c) UNKNOWN: a human-created `.codex/` dir with NO claim — the exact
+        // regression this milestone fixes. Must never read "likely yours".
+        let codex_dir = dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let codex_path = codex_dir.to_string_lossy().into_owned();
+        let line = whose_line(&root, &codex_path, Some("code-whoseview1"));
+        assert!(line.contains("unattributed"), "{line}");
+        assert!(!line.contains("yours"), "{line}");
+        let j = whose_json(&root, &codex_path, Some("code-whoseview1"));
+        assert_eq!(j["state"], "unknown");
+        assert_eq!(j["attributed"], false);
+        assert_eq!(j["mine"], false);
+
+        let room = "room-whose";
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-whoseview1".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: dir.to_string_lossy().into_owned(),
+                room: Some(room.into()),
+            },
+        )
+        .unwrap();
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-whosepeer2".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: dir.to_string_lossy().into_owned(),
+                room: Some(room.into()),
+            },
+        )
+        .unwrap();
+
+        // (a) VIEWER: the viewer's own present claim -> "yours" / state:"viewer".
+        let mine_path = dir.join("mine.rs");
+        std::fs::write(&mine_path, b"// x").unwrap();
+        let mine_path = std::fs::canonicalize(&mine_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        codesession::add_claim(&root, room, "code-whoseview1", &mine_path).unwrap();
+        let line = whose_line(&root, &mine_path, Some("code-whoseview1"));
+        assert!(line.contains("yours"), "{line}");
+        let j = whose_json(&root, &mine_path, Some("code-whoseview1"));
+        assert_eq!(j["state"], "viewer");
+        assert_eq!(j["mine"], true);
+        assert_eq!(j["session"], "code-whoseview1");
+
+        // (b) OTHER: only a peer's claim -> "claimed by <peer>", NEVER "yours".
+        let theirs_path = dir.join("theirs.rs");
+        std::fs::write(&theirs_path, b"// x").unwrap();
+        let theirs_path = std::fs::canonicalize(&theirs_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        codesession::add_claim(&root, room, "code-whosepeer2", &theirs_path).unwrap();
+        let line = whose_line(&root, &theirs_path, Some("code-whoseview1"));
+        assert!(line.contains("claimed by code-whosepeer2"), "{line}");
+        assert!(!line.contains("yours"), "{line}");
+        let j = whose_json(&root, &theirs_path, Some("code-whoseview1"));
+        assert_eq!(j["state"], "other");
+        assert_eq!(j["mine"], false);
+        assert_eq!(j["session"], "code-whosepeer2");
+
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M2: one claim/unclaim resolver, every reader agrees after release ─────
+
+    #[test]
+    fn claim_then_unclaim_removes_the_row_and_every_reader_agrees() {
+        // BUG: claim_cmd canonicalized before INSERT but unclaim_cmd passed the raw
+        // arg to remove_claim, missing the stored row — the release "succeeded" but
+        // left the claim visible to every reader. Exercise the real CLI verbs and
+        // assert own_claims/peer_claims/whose_path ALL agree it is gone, not just
+        // unclaim_cmd's own success message.
+        let _env = ENV_SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = m3_tmp_root();
+        let workdir = root.dir.join("m2-lifecycle-proj");
+        std::fs::create_dir_all(workdir.join("src")).unwrap();
+        std::fs::write(workdir.join("src/foo.rs"), b"// x").unwrap();
+        let workdir = std::fs::canonicalize(&workdir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let room = "room-m2-lifecycle";
+        for sess in ["code-m2owner01", "code-m2peer002"] {
+            codesession::upsert_record(
+                &root,
+                &codesession::SessionRecord {
+                    elanus_session: sess.into(),
+                    native_session: "n".into(),
+                    tool: "codex".into(),
+                    agent_noun: "codex".into(),
+                    workdir: workdir.clone(),
+                    room: Some(room.into()),
+                },
+            )
+            .unwrap();
+        }
+        let want = std::fs::canonicalize(Path::new(&workdir).join("src/foo.rs"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        std::env::set_var(ENV_SESSION, "code-m2owner01");
+        claim_cmd(&root, "src/foo.rs").unwrap();
+        std::env::remove_var(ENV_SESSION);
+
+        // Before release: visible to own_claims, a roommate's peer_claims, AND
+        // whose_path — the coordination-relevant readers.
+        assert_eq!(
+            codesession::own_claims(&root, room, "code-m2owner01")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(codesession::peer_claims(&root, room, "code-m2peer002")
+            .unwrap()
+            .iter()
+            .any(|c| c.session == "code-m2owner01" && c.path == want));
+        assert_eq!(
+            codesession::whose_path(&root, &want).unwrap().session,
+            "code-m2owner01"
+        );
+
+        std::env::set_var(ENV_SESSION, "code-m2owner01");
+        unclaim_cmd(&root, "src/foo.rs").unwrap();
+        std::env::remove_var(ENV_SESSION);
+
+        // After release: gone from every reader — not just an honest-sounding
+        // message with the row still stuck.
+        assert!(codesession::own_claims(&root, room, "code-m2owner01")
+            .unwrap()
+            .is_empty());
+        assert!(codesession::peer_claims(&root, room, "code-m2peer002")
+            .unwrap()
+            .is_empty());
+        assert!(codesession::whose_path(&root, &want).is_none());
+        let result = codesession::whose_path_for_viewer(&root, &want, Some("code-m2owner01"));
+        assert_eq!(result.state, codesession::AttributionState::Unknown);
+
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn claim_and_unclaim_agree_across_equivalent_spellings() {
+        // A relative claim and an absolute unclaim (or vice versa) must resolve to
+        // the SAME canonical row, since both now go through resolve_own_claim_path.
+        let _env = ENV_SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = m3_tmp_root();
+        let workdir = root.dir.join("m2-spelling-proj");
+        std::fs::create_dir_all(workdir.join("src")).unwrap();
+        std::fs::write(workdir.join("src/bar.rs"), b"// x").unwrap();
+        let workdir = std::fs::canonicalize(&workdir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let room = "room-m2-spelling";
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-m2spell01".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: workdir.clone(),
+                room: Some(room.into()),
+            },
+        )
+        .unwrap();
+        let abs_path = Path::new(&workdir)
+            .join("src/bar.rs")
+            .to_string_lossy()
+            .into_owned();
+
+        std::env::set_var(ENV_SESSION, "code-m2spell01");
+        claim_cmd(&root, "src/bar.rs").unwrap(); // relative
+        std::env::remove_var(ENV_SESSION);
+        assert_eq!(
+            codesession::own_claims(&root, room, "code-m2spell01")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        std::env::set_var(ENV_SESSION, "code-m2spell01");
+        unclaim_cmd(&root, &abs_path).unwrap(); // absolute
+        std::env::remove_var(ENV_SESSION);
+        assert!(
+            codesession::own_claims(&root, room, "code-m2spell01")
+                .unwrap()
+                .is_empty(),
+            "an equivalent-spelling unclaim must still find and remove the claimed row"
+        );
+
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn unclaim_never_touches_a_different_live_sessions_claim_on_the_same_path() {
+        let _env = ENV_SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = m3_tmp_root();
+        let workdir = root.dir.join("m2-untouch-proj");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(workdir.join("shared.rs"), b"// x").unwrap();
+        let workdir = std::fs::canonicalize(&workdir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let room = "room-m2-untouch";
+        for sess in ["code-m2a00001", "code-m2b00002"] {
+            codesession::upsert_record(
+                &root,
+                &codesession::SessionRecord {
+                    elanus_session: sess.into(),
+                    native_session: "n".into(),
+                    tool: "codex".into(),
+                    agent_noun: "codex".into(),
+                    workdir: workdir.clone(),
+                    room: Some(room.into()),
+                },
+            )
+            .unwrap();
+        }
+
+        std::env::set_var(ENV_SESSION, "code-m2a00001");
+        claim_cmd(&root, "shared.rs").unwrap();
+        std::env::remove_var(ENV_SESSION);
+
+        std::env::set_var(ENV_SESSION, "code-m2b00002");
+        claim_cmd(&root, "shared.rs").unwrap();
+        unclaim_cmd(&root, "shared.rs").unwrap(); // B releases its OWN claim
+        std::env::remove_var(ENV_SESSION);
+
+        // A's claim on the identical path survives untouched; only B's row is gone.
+        assert_eq!(
+            codesession::own_claims(&root, room, "code-m2a00001")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(codesession::own_claims(&root, room, "code-m2b00002")
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // ── M2 PHANTOM-CLAIM: reap a dead peer's claims at the advertise boundary ──
+
+    #[test]
+    fn turn_injection_reaps_a_dead_peers_phantom_claims_before_advertising() {
+        // Field bug: a crashed session's claims were advertised to peers 30+ minutes
+        // after death, because peer_claims read with no reap first. Confirmed-dead
+        // (pid gone) must be reaped right before the read; a disconnected-but-alive
+        // split brain must NOT be reaped (M3 safety rule, reap_dead_members).
+        let root = m3_tmp_root();
+        let dead_pid = 0x7fff_fffe; // not a live pid on any sane system
+        let live_pid = std::process::id() as i32;
+        let room = "room-phantom";
+
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-phdead0001".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                // Distinct workdirs per session so SA2's workdir-sibling roster
+                // (an unrelated advisory surface) never folds them together — this
+                // test isolates the ROOM-based claim-advertising boundary only.
+                workdir: "/tmp/phantom-dead-wd".into(),
+                room: Some(room.into()),
+            },
+        )
+        .unwrap();
+        codesession::join_room(&root, room, "code-phdead0001", "codex", dead_pid).unwrap();
+        codesession::add_claim(&root, room, "code-phdead0001", "dead-claim.rs").unwrap();
+
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-phsplit002".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp/phantom-split-wd".into(),
+                room: Some(room.into()),
+            },
+        )
+        .unwrap();
+        codesession::join_room(&root, room, "code-phsplit002", "codex", live_pid).unwrap();
+        codesession::set_connected(&root, "code-phsplit002", false).unwrap();
+        codesession::add_claim(&root, room, "code-phsplit002", "split-claim.rs").unwrap();
+
+        codesession::upsert_record(
+            &root,
+            &codesession::SessionRecord {
+                elanus_session: "code-phviewer03".into(),
+                native_session: "n".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/tmp/phantom-viewer-wd".into(),
+                room: Some(room.into()),
+            },
+        )
+        .unwrap();
+        codesession::join_room(&root, room, "code-phviewer03", "codex", live_pid).unwrap();
+
+        // Sanity: before any reap runs, the dead peer's claim is still on the
+        // ledger (the field scenario — no launch/tick has swept it yet).
+        assert!(codesession::peer_claims(&root, room, "code-phviewer03")
+            .unwrap()
+            .iter()
+            .any(|c| c.session == "code-phdead0001"));
+
+        let inj = turn_injection(&root, "codex", "code-phviewer03").unwrap();
+        assert!(
+            !inj.contains("dead-claim.rs")
+                && !inj.contains("code-phdead0001 is editing"),
+            "a confirmed-dead peer's claim must never be advertised into a live turn: {inj}"
+        );
+        assert!(
+            inj.contains("code-phsplit002 is editing split-claim.rs"),
+            "a disconnected-but-alive (split-brain) peer's claim must still be advertised: {inj}"
+        );
+
+        // The dead peer's row is actually gone (reaped), not merely filtered out of
+        // this one render.
+        assert!(codesession::own_claims(&root, room, "code-phdead0001")
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
     #[test]
     fn sa3_blank_and_no_record_paths_stay_safe_noops() {
         // Guardrail (unchanged): blank/whitespace paths and a missing record both
@@ -16059,6 +16461,7 @@ mod tests {
     fn ask_dead_target_returns_immediately_not_a_block() {
         // The M5 pre-check: asking a CONFIRMED-DEAD session must fail fast with a
         // clear message pointing at async `deliver`, NOT block to the timeout.
+        let _env = ENV_SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = delivery_tmp_root();
         let dead_pid = 0x7fff_fffe; // gone on any sane host
         codesession::upsert_record(

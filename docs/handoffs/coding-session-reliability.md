@@ -1,5 +1,5 @@
 ---
-status: planned
+status: done
 author: Terra/high planner (Codex)
 last-updated: 2026-07-11
 ---
@@ -117,6 +117,22 @@ projection.
   `mailcli::room_claims`/`lanius code rooms`.
 - Retain crash cleanup in `reap_dead_members`; it is a separate lifecycle exit
   that must use the same table semantics.
+- **Phantom-claim expiry at the advertise boundary (field-evidence addition, see
+  Log 2026-07-11).** `reap_dead_members` (`codesession.rs` ~1463) already deletes
+  a *confirmed-dead* session's claims, but it only runs on a new `lanius code`
+  launch (`codeagent.rs` ~4074) and the daemon tick (`dispatcher.rs` ~208). The
+  turn-injection builder (`codeagent.rs` ~3465) reads `peer_claims` **directly,
+  with no reap first**, so a crashed session's advisory claims keep getting
+  injected into its roommates' turns until the next launch/tick — the observed
+  30+-minute phantom-claim window for `code-d94cac68`. Call `reap_dead_members`
+  once immediately before the `peer_claims` read in that injection path so a
+  confirmed-dead session's claims are never advertised, even before a launch or
+  tick fires. Reuse the existing `reap_dead_members` (no new table, no new cache);
+  keep its split-brain safety intact — it reaps only on a confirmed same-host pid
+  death and leaves a disconnected-but-alive (split-brain) session's claims alone.
+  This is the smallest coherent addition; the credential/adapter defects in
+  `docs/bugs/claude-code-adapter-summary-credential-crash.md` are the larger,
+  out-of-scope fix.
 
 **Acceptance:**
 
@@ -130,6 +146,12 @@ projection.
   permits it).
 - A claim made by another live session remains untouched by this session's
   unclaim attempt.
+- **Phantom-claim expiry.** Seed a room where a peer session holds claims but its
+  `code_room_members.owner_pid` is a confirmed-dead pid; the very next turn
+  injection for a live roommate advertises **no** peer claim from that dead
+  session (it was reaped at the advertise boundary). A disconnected peer whose pid
+  is still alive (split brain) keeps its claims advertised — liveness, not mere
+  disconnection, is the reap trigger.
 
 ### M3 -- Conflict-tolerant dev ports by default
 
@@ -209,6 +231,31 @@ skills tree, or connect it to packages, profiles, grants, or runtime discovery.
 
 ## Log
 
+- 2026-07-11 -- **Phase B planner (Fable's planner) pickup — anchors re-verified
+  post-keystone, M2 extended.** Phase A (M3+M4) is committed (`2d3eaaa`) and the
+  worker-dm-unification keystone is committed (`107c332`), so `src/codeagent.rs` /
+  `src/codesession.rs` / `src/main.rs` are cold; tree is clean (only `.chainlink/`
+  + `.codex/` untracked). Re-checked every M1/M2 line anchor after the keystone:
+  `codeagent.rs` all hold exactly — `whose_cmd` 2597, `whose_line` 2671,
+  `whose_json` 2692, `claim_cmd` 2811, `canonicalize_claim_path` 2889,
+  `auto_claim_write` 2915, `unclaim_cmd` 2961. `codesession.rs`: `add_claim` 1182,
+  `remove_claim` 1206, `peer_claims` 1223, `whose_path` 1350 hold; only
+  `own_claims` drifted to **1433** (was cited ~1230). M1/M2 acceptance clauses are
+  concrete; no sharpening needed beyond the phantom addition below.
+- 2026-07-11 -- **Field-evidence fold-in: phantom claims from dead sessions (M2
+  extension).** `docs/bugs/claude-code-adapter-summary-credential-crash.md` records
+  `code-d94cac68` crashing with 12 live edit claims still advertised to peers 30+
+  minutes later. Read the code: `reap_dead_members` already deletes a
+  confirmed-dead session's claims and runs on new-launch (`codeagent.rs` ~4074) +
+  daemon tick (`dispatcher.rs` ~208), but the turn-injection builder
+  (`codeagent.rs` ~3465) reads `peer_claims` with **no reap first**, so phantom
+  claims persist until the next launch/tick. M2 previously only said "retain
+  `reap_dead_members`" — it did **not** cover the advertise boundary. Extended M2
+  with the smallest coherent addition: reap once before the `peer_claims`
+  injection read, reusing existing `reap_dead_members` (no new table/cache),
+  preserving its confirmed-pid-death-only / split-brain-safe semantics. Added a
+  matching acceptance clause. The credential/adapter defects in the same bug doc
+  are the larger out-of-scope fix and are NOT part of this sprint.
 - 2026-07-11 -- **Sol stop state / Fable pickup.** Durable sprint state is in
   Chainlink milestone `#1`: dev-lifecycle spike `#1`, this planning task `#2`,
   and cross-harness async model/effort controls `#3`. Terra/high planner Dirac
