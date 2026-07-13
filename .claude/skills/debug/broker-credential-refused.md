@@ -6,6 +6,10 @@ every few seconds:
 ```
 [bus] CONNECT refused: bad credential for identity "owner"
 ```
+or:
+```
+[bus] CONNECT refused: bad token / unknown identity (user Some("resident-gate"))
+```
 `<name>` is usually `owner` but can be any human/kernel identity.
 
 ## What it means
@@ -20,6 +24,10 @@ client then retries on its keepalive, which is why the line *repeats*.
 So a steady stream of refusals means **some client keeps connecting with the wrong
 secret for that identity.**
 
+For a package/resident name such as `resident-gate`, `bad token / unknown identity`
+means the broker did not recognize the supervisor-minted package token for that
+connection. That is still a refused CONNECT, not broker authority leakage.
+
 ## Most common cause: a stray client on the wrong root
 A process is connecting to *this* broker while holding a *different* root's owner
 secret. The classic source is an **orphaned `lanius web` (or daemon) left by a
@@ -32,6 +40,11 @@ secret)`), so it never recovers — it just reconnect-loops forever.
 Less common: a rotated/restored `.secrets` out of sync with running clients, or a
 real client genuinely misconfigured with the wrong `--root`.
 
+For `resident-*` package names, the common source is an orphaned daemon-mode
+package from `tests/e2e.sh` whose temp package root was removed while its shell
+loop kept running. Its own stderr may grow quickly under
+`/private/tmp/<root>/run/pkg-<name>/err.log`.
+
 ## Diagnose
 1. Watch the rate: `tail -f ~/.lanius/root/lanius-serve.log` (or your serve log).
 2. Enumerate and split legit vs stray (see SKILL.md):
@@ -40,6 +53,8 @@ real client genuinely misconfigured with the wrong `--root`.
    ```
    Legit stack is under your real root (`serve` → `daemon` → `web`). Suspects are
    `lanius web`/`daemon` on a `/tmp` or `/private/tmp` root (often `ppid 1`).
+   Also look for orphaned daemon packages such as
+   `/private/tmp/.../packages/resident-gate/scripts/main`.
 3. Confirm a stray is the culprit (optional, very convincing): kill ONE stray and
    watch the refusal rate in the log drop. Starting a foreign-root `lanius web` on
    `:1883` makes the rate jump; killing it restores baseline.

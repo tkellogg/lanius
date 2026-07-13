@@ -62,7 +62,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 #[derive(Debug)]
@@ -143,6 +143,13 @@ enum ConnectId {
     Refused(&'static str),
 }
 
+const CONNECT_REFUSAL_LOG_SECS: u64 = 10;
+
+struct ConnectRefusalLog {
+    last: Instant,
+    suppressed: u64,
+}
+
 struct SessionRec {
     sink: v5::MqttSink,
     subs: Vec<SubRec>,
@@ -202,6 +209,9 @@ struct Broker {
     /// Registration sequence counter (ordering tiebreak).
     reg_seq: Cell<u64>,
     next_key: Cell<u64>,
+    /// Repeated bad CONNECT attempts are usually one broken/stray client in a
+    /// retry loop. Log the first refusal, then summarize per reason+username.
+    connect_refusals: RefCell<HashMap<(&'static str, Option<String>), ConnectRefusalLog>>,
 }
 
 impl Broker {
@@ -223,6 +233,7 @@ impl Broker {
             pending_verdicts: RefCell::new(HashMap::new()),
             reg_seq: Cell::new(1),
             next_key: Cell::new(1),
+            connect_refusals: RefCell::new(HashMap::new()),
         };
         // A fresh broker has zero resident registrations by construction;
         // clear any stale active-points row a crashed daemon left behind so
@@ -301,6 +312,47 @@ impl Broker {
             }
         } else {
             ConnectId::Refused("bad token / unknown identity")
+        }
+    }
+
+    fn connect_refusal_log_line(&self, why: &'static str, user: Option<&str>) -> Option<String> {
+        self.connect_refusal_log_line_at(why, user, Instant::now())
+    }
+
+    fn connect_refusal_log_line_at(
+        &self,
+        why: &'static str,
+        user: Option<&str>,
+        now: Instant,
+    ) -> Option<String> {
+        let key = (why, user.map(String::from));
+        let mut refusals = self.connect_refusals.borrow_mut();
+        let Some(entry) = refusals.get_mut(&key) else {
+            refusals.insert(
+                key,
+                ConnectRefusalLog {
+                    last: now,
+                    suppressed: 0,
+                },
+            );
+            return Some(format!("[bus] CONNECT refused: {why} (user {user:?})"));
+        };
+        if now.checked_duration_since(entry.last).unwrap_or_default()
+            < Duration::from_secs(CONNECT_REFUSAL_LOG_SECS)
+        {
+            entry.suppressed += 1;
+            return None;
+        }
+
+        let suppressed = entry.suppressed;
+        entry.last = now;
+        entry.suppressed = 0;
+        if suppressed == 0 {
+            Some(format!("[bus] CONNECT refused: {why} (user {user:?})"))
+        } else {
+            Some(format!(
+                "[bus] CONNECT refused: {why} (user {user:?}; suppressed {suppressed} repeat(s) since last log)"
+            ))
         }
     }
 
@@ -591,10 +643,9 @@ async fn handshake(
                 kind,
             } => (actor, sender, kind),
             ConnectId::Refused(why) => {
-                eprintln!(
-                    "[bus] CONNECT refused: {why} (user {:?})",
-                    pkt.username.as_deref()
-                );
+                if let Some(line) = st.connect_refusal_log_line(why, pkt.username.as_deref()) {
+                    eprintln!("{line}");
+                }
                 return Ok(h.failed(v5::codec::ConnectAckReason::NotAuthorized));
             }
         };
@@ -1508,6 +1559,7 @@ mod tests {
     use crate::paths::Root;
     use crate::sandbox::{ReadCameraStatus, TierStatus};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     fn tmp_root() -> Root {
         static N: AtomicUsize = AtomicUsize::new(0);
@@ -1686,11 +1738,7 @@ mod tests {
         // Fenced secrets for a human (owner) and the kernel.
         std::fs::create_dir_all(root.secrets()).unwrap();
         std::fs::write(root.secrets().join("owner"), "owner-secret").unwrap();
-        std::fs::write(
-            root.secrets().join(crate::secrets::KERNEL),
-            "kernel-secret",
-        )
-        .unwrap();
+        std::fs::write(root.secrets().join(crate::secrets::KERNEL), "kernel-secret").unwrap();
 
         let b = Broker::new(root);
         // A supervisor-minted package actor in the in-memory map.
@@ -1753,6 +1801,45 @@ mod tests {
             b.resolve_connect(Some("owner"), None),
             ConnectId::Refused(_)
         ));
+    }
+
+    #[test]
+    fn repeated_connect_refusals_are_rate_limited_per_reason_and_user() {
+        let root = tmp_root();
+        let b = Broker::new(root);
+        let t0 = std::time::Instant::now();
+        let why = "bad token / unknown identity";
+
+        let first = b
+            .connect_refusal_log_line_at(why, Some("resident-gate"), t0)
+            .unwrap();
+        assert_eq!(
+            first,
+            "[bus] CONNECT refused: bad token / unknown identity (user Some(\"resident-gate\"))"
+        );
+        assert!(b
+            .connect_refusal_log_line_at(why, Some("resident-gate"), t0 + Duration::from_secs(1))
+            .is_none());
+        assert!(b
+            .connect_refusal_log_line_at(why, Some("resident-gate"), t0 + Duration::from_secs(2))
+            .is_none());
+
+        let summary = b
+            .connect_refusal_log_line_at(why, Some("resident-gate"), t0 + Duration::from_secs(10))
+            .unwrap();
+        assert!(
+            summary.contains("suppressed 2 repeat(s) since last log"),
+            "{summary}"
+        );
+
+        let other_user = b
+            .connect_refusal_log_line_at(why, Some("resident-guard"), t0 + Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            other_user.contains("user Some(\"resident-guard\")")
+                && !other_user.contains("suppressed"),
+            "{other_user}"
+        );
     }
 
     #[test]
