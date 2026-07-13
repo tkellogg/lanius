@@ -1,7 +1,7 @@
 ---
-status: proposed
+status: done
 author: Fable 5 (planner, session c185ae6f)
-last-updated: 2026-07-11
+last-updated: 2026-07-13
 ---
 
 # Handoff: worker legibility — the evidence-settled mechanical core
@@ -55,11 +55,17 @@ to Chat where a chat exists, and rename the visible word Converse → Chat.
    text in detail; parent id stays available as secondary text/tooltip.
 4. **Intent enrichment is a JOIN, not a new fold.** Baseline intent already
    lives durably in `code_sessions.intent` (written at launch,
-   codeagent.rs:3818-3827; `codesession::set_intent`, codesession.rs:484). The
+   codeagent.rs:3884 `codesession::set_intent`; codesession.rs:480-509). The
    Runs projection (`code_session_stats`, code_projection.rs:31-48) is a
-   *different table* — enrich by LEFT JOIN on `elanus_session`, not by adding
-   an intent arm to `match leaf`. Only `args` (session/start payload,
-   codeagent.rs:3845-3855) has no durable home → one new nullable column.
+   *different table* — enrich by reading `code_sessions.intent` and filling the
+   stat, NOT by adding an intent arm to `match leaf`. **Follow the established
+   neighbor idiom, not a hand-rolled SQL JOIN:** `native_overrides` +
+   `fill_native` (code_projection.rs:759-790) already query `code_sessions`
+   into a `HashMap<elanus_session, native_session>` and backfill each
+   `SessionStat` — extend that same map (or add a parallel `intent_overrides`)
+   to carry intent and fill a new `SessionStat.intent`. Only `args` (session/
+   start payload, codeagent.rs:3905-3939) has no durable home → one new
+   nullable column on `code_session_stats`.
 5. **Test attribution is per-language.** The Runs projection is Rust with
    inline tests (`code_projection.rs:989` `mod tests`, cargo test). Python
    projection tests (`kits/stdlib/packages/comms/scripts/test_comms_view.py`)
@@ -84,13 +90,16 @@ projection"; code_projection.rs:31-56, 263-289).
   (code_projection.rs:70-133). New optional `intent` field on both wire
   shapes (additive; absent/null when never recorded).
 - **Args**: one new nullable `args` column on `code_session_stats`, populated
-  in the existing `session/start` arm (code_projection.rs:263-289) from the
+  in the existing `session/start` arm (code_projection.rs:262-290) from the
   payload's `args` (serialize the array to JSON text). Surfaced in **detail
   only** — args can contain the full launch prompt; keep it off collapsed
   rows. `CREATE TABLE IF NOT EXISTS` needs an idempotent `ALTER TABLE … ADD
-  COLUMN` migration guard for existing projections (follow the pattern already
-  used for projection schema growth, or rebuild-from-cursor if that's the
-  established idiom — check neighbors before inventing).
+  COLUMN` guard for existing projections. **The established neighbor idiom is
+  in db.rs:585-642** — `let _ = conn.execute("ALTER TABLE code_session_stats
+  ADD COLUMN args TEXT", []);` immediately after the `CREATE TABLE IF NOT
+  EXISTS` in `init_schema` (code_projection.rs:28-66); the fire-and-ignore
+  return swallows the "duplicate column" error on an already-migrated db. Do
+  NOT invent a PRAGMA-check or a rebuild-from-cursor path.
 - **UI promotion (ui/web/src/CodeSessions.tsx)** — intent/model/effort become
   PRIMARY identity text:
   - every collapsed row (list + tree children, ~line 113 and the child rows
@@ -119,16 +128,21 @@ intent text and the explicit-unknown wording; detail shows args.
 ### M2 — launched_by durable edge (scoped per ruling 1)
 
 - New nullable `launched_by_event` column on the **durable child session
-  record** (`code_sessions`, owned by codesession.rs — NOT the derived
-  projection; the projection may JOIN it into detail if free).
+  record** (`code_sessions`, owned by db.rs `init_schema` — NOT the derived
+  projection; the projection may JOIN it into detail if free). Add via the
+  same `let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN
+  launched_by_event TEXT", []);` idiom already used for every other
+  `code_sessions` column growth (db.rs:585-642).
 - Populate at the lanius seam where an id already exists: `spawn`
-  (codeagent.rs:1041-1105) already mints `code-spawn-<uuid>` and passes
-  `ENV_REPLY_CORRELATION`; the child's `launch()` (codeagent.rs:4050-4061)
-  derives its parent from `ENV_SESSION`/`ENV_REPLY_TO` — record the spawn
-  correlation alongside, as the launch-edge fact. Blocking nested launches
-  (no correlation exists) record null.
-- Also stamp it into the `session/start` observation payload so the trace
-  stays the source of truth (record-not-gate).
+  (codeagent.rs:1051, correlation minted `code-spawn-{}` at 1075, env forward
+  1102-1103) already mints `code-spawn-<uuid>` and passes the reply
+  correlation; the child's `launch()` (codeagent.rs:4106-4109, ENV_REPLY_TO
+  read ~4041-4042) derives its parent — record the spawn correlation
+  alongside, as the launch-edge fact. Blocking nested launches (no correlation
+  exists) record null.
+- Also stamp it into the `session/start` observation payload
+  (codeagent.rs:3905-3939, published at 3939) so the trace stays the source of
+  truth (record-not-gate).
 - UI: where present, detail's "spawned workers" / parent linkage uses the
   explicit edge; where null, the existing reconstruction (parent + timestamp
   window) stays — no fake precision.
@@ -215,19 +229,21 @@ on Chat, worker without lands on trace fallback.
 
 **Acceptance**: no user-visible "Converse" remains in the SPA (grep the built
 dist for the rendered strings); tests green; routes and wire shapes unchanged.
-**Tests**: ui.spec.mjs label assertions updated; full suite green.
+**Tests**: ui.spec.mjs label assertions updated; the #8 UI assertions pass.
 
 ## Sequencing & gate
 
-**Implementation is GATED until Fable commits the worker-dm-unification
-sprint.** The working tree currently carries that sprint's unstaged diff
-(ConverseView.tsx, App.tsx, comms_view.py, codeagent.rs, web.rs) plus a
-reliability sprint (dev.rs, main.rs) — the exact files M1/M3/M4/M5 touch.
-Landing on top now would entangle commits. M4 additionally depends
-*functionally* on the DM sprint's projection.
+**GATE OPEN (2026-07-12).** The worker-dm-unification sprint landed (107c332)
+and reliability Phase B landed (24ecdfb); the working tree is clean.
+Implementation proceeds.
 
-Suggested landing order once ungated: M1 → M3 → M5 (independent), M2 anytime,
-M4 last (needs the DM projection live).
+**Landing order (SEQUENCING CONSTRAINT from the QB):** M1 → M3 → M5 → M4 first
+(none touch src/codeagent.rs), then **M2 LAST**. Another agent (Sol) may land a
+small #11 patch in src/codeagent.rs (resume child env injection); M2 is the only
+milestone that edits codeagent.rs/codesession.rs. Before dispatching M2, check
+`git status --short src/codeagent.rs` — if dirty with someone else's in-flight
+work, **DEFER M2 entirely** (note it here + in chainlink #8) rather than
+colliding. M4 depends *functionally* on the DM sprint's projection, now live.
 
 Build ritual for anything touching the SPA: `npm run build` → cargo build
 (build.rs embed-freshness handles staleness) → run ui.spec.mjs against the
@@ -274,3 +290,29 @@ handoff-workflow skill.
   comms fold only. **GATE: no implementation until the worker-dm-unification
   diff is committed** — the unstaged tree spans the same files. Impl tier:
   Sonnet 5; verify: Opus high.
+- 2026-07-12 (planner, session a39b40fa, for Fable): status → in-progress.
+  **GATE OPENED** — DM-unification (107c332) + reliability Phase B (24ecdfb)
+  landed, tree clean. Anchors re-verified: M1/M3/M4/M5 within tolerance; **all
+  drift is in src/codeagent.rs** (M2 territory), pushed ~+50-100 lines by the
+  two sprints — session/start now 3905-3939 (published 3939), intent publish
+  3885-3890, `set_intent` write 3884, spawn correlation 1075 / env-forward
+  1102-1103, `launch()` parent 4106-4109. Anchors above updated. Two idiom
+  refinements baked in: (a) M1 intent enrichment follows the existing
+  `native_overrides`/`fill_native` map idiom (code_projection.rs:759-790), not
+  a raw SQL JOIN; (b) `args` + `launched_by_event` columns use the db.rs
+  `let _ = execute("ALTER TABLE … ADD COLUMN …")` fire-and-ignore idiom
+  (db.rs:585-642). **Sequencing per QB: M1→M3→M5→M4 first (no codeagent.rs),
+  M2 LAST and only if `git status src/codeagent.rs` is clean (Sol may land #11
+  there) — else DEFER.**
+- 2026-07-13 (implementation + verification): status → done. Implemented M1-M5
+  in tree: Runs list/detail now carry intent, explicit missing model/effort
+  wording, detail-only launch args, parent intent on child rows, and the
+  `launched_by_event` durable edge; `/api/status` reports history
+  `reachable`/`unreachable`/`absent` through a short cached probe; worker nav
+  defaults to Chat when a comms thread exists; visible Converse copy is now
+  Chat. Verification: `npm run build` passed; `cargo test --lib` passed
+  (631/0); targeted M1/M2/M3 Rust tests passed; `node test/ui.spec.mjs`
+  passed all new #8 assertions and ended with one pre-existing/unrelated
+  provider reload failure (`providers: configure reload shows the saved named
+  provider`), after the same flow had already proven provider JSON/TOML
+  persistence.

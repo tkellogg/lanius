@@ -3,7 +3,13 @@ import { IconButton } from '../components/primitives';
 import { relativeTime } from '../lib/format';
 import { isWorkerAgentName, isWorkerSessionId } from '../lib/conversation';
 
-function Nav({ agents, panelAgents, conversations, sel, historyOk, selectAgent, openConversation, selectSignals, selectSetup, selectCodeSessions, selectComms, selectProviders, navOpen, setNavOpen, exploreLabel }: any) {
+function historyHint(historyState: string | null | undefined): string {
+  if (historyState === 'absent') return 'History is not running. Start or allow it to use transcripts.';
+  if (historyState === 'unreachable') return 'History is allowed but not answering. Restart it to use transcripts.';
+  return 'History is unavailable right now.';
+}
+
+function Nav({ agents, panelAgents, conversations, sel, historyOk, historyState, selectAgent, openConversation, selectSignals, selectSetup, selectCodeSessions, selectComms, selectProviders, navOpen, setNavOpen, exploreLabel }: any) {
   // helper-first-encounter H4 (wonky bit 2): a profile presented in a dedicated
   // surface (`[ui] surface = "panel"`, e.g. the helper) never appears as an
   // agent-list row. Filter by that GENERIC property — passed down as a set of
@@ -73,13 +79,13 @@ function Nav({ agents, panelAgents, conversations, sel, historyOk, selectAgent, 
           <details id="nav-workers" className="nav-workers">
             <summary><span>workers</span><span className="nav-worker-count">{workerCount}</span></summary>
             <div className="nav-worker-list">
-              {workerItems.map((name) => <button key={name} className="nav-item nav-worker" onClick={() => selectAgent(name, 'telemetry')}><span>{name}</span><span className="nav-convo-meta">{agents.get(name)?.sessions?.size ?? 0} run{(agents.get(name)?.sessions?.size ?? 0) === 1 ? '' : 's'}</span></button>)}
+              {workerItems.map((name) => <button key={name} className="nav-item nav-worker" onClick={() => selectAgent(name)}><span>{name}</span><span className="nav-convo-meta">{agents.get(name)?.sessions?.size ?? 0} run{(agents.get(name)?.sessions?.size ?? 0) === 1 ? '' : 's'}</span></button>)}
             </div>
           </details>
         )}
         <button id="nav-new-agent" className="nav-item nav-new" onClick={() => selectSetup()}><span className="nav-sigil">＋</span> new agent</button>
       </div>
-      <div id="history-hint" className="nav-hint nav-foot" hidden={historyOk !== false}>transcripts unavailable — live view only</div>
+      <div id="history-hint" className="nav-hint nav-foot" hidden={historyOk !== false}>{historyHint(historyState)}</div>
     </nav>
   );
 }

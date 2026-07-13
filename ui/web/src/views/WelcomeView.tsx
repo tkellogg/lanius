@@ -1,6 +1,12 @@
 import AgentChip from '../components/AgentChip';
 
-function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, selectSetup, selectSignals }: any) {
+function historyHint(historyState: string | null | undefined): string {
+  if (historyState === 'absent') return 'History is not running. Start or allow it to use transcripts.';
+  if (historyState === 'unreachable') return 'History is allowed but not answering. Restart it to use transcripts.';
+  return 'History is unavailable right now.';
+}
+
+function WelcomeView({ hidden, primary, historyOk, historyState, systemStatus, selectAgent, selectSetup, selectSignals }: any) {
   const healthy = systemStatus?.credential === 'present' && (systemStatus?.broker_connected || false);
   return (
     <div id="view-welcome" className="view" hidden={hidden}>
@@ -17,7 +23,7 @@ function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, se
               <div className="welcome-agent-row">
                 <AgentChip name={primary} size="md" />
                 <span className="welcome-agent-name">{primary}</span>
-                <button onClick={() => selectAgent(primary, 'converse')}>converse with {primary}</button>
+                <button onClick={() => selectAgent(primary, 'converse')}>chat with {primary}</button>
                 <button className="ghost" onClick={() => selectAgent(primary, 'configure')}>configure</button>
               </div>
             </>
@@ -27,7 +33,7 @@ function WelcomeView({ hidden, primary, historyOk, systemStatus, selectAgent, se
           <button id="welcome-new" className="ghost" onClick={() => selectSetup()}>＋ guided setup</button>
           <button id="welcome-signals" className="ghost" onClick={selectSignals}>◮ activity</button>
         </div>
-        {historyOk === false && <p id="welcome-hint" className="dim-note">transcripts are unavailable until the history view is on.</p>}
+        {historyOk === false && <p id="welcome-hint" className="dim-note">{historyHint(historyState)}</p>}
       </div>
     </div>
   );

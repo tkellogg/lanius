@@ -518,7 +518,11 @@ pub fn set_intent_if_absent(root: &Root, session: &str, intent: &str) -> Result<
         )
         .ok()
         .flatten();
-    if existing.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+    if existing
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
         return Ok(()); // already has a baseline intent — the launch task wins
     }
     set_intent(root, session, intent)
@@ -530,6 +534,45 @@ pub fn get_intent(root: &Root, session: &str) -> Option<String> {
     let _ = crate::db::init_schema(&conn);
     conn.query_row(
         "SELECT intent FROM code_sessions WHERE elanus_session = ?1",
+        [session],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .filter(|s| !s.trim().is_empty())
+}
+
+/// Record the explicit launch event/correlation for a spawned worker when the
+/// launcher already knows it. Blocking nested launches do not have this fact and
+/// leave the column NULL. Best-effort.
+pub fn set_launched_by_event(root: &Root, session: &str, event: &str) -> Result<()> {
+    let event = event.trim();
+    if event.is_empty() {
+        return Ok(());
+    }
+    let conn = crate::db::open(root).context("opening the ledger to set launch edge")?;
+    crate::db::init_schema(&conn)?;
+    let n = conn.execute(
+        "UPDATE code_sessions SET launched_by_event = ?2 WHERE elanus_session = ?1",
+        rusqlite::params![session, event],
+    )?;
+    if n == 0 {
+        conn.execute(
+            "INSERT INTO code_sessions
+               (elanus_session, native_session, tool, agent_noun, workdir, launched_by_event)
+             VALUES (?1, '', '', '', '', ?2)
+             ON CONFLICT(elanus_session) DO UPDATE SET launched_by_event = excluded.launched_by_event",
+            rusqlite::params![session, event],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn get_launched_by_event(root: &Root, session: &str) -> Option<String> {
+    let conn = crate::db::open(root).ok()?;
+    let _ = crate::db::init_schema(&conn);
+    conn.query_row(
+        "SELECT launched_by_event FROM code_sessions WHERE elanus_session = ?1",
         [session],
         |r| r.get::<_, Option<String>>(0),
     )
@@ -2771,7 +2814,8 @@ mod tests {
         // A PRE-MIGRATION token: the exact flat JSON shape a prior version wrote,
         // with NO `kind` key. It must round-trip through `read` unchanged and
         // report kind == Session via the serde default.
-        let legacy = r#"{"principal":"code-0badf00d","agent":"codex","secret":"s3cr3t","owner_pid":7}"#;
+        let legacy =
+            r#"{"principal":"code-0badf00d","agent":"codex","secret":"s3cr3t","owner_pid":7}"#;
         std::fs::create_dir_all(store_dir(&root)).unwrap();
         std::fs::write(token_path(&root, "code-0badf00d"), legacy).unwrap();
         let tok = read(&root, "code-0badf00d").expect("legacy token must still deserialize");
@@ -3450,7 +3494,9 @@ mod tests {
         add_claim(&root, "room-v", "code-viewer02", "/tmp/m1/mine.rs").unwrap();
         let result = whose_path_for_viewer(&root, "/tmp/m1/mine.rs", Some("code-viewer02"));
         assert_eq!(result.state, AttributionState::Viewer);
-        let att = result.attribution.expect("viewer state carries the claim as evidence");
+        let att = result
+            .attribution
+            .expect("viewer state carries the claim as evidence");
         assert_eq!(att.session, "code-viewer02");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -3466,7 +3512,9 @@ mod tests {
         add_claim(&root, "room-v", "code-peer00003", "/tmp/m1/theirs.rs").unwrap();
         let result = whose_path_for_viewer(&root, "/tmp/m1/theirs.rs", Some("code-viewer04"));
         assert_eq!(result.state, AttributionState::Other);
-        let att = result.attribution.expect("other state still carries the claimant as evidence");
+        let att = result
+            .attribution
+            .expect("other state still carries the claimant as evidence");
         assert_eq!(att.session, "code-peer00003");
         let _ = std::fs::remove_dir_all(&root.dir);
     }
@@ -3508,6 +3556,34 @@ mod tests {
         assert_eq!(rec.room.as_deref(), Some("my-room"));
         assert_eq!(rec.native_session, "thread-9"); // the rest filled in
         assert_eq!(rec.workdir, "/proj");
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn launched_by_event_roundtrips_and_survives_native_upsert() {
+        let root = tmp_root();
+        set_launched_by_event(&root, "code-edgeevt1", "code-spawn-corr").unwrap();
+        assert_eq!(
+            get_launched_by_event(&root, "code-edgeevt1").as_deref(),
+            Some("code-spawn-corr")
+        );
+
+        upsert_record(
+            &root,
+            &SessionRecord {
+                elanus_session: "code-edgeevt1".into(),
+                native_session: "thread-edgeevt1".into(),
+                tool: "codex".into(),
+                agent_noun: "codex".into(),
+                workdir: "/proj".into(),
+                room: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            get_launched_by_event(&root, "code-edgeevt1").as_deref(),
+            Some("code-spawn-corr")
+        );
         let _ = std::fs::remove_dir_all(&root.dir);
     }
 
@@ -4920,10 +4996,7 @@ mod tests {
         );
         // DISCONNECTED (unknown): no local pid to probe (cross host) and the broker
         // lost it — death is unconfirmable, so it is never escalated to dead.
-        assert_eq!(
-            classify_liveness(Some(false), None),
-            Disconnected(Unknown)
-        );
+        assert_eq!(classify_liveness(Some(false), None), Disconnected(Unknown));
         // DEAD: a same-host pid probe FAILS — the one signal that confirms death.
         // This holds regardless of the broker's (possibly stale) connection view.
         assert_eq!(classify_liveness(Some(true), Some(false)), Dead);
@@ -4993,7 +5066,10 @@ mod tests {
         set_connected(&root, "code-splt0002", false).unwrap();
         let sibs = live_siblings(&root, "code-view00001", &wd);
         let sb = sibs.iter().find(|s| s.session == "code-splt0002");
-        assert!(sb.is_some(), "a disconnected split brain must stay in the roster");
+        assert!(
+            sb.is_some(),
+            "a disconnected split brain must stay in the roster"
+        );
         assert_eq!(
             sb.unwrap().liveness,
             Liveness::Disconnected(DisconnectKind::SplitBrain)
@@ -5026,7 +5102,13 @@ mod tests {
         // set_intent records the launch task; set_intent_if_absent (the interactive
         // first-prompt path) must NOT clobber it, but DOES seed when none exists.
         let root = tmp_root();
-        sa2_record(&root, "code-int00001", "/tmp", "r", std::process::id() as i32);
+        sa2_record(
+            &root,
+            "code-int00001",
+            "/tmp",
+            "r",
+            std::process::id() as i32,
+        );
         set_intent(&root, "code-int00001", "the launch task").unwrap();
         set_intent_if_absent(&root, "code-int00001", "a later prompt").unwrap();
         assert_eq!(
@@ -5035,7 +5117,13 @@ mod tests {
             "the launch task must win over a later prompt"
         );
         // With no prior intent, the first prompt seeds it.
-        sa2_record(&root, "code-int00002", "/tmp", "r", std::process::id() as i32);
+        sa2_record(
+            &root,
+            "code-int00002",
+            "/tmp",
+            "r",
+            std::process::id() as i32,
+        );
         set_intent_if_absent(&root, "code-int00002", "first prompt").unwrap();
         assert_eq!(
             get_intent(&root, "code-int00002").as_deref(),
@@ -5126,7 +5214,10 @@ mod tests {
             session_liveness(&root, "code-l00000001"),
             Some(Liveness::Connected)
         );
-        assert_eq!(session_liveness(&root, "code-d00000002"), Some(Liveness::Dead));
+        assert_eq!(
+            session_liveness(&root, "code-d00000002"),
+            Some(Liveness::Dead)
+        );
         assert_eq!(session_liveness(&root, "code-nosuch999"), None);
         let _ = std::fs::remove_dir_all(&root.dir);
     }

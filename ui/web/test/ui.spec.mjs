@@ -33,6 +33,51 @@ async function waitFor(desc, fn, timeoutMs = 15000) {
   return false;
 }
 const lanius = (...a) => execFileSync(path.join(BIN, 'lanius'), a, { env: ENV, encoding: 'utf8' });
+function sqlString(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+function appendTrace(kind, payload, sender = 'test') {
+  fs.appendFileSync(path.join(TMP, 'trace.jsonl'), `${JSON.stringify({
+    ts: payload.ts ?? '2026-07-12T00:00:00.000Z',
+    kind,
+    payload,
+    sender,
+  })}\n`);
+}
+function seedCodeRunIdentityFixture() {
+  const parent = {
+    session: 'code-uiidentp1',
+    intent: 'plan the worker legibility sprint',
+    args: ['--model', 'gpt-5.6', 'plan worker legibility'],
+  };
+  const child = {
+    session: 'code-uiidentc1',
+    intent: 'implement the Runs identity UI',
+    args: ['--effort', 'high', 'implement child row'],
+  };
+  appendTrace(`obs/agent/codex/${parent.session}/session/start`, {
+    ts: '2026-07-12T00:00:00.000Z',
+    tool: 'codex',
+    workdir: TMP,
+    args: parent.args,
+  });
+  appendTrace(`obs/agent/codex/${child.session}/session/start`, {
+    ts: '2026-07-12T00:00:01.000Z',
+    tool: 'codex',
+    workdir: TMP,
+    parent: parent.session,
+    args: child.args,
+  });
+  lanius('code', 'sessions', '--json');
+  const db = path.join(TMP, 'lanius.db');
+  const sql = [parent, child].map((run) => `
+    INSERT INTO code_sessions (elanus_session, native_session, tool, agent_noun, workdir, intent)
+    VALUES (${sqlString(run.session)}, '', 'codex', 'codex', ${sqlString(TMP)}, ${sqlString(run.intent)})
+    ON CONFLICT(elanus_session) DO UPDATE SET intent = excluded.intent;
+  `).join('\n');
+  execFileSync('sqlite3', [db, sql], { env: ENV, encoding: 'utf8' });
+  return { parent, child };
+}
 function createConfigProposal(id, pkg, toml) {
   const cfg = path.join(TMP, 'config');
   const branch = `tmp-${id}`;
@@ -182,10 +227,10 @@ async function ensureAiPanelClosed(page) {
   });
   const welcomeVisible = await page.$eval('#view-welcome', (el) => !el.hidden);
   welcomeVisible ? ok('boot: welcome view is the front door on load') : fail('boot: welcome view hidden on load');
-  // The welcome routes to the primary agent — converse button is present.
+  // The welcome routes to the primary agent — Chat button is present.
   await waitFor('boot: welcome offers the primary agent', async () => {
     const t = await page.$eval('#welcome-agent', (el) => el.textContent).catch(() => '');
-    return /converse with/.test(t);
+    return /chat with/.test(t);
   });
   // Agent tabs must NOT show on welcome (the [hidden] regression guard).
   const tabsHidden = await page.$eval('#agent-tabs', (el) => el.hidden && getComputedStyle(el).display === 'none');
@@ -1195,7 +1240,11 @@ const renamedAgent = 'falcon';
   }, workerAgent);
   if (opened) {
     await page.waitForSelector('#agent-tabs', { state: 'visible' });
-    await page.click('[data-tab="converse"]');
+    await waitFor('chat-render: worker nav opens Chat directly', async () => {
+      const active = await page.$eval('#agent-tabs [data-tab="converse"]', (el) => el.getAttribute('aria-pressed') === 'true').catch(() => false);
+      const visible = await page.$eval('#view-converse', (el) => !el.hidden).catch(() => false);
+      return active && visible;
+    }, 5000);
     await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
     await waitFor('chat-render: worker noun renders the comms conversation surface (not trace fallback)', async () => {
       const mode = await page.$eval('#view-converse', (el) => el.getAttribute('data-mode')).catch(() => null);
@@ -1311,7 +1360,11 @@ const renamedAgent = 'falcon';
     fail('worker-dm: claude-code not reachable in the Workers drawer');
   } else {
     await page.waitForSelector('#agent-tabs', { state: 'visible' });
-    await page.click('[data-tab="converse"]');
+    await waitFor('worker-dm: worker nav opens Chat directly', async () => {
+      const active = await page.$eval('#agent-tabs [data-tab="converse"]', (el) => el.getAttribute('aria-pressed') === 'true').catch(() => false);
+      const visible = await page.$eval('#view-converse', (el) => !el.hidden).catch(() => false);
+      return active && visible;
+    }, 5000);
     await page.waitForSelector('#view-converse:not([hidden])', { timeout: 5000 });
     await waitFor('worker-dm: claude-code renders the comms conversation surface (not the trace fallback)', async () =>
       (await page.$eval('#view-converse', (el) => el.getAttribute('data-mode')).catch(() => null)) === 'comms', 10000);
@@ -2128,6 +2181,26 @@ const renamedAgent = 'falcon';
     return await page.$eval('#history-hint', (el) => el.hidden);
   }, 12000);
   await page.close();
+
+  for (const [state, expected] of [
+    ['absent', /not running/i],
+    ['unreachable', /not answering/i],
+  ]) {
+    const p = await newPage();
+    await p.route('**/api/status', async (route) => {
+      const resp = await route.fetch();
+      const j = await resp.json().catch(() => ({}));
+      j.history = { ...(j.history || {}), available: false, state };
+      await route.fulfill({ response: resp, json: j });
+    });
+    await p.goto('/');
+    await p.waitForSelector('#history-hint', { state: 'attached', timeout: 10000 });
+    await waitFor(`history: ${state} state has distinct repair copy`, async () => {
+      const hint = await p.$eval('#history-hint', (el) => ({ hidden: el.hidden, text: el.textContent || '' }));
+      return hint.hidden === false && expected.test(hint.text);
+    }, 8000);
+    await p.close();
+  }
 }
 
 // ── flow 8: narrow viewport (sub-900px) ──────────────────────────────────────
@@ -2289,6 +2362,8 @@ const renamedAgent = 'falcon';
   await page.click('#nav-agents .nav-item');
   await page.waitForSelector('#agent-tabs', { state: 'visible' });
   const tabText = await page.$$eval('#agent-tabs button', (els) => els.map((e) => e.textContent.trim()));
+  const chatTabPresent = tabText.some((t) => /^Chat$/i.test(t));
+  chatTabPresent ? ok(`language: "converse" tab renamed to Chat (saw: ${tabText.join('|')})`) : fail(`language: Chat tab missing (${tabText.join('|')})`);
   const sessionsWordGone = !tabText.some((t) => /^sessions$/i.test(t));
   sessionsWordGone ? ok(`language: "sessions" tab renamed in warm mode (saw: ${tabText.join('|')})`) : fail(`language: tab still says "sessions" (${tabText.join('|')})`);
   // Converse header shows the identity chip alongside the agent name.
@@ -2523,6 +2598,74 @@ const renamedAgent = 'falcon';
       ? ok('estimate: a session with no estimate returns 200 null (group omitted, no crash)')
       : fail(`estimate: no-estimate session did not return null (${JSON.stringify(none)})`);
   }
+  await page.close();
+}
+
+// ── flow: worker-legibility M1 — Runs rows keep launch identity ──────────────
+// Seed a parent/child coding run directly into the trace + durable session table:
+// no real model or harness is needed. The UI must show the launch intent, say
+// exactly which model/effort facts are missing, keep args detail-only, and show
+// the parent's intent on the child row.
+{
+  const { parent, child } = seedCodeRunIdentityFixture();
+  const page = await newPage();
+  await page.goto('/');
+  await page.waitForSelector('#nav-agents', { timeout: 10000 });
+  await page.click('[data-sel="code-sessions"]');
+  await page.waitForSelector('.cs-wrap', { timeout: 5000 });
+
+  await waitFor('runs identity: list row shows intent and explicit unknown model/effort', async () => {
+    const rows = await page.$$eval('.cs-tree .cs-row', (els) => els.map((el) => el.textContent || ''));
+    return rows.some((t) =>
+      t.includes(parent.intent)
+      && t.includes(parent.session)
+      && t.includes('model unknown / effort not supplied'));
+  }, 8000);
+
+  await waitFor('runs identity: intent is the first row label and id is secondary', async () => {
+    return await page.evaluate(({ session, intent }) => {
+      const row = [...document.querySelectorAll('.cs-tree .cs-row')]
+        .find((el) => (el.textContent || '').includes(session));
+      if (!row) return false;
+      const cells = [...row.children].map((el) => ({
+        cls: el.className || '',
+        text: el.textContent || '',
+      }));
+      return cells[0]?.cls.includes('cs-intent')
+        && cells[0]?.text.includes(intent)
+        && cells[1]?.cls.includes('cs-child-id')
+        && cells[1]?.text.includes(session);
+    }, { session: parent.session, intent: parent.intent });
+  }, 8000);
+
+  const selected = await page.evaluate((session) => {
+    const row = [...document.querySelectorAll('.cs-tree .cs-row')]
+      .find((el) => (el.textContent || '').includes(session));
+    if (!row) return false;
+    row.click();
+    return true;
+  }, parent.session);
+  selected ? ok('runs identity: selected the seeded parent run') : fail('runs identity: could not select the seeded parent run');
+
+  await waitFor('runs identity: detail heading uses the intent and keeps the raw id secondary', async () => {
+    const detail = await page.$eval('.cs-detail', (el) => el.textContent).catch(() => '');
+    return detail.includes(parent.intent)
+      && detail.includes(parent.session)
+      && detail.includes('model unknown / effort not supplied');
+  }, 8000);
+
+  await page.click('.cs-args-disclosure summary');
+  await waitFor('runs identity: detail shows launch args only after opening the disclosure', async () => {
+    const args = await page.$eval('.cs-args', (el) => el.textContent).catch(() => '');
+    return args.includes('--model gpt-5.6 plan worker legibility');
+  }, 5000);
+
+  await waitFor('runs identity: child row shows child intent and parent intent text', async () => {
+    const detail = await page.$eval('.cs-detail', (el) => el.textContent).catch(() => '');
+    return detail.includes(child.intent)
+      && detail.includes(`parent: ${parent.intent}`)
+      && detail.includes('model unknown / effort not supplied');
+  }, 8000);
   await page.close();
 }
 

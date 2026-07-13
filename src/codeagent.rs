@@ -1025,6 +1025,19 @@ fn launch_session_id(root: &Root) -> String {
     }
 }
 
+fn launch_parent_and_event_from_env() -> (Option<String>, Option<String>) {
+    let inherited_parent = std::env::var(ENV_SESSION).ok().filter(|s| !s.is_empty());
+    let reply_to = std::env::var(ENV_REPLY_TO).ok().filter(|s| !s.is_empty());
+    let launched_by_event = if inherited_parent.is_none() && reply_to.is_some() {
+        std::env::var(ENV_REPLY_CORRELATION)
+            .ok()
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    (inherited_parent.or(reply_to), launched_by_event)
+}
+
 /// Does the fenced token-store path for a syntactically valid forced session id
 /// already exist? `codesession::read` intentionally hides unparseable tokens; for
 /// the clobber guard, even an unreadable existing file means "do not overwrite".
@@ -1984,6 +1997,59 @@ fn extract_model_effort(args: &[String]) -> (Option<String>, Option<String>) {
         i += 1;
     }
     (model, effort)
+}
+
+fn first_seed_prompt(args: &[String], value_flags: &[&str]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            let rest = args.get(i + 1..).unwrap_or_default().join(" ");
+            return (!rest.trim().is_empty()).then_some(rest);
+        }
+        if value_flags.iter().any(|f| arg == f) {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(args[i..].join(" "));
+    }
+    None
+}
+
+fn opencode_seed_prompt(args: &[String]) -> Option<String> {
+    let prompt = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!prompt.trim().is_empty()).then_some(prompt)
+}
+
+fn launch_intent_for_harness(tool: &str, args: &[String]) -> Option<String> {
+    let prompt = match tool {
+        "codex" => split_codex_seed_prompt(args).1,
+        "opencode" => opencode_seed_prompt(args),
+        "claude" => first_seed_prompt(
+            args,
+            &[
+                "--settings",
+                "--setting-sources",
+                "--plugin-dir",
+                "--mcp-config",
+                "--append-system-prompt",
+                "--model",
+                "-m",
+            ],
+        ),
+        _ => first_seed_prompt(args, &["--model", "-m"]),
+    }?;
+    let prompt = prompt.trim();
+    (!prompt.is_empty()).then(|| prompt.to_string())
 }
 
 /// Pull `model_reasoning_effort=<value>` out of one tool config arg. The value is
@@ -3790,6 +3856,7 @@ fn launch_external_harness(
     want_brief: bool,
     requested_grants: codesession::RequestedGrants,
     parent: Option<String>,
+    launched_by_event: Option<String>,
     room: Option<String>,
     model: Option<&str>,
     effort: Option<&str>,
@@ -3835,7 +3902,7 @@ fn launch_external_harness(
     let skills_dir = scratch.join("skills");
     let summary_path = scratch.join("adapter-summary.json");
 
-    let prompt = (!args.is_empty()).then(|| args.join(" "));
+    let prompt = launch_intent_for_harness(&external.decl.name, args);
     let mut brief_text = want_brief.then(|| briefing(&session));
     // The workdir-derived coordination room (SA1) — same as a built-in session, so the
     // external adapter's auto-claims land where siblings see them.
@@ -3871,6 +3938,9 @@ fn launch_external_harness(
         // best-effort (a launch outside a git repo just records no branch).
         if let Some(branch) = git_current_branch(&workdir) {
             let _ = codesession::set_branch(root, &session, &branch);
+        }
+        if let Some(event) = launched_by_event.as_deref() {
+            let _ = codesession::set_launched_by_event(root, &session, event);
         }
 
         // M2 (situational-awareness): record the launch TASK as this session's
@@ -3917,6 +3987,7 @@ fn launch_external_harness(
             "effort": effort,
             "provider": provider,
             "mcp_merged": mcp_merged,
+            "launched_by_event": launched_by_event,
         });
         if let Some((approvals, sandbox)) =
             codex_headless_approval_posture(&external.decl.name, mode, app_server)
@@ -4120,10 +4191,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
     // `spawn` worker has ENV_SESSION scrubbed (it mints its own identity) but
     // carries its spawner in ENV_REPLY_TO — so fall back to that, otherwise a
     // spawned worker would lose the parent→child edge the session tree needs.
-    let parent = std::env::var(ENV_SESSION)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var(ENV_REPLY_TO).ok().filter(|s| !s.is_empty()));
+    let (parent, launched_by_event) = launch_parent_and_event_from_env();
 
     // Reap any session tokens a prior SIGKILL'd launcher leaked, before anything
     // else — a crash must never leave a usable credential lying around
@@ -4183,6 +4251,7 @@ pub fn launch(root: &Root, tool: &str, args: &[String], provider: Option<&str>) 
         want_brief,
         requested_grants,
         parent,
+        launched_by_event,
         room,
         model.as_deref(),
         effort.as_deref(),
@@ -6101,8 +6170,9 @@ fn split_codex_seed_prompt(args: &[String]) -> (Vec<String>, Option<String>) {
             i += 1;
             continue;
         }
-        // First non-flag token: the seed prompt.
-        prompt = Some(arg.clone());
+        // First non-flag token: the seed prompt. Join the remaining tokens so
+        // callers that did not shell-quote the task still get the full purpose.
+        prompt = Some(args[i..].join(" "));
         break;
     }
     (flags, prompt)
@@ -8449,7 +8519,10 @@ pub struct ResumeOutcome {
 /// (`harness_id_for_tool` has no ACP entry, so `resume_command_for` would otherwise
 /// misfire it as `claude -p --resume <acp-id>`). Best-effort over the default
 /// profile (the record doesn't store which profile launched it).
-fn acp_harness_for_resume(root: &Root, rec: &codesession::SessionRecord) -> Option<ExternalHarness> {
+fn acp_harness_for_resume(
+    root: &Root,
+    rec: &codesession::SessionRecord,
+) -> Option<ExternalHarness> {
     find_external_harness(root, "default", &rec.tool)
         .ok()
         .flatten()
@@ -9719,7 +9792,10 @@ fn git_current_branch(workdir: &Path) -> Option<String> {
 /// else whichever of `main`/`master` exists. None when neither can be determined
 /// (the outcome then degrades to "unknown" rather than guessing wrong).
 fn git_default_branch(workdir: &Path) -> Option<String> {
-    if let Some(sym) = git_in(workdir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+    if let Some(sym) = git_in(
+        workdir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) {
         // "origin/main" → "main"
         if let Some((_, b)) = sym.split_once('/') {
             if !b.is_empty() {
@@ -9750,8 +9826,7 @@ fn git_dirty(workdir: &Path) -> bool {
 /// `branch_merged` and `has_unmerged_commits` inputs to `classify_outcome`.
 fn git_unmerged_count(workdir: &Path, branch: &str, default: &str) -> Option<u64> {
     let range = format!("{default}..{branch}");
-    git_in(workdir, &["rev-list", "--count", &range])
-        .and_then(|s| s.trim().parse::<u64>().ok())
+    git_in(workdir, &["rev-list", "--count", &range]).and_then(|s| s.trim().parse::<u64>().ok())
 }
 
 /// Loose worktrees of the repo containing `workdir` (M4): every `git worktree list`
@@ -9778,7 +9853,10 @@ fn git_worktrees(workdir: &Path) -> Vec<(String, Option<String>)> {
             cur_path = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("branch ") {
             // "refs/heads/foo" → "foo"
-            let b = rest.trim().strip_prefix("refs/heads/").unwrap_or(rest.trim());
+            let b = rest
+                .trim()
+                .strip_prefix("refs/heads/")
+                .unwrap_or(rest.trim());
             cur_branch = Some(b.to_string());
         }
     }
@@ -9837,13 +9915,19 @@ pub fn sitrep_cmd(root: &Root, args: &[String]) -> Result<()> {
     // paths a session already covers so we only list the genuinely loose ones.
     let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in &sessions {
-        covered.insert(canonical_workdir(Path::new(&s.workdir)).to_string_lossy().into_owned());
+        covered.insert(
+            canonical_workdir(Path::new(&s.workdir))
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
     let mut loose: Vec<(String, Option<String>)> = Vec::new();
     let mut seen_wt: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in &sessions {
         for (path, branch) in git_worktrees(Path::new(&s.workdir)) {
-            let canon = canonical_workdir(Path::new(&path)).to_string_lossy().into_owned();
+            let canon = canonical_workdir(Path::new(&path))
+                .to_string_lossy()
+                .into_owned();
             if covered.contains(&canon) || !seen_wt.insert(canon) {
                 continue; // a session already accounts for it, or already listed
             }
@@ -9876,8 +9960,7 @@ pub fn sitrep_cmd(root: &Root, args: &[String]) -> Result<()> {
             .iter()
             .map(|(path, branch)| {
                 // No session owns it → treat as dead for outcome purposes.
-                let outcome =
-                    compute_outcome(path, branch.as_deref(), codesession::Liveness::Dead);
+                let outcome = compute_outcome(path, branch.as_deref(), codesession::Liveness::Dead);
                 json!({
                     "kind": "worktree",
                     "session": Value::Null,
@@ -9977,7 +10060,11 @@ fn watch_digest_line(leaf: &str, payload: &Value) -> Option<String> {
                     .filter(|s| !s.is_empty() && s != "null")
             })
             .unwrap_or_default();
-        let arrow = if phase == "result" { "tool <-" } else { "tool ->" };
+        let arrow = if phase == "result" {
+            "tool <-"
+        } else {
+            "tool ->"
+        };
         let name = name.trim_matches('/');
         return Some(if detail.is_empty() {
             format!("{arrow} {name}")
@@ -10053,7 +10140,10 @@ pub fn watch_cmd(root: &Root, args: &[String]) -> Result<()> {
         .filter(|n| !n.is_empty());
     // A quick liveness note so the watcher knows if it is tailing a dead session.
     if let Some(l) = codesession::session_liveness(root, &target) {
-        eprintln!("[code] watching {target} — currently {}", liveness_phrase(l));
+        eprintln!(
+            "[code] watching {target} — currently {}",
+            liveness_phrase(l)
+        );
     } else {
         eprintln!("[code] watching {target} — no session record (nothing may arrive)");
     }
@@ -10431,7 +10521,7 @@ mod tests {
     #[test]
     fn split_codex_seed_prompt_separates_flags_from_prompt() {
         // Plain prompt, no flags.
-        let (flags, prompt) = split_codex_seed_prompt(&["do a thing".to_string()]);
+        let (flags, prompt) = split_codex_seed_prompt(&["do".to_string(), "a thing".to_string()]);
         assert!(flags.is_empty());
         assert_eq!(prompt.as_deref(), Some("do a thing"));
         // Value-taking flag passed through; prompt still found.
@@ -10446,6 +10536,62 @@ mod tests {
         let (flags, prompt) = split_codex_seed_prompt(&[]);
         assert!(flags.is_empty());
         assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn launch_intent_ignores_interactive_flags_and_keeps_real_tasks() {
+        assert!(launch_intent_for_harness(
+            "claude",
+            &["--dangerously-skip-permissions".to_string()]
+        )
+        .is_none());
+        assert_eq!(
+            launch_intent_for_harness(
+                "claude",
+                &[
+                    "--model".to_string(),
+                    "opus".to_string(),
+                    "review the worker handoff".to_string(),
+                ],
+            )
+            .as_deref(),
+            Some("review the worker handoff")
+        );
+        assert_eq!(
+            launch_intent_for_harness(
+                "codex",
+                &[
+                    "-c".to_string(),
+                    "model_reasoning_effort=high".to_string(),
+                    "fix".to_string(),
+                    "history status".to_string(),
+                ],
+            )
+            .as_deref(),
+            Some("fix history status")
+        );
+        assert_eq!(
+            launch_intent_for_harness(
+                "opencode",
+                &["--pure".to_string(), "write".to_string(), "tests".to_string()],
+            )
+            .as_deref(),
+            Some("write tests")
+        );
+    }
+
+    #[test]
+    fn opencode_seed_prompt_matches_task_arg_filtering() {
+        assert_eq!(
+            opencode_seed_prompt(&[
+                "--pure".to_string(),
+                "write".to_string(),
+                "tests".to_string(),
+            ])
+            .as_deref(),
+            Some("write tests")
+        );
+        assert!(opencode_seed_prompt(&["--pure".to_string()]).is_none());
     }
 
     // ── HM2: codex rollout import — reader against a real-schema fixture ──────
@@ -14758,7 +14904,12 @@ mod tests {
         // Give the sibling BOTH a launch-task baseline and an in-progress todo; the
         // refined todo must win the note line.
         codesession::set_intent(&root, "code-todoa001", "the launch task").unwrap();
-        seed_task(&root, "code-todoa001", "wire the SSE reconnect", "in_progress");
+        seed_task(
+            &root,
+            "code-todoa001",
+            "wire the SSE reconnect",
+            "in_progress",
+        );
         let b = turn_injection(&root, "codex", "code-viewb002").unwrap();
         assert!(
             b.contains("wire the SSE reconnect"),
@@ -15011,6 +15162,27 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
+    fn launched_by_event_only_comes_from_detached_spawn_env() {
+        let _env = ENV_SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(ENV_SESSION);
+        std::env::set_var(ENV_REPLY_TO, "code-parent00");
+        std::env::set_var(ENV_REPLY_CORRELATION, "code-spawn-corr");
+
+        let (parent, edge) = launch_parent_and_event_from_env();
+        assert_eq!(parent.as_deref(), Some("code-parent00"));
+        assert_eq!(edge.as_deref(), Some("code-spawn-corr"));
+
+        std::env::set_var(ENV_SESSION, "code-nested01");
+        let (parent, edge) = launch_parent_and_event_from_env();
+        assert_eq!(parent.as_deref(), Some("code-nested01"));
+        assert_eq!(edge, None);
+
+        std::env::remove_var(ENV_SESSION);
+        std::env::remove_var(ENV_REPLY_TO);
+        std::env::remove_var(ENV_REPLY_CORRELATION);
     }
 
     // ── SA3 (write half): touching a file IS the claim ───────────────────────
@@ -15556,8 +15728,7 @@ mod tests {
 
         let inj = turn_injection(&root, "codex", "code-phviewer03").unwrap();
         assert!(
-            !inj.contains("dead-claim.rs")
-                && !inj.contains("code-phdead0001 is editing"),
+            !inj.contains("dead-claim.rs") && !inj.contains("code-phdead0001 is editing"),
             "a confirmed-dead peer's claim must never be advertised into a live turn: {inj}"
         );
         assert!(
@@ -16171,7 +16342,11 @@ mod tests {
         // the filler character 'x' must be <= INBOX_MSG_CAP_BYTES (a raw count of
         // 'x' would also catch the letter inside "inbox"/"lanius code inbox"
         // elsewhere in the injection, which is not part of the message body).
-        let longest_run = inj.split(|c: char| c != 'x').map(str::len).max().unwrap_or(0);
+        let longest_run = inj
+            .split(|c: char| c != 'x')
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
         assert!(
             longest_run <= INBOX_MSG_CAP_BYTES,
             "the rendered body must be capped, not just annotated: longest run {longest_run}"
@@ -16510,11 +16685,8 @@ mod tests {
         .unwrap();
         assert_eq!(say, "says: I'll edit the parser now");
 
-        let call = watch_digest_line(
-            "tool/Bash/call",
-            &json!({ "command": "cargo test --lib" }),
-        )
-        .unwrap();
+        let call =
+            watch_digest_line("tool/Bash/call", &json!({ "command": "cargo test --lib" })).unwrap();
         assert!(call.contains("tool ->") && call.contains("Bash") && call.contains("cargo test"));
 
         let result = watch_digest_line("tool/Bash/result", &json!({ "output": "ok" })).unwrap();
@@ -16589,7 +16761,10 @@ mod tests {
         let elapsed = started.elapsed();
         std::env::remove_var(ENV_SESSION);
         std::env::remove_var(ENV_AGENT);
-        assert!(res.is_ok(), "ask on a dead target should return Ok, got {res:?}");
+        assert!(
+            res.is_ok(),
+            "ask on a dead target should return Ok, got {res:?}"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(3),
             "ask on a dead target must return immediately, not block ({elapsed:?})"

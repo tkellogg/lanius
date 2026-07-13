@@ -64,7 +64,6 @@ export function App() {
   const [count, setCount] = useState(0);
   const [conn, setConn] = useState({ connected: false, text: 'connecting' });
   const [signal, setSignal] = useState({ lit: false, label: 'signal' });
-  const [historyOk, setHistoryOk] = useState<boolean | null>(null);
   const [sel, setSel] = useState<any>({ kind: 'welcome' });
   const [navOpen, setNavOpen] = useState(false);
   // M2 (agentic-configuration): the AI panel — a non-modal, always-available
@@ -143,6 +142,13 @@ export function App() {
   const [cfgContextVarEdits, setCfgContextVarEdits] = useState(new Map());
   const [kitModalOpen, setKitModalOpen] = useState(false);
 
+  // chat-liveness M1 (wonky bit 5): the shared projection of the already-polled
+  // status + liveness. A read, not a fetch — consumed by submitCompose's
+  // send-time pre-check (M3) and, later, by H3/H4.
+  const health = useSystemHealth(systemStatus, liveness);
+  const historyState = typeof systemStatus?.history?.state === 'string' ? systemStatus.history.state : null;
+  const historyOk = historyState == null ? null : systemStatus?.history?.available === true;
+
   const refs = useRef<any>({});
   refs.current = { sel, agents, diskProfiles, defaultAgent, historyOk, filter, paused, cfgForm, cfgPackages, cfgContextChain, conversations };
   const corrAgent = useRef(new Map());
@@ -167,11 +173,6 @@ export function App() {
   // closure, so two rapid clicks on the same stalled line would BOTH see the
   // entry and double-publish. The ref sees the first consumption immediately.
   const retriedCorrs = useRef(new Set<string>());
-
-  // chat-liveness M1 (wonky bit 5): the shared projection of the already-polled
-  // status + liveness. A read, not a fetch — consumed by submitCompose's
-  // send-time pre-check (M3) and, later, by H3/H4.
-  const health = useSystemHealth(systemStatus, liveness);
 
   // helper-first-encounter H4 (wonky bit 2): the agent nouns to hide from the
   // left-hand agent list because they are presented in a dedicated surface
@@ -227,13 +228,9 @@ export function App() {
     if (j?.ok) setLiveness(j);
   };
 
-  const setHistoryState = (v: boolean) => setHistoryOk((prev) => prev === v ? prev : v);
-
   const refreshAgents = async () => {
     const j = await history({ kind: 'agents' });
-    if (j?.unavailable) setHistoryState(false);
     if (!j?.ok) return;
-    setHistoryState(true);
     for (const a of j.agents ?? []) touchAgent(a.agent, { sessions: a.sessions });
   };
 
@@ -426,7 +423,7 @@ export function App() {
     },
     {
       name: 'navigate',
-      description: 'Switch what the interface is showing — the same selection a nav click would make. kind is one of welcome, agent, setup, signals, code-sessions, comms, providers; pass agent (and optionally tab: converse/sessions/telemetry/configure) when kind is "agent".',
+      description: 'Switch what the interface is showing — the same selection a nav click would make. kind is one of welcome, agent, setup, signals, code-sessions, comms, providers; pass agent and, optionally, a tab for Chat, History, Activity, or settings when kind is "agent".',
       parameters: {
         type: 'object',
         properties: {
@@ -1259,10 +1256,8 @@ export function App() {
   const loadSessions = async (agent: string) => {
     setSessionsState({ status: 'loading', sessions: [], transcript: null, error: '' });
     const j = await history({ kind: 'sessions', agent });
-    if (j?.unavailable) setHistoryState(false);
     if (refs.current.sel.kind !== 'agent' || refs.current.sel.agent !== agent || refs.current.sel.tab !== 'sessions') return;
     if (!j?.ok) { setSessionsState({ status: 'error', sessions: [], transcript: null, error: j?.error ?? 'turn on the history view under add-ons to browse transcripts.' }); return; }
-    setHistoryState(true);
     for (const s of j.sessions ?? []) touchAgent(agent, { sessions: [s.session] });
     setSessionsState({ status: 'list', sessions: j.sessions ?? [], transcript: null, error: '' });
   };
@@ -1272,10 +1267,8 @@ export function App() {
     const params: any = { kind: 'transcript', session };
     if (beforeId != null) params.before_id = beforeId;
     const j = await history(params);
-    if (j?.unavailable) setHistoryState(false);
     if (refs.current.sel.kind !== 'agent' || refs.current.sel.agent !== agent || refs.current.sel.tab !== 'sessions') return;
     if (!j?.ok) { setSessionsState({ status: 'error', sessions: [], transcript: null, error: j?.error }); return; }
-    setHistoryState(true);
     setSessionsState((prev: any) => ({
       status: 'transcript',
       sessions: [],
@@ -1344,7 +1337,7 @@ export function App() {
 
       <div className="body-row">
       <main className="deck">
-        <Nav agents={agents} panelAgents={panelAgents} conversations={conversations} sel={sel} historyOk={historyOk} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} selectComms={selectComms} selectProviders={selectProviders} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel="explore" />
+        <Nav agents={agents} panelAgents={panelAgents} conversations={conversations} sel={sel} historyOk={historyOk} historyState={historyState} selectAgent={selectAgent} openConversation={openConversation} selectSignals={selectSignals} selectSetup={selectSetup} selectCodeSessions={selectCodeSessions} selectComms={selectComms} selectProviders={selectProviders} navOpen={navOpen} setNavOpen={setNavOpen} exploreLabel="explore" />
 
         <section className="stage panel" aria-label="view">
           <div className="panel-head">
@@ -1354,14 +1347,14 @@ export function App() {
                 const on = sel.kind === 'agent' && sel.tab === tab;
                 // One meaning per symbol (chrome-polish M1): configure is the WORD
                 // "settings" in the tab strip, not a lone gear that also meant "runs".
-                const display = tab === 'sessions' ? 'History' : tab === 'telemetry' ? 'Activity' : tab === 'configure' ? 'settings' : tab;
+                const display = tab === 'converse' ? 'Chat' : tab === 'sessions' ? 'History' : tab === 'telemetry' ? 'Activity' : tab === 'configure' ? 'settings' : tab;
                 return <button key={tab} data-tab={tab} className={on ? 'on' : ''} aria-pressed={on} onClick={() => sel.kind === 'agent' && selectAgent(sel.agent, tab)}>{display}</button>;
               })}
             </div>
             <span id="stage-note" className="panel-note">{stageNote}</span>
           </div>
 
-          <WelcomeView hidden={sel.kind !== 'welcome'} primary={primaryAgent()} historyOk={historyOk} systemStatus={systemStatus} selectAgent={selectAgent} selectSetup={selectSetup} selectSignals={selectSignals} />
+          <WelcomeView hidden={sel.kind !== 'welcome'} primary={primaryAgent()} historyOk={historyOk} historyState={historyState} systemStatus={systemStatus} selectAgent={selectAgent} selectSetup={selectSetup} selectSignals={selectSignals} />
           <ConverseView
             hidden={!(sel.kind === 'agent' && sel.tab === 'converse')}
             agent={sel.agent}

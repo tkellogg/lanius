@@ -25,6 +25,12 @@ statuses: planned | in-progress | verifying | done
 
 ## Contents
 
+- [worker-legibility-review.md](worker-legibility-review.md) - **changes
+  requested** review of chainlink #8: real launch purpose can be polluted by
+  harness flags, History's three states are not wired through the UI, and raw
+  run IDs still lead the list hierarchy. Read before finishing or verifying
+  [worker-legibility.md](worker-legibility.md).
+
 - [coding-agents.md](coding-agents.md) - launch and supervise Codex and Claude
   Code under elanus as one envelope, two adapters: cage, hook→bus record,
   mailbox delivery, memory/context via the prompt hook, and the planner/worker

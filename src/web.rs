@@ -46,12 +46,14 @@ use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, Event, MqttOptions};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskCtx, Poll};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// The built SPA, embedded at compile time. `dist` is a build output (gitignored),
 /// so the publish workflow must `npm run build` it and `Cargo.toml`'s `include`
@@ -82,6 +84,10 @@ struct Hub {
     // product words the interface shows (running/stopped/failed).
     liveness: Mutex<HashMap<String, Value>>,
     trusted_hosts: TrustedHosts,
+    // M3 (worker-legibility): a short-lived cache of the history actor's liveness
+    // probe (freshness instant, available bool, state word), so `/api/status`
+    // polling doesn't hammer the actor with a fresh HTTP round-trip every poll.
+    history_liveness: AsyncMutex<Option<(std::time::Instant, bool, &'static str)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,8 +111,7 @@ impl TrustedHosts {
     }
 
     fn allows(&self, authority: &str) -> bool {
-        authority_hostname(authority)
-            .is_some_and(|hostname| self.names.contains(&hostname))
+        authority_hostname(authority).is_some_and(|hostname| self.names.contains(&hostname))
     }
 }
 
@@ -207,6 +212,7 @@ pub fn serve_web(root: &Root, port: u16, agent: &str, trusted_hosts: &[String]) 
             clients: Mutex::new(Vec::new()),
             liveness: Mutex::new(HashMap::new()),
             trusted_hosts,
+            history_liveness: AsyncMutex::new(None),
         });
 
         // The bus relay runs on its OWN real-tokio thread, NOT the ntex runtime:
@@ -499,6 +505,7 @@ async fn status(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
     let owner = secrets::owner_name(root);
     let cred = secrets::read(root, &owner).is_some();
     let history = history_endpoint(root);
+    let (history_available, history_state) = history_liveness(&hub, history.as_deref()).await;
     let comms = comms_endpoint(root);
     let grants = package_grant_words(root, &["history", "comms"]);
     let bus = root.bus_file();
@@ -527,7 +534,7 @@ async fn status(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
             // `available` (http.json) can read true while the package is parked
             // after a revoke (package-truth.md pre-impl finding), so the sessions
             // tab distinguishes revoked (terminal) from unreachable off this word.
-            "history": { "available": history.is_some(), "endpoint": history, "grant": grants.get("history") },
+            "history": { "available": history_available, "state": history_state, "endpoint": history, "grant": grants.get("history") },
             // The comms reconstruction view's availability, reported like
             // history's (docs/handoffs/comms-package.md M2). The web comms list
             // relays to it; parked ⇒ the SPA degrades to "approve the package".
@@ -544,6 +551,61 @@ async fn status(hub: web::types::State<Arc<Hub>>) -> HttpResponse {
             },
         }),
     )
+}
+
+const HISTORY_LIVENESS_WINDOW: Duration = Duration::from_secs(3);
+
+/// Resolve the history object's `(available, state)` pair for `/api/status`
+/// (M3, worker-legibility). `absent` short-circuits with no probe (there's
+/// nothing to reach). Otherwise a cached sample fresher than
+/// `HISTORY_LIVENESS_WINDOW` is reused so status polling doesn't re-probe the
+/// actor every call; a stale/missing cache triggers one probe, offloaded to
+/// the blocking pool (`web::block`) exactly like the `history` handler's own
+/// proxy call — this must never block the ntex worker directly.
+async fn history_liveness(hub: &Hub, endpoint: Option<&str>) -> (bool, &'static str) {
+    history_liveness_with_probe(&hub.history_liveness, endpoint, |base| async move {
+        web::block(move || probe_history(&base))
+            .await
+            .map_err(|_| ())
+    })
+    .await
+}
+
+async fn history_liveness_with_probe<F, Fut>(
+    cache: &AsyncMutex<Option<(std::time::Instant, bool, &'static str)>>,
+    endpoint: Option<&str>,
+    probe: F,
+) -> (bool, &'static str)
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<u16, ()>>,
+{
+    let Some(base) = endpoint.map(str::to_string) else {
+        return classify_history(None, None);
+    };
+    let mut sample = cache.lock().await;
+    if let Some(cached) = cached_history_liveness(&sample, std::time::Instant::now()) {
+        return cached;
+    }
+    let probe_result = Some(probe(base.clone()).await);
+    let (available, state) = classify_history(Some(&base), probe_result);
+    *sample = Some((std::time::Instant::now(), available, state));
+    (available, state)
+}
+
+fn cached_history_liveness(
+    cache: &Option<(std::time::Instant, bool, &'static str)>,
+    now: std::time::Instant,
+) -> Option<(bool, &'static str)> {
+    let Some((sampled_at, available, state)) = *cache else {
+        return None;
+    };
+    if let Some(age) = now.checked_duration_since(sampled_at) {
+        if age < HISTORY_LIVENESS_WINDOW {
+            return Some((available, state));
+        }
+    }
+    None
 }
 
 /// READ CAMERA status (read-provenance M3) — the legibility surface server.mjs
@@ -1238,9 +1300,7 @@ async fn admin(
     // origin guard is the CSRF/DNS-rebinding floor; at reduced trust it tightens
     // to require a browser gesture so a caged agent's no-Origin curl cannot
     // approve its own grants (M5, partial close of security.md entry 13).
-    if method != ntex::http::Method::GET
-        && !human_proof_ok(&hub.root, &hub.trusted_hosts, &req)
-    {
+    if method != ntex::http::Method::GET && !human_proof_ok(&hub.root, &hub.trusted_hosts, &req) {
         return json_resp(
             403,
             json!({ "ok": false, "error": "cross-origin request refused (CSRF/DNS-rebinding guard)" }),
@@ -2209,6 +2269,45 @@ fn proxy_history(base: &str, query: &Value) -> Result<(u16, String)> {
     })
 }
 
+/// A short-timeout liveness probe against the history actor (M3, worker-
+/// legibility): unlike `proxy_history` (a real query, 5s timeout), this asks a
+/// cheap `agents` query with a 1s timeout purely to classify reachability for
+/// `/api/status` — callers care about the status code, not the body.
+fn probe_history(base: &str) -> Result<u16> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let res = reqwest::Client::new()
+            .post(format!("{base}/query"))
+            .header("content-type", "application/json")
+            .json(&json!({"kind":"agents","limit":"1"}))
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await?;
+        Ok(res.status().as_u16())
+    })
+}
+
+/// Pure classifier for the history three-state wire word (M3, worker-
+/// legibility): `absent` (no endpoint file — the package isn't running/
+/// approved, never probed), `unreachable` (endpoint file present but the actor
+/// didn't answer healthily — probe error or non-2xx), `reachable` (the actor
+/// answered the query successfully). Factored out of `status` so the state machine is unit-testable
+/// without a live actor.
+fn classify_history(
+    endpoint: Option<&str>,
+    probe: Option<Result<u16, ()>>,
+) -> (bool, &'static str) {
+    if endpoint.is_none() {
+        return (false, "absent");
+    }
+    match probe {
+        Some(Ok(code)) if (200..300).contains(&code) => (true, "reachable"),
+        _ => (false, "unreachable"),
+    }
+}
+
 /// The grant-review word for a package, matching the SPA's `grantState`
 /// (lib/packages.ts): `needs review` (any grant still `requested`), `allowed`
 /// (any `approved`), `revoked` (all `revoked`), or `no review record` (none).
@@ -2234,8 +2333,10 @@ fn package_grant_words(root: &Root, names: &[&str]) -> std::collections::HashMap
         let states: Vec<String> = conn
             .prepare("SELECT state FROM grants WHERE package=?1 AND manifest_hash=?2")
             .and_then(|mut stmt| {
-                stmt.query_map(rusqlite::params![p.name, lm.hash], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()
+                stmt.query_map(rusqlite::params![p.name, lm.hash], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
             })
             .unwrap_or_default();
         let word = if states.is_empty() {
@@ -2684,7 +2785,6 @@ fn session_for_event(row: &EventRow) -> String {
 // in-core; `session_for_event` and `query_human_by_corr` are shared with them and
 // stay here.
 
-
 // docs/handoffs/reply-branching.md M2 — the branch origin for a thread's feed,
 // derived from the seeding in/agent event's structured `branched_from`. Unlike
 // the list summary, the feed's origin chip quotes the full target text, so this
@@ -2846,7 +2946,9 @@ fn conversation_messages(session: &str, db: &FsPath) -> Result<Value> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for row in &delivery_rows {
             let Some(etype) = &row.type_ else { continue };
-            let Some(rest) = etype.strip_prefix("in/agent/") else { continue };
+            let Some(rest) = etype.strip_prefix("in/agent/") else {
+                continue;
+            };
             let parts: Vec<&str> = rest.split('/').collect();
             if parts.len() != 2 || parts[1] != session {
                 continue;
@@ -3111,7 +3213,10 @@ mod ambient_tests {
             .output();
         match out {
             Ok(o) if o.status.success() => Some(serde_json::from_slice(&o.stdout).unwrap()),
-            Ok(o) => panic!("comms_view.py failed: {}", String::from_utf8_lossy(&o.stderr)),
+            Ok(o) => panic!(
+                "comms_view.py failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
             Err(e) => {
                 eprintln!("[comms tests] python3 unavailable ({e}); skipping");
                 None
@@ -3132,7 +3237,10 @@ mod ambient_tests {
             .output();
         match out {
             Ok(o) if o.status.success() => Some(serde_json::from_slice(&o.stdout).unwrap()),
-            Ok(o) => panic!("comms_view.py conversation_info failed: {}", String::from_utf8_lossy(&o.stderr)),
+            Ok(o) => panic!(
+                "comms_view.py conversation_info failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
             Err(e) => {
                 eprintln!("[comms tests] python3 unavailable ({e}); skipping");
                 None
@@ -3211,7 +3319,10 @@ mod ambient_tests {
 
         let out = match py_conversations(&root.db(), agent, owner) {
             Some(v) => v,
-            None => { std::fs::remove_dir_all(&dir).ok(); return; }
+            None => {
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
         };
         let convs = out.as_array().unwrap();
         let sessions: Vec<&str> = convs
@@ -3325,11 +3436,13 @@ mod ambient_tests {
         let feed = feed.as_array().unwrap();
 
         assert!(
-            feed.iter().any(|m| m["text"].as_str() == Some("worker-reply-marker")),
+            feed.iter()
+                .any(|m| m["text"].as_str() == Some("worker-reply-marker")),
             "the worker's genuine reply renders in its own thread ({feed:?})"
         );
         assert!(
-            feed.iter().any(|m| m["text"].as_str() == Some("owner-prompt-marker")),
+            feed.iter()
+                .any(|m| m["text"].as_str() == Some("owner-prompt-marker")),
             "the owner's delivery prompt folds into the opened worker thread ({feed:?})"
         );
         assert!(
@@ -3384,7 +3497,10 @@ mod ambient_tests {
 
         let out = match py_conversations(&root.db(), agent, owner) {
             Some(v) => v,
-            None => { std::fs::remove_dir_all(&dir).ok(); return; }
+            None => {
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
         };
         let convs = out.as_array().unwrap();
         let tg = convs
@@ -3464,7 +3580,10 @@ mod ambient_tests {
         // (1) The list row for B references A (parent session + the anchor id).
         let out = match py_conversations(&root.db(), agent, owner) {
             Some(v) => v,
-            None => { std::fs::remove_dir_all(&dir).ok(); return; }
+            None => {
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
         };
         let convs = out.as_array().unwrap();
         let b = convs.iter().find(|c| c["session"] == "web-B").unwrap();
@@ -3540,38 +3659,78 @@ mod ambient_tests {
         let mailbox = crate::topic::human_mailbox(owner);
 
         // (1) Ambient agent-first send (badge = cron, not "you").
-        insert_event(&conn, &mailbox, None,
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
             json!({ "text": "your build finished — all green", "session": "run-amb-1", "source": "cron" }),
-            Some(agent), "2026-07-01T10:00:00.000Z");
+            Some(agent),
+            "2026-07-01T10:00:00.000Z",
+        );
         // (2) Prompted thread + its correlated reply (single conversation, web).
-        insert_event(&conn, &format!("in/agent/{agent}"), Some("c-prompted"),
+        insert_event(
+            &conn,
+            &format!("in/agent/{agent}"),
+            Some("c-prompted"),
             json!({ "prompt": "how are the tests?", "session": "web-1" }),
-            Some(owner), "2026-07-01T09:00:00.000Z");
-        insert_event(&conn, &mailbox, Some("c-prompted"),
+            Some(owner),
+            "2026-07-01T09:00:00.000Z",
+        );
+        insert_event(
+            &conn,
+            &mailbox,
+            Some("c-prompted"),
             json!({ "text": "13 passing", "session": "web-1" }),
-            Some(agent), "2026-07-01T09:00:01.000Z");
+            Some(agent),
+            "2026-07-01T09:00:01.000Z",
+        );
         // (3) Worker-session send: evicted from the chat list.
-        insert_event(&conn, &mailbox, None,
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
             json!({ "text": "worker chatter", "session": "code-deadbeef" }),
-            Some(agent), "2026-07-01T11:00:00.000Z");
+            Some(agent),
+            "2026-07-01T11:00:00.000Z",
+        );
         // (4) Another agent's ambient send: must NOT leak in.
-        insert_event(&conn, &mailbox, None,
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
             json!({ "text": "not for companion", "session": "run-other-1" }),
-            Some("researcher"), "2026-07-01T12:00:00.000Z");
+            Some("researcher"),
+            "2026-07-01T12:00:00.000Z",
+        );
         // (5) A Telegram-stamped ambient send: source from payload.source alone.
-        insert_event(&conn, &mailbox, None,
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
             json!({ "text": "got it, Tim — the bridge shipped", "session": "tg-424242", "source": "telegram" }),
-            Some(agent), "2026-07-01T10:30:00.000Z");
+            Some(agent),
+            "2026-07-01T10:30:00.000Z",
+        );
         // (6) A branch: root A (web-A) + child B (web-B) carrying branched_from.
-        insert_event(&conn, &format!("in/agent/{agent}"), Some("c-a"),
+        insert_event(
+            &conn,
+            &format!("in/agent/{agent}"),
+            Some("c-a"),
             json!({ "prompt": "the plan is to ship on friday", "session": "web-A" }),
-            Some(owner), "2026-07-01T08:00:00.000Z");
+            Some(owner),
+            "2026-07-01T08:00:00.000Z",
+        );
         let parent_event_id = conn.last_insert_rowid();
-        insert_event(&conn, &format!("in/agent/{agent}"), Some("c-b"),
+        insert_event(
+            &conn,
+            &format!("in/agent/{agent}"),
+            Some("c-b"),
             json!({ "prompt": "and what about the cost?", "session": "web-B",
                     "branched_from": { "event_id": parent_event_id, "corr": "c-a",
                                        "session": "web-A", "quote": "the plan is to ship on friday" } }),
-            Some(owner), "2026-07-01T08:30:00.000Z");
+            Some(owner),
+            "2026-07-01T08:30:00.000Z",
+        );
 
         let out = match py_conversations(&root.db(), agent, owner) {
             Some(v) => v,
@@ -3581,20 +3740,50 @@ mod ambient_tests {
             }
         };
         let convs = out.as_array().unwrap();
-        let sessions: Vec<&str> = convs.iter().map(|c| c["session"].as_str().unwrap()).collect();
+        let sessions: Vec<&str> = convs
+            .iter()
+            .map(|c| c["session"].as_str().unwrap())
+            .collect();
 
-        assert!(sessions.contains(&"run-amb-1"), "ambient send is a conversation ({sessions:?})");
-        assert!(sessions.contains(&"web-1"), "prompted thread is a conversation ({sessions:?})");
-        assert_eq!(sessions.iter().filter(|s| **s == "web-1").count(), 1, "prompted thread is SINGLE");
-        assert!(!sessions.contains(&"code-deadbeef"), "worker send evicted ({sessions:?})");
-        assert!(!sessions.contains(&"run-other-1"), "other agent's send does not leak ({sessions:?})");
+        assert!(
+            sessions.contains(&"run-amb-1"),
+            "ambient send is a conversation ({sessions:?})"
+        );
+        assert!(
+            sessions.contains(&"web-1"),
+            "prompted thread is a conversation ({sessions:?})"
+        );
+        assert_eq!(
+            sessions.iter().filter(|s| **s == "web-1").count(),
+            1,
+            "prompted thread is SINGLE"
+        );
+        assert!(
+            !sessions.contains(&"code-deadbeef"),
+            "worker send evicted ({sessions:?})"
+        );
+        assert!(
+            !sessions.contains(&"run-other-1"),
+            "other agent's send does not leak ({sessions:?})"
+        );
 
         let ambient = convs.iter().find(|c| c["session"] == "run-amb-1").unwrap();
-        assert_eq!(ambient["title"].as_str().unwrap(), "your build finished — all green");
-        assert_eq!(ambient["source"].as_str().unwrap(), "cron", "agent-initiated is not badged 'you'");
+        assert_eq!(
+            ambient["title"].as_str().unwrap(),
+            "your build finished — all green"
+        );
+        assert_eq!(
+            ambient["source"].as_str().unwrap(),
+            "cron",
+            "agent-initiated is not badged 'you'"
+        );
 
         let tg = convs.iter().find(|c| c["session"] == "tg-424242").unwrap();
-        assert_eq!(tg["source"].as_str().unwrap(), "telegram", "source is the stamped payload.source");
+        assert_eq!(
+            tg["source"].as_str().unwrap(),
+            "telegram",
+            "source is the stamped payload.source"
+        );
 
         let b = convs.iter().find(|c| c["session"] == "web-B").unwrap();
         let bf = &b["branched_from"];
@@ -3629,38 +3818,88 @@ mod ambient_tests {
         // A prompted thread: the owner's prompt (verified sender = owner) and the
         // agent's correlated reply (verified sender = the agent). The reply payload
         // ALSO carries a forged `sender: "attacker"` a hostile agent might inject.
-        insert_event(&conn, &format!("in/agent/{agent}"), Some("c-9"),
+        insert_event(
+            &conn,
+            &format!("in/agent/{agent}"),
+            Some("c-9"),
             json!({ "prompt": "status?", "session": "web-9" }),
-            Some(owner), "2026-07-01T09:00:00.000Z");
-        insert_event(&conn, &mailbox, Some("c-9"),
+            Some(owner),
+            "2026-07-01T09:00:00.000Z",
+        );
+        insert_event(
+            &conn,
+            &mailbox,
+            Some("c-9"),
             json!({ "text": "all good", "session": "web-9", "sender": "attacker" }),
-            Some(agent), "2026-07-01T09:00:01.000Z");
+            Some(agent),
+            "2026-07-01T09:00:01.000Z",
+        );
 
         let info = match py_conversation_info(&root.db(), "web-9", owner) {
             Some(v) => v,
-            None => { std::fs::remove_dir_all(&dir).ok(); return; }
+            None => {
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
         };
-        let participants: Vec<&str> = info["participants"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(participants, vec!["main", "owner"], "participants are the verified senders");
-        assert!(!participants.contains(&"attacker"),
-            "a forged payload.sender must NOT appear ({participants:?})");
+        let participants: Vec<&str> = info["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            participants,
+            vec!["main", "owner"],
+            "participants are the verified senders"
+        );
+        assert!(
+            !participants.contains(&"attacker"),
+            "a forged payload.sender must NOT appear ({participants:?})"
+        );
         assert_eq!(info["source"].as_str().unwrap(), "web");
         assert_eq!(info["event_count"].as_u64().unwrap(), 2);
-        assert_eq!(info["correlations"].as_array().unwrap()[0].as_str().unwrap(), "c-9");
-        assert_eq!(info["first_ts"].as_str().unwrap(), "2026-07-01T09:00:00.000Z");
-        assert_eq!(info["last_ts"].as_str().unwrap(), "2026-07-01T09:00:01.000Z");
+        assert_eq!(
+            info["correlations"].as_array().unwrap()[0]
+                .as_str()
+                .unwrap(),
+            "c-9"
+        );
+        assert_eq!(
+            info["first_ts"].as_str().unwrap(),
+            "2026-07-01T09:00:00.000Z"
+        );
+        assert_eq!(
+            info["last_ts"].as_str().unwrap(),
+            "2026-07-01T09:00:01.000Z"
+        );
 
         // A conversation spanning a dm channel reports that channel.
-        insert_event(&conn, &mailbox, None,
+        insert_event(
+            &conn,
+            &mailbox,
+            None,
             json!({ "text": "pong", "session": "tg-9", "source": "telegram" }),
-            Some(agent), "2026-07-01T10:00:00.000Z");
+            Some(agent),
+            "2026-07-01T10:00:00.000Z",
+        );
         let dm = py_conversation_info(&root.db(), "tg-9", owner).unwrap();
         assert_eq!(dm["source"].as_str().unwrap(), "telegram");
-        assert_eq!(dm["channels"].as_array().unwrap()[0].as_str().unwrap(), "telegram");
-        let dm_parts: Vec<&str> = dm["participants"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(dm_parts, vec!["main"], "the dm conversation's sole verified sender");
+        assert_eq!(
+            dm["channels"].as_array().unwrap()[0].as_str().unwrap(),
+            "telegram"
+        );
+        let dm_parts: Vec<&str> = dm["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            dm_parts,
+            vec!["main"],
+            "the dm conversation's sole verified sender"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3714,6 +3953,80 @@ mod route_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // M3 (worker-legibility): the history three-state classifier. `absent` (no
+    // endpoint file) never probes; endpoint present but the probe errored or
+    // returned a non-2xx is `unreachable`; a successful query is `reachable`.
+    #[test]
+    fn classify_history_three_states() {
+        assert_eq!(classify_history(None, None), (false, "absent"));
+        assert_eq!(
+            classify_history(Some("http://127.0.0.1:1"), Some(Err(()))),
+            (false, "unreachable")
+        );
+        assert_eq!(
+            classify_history(Some("http://127.0.0.1:1"), Some(Ok(200))),
+            (true, "reachable")
+        );
+        assert_eq!(
+            classify_history(Some("http://127.0.0.1:1"), Some(Ok(401))),
+            (false, "unreachable")
+        );
+        assert_eq!(
+            classify_history(Some("http://127.0.0.1:1"), Some(Ok(404))),
+            (false, "unreachable")
+        );
+        assert_eq!(
+            classify_history(Some("http://127.0.0.1:1"), Some(Ok(503))),
+            (false, "unreachable")
+        );
+    }
+
+    #[test]
+    fn history_liveness_cache_only_reuses_fresh_samples() {
+        let now = std::time::Instant::now();
+        let cache = Some((now, true, "reachable"));
+
+        assert_eq!(
+            cached_history_liveness(&cache, now + Duration::from_secs(1)),
+            Some((true, "reachable"))
+        );
+        assert_eq!(
+            cached_history_liveness(&cache, now + HISTORY_LIVENESS_WINDOW),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn history_liveness_coalesces_concurrent_refreshes() {
+        let cache = Arc::new(AsyncMutex::new(None));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Barrier::new(6));
+        let mut tasks = Vec::new();
+
+        for _ in 0..5 {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            let gate = Arc::clone(&gate);
+            tasks.push(tokio::spawn(async move {
+                gate.wait().await;
+                history_liveness_with_probe(&cache, Some("http://history.local"), move |_| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(200)
+                    }
+                })
+                .await
+            }));
+        }
+
+        gate.wait().await;
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), (true, "reachable"));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3967,18 +4280,14 @@ mod route_tests {
         // Local host, no Origin (curl / local agent) → allowed (host check only).
         assert!(trusted.allows("127.0.0.1:8080"));
         // Same-origin browser POST → Origin host is local. allowed.
-        assert!(trusted.allows(
-            &origin_host("http://127.0.0.1:7182/").unwrap()
-        ));
+        assert!(trusted.allows(&origin_host("http://127.0.0.1:7182/").unwrap()));
         // Vite dev proxy: UI on :5174, relay on :7182 — a local cross-PORT origin.
         // Different port, but still local → origin_ok accepts it (the dev-loop fix).
         let vite = origin_host("http://127.0.0.1:5174/").unwrap();
         assert_ne!(vite, "127.0.0.1:7182");
         assert!(trusted.allows(&vite));
         // A foreign Origin (an attacker page) is refused: its host is not local.
-        assert!(!trusted.allows(
-            &origin_host("http://evil.example/page").unwrap()
-        ));
+        assert!(!trusted.allows(&origin_host("http://evil.example/page").unwrap()));
         // A rebound / non-local Host is refused outright by the Host check.
         assert!(!trusted.allows("evil.example"));
         assert!(trusted.allows("[::1]:7180"));
@@ -4066,7 +4375,11 @@ mod route_tests {
 
     #[test]
     fn llm_world_picks_native_over_harness_over_neither() {
-        assert_eq!(llm_world(true, true), "a", "a native provider wins outright");
+        assert_eq!(
+            llm_world(true, true),
+            "a",
+            "a native provider wins outright"
+        );
         assert_eq!(
             llm_world(true, false),
             "a",
@@ -4146,7 +4459,10 @@ mod route_tests {
         assert_eq!(spa_resolve("runs", false), SpaResolve::Index);
         assert_eq!(spa_resolve("runs/code-abc123", false), SpaResolve::Index);
         assert_eq!(spa_resolve("agents/main/config", false), SpaResolve::Index);
-        assert_eq!(spa_resolve("coding-agents/config", false), SpaResolve::Index);
+        assert_eq!(
+            spa_resolve("coding-agents/config", false),
+            SpaResolve::Index
+        );
     }
 
     #[test]
@@ -4157,7 +4473,10 @@ mod route_tests {
         assert_eq!(spa_resolve("assets/gone.css", false), SpaResolve::NotFound);
         // Traversal is refused regardless of extension or existence.
         assert_eq!(spa_resolve("../etc/passwd", false), SpaResolve::NotFound);
-        assert_eq!(spa_resolve("agents/../../secret", false), SpaResolve::NotFound);
+        assert_eq!(
+            spa_resolve("agents/../../secret", false),
+            SpaResolve::NotFound
+        );
     }
 
     #[test]

@@ -62,7 +62,14 @@ CREATE TABLE IF NOT EXISTS code_projection_cursor (
   trace_offset INTEGER NOT NULL
 );
 "#,
-    )
+    )?;
+    // M1 (worker-legibility): the launch args (a JSON array, serialized to text) a
+    // `session/start` obs carried. Nullable — pre-M1 rows and sessions launched
+    // before this column existed have no recorded args. Migration for databases
+    // created before the column existed; the "duplicate column" error is expected
+    // and ignored (mirrors db.rs's ALTER-TABLE idiom).
+    let _ = conn.execute("ALTER TABLE code_session_stats ADD COLUMN args TEXT", []);
+    Ok(())
 }
 
 /// One row from the coding-session projection, plus fields derived for readers.
@@ -85,6 +92,22 @@ pub struct SessionStat {
     pub output_tokens: i64,
     pub updated_at: Option<String>,
     pub duration_ms: Option<i64>,
+
+    // ── worker-legibility M1: launch identity ──────────────────────────────────
+    /// The session's baseline intent (the launch task string), backfilled from
+    /// `code_sessions.intent` — the durable field codesession.rs owns. Additive on
+    /// the wire (absent/null when never recorded).
+    #[serde(default)]
+    pub intent: Option<String>,
+    /// The launch args a `session/start` obs carried, serialized to JSON text.
+    /// Additive on the wire (absent/null for sessions launched before this column
+    /// existed, or with no args).
+    #[serde(default)]
+    pub args: Option<String>,
+    /// Explicit detached-spawn launch edge (`code-spawn-*`) from the durable
+    /// `code_sessions` row. Null for blocking nested launches / old rows.
+    #[serde(default)]
+    pub launched_by_event: Option<String>,
 
     // ── Thread-grouping fold (session-thread-grouping handoff, TG1) ───────────
     // These are ADDITIVE wire fields layered on top of the representative
@@ -261,10 +284,14 @@ fn apply_event(conn: &Connection, topic: &str, payload: &Value) -> rusqlite::Res
     let _ = fold_tasks(conn, session, leaf, payload, &updated_at);
     match leaf {
         "session/start" => {
+            let args = payload
+                .get("args")
+                .filter(|v| !v.is_null())
+                .map(|v| v.to_string());
             conn.execute(
                 "INSERT INTO code_session_stats
-                 (elanus_session, tool, agent_noun, workdir, model, effort, parent, started_at, last_status, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', ?9)
+                 (elanus_session, tool, agent_noun, workdir, model, effort, parent, started_at, last_status, updated_at, args)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', ?9, ?10)
                  ON CONFLICT(elanus_session) DO UPDATE SET
                    tool=COALESCE(excluded.tool, code_session_stats.tool),
                    agent_noun=excluded.agent_noun,
@@ -274,7 +301,8 @@ fn apply_event(conn: &Connection, topic: &str, payload: &Value) -> rusqlite::Res
                    parent=COALESCE(excluded.parent, code_session_stats.parent),
                    started_at=COALESCE(excluded.started_at, code_session_stats.started_at),
                    last_status='running',
-                   updated_at=excluded.updated_at",
+                   updated_at=excluded.updated_at,
+                   args=COALESCE(excluded.args, code_session_stats.args)",
                 params![
                     session,
                     text_field(payload, "tool"),
@@ -285,6 +313,7 @@ fn apply_event(conn: &Connection, topic: &str, payload: &Value) -> rusqlite::Res
                     text_field(payload, "parent"),
                     ts,
                     updated_at,
+                    args,
                 ],
             )?;
         }
@@ -661,7 +690,7 @@ pub fn project_trace(root: &Root) -> Result<usize> {
 /// in one place.
 const STATS_COLUMNS: &str = "elanus_session, tool, agent_noun, native_session, workdir, model, \
 effort, parent, started_at, ended_at, exit_code, last_status, resume_count, input_tokens, \
-output_tokens, updated_at";
+output_tokens, updated_at, args";
 
 /// Milliseconds between two RFC3339 timestamps, or None if either fails to parse.
 fn duration_ms_between(start: &str, end: &str) -> Option<i64> {
@@ -714,6 +743,11 @@ fn row_to_stat(row: &rusqlite::Row) -> rusqlite::Result<SessionStat> {
         output_tokens: row.get(14)?,
         updated_at: row.get(15)?,
         duration_ms,
+        // Backfilled from `code_sessions.intent` by `fill_intent` (the neighbor
+        // idiom `fill_native` follows) — not a `code_session_stats` column.
+        intent: None,
+        args: row.get(16)?,
+        launched_by_event: None,
     })
 }
 
@@ -743,8 +777,12 @@ pub fn list_sessions_raw(root: &Root) -> Result<Vec<SessionStat>> {
         .filter_map(Result::ok)
         .collect();
     let overrides = native_overrides(&conn);
+    let intents = intent_overrides(&conn);
+    let launch_edges = launched_by_event_overrides(&conn);
     for s in &mut out {
         fill_native(s, &overrides);
+        fill_intent(s, &intents);
+        fill_launched_by_event(s, &launch_edges);
     }
     sort_active_first(&mut out);
     Ok(out)
@@ -786,6 +824,65 @@ fn fill_native(s: &mut SessionStat, overrides: &std::collections::HashMap<String
         if let Some(ns) = overrides.get(&s.elanus_session) {
             s.native_session = Some(ns.clone());
         }
+    }
+}
+
+/// worker-legibility M1: the durable elanus_session→intent mapping from
+/// `code_sessions` (codesession.rs owns the column), used to backfill
+/// `SessionStat.intent` — the projection has no intent column of its own. Mirrors
+/// `native_overrides` exactly. Blank/whitespace-only intent is treated as absent
+/// (matches codesession.rs's own `set_intent`/read filtering). Best-effort: a
+/// missing table / query error yields an empty map.
+fn intent_overrides(conn: &Connection) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT elanus_session, intent FROM code_sessions \
+         WHERE intent IS NOT NULL AND trim(intent) <> ''",
+    ) else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    else {
+        return map;
+    };
+    for (es, intent) in rows.flatten() {
+        map.insert(es, intent);
+    }
+    map
+}
+
+/// Fill a stat's `intent` from the durable baseline-intent mapping. Mirrors
+/// `fill_native`.
+fn fill_intent(s: &mut SessionStat, overrides: &std::collections::HashMap<String, String>) {
+    if let Some(intent) = overrides.get(&s.elanus_session) {
+        s.intent = Some(intent.clone());
+    }
+}
+
+fn launched_by_event_overrides(conn: &Connection) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT elanus_session, launched_by_event FROM code_sessions \
+         WHERE launched_by_event IS NOT NULL AND trim(launched_by_event) <> ''",
+    ) else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    else {
+        return map;
+    };
+    for (es, event) in rows.flatten() {
+        map.insert(es, event);
+    }
+    map
+}
+
+fn fill_launched_by_event(
+    s: &mut SessionStat,
+    overrides: &std::collections::HashMap<String, String>,
+) {
+    if let Some(event) = overrides.get(&s.elanus_session) {
+        s.launched_by_event = Some(event.clone());
     }
 }
 
@@ -1560,6 +1657,110 @@ mod tests {
         assert_eq!(
             cur,
             ("write the fold".to_string(), "in_progress".to_string())
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    // ── worker-legibility M1: launch identity (intent + args) ─────────────────
+
+    #[test]
+    fn m1_intent_backfilled_from_code_sessions_on_list_and_detail() {
+        let root = temp_root("m1-intent");
+        append_trace(
+            &root,
+            "obs/agent/codex/code-m1intent/session/start",
+            json!({ "ts": "2026-07-12T00:00:00.000Z", "tool": "codex" }),
+        );
+        project_trace(&root).unwrap();
+        crate::codesession::set_intent(&root, "code-m1intent", "fix the flaky e2e test").unwrap();
+
+        let listed = list_sessions(&root).unwrap();
+        let s = listed
+            .iter()
+            .find(|s| s.elanus_session == "code-m1intent")
+            .unwrap();
+        assert_eq!(s.intent.as_deref(), Some("fix the flaky e2e test"));
+
+        let detail = session_detail(&root, "code-m1intent").unwrap().unwrap();
+        assert_eq!(
+            detail.session.intent.as_deref(),
+            Some("fix the flaky e2e test")
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn m1_args_column_round_trips_from_session_start() {
+        let root = temp_root("m1-args");
+        append_trace(
+            &root,
+            "obs/agent/codex/code-m1args/session/start",
+            json!({
+                "ts": "2026-07-12T00:00:00.000Z",
+                "tool": "codex",
+                "args": ["--dangerously-skip-permissions", "fix the bug"]
+            }),
+        );
+        project_trace(&root).unwrap();
+
+        let listed = list_sessions_raw(&root).unwrap();
+        let s = listed
+            .iter()
+            .find(|s| s.elanus_session == "code-m1args")
+            .unwrap();
+        let args: Value = serde_json::from_str(s.args.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            args,
+            json!(["--dangerously-skip-permissions", "fix the bug"])
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn m1_missing_model_effort_stay_null_on_the_wire() {
+        let root = temp_root("m1-nullmodel");
+        append_trace(
+            &root,
+            "obs/agent/codex/code-m1null/session/start",
+            json!({ "ts": "2026-07-12T00:00:00.000Z", "tool": "codex" }),
+        );
+        project_trace(&root).unwrap();
+
+        let listed = list_sessions(&root).unwrap();
+        let s = listed
+            .iter()
+            .find(|s| s.elanus_session == "code-m1null")
+            .unwrap();
+        assert_eq!(s.model, None);
+        assert_eq!(s.effort, None);
+        let v = serde_json::to_value(s).unwrap();
+        assert!(v.get("model").unwrap().is_null());
+        assert!(v.get("effort").unwrap().is_null());
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn m2_launched_by_event_backfilled_from_code_sessions_on_list_and_detail() {
+        let root = temp_root("m2-launched-by");
+        append_trace(
+            &root,
+            "obs/agent/codex/code-m2edge/session/start",
+            json!({ "ts": "2026-07-12T00:00:00.000Z", "tool": "codex" }),
+        );
+        project_trace(&root).unwrap();
+        crate::codesession::set_launched_by_event(&root, "code-m2edge", "code-spawn-corr").unwrap();
+
+        let listed = list_sessions(&root).unwrap();
+        let s = listed
+            .iter()
+            .find(|s| s.elanus_session == "code-m2edge")
+            .unwrap();
+        assert_eq!(s.launched_by_event.as_deref(), Some("code-spawn-corr"));
+
+        let detail = session_detail(&root, "code-m2edge").unwrap().unwrap();
+        assert_eq!(
+            detail.session.launched_by_event.as_deref(),
+            Some("code-spawn-corr")
         );
         std::fs::remove_dir_all(&root.dir).ok();
     }

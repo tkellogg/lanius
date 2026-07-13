@@ -36,6 +36,11 @@ type Stat = {
   incarnations?: string[];
   relaunches?: number;
   driven_resumes?: number;
+  // worker-legibility M1: launch identity. Optional/additive so older payloads
+  // (and sessions launched before these fields existed) still render.
+  intent?: string | null;
+  args?: string | null;
+  launched_by_event?: string | null;
 };
 
 type Ev = { id: number; ts: string | null; kind: string | null; summary: string | null };
@@ -55,6 +60,33 @@ function humanTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
+}
+
+// worker-legibility M1: never render a bare "?" for missing model/effort — say
+// explicitly which fact is missing so a reader isn't left guessing whether it's
+// unset or a rendering bug.
+function modelEffortText(model: string | null | undefined, effort: string | null | undefined): string {
+  return `${model ?? 'model unknown'} / ${effort ?? 'effort not supplied'}`;
+}
+
+function truncate(s: string | null | undefined, max: number): string | null {
+  if (!s) return null;
+  const t = s.trim();
+  if (!t) return null;
+  return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
+}
+
+// The launch args a session/start obs carried, serialized JSON text — render the
+// underlying array space-joined (falls back to the raw text on a shape we don't
+// recognize, e.g. pre-M1 data).
+function formatArgs(raw: string | null | undefined): string {
+  if (!raw) return '';
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map((v) => String(v)).join(' ') : raw;
+  } catch {
+    return raw;
+  }
 }
 
 function statusRank(s: string | null): number {
@@ -109,9 +141,16 @@ function SessionNode({
             {expanded ? '▾' : '▸'}
           </span>
         )}
-        <span className="cs-id">{stat.elanus_session}</span>
+        {stat.intent ? (
+          <>
+            <span className="cs-intent" title={stat.intent}>{truncate(stat.intent, 80)}</span>
+            <span className="cs-dim cs-child-id" title={stat.elanus_session}>{stat.elanus_session}</span>
+          </>
+        ) : (
+          <span className="cs-id">{stat.elanus_session}</span>
+        )}
         <span className="cs-tool">{stat.tool ?? '?'}</span>
-        <span className="cs-dim">{(stat.model ?? '?') + ' / ' + (stat.effort ?? '?')}</span>
+        <span className="cs-dim">{modelEffortText(stat.model, stat.effort)}</span>
         <StatusBadge status={stat.last_status} />
         <span className="cs-dim">{humanDuration(stat.duration_ms)}</span>
         {stat.resume_count > 0 && <span className="cs-dim">↻{stat.resume_count}</span>}
@@ -181,6 +220,12 @@ type LivePatch = {
   resume_count: number; // delta from live session/resume events
   updated_at?: string | null;
   saw_event: boolean; // a non-lifecycle leaf (tool/assistant/...) bumps activity
+  // worker-legibility M1: launch identity, folded from session/start (args) and
+  // the separate retained `intent` leaf topic (codeagent.rs publishes it BEFORE
+  // session/start, so this must not assume ordering).
+  intent?: string | null;
+  args?: string | null;
+  launched_by_event?: string | null;
 };
 
 // Parse a coding-session obs topic: obs/agent/<noun>/<elanus_session>/<leaf>.
@@ -234,8 +279,15 @@ function foldLive(prev: Map<string, LivePatch>, topic: string, env: any): Map<st
       p.model = p.model ?? (typeof payload.model === 'string' ? payload.model : null);
       p.effort = p.effort ?? (typeof payload.effort === 'string' ? payload.effort : null);
       p.parent = p.parent ?? (typeof payload.parent === 'string' ? payload.parent : null);
+      p.args = p.args ?? (Array.isArray(payload.args) ? JSON.stringify(payload.args) : null);
+      p.launched_by_event = p.launched_by_event ?? (typeof payload.launched_by_event === 'string' ? payload.launched_by_event : null);
       p.started_at = p.started_at ?? ts;
       p.last_status = 'running';
+      break;
+    case 'intent':
+      // codeagent.rs publishes this RETAINED, separate from session/start (the
+      // launch task string) — may arrive before OR after session/start.
+      if (typeof payload.intent === 'string') p.intent = payload.intent;
       break;
     case 'session/thread':
       if (noun === 'codex' && typeof payload.codex_thread === 'string') p.native_session = payload.codex_thread;
@@ -284,6 +336,9 @@ function mergeLive(backfill: Stat[], patches: Map<string, LivePatch>): Stat[] {
       merged.resume_count = base.resume_count + p.resume_count;
       if (p.native_session && !merged.native_session) merged.native_session = p.native_session;
       if (p.parent && !merged.parent) merged.parent = p.parent;
+      if (p.intent && !merged.intent) merged.intent = p.intent;
+      if (p.args && !merged.args) merged.args = p.args;
+      if (p.launched_by_event && !merged.launched_by_event) merged.launched_by_event = p.launched_by_event;
       // Lifecycle: 'done' is terminal and wins; otherwise the live status (the
       // newer signal) takes precedence over the backfill's older status.
       if (p.last_status) {
@@ -318,6 +373,9 @@ function mergeLive(backfill: Stat[], patches: Map<string, LivePatch>): Stat[] {
         output_tokens: p.output_tokens,
         updated_at: p.updated_at ?? null,
         duration_ms: null,
+        intent: p.intent ?? null,
+        args: p.args ?? null,
+        launched_by_event: p.launched_by_event ?? null,
       };
       syn.duration_ms = computeDuration(syn);
       byId.set(id, syn);
@@ -712,10 +770,11 @@ export default function CodeSessions({ focus, onOpenConversation }: { focus?: st
         const ds: Stat = live ? { ...detail.session, ...live, relaunches: detail.session.relaunches, driven_resumes: detail.session.driven_resumes, incarnations: detail.session.incarnations } : detail.session;
         return (
         <div className="cs-detail">
-          <h3 className="cs-h">{ds.elanus_session}</h3>
+          <h3 className="cs-h" title={ds.intent ?? undefined}>{ds.intent ? truncate(ds.intent, 120) : ds.elanus_session}</h3>
+          {ds.intent && <div className="cs-dim cs-detail-id" title={ds.elanus_session}>{ds.elanus_session}</div>}
           <div className="cs-kv">
             <span>tool</span><b>{ds.tool ?? '?'}</b>
-            <span>model / effort</span><b>{(ds.model ?? '?') + ' / ' + (ds.effort ?? '?')}</b>
+            <span>model / effort</span><b>{modelEffortText(ds.model, ds.effort)}</b>
             <span>status</span><b><StatusBadge status={ds.last_status} /></b>
             <span>duration</span><b>{humanDuration(ds.duration_ms)}</b>
             <span>tokens</span><b>{humanTokens(ds.input_tokens)} in / {humanTokens(ds.output_tokens)} out</b>
@@ -730,8 +789,18 @@ export default function CodeSessions({ focus, onOpenConversation }: { focus?: st
               <><span>resumes</span><b>{ds.resume_count}</b></>
             )}
             {ds.parent && (<><span>parent</span><b className="cs-id">{ds.parent}</b></>)}
+            {ds.launched_by_event && (<><span>launch edge</span><b className="cs-id">{ds.launched_by_event}</b></>)}
             {ds.workdir && (<><span>workdir</span><b className="cs-id">{ds.workdir}</b></>)}
           </div>
+
+          {/* worker-legibility M1: launch args — big and detail-only, never on a
+              collapsed row. A <details> disclosure so it stays out of the way. */}
+          {ds.args && (
+            <details className="cs-sub cs-args-disclosure">
+              <summary className="cs-dim">launch args</summary>
+              <pre className="cs-args">{formatArgs(ds.args)}</pre>
+            </details>
+          )}
 
           {/* worker-notes-panel: the shared compose (same component the trace
               fallback mounts). Honest label + the observe-vs-converse distinction:
@@ -802,10 +871,24 @@ export default function CodeSessions({ focus, onOpenConversation }: { focus?: st
             <div className="cs-sub">
               <div className="cs-dim">spawned workers:</div>
               {detail.children.map((c) => (
-                <div key={c.elanus_session} className="cs-row" onClick={() => setSelected(c.elanus_session)}>
-                  <span className="cs-id">{c.elanus_session}</span>
+                <div
+                  key={c.elanus_session}
+                  className="cs-row"
+                  onClick={() => setSelected(c.elanus_session)}
+                  title={`${c.elanus_session}${c.intent ? `\nintent: ${c.intent}` : ''}${c.launched_by_event ? `\nlaunch edge: ${c.launched_by_event}` : ''}${ds.intent ? `\nparent intent: ${ds.intent}` : ''}`}
+                >
+                  {c.intent ? (
+                    <span className="cs-intent">{truncate(c.intent, 80)}</span>
+                  ) : (
+                    <span className="cs-id">{c.elanus_session}</span>
+                  )}
+                  <span className="cs-dim cs-child-id">{c.elanus_session}</span>
                   <span className="cs-tool">{c.tool ?? '?'}</span>
+                  <span className="cs-dim">{modelEffortText(c.model, c.effort)}</span>
                   <StatusBadge status={c.last_status} />
+                  {ds.intent && (
+                    <span className="cs-dim cs-parent-intent">↳ parent: {truncate(ds.intent, 80)}</span>
+                  )}
                 </div>
               ))}
             </div>
@@ -882,4 +965,10 @@ const CS_STYLE = `
 .cs-block-editor { margin-top: 4px; }
 .cs-block-textarea { width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: 11px; background: var(--field-bg); color: var(--ink); border: 1px solid var(--field-border); border-radius: var(--r-sharp); padding: 5px 6px; resize: vertical; }
 .cs-block-actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+.cs-intent { color: var(--ink); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40ch; }
+.cs-detail-id { margin: -6px 0 8px; font-family: var(--mono); font-size: 11px; }
+.cs-child-id { font-family: var(--mono); font-size: 10px; }
+.cs-parent-intent { font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 30ch; }
+.cs-args-disclosure summary { cursor: pointer; }
+.cs-args { font-family: var(--mono); font-size: 11px; background: var(--code-bg); border: 1px solid var(--panel-edge); border-radius: var(--r-sharp); padding: 6px 8px; white-space: pre-wrap; word-break: break-word; margin: 4px 0 0; }
 `;

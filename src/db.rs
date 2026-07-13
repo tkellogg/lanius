@@ -388,6 +388,7 @@ CREATE TABLE IF NOT EXISTS code_sessions (
   tool           TEXT NOT NULL,         -- the binary: claude | codex
   agent_noun     TEXT NOT NULL,         -- the obs noun: claude-code | codex
   workdir        TEXT NOT NULL,         -- absolute dir the session ran in (resume cwd)
+  launched_by_event TEXT,               -- explicit spawn correlation when known
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   last_active    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -601,7 +602,10 @@ CREATE TABLE IF NOT EXISTS code_spawn_edges (
     // its claims are NEVER reaped on this signal alone; only a confirmed-dead pid
     // reaps. `conn_updated_at` timestamps the last transition.
     let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN connected INTEGER", []);
-    let _ = conn.execute("ALTER TABLE code_sessions ADD COLUMN conn_updated_at TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE code_sessions ADD COLUMN conn_updated_at TEXT",
+        [],
+    );
     // Situational-awareness M4 (agent-situational-awareness handoff): the git BRANCH
     // this session is working on (the branch checked out in its workdir at launch).
     // Paired with the already-stored `workdir` (the worktree), this is the durable
@@ -621,6 +625,13 @@ CREATE TABLE IF NOT EXISTS code_spawn_edges (
     // nothing (docs/handoffs/principal-kind.md).
     let _ = conn.execute(
         "ALTER TABLE code_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'session'",
+        [],
+    );
+    // worker-legibility M2: the explicit launch edge where the lanius seam already
+    // carries one (`lanius code spawn`'s code-spawn-* correlation). Nullable:
+    // blocking nested launches and pre-M2 rows have no durable event id.
+    let _ = conn.execute(
+        "ALTER TABLE code_sessions ADD COLUMN launched_by_event TEXT",
         [],
     );
     // Migrations for databases created before a column existed; the error on
