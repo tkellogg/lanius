@@ -46,17 +46,6 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 croner = "3.0"
-# TLS: native-tls (SChannel on Windows, SecureTransport on macOS, OpenSSL on
-# Linux) instead of the default rustls+aws-lc-rs. This drops the aws-lc-sys C
-# crypto crate entirely — it fails to cross-compile to windows-msvc
-# (jitterentropy-base-windows.h can't find windows.h from a mac host) and, on a
-# native Windows box, additionally demands NASM + a full C toolchain, an unkind
-# ask for `cargo install lanius`. genai 0.6.5 exposes ONLY `rustls-tls`
-# (-> reqwest/rustls -> aws-lc) or `native-tls`, so native-tls is the sole lever
-# that keeps aws-lc out of the graph without forking genai. Prove it gone with
-# `cargo tree -i aws-lc-sys` (should report "nothing depends on it").
-# Trade: Linux builds now need OpenSSL dev headers (present on ubuntu-latest CI).
-genai = { version = "0.6.5", default-features = false, features = ["native-tls"] }
 ntex = { version = "3.9.6", features = ["tokio"] }
 ntex-mqtt = "8.1.0"
 # default features drop `use-rustls`: the bus talks plain TCP to a loopback
@@ -72,22 +61,38 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 toml = "1"
 uuid = { version = "1", features = ["v4"] }
 toml_edit = "0.25.12"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
 include_dir = "0.7"
 chacha20poly1305 = "0.10"
 
-# libc is a Unix-only concern; every libc call site is now behind `#[cfg(unix)]`
+# ── TLS is target-scoped (docs/handoffs/windows-support.md M1) ────────────────
+# Unix keeps the exact 0.1.1 configuration: genai/reqwest defaults = rustls +
+# aws-lc-rs, fully static, no dynamic-lib deps for Linux/mac users (Tim's
+# ruling: no OpenSSL dependency on Linux). Windows swaps to native-tls
+# (SChannel): aws-lc-sys does not cross-compile to windows-msvc and, on a
+# native box, demands NASM + a full C toolchain — an unkind ask for a `cargo
+# install lanius` user. genai 0.6.5 exposes only `rustls-tls` (-> aws-lc) or
+# `native-tls`, so native-tls is the sole per-target lever without forking
+# genai; a genai-upstream ring feature is the eventual static-everywhere path.
+# Feature unification is per-compile-target, so the two tables do not bleed:
+# `cargo tree -i aws-lc-sys` is NON-empty on a unix host and EMPTY under
+# `--target x86_64-pc-windows-msvc` (verified both ways).
+#
+# libc is likewise Unix-only; every libc call site is behind `#[cfg(unix)]`
 # (mostly inside src/platform/unix.rs). On Windows the platform shims use
 # windows-sys instead. Keeping libc off the Windows graph makes a stray,
 # unguarded libc call a hard compile error rather than a silent link failure.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+genai = "0.6.5"
+reqwest = { version = "0.13.4", features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
+genai = { version = "0.6.5", default-features = false, features = ["native-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
 
 [[bin]]
 name = "harness-acp"
