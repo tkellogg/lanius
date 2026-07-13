@@ -891,6 +891,8 @@ mod adapter_refresh_tests {
 
     #[test]
     fn refreshes_when_source_is_newer_and_lands_on_a_fresh_inode() {
+        use std::io::{Read, Seek, SeekFrom};
+
         let dir = scratch_dir("newer");
         let source = dir.join("harness-claude");
         let adapter = dir.join("adapter");
@@ -902,7 +904,15 @@ mod adapter_refresh_tests {
         set_mtime(&source, base);
         set_mtime(&adapter, base);
 
-        let adapter_ino_before = inode(&adapter);
+        // Pin the pre-refresh adapter file object by holding it open: on
+        // Unix, unlinking a path leaves an already-open file descriptor's
+        // data intact, so this handle keeps reading the OLD bytes even
+        // after refresh_adapter_if_stale unlinks the path and recreates it.
+        // (Inode *numbers* are not asserted here — Linux filesystems
+        // routinely reuse a just-freed inode number, so a numeric
+        // before/after comparison is fragile; what actually matters is
+        // that the old file object is never mutated in place.)
+        let mut pinned_old_adapter = fs::File::open(&adapter).unwrap();
 
         // Source gets rebuilt/reinstalled: bump its mtime strictly newer.
         fs::write(&source, b"new bytes").unwrap();
@@ -910,10 +920,12 @@ mod adapter_refresh_tests {
 
         refresh_adapter_if_stale(&source, &adapter).unwrap();
 
-        assert_ne!(
-            inode(&adapter),
-            adapter_ino_before,
-            "a stale adapter must be refreshed onto a fresh inode, never overwritten in place"
+        let mut old_bytes = Vec::new();
+        pinned_old_adapter.seek(SeekFrom::Start(0)).unwrap();
+        pinned_old_adapter.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(
+            old_bytes, b"already installed",
+            "the pre-refresh adapter file object must be left untouched, never overwritten in place"
         );
         assert_eq!(fs::read(&adapter).unwrap(), b"new bytes");
 
