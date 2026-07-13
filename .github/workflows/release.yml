@@ -1,0 +1,62 @@
+name: Release
+
+# Build release binaries natively on each platform's own runner (NO
+# cross-compiling — docs/handoffs/windows-support.md M6) when a version tag is
+# pushed, and attach them to the GitHub Release for that tag.
+#
+# Node must be present before cargo: build.rs runs the vite build into
+# ui/web/dist ahead of compilation so the binary embeds a fresh web UI
+# (same convention as ci.yml).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release + upload assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest # arm64 (Apple Silicon)
+            artifact: lanius-macos-arm64.tar.gz
+          - os: ubuntu-latest # x64
+            artifact: lanius-linux-x64.tar.gz
+          - os: windows-latest # x64
+            artifact: lanius-windows-x64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # build.rs runs the vite build into ui/web/dist before the crate compiles.
+      - run: cargo build --release
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          tar -C target/release -czf "${{ matrix.artifact }}" lanius harness-acp
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/lanius.exe, target/release/harness-acp.exe -DestinationPath "${{ matrix.artifact }}"
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          # Create the release for this tag if no other leg has yet (racing legs
+          # tolerate the "already exists" failure), then upload this platform's
+          # archive. --clobber makes re-runs idempotent.
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes || true
+          gh release upload "${GITHUB_REF_NAME}" "${{ matrix.artifact }}" --clobber
