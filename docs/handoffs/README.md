@@ -69,6 +69,22 @@ statuses: planned | in-progress | verifying | done
   consistent across all claim readers, shift conflicting dev ports by default with
   `--fixed-ports`, and record the `.codex/skills` symlink invariant. Defers the
   dev-supervisor lifecycle spike and async spawn model/effort controls.
+- [session-credential-lifecycle.md](session-credential-lifecycle.md) - **planned**
+  (chainlink #10): the credential half of the claude-code crash class — a driven
+  resume mints a fresh secret over a live incarnation's secret and then deletes
+  the shared token file, so the live session's every hook publish is refused
+  (`bad/unknown session token`); two supervised sessions lost in three days. M1
+  makes credentials incarnation-safe (**ruling: reuse the live credential + mint
+  ephemeral only for an idle session + secret-scoped compare-and-delete retire**;
+  rejected multi-generation as unwarranted by the evidence). M2 gates resume as
+  containment (**ruling: a delivery to a live session lands in the inbox, not a
+  parallel resume**; serialize idle resumes). M3 records the terminal reason
+  kernel-side when the bus is unauthorized. M4 flags a real residual: the
+  adapter-staleness refresh (`5c16270`) runs only at seed/init, never at the
+  launch use boundary, so an upgraded root keeps running the stale adapter. Sibling
+  defects already fixed: phantom claims (`24ecdfb`), summary-race source
+  (`5c16270`). Mirrors
+  [../bugs/claude-code-adapter-summary-credential-crash.md](../bugs/claude-code-adapter-summary-credential-crash.md).
 - [coding-agent-observability.md](coding-agent-observability.md) - the
   human-facing companion: materialize the obs/MQTT stream into sqlite, expose it
   via an API (server.mjs), and render the live session + nested subagent tree in
