@@ -231,6 +231,30 @@ skills tree, or connect it to packages, profiles, grants, or runtime discovery.
 
 ## Log
 
+- 2026-07-12 -- **Phase B (M1 + M2) IMPLEMENTED + VERIFIED; changes unstaged for
+  Fable's commit.** Impl worker (sonnet, clean context) built M1
+  (`whose_path_for_viewer` + `AttributionState{Viewer,Other,Unknown}`, three-state
+  `whose_line`/`whose_json` with a JSON `state` key, `likely yours` removed) and M2
+  (shared `resolve_own_claim_path` for both `claim`/`unclaim`, normalized-path
+  release message, and the phantom-claim reap: `reap_dead_members` before the
+  `peer_claims` read in `turn_injection`). Adversarial verifier (opus/high)
+  returned **pass=true, build_ok=true, tests_ok=true**; every M1+M2 acceptance
+  clause holds and the new tests assert real DB state (own/peer/whose
+  before+after). The headline attack — a canonicalization mismatch mislabeling the
+  viewer's OWN claim as `claimed by <itself>` — was REFUTED (`session_holds_claim`
+  and the `whose_path` fallback scan the identical canon+raw pair, so a miss
+  degrades to Unknown, never Other-by-self). One med test-quality defect (the new
+  M2 tests mutated global `ENV_SESSION` unguarded → deterministic failure as a
+  filtered subset) was fixed in one round with a test-only shared `ENV_SESSION_LOCK`
+  Mutex covering all four ENV_SESSION-mutating tests. Planner re-ran the checks
+  directly: the previously failing filtered subset now passes 3/3, full suite
+  **620 passed / 0 failed**, clean build. Files changed (unstaged): `src/codeagent.rs`,
+  `src/codesession.rs` (+ this doc). Accepted-as-scoped residuals: `whose` itself
+  never reaps, so it can still cite a confirmed-dead session as a current claimant
+  (M1 scopes reap to the advertise boundary only); JSON `mine` is now `false` (was
+  `null`) for the unattributed case — callers should key off `attributed`/`state`;
+  `turn_injection`'s reap is per-turn and cross-room (bounded, advisory). The
+  credential/adapter defects in the bug doc remain the larger out-of-scope fix.
 - 2026-07-11 -- **Phase B planner (Fable's planner) pickup — anchors re-verified
   post-keystone, M2 extended.** Phase A (M3+M4) is committed (`2d3eaaa`) and the
   worker-dm-unification keystone is committed (`107c332`), so `src/codeagent.rs` /
