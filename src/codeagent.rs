@@ -185,6 +185,23 @@ pub fn scrub_provider_creds(cmd: &mut std::process::Command) -> &mut std::proces
     cmd
 }
 
+fn configure_resume_child_env<'a>(
+    cmd: &'a mut std::process::Command,
+    root: &Root,
+    principal: &str,
+    bus_token: &str,
+    agent: &str,
+    session: &str,
+) -> &'a mut std::process::Command {
+    scrub_provider_creds(cmd);
+    scrub_launch_control_env(cmd);
+    cmd.env_dual("PACKAGE", principal)
+        .env_dual("BUS_TOKEN", bus_token)
+        .env(ENV_SESSION, session)
+        .env(ENV_AGENT, agent)
+        .env_dual("ROOT", &root.dir)
+}
+
 /// Resolve the `lanius` binary used by generated hook commands.
 ///
 /// When running from the main binary, this is just the current executable. When
@@ -8699,12 +8716,11 @@ pub fn resume_capture(root: &Root, elanus_session: &str, message: &str) -> Resul
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Scrub lanius's provider credentials so the resumed tool uses its own
-        // login rather than inheriting lanius's provider env (Task 2). The native
-        // tool (claude/codex) is wrapped in `timeout`, but env_remove on the parent
-        // Command is inherited through the `timeout` exec, so the tool still never
-        // sees them.
-        scrub_provider_creds(&mut cmd);
+        // Scrub lanius's provider credentials, remove wrapper-only launch control,
+        // and pass the resumed session's identity/root to the native tool. The
+        // command is wrapped in `timeout`, but the environment set on the parent
+        // Command is inherited through the `timeout` exec.
+        configure_resume_child_env(&mut cmd, root, &principal, &bus_token, &agent, &session);
         eprintln!(
             "[code] resuming {} session {session} ({}) [timeout {secs}s]",
             rec.tool, rec.native_session
@@ -13852,6 +13868,31 @@ mod tests {
     }
 
     #[test]
+    fn build_resume_message_surfaces_a_delivered_inbox_block() {
+        let root = m3_tmp_root();
+        m3_record(&root, "code-bld00002", "codex");
+        m3_deliver(
+            &root,
+            "codex",
+            "code-bld00002",
+            "owner",
+            "please check the resumed inbox",
+        );
+
+        let injected = build_resume_message(&root, "codex", "code-bld00002", "continue");
+
+        assert!(
+            injected.starts_with("[lanius block: inbox]"),
+            "delivered mail must lead the resume injection: {injected}"
+        );
+        assert!(injected.contains("1 new message(s)"));
+        assert!(injected.contains("please check the resumed inbox"));
+        assert!(injected.contains("message you were resumed with"));
+        assert!(injected.ends_with("continue"));
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    #[test]
     fn note_cmd_requires_a_recorded_session() {
         let root = m3_tmp_root();
         // No record → clean error (a note would otherwise sit unread).
@@ -14922,6 +14963,54 @@ mod tests {
                 "child must inherit {kept}; saw env:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn resumed_child_receives_session_identity_and_root() {
+        // The CLI resume path is a fresh child process, not the original interactive
+        // shell, so it must explicitly receive the session identity/root that
+        // `lanius code inbox`, `deliver`, and hooks read from env.
+        use std::collections::HashMap;
+        use std::process::{Command, Stdio};
+
+        let root = m3_tmp_root();
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env("ANTHROPIC_API_KEY", "must-not-leak")
+            .env(ENV_FORCE_SESSION, "code-wrong000")
+            .env(ENV_REPLY_TO, "code-parent00")
+            .env(ENV_REPLY_CORRELATION, "corr-stale");
+        configure_resume_child_env(
+            &mut cmd,
+            &root,
+            "code-resume99",
+            "bus-secret",
+            "codex",
+            "code-resume99",
+        );
+        cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+
+        let out = cmd.output().expect("running `env`");
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        let vars: HashMap<&str, &str> = text.lines().filter_map(|l| l.split_once('=')).collect();
+
+        assert_eq!(vars.get(ENV_SESSION).copied(), Some("code-resume99"));
+        assert_eq!(vars.get(ENV_AGENT).copied(), Some("codex"));
+        let root_dir = root.dir.to_string_lossy().to_string();
+        assert_eq!(vars.get("LANIUS_ROOT").copied(), Some(root_dir.as_str()));
+        assert_eq!(vars.get("LANIUS_PACKAGE").copied(), Some("code-resume99"));
+        assert_eq!(vars.get("LANIUS_BUS_TOKEN").copied(), Some("bus-secret"));
+        assert!(
+            !vars.contains_key("ANTHROPIC_API_KEY"),
+            "resume child must not inherit provider creds; saw env:\n{text}"
+        );
+        for removed in [ENV_FORCE_SESSION, ENV_REPLY_TO, ENV_REPLY_CORRELATION] {
+            assert!(
+                !vars.contains_key(removed),
+                "resume child must not inherit launch-control {removed}; saw env:\n{text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root.dir);
     }
 
     // ── SA3 (write half): touching a file IS the claim ───────────────────────
