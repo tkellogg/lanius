@@ -17,6 +17,7 @@ All notable changes to lanius are documented here.
   repeat the flag for multiple names.
 
 ### Changed
+- worker legibility: Runs identity, launched_by edge, History honesty, chat-first workers, Chat rename (#8)
 - worker-dm-unification: unify coding-session DMs into the chat plane (#4)
 
 - `Cargo.toml` now declares `rust-version = "1.88"`, so installing with an
