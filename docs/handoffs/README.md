@@ -240,6 +240,27 @@ statuses: planned | in-progress | verifying | done
   forward verbatim; the existing harness **scrub** becomes the *enabler* of nesting
   ("codex-on-ChatGPT-inside-codex-on-GLM"). M1 vault + sum type → M2 harness/launch
   (delivers #5) → M3 dispatcher (`build_client`, src/exec.rs) → M4 the #4 UI.
+- [telegram-bridge.md](telegram-bridge.md) - **planned** (chainlink #15): close the
+  loop so Tim can chat with his running agents from his phone on the *same*
+  conversation the web UI shows. The bridge **daemon is already built and committed**
+  (`packages/telegram/`, `eeaf712`) — long-poll ingress, `sender=telegram` egress
+  receipts, phonebook sightings, park-not-crash; this is Handoff C's
+  ([agent-dm-relay.md](agent-dm-relay.md)) unfinished second half. Four verified
+  gaps: **M1** reply routing — nothing forwards `in/human/<owner>` →
+  `in/package/telegram/send`, so an agent's reply renders in the web but never
+  reaches the phone (stateless correlation-follow, the routing twin of
+  `reply_source`); **M2** owner-sender authentication + fail-closed promotion —
+  resolve a chat id to `owner` via the phonebook and promote onto `in/human/<owner>`
+  (`source:telegram`), an unknown sender records a sighting but never reaches an
+  agent; **M3** bot token as an encrypted vault credential materialized into the
+  daemon env at the spawn seam (`dispatcher.rs:495-521` injects `BUS_TOKEN` but
+  **never** config keys today — closes an absent wiring *and* the plaintext
+  exposure); **M4** stub-transport e2e round trip + BotFather on-ramp. **Rulings:**
+  outbound = long-poll (a laptop behind NAT has no public endpoint); reply routing =
+  deterministic correlation-follow, distinct from the still-deferred EA "pick a
+  platform unprompted" policy (`channels.md` gap 4). Depends on A
+  ([principal-kind.md](principal-kind.md)) + B ([dm-channel-grammar.md](dm-channel-grammar.md)),
+  both done. Backed by [../journeys/chat-from-anywhere.md](../journeys/chat-from-anywhere.md).
 - [web-packaging.md](web-packaging.md) - **in-progress** (M1–M3 shipped, M4
   deferred): make `cargo install elanus` serve the web UI with **no Node.js, no
   npm, and no source tree at runtime** — fold `server.mjs` into a Rust `src/web.rs`
