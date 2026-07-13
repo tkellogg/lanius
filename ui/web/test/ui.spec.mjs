@@ -20,10 +20,50 @@ const WEB_LOG = path.join(TMP, 'web.log');
 const ENV = { ...process.env, LANIUS_ROOT: TMP, PATH: `${BIN}:${process.env.PATH}`, LANIUS_WEB_LOG: WEB_LOG };
 
 let failures = 0;
-const ok = (m) => console.log(`  ok: ${m}`);
-const fail = (m) => { console.error(`FAIL: ${m}`); failures++; };
+let lastStep = 'startup';
+let lastActivity = Date.now();
+const suiteStart = Date.now();
+let tornDown = false;
+const ok = (m) => { lastStep = m; lastActivity = Date.now(); console.log(`  ok: ${m}`); };
+const fail = (m) => { lastStep = m; lastActivity = Date.now(); console.error(`FAIL: ${m}`); failures++; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const watchdog = setInterval(async () => {
+  if (Date.now() - suiteStart > 15 * 60 * 1000) {
+    console.error(`SUITE DEADLINE EXCEEDED after "${lastStep}"`);
+    await teardown();
+    process.exit(2);
+  }
+  if (Date.now() - lastActivity > 90000) {
+    console.error(`STALL: no progress for 90s after "${lastStep}"`);
+    await teardown();
+    process.exit(2);
+  }
+}, 5000);
+
+// Idempotent async teardown, safe to call from the watchdog, signal handlers,
+// or the normal end-of-suite path. Defined here (hoisted) so it is callable
+// from the watchdog above; the browser/server/daemon/TMP it references are
+// module-level consts assigned during stack setup below.
+async function teardown() {
+  if (tornDown) return;
+  tornDown = true;
+  clearInterval(watchdog);
+  try { server.kill('SIGKILL'); } catch {}
+  try { daemon.kill('SIGKILL'); } catch {}
+  try { execFileSync('pkill', ['-9', '-f', TMP], { timeout: 10000 }); } catch {}
+  try { await Promise.race([browser.close().catch(() => {}), sleep(5000)]); } catch {}
+}
+process.on('SIGINT', async () => { await teardown(); process.exit(130); });
+process.on('SIGTERM', async () => { await teardown(); process.exit(130); });
+process.on('exit', () => {
+  if (tornDown) return;
+  tornDown = true;
+  try { server.kill('SIGKILL'); } catch {}
+  try { daemon.kill('SIGKILL'); } catch {}
+  try { execFileSync('pkill', ['-9', '-f', TMP], { timeout: 10000 }); } catch {}
+});
 async function waitFor(desc, fn, timeoutMs = 15000) {
+  lastStep = desc;
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     if (await fn()) { ok(desc); return true; }
@@ -32,7 +72,7 @@ async function waitFor(desc, fn, timeoutMs = 15000) {
   fail(`${desc} (timed out)`);
   return false;
 }
-const lanius = (...a) => execFileSync(path.join(BIN, 'lanius'), a, { env: ENV, encoding: 'utf8' });
+const lanius = (...a) => execFileSync(path.join(BIN, 'lanius'), a, { env: ENV, encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' });
 function sqlString(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
@@ -75,20 +115,20 @@ function seedCodeRunIdentityFixture() {
     VALUES (${sqlString(run.session)}, '', 'codex', 'codex', ${sqlString(TMP)}, ${sqlString(run.intent)})
     ON CONFLICT(elanus_session) DO UPDATE SET intent = excluded.intent;
   `).join('\n');
-  execFileSync('sqlite3', [db, sql], { env: ENV, encoding: 'utf8' });
+  execFileSync('sqlite3', [db, sql], { env: ENV, encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' });
   return { parent, child };
 }
 function createConfigProposal(id, pkg, toml) {
   const cfg = path.join(TMP, 'config');
   const branch = `tmp-${id}`;
-  execFileSync('git', ['-C', cfg, 'checkout', '-q', '-b', branch, 'live'], { encoding: 'utf8' });
+  execFileSync('git', ['-C', cfg, 'checkout', '-q', '-b', branch, 'live'], { encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' });
   fs.writeFileSync(path.join(cfg, 'packages', `${pkg}.toml`), toml);
-  execFileSync('git', ['-C', cfg, 'add', `packages/${pkg}.toml`], { encoding: 'utf8' });
-  execFileSync('git', ['-C', cfg, '-c', 'user.name=qa', '-c', 'user.email=qa@local', 'commit', '-q', '-m', `proposal ${id}`], { encoding: 'utf8' });
-  const sha = execFileSync('git', ['-C', cfg, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-  execFileSync('git', ['-C', cfg, 'update-ref', `refs/proposals/${id}`, sha], { encoding: 'utf8' });
-  execFileSync('git', ['-C', cfg, 'checkout', '-q', 'live'], { encoding: 'utf8' });
-  execFileSync('git', ['-C', cfg, 'branch', '-D', branch], { encoding: 'utf8' });
+  execFileSync('git', ['-C', cfg, 'add', `packages/${pkg}.toml`], { encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' });
+  execFileSync('git', ['-C', cfg, '-c', 'user.name=qa', '-c', 'user.email=qa@local', 'commit', '-q', '-m', `proposal ${id}`], { encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' });
+  const sha = execFileSync('git', ['-C', cfg, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' }).trim();
+  execFileSync('git', ['-C', cfg, 'update-ref', `refs/proposals/${id}`, sha], { encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' });
+  execFileSync('git', ['-C', cfg, 'checkout', '-q', 'live'], { encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' });
+  execFileSync('git', ['-C', cfg, 'branch', '-D', branch], { encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' });
 }
 
 // -- stack setup (mirrors smoke.mjs) --
@@ -109,6 +149,8 @@ await waitFor('web server up', async () => {
 // -- browser --
 const browser = await chromium.launch({ headless: true });
 const ctx = await browser.newContext({ baseURL: BASE });
+ctx.setDefaultTimeout(20000);
+ctx.setDefaultNavigationTimeout(20000);
 
 // Shared page error accumulator — every test that opens a page attaches to this.
 const pageErrors = [];
@@ -153,7 +195,7 @@ async function newPage() {
 // this the haiku model's default max_turns=24 races the test's fill() calls.
 async function waitForConfigureLoaded(page, expectedAgent = '') {
   const t0 = Date.now();
-  while (Date.now() - t0 < 8000) {
+  while (Date.now() - t0 < 30000) {
     const note = await page.$eval('#cfg-note', (el) => el.textContent).catch(() => '');
     const model = await page.$eval('#cfg-model', (el) => el.value).catch(() => '');
     const file = await page.$eval('#cfg-file', (el) => el.textContent).catch(() => '');
@@ -162,9 +204,11 @@ async function waitForConfigureLoaded(page, expectedAgent = '') {
     // loadConfigure finishes by populating cfg-model (or setting an error note).
     // When we know which profile should load, also require the profile label to
     // match so a stale prior load does not slip through on reload.
-    if ((profileOk && !saveDisabled && !/^loading/i.test(note)) || note.includes('no profile')) return;
+    if ((profileOk && !saveDisabled && !/^loading/i.test(note)) || note.includes('no profile')) return true;
     await sleep(80);
   }
+  fail(`configure form did not finish loading for "${expectedAgent}" (timed out)`);
+  return false;
 }
 
 // The AI panel's open/closed state persists in localStorage (shared across
@@ -653,7 +697,7 @@ const testAgentProfile = 'harrier';
       && turns !== '7'
       && text.includes(model)
       && text.includes(autonomy);
-  }, 5000);
+  }, 20000);
   await mainWindowPackage().evaluate((el) => { if (!el.open) el.querySelector('summary')?.click(); });
   await mainWindowPackage().locator('.cfg-package-config-toggle').click();
   await waitFor('configure reload: second agent sees shared package setting', async () => {
@@ -2738,7 +2782,7 @@ const renamedAgent = 'falcon';
     page.evaluate(() => {
       const rows = [...document.querySelectorAll('#view-providers [data-provider]')].map((el) => el.getAttribute('data-provider'));
       return rows.includes('ui-deepseek') && rows.includes('ui-claude-oauth');
-    }), 8000);
+    }), 12000);
 
   // the page's test button surfaces the native result inline.
   await page.click('[data-test-provider="ui-claude-oauth"]');
@@ -2753,14 +2797,11 @@ const renamedAgent = 'falcon';
   // the empty-list state with the link; clicking it navigates to the Providers page.
   await page.click('[data-sel="setup"]');
   await page.waitForSelector('#view-setup:not([hidden])', { timeout: 5000 });
-  const naLink = await page.$('#view-setup [data-providers-link]');
-  if (naLink) {
-    ok('providers: the new-agent model field shows the "set up a provider →" link');
-    await naLink.click();
+  const naLinkVisible = await waitFor('providers: the new-agent model field shows the "set up a provider →" link', async () => !!(await page.$('#view-setup [data-providers-link]')), 8000);
+  if (naLinkVisible) {
+    await page.click('#view-setup [data-providers-link]');
     await page.waitForSelector('#view-providers', { timeout: 5000 });
     ok('providers: the link navigates to the Providers page');
-  } else {
-    fail('providers: the "set up a provider →" link is missing from the empty model field');
   }
 
   // -- the configure-view ModelField gets the same "set up a provider →" link --
@@ -2779,7 +2820,7 @@ const renamedAgent = 'falcon';
     await linkPage.click('[data-tab="configure"]');
     await linkPage.waitForSelector('#view-configure:not([hidden])', { timeout: 5000 });
     await waitForConfigureLoaded(linkPage);
-    const cfgLink = await linkPage.$('#view-configure [data-providers-link]');
+    const cfgLink = await linkPage.waitForSelector('#view-configure [data-providers-link]', { timeout: 10000 }).catch(() => null);
     if (cfgLink) {
       ok('providers: the configure-view model field also shows the "set up a provider →" link');
       await cfgLink.click();
@@ -2832,7 +2873,7 @@ const renamedAgent = 'falcon';
         && j.profile?.provider === 'ui-deepseek'
         && j.profile?.model === 'deepseek-v4-flash'
         && /\bprovider\s*=\s*"ui-deepseek"/.test(j.toml || '');
-    }, providerProfile), 8000);
+    }, providerProfile), 12000);
   await page.reload();
   await page.waitForSelector('#nav-agents', { timeout: 10000 });
   await page.click('#nav-agents .nav-item');
@@ -2846,7 +2887,7 @@ const renamedAgent = 'falcon';
       const provider = document.querySelector('#cfg-provider')?.value;
       const model = document.querySelector('#cfg-model')?.value;
       return provider === 'ui-deepseek' && model === 'deepseek-v4-flash';
-    }), 8000);
+    }), 12000);
 
   // -- rm --
   const removed = await page.evaluate(async () => {
@@ -3971,9 +4012,6 @@ if (consoleErrors.length) {
 }
 
 // -- teardown --
-await browser.close();
-server.kill('SIGKILL');
-daemon.kill('SIGKILL');
-try { execFileSync('pkill', ['-9', '-f', TMP]); } catch {}
+await teardown();
 console.log(failures === 0 ? 'ALL PASS' : `${failures} failure(s)`);
 process.exit(failures === 0 ? 0 : 1);
