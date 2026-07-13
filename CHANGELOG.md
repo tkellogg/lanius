@@ -4,6 +4,9 @@ All notable changes to lanius are documented here.
 
 ## 0.1.1 — 2026-07-10
 
+### Fixed
+- Codex resumed turns miss inbox block / lanius code inbox affordance (#11)
+
 ### Added
 - Plan coding-session reliability sprint (#2)
 
