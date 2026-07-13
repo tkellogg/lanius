@@ -16,11 +16,11 @@
 //! Decision table (see docs/handoffs/web-embed-freshness.md):
 //!   - LANIUS_SKIP_UI_BUILD=1        -> skip npm, warn loudly, succeed.
 //!   - ui/web/src present + npm on PATH:
-//!       * node_modules missing      -> `npm --prefix ui/web install` (warn);
+//!       * node_modules missing      -> `npm install` in ui/web (warn);
 //!                                       a FAILED install (airgapped / registry
 //!                                       down) warns loudly and falls back to
 //!                                       the committed dist.
-//!       * then `npm --prefix ui/web run build`; a non-zero BUILD exit PANICS
+//!       * then `npm run build` in ui/web; a non-zero BUILD exit PANICS
 //!         with the npm output (a present-but-broken UI build is a real error;
 //!         falling back silently would re-create the staleness bug).
 //!   - otherwise (no npm / no ui source) -> warn loudly, embed committed dist.
@@ -89,10 +89,9 @@ fn main() {
     // registry down) — warn and fall back to the committed dist rather than
     // hard-failing `cargo install` on a network hiccup.
     if !web.join("node_modules").is_dir() {
-        warn("web UI: node_modules missing — running `npm --prefix ui/web install`");
+        warn("web UI: node_modules missing — running `npm install` in ui/web");
         let installed = npm()
-            .arg("--prefix")
-            .arg(&web)
+            .current_dir(&web)
             .arg("install")
             .status()
             .map(|s| s.success())
@@ -100,7 +99,7 @@ fn main() {
         if !installed {
             fallback(
                 &web,
-                "web UI: `npm --prefix ui/web install` FAILED (airgapped / registry \
+                "web UI: `npm install` (in ui/web) FAILED (airgapped / registry \
                  down?) — embedding the existing ui/web/dist as-is. Fix networking \
                  and rebuild, or set LANIUS_SKIP_UI_BUILD=1 to skip the UI build.",
             );
@@ -112,8 +111,7 @@ fn main() {
     // a real error (a broken UI build) — panic with the output. Silently
     // falling back here would re-create the staleness bug with extra steps.
     let output = npm()
-        .arg("--prefix")
-        .arg(&web)
+        .current_dir(&web)
         .arg("run")
         .arg("build")
         .stdin(Stdio::null())
@@ -130,7 +128,7 @@ fn main() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
             panic!(
-                "web UI build failed: `npm --prefix ui/web run build` exited {}.\n\
+                "web UI build failed: `npm run build` (in ui/web) exited {}.\n\
                  --- npm stdout ---\n{stdout}\n--- npm stderr ---\n{stderr}\n\
                  Fix the UI build, or set LANIUS_SKIP_UI_BUILD=1 to skip it and \
                  embed the existing ui/web/dist as-is.",
@@ -139,7 +137,7 @@ fn main() {
         }
         Err(e) => {
             panic!(
-                "web UI build failed: could not run `npm --prefix ui/web run build`: {e}. \
+                "web UI build failed: could not run `npm run build` in ui/web: {e}. \
                  Set LANIUS_SKIP_UI_BUILD=1 to skip the UI build and embed the existing \
                  ui/web/dist as-is."
             );
