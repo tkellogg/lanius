@@ -2135,6 +2135,95 @@ fn cli_err(r: &CliOut) -> String {
     }
 }
 
+/// Wall-clock cap on a shelled-out `lanius` child. Without this, a hung child
+/// wedges its ntex blocking-pool thread forever; enough hangs starve the pool
+/// and every request stalls or is lost. See src/web.rs shell-out helpers.
+const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run `cmd` (already configured with exe/args/env) to completion, feeding it
+/// `stdin` when Some, and killing it if it outlives `timeout`. Concurrently
+/// drains stdout/stderr on reader threads while polling — required, because a
+/// poll loop that doesn't drain the pipes deadlocks the instant the child
+/// writes enough output to fill a pipe buffer.
+fn run_bounded(
+    mut cmd: std::process::Command,
+    stdin: Option<&str>,
+    timeout: std::time::Duration,
+    log_args: &str,
+) -> Result<CliOut> {
+    use std::io::{Read as _, Write as _};
+    use std::process::Stdio;
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if stdin.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd.spawn().context("spawning lanius")?;
+
+    if let Some(secret) = stdin {
+        if let Some(mut sink) = child.stdin.take() {
+            sink.write_all(secret.as_bytes())
+                .context("piping the provider key on stdin")?;
+            // Drop closes the pipe so the child's stdin read sees EOF.
+        }
+    }
+
+    let mut child_stdout = child.stdout.take().expect("stdout was piped");
+    let mut child_stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().context("awaiting lanius")? {
+            Some(status) => break status,
+            None => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!(
+                        "[web] cli TIMEOUT after {}s: lanius {}",
+                        timeout.as_secs(),
+                        log_args
+                    );
+                    weblog(
+                        "cli",
+                        &format!("TIMEOUT after {}s: lanius {}", timeout.as_secs(), log_args),
+                    );
+                    anyhow::bail!(
+                        "lanius {} timed out after {}s",
+                        log_args,
+                        timeout.as_secs()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    };
+
+    let stdout_bytes = stdout_thread.join().unwrap_or_default();
+    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+
+    Ok(CliOut {
+        ok: status.success(),
+        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        error: if status.success() {
+            None
+        } else {
+            Some(format!("exited {}", status))
+        },
+    })
+}
+
 /// Run THIS binary (current_exe) as the lanius CLI with LANIUS_ROOT set, exactly
 /// as mjs ran the sibling binary — but in-process there is no node and no PATH
 /// lookup. Provider credentials are inherited from the launching environment
@@ -2150,57 +2239,22 @@ fn cli_owned(root: &Root, args: &[String]) -> Result<CliOut> {
     // so the same QA tail / e2e assertions work against this server.
     weblog("cli", &format!("lanius {}", args.join(" ")));
     let exe = std::env::current_exe().context("locating the running lanius binary")?;
-    let out = std::process::Command::new(exe)
-        .args(args)
-        .env_dual("ROOT", root.dir.display().to_string())
-        .output()
-        .context("spawning lanius")?;
-    Ok(CliOut {
-        ok: out.status.success(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        error: if out.status.success() {
-            None
-        } else {
-            Some(format!("exited {}", out.status))
-        },
-    })
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .env_dual("ROOT", root.dir.display().to_string());
+    run_bounded(cmd, None, CLI_TIMEOUT, &args.join(" "))
 }
 
 /// Like `cli`, but feeds `stdin` (when Some) to the child on its stdin pipe — the
 /// safe path for a secret (`provider add`'s key) so it never lands on argv or in
 /// the `[web:cli]` obs line. The logged command line is the argv only (no key).
 fn cli_stdin(root: &Root, args: &[String], stdin: Option<&str>) -> Result<CliOut> {
-    use std::io::Write as _;
     weblog("cli", &format!("lanius {}", args.join(" ")));
     let exe = std::env::current_exe().context("locating the running lanius binary")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args)
-        .env_dual("ROOT", root.dir.display().to_string())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    if stdin.is_some() {
-        cmd.stdin(std::process::Stdio::piped());
-    }
-    let mut child = cmd.spawn().context("spawning lanius")?;
-    if let Some(secret) = stdin {
-        if let Some(mut sink) = child.stdin.take() {
-            sink.write_all(secret.as_bytes())
-                .context("piping the provider key on stdin")?;
-            // Drop closes the pipe so the child's stdin read sees EOF.
-        }
-    }
-    let out = child.wait_with_output().context("awaiting lanius")?;
-    Ok(CliOut {
-        ok: out.status.success(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        error: if out.status.success() {
-            None
-        } else {
-            Some(format!("exited {}", out.status))
-        },
-    })
+        .env_dual("ROOT", root.dir.display().to_string());
+    run_bounded(cmd, stdin, CLI_TIMEOUT, &args.join(" "))
 }
 
 /// {ok, output, error} — the shape mjs returns for simple mutating verbs.
@@ -4493,5 +4547,35 @@ mod route_tests {
         assert!(!valid_worker_session("code-abc/evil"));
         assert!(!valid_worker_session("code-abc\"; rm -rf"));
         assert!(!valid_worker_session(""));
+    }
+
+    #[test]
+    fn run_bounded_times_out_and_returns_err() {
+        // Pins the timeout cap: a child that outlives the deadline is killed and
+        // the call returns Err promptly, instead of the poll loop (or the ntex
+        // blocking-pool thread it runs on) hanging for the child's full lifetime.
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("10");
+        let start = std::time::Instant::now();
+        let result = run_bounded(cmd, None, std::time::Duration::from_millis(200), "sleep 10");
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "expected timeout to produce Err");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "run_bounded took {:?}, expected well under the child's 10s sleep",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn run_bounded_fast_child_succeeds() {
+        // A normally-completing child under the cap still returns Ok with the
+        // same CliOut shape as before (ok/stdout populated, no error).
+        let mut cmd = std::process::Command::new("printf");
+        cmd.arg("hi");
+        let result = run_bounded(cmd, None, std::time::Duration::from_secs(30), "printf hi");
+        let out = result.expect("fast child should succeed");
+        assert!(out.ok);
+        assert!(out.stdout.contains("hi"));
     }
 }
