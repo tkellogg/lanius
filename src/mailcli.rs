@@ -50,6 +50,9 @@ pub struct MailRow {
     pub mid_cycle: bool,
     /// A short preview of the message text.
     pub preview: String,
+    /// The complete message text. The preview keeps list responses easy to scan;
+    /// this field lets the UI reveal what was actually sent.
+    pub message: String,
     /// When the delivery was recorded.
     pub ts: String,
 }
@@ -135,8 +138,8 @@ pub fn recent_mail(root: &Root, limit: usize) -> Result<Vec<MailRow>> {
             continue;
         }
         let pv: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
-        let preview = crate::codeagent::delivery_message(&pv).unwrap_or_default();
-        let preview = clip(&preview, 200);
+        let message = crate::codeagent::delivery_message(&pv).unwrap_or_default();
+        let preview = clip(&message, 200);
 
         let failed = correlation
             .as_deref()
@@ -155,6 +158,7 @@ pub fn recent_mail(root: &Root, limit: usize) -> Result<Vec<MailRow>> {
             failed,
             mid_cycle,
             preview,
+            message,
             ts: created_at,
         });
         if out.len() >= limit {
@@ -722,6 +726,7 @@ mod tests {
         assert_eq!(normal.priority, 0);
         assert!(!normal.failed);
         assert_eq!(normal.preview, "do x");
+        assert_eq!(normal.message, "do x");
 
         let high = rows.iter().find(|r| r.id == id_high).unwrap();
         assert_eq!(

@@ -32,7 +32,19 @@ type Mail = {
   failed: boolean;
   mid_cycle: boolean;
   preview: string;
+  message?: string;
   ts: string;
+};
+
+type SessionSummary = {
+  elanus_session: string;
+  agent_noun?: string | null;
+  tool?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  intent?: string | null;
+  last_status?: string | null;
+  started_at?: string | null;
 };
 
 type RoomMember = { session: string; agent_noun: string; live: boolean };
@@ -71,15 +83,66 @@ function StateBadge({ state, failed }: { state: string; failed: boolean }) {
   return <span className={cls}>{state}</span>;
 }
 
+function agentLabel(id: string, session?: SessionSummary | null, noun?: string | null): string {
+  if (id === 'kernel') return 'System';
+  const agent = session?.agent_noun ?? noun;
+  if (agent === 'claude-code') return 'Claude worker';
+  if (agent === 'codex') return 'Codex worker';
+  if (agent) return `${agent} worker`;
+  return 'Worker';
+}
+
+function AgentReference({ id, noun, session, onOpenRun }: {
+  id: string | null;
+  noun?: string | null;
+  session?: SessionSummary | null;
+  onOpenRun?: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const value = id ?? 'unknown';
+  const label = agentLabel(value, session, noun);
+  return (
+    <span className="cm-agent-ref">
+      <button
+        type="button"
+        className="cm-agent-button"
+        aria-expanded={open}
+        onClick={(e) => { e.stopPropagation(); setOpen((v) => !v); }}
+      >
+        <span>{label}</span>
+        {value.startsWith('code-') && <span className="cm-agent-short">{value.slice(-8)}</span>}
+      </button>
+      {open && (
+        <span className="cm-agent-popover" role="dialog" aria-label={`${label} details`} onClick={(e) => e.stopPropagation()}>
+          <strong>{session?.intent || label}</strong>
+          <span className="cm-agent-id">{value}</span>
+          {session ? (
+            <span className="cm-agent-facts">
+              <span>{session.tool ?? session.agent_noun ?? 'worker'}</span>
+              <span>{session.model ?? 'model unknown'}</span>
+              <span>{session.effort ?? 'effort not supplied'}</span>
+              <span>{session.last_status ?? 'status unknown'}</span>
+              {session.started_at && <span>started {relTime(session.started_at)}</span>}
+            </span>
+          ) : value.startsWith('code-') ? <span className="cm-dim">Run details are not available.</span> : null}
+          {value.startsWith('code-') && onOpenRun && (
+            <button type="button" className="cm-open-run" onClick={() => onOpenRun(value)}>Open run</button>
+          )}
+        </span>
+      )}
+    </span>
+  );
+}
+
 // One mail row, expandable to its correlation thread.
-function MailRow({ m, onSelectSession }: { m: Mail; onSelectSession?: (id: string) => void }) {
+function MailRow({ m, sessions, onSelectSession }: { m: Mail; sessions: Map<string, SessionSummary>; onSelectSession?: (id: string) => void }) {
   const [open, setOpen] = useState(false);
   return (
     <div className={`comms-row cm-row${m.failed ? ' cm-row-failed' : ''}`} data-event-id={m.id}>
       <div className="cm-line" onClick={() => setOpen((v) => !v)} role="button" aria-expanded={open}>
-        <span className="cm-from cm-id" title="from" onClick={(e) => { e.stopPropagation(); if (m.from && onSelectSession) onSelectSession(m.from); }}>{m.from ?? '?'}</span>
+        <AgentReference id={m.from} session={m.from ? sessions.get(m.from) : null} onOpenRun={onSelectSession} />
         <span className="cm-arrow">→</span>
-        <span className="cm-to cm-id" title="to" onClick={(e) => { e.stopPropagation(); if (m.to && onSelectSession) onSelectSession(m.to); }}>{m.to ?? '?'}</span>
+        <AgentReference id={m.to} noun={m.to_noun} session={m.to ? sessions.get(m.to) : null} onOpenRun={onSelectSession} />
         <PriorityChip priority={m.priority} />
         <StateBadge state={m.state} failed={m.failed} />
         {m.mid_cycle && <span className="cm-tell" title="Delivered while the agent was working — unread until it checks its inbox.">delivered mid-task</span>}
@@ -88,9 +151,9 @@ function MailRow({ m, onSelectSession }: { m: Mail; onSelectSession?: (id: strin
       </div>
       {open && (
         <div className="cm-thread">
-          <div className="cm-dim">Thread: <code>{m.correlation ?? '(none)'}</code></div>
-          {m.failed && <div className="cm-thread-fail">↳ This run failed.</div>}
-          {m.mid_cycle && <div className="cm-dim">urgent copy delivered early (mid-task); the same message still counts as unread in the next-turn inbox until the agent pulls it — by design, not a duplicate.</div>}
+          <div className="cm-message">{m.message ?? m.preview}</div>
+          {m.failed && <div className="cm-thread-fail">This run failed.</div>}
+          {m.mid_cycle && <div className="cm-dim">Delivered while the agent was working. It remains unread until the agent checks its messages.</div>}
         </div>
       )}
     </div>
@@ -100,6 +163,7 @@ function MailRow({ m, onSelectSession }: { m: Mail; onSelectSession?: (id: strin
 export default function CommsView({ onSelectSession }: { onSelectSession?: (id: string) => void } = {}) {
   const [mail, setMail] = useState<Mail[]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
+  const [sessions, setSessions] = useState<Map<string, SessionSummary>>(new Map());
   const [error, setError] = useState('');
   // Live mail folded off the stream since the last backfill, keyed by event id so
   // a double-channel delivery (mid-cycle + next-turn) is one entry, never two.
@@ -113,12 +177,14 @@ export default function CommsView({ onSelectSession }: { onSelectSession?: (id: 
     let alive = true;
     const load = async () => {
       try {
-        const [mr, rr] = await Promise.all([fetch('/api/comms/mail'), fetch('/api/comms/rooms')]);
+        const [mr, rr, sr] = await Promise.all([fetch('/api/comms/mail'), fetch('/api/comms/rooms'), fetch('/api/code/sessions')]);
         const md = mr.ok ? await mr.json() : [];
         const rd = rr.ok ? await rr.json() : [];
+        const sd = sr.ok ? await sr.json() : [];
         if (!alive) return;
         setMail(Array.isArray(md) ? md : []);
         setRooms(Array.isArray(rd) ? rd : []);
+        setSessions(new Map((Array.isArray(sd) ? sd : []).map((s: SessionSummary) => [s.elanus_session, s])));
         setLiveMail(new Map());
         seenSeqs.current = new Set();
         setError('');
@@ -163,6 +229,7 @@ export default function CommsView({ onSelectSession }: { onSelectSession?: (id: 
           failed: payload.failed === true,
           mid_cycle: false,
           preview: preview.slice(0, 200),
+          message: preview,
           ts: env.ts ?? new Date().toISOString(),
         };
         setLiveMail((prev) => {
@@ -195,7 +262,7 @@ export default function CommsView({ onSelectSession }: { onSelectSession?: (id: 
         )}
         <div className="cm-list">
           {merged.map((m) => (
-            <MailRow key={m.id} m={m} onSelectSession={onSelectSession} />
+            <MailRow key={m.id} m={m} sessions={sessions} onSelectSession={onSelectSession} />
           ))}
         </div>
       </div>
@@ -269,6 +336,16 @@ const CM_STYLE = `
 .cm-dim { color: var(--dim); }
 .cm-id { font-family: var(--mono); color: var(--work); cursor: pointer; }
 .cm-id:hover { text-decoration: underline; }
+.cm-agent-ref { position: relative; display: inline-flex; }
+.cm-agent-button { display: inline-flex; align-items: baseline; gap: 6px; border: 0; padding: 1px 3px; background: transparent; color: var(--work); font: inherit; cursor: pointer; }
+.cm-agent-button:hover, .cm-agent-button[aria-expanded="true"] { background: var(--hover); }
+.cm-agent-button:focus-visible { outline: 1px solid var(--work); outline-offset: 2px; }
+.cm-agent-short, .cm-agent-id { color: var(--meta); font-family: var(--mono); font-size: 10px; }
+.cm-agent-popover { position: absolute; z-index: 20; top: calc(100% + 6px); left: 0; width: min(340px, 75vw); display: flex; flex-direction: column; gap: 7px; padding: 10px; border: 1px solid var(--subtle-border-strong); border-radius: var(--r-card); background: var(--panel); color: var(--ink); box-shadow: 0 10px 28px color-mix(in srgb, var(--ground) 70%, transparent); font-family: var(--sans); }
+.cm-agent-popover strong { font-size: 13px; line-height: 1.35; }
+.cm-agent-facts { display: flex; flex-wrap: wrap; gap: 5px 10px; color: var(--dim); font-family: var(--mono); font-size: 10px; }
+.cm-open-run { align-self: flex-start; border: 1px solid var(--panel-edge); border-radius: 2px; padding: 3px 7px; background: transparent; color: var(--ink); font: inherit; cursor: pointer; }
+.cm-open-run:hover { background: var(--hover); }
 .cm-err { color: var(--pain); font-family: var(--mono); font-size: 12px; }
 .cm-empty { font-size: 12px; max-width: 60ch; color: var(--dim); }
 .cm-list { display: flex; flex-direction: column; gap: 2px; }
@@ -277,7 +354,7 @@ const CM_STYLE = `
 .cm-line:hover { background: var(--hover); }
 .cm-row-failed .cm-line { background: color-mix(in srgb, var(--pain) 7%, transparent); border-left-color: var(--pain); }
 .cm-arrow { color: var(--meta); }
-.cm-preview { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 28ch; }
+.cm-preview { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 18ch; flex: 1 1 30ch; }
 .cm-time { margin-left: auto; font-family: var(--mono); color: var(--meta); }
 .cm-chip { font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; padding: 0 6px; border-radius: 2px; border: 1px solid currentColor; }
 .cm-normal { color: var(--meta); }
@@ -288,7 +365,8 @@ const CM_STYLE = `
 .cm-done { border-color: var(--panel-edge); color: var(--meta); }
 .cm-failed { border-color: color-mix(in srgb, var(--pain) 55%, transparent); color: var(--pain); background: color-mix(in srgb, var(--pain) 8%, transparent); font-weight: 600; }
 .cm-tell { font-family: var(--mono); font-size: 10px; padding: 0 6px; border-radius: 2px; border: 1px solid var(--ask-border); color: var(--ask); cursor: help; }
-.cm-thread { margin: 0 0 4px 18px; padding: 4px 8px; border-left: 1px solid var(--subtle-border-strong); font-size: 11px; display: flex; flex-direction: column; gap: 3px; }
+.cm-thread { margin: 0 0 7px 18px; padding: 8px 10px; border-left: 1px solid var(--subtle-border-strong); font-size: 11px; display: flex; flex-direction: column; gap: 6px; }
+.cm-message { color: var(--ink); font-family: var(--sans); font-size: 13px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .cm-thread code { font-family: var(--mono); }
 .cm-thread-fail { color: var(--pain); }
 .cm-room { border: 1px solid var(--panel-edge); border-radius: var(--r-card); padding: 8px 10px; margin-bottom: 8px; font-size: 12px; background: var(--card-bg-soft); }
