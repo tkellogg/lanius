@@ -141,6 +141,12 @@ pub struct ConfigKeyDecl {
     /// Whether the package's setup gate treats this key as required (default true).
     #[serde(default = "default_true")]
     pub required: bool,
+    /// Whether this key's value is a secret (docs/handoffs/telegram-bridge.md M3):
+    /// stored sealed in the vault (`provider::set_package_secret`), never in the
+    /// config repo, and materialized into a daemon's child env at spawn rather
+    /// than exposed to any agent. Default false (a plain config key).
+    #[serde(default)]
+    pub secret: bool,
 }
 
 fn default_true() -> bool {
@@ -1006,6 +1012,37 @@ required = false
         assert_eq!(keys[1].name, "cadence");
         assert!(!keys[1].required);
         assert_eq!(lm.manifest.config.agent_tunable, vec!["cadence"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_key_secret_flag_parses_and_defaults_false() {
+        // docs/handoffs/telegram-bridge.md M3: a manifest may mark a config key
+        // `secret = true` so the vault (not the config repo) holds its value.
+        // `deny_unknown_fields` still holds — this only legalizes the new field.
+        let dir = std::env::temp_dir().join(format!("el-man-pkg-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("lanius.toml"),
+            r#"
+[[config.keys]]
+name = "TELEGRAM_TOKEN"
+description = "bot token"
+secret = true
+
+[[config.keys]]
+name = "plain_key"
+description = "not secret"
+"#,
+        )
+        .unwrap();
+        let lm = load(&dir).unwrap().unwrap();
+        let keys = &lm.manifest.config.keys;
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].name, "TELEGRAM_TOKEN");
+        assert!(keys[0].secret);
+        assert_eq!(keys[1].name, "plain_key");
+        assert!(!keys[1].secret, "secret defaults to false");
         std::fs::remove_dir_all(&dir).ok();
     }
 

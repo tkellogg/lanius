@@ -864,9 +864,32 @@ pub fn validate(root: &Root, conn: &Connection, profile: &str) -> Result<Validit
         }
         // The config half REUSES the existing required-config-key setup gate: a
         // visible package with a `required` key unset is inert, and the fix is
-        // the standard `config set` (no new field, no new enforcement).
+        // the standard `config set` (no new field, no new enforcement). A
+        // `secret = true` key is NOT held in the plaintext config repo at all
+        // (it lives sealed in the vault's `package_secrets` table), so its
+        // presence is checked via `provider::list_package_secrets` and its fix
+        // points at `provider set-secret` — never at a plaintext `config set`,
+        // which would reintroduce the exposure the vault exists to eliminate.
         for key in &lm.manifest.config.keys {
-            if key.required && crate::config_repo::get_key(root, &p.name, &key.name)?.is_none() {
+            if !key.required {
+                continue;
+            }
+            let unset = if key.secret {
+                !crate::provider::list_package_secrets(conn, &p.name)?
+                    .iter()
+                    .any(|k| k == &key.name)
+            } else {
+                crate::config_repo::get_key(root, &p.name, &key.name)?.is_none()
+            };
+            if unset {
+                let fix = if key.secret {
+                    format!(
+                        "echo -n <value> | lanius provider set-secret {} {}",
+                        p.name, key.name
+                    )
+                } else {
+                    format!("elanus config set {} {} <value>", p.name, key.name)
+                };
                 problems.push(Problem {
                     package: p.name.clone(),
                     requires: None,
@@ -875,7 +898,7 @@ pub fn validate(root: &Root, conn: &Connection, profile: &str) -> Result<Validit
                         "package `{}` needs config `{}.{}`, which is unset.",
                         p.name, p.name, key.name
                     ),
-                    fix: format!("elanus config set {} {} <value>", p.name, key.name),
+                    fix,
                 });
             }
         }
@@ -1742,6 +1765,49 @@ mod tests {
         assert!(
             !r.problems.iter().any(|p| p.package == "quiet"),
             "a package with no deps and no required keys never appears"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn validate_secret_config_key_unset_and_set() {
+        // FIX ROUND 1 (2): a `secret = true` required key must NOT be checked
+        // against the plaintext config repo (it is never written there), and
+        // its fix must point at `provider set-secret`, never at a plaintext
+        // `config set` — that would reintroduce the exposure the vault exists
+        // to eliminate.
+        let root = scratch_root("validate-secret-cfg");
+        write_pkg(
+            &root,
+            "telegram",
+            "[[config.keys]]\nname = \"TELEGRAM_TOKEN\"\ndescription = \"bot token\"\nsecret = true\n",
+        );
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        sync(&root, &conn).unwrap();
+
+        // Missing: reported, with the vault-appropriate fix.
+        let r = validate(&root, &conn, "default").unwrap();
+        let p = r
+            .problems
+            .iter()
+            .find(|p| p.kind == ProblemKind::ConfigKeyUnset && p.package == "telegram")
+            .expect("the unset required secret key surfaces");
+        assert_eq!(
+            p.fix,
+            "echo -n <value> | lanius provider set-secret telegram TELEGRAM_TOKEN"
+        );
+
+        // Set via the vault (not config_repo) → clears.
+        crate::provider::set_package_secret(&root, &conn, "telegram", "TELEGRAM_TOKEN", "shh")
+            .unwrap();
+        let r2 = validate(&root, &conn, "default").unwrap();
+        assert!(
+            !r2.problems
+                .iter()
+                .any(|p| p.kind == ProblemKind::ConfigKeyUnset && p.package == "telegram"),
+            "a secret set via the vault must clear the problem: {:?}",
+            r2.problems
         );
         std::fs::remove_dir_all(&root.dir).ok();
     }

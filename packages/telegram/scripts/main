@@ -41,6 +41,7 @@ TELEGRAM_TOKEN), it PARKS forever instead of crash-looping.
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -49,6 +50,15 @@ import urllib.request
 
 ROOT = os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", ".")
 PKG = os.environ.get("LANIUS_PACKAGE") or os.environ.get("ELANUS_PACKAGE") or "telegram"
+# The ledger, opened read-only (mirrors packages/recall + packages/webhook):
+# the reply forwarder only ever READS it, to derive the chat id a reply
+# correlates to — it must be physically unable to write the truth it reads.
+DB = (
+    os.environ.get("LANIUS_DB")
+    or os.environ.get("ELANUS_DB")
+    or os.environ.get("HARNESS_DB")
+    or os.path.join(ROOT, "elanus.db")
+)
 
 
 def _config(key):
@@ -70,7 +80,7 @@ def _config(key):
     return None
 
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN") or _config("token") or ""
+TOKEN = os.environ.get("TELEGRAM_TOKEN") or ""
 # The Bot API base — real by default, overridable for a stub/recorded transport.
 API_BASE = (os.environ.get("TELEGRAM_API_BASE") or _config("api_base") or "https://api.telegram.org").rstrip("/")
 # Long-poll timeout (seconds) the daemon asks getUpdates to hold the connection.
@@ -78,6 +88,7 @@ POLL_TIMEOUT = int(os.environ.get("TELEGRAM_POLL_TIMEOUT") or _config("poll_time
 
 SEND_REQ = "in/package/telegram/send"
 SENT = "obs/channel/telegram/sent"
+REPLY_SRC = "in/human/owner"
 CLI = os.environ.get("LANIUS_CLI", "lanius")
 
 
@@ -101,6 +112,18 @@ def encode_segment(s):
         .replace("+", "%2B")
         .replace("#", "%23")
         .replace("/", "%2F")
+    )
+
+
+def decode_segment(s):
+    # Inverse of encode_segment (mirrors src/topic.rs decode order: '%25' last
+    # so a decoded '%' cannot re-trigger another escape).
+    return (
+        str(s)
+        .replace("%2F", "/")
+        .replace("%23", "#")
+        .replace("%2B", "+")
+        .replace("%25", "%")
     )
 
 
@@ -194,7 +217,14 @@ def publish_inbound(msg):
         "source": "telegram",
     }
     addr = encode_segment(chat_id)
-    bus_pub(f"in/dm/telegram/{addr}", inbound, qos=1)
+    # A deterministic per-chat correlation (mirrors the "tg-<chat_id>" session
+    # convention dm-promoter already uses), NOT left unset. Without this, the
+    # ingress event's correlation_id is SQL NULL; dm-promoter's re-publish then
+    # inherits that NULL, and reply_forward_loop's chat_id_for_correlation
+    # early-returns on a falsy correlation_id before it ever reaches its own
+    # topic-decoding fallback — silently breaking the whole promotion + reply-
+    # forward chain for real (uncorrelated) Telegram traffic.
+    bus_pub(f"in/dm/telegram/{addr}", inbound, correlation=f"tg-{chat_id}", qos=1)
     # M4: record the sighting so it can later be resolved. UNRESOLVED (no
     # identity) — linking it to a person is owner/EA territory (M5 seeding),
     # done once, not on every message. Provenance is this bridge's verified
@@ -242,12 +272,113 @@ def inbound_loop():
                 log(f"[telegram] bad inbound update skipped: {e}")
 
 
+# ---- reply-forward: in/human/owner (agent reply) -> in/package/telegram/send
+
+def is_agent_reply(sender, body):
+    """True when an `in/human/owner` event is an AGENT's reply worth relaying
+    to Telegram — false when it is INBOUND traffic that must never be echoed
+    back out. Loop-avoidance contract shared with the M2 dm-promoter (which
+    re-publishes an inbound Telegram message onto in/human/owner stamped
+    sender=dm-promoter, body {"promoted": true, "prompt": ..., "source":
+    "telegram", "chat_id": ...}): a promoted/prompt-carrying body, or
+    sender telegram/dm-promoter, is inbound, not a reply."""
+    if sender in ("telegram", "dm-promoter"):
+        return False
+    if not isinstance(body, dict):
+        return False
+    if body.get("promoted"):
+        return False
+    if "prompt" in body:
+        return False
+    return True
+
+
+def chat_id_for_correlation(cx, correlation_id):
+    """Read-only derive the Telegram chat id an agent's reply on this
+    correlation should be forwarded to. Looks for the correlated INGRESS
+    event: either the canonical `in/dm/telegram/<addr>` publish (the addr
+    segment IS the chat id, percent-decoded), or an `in/human/owner` event
+    the M2 promoter stamped with {source:"telegram", chat_id:...}. Takes the
+    first (oldest) match. Returns the chat id as a string, or None if no
+    telegram ingress correlates — a forwarder must NEVER guess a recipient."""
+    if not correlation_id:
+        return None
+    rows = cx.execute(
+        "SELECT type, payload FROM events WHERE correlation_id = ? ORDER BY id ASC",
+        (correlation_id,),
+    ).fetchall()
+    for etype, payload in rows:
+        if not isinstance(etype, str):
+            continue
+        if etype.startswith("in/dm/telegram/"):
+            return decode_segment(etype[len("in/dm/telegram/"):])
+        if etype == "in/human/owner":
+            try:
+                p = json.loads(payload) if payload else {}
+            except ValueError:
+                p = {}
+            if isinstance(p, dict) and p.get("source") == "telegram" and p.get("chat_id"):
+                return str(p["chat_id"])
+    return None
+
+
+def reply_forward_loop():
+    """Subscribes the owner mailbox `in/human/owner`; forwards an AGENT's
+    reply (never an inbound/promoted message — is_agent_reply) to Telegram by
+    deriving the chat id from the correlated ingress event in the ledger
+    (read-only) and publishing `in/package/telegram/send`. outbound_loop does
+    the actual sendMessage + receipt — this loop never calls the Bot API
+    itself. Dedupe by ledger event_id (in-memory, process-lifetime) so a
+    redelivered line never double-sends."""
+    seen = set()
+    proc = subprocess.Popen(
+        [CLI, "bus", "sub", REPLY_SRC], stdout=subprocess.PIPE, text=True,
+    )
+    log(f"[telegram] serving {REPLY_SRC} (reply forwarder; ledger-derived chat id)")
+    for line in proc.stdout:
+        try:
+            env = json.loads(line)
+        except ValueError:
+            continue
+        inner = env.get("payload") if isinstance(env.get("payload"), dict) else {}
+        body = inner.get("payload") if isinstance(inner.get("payload"), dict) else {}
+        corr = inner.get("correlation_id")
+        sender = inner.get("sender")
+        eid = inner.get("event_id")
+        dedupe_key = eid if eid is not None else (corr, body.get("text") if isinstance(body, dict) else None)
+        if dedupe_key in seen:
+            continue
+        if not is_agent_reply(sender, body):
+            continue
+        text = body.get("text", "") if isinstance(body, dict) else ""
+        try:
+            cx = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+            try:
+                chat_id = chat_id_for_correlation(cx, corr)
+            finally:
+                cx.close()
+        except sqlite3.Error as e:
+            log(f"[telegram] reply-forward ledger read failed (skipping): {e}")
+            continue
+        if chat_id is None:
+            continue  # no correlated telegram ingress -> do nothing, never guess
+        seen.add(dedupe_key)
+        try:
+            bus_pub(SEND_REQ, {"recipient": chat_id, "text": text}, correlation=corr)
+        except subprocess.SubprocessError:
+            break  # bus trouble is crash-only (handled below)
+    log("[telegram] reply-forward bus subscription died -> exiting for restart")
+    os._exit(1)
+
+
 def main():
     if not TOKEN:
         park("TELEGRAM_TOKEN not set")
-    # Egress on a daemon thread; ingress owns the main thread. Either dying takes
-    # the whole process down (os._exit) so the supervisor restarts us whole.
+    # Egress and reply-forward each on their own daemon thread; ingress owns
+    # the main thread. Any of the three dying takes the whole process down
+    # (os._exit) so the supervisor restarts us whole.
     threading.Thread(target=outbound_loop, daemon=True).start()
+    threading.Thread(target=reply_forward_loop, daemon=True).start()
     inbound_loop()
 
 

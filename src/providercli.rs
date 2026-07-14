@@ -267,3 +267,41 @@ pub fn rm(conn: &Connection, name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// `lanius provider set-secret <package> <key>` (docs/handoffs/telegram-bridge.md
+/// M3) — seal a package's declared secret config key (e.g. telegram's
+/// TELEGRAM_TOKEN) into the vault. The value is read from stdin ONLY, never
+/// argv — mirrors `resolve_key`'s stdin fallback above, so a bot token never
+/// appears in the process table or shell history.
+pub fn set_secret(root: &Root, conn: &Connection, package: &str, key: &str) -> Result<()> {
+    let mut buf = String::new();
+    let n = std::io::stdin().read_to_string(&mut buf).unwrap_or(0);
+    let value = buf.trim().to_string();
+    if n == 0 || value.is_empty() {
+        bail!("no secret supplied — pipe the value on stdin, e.g. `echo -n <token> | lanius provider set-secret {package} {key}`");
+    }
+    provider::set_package_secret(root, conn, package, key, &value)?;
+    println!("set secret {package}/{key} ({REDACTED})");
+    Ok(())
+}
+
+/// `lanius provider list-secrets <package>` — key NAMES only, never values.
+pub fn list_secrets(conn: &Connection, package: &str, want_json: bool) -> Result<()> {
+    let names = provider::list_package_secrets(conn, package)?;
+    if want_json {
+        println!(
+            "{}",
+            json!({
+                "package": package,
+                "keys": names.iter().map(|n| json!({ "key": n, "value": REDACTED })).collect::<Vec<_>>(),
+            })
+        );
+    } else if names.is_empty() {
+        println!("no secrets set for {package}");
+    } else {
+        for n in &names {
+            println!("{n:<20} {REDACTED}");
+        }
+    }
+    Ok(())
+}

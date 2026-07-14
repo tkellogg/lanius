@@ -1014,3 +1014,28 @@ network-inbound / network-bind arms; new live regression
 `sandbox::seatbelt_network_loopback_blocks_external` (a real external
 connect must fail; skips without sandbox-exec or an outbound route).
 Residual: none known; policy `none` was never affected.
+
+## 26. [DESIGN 2026-07-13] Package secrets: a minimal vault binding for daemon config keys
+
+Telegram-bridge M3 (`docs/handoffs/telegram-bridge.md`) needed a bot token held
+somewhere other than plaintext-on-disk or the operator's own shell env. Rather
+than invent new crypto, a manifest may now mark a `[[config.keys]]` entry
+`secret = true` (entry 23's provider vault pattern, generalized): the value is
+sealed with the SAME master key + XChaCha20-Poly1305 AEAD (`provider.rs`
+`seal`/`open`/`master_key`) into a new `package_secrets(package, key, nonce,
+secret)` table — no plaintext column, same fail-closed posture (a tampered
+blob errors, never garbage plaintext). `lanius provider set-secret <package>
+<key>` reads the value from STDIN only (mirrors `resolve_key`'s pattern,
+entry 23) so it never touches argv or the process table. The daemon-spawn
+seam (`dispatcher.rs::tick_actors`, right beside `BUS_TOKEN`) decrypts each
+declared secret key transiently and injects it into the child's env under its
+literal declared name (e.g. `TELEGRAM_TOKEN`); an unset or unreadable secret
+injects nothing (the daemon parks, unchanged from today) rather than crashing
+the supervisor, and a decrypt failure is logged with a REDACTED-safe message,
+never the plaintext. Threat model is identical to entry 23 (accidental
+disclosure via git/backups/`SELECT`/screen-share) — this is scope, not a new
+crypto surface. Residual: `lanius provider set-secret`/`list-secrets` reuses
+the `provider` CLI family rather than a `config` verb, because `config set`
+takes its value as a literal argv arg (wrong shape for a secret) while
+`provider add` already had the stdin pattern; a future `lanius config`
+secret verb should route through the same vault functions, not reinvent them.

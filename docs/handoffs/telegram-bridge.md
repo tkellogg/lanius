@@ -1,5 +1,5 @@
 ---
-status: planned
+status: implemented
 author: Opus 4.8 in Claude Code (planner)
 last-updated: 2026-07-13
 ---
@@ -292,3 +292,40 @@ from a phone.
   transport ruled long-poll (no public endpoint for a laptop). Reply routing ruled
   deterministic correlation-follow, distinct from the still-deferred EA policy.
   Depends on A+B (both done), continues C (done).
+- 2026-07-13 — M1-M4 IMPLEMENTED (planner-driven, 3 sonnet impl workers + 1 e2e
+  worker + 1 opus verifier + 1 fix round; left unstaged for Fable). Shapes as
+  ruled: M1 = a third loop (`reply_forward_loop`) in the telegram daemon —
+  stateless correlation-follow, chat id re-derived read-only from the ledger,
+  loop-avoidance discriminator (skips sender ∈ {telegram, dm-promoter} and
+  bodies carrying `prompt`/`promoted`), plaintext `_config("token")` fallback
+  deleted. M2 = NEW `packages/dm-promoter/` (wonky-bit 5's "trusted actor"
+  landed as its own broker-trusted daemon, not inside phonebook/recall):
+  subscribes `in/dm/telegram/#`, resolves via phonebook HTTP, promotes onto
+  `in/human/owner` `{prompt, source:"telegram", chat_id, promoted:true,
+  session:"tg-<id>"}` on the ingress correlation ONLY for resolved==owner;
+  anything else — including any resolve error — publishes nothing (fail-closed;
+  opus verifier probed 13 adversarial resolution shapes, all rejected). M3 =
+  `package_secrets` vault table reusing seal/open, `provider set-secret`
+  (stdin-only) / `list-secrets` (REDACTED), manifest `ConfigKeyDecl.secret`,
+  spawn-seam `secret_env_for` injecting the decrypted token transiently into
+  the child env; security.md entry 26; `packages check` is vault-aware for
+  secret keys. M4 = e2e section 20b rewritten to drive the whole loop with the
+  stub transport (vault token, no-plaintext-at-rest asserts, unknown-sender
+  fail-closed case, owner promotion, AUTOMATIC reply-forward round trip).
+  Verification found + the loop fixed: (HIGH) telegram's manifest lacked the
+  `in/package/telegram/send` self-publish grant — the broker NACKed the
+  forward, replies silently dropped; (real bugs caught by the e2e worker)
+  dm-promoter shipped without its exec bit, and ingress published with a NULL
+  correlation which silently broke the whole promote→reply chain (fixed with a
+  deterministic `tg-<chat_id>` ingress correlation); (MEDIUM) `packages check`
+  pointed secret keys at a plaintext `config set` fix. Also repaired
+  pre-existing e2e rot (hardcoded `elanus.db` vs the post-rename `lanius.db`).
+  Final: cargo test 663/0, full e2e 253 ok / 0 fail. RESIDUAL (new, needs a
+  decision): recall unification does NOT fire for promoted turns — recall keys
+  the correspondent off the `in/dm/<kind>/<addr>` topic, which promotion
+  discards; a promoted `in/human/owner` turn gets no cross-channel history.
+  Candidate fix: recall trusts `payload.chat_id`+`source` only when the
+  broker-verified sender is `dm-promoter`. Documented in the e2e notes; NOT
+  patched. Still pending from the milestone list: the one-time live BotFather
+  validation from a phone (M4's manual step — operator on-ramp is written in
+  packages/telegram/SKILL.md).

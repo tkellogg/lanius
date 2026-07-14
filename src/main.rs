@@ -543,6 +543,19 @@ enum ProviderCmd {
     },
     /// Delete a provider
     Rm { name: String },
+    /// Set a package's declared secret config key (docs/handoffs/telegram-bridge.md
+    /// M3), e.g. telegram's TELEGRAM_TOKEN. The value is read from stdin ONLY
+    /// (never argv/env) so it never appears in the process table or shell
+    /// history: `echo -n <token> | lanius provider set-secret telegram TELEGRAM_TOKEN`.
+    /// Sealed with the same vault crypto as an api-key provider; injected into
+    /// the package's daemon env at spawn, never shown to any agent.
+    SetSecret { package: String, key: String },
+    /// List a package's secret key NAMES (never values)
+    ListSecrets {
+        package: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Block-addressing flags shared by every `lanius block` verb (clap flattens
@@ -1444,6 +1457,14 @@ fn run(cli: Cli) -> Result<()> {
             ProviderCmd::Rm { name } => {
                 let conn = open(&root)?;
                 providercli::rm(&conn, &name)?;
+            }
+            ProviderCmd::SetSecret { package, key } => {
+                let conn = open(&root)?;
+                providercli::set_secret(&root, &conn, &package, &key)?;
+            }
+            ProviderCmd::ListSecrets { package, json } => {
+                let conn = open(&root)?;
+                providercli::list_secrets(&conn, &package, json)?;
             }
         },
         Cmd::Block { cmd } => match cmd {

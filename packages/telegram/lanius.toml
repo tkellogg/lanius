@@ -32,11 +32,14 @@ packages = ["phonebook", "recall"]
 [[config.keys]]
 name = "TELEGRAM_TOKEN"
 description = "The Telegram bot token from BotFather. Held in the bridge's own environment; no agent sees it."
+secret = true
 
 [request]
 # EGRESS inbox: an agent commands a send by publishing to this actor's inbox
-# (in/package/telegram/send {recipient, text}).
-subscribe = ["in/package/telegram/send"]
+# (in/package/telegram/send {recipient, text}), plus the owner's own mail so
+# the reply-forwarder (M1) can relay a send_message/ask_human reply back out
+# to the phone.
+subscribe = ["in/package/telegram/send", "in/human/owner"]
 # Three publish scopes:
 #   in/dm/telegram/#          INGRESS — the canonical, recall-keyable
 #                             conversation address (Handoff B). Holding an
@@ -51,7 +54,12 @@ subscribe = ["in/package/telegram/send"]
 #                             on ingress; provenance is this bridge's verified
 #                             sender (it is the party that actually saw the wire
 #                             address).
-publish = ["in/dm/telegram/#", "obs/channel/telegram/#", "in/package/phonebook/channel"]
+#   in/package/telegram/send  the reply-forwarder (M1) re-publishes to its OWN
+#                             egress inbox to relay a send_message/ask_human
+#                             reply back out to the phone; the send therefore
+#                             inherits the daemon's verified sender + receipt
+#                             path rather than being sent by some other actor.
+publish = ["in/dm/telegram/#", "obs/channel/telegram/#", "in/package/phonebook/channel", "in/package/telegram/send"]
 
 [process]
 mode = "daemon"

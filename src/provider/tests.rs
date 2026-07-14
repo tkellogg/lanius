@@ -443,3 +443,63 @@ fn get_fails_closed_on_corrupt_blob() {
     );
     std::fs::remove_dir_all(&root.dir).ok();
 }
+
+// ───────────────────── M3: package secrets (telegram-bridge.md) ─────────────────────
+
+#[test]
+fn package_secret_round_trip_and_ciphertext_not_plaintext() {
+    let root = tmp_root("pkgsecret");
+    let conn = Connection::open(root.db()).unwrap();
+    set_package_secret(&root, &conn, "telegram", "TELEGRAM_TOKEN", "bot-secret-abc").unwrap();
+
+    // Round trip returns the exact plaintext.
+    let got = get_package_secret(&root, &conn, "telegram", "TELEGRAM_TOKEN").unwrap();
+    assert_eq!(got.as_deref(), Some("bot-secret-abc"));
+
+    // The stored blob is NOT the plaintext bytes.
+    let stored: Vec<u8> = conn
+        .query_row(
+            "SELECT secret FROM package_secrets WHERE package='telegram' AND key='TELEGRAM_TOKEN'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_ne!(stored, b"bot-secret-abc".to_vec());
+
+    // A second key for the same package coexists.
+    set_package_secret(&root, &conn, "telegram", "OTHER_KEY", "other-value").unwrap();
+    let names = list_package_secrets(&conn, "telegram").unwrap();
+    assert_eq!(names, vec!["OTHER_KEY".to_string(), "TELEGRAM_TOKEN".to_string()]);
+    // list never carries the value.
+    for n in &names {
+        assert!(n != "bot-secret-abc" && n != "other-value");
+    }
+
+    std::fs::remove_dir_all(&root.dir).ok();
+}
+
+#[test]
+fn package_secret_absent_returns_none() {
+    let root = tmp_root("pkgsecret-absent");
+    let conn = Connection::open(root.db()).unwrap();
+    let got = get_package_secret(&root, &conn, "telegram", "TELEGRAM_TOKEN").unwrap();
+    assert!(got.is_none());
+    std::fs::remove_dir_all(&root.dir).ok();
+}
+
+#[test]
+fn package_secret_fails_closed_on_corrupt_blob() {
+    let root = tmp_root("pkgsecret-corrupt");
+    let conn = Connection::open(root.db()).unwrap();
+    set_package_secret(&root, &conn, "telegram", "TELEGRAM_TOKEN", "bot-secret-abc").unwrap();
+    conn.execute(
+        "UPDATE package_secrets SET secret=?1 WHERE package='telegram' AND key='TELEGRAM_TOKEN'",
+        rusqlite::params![vec![0u8, 1, 2, 3, 4]],
+    )
+    .unwrap();
+    assert!(
+        get_package_secret(&root, &conn, "telegram", "TELEGRAM_TOKEN").is_err(),
+        "a tampered package secret must fail closed"
+    );
+    std::fs::remove_dir_all(&root.dir).ok();
+}

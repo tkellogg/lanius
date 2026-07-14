@@ -5,6 +5,7 @@ use crate::events::{self, EmitOpts};
 use crate::hooks;
 use crate::packages;
 use crate::paths::Root;
+use crate::provider;
 use crate::profile;
 use crate::sandbox;
 use crate::trace;
@@ -519,6 +520,14 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
                     std::env::var("PATH").unwrap_or_default()
                 ),
             );
+        // Materialize any declared vault secrets into the child env (docs/handoffs
+        // /telegram-bridge.md M3), e.g. telegram's TELEGRAM_TOKEN. Transient only
+        // — never logged, never written to the scratch dir, never in a status
+        // event. Absent (unset) means inject nothing; the daemon then parks, same
+        // as today.
+        for (name, value) in secret_env_for(root, conn, &pkg.name, &lm.manifest) {
+            cmd.env(name, value);
+        }
         match cmd.spawn() {
             Ok(child) => {
                 status_event(root, &pkg.name, "alive", json!({ "pid": child.id() }));
@@ -548,6 +557,36 @@ fn tick_actors(root: &Root, conn: &Connection, actors: &mut Actors) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Collect the vault secrets a package's manifest declares (`[[config.keys]]
+/// secret = true`) into `(ENV_NAME, plaintext)` pairs, ready to inject into a
+/// spawned daemon's child env (docs/handoffs/telegram-bridge.md M3). A key with
+/// no vault row set yields nothing for that key (the daemon parks, unchanged
+/// behavior). A decrypt failure (tampered/corrupt blob) is logged with a
+/// REDACTED-safe message — never the plaintext, never a crash — and that key is
+/// skipped. Factored out as a pure(ish) function so the seam is unit-testable
+/// without spawning a process.
+fn secret_env_for(
+    root: &Root,
+    conn: &Connection,
+    package: &str,
+    manifest: &crate::manifest::Manifest,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for k in &manifest.config.keys {
+        if !k.secret {
+            continue;
+        }
+        match provider::get_package_secret(root, conn, package, &k.name) {
+            Ok(Some(value)) => out.push((k.name.clone(), value)),
+            Ok(None) => {} // unset — daemon parks
+            Err(_) => {
+                eprintln!("[daemon] {package}: secret {} unreadable", k.name);
+            }
+        }
+    }
+    out
 }
 
 /// Retained liveness: late subscribers always see the last known state.
@@ -3234,5 +3273,48 @@ mod tests {
             "exactly one completion, and only for the unreported worker"
         );
         let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    // docs/handoffs/telegram-bridge.md M3: the spawn-seam secret helper, unit
+    // tested without spawning any process.
+    #[test]
+    fn secret_env_for_returns_set_secret_and_skips_unset() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        provider::set_package_secret(&root, &conn, "telegram", "TELEGRAM_TOKEN", "shh-token")
+            .unwrap();
+
+        let toml_src = r#"
+[[config.keys]]
+name = "TELEGRAM_TOKEN"
+secret = true
+
+[[config.keys]]
+name = "OTHER_UNSET"
+secret = true
+
+[[config.keys]]
+name = "PLAIN"
+"#;
+        let manifest: crate::manifest::Manifest = toml::from_str(toml_src).unwrap();
+        let env = secret_env_for(&root, &conn, "telegram", &manifest);
+        assert_eq!(
+            env,
+            vec![("TELEGRAM_TOKEN".to_string(), "shh-token".to_string())],
+            "only the SET secret key is injected; the unset secret key and the \
+             non-secret plain key are absent"
+        );
+        std::fs::remove_dir_all(&root.dir).ok();
+    }
+
+    #[test]
+    fn secret_env_for_empty_when_no_secret_configured() {
+        let root = tmp_root();
+        let conn = db::open(&root).unwrap();
+        db::init_schema(&conn).unwrap();
+        let manifest: crate::manifest::Manifest = toml::from_str("").unwrap();
+        assert!(secret_env_for(&root, &conn, "telegram", &manifest).is_empty());
+        std::fs::remove_dir_all(&root.dir).ok();
     }
 }

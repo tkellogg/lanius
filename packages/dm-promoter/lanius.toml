@@ -1,0 +1,62 @@
+# dm-promoter — the resolve-and-promote SECURITY GATE for verified-owner DMs
+# (docs/handoffs/telegram-bridge.md M2; docs/security.md entry 15;
+# docs/journeys/chat-from-anywhere.md: "it knows it's me; a stranger doesn't
+# get to be me").
+#
+# WHY THIS IS A SEPARATE, BROKER-TRUSTED DAEMON (not folded into a channel
+# bridge, and NEVER an agent):
+#
+#   `in/human/owner` is the owner's mailbox. Writing to it IS claiming to be
+#   the owner speaking. The kernel's reserved `in/` plane and its refusal to
+#   let an ordinary emit_event write there exist precisely so that claim can
+#   only be made by something the broker itself vouches for — a token-authed
+#   daemon, spawned under an approved manifest, whose `sender` on every event
+#   it publishes is stamped by the broker at delivery time, not chosen by the
+#   daemon's own payload. That stamped, unforgeable sender is this package's
+#   entire authority to write owner mail. There is no other credential and no
+#   payload field grants it.
+#
+#   A raw channel bridge (packages/telegram) is NOT that authority. Its own
+#   verified sender is `telegram` — it proves only "a message arrived on this
+#   wire", never "this message is from the owner". Conflating the two would
+#   let anyone who can reach the bot (a stranger who finds the Telegram
+#   username) write into the owner's inbox. And an agent must NEVER be the one
+#   deciding "this counts as owner mail" — that is exactly the confused-deputy
+#   move a prompt-injected conversation would attempt, and agents are
+#   deliberately never granted publish on `in/human/#`.
+#
+#   So promotion is its own narrow daemon: it subscribes the channel-neutral
+#   `in/dm/telegram/#` ingress plane, asks the phonebook (the identity
+#   authority, packages/phonebook) whether the sighted chat id resolves to
+#   identity `owner`, and ONLY on that answer publishes onto `in/human/owner`
+#   — retaining the ingress correlation id so the reply threads back through
+#   the existing reply-forwarder (M1) exactly like any other owner turn.
+#
+# FAIL-CLOSED is the load-bearing property, not an aspiration: phonebook down,
+# a malformed response, a network error, an unlinked or unknown chat id, or
+# any other failure mode is treated as NOT-owner and produces no publish at
+# all. The message stays exactly where the bridge already put it — an
+# unresolved phonebook sighting — and goes no further. Nothing here ever
+# promotes on an error or a guess; a stranger's message simply stops.
+#
+# Ships PENDING (it can write owner mail, the most sensitive plane in the
+# system): parks until `lanius approve dm-promoter`, mirroring how telegram
+# itself ships pending for reaching the outside world.
+
+[requires]
+# Needs phonebook approved and reachable — it is the only place chat-id ->
+# identity resolution is decided. Without it, resolution always fails closed
+# (no publish), so an unapproved/absent phonebook is safe, just inert.
+packages = ["phonebook"]
+
+[request]
+# Ingress plane: any `in/dm/telegram/<chat.id>` sighting the bridge publishes.
+# Read-only interest — this daemon never writes back onto the dm plane itself.
+subscribe = ["in/dm/telegram/#"]
+# The ONE thing this daemon is trusted to write: owner mail, and nothing else
+# (no wildcard, no other topic) — the narrowest grant that does the job.
+publish = ["in/human/owner"]
+
+[process]
+mode = "daemon"
+run  = "scripts/main"

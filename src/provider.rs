@@ -565,9 +565,86 @@ CREATE TABLE IF NOT EXISTS providers (
   secret       BLOB,                   -- sealed SecretBlob (ApiKey only)
   created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+-- Package secrets (docs/handoffs/telegram-bridge.md M3): a minimal binding from
+-- a package's declared `[[config.keys]] secret = true` name to a sealed value,
+-- reusing the SAME master key + AEAD as `providers`. No plaintext column ever —
+-- `nonce`+`secret` is the only persistence path; `get_package_secret` is the
+-- only read path and it decrypts transiently, never logged/printed.
+CREATE TABLE IF NOT EXISTS package_secrets (
+  package    TEXT NOT NULL,
+  key        TEXT NOT NULL,
+  nonce      BLOB NOT NULL,
+  secret     BLOB NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (package, key)
+);
 "#,
     )?;
     Ok(())
+}
+
+/// Seal `plaintext` under the master key and UPSERT it as `package`'s `key`
+/// secret. No plaintext column — only `(nonce, secret)` is stored.
+pub fn set_package_secret(
+    root: &Root,
+    conn: &Connection,
+    package: &str,
+    key: &str,
+    plaintext: &str,
+) -> Result<()> {
+    init_schema(conn)?;
+    let mkey = master_key(root)?;
+    let (nonce, ct) = seal(&mkey, plaintext.as_bytes())?;
+    conn.execute(
+        "INSERT INTO package_secrets(package, key, nonce, secret)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(package, key) DO UPDATE SET nonce=?3, secret=?4",
+        rusqlite::params![package, key, nonce, ct],
+    )?;
+    Ok(())
+}
+
+/// Read `package`'s `key` secret, DECRYPTING it transiently. Returns `None` if
+/// no such row exists. Fails closed (errors) on a tampered/corrupt blob — never
+/// returns garbage plaintext. This is the ONLY read path for the value.
+pub fn get_package_secret(
+    root: &Root,
+    conn: &Connection,
+    package: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    init_schema(conn)?;
+    let row = conn
+        .query_row(
+            "SELECT nonce, secret FROM package_secrets WHERE package=?1 AND key=?2",
+            rusqlite::params![package, key],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    let Some((nonce, ct)) = row else {
+        return Ok(None);
+    };
+    let mkey = master_key(root)?;
+    let plaintext = open(&mkey, &nonce, &ct)
+        .with_context(|| format!("package secret {package}/{key} unreadable"))?;
+    Ok(Some(String::from_utf8(plaintext).with_context(|| {
+        format!("package secret {package}/{key} is not valid UTF-8")
+    })?))
+}
+
+/// The KEY NAMES a package has a secret set for — never the values. For a
+/// `check`/list surface that reports "TELEGRAM_TOKEN: set" without decrypting.
+pub fn list_package_secrets(conn: &Connection, package: &str) -> Result<Vec<String>> {
+    init_schema(conn)?;
+    let mut stmt =
+        conn.prepare("SELECT key FROM package_secrets WHERE package=?1 ORDER BY key")?;
+    let rows = stmt.query_map([package], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Provider names flow into env-var tokens (`LANIUS_PV_<NAME>_KEY`), codex TOML

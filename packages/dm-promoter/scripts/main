@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""dm-promoter — the resolve-and-promote security gate (docs/handoffs/telegram-bridge.md
+M2; docs/security.md entry 15; wonky-bits 4-5).
+
+`in/human/<owner>` is the owner's mailbox. Writing to it is claiming to BE the
+owner. The reserved `in/dm/` prefix and the kernel's `in/`-plane refusal in
+`emit_event` exist to make that unforgeable from a payload field — but a raw
+channel bridge (e.g. packages/telegram) only proves "a message arrived on this
+wire", never "this message is from the owner". Its verified sender is the
+bridge itself (`telegram`), not a trust authority over owner mail. And an
+AGENT must never promote — an agent deciding "this counts as owner mail" is
+exactly the confused-deputy move a prompt-injected conversation would want.
+
+So promotion needs its OWN daemon: a broker-trusted, token-authed actor whose
+verified `sender` (stamped by the broker at spawn, unforgeable by payload) is
+`dm-promoter`, holding its own narrow manifest grant to publish `in/human/owner`
+— and nothing else. It subscribes the channel-neutral `in/dm/telegram/#` plane,
+asks the phonebook (already the identity authority — packages/phonebook) who a
+chat id resolves to, and promotes ONLY when that resolution is unambiguous and
+says `owner`. This is the whole security property: "it knows it's me; a
+stranger doesn't get to be me." A stranger's message is left exactly where the
+bridge put it — an unresolved phonebook sighting — and goes no further.
+
+FAIL-CLOSED is the operative word, not merely "the intent": any failure mode
+(phonebook down, malformed response, network hiccup, missing fields) is
+treated as "not owner" and produces NO publish. There is no code path that
+promotes on an error, a timeout, or an ambiguous response. A single bad
+inbound is skipped, never crash-looped; only bus death is a genuine
+infrastructure fault that exits for a supervisor restart.
+
+Promotion re-emits the SAME correlation id the ingress event carried
+(`in/dm/telegram/<chat.id>`'s `correlation_id`), so the owner's agent turn and
+its eventual reply thread back through the existing M1 reply-forwarder and
+`reply_source` rendering — the promoter never invents a new conversation, it
+folds an already-verified-owner message into the SAME conversation the kernel
+already knows how to reply on.
+
+LOOP-AVOIDANCE CONTRACT (shared with the telegram reply-forwarder, another
+worker): the promoted body carries `"promoted": true` and `"prompt"` (not
+`"text"`) precisely so the forwarder can recognize and SKIP a promoter-emitted
+`in/human/owner` event (by sender=="dm-promoter" or by the presence of these
+fields) rather than mistaking it for an agent reply to forward back out to
+Telegram. Do not rename these fields without updating that contract.
+
+No sender field is ever written into the payload body. Provenance is the
+broker-verified `sender` on the *event envelope* (stamped because this daemon
+is spawned token-authed, per its manifest grant) — never a body field a writer
+could simply claim, which is the same discipline recall and phonebook already
+follow for correspondent trust.
+"""
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+ROOT = os.environ.get("LANIUS_ROOT") or os.environ.get("ELANUS_ROOT") or os.environ.get("HARNESS_ROOT", ".")
+PKG = os.environ.get("LANIUS_PACKAGE") or os.environ.get("ELANUS_PACKAGE") or "dm-promoter"
+CLI = os.environ.get("LANIUS_CLI", "lanius")
+
+SUB_TOPIC = "in/dm/telegram/#"
+PROMOTE_TOPIC = "in/human/owner"
+OWNER_ID = "owner"
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ---- topic segment decoding (mirrors src/topic.rs encode_segment, and the
+# telegram bridge's own encode_segment) ---------------------------------------
+
+def decode_segment(s):
+    # %25 (the escape for '%') last, so a decoded '%' cannot re-trigger.
+    return s.replace("%2F", "/").replace("%23", "#").replace("%2B", "+").replace("%25", "%")
+
+
+def chat_id_from_topic(topic):
+    """The last segment of in/dm/telegram/<chat_id>, decoded. Fallback used
+    only when the inbound body itself is missing chat_id."""
+    parts = (topic or "").split("/")
+    if len(parts) >= 4 and parts[0] == "in" and parts[1] == "dm":
+        return decode_segment("/".join(parts[3:]))
+    return None
+
+
+# ---- package config (mirrors packages/telegram's _config helper) -----------
+
+def _config(key):
+    import re
+    path = os.path.join(ROOT, "config", "packages", f"{PKG}.toml")
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(rf'^\s*{re.escape(key)}\s*=\s*"([^"]*)"\s*$', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def default_profile():
+    return os.environ.get("DM_PROMOTER_PROFILE") or _config("profile") or "main"
+
+
+# ---- phonebook (best-effort HTTP read plane; mirrors packages/recall) ------
+
+def phonebook_base():
+    try:
+        j = json.load(open(os.path.join(ROOT, "run", "pkg-phonebook", "http.json")))
+        return f"http://127.0.0.1:{j['port']}" if j.get("port") else None
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def phonebook_query(base, q, timeout=3):
+    try:
+        req = urllib.request.Request(
+            base + "/query", data=json.dumps(q).encode(),
+            headers={"content-type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None  # best-effort; any failure degrades to "not owner", never raises
+
+
+def resolve_owner(kind, addr):
+    """Ask the phonebook whether (kind, addr) resolves to the owner identity.
+    Any failure — phonebook down, malformed reply, network error — degrades to
+    None (== not owner), fail-closed. Never raises."""
+    base = phonebook_base()
+    if not base:
+        return None
+    r = phonebook_query(base, {"kind": "resolve", "channel_kind": kind, "address": addr})
+    return r
+
+
+# ---- the pure gate decision (unit-testable in isolation) -------------------
+
+def is_owner_resolution(resolve_result):
+    """OWNER MATCH = resolved == true AND identity.id == "owner". Anything else
+    (not a dict, resolved false/missing, no identity, wrong id, None from a
+    raised/failed call) is NOT owner. This is the entire fail-closed gate,
+    factored out so it can be unit-tested without a network."""
+    if not isinstance(resolve_result, dict):
+        return False
+    if resolve_result.get("resolved") is not True:
+        return False
+    identity = resolve_result.get("identity")
+    if not isinstance(identity, dict):
+        return False
+    return identity.get("id") == OWNER_ID
+
+
+def build_promotion_body(inbound, chat_id, profile):
+    """The promoted in/human/owner body. Field names are the loop-avoidance
+    contract shared with the telegram reply-forwarder — do not rename."""
+    return {
+        "prompt": inbound.get("text", ""),
+        "source": "telegram",
+        "chat_id": chat_id,
+        "promoted": True,
+        "author": inbound.get("author"),
+        "profile": profile,
+        "session": f"tg-{chat_id}",
+    }
+
+
+def extract_inbound(env):
+    """Unwrap a broker envelope delivered by `lanius bus sub`:
+    env.payload -> inner (the ingress event), inner.payload -> the inbound
+    body the telegram bridge published, inner.correlation_id -> the
+    correlation to re-emit under. Returns (body, correlation, topic) or
+    (None, None, None) if the envelope isn't the expected shape (skipped, not
+    fatal)."""
+    inner = env.get("payload") if isinstance(env.get("payload"), dict) else None
+    if inner is None:
+        return None, None, None
+    body = inner.get("payload") if isinstance(inner.get("payload"), dict) else None
+    if body is None:
+        return None, None, None
+    correlation = inner.get("correlation_id")
+    topic = env.get("topic") or inner.get("topic")
+    return body, correlation, topic
+
+
+def resolve_chat_id(body, topic):
+    chat_id = body.get("chat_id")
+    if chat_id is not None:
+        return str(chat_id)
+    return chat_id_from_topic(topic)
+
+
+# ---- bus wire ----------------------------------------------------------------
+
+def bus_pub(topic, payload, correlation=None, qos=1):
+    args = [CLI, "bus", "pub", topic, json.dumps(payload), "--qos", str(qos)]
+    if correlation:
+        args += ["--correlation", correlation]
+    subprocess.run(args, check=True, timeout=30)
+
+
+def handle_line(line, profile):
+    """One delivered bus line -> promote or no-op. A bad/malformed line is
+    skipped (return without raising); only bus-subprocess trouble upstream is
+    crash-only."""
+    try:
+        env = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(env, dict):
+        return
+    body, correlation, topic = extract_inbound(env)
+    if body is None:
+        return
+    chat_id = resolve_chat_id(body, topic)
+    if chat_id is None:
+        return  # no address to resolve against; nothing to promote
+    resolution = resolve_owner("telegram", chat_id)
+    if not is_owner_resolution(resolution):
+        # Fail-closed: unresolved/unlinked/unknown/error -> the message stays
+        # an unresolved phonebook sighting (already recorded by the bridge)
+        # and stops here. No publish, no dispatch as owner mail.
+        return
+    promoted = build_promotion_body(body, chat_id, profile)
+    bus_pub(PROMOTE_TOPIC, promoted, correlation=correlation, qos=1)
+    log(f"[dm-promoter] promoted telegram:{chat_id} -> {PROMOTE_TOPIC} (correlation={correlation})")
+
+
+def main():
+    profile = default_profile()
+    proc = subprocess.Popen([CLI, "bus", "sub", SUB_TOPIC], stdout=subprocess.PIPE, text=True)
+    log(f"[dm-promoter] serving {SUB_TOPIC} -> fail-closed resolve-and-promote onto {PROMOTE_TOPIC} (profile={profile})")
+    for line in proc.stdout:
+        try:
+            handle_line(line, profile)
+        except subprocess.SubprocessError:
+            break  # bus trouble is crash-only
+        except Exception as e:
+            # A single bad inbound is skipped, never fatal.
+            log(f"[dm-promoter] bad inbound skipped: {e}")
+    log("[dm-promoter] bus subscription died -> exiting for restart")
+    os._exit(1)
+
+
+if __name__ == "__main__":
+    main()
