@@ -5,6 +5,7 @@ All notable changes to lanius are documented here.
 ## 0.1.2 — 2026-07-13
 
 ### Added
+- telegram-bridge: close the loop — chat with agents from your phone (#15)
 - **Coding-session DMs join the chat plane** (#4): workers message the owner with
   `lanius code send`, deliveries and replies fold into real chat threads with a
   "coding session" chip, and both the conversation list and the opened thread are
